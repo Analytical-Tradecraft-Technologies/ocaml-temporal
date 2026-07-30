@@ -90,8 +90,11 @@ non-retryable error-type classification. The restart/replay controller is
 implemented as `make test-temporal-worker-restart`; its contract and
 real-server execution passed in the [PR #253 Actions run](https://github.com/mfow/ocaml-temporal/actions/runs/29286560471).
 The controller's thirteen-step record, exact run identity, replay marker,
-normalized history, and volume cleanup are now live evidence; the larger-backoff
-retry contract passed in [PR #298](https://github.com/mfow/ocaml-temporal/actions/runs/29346853291);
+normalized history, and volume cleanup are now live evidence. Retry after worker
+replacement passed in [PR #298](https://github.com/mfow/ocaml-temporal/actions/runs/29346853291).
+The separate non-immediate retry under a two-second-backoff policy first passed
+in [PR #302](https://github.com/mfow/ocaml-temporal/actions/runs/29351689638);
+its timing guard proves only that at least one second elapsed. Finally,
 the separate one-slot sticky-cache eviction scenario passed in the complete
 [PR #438 run](https://github.com/mfow/ocaml-temporal/actions/runs/29805397413);
 the earlier [PR #322 run](https://github.com/mfow/ocaml-temporal/actions/runs/29402103748)
