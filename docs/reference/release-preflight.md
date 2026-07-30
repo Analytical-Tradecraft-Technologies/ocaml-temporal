@@ -33,7 +33,9 @@ disabled. The generated SPDX 2.3 document is deterministic: package IDs are
 derived from Cargo IDs, package order is stable, and its creation timestamp is
 fixed. A second isolated invocation validates the document before the job
 finishes. The SBOM is a CI artifact/input check and is not committed to the
-repository.
+repository. It covers the locked Cargo package graph only; it is not yet the
+complete OCaml package, runtime-container, or release-artifact SBOM required for
+publication.
 
 This workflow does not publish packages, create tags, or claim that a release
 is ready. Those actions require a later, explicitly reviewed release process

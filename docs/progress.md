@@ -14,6 +14,22 @@ implementation when a later entry documents that work as complete. The
 latest entry that records a successful live run is the authoritative status
 for the two-binary Temporal acceptance path.
 
+## 2026-07-21: Stable and prerelease tag consistency gate (#444)
+
+The complete [PR #444 Actions run](https://github.com/mfow/ocaml-temporal/actions/runs/29827725596)
+passed the release-preflight job and every applicable compatibility job. The
+host-only `make release-tag-check RELEASE_TAG=...` gate accepts a stable
+`vMAJOR.MINOR.PATCH` tag or an optional prerelease suffix. A SemVer-style tag
+such as `v1.0.0-beta.1` is normalized to the OPAM version
+`1.0.0~beta.1`; the equivalent `v1.0.0~beta.1` tag is accepted directly. The
+checker then requires that normalized version in `.release-version`,
+`temporal-sdk.opam`, and `temporal-sdk.opam.locked`.
+
+Malformed tags, metadata disagreement, and the checked-in `~dev` version fail
+before an artifact build. This gate does not create or publish a tag, establish
+artifact provenance, or replace the complete release dry run and redistribution
+audit that remain roadmap work.
+
 ## 2026-07-21: Repaired live sticky-cache eviction acceptance (#438)
 
 The complete [PR #438 Actions run](https://github.com/mfow/ocaml-temporal/actions/runs/29805397413)
