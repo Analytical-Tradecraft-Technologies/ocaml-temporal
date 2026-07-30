@@ -85,8 +85,10 @@ Consequently:
   marker, and the handler wakes a deterministic condition before returning its
   terminal value. The recorded seventeen-result baseline is also covered by
   the [PR #289 Actions run](https://github.com/mfow/ocaml-temporal/actions/runs/29339077368).
-  That historical run predates the long-backoff workflow now present in the
-  fixture, whose first live run remains pending.
+  The [PR #302 Actions run](https://github.com/mfow/ocaml-temporal/actions/runs/29351689638)
+  first verifies the later long-backoff extension, and the complete [PR #439
+  Actions run](https://github.com/mfow/ocaml-temporal/actions/runs/29824441578)
+  retains both paths in the current 26-start baseline.
   The [PR #434 Actions run](https://github.com/mfow/ocaml-temporal/actions/runs/29684113836)
   proves both query forms against parked exact runs. Typed update
   admission/completion is live-verified by the [PR #428 Actions

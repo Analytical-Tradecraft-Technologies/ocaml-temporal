@@ -20,8 +20,10 @@ updates have an experimental typed slice: a registered one-input handler may
  completion is emitted when it resumes. PR #266 provides the first focused live proof of the typed
 signal/condition path; the recorded seventeen-result Compose baseline is
 also covered by the [PR #289 Actions run](https://github.com/mfow/ocaml-temporal/actions/runs/29339077368).
-That historical run predates the long-backoff workflow now present in the
-fixture, whose first live run remains pending.
+The [PR #302 Actions run](https://github.com/mfow/ocaml-temporal/actions/runs/29351689638)
+first verifies the later long-backoff extension, and the complete [PR #439
+Actions run](https://github.com/mfow/ocaml-temporal/actions/runs/29824441578)
+retains both paths in the current 26-start baseline.
 The [PR #406 Actions run](https://github.com/mfow/ocaml-temporal/actions/runs/29557704643)
 also proves an output-only client query against the exact signal-condition run
 while it is parked. The complete [PR #434 Actions run](https://github.com/mfow/ocaml-temporal/actions/runs/29684113836)

@@ -887,9 +887,12 @@ complete [PR #266 CI
 run](https://github.com/mfow/ocaml-temporal/actions/runs/29311239247) live-verifies
 typed signal delivery and condition wake-up, and the expanded [PR #289 CI
 run](https://github.com/mfow/ocaml-temporal/actions/runs/29333761719) retains those
-assertions in the recorded seventeen-result baseline. The current source adds
-the long-backoff retry assertion as an eighteenth result; its first live run is
-still pending. A successful signal call still acknowledges Temporal's RPC
+assertions in the historical seventeen-result baseline. The [PR #302 CI
+run](https://github.com/mfow/ocaml-temporal/actions/runs/29351689638) first
+verified the long-backoff retry extension, and the complete [PR #439 CI
+run](https://github.com/mfow/ocaml-temporal/actions/runs/29824441578) retains
+the signal and retry paths in the current 26-start baseline. A successful
+signal call still acknowledges Temporal's RPC
 rather than the later execution of the worker-side handler.
 
 ## 10. Validate locally
@@ -908,20 +911,20 @@ server. The integration target starts a fresh PostgreSQL and Temporal Server
 Compose project, checks the schemas and frontend, runs the OCaml-owned Core
 lifecycle executable, then runs a public worker and a separate public driver.
 The worker executes registered workflows and activities. The driver is a
-one-shot test runner, not a worker. Its current implementation starts sixteen
-workflows before the first wait: fan-out, timer/activity, continue-as-new
-successor following, ordinary activity retry, long-backoff retry,
-heartbeat-detail retry, delayed asynchronous activity completion, parent/child
-success and failure/cancellation, child retry, duplicate-ID child-start
-failure, typed workflow failure, activity-level non-retryable policy matching,
-marker-guarded exact-run cancellation, and typed signal/condition handling. It
-then starts the start-to-close timeout-retry and heartbeat-timeout-retry
-workflows after the shorter retry paths have completed, and waits for all
-eighteen exact terminal results. The complete [PR #289 CI
-run](https://github.com/mfow/ocaml-temporal/actions/runs/29333761719) passed the
-seventeen-result baseline against Temporal Server 1.31 and PostgreSQL, then
-passed the separate two-generation worker restart/replay acceptance; it
-predates the long-backoff extension, whose first live run is still pending. The
+one-shot test runner, not a worker. Its current implementation stages 26
+top-level workflow starts covering fan-out, timers, local and remote
+activities, continue-as-new, the retry variants, delayed asynchronous
+completion, child success/failure/cancellation/retry/start rejection, typed
+workflow failure, direct cancellation and termination, queries, updates,
+direct and workflow-to-workflow signals, and external cancellation. Readiness
+markers guard control operations, and the start-to-close and heartbeat-timeout
+retries remain serialized after the shorter heartbeat path. The complete [PR
+#439 CI run](https://github.com/mfow/ocaml-temporal/actions/runs/29824441578)
+passed all current terminal assertions against Temporal Server 1.31 and
+PostgreSQL. The historical [PR #289 CI
+run](https://github.com/mfow/ocaml-temporal/actions/runs/29333761719) verifies
+the earlier seventeen-result baseline, and [PR #302](https://github.com/mfow/ocaml-temporal/actions/runs/29351689638)
+first verifies its long-backoff extension. The
 [PR #266 CI
 run](https://github.com/mfow/ocaml-temporal/actions/runs/29311239247) remains focused
 evidence for typed signal delivery and condition wake-up, while the historical
