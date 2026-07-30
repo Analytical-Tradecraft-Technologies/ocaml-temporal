@@ -369,8 +369,15 @@ re-verified these activity paths together in the prior sixteen-result gate.
 The complete [PR #289 Compose run](https://github.com/mfow/ocaml-temporal/actions/runs/29339077368)
 records the seventeen-result baseline, including the child-retry and
 duplicate-ID child-start-failure scenarios that share the same worker and
-activity adapter. It predates the long-backoff workflow now present in the
-fixture, whose first live run remains pending.
+activity adapter. The [PR #302 Compose
+run](https://github.com/mfow/ocaml-temporal/actions/runs/29351689638) first
+live-verifies a server-delivered, non-immediate retry under the later
+two-second-backoff policy and requires the exact
+`SMOKE:BACKOFF:RETRIED:SMOKE` result. The timing guard rejects delivery in
+under one second; it does not prove the full configured delay. The complete
+[PR #439 Compose
+run](https://github.com/mfow/ocaml-temporal/actions/runs/29824441578) retains
+that activity path in the current baseline.
 
 The worker handoff uses `Will_complete_async` only for `define_async` callbacks.
 The later client endpoint rejects that marker and accepts only completed,

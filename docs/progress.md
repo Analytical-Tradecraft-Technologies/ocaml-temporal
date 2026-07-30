@@ -234,6 +234,24 @@ markers in both normalized legacy snapshots, and one non-deprecated marker in
 both normalized new snapshots. This is an implemented acceptance design, not a
 claim that the real-server target has already passed.
 
+## 2026-07-14: Live non-immediate activity retry (#302)
+
+The complete [PR #302 Actions
+run](https://github.com/mfow/ocaml-temporal/actions/runs/29351689638) passed the
+Temporal/PostgreSQL integration job. Its public driver started
+`smoke.activity_long_backoff_retry`, retained the exact workflow/run handle,
+observed the run complete, required
+`SMOKE:BACKOFF:RETRIED:SMOKE`, and finished with the complete driver assertion
+marker. The worker-side fixture rejects a second callback delivered in under
+one second, so the result is evidence of a server-delivered, non-immediate retry
+under a policy configured with a two-second initial and maximum backoff. It does
+not measure or prove that the full configured delay elapsed.
+
+This was the first live evidence for the eighteenth baseline result. The
+complete [PR #439 run](https://github.com/mfow/ocaml-temporal/actions/runs/29824441578)
+retains the scenario in the later 26-start baseline; PR #289 remains historical
+evidence for the preceding seventeen-result slice.
+
 ## 2026-07-14: Retry-after-restart acceptance extension
 
 Status: verified in the Temporal/PostgreSQL integration job of the complete
