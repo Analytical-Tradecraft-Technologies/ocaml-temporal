@@ -1,6 +1,6 @@
 # OCaml Temporal SDK
 
-[![Build](https://github.com/mfow/ocaml-temporal/actions/workflows/build.yml/badge.svg?branch=master)](https://github.com/mfow/ocaml-temporal/actions/workflows/build.yml)
+[![Build](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/workflows/build.yml/badge.svg?branch=master)](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/workflows/build.yml)
 
 > **Community-maintained and unofficial. Not affiliated with or endorsed by Temporal Technologies, Inc.**
 
