@@ -127,6 +127,14 @@ test-install:
 # compatibility gate without knowing the package-layout test's implementation.
 test-api: test-install
 
+# Release preparation must run from a clean checkout. Keep its stale-owner
+# rejection fixture out of the ordinary quality target so contributors can run
+# that target while iterating with local changes, while the release-preflight
+# workflow exercises both gates on every clean CI checkout.
+release-preflight:
+	sh scripts/check-release-preflight.sh .
+	sh test/smoke/test_release_preflight_contract.sh .
+
 # Validates a concrete vMAJOR.MINOR.PATCH tag against the package manifests.
 # This is deliberately host-only so a release cannot spend time building an
 # artifact whose version metadata is inconsistent.

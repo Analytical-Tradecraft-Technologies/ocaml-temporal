@@ -5,7 +5,7 @@ resolver = "2"
 [workspace.package]
 edition = "2024"
 license = "Apache-2.0"
-repository = "https://github.com/mfow/ocaml-temporal"
+repository = "https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal"
 rust-version = "1.94"
 
 [workspace.dependencies]
