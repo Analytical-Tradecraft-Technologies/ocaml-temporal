@@ -14,9 +14,11 @@ val create : unit -> (t, Error.t) result
 
 (** Creates a scope, runs [body], and cancels the scope during cleanup. The
     body should use [await] for every operation whose observation belongs to
-    this scope. When the body succeeds, a typed cancellation-hook failure is
-    returned instead of the body's value. A body error or unexpected exception
-    remains primary after cleanup is attempted. *)
+    this scope. When the body succeeds, a typed failure from [with_scope]'s
+    implicit cleanup cancellation is returned instead of the body's value. A
+    body error or unexpected exception remains primary after cleanup is
+    attempted. An earlier explicit [cancel] returns its result only to that
+    call; if the body discards an error from it, cleanup does not replay it. *)
 val with_scope :
   (t -> ('value, Error.t) result) ->
   ('value, Error.t) result
