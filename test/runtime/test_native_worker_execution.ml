@@ -1389,6 +1389,81 @@ let test_eviction_allows_fresh_replay_execution () =
   if Hashtbl.length supervisor.leased <> 0 then
     failwith "fresh replay execution left a native lease outstanding"
 
+(** A second initialization for a run that is still suspended is a terminal
+    adapter defect. Once the corresponding failure completion is acknowledged,
+    the original execution must be shut down and removed: its paused fiber must
+    run cleanup exactly once, and later jobs for the same run ID must be rejected
+    instead of resuming workflow code that Core has already been told failed. *)
+let test_duplicate_initialization_retires_existing_run () =
+  let supervisor = fake_supervisor () in
+  let cleanups = ref 0 in
+  let workflow =
+    Temporal.Workflow.define ~name:"native_worker_duplicate_initialization"
+      ~input:Temporal.Codec.unit ~output:Temporal.Codec.unit (fun () ->
+        Fun.protect
+          ~finally:(fun () -> incr cleanups)
+          (fun () -> Temporal.Workflow.sleep (Temporal.Duration.of_ms 25L)))
+  in
+  let run_id = "run-duplicate-initialization" in
+  let workflow_type = "native_worker_duplicate_initialization" in
+  enqueue supervisor (activation ~run_id [ initialize ~run_id ~workflow_type ]);
+  let worker = worker supervisor [ Adapter.register workflow ] in
+  expect_completed ~terminal:false (Result.get_ok (Worker.poll worker));
+  let timer_seq =
+    match (latest_completion supervisor).commands with
+    | [ Protocol.Start_timer { seq; _ } ] -> seq
+    | _ -> failwith "duplicate-initialization fixture did not suspend on a timer"
+  in
+  supervisor.reject_next_completion := true;
+  enqueue supervisor (activation ~run_id [ initialize ~run_id ~workflow_type ]);
+  begin
+    match Worker.poll worker with
+    | Error { code = "completion_failed"; _ } -> ()
+    | Ok _ -> failwith "rejected duplicate initialization was acknowledged immediately"
+    | Error error ->
+        failwith
+          ("duplicate initialization completion returned the wrong error: "
+         ^ error.message)
+  end;
+  if !cleanups <> 0 then
+    failwith "duplicate initialization tore down its workflow before acknowledgement";
+  if Hashtbl.length supervisor.leased <> 1 then
+    failwith "rejected duplicate initialization retired its native lease too early";
+  let retained = latest_attempt supervisor in
+  begin
+    match retained.commands with
+    | [ Protocol.Fail_workflow _ ] -> ()
+    | _ -> failwith "duplicate initialization did not retain its failure completion"
+  end;
+  begin
+    match Worker.poll worker with
+    | Ok (Adapter.Rejected { error; lease_retired = true; _ })
+      when String.equal error.code "duplicate_run_id" ->
+        ()
+    | Ok _ -> failwith "duplicate initialization did not retire its failure lease"
+    | Error error ->
+        failwith
+          ("duplicate initialization failure was not acknowledged: " ^ error.message)
+  end;
+  if latest_completion supervisor <> retained then
+    failwith "duplicate initialization retry changed the retained failure completion";
+  if !cleanups <> 1 then
+    failwith "duplicate initialization did not tear down the existing workflow fiber";
+  if Hashtbl.length supervisor.leased <> 0 then
+    failwith "duplicate initialization left a native lease outstanding";
+  enqueue supervisor (activation ~run_id [ Protocol.Fire_timer { seq = timer_seq } ]);
+  begin
+    match Worker.poll worker with
+    | Ok (Adapter.Rejected { error; lease_retired = true; _ })
+      when String.equal error.code "unknown_run_id" ->
+        ()
+    | Ok _ -> failwith "duplicate initialization retained stale execution state"
+    | Error error ->
+        failwith ("duplicate initialization cleanup poll failed: " ^ error.message)
+  end;
+  if !cleanups <> 1 then
+    failwith "stale duplicate-initialization work repeated workflow cleanup"
+
 (** A parent that is evicted while a child is pending must not retain the old
     child future or sequence allocator. Temporal can later deliver a replayed
     start for the same run ID; the new execution must issue the same child
@@ -2508,6 +2583,7 @@ let () =
   test_unhandled_signal_fails_closed ();
   test_eviction ();
   test_eviction_allows_fresh_replay_execution ();
+  test_duplicate_initialization_retires_existing_run ();
   test_child_replay_after_eviction_restarts_pending_child ();
   test_eviction_after_terminal_completion ();
   test_unexpected_completion_exception_is_retried ();
