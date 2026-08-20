@@ -1166,6 +1166,27 @@ let run () =
           require_completed "smoke.signal_condition" "SMOKE:SIGNAL:EXTERNAL"
             (Ok signal_result)
         in
+        (* The signal target is terminal now, so this second parent proves
+           an exact-run external signal does not silently succeed after completion. *)
+        let completed_signal_target =
+          Client.workflow_id signal_handle ^ "
+" ^ Client.run_id signal_handle
+        in
+        let* external_signal_completed_parent_handle =
+          start_workflow client
+            ~workflow:Definitions.external_signal_completed_parent
+            ~task_queue:Definitions.task_queue
+            ~id:"two-binary-external-signal-completed-parent"
+            ~input:completed_signal_target
+        in
+        let* external_signal_completed_parent_result =
+          wait_workflow external_signal_completed_parent_handle
+        in
+        let* () =
+          require_completed "smoke.external_signal_completed_parent"
+            "SMOKE:EXTERNAL:SIGNAL:COMPLETED"
+            (Ok external_signal_completed_parent_result)
+        in
         let* update_workflow_result = wait_workflow update_handle in
         require_completed "smoke.signal_condition_update" "SMOKE:SIGNAL:UPDATED"
           (Ok update_workflow_result)
