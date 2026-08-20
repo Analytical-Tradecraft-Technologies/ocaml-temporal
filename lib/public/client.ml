@@ -169,8 +169,8 @@ let validate_start_fields ~request_id ~workflow_name ~id ~task_queue =
           | Ok () -> validate_name "task queue" task_queue))
 
 (** Checks metadata keys before they reach the protocol map representation.
-    Rejecting duplicates here keeps caller-visible behavior independent of
-    Rust's map implementation and avoids silently losing one value. *)
+    Rejecting duplicates and malformed UTF-8 here keeps caller-visible
+    behavior independent of Rust's map implementation and JSON validation. *)
 let validate_metadata_fields label fields =
   let rec loop seen = function
     | [] -> Ok ()
@@ -187,6 +187,10 @@ let validate_metadata_fields label fields =
           Error
             (Error.make ~category:`Defect
                ~message:(Printf.sprintf "%s key exceeds protocol limit" label) ())
+        else if not (Temporal_base.Codec.valid_utf_8 key) then
+          Error
+            (Error.make ~category:`Defect
+               ~message:(Printf.sprintf "%s key must be valid UTF-8" label) ())
         else loop (key :: seen) rest
   in
   loop [] fields

@@ -703,9 +703,12 @@ let test_client_identifier_size_validation () =
 (** Malformed UTF-8 identifiers are rejected by the public client before
     transport selection. The mock backend must enforce the same string
     boundary as the native JSON protocol for both connection configuration and
-    workflow operations. *)
+    workflow operations, including memo and search attribute keys. *)
 let test_client_identifier_utf_8_validation () =
   let malformed_utf_8 = String.make 1 '\255' in
+  let metadata_value =
+    unwrap (Temporal.Codec.encode Temporal.Codec.string "value")
+  in
   expect_error_message_contains "defect" "valid UTF-8"
     (Temporal.Client.create ~target_url:"mock://client"
        ~namespace:malformed_utf_8 ());
@@ -717,6 +720,15 @@ let test_client_identifier_utf_8_validation () =
   expect_error_message_contains "defect" "valid UTF-8"
     (Temporal.Client.start client ~workflow:echo_workflow
        ~task_queue:"unit-test" ~id:malformed_utf_8 ~input:"ignored" ());
+  expect_error_message_contains "defect" "valid UTF-8"
+    (Temporal.Client.start client ~workflow:echo_workflow
+       ~task_queue:"unit-test" ~id:"invalid-memo-key" ~input:"ignored"
+       ~memo:[ (malformed_utf_8, metadata_value) ] ());
+  expect_error_message_contains "defect" "valid UTF-8"
+    (Temporal.Client.start client ~workflow:echo_workflow
+       ~task_queue:"unit-test" ~id:"invalid-search-attribute-key"
+       ~input:"ignored"
+       ~search_attributes:[ (malformed_utf_8, metadata_value) ] ());
   unwrap (Temporal.Client.shutdown client)
 
 (** An HTTP-shaped endpoint is deliberately handed to the native configuration
