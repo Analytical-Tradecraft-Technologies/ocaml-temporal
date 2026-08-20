@@ -23,9 +23,10 @@ dune_dependencies=$(dune format-dune-file "$root/dune-project")
 
 # The OCaml base image contains a point-in-time clone of opam-repository. New
 # conf packages declared by this project are not guaranteed to be present in
-# that clone, so refresh it in the same layer that resolves dependencies.
+# that clone, so replace it with the canonical Git HTTPS remote and refresh it
+# in the same layer that resolves dependencies.
 if ! awk '
-  before_previous == "RUN opam repository set-url default https://opam.ocaml.org \\" &&
+  before_previous == "RUN opam repository set-url default git+https://github.com/ocaml/opam-repository.git \\" &&
     previous == "    && opam update \\" &&
     $0 == "    && opam install --deps-only --with-test --assume-depexts -y ." { found = 1 }
   { before_previous = previous; previous = $0 }
