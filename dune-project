@@ -1,7 +1,7 @@
 (lang dune 3.18)
 (name temporal-sdk)
 (generate_opam_files false)
-(source (github mfow/ocaml-temporal))
+(source (github Analytical-Tradecraft-Technologies/ocaml-temporal))
 (license Apache-2.0)
 (authors "Michael Fowlie")
 (maintainers "Michael Fowlie")
