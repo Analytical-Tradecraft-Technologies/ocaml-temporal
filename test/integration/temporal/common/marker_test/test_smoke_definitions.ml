@@ -173,8 +173,41 @@ let test_atomic_publication () =
         "marker contents were not exact";
       require (staging_files path = []) "staging file remained after rename")
 
+(** Pins the live Core failure shape used by the completed-target signal
+    assertion. This keeps a wording mismatch from requiring a full Compose run
+    to diagnose while still rejecting the wrong category, retry policy, or
+    application failure type. *)
+let test_completed_external_signal_not_found_contract () =
+  let message =
+    "Unable to signal external workflow because it was not found application type=ExternalWorkflowExecutionNotFound non_retryable=false details=0"
+  in
+  let error category ?(non_retryable = false) message =
+    Temporal.Error.make ~category ~non_retryable ~message ()
+  in
+  require
+    (Smoke_definitions.is_completed_external_signal_not_found
+       (error `Workflow message))
+    "completed-target signal did not accept Core's typed not-found failure";
+  require
+    (not
+       (Smoke_definitions.is_completed_external_signal_not_found
+          (error `Bridge message)))
+    "completed-target signal accepted the wrong error category";
+  require
+    (not
+       (Smoke_definitions.is_completed_external_signal_not_found
+          (error `Workflow ~non_retryable:true message)))
+    "completed-target signal accepted a non-retryable failure";
+  require
+    (not
+       (Smoke_definitions.is_completed_external_signal_not_found
+          (error `Workflow
+             "Unable to signal external workflow because it was not found application type=DifferentFailure")))
+    "completed-target signal accepted the wrong application failure type"
+
 (** Verifies the success path and reports a stable test name in Dune output. *)
 let () =
   test_atomic_publication ();
   test_heartbeat_retry_activity_contract ();
+  test_completed_external_signal_not_found_contract ();
   print_endline "smoke definitions marker test passed"
