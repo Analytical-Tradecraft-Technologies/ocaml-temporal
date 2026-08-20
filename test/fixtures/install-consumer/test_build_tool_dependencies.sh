@@ -23,13 +23,24 @@ dune_dependencies=$(dune format-dune-file "$root/dune-project")
 
 # The OCaml base image contains a point-in-time clone of opam-repository. New
 # conf packages declared by this project are not guaranteed to be present in
-# that clone, so replace it with the canonical Git HTTPS remote and refresh it
-# in the same layer that resolves dependencies.
-if ! grep -F 'RUN opam repository set-url default git+https://github.com/ocaml/opam-repository.git \' \
-  "$root/Dockerfile.dev" >/dev/null ||
-  ! grep -F 'if ! opam install --deps-only --with-test --assume-depexts -y . \' \
-    "$root/Dockerfile.dev" >/dev/null; then
+# that clone, so refresh it in the same layer that resolves dependencies. The
+# image installs protoc through apt and copies the pinned Rust toolchain from
+# the official Rust image, so opam must validate the conf packages without
+# attempting or solving their distribution-level depexts.
+if ! awk '
+  before_previous == "RUN opam repository set-url default https://opam.ocaml.org \\" &&
+    previous == "    && opam update \\" &&
+    $0 == "    && opam install --deps-only --with-test --no-depexts -y ." { found = 1 }
+  { before_previous = previous; previous = $0 }
+  END { exit !found }
+' "$root/Dockerfile.dev"; then
   fail "Dockerfile.dev does not use the current HTTPS opam repository before installing dependencies"
+fi
+
+if ! grep -F 'protobuf-compiler \' "$root/Dockerfile.dev" >/dev/null ||
+  ! grep -F 'COPY --from=rust-toolchain /usr/local/cargo /usr/local/cargo' \
+    "$root/Dockerfile.dev" >/dev/null; then
+  fail "Dockerfile.dev does not install the native tools required by its conf packages"
 fi
 
 for workflow in "$root/.github/workflows/build.yml" "$root/.github/workflows/build-pr.yml"; do
