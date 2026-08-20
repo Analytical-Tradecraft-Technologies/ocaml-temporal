@@ -15,6 +15,7 @@
  (depends
   (ocaml (>= 5.2))
   conf-rust-2024
+  conf-protoc
   (dune (>= 3.18))
   (logs (>= 0.10))
   (yojson (>= 3.0))))

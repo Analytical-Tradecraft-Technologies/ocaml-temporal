@@ -1,0 +1,13 @@
+(rule
+ (alias runtest)
+ (package temporal-sdk)
+ (deps
+  ../../dune-project
+  ../../temporal-sdk.opam
+  ../../temporal-sdk.opam.locked
+  install-consumer/test_build_tool_dependencies.sh)
+ (action
+  (run
+   sh
+   %{dep:install-consumer/test_build_tool_dependencies.sh}
+   %{workspace_root})))

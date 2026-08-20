@@ -14,6 +14,7 @@ dev-repo: "git+https://github.com/Analytical-Tradecraft-Technologies/ocaml-tempo
 depends: [
   "ocaml" {>= "5.2"}
   "conf-rust-2024"
+  "conf-protoc"
   "dune" {>= "3.18"}
   "logs" {>= "0.10"}
   "yojson" {>= "3.0"}
@@ -22,7 +23,4 @@ build: [
   ["dune" "subst"] {dev}
   ["dune" "build" "-p" name "-j" jobs]
 ]
-run-test: [
-  ["dune" "runtest" "-p" name "-j" jobs]
-  ["sh" "test/fixtures/install-consumer/test_build_tool_dependencies.sh" "."]
-]
+run-test: [["dune" "runtest" "-p" name "-j" jobs]]
