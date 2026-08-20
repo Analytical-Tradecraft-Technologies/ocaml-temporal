@@ -12,6 +12,16 @@ let require_error = function
   | Error _ -> ()
   | Ok _ -> failwith "expected activity protocol validation to fail"
 
+(** Requires malformed input to retain the strict decoder's precise safe path. *)
+let check_error_path label expected = function
+  | Error error ->
+      let actual = (Protocol.error_view error).path in
+      if not (String.equal expected actual) then
+        failwith
+          (Printf.sprintf "%s path differed: expected %s, got %s" label expected
+             actual)
+  | Ok _ -> failwith (label ^ " unexpectedly passed validation")
+
 (** Compares normalized JSON output exactly. *)
 let check_string label expected actual =
   if not (String.equal expected actual) then
@@ -130,7 +140,10 @@ let test_closed_documents () =
     ];
   require_error
     (Protocol.decode_completion
-       {|{"task_token":"AA==","result":{"kind":"completed"}}|})
+       {|{"task_token":"AA==","result":{"kind":"completed"}}|});
+  check_error_path "nested completion duplicate" "$.result"
+    (Protocol.decode_completion
+       {|{"task_token":"AA==","result":{"kind":"will_complete_async","kind":"will_complete_async"}}|})
 
 (** Tokens, identifiers, time values, attempts, retry-policy numbers, header
     keys, and raw bit strings retain the exact bilateral numeric domains. *)

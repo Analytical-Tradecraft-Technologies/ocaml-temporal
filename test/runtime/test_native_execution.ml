@@ -890,13 +890,9 @@ let test_signal_identity_validation () =
         let view = Native_execution.error_view error in
         if not (String.equal view.code "invalid_message") then
           failwith (label ^ " returned the wrong error code");
-        (* Invalid UTF-8 is rejected by the lower-level JSON foundation before
-           the semantic decoder can attach the nested identity path. *)
-        if
-          not
-            (String.equal view.path "$.jobs[0].identity"
-            || String.equal view.path "$")
-        then
+        (* Invalid UTF-8 is rejected by the lower-level JSON foundation, which
+           retains the exact array element and field location. *)
+        if not (String.equal view.path "$.jobs[0].identity") then
           failwith (label ^ " returned the wrong error path")
   in
   expect_rejected "NUL" "sender\000";
