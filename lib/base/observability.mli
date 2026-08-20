@@ -39,8 +39,9 @@ module Tag : sig
 end
 
 (** [tags ~operation ()] constructs metadata shared by current SDK boundaries.
-    String values are bounded before they reach an application reporter.
-    Negative counts and negative, NaN, or infinite durations become zero. *)
+    String values are bounded before they reach an application reporter without
+    splitting valid UTF-8 characters. Negative counts and negative, NaN, or
+    infinite durations become zero. *)
 val tags :
   operation:string ->
   ?duration_ms:float ->

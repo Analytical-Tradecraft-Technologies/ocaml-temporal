@@ -208,12 +208,13 @@ optional reporter package on the application's behalf.
 Events contain operation names, counts, type names, stable error categories,
 and latency. They do not contain payload bytes, workflow inputs or outputs,
 credentials, Rust diagnostic strings, or arbitrary remote failure detail.
-User-controlled string tags are capped at 256 bytes, and current message prose
-is constant and bounded. The Rust bridge reduces Core/gRPC worker and
-poll-lane failures to those constant categories before they reach C; the OCaml
-worker adapter repeats the check before reporting or returning an error. The
-private diagnostic text is discarded because this logging policy has no path
-that is allowed to expose it.
+User-controlled string tags are capped at 256 bytes. Truncation preserves valid
+UTF-8 character boundaries before adding the visible `...` suffix, and current
+message prose is constant and bounded. The Rust bridge reduces Core/gRPC worker
+and poll-lane failures to those constant categories before they reach C; the
+OCaml worker adapter repeats the check before reporting or returning an error.
+The private diagnostic text is discarded because this logging policy has no
+path that is allowed to expose it.
 
 Every SDK report passes through one exception shield. If an application
 reporter or formatter raises, the SDK discards that record and returns the
