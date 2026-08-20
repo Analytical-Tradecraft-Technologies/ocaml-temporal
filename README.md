@@ -227,6 +227,23 @@ On a memory-constrained Docker VM, bound Dune's native build concurrency with
 `make build DUNE_JOBS=1`; leaving `DUNE_JOBS` unset preserves the default
 parallelism used by CI.
 
+### Install from a source checkout
+
+The checked-in package version is `~dev`. To install the current checkout into
+an existing OPAM switch, use OCaml 5.2 or newer, Dune 3.18 or newer, and Rust
+1.94 or newer, then run:
+
+```sh
+opam install --with-test .
+```
+
+The OPAM metadata depends on `conf-rust-2024`, so dependency resolution checks
+that `cargo` and a compiler supporting Rust edition 2024 are available before
+Dune builds the private native bridge. Cargo still enforces the package's more
+specific Rust 1.94 minimum from `rust/Cargo.toml`. Applications link only the
+installed `temporal-sdk` library and use the wrapped `Temporal` module; the
+Rust toolchain is a build prerequisite, not part of the public OCaml API.
+
 ### The real Temporal smoke
 
 `make test-temporal-integration` starts the pinned Temporal Server and

@@ -16,6 +16,7 @@ depends: [
   "base-nnp" {= "base"}
   "base-threads" {= "base"}
   "base-unix" {= "base"}
+  "conf-rust-2024" {= "1"}
   "dune" {= "3.24.0"}
   "logs" {= "0.10.0"}
   "ocaml" {= "5.2.1"}
@@ -31,7 +32,10 @@ build: [
   ["dune" "subst"] {dev}
   ["dune" "build" "-p" name "-j" jobs]
 ]
-run-test: ["dune" "runtest" "-p" name "-j" jobs]
+run-test: [
+  ["dune" "runtest" "-p" name "-j" jobs]
+  ["sh" "test/fixtures/install-consumer/test_build_tool_dependencies.sh" "."]
+]
 dev-repo: "git+https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal.git"
 pin-depends: [
   "ocaml-base-compiler.5.2.1"
