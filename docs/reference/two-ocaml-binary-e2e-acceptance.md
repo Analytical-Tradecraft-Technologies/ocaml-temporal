@@ -1,9 +1,17 @@
 # Two-OCaml-binary Temporal acceptance design
 
-**Status:** The [PR #289 Actions run](https://github.com/mfow/ocaml-temporal/actions/runs/29333761719)
-verified the current seventeen-result baseline, including typed signal delivery,
-activity retry classification, heartbeat-timeout retry, child-workflow retry,
-and duplicate-ID child-start failure against real Temporal Server and PostgreSQL.
+**Status:** The complete [PR #439 Actions
+run](https://github.com/mfow/ocaml-temporal/actions/runs/29824441578) verifies
+the current 26-start baseline against real Temporal Server and PostgreSQL. It
+includes local and remote activities, typed queries, direct and
+workflow-to-workflow signals, updates, termination, and external cancellation.
+The historical [PR #289 Actions
+run](https://github.com/mfow/ocaml-temporal/actions/runs/29333761719) verifies
+the earlier seventeen-result baseline; the [PR #302 Actions
+run](https://github.com/mfow/ocaml-temporal/actions/runs/29351689638) first
+verifies the eighteenth result: a non-immediate retry under a policy configured
+with a two-second backoff. Its timing guard rejects retries delivered in under
+one second and therefore does not prove that the full configured delay elapsed.
 The complete
 [PR #253 Actions run](https://github.com/mfow/ocaml-temporal/actions/runs/29286560471) verified the separate two-generation worker restart/replay acceptance against real Temporal Server and PostgreSQL.
 The PR #253 run passed the supported Linux and native platform matrix. The
@@ -27,11 +35,12 @@ Temporal returns the first attempt's detail and timeout to the second attempt.
 The worker and driver remain guarded by
 `TEMPORAL_TWO_BINARY_LIVE=1`; only the dedicated Compose services set it.
 
-The accepted CI run adds delayed asynchronous activity completion,
-continue-as-new successor following, typed signal/condition acceptance, and a
-live child-start rejection to the timeout path, for seventeen top-level
-assertions in the accepted baseline. The current fixture adds a long-backoff
-retry assertion, bringing the pending gate to eighteen.
+PR #289 added delayed asynchronous activity completion, continue-as-new
+successor following, typed signal/condition acceptance, and live child-start
+rejection to the timeout path, for seventeen top-level assertions. PR #302
+added and live-verified the long-backoff retry assertion as the eighteenth
+result. Later interaction and control scenarios bring the current fixture to
+26 top-level starts, all live-verified by PR #439.
 
 The baseline driver/worker smoke is not workflow-code versioning evidence. The
 separate [`make test-temporal-workflow-patching`](workflow-patching.md#intended-live-replay-acceptance)
@@ -41,10 +50,11 @@ real-server result is independently verified by the complete [PR #348 CI
 run](https://github.com/mfow/ocaml-temporal/actions/runs/29411260374); it must
 not be inferred from the baseline's green historical runs.
 
-The current implementation starts sixteen top-level workflows before waiting
-for any terminal result, including the delayed asynchronous completion,
-continue-as-new successor, signal/condition, long-backoff retry, and
-child-start-failure workflows.
+The current implementation stages 26 top-level workflow starts. It begins with
+the core activity, child, continuation, and signal scenarios before terminal
+waits, then adds direct signal, workflow-to-workflow signal, update,
+child-start-failure, termination, and external-cancellation workflows behind
+their required readiness barriers.
 The child-start-failure parent is started after
 `two-binary-long-running-cancellation` has been accepted, then deliberately
 uses that top-level workflow ID for its child; Temporal must reject the child
@@ -52,7 +62,7 @@ start with a typed non-retryable `Child_workflow` error. The driver waits for
 the signal workflow's worker-visible readiness marker before signaling its exact
 run. After the heartbeat-retry workflow reaches
 its terminal result, it starts the start-to-close timeout workflow, then starts
-the heartbeat-timeout workflow after that result. The eighteen-result assertion
+the heartbeat-timeout workflow after that result. The complete assertion set
 also includes the activity-level non-retryable policy and a parent whose child
 returns `SMOKE:CHILD_RETRY:ATTEMPT:2` on its second server-owned attempt.
 This ordering keeps the six-second callback from occupying the serialized
@@ -93,12 +103,15 @@ removed the Compose project and its PostgreSQL data volume, and cleanup removes
 that volume again on success or failure; no database state is preserved for a
 later acceptance run. The driver starts sixteen top-level workflows before its
 first terminal wait, including the delayed asynchronous-completion,
-long-backoff retry, and continue-as-new scenarios. It starts the child-start-failure parent immediately
+long-backoff retry, continue-as-new, and direct-signal scenarios. It then
+stages workflow-to-workflow signal, update, cancellation, child-start failure,
+termination, external cancellation, and the timeout-retry workflows for 26
+top-level starts and waits. It starts the child-start-failure parent immediately
 after the long-running cancellation workflow so the duplicate workflow ID is
 already accepted when the child command is issued. Once the heartbeat-retry
 workflow has completed, it starts the timeout-retry workflow, then the
-heartbeat-timeout retry workflow, and waits for those separate results, for
-eighteen top-level starts and waits. The cancellation scenario waits for the
+heartbeat-timeout retry workflow and waits for those separate results. The
+cancellation scenario waits for the
 `smoke.cancellation_ready` activity marker after the long-running workflow has
 issued its durable-timer and marker commands in one activation, then
 acknowledges cancellation for `two-binary-long-running-cancellation` before
@@ -167,7 +180,7 @@ handle to return a typed `Cancelled` error. Those historical ten-run paths,
 including the updated timeout ordering, passed in the [PR #229 live CI run](https://github.com/mfow/ocaml-temporal/actions/runs/29235144016)
 and the [PR #226 live CI run](https://github.com/mfow/ocaml-temporal/actions/runs/29224854182);
 the historical nine-run path passed in [PR #210](https://github.com/mfow/ocaml-temporal/actions/runs/29221151859).
-The current seventeen-result run additionally verifies asynchronous completion,
+The historical seventeen-result run additionally verifies asynchronous completion,
 typed signal delivery, continue-as-new successor following, activity-level
 non-retryable classification, heartbeat-timeout retry, and child-workflow
 retry and duplicate-ID child-start failure. The [PR #289 run](https://github.com/mfow/ocaml-temporal/actions/runs/29333761719)
@@ -662,18 +675,16 @@ for PR head `47c9a93`, later squash-merged as `f877fbf`:
    `non_retryable=false` and the stable message `workflow execution was
     cancelled`.
 
-The current fixture starts sixteen top-level workflows before its first wait,
-including `smoke.activity_long_backoff_retry`, then starts
+The current fixture stages 26 top-level workflow starts and waits, including
+`smoke.activity_long_backoff_retry`, then starts
 `smoke.activity_timeout_retry` and `smoke.activity_heartbeat_timeout_retry` in
-serialized order, for eighteen top-level starts and waits. The
-child-start-failure parent is included among
-the first sixteen and returns `SMOKE:CHILD:START_FAILED` after Temporal rejects
-its duplicate child ID. The complete PR #289 run accepted the exact
-asynchronous result, successor result, timeout-retry markers, activity
-non-retryable classification, child-retry marker, child-start-failure marker, typed signal/condition
-result, and the earlier assertions. The exact six-second late callbacks,
-dedicated retry policies, and ordering guards remain protected by the
-Docker-free contracts and historical PR #229/PR #226 CI runs.
+serialized order. The child-start-failure parent returns
+`SMOKE:CHILD:START_FAILED` after Temporal rejects its duplicate child ID. The
+complete PR #439 run accepted every terminal assertion, including local
+activity execution, the long-backoff result, queries, direct and external
+signals, updates, termination, and external cancellation. The exact six-second
+late callbacks, dedicated retry policies, and ordering guards remain protected
+by the Docker-free contracts and historical PR #229/PR #226 CI runs.
 
 The driver logs no-payload phase records for starts, exact-run cancellation,
 exact-run waits, terminal classes, and operation latency. The Makefile requires
@@ -722,14 +733,16 @@ have their own live acceptance references and [coverage boundaries](live-accepta
 
 ## Completion criteria for this design
 
-The accepted seventeen-result baseline
-was verified by the complete [PR #289 CI run](https://github.com/mfow/ocaml-temporal/actions/runs/29333761719). The separate two-generation restart/replay acceptance was verified by the complete [PR #253 CI run](https://github.com/mfow/ocaml-temporal/actions/runs/29286560471).
-The baseline driver assertions and the restart controller are separate gates;
-the pending long-backoff extension adds an eighteenth exact outcome. The
-former waits for all seventeen exact workflow outcomes, while the latter
-replaces generation 1, validates replay on generation 2, and removes the
-PostgreSQL volume. The older entries below retain the history of the earlier
-nine- and ten-workflow milestones.
+The current 26-start baseline was verified by the complete [PR #439 CI
+run](https://github.com/mfow/ocaml-temporal/actions/runs/29824441578). The
+separate two-generation restart/replay acceptance was verified by the complete
+[PR #253 CI run](https://github.com/mfow/ocaml-temporal/actions/runs/29286560471).
+The baseline driver assertions and the restart controller are separate gates:
+the former waits for every exact terminal outcome, while the latter replaces
+generation 1, validates replay on generation 2, and removes the PostgreSQL
+volume. PR #289 and PR #302 retain the history of the seventeen- and
+eighteen-result milestones; the older entries below retain the earlier nine-
+and ten-workflow milestones.
 
 The previous nine-workflow acceptance contract was verified by the complete
 [PR #210 CI run](https://github.com/mfow/ocaml-temporal/actions/runs/29221151859)

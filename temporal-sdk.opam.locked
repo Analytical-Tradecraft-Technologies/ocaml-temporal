@@ -8,8 +8,8 @@ authors: "Michael Fowlie"
 license: "Apache-2.0"
 tags: [ "temporal" "workflow" "sdk" "experimental" ]
 x-maintenance-intent: [ "(latest)" ]
-homepage: "https://github.com/mfow/ocaml-temporal"
-bug-reports: "https://github.com/mfow/ocaml-temporal/issues"
+homepage: "https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal"
+bug-reports: "https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues"
 depends: [
   "base-bigarray" {= "base"}
   "base-domains" {= "base"}
@@ -32,7 +32,7 @@ build: [
   ["dune" "build" "-p" name "-j" jobs]
 ]
 run-test: ["dune" "runtest" "-p" name "-j" jobs]
-dev-repo: "git+https://github.com/mfow/ocaml-temporal.git"
+dev-repo: "git+https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal.git"
 pin-depends: [
   "ocaml-base-compiler.5.2.1"
   "https://github.com/ocaml/ocaml/releases/download/5.2.1/ocaml-5.2.1.tar.gz"

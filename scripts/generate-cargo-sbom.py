@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 
-NAMESPACE = "https://github.com/mfow/ocaml-temporal/sbom/cargo"
+NAMESPACE = "https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/sbom/cargo"
 
 
 def normalized_manifest_path(

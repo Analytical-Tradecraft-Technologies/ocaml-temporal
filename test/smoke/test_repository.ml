@@ -71,6 +71,8 @@ let test_package_metadata () =
   let opam = source "temporal-sdk.opam" in
   let locked = source "temporal-sdk.opam.locked" in
   let dune_project = source "dune-project" in
+  let cargo_manifest = source "rust/Cargo.toml" in
+  let cargo_sbom = source "scripts/generate-cargo-sbom.py" in
   if Sys.file_exists (source "temporal.opam") then
     failwith "the retired temporal.opam package manifest still exists";
   require_text ~path:opam
@@ -84,11 +86,14 @@ let test_package_metadata () =
     ~needle:"tags: [ \"temporal\" \"workflow\" \"sdk\" \"experimental\" ]";
   require_text ~path:opam ~needle:"x-maintenance-intent: [ \"(latest)\" ]";
   require_text ~path:opam
-    ~needle:"homepage: \"https://github.com/mfow/ocaml-temporal\"";
+    ~needle:
+      "homepage: \"https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal\"";
   require_text ~path:opam
-    ~needle:"bug-reports: \"https://github.com/mfow/ocaml-temporal/issues\"";
+    ~needle:
+      "bug-reports: \"https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues\"";
   require_text ~path:opam
-    ~needle:"dev-repo: \"git+https://github.com/mfow/ocaml-temporal.git\"";
+    ~needle:
+      "dev-repo: \"git+https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal.git\"";
   require_text ~path:opam ~needle:"\"logs\" {>= \"0.10\"}";
   require_text ~path:opam ~needle:"\"yojson\" {>= \"3.0\"}";
   require_text ~path:locked ~needle:"name: \"temporal-sdk\"";
@@ -103,15 +108,24 @@ let test_package_metadata () =
     ~needle:"tags: [ \"temporal\" \"workflow\" \"sdk\" \"experimental\" ]";
   require_text ~path:locked ~needle:"x-maintenance-intent: [ \"(latest)\" ]";
   require_text ~path:locked
-    ~needle:"homepage: \"https://github.com/mfow/ocaml-temporal\"";
+    ~needle:
+      "homepage: \"https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal\"";
   require_text ~path:locked
-    ~needle:"bug-reports: \"https://github.com/mfow/ocaml-temporal/issues\"";
+    ~needle:
+      "bug-reports: \"https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues\"";
   require_text ~path:locked
-    ~needle:"dev-repo: \"git+https://github.com/mfow/ocaml-temporal.git\"";
+    ~needle:
+      "dev-repo: \"git+https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal.git\"";
   require_text ~path:locked ~needle:"\"logs\" {= \"0.10.0\"}";
   require_text ~path:locked ~needle:"\"yojson\" {= \"3.0.0\"}";
   require_text ~path:dune_project
-    ~needle:"(source (github mfow/ocaml-temporal))";
+    ~needle:"(source (github Analytical-Tradecraft-Technologies/ocaml-temporal))";
+  require_text ~path:cargo_manifest
+    ~needle:
+      "repository = \"https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal\"";
+  require_text ~path:cargo_sbom
+    ~needle:
+      "NAMESPACE = \"https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/sbom/cargo\"";
   require_text ~path:dune_project
     ~needle:"(synopsis \"Experimental Temporal workflows in modern OCaml\")";
   require_text ~path:dune_project

@@ -14,6 +14,22 @@ implementation when a later entry documents that work as complete. The
 latest entry that records a successful live run is the authoritative status
 for the two-binary Temporal acceptance path.
 
+## 2026-07-21: Stable and prerelease tag consistency gate (#444)
+
+The complete [PR #444 Actions run](https://github.com/mfow/ocaml-temporal/actions/runs/29827725596)
+passed the release-preflight job and every applicable compatibility job. The
+host-only `make release-tag-check RELEASE_TAG=...` gate accepts a stable
+`vMAJOR.MINOR.PATCH` tag or an optional prerelease suffix. A SemVer-style tag
+such as `v1.0.0-beta.1` is normalized to the OPAM version
+`1.0.0~beta.1`; the equivalent `v1.0.0~beta.1` tag is accepted directly. The
+checker then requires that normalized version in `.release-version`,
+`temporal-sdk.opam`, and `temporal-sdk.opam.locked`.
+
+Malformed tags, metadata disagreement, and the checked-in `~dev` version fail
+before an artifact build. This gate does not create or publish a tag, establish
+artifact provenance, or replace the complete release dry run and redistribution
+audit that remain roadmap work.
+
 ## 2026-07-21: Repaired live sticky-cache eviction acceptance (#438)
 
 The complete [PR #438 Actions run](https://github.com/mfow/ocaml-temporal/actions/runs/29805397413)
@@ -36,6 +52,17 @@ separately started target and observes its cancelled result. This replaces the
 earlier documentation boundary that treated live external workflow operations
 as outstanding; missing or already-completed targets and replay interaction
 remain separate live scenarios.
+
+## 2026-07-21: Stable mismatched-run external cancellation diagnostic (#439)
+
+The complete [PR #439 Build run](https://github.com/mfow/ocaml-temporal/actions/runs/29824441578)
+keeps the live external-cancellation scenario green while tightening its
+wrong-run assertion. A mismatched exact-run cancellation now has documented
+bridge evidence as a retryable workflow error (`non_retryable=false`) whose
+message begins `Unable to cancel external workflow because not found`. The
+workflow-ID-plus-run-ID identity check remains the acceptance boundary; missing
+or already-completed targets and replay interaction are not implied by this
+diagnostic.
 
 ## 2026-07-19: Live typed queries, workflow updates, and termination
 
@@ -206,6 +233,24 @@ controller requires `is_replaying=true` after each replacement, zero patch
 markers in both normalized legacy snapshots, and one non-deprecated marker in
 both normalized new snapshots. This is an implemented acceptance design, not a
 claim that the real-server target has already passed.
+
+## 2026-07-14: Live non-immediate activity retry (#302)
+
+The complete [PR #302 Actions
+run](https://github.com/mfow/ocaml-temporal/actions/runs/29351689638) passed the
+Temporal/PostgreSQL integration job. Its public driver started
+`smoke.activity_long_backoff_retry`, retained the exact workflow/run handle,
+observed the run complete, required
+`SMOKE:BACKOFF:RETRIED:SMOKE`, and finished with the complete driver assertion
+marker. The worker-side fixture rejects a second callback delivered in under
+one second, so the result is evidence of a server-delivered, non-immediate retry
+under a policy configured with a two-second initial and maximum backoff. It does
+not measure or prove that the full configured delay elapsed.
+
+This was the first live evidence for the eighteenth baseline result. The
+complete [PR #439 run](https://github.com/mfow/ocaml-temporal/actions/runs/29824441578)
+retains the scenario in the later 26-start baseline; PR #289 remains historical
+evidence for the preceding seventeen-result slice.
 
 ## 2026-07-14: Retry-after-restart acceptance extension
 

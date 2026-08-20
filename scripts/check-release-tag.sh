@@ -19,20 +19,50 @@ case "$tag" in
   *) fail "tag must start with v (got $tag)" ;;
 esac
 
-# Accept only the three numeric components used by opam releases. This
-# intentionally rejects a development marker and floating or ambiguous tags.
-version=${tag#v}
-case "$version" in
+# Accept three numeric components plus an optional prerelease suffix. Git tags
+# may use the familiar SemVer hyphen (v1.0.0-beta.1), but OPAM deliberately
+# uses a tilde for prereleases so that a beta sorts before the final 1.0.0.
+# Normalize the former to the latter before comparing package metadata.
+tag_version=${tag#v}
+core=$tag_version
+prerelease=
+separator=
+case "$tag_version" in
+  *-*)
+    core=${tag_version%%-*}
+    prerelease=${tag_version#*-}
+    separator=-
+    ;;
+  *~*)
+    core=${tag_version%%~*}
+    prerelease=${tag_version#*~}
+    separator='~'
+    ;;
+esac
+case "$separator" in
+  -|~)
+    case "$prerelease" in
+      '' | .* | *. | *..* | *[!A-Za-z0-9.-]* | *~*)
+        fail "tag has an invalid prerelease suffix (got $tag)" ;;
+    esac
+    ;;
+esac
+case "$core" in
   *[!0-9.]* | .* | *. | *..*) fail "tag must be vMAJOR.MINOR.PATCH (got $tag)" ;;
 esac
 old_ifs=$IFS
 IFS=.
-set -- $version
+set -- $core
 IFS=$old_ifs
 [ "$#" -eq 3 ] || fail "tag must be vMAJOR.MINOR.PATCH (got $tag)"
 for component in "$@"; do
   [ -n "$component" ] || fail "tag contains an empty version component"
 done
+
+case "$separator" in
+  -) version="$core~$prerelease" ;;
+  *) version="$tag_version" ;;
+esac
 
 [ -f .release-version ] || fail "missing .release-version"
 release_version=$(sed 's/\r$//' .release-version)

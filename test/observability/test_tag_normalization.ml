@@ -34,6 +34,19 @@ let test_valid_numeric_metadata_is_unchanged () =
   assert (require Observability.Tag.job_count tags = 2);
   assert (require Observability.Tag.command_count tags = 3)
 
+(** Truncating a valid UTF-8 tag never exposes a partial encoded character to
+    application reporters. A raw 253-byte prefix would retain only the first
+    byte of the four-byte emoji in this fixture. *)
+let test_bounded_tag_preserves_utf8_character_boundaries () =
+  let ascii_prefix = String.make 252 'a' in
+  let tags =
+    Observability.tags ~operation:"unicode_tag"
+      ~workflow_type:(ascii_prefix ^ "😀tail") ()
+  in
+  assert
+    (require Observability.Tag.workflow_type tags = ascii_prefix ^ "...")
+
 let () =
   test_invalid_numeric_metadata_becomes_zero ();
-  test_valid_numeric_metadata_is_unchanged ()
+  test_valid_numeric_metadata_is_unchanged ();
+  test_bounded_tag_preserves_utf8_character_boundaries ()

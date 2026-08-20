@@ -1,0 +1,7 @@
+# Require Michael Fowlie's approval for all GitHub configuration.
+/.github/ @mfow
+/.github/** @mfow
+/.github/CODEOWNERS @mfow
+
+# Require Michael Fowlie's approval for the repository license.
+/LICENSE @mfow

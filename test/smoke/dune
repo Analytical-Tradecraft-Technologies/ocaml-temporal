@@ -16,6 +16,8 @@
   ../../lib/sdk_supervisor/dune
   ../../lib/sdk_supervisor/sdk_supervisor.mli
   ../../scripts/build-rust-bridge.sh
+  ../../scripts/generate-cargo-sbom.py
+  ../../rust/Cargo.toml
   ../bridge/dune
   ../../temporal-sdk.opam
   ../../temporal-sdk.opam.locked)
