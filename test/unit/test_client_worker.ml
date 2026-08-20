@@ -700,6 +700,25 @@ let test_client_identifier_size_validation () =
     (Temporal.Client.cancel ~request_id:oversized handle);
   unwrap (Temporal.Client.shutdown client)
 
+(** Malformed UTF-8 identifiers are rejected by the public client before
+    transport selection. The mock backend must enforce the same string
+    boundary as the native JSON protocol for both connection configuration and
+    workflow operations. *)
+let test_client_identifier_utf_8_validation () =
+  let malformed_utf_8 = String.make 1 '\255' in
+  expect_error_message_contains "defect" "valid UTF-8"
+    (Temporal.Client.create ~target_url:"mock://client"
+       ~namespace:malformed_utf_8 ());
+  let client =
+    unwrap
+      (Temporal.Client.create ~target_url:"mock://client"
+         ~namespace:"unit-test" ())
+  in
+  expect_error_message_contains "defect" "valid UTF-8"
+    (Temporal.Client.start client ~workflow:echo_workflow
+       ~task_queue:"unit-test" ~id:malformed_utf_8 ~input:"ignored" ());
+  unwrap (Temporal.Client.shutdown client)
+
 (** An HTTP-shaped endpoint is deliberately handed to the native configuration
     validator rather than the deterministic mock. The malformed host fails
     before a runtime or network connection is allocated, proving the public
@@ -821,6 +840,7 @@ let () =
   test_default_signal_request_ids_are_process_wide ();
   test_client_validation_errors ();
   test_client_identifier_size_validation ();
+  test_client_identifier_utf_8_validation ();
   test_native_client_configuration_boundary ();
   test_worker_validation_errors ();
   test_native_worker_configuration_boundary ();

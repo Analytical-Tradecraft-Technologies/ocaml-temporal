@@ -845,6 +845,11 @@ that ID only for the same logical start. As with the worker, expected failures
 are `result` values. Exceptions are reserved for programmer defects and are
 contained at the worker boundary.
 
+Client identifier fields are checked before transport selection: they must be
+non-empty, valid UTF-8, NUL-free strings no longer than 65,536 bytes. Malformed
+identifiers therefore return a typed defect consistently with either the
+deterministic mock or the native JSON bridge.
+
 When the result is `Continued_as_new successor`, use
 `Temporal.Client.follow` to make an exact-run handle for that successor:
 
