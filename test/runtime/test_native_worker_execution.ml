@@ -1414,7 +1414,27 @@ let test_duplicate_initialization_retires_existing_run () =
     | [ Protocol.Start_timer { seq; _ } ] -> seq
     | _ -> failwith "duplicate-initialization fixture did not suspend on a timer"
   in
+  supervisor.reject_next_completion := true;
   enqueue supervisor (activation ~run_id [ initialize ~run_id ~workflow_type ]);
+  begin
+    match Worker.poll worker with
+    | Error { code = "completion_failed"; _ } -> ()
+    | Ok _ -> failwith "rejected duplicate initialization was acknowledged immediately"
+    | Error error ->
+        failwith
+          ("duplicate initialization completion returned the wrong error: "
+         ^ error.message)
+  end;
+  if !cleanups <> 0 then
+    failwith "duplicate initialization tore down its workflow before acknowledgement";
+  if Hashtbl.length supervisor.leased <> 1 then
+    failwith "rejected duplicate initialization retired its native lease too early";
+  let retained = latest_attempt supervisor in
+  begin
+    match retained.commands with
+    | [ Protocol.Fail_workflow _ ] -> ()
+    | _ -> failwith "duplicate initialization did not retain its failure completion"
+  end;
   begin
     match Worker.poll worker with
     | Ok (Adapter.Rejected { error; lease_retired = true; _ })
@@ -1425,23 +1445,24 @@ let test_duplicate_initialization_retires_existing_run () =
         failwith
           ("duplicate initialization failure was not acknowledged: " ^ error.message)
   end;
-  begin
-    match (latest_completion supervisor).commands with
-    | [ Protocol.Fail_workflow _ ] -> ()
-    | _ -> failwith "duplicate initialization did not submit a failure completion"
-  end;
+  if latest_completion supervisor <> retained then
+    failwith "duplicate initialization retry changed the retained failure completion";
   if !cleanups <> 1 then
     failwith "duplicate initialization did not tear down the existing workflow fiber";
   if Hashtbl.length supervisor.leased <> 0 then
     failwith "duplicate initialization left a native lease outstanding";
   enqueue supervisor (activation ~run_id [ Protocol.Fire_timer { seq = timer_seq } ]);
-  match Worker.poll worker with
-  | Ok (Adapter.Rejected { error; lease_retired = true; _ })
-    when String.equal error.code "unknown_run_id" ->
-      ()
-  | Ok _ -> failwith "duplicate initialization retained stale execution state"
-  | Error error ->
-      failwith ("duplicate initialization cleanup poll failed: " ^ error.message)
+  begin
+    match Worker.poll worker with
+    | Ok (Adapter.Rejected { error; lease_retired = true; _ })
+      when String.equal error.code "unknown_run_id" ->
+        ()
+    | Ok _ -> failwith "duplicate initialization retained stale execution state"
+    | Error error ->
+        failwith ("duplicate initialization cleanup poll failed: " ^ error.message)
+  end;
+  if !cleanups <> 1 then
+    failwith "stale duplicate-initialization work repeated workflow cleanup"
 
 (** A parent that is evicted while a child is pending must not retain the old
     child future or sequence allocator. Temporal can later deliver a replayed
