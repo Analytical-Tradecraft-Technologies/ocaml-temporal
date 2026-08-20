@@ -126,6 +126,11 @@ type error_view = Workflow.error_view = { code : string; path : string; message 
 (** Copies a semantic error without exposing its private representation. *)
 let error_view = Workflow.error_view
 
+(** Converts a strict-JSON failure without flattening its safe nested path. *)
+let of_control_error error =
+  let view = Control.error_view error in
+  Shared.of_control_error view.path error
+
 (** Sequences strict structural and semantic validation without exceptions. *)
 let ( let* ) = Result.bind
 
@@ -518,7 +523,7 @@ let task_from_json json =
 (** Strictly decodes a task through the duplicate-aware JSON foundation. *)
 let decode_task input =
   match Control.decode_payload_object input with
-  | Error error -> Error (Shared.of_control_error "$" error)
+  | Error error -> Error (of_control_error error)
   | Ok json -> task_from_json json
 
 (** Encodes and reparses a task so typed outgoing values obey every receiver
@@ -528,7 +533,7 @@ let encode_task (value : task) =
   let* variant = task_variant_json value.variant in
   let json = `Assoc [ ("task_token", token); ("variant", variant) ] in
   match Control.encode_payload_object json with
-  | Error error -> Error (Shared.of_control_error "$" error)
+  | Error error -> Error (of_control_error error)
   | Ok output ->
       let* _ = decode_task output in
       Ok output
@@ -587,7 +592,7 @@ let completion_from_json json =
 (** Strictly decodes a completion through the duplicate-aware JSON foundation. *)
 let decode_completion input =
   match Control.decode_payload_object input with
-  | Error error -> Error (Shared.of_control_error "$" error)
+  | Error error -> Error (of_control_error error)
   | Ok json -> completion_from_json json
 
 (** Encodes and reparses a completion before it can be submitted to Core. *)
@@ -596,7 +601,7 @@ let encode_completion (value : completion) =
   let* result = completion_result_json value.result in
   let json = `Assoc [ ("task_token", token); ("result", result) ] in
   match Control.encode_payload_object json with
-  | Error error -> Error (Shared.of_control_error "$" error)
+  | Error error -> Error (of_control_error error)
   | Ok output ->
       let* _ = decode_completion output in
       Ok output
@@ -613,7 +618,7 @@ let heartbeat_from_json json =
 (** Strictly decodes one activity-heartbeat JSON document. *)
 let decode_heartbeat input =
   match Control.decode_payload_object input with
-  | Error error -> Error (Shared.of_control_error "$" error)
+  | Error error -> Error (of_control_error error)
   | Ok json -> heartbeat_from_json json
 
 (** Encodes and reparses a heartbeat before sending it across the native
@@ -623,7 +628,7 @@ let encode_heartbeat (value : heartbeat) =
   let* details = payloads_json value.details in
   let json = `Assoc [ ("task_token", token); ("details", details) ] in
   match Control.encode_payload_object json with
-  | Error error -> Error (Shared.of_control_error "$" error)
+  | Error error -> Error (of_control_error error)
   | Ok output ->
       let* _ = decode_heartbeat output in
       Ok output

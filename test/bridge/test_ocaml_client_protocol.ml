@@ -16,6 +16,16 @@ let require_error = function
   | Error _ -> ()
   | Ok _ -> failwith "expected client protocol validation to fail"
 
+(** Requires malformed input to retain the strict decoder's precise safe path. *)
+let check_error_path label expected = function
+  | Error error ->
+      let actual = (Protocol.error_view error).path in
+      if not (String.equal expected actual) then
+        failwith
+          (Printf.sprintf "%s path differed: expected %s, got %s" label expected
+             actual)
+  | Ok _ -> failwith (label ^ " unexpectedly passed validation")
+
 (** Checks that canonical JSON contains a small structural marker without
     coupling this test to association-list member ordering. *)
 let require_fragment label fragment value =
@@ -424,7 +434,7 @@ let test_closed_response_shape () =
   require_error
     (Protocol.decode_start_response ~request:start_request
        {|{"execution":{"namespace":"default","workflow_id":"workflow-1","run_id":"run-1"},"extra":true}|});
-  require_error
+  check_error_path "nested execution duplicate" "$.execution"
     (Protocol.decode_start_response ~request:start_request
        {|{"execution":{"namespace":"default","workflow_id":"workflow-1","run_id":"run-1","run_id":"run-2"}}|});
   require_error

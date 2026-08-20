@@ -144,9 +144,10 @@ let of_workflow_error path (error : Workflow.error) : error =
   let view = Workflow.error_view error in
   { code = view.code; path; message = view.message }
 
-let of_control_error path (error : Control.error) : error =
+(** Converts a strict-JSON failure while retaining its safe nested path. *)
+let of_control_error (error : Control.error) : error =
   let view = Control.error_view error in
-  { code = view.code; path; message = view.message }
+  { code = view.code; path = view.path; message = view.message }
 
 let invalid ?(path = "$") message : error =
   { code = "invalid_message"; path; message }
@@ -258,12 +259,12 @@ let encode_execution path (value : execution) =
 let encode_object json =
   match Control.encode_payload_object json with
   | Ok value -> Ok value
-  | Error error -> Error (of_control_error "$" error)
+  | Error error -> Error (of_control_error error)
 
 let decode_object input =
   match Control.decode_payload_object input with
   | Ok value -> Ok value
-  | Error error -> Error (of_control_error "$" error)
+  | Error error -> Error (of_control_error error)
 
 let encode_start_request (value : start_request) =
   let* () = validate_identifier "$.request_id" value.request_id in
