@@ -281,6 +281,7 @@ let run () =
                 ~updates:[ Definitions.signal_value_update_handler ]
                 Definitions.signal_condition_workflow;
               Worker.workflow Definitions.external_signal_parent;
+              Worker.workflow Definitions.external_signal_completed_parent;
               Worker.workflow Definitions.external_cancellation_wrong_run_parent;
               Worker.workflow Definitions.external_cancellation_parent;
               Worker.workflow Definitions.fan_out;
