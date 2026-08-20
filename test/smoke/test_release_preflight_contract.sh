@@ -18,12 +18,30 @@ sh scripts/check-release-preflight.sh .
 # repository location, even when the checkout is otherwise clean. Build a
 # committed fixture so the release gate reaches metadata validation instead of
 # failing first on its clean-tree requirement.
-fixture=$(mktemp -d "${TMPDIR:-/tmp}/temporal-release-preflight.XXXXXX")
-trap 'rm -rf "$fixture"' EXIT HUP INT TERM
+fixture_root=$(mktemp -d "${TMPDIR:-/tmp}/temporal-release-preflight.XXXXXX")
+fixture=$fixture_root/repository
+host_git_config=$fixture_root/gitconfig
+git_trace=$fixture_root/git-trace
+mkdir "$fixture"
+trap 'rm -rf "$fixture_root"' EXIT HUP INT TERM
+
+# Exercise the fixture under a hostile but valid user configuration that makes
+# every eligible Git command start detached automatic maintenance. Ephemeral
+# fixture cleanup must never race a process that Git started in the fixture.
+git config --file "$host_git_config" maintenance.auto true
+git config --file "$host_git_config" maintenance.autoDetach true
+git config --file "$host_git_config" maintenance.commit-graph.auto -1
+: > "$git_trace"
+export GIT_CONFIG_GLOBAL="$host_git_config"
+export GIT_TRACE2_EVENT="$git_trace"
 git archive --format=tar HEAD | tar -x -C "$fixture"
 (
   cd "$fixture"
   git init -q
+  # This repository is discarded immediately after its two commits. Disable
+  # detached automatic maintenance so no Git process can outlive the fixture
+  # and race the strict EXIT-trap cleanup.
+  git config maintenance.auto false
   git config user.email release-contract@example.invalid
   git config user.name 'Release contract'
   git add -A
@@ -38,3 +56,8 @@ git archive --format=tar HEAD | tar -x -C "$fixture"
     exit 1
   fi
 )
+
+if grep -F '"maintenance","run","--auto"' "$git_trace" >/dev/null; then
+  echo "release preflight fixture started automatic Git maintenance" >&2
+  exit 1
+fi
