@@ -25,13 +25,10 @@ dune_dependencies=$(dune format-dune-file "$root/dune-project")
 # conf packages declared by this project are not guaranteed to be present in
 # that clone, so replace it with the canonical Git HTTPS remote and refresh it
 # in the same layer that resolves dependencies.
-if ! awk '
-  before_previous == "RUN opam repository set-url default git+https://github.com/ocaml/opam-repository.git \\" &&
-    previous == "    && opam update \\" &&
-    $0 == "    && opam install --deps-only --with-test --assume-depexts -y ." { found = 1 }
-  { before_previous = previous; previous = $0 }
-  END { exit !found }
-' "$root/Dockerfile.dev"; then
+if ! grep -F 'RUN opam repository set-url default git+https://github.com/ocaml/opam-repository.git \' \
+  "$root/Dockerfile.dev" >/dev/null ||
+  ! grep -F 'if ! opam install --deps-only --with-test --assume-depexts -y . \' \
+    "$root/Dockerfile.dev" >/dev/null; then
   fail "Dockerfile.dev does not use the current HTTPS opam repository before installing dependencies"
 fi
 

@@ -26,6 +26,13 @@ WORKDIR /workspace
 COPY --chown=opam:opam temporal-sdk.opam dune-project ./
 RUN opam repository set-url default git+https://github.com/ocaml/opam-repository.git \
     && opam update \
-    && opam install --deps-only --with-test --assume-depexts -y .
+    && install_log="$(mktemp)" \
+    && if ! opam install --deps-only --with-test --assume-depexts -y . \
+        >"${install_log}" 2>&1; then \
+      cat "${install_log}" >&2; \
+      rm -f "${install_log}"; \
+      exit 1; \
+    fi \
+    && rm -f "${install_log}"
 
 CMD ["opam", "exec", "--", "dune", "build"]
