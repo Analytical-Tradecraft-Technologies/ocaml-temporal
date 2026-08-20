@@ -31,6 +31,7 @@ trap 'rm -rf "$fixture_root"' EXIT HUP INT TERM
 git config --file "$host_git_config" maintenance.auto true
 git config --file "$host_git_config" maintenance.autoDetach true
 git config --file "$host_git_config" maintenance.commit-graph.auto -1
+: > "$git_trace"
 export GIT_CONFIG_GLOBAL="$host_git_config"
 export GIT_TRACE2_EVENT="$git_trace"
 git archive --format=tar HEAD | tar -x -C "$fixture"
