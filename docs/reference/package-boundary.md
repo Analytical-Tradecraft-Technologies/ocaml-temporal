@@ -137,6 +137,12 @@ for the `(package temporal-sdk)` declaration and rejects a future
 `public_name`. It rejects direct lower-layer module references or Dune
 dependencies from `lib/public`, and it compiles a negative consumer fixture for
 `Temporal_sdk_kernel` so the kernel cannot silently become application API.
+The normal Dune `runtest` alias, including the OPAM test phase, runs the
+install-consumer metadata contract. It parses both OPAM manifests and the Dune
+package declaration to require `conf-rust-2024` and `conf-protoc`. This makes
+the Cargo/Rust and Protocol Buffers compiler prerequisites explicit during
+source-install dependency resolution rather than letting the private bridge
+build fail later with a missing executable.
 Changes that intentionally publish an implementation component must update
 this document, the public API review, and the install regression rather than
 silently widening the package surface.

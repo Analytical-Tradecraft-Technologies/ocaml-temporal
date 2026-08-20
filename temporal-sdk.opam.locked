@@ -16,6 +16,8 @@ depends: [
   "base-nnp" {= "base"}
   "base-threads" {= "base"}
   "base-unix" {= "base"}
+  "conf-protoc" {= "4.4.0"}
+  "conf-rust-2024" {= "1"}
   "dune" {= "3.24.0"}
   "logs" {= "0.10.0"}
   "ocaml" {= "5.2.1"}

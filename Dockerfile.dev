@@ -24,6 +24,8 @@ ENV RUSTUP_HOME=/usr/local/rustup \
 USER opam
 WORKDIR /workspace
 COPY --chown=opam:opam temporal-sdk.opam dune-project ./
-RUN opam install --deps-only --with-test -y .
+RUN opam repository set-url default https://opam.ocaml.org \
+    && opam update \
+    && opam install --deps-only --with-test --no-depexts -y .
 
 CMD ["opam", "exec", "--", "dune", "build"]

@@ -1,0 +1,36 @@
+(rule
+ (alias runtest)
+ (package temporal-sdk)
+ (deps
+  ../../.gitattributes
+  ../../.github/workflows/build-pr.yml
+  ../../.github/workflows/build.yml
+  ../../dune-project
+  ../../Dockerfile.dev
+  ../../temporal-sdk.opam
+  ../../temporal-sdk.opam.locked
+  install-consumer/test_build_tool_dependencies.sh)
+ (action
+  (run
+   sh
+   %{dep:install-consumer/test_build_tool_dependencies.sh}
+   %{workspace_root})))
+
+(rule
+ (alias runtest)
+ (package temporal-sdk)
+ (deps
+  ../../.gitattributes
+  ../../.github/workflows/build-pr.yml
+  ../../.github/workflows/build.yml
+  ../../dune-project
+  ../../Dockerfile.dev
+  ../../temporal-sdk.opam
+  ../../temporal-sdk.opam.locked
+  install-consumer/test_build_tool_dependencies.sh
+  install-consumer/test_build_tool_dependency_pins.sh)
+ (action
+  (run
+   sh
+   %{dep:install-consumer/test_build_tool_dependency_pins.sh}
+   %{workspace_root})))
