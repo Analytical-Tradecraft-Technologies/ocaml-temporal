@@ -33,14 +33,17 @@ for required_dependency in $required_dependencies; do
   fi
 done
 
-case "$locked_dependencies" in
-  *\"conf-rust-2024\"*'{= "1"}'*) ;;
-  *) fail "temporal-sdk.opam.locked does not pin conf-rust-2024 to version 1" ;;
-esac
+require_locked_pin() {
+  dependency=$1
+  version=$2
+  exact_pin="\"$dependency\" {= \"$version\"}"
+  case "$locked_dependencies" in
+    *"$exact_pin"*) ;;
+    *) fail "temporal-sdk.opam.locked does not pin $dependency to version $version" ;;
+  esac
+}
 
-case "$locked_dependencies" in
-  *\"conf-protoc\"*'{= "4.4.0"}'*) ;;
-  *) fail "temporal-sdk.opam.locked does not pin conf-protoc to version 4.4.0" ;;
-esac
+require_locked_pin conf-rust-2024 1
+require_locked_pin conf-protoc 4.4.0
 
 printf '%s\n' "install consumer metadata: ok"
