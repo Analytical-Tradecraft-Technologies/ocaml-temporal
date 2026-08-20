@@ -18,6 +18,45 @@ pr_workflow_text=$(tr -d '\015' < "$pr_workflow")
 release_workflow_text=$(tr -d '\015' < "$release_workflow")
 makefile_text=$(tr -d '\015' < "$makefile")
 
+# GitHub-owned actions are governed by the repository's Actions allow-list and
+# may use the readable major-version references maintained by GitHub. Every
+# other remote action crosses a third-party supply-chain boundary, so both
+# build workflows must select an immutable full commit. Local actions are
+# repository source and therefore do not have an @ reference to validate.
+assert_third_party_actions_pinned() {
+  workflow_name=$1
+  workflow_text=$2
+  third_party_refs=$(printf '%s\n' "$workflow_text" | awk '
+    /^[[:space:]]*uses:[[:space:]]*/ {
+      ref = $0
+      sub(/^[[:space:]]*uses:[[:space:]]*/, "", ref)
+      sub(/[[:space:]]*#.*/, "", ref)
+      if (ref !~ /^actions\// && ref !~ /^\.\//) print ref
+    }
+  ')
+  if [ -z "$third_party_refs" ]; then
+    return 0
+  fi
+  unpinned_refs=$(printf '%s\n' "$third_party_refs" |
+    grep -Ev '@[0-9a-f]{40}$' || true)
+  if [ -n "$unpinned_refs" ]; then
+    printf '%s: third-party actions must use full commit SHAs:\n%s\n' \
+      "$workflow_name" "$unpinned_refs" >&2
+    return 1
+  fi
+}
+
+assert_third_party_actions_pinned build.yml "$master_workflow_text"
+assert_third_party_actions_pinned build-pr.yml "$pr_workflow_text"
+
+setup_ocaml_sha=605a7e998e76e035b82c14d618a6e1010732c4ce
+master_setup_ocaml_count=$(printf '%s\n' "$master_workflow_text" |
+  grep -Fc "ocaml/setup-ocaml@$setup_ocaml_sha # v3")
+pr_setup_ocaml_count=$(printf '%s\n' "$pr_workflow_text" |
+  grep -Fc "ocaml/setup-ocaml@$setup_ocaml_sha # v3")
+test "$master_setup_ocaml_count" -eq 1
+test "$pr_setup_ocaml_count" -eq 2
+
 # Release preflight runs from a clean Actions checkout, so it is the right
 # place to execute the stale-owner rejection fixture. Keep the fixture out of
 # ordinary dirty-worktree quality checks, but assert both the Make target and

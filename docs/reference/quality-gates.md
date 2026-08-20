@@ -29,14 +29,18 @@ retain the same version gate. These checks are native because their upstream
 projects publish small binaries for supported development platforms; they are
 not SDK dependencies and are intentionally absent from the Compose builder.
 
-GitHub Actions uses
-[`taiki-e/install-action`](https://github.com/taiki-e/install-action) at an
-immutable commit with checksum validation enabled and fallback installation
-disabled. The action installs the same exact versions and then invokes `make
-quality`. The job runs once for each code pull request and once for each push
-to `master` or scheduled run; it is not repeated for every OCaml matrix cell.
-Path filtering skips it for documentation-only pull requests, while the
-standalone license-audit job remains independent.
+Every third-party action in the build workflows uses an immutable full commit
+SHA. GitHub-owned `actions/*` actions may use readable major-version references
+because the repository Actions allow-list governs them separately. In
+particular, [`taiki-e/install-action`](https://github.com/taiki-e/install-action)
+is pinned with checksum validation enabled and fallback installation disabled,
+and the native lanes pin
+[`ocaml/setup-ocaml`](https://github.com/ocaml/setup-ocaml) rather than following
+its mutable `v3` reference. The quality action installs the same exact tool
+versions and then invokes `make quality`. The job runs once for each code pull
+request and once for each push to `master` or scheduled run; it is not repeated
+for every OCaml matrix cell. Path filtering skips it for documentation-only
+pull requests, while the standalone license-audit job remains independent.
 
 ## CI matrix policy
 
