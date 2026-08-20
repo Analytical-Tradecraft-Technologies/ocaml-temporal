@@ -25,12 +25,13 @@ dune_dependencies=$(dune format-dune-file "$root/dune-project")
 # conf packages declared by this project are not guaranteed to be present in
 # that clone, so refresh it in the same layer that resolves dependencies.
 if ! awk '
-  previous == "RUN opam update \\" &&
+  before_previous == "RUN opam repository set-url default https://opam.ocaml.org \\" &&
+    previous == "    && opam update \\" &&
     $0 == "    && opam install --deps-only --with-test -y ." { found = 1 }
-  { previous = $0 }
+  { before_previous = previous; previous = $0 }
   END { exit !found }
 ' "$root/Dockerfile.dev"; then
-  fail "Dockerfile.dev does not refresh opam-repository before installing dependencies"
+  fail "Dockerfile.dev does not use the current HTTPS opam repository before installing dependencies"
 fi
 
 for required_dependency in $required_dependencies; do
