@@ -21,6 +21,18 @@ opam_dependencies=$(manifest_dependencies "$root/temporal-sdk.opam")
 locked_dependencies=$(manifest_dependencies "$root/temporal-sdk.opam.locked")
 dune_dependencies=$(dune format-dune-file "$root/dune-project")
 
+# The OCaml base image contains a point-in-time clone of opam-repository. New
+# conf packages declared by this project are not guaranteed to be present in
+# that clone, so refresh it in the same layer that resolves dependencies.
+if ! awk '
+  previous == "RUN opam update \\" &&
+    $0 == "    && opam install --deps-only --with-test -y ." { found = 1 }
+  { previous = $0 }
+  END { exit !found }
+' "$root/Dockerfile.dev"; then
+  fail "Dockerfile.dev does not refresh opam-repository before installing dependencies"
+fi
+
 for required_dependency in $required_dependencies; do
   case "$opam_dependencies" in
     *\"$required_dependency\"*) ;;

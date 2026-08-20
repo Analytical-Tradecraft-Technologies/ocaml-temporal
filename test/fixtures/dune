@@ -3,6 +3,7 @@
  (package temporal-sdk)
  (deps
   ../../dune-project
+  ../../Dockerfile.dev
   ../../temporal-sdk.opam
   ../../temporal-sdk.opam.locked
   install-consumer/test_build_tool_dependencies.sh)
@@ -17,6 +18,7 @@
  (package temporal-sdk)
  (deps
   ../../dune-project
+  ../../Dockerfile.dev
   ../../temporal-sdk.opam
   ../../temporal-sdk.opam.locked
   install-consumer/test_build_tool_dependencies.sh

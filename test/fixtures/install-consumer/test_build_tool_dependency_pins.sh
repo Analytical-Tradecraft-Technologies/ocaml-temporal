@@ -14,6 +14,7 @@ cleanup() {
 trap cleanup EXIT HUP INT TERM
 
 prepare_fixture() {
+  sed -n 'p' "$root/Dockerfile.dev" >"$fixture_root/Dockerfile.dev"
   sed -n 'p' "$root/dune-project" >"$fixture_root/dune-project"
   sed -n 'p' "$root/temporal-sdk.opam" >"$fixture_root/temporal-sdk.opam"
   sed -n 'p' "$root/temporal-sdk.opam.locked" \
