@@ -4,6 +4,7 @@
 # environment used by Windows CI. Keep their syntax portable at checkout time.
 *.sh text eol=lf
 Makefile text eol=lf
+.gitattributes text eol=lf
 
 # Metadata contract tests compare these build and packaging inputs exactly.
 # Keep their checkout representation stable on Windows as well as POSIX hosts.

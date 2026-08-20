@@ -24,6 +24,7 @@ dune_dependencies=$(dune format-dune-file "$root/dune-project")
 require_lf_attribute() {
   pattern=$1
   if ! awk -v pattern="$pattern" '
+    { sub(/\r$/, "") }
     $1 == pattern {
       for (field = 2; field <= NF; field++) {
         if ($field == "text") has_text = 1
@@ -37,7 +38,7 @@ require_lf_attribute() {
 }
 
 for lf_pattern in \
-  'Dockerfile*' dune-project '*.opam' '*.opam.locked' \
+  '.gitattributes' 'Dockerfile*' dune-project '*.opam' '*.opam.locked' \
   '.github/workflows/*.yml'; do
   require_lf_attribute "$lf_pattern"
 done

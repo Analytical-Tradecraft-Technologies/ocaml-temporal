@@ -3,7 +3,10 @@ set -eu
 
 root=${1:-.}
 checker="$root/test/fixtures/install-consumer/test_build_tool_dependencies.sh"
-fixture_root=$(mktemp -d "/tmp/temporal-sdk-build-dependency-pins.XXXXXX")
+# Keep the fixture beneath the current workspace. Native Windows executables
+# invoked from Cygwin cannot resolve Cygwin's /tmp path, but can resolve this
+# relative path from their shared working directory.
+fixture_root=$(mktemp -d "./temporal-sdk-build-dependency-pins.XXXXXX")
 
 cleanup() {
   case "$(basename "$fixture_root")" in
@@ -14,12 +17,17 @@ cleanup() {
 trap cleanup EXIT HUP INT TERM
 
 prepare_fixture() {
+  mkdir -p "$fixture_root/.github/workflows"
   sed -n 'p' "$root/.gitattributes" >"$fixture_root/.gitattributes"
   sed -n 'p' "$root/Dockerfile.dev" >"$fixture_root/Dockerfile.dev"
   sed -n 'p' "$root/dune-project" >"$fixture_root/dune-project"
   sed -n 'p' "$root/temporal-sdk.opam" >"$fixture_root/temporal-sdk.opam"
   sed -n 'p' "$root/temporal-sdk.opam.locked" \
     >"$fixture_root/temporal-sdk.opam.locked"
+  sed -n 'p' "$root/.github/workflows/build.yml" \
+    >"$fixture_root/.github/workflows/build.yml"
+  sed -n 'p' "$root/.github/workflows/build-pr.yml" \
+    >"$fixture_root/.github/workflows/build-pr.yml"
 }
 
 replace_pin_with_unrelated_sentinel() {
@@ -59,6 +67,21 @@ assert_rejects_detached_pin() {
     exit 1
   fi
 }
+
+assert_accepts_crlf_attributes() {
+  crlf_attributes="$fixture_root/.gitattributes.crlf"
+
+  prepare_fixture
+  awk '{ printf "%s\r\n", $0 }' "$fixture_root/.gitattributes" \
+    >"$crlf_attributes"
+  mv "$crlf_attributes" "$fixture_root/.gitattributes"
+  if ! sh "$checker" "$fixture_root"; then
+    echo "install consumer metadata mutation: CRLF attributes were rejected" >&2
+    exit 1
+  fi
+}
+
+assert_accepts_crlf_attributes
 
 assert_rejects_detached_pin \
   conf-protoc 4.4.0 zz-conf-protoc-pin-sentinel
