@@ -195,7 +195,7 @@ jobs:
           echo "PROTOC=$protoc_windows_path" >> "$GITHUB_ENV"
           "$protoc_unix_path" --version
       - name: Install OCaml dependencies
-        run: opam install . --deps-only --with-test --yes
+        run: opam install . --deps-only --with-test --assume-depexts --yes
       - name: Build, lint, and test natively
         shell: bash
         run: make native-verify

@@ -27,12 +27,19 @@ dune_dependencies=$(dune format-dune-file "$root/dune-project")
 if ! awk '
   before_previous == "RUN opam repository set-url default https://opam.ocaml.org \\" &&
     previous == "    && opam update \\" &&
-    $0 == "    && opam install --deps-only --with-test -y ." { found = 1 }
+    $0 == "    && opam install --deps-only --with-test --assume-depexts -y ." { found = 1 }
   { before_previous = previous; previous = $0 }
   END { exit !found }
 ' "$root/Dockerfile.dev"; then
   fail "Dockerfile.dev does not use the current HTTPS opam repository before installing dependencies"
 fi
+
+for workflow in "$root/.github/workflows/build.yml" "$root/.github/workflows/build-pr.yml"; do
+  if grep -E 'opam install .*--deps-only.*--with-test' "$workflow" |
+    grep -v -- '--assume-depexts' >/dev/null; then
+    fail "$(basename "$workflow") allows conf packages to replace the pinned native toolchain"
+  fi
+done
 
 for required_dependency in $required_dependencies; do
   case "$opam_dependencies" in

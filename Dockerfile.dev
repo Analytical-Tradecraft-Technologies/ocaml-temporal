@@ -26,6 +26,6 @@ WORKDIR /workspace
 COPY --chown=opam:opam temporal-sdk.opam dune-project ./
 RUN opam repository set-url default https://opam.ocaml.org \
     && opam update \
-    && opam install --deps-only --with-test -y .
+    && opam install --deps-only --with-test --assume-depexts -y .
 
 CMD ["opam", "exec", "--", "dune", "build"]

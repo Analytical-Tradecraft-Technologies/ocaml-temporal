@@ -2,6 +2,8 @@
  (alias runtest)
  (package temporal-sdk)
  (deps
+  ../../.github/workflows/build-pr.yml
+  ../../.github/workflows/build.yml
   ../../dune-project
   ../../Dockerfile.dev
   ../../temporal-sdk.opam
@@ -17,6 +19,8 @@
  (alias runtest)
  (package temporal-sdk)
  (deps
+  ../../.github/workflows/build-pr.yml
+  ../../.github/workflows/build.yml
   ../../dune-project
   ../../Dockerfile.dev
   ../../temporal-sdk.opam
