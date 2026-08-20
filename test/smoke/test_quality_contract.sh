@@ -68,9 +68,10 @@ assert_third_party_actions_pinned() {
       if (text == "" || text ~ /^#/) next
 
       # An action reference is a scalar token, never an opaque block body.
-      # Handle this key before the generic scalar tracker so `uses: |` and
-      # `uses: >` cannot hide a mutable reference on the following line.
-      if (text ~ /^uses:[[:space:]]*[|>]/) {
+      # Handle this key before the generic scalar tracker so canonical and
+      # compact-step `uses: |` / `uses: >` entries cannot hide a mutable
+      # reference on the following line.
+      if (text ~ /^(-[[:space:]]+)?uses:[[:space:]]*[|>]/) {
         reject("action reference must be one unquoted token", line)
         next
       }
@@ -177,6 +178,12 @@ assert_action_fixture_rejected literal-block-action \
           evil/example@v1'
 assert_action_fixture_rejected folded-block-action \
   '        uses: >-
+          evil/example@v1'
+assert_action_fixture_rejected compact-literal-block-action \
+  '      - uses: |-
+          evil/example@v1'
+assert_action_fixture_rejected compact-folded-block-action \
+  '      - uses: >-
           evil/example@v1'
 
 assert_third_party_actions_pinned github-owned-fixture \
