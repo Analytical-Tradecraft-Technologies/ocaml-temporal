@@ -107,10 +107,11 @@ let next_signal_request_id = Atomic.make 0
     only distinguishes requests created by this one OCaml process. *)
 let next_update_id = Atomic.make 0
 
-(** Rejects empty, oversized, or NUL-containing identifiers before they can
-    enter a backend request. The 65,536-byte bound is shared by the JSON
-    protocol and native bridge, so mock and native transports reject the same
-    malformed operation rather than diverging at their respective boundaries. *)
+(** Rejects empty, oversized, malformed UTF-8, or NUL-containing identifiers
+    before they can enter a backend request. The UTF-8 and 65,536-byte bounds
+    are shared by the JSON protocol and native bridge, so mock and native
+    transports reject the same malformed operation rather than diverging at
+    their respective boundaries. *)
 let validate_name field value =
   if String.equal value "" then
     Error (Error.defect ~message:(field ^ " must not be empty"))
@@ -118,6 +119,8 @@ let validate_name field value =
     Error
       (Error.defect
          ~message:(field ^ " exceeds the protocol string safety limit"))
+  else if not (Temporal_base.Codec.valid_utf_8 value) then
+    Error (Error.defect ~message:(field ^ " must be valid UTF-8"))
   else if String.contains value '\000' then
     Error (Error.defect ~message:(field ^ " must not contain NUL"))
   else Ok ()
@@ -166,8 +169,8 @@ let validate_start_fields ~request_id ~workflow_name ~id ~task_queue =
           | Ok () -> validate_name "task queue" task_queue))
 
 (** Checks metadata keys before they reach the protocol map representation.
-    Rejecting duplicates here keeps caller-visible behavior independent of
-    Rust's map implementation and avoids silently losing one value. *)
+    Rejecting duplicates and malformed UTF-8 here keeps caller-visible
+    behavior independent of Rust's map implementation and JSON validation. *)
 let validate_metadata_fields label fields =
   let rec loop seen = function
     | [] -> Ok ()
@@ -184,6 +187,10 @@ let validate_metadata_fields label fields =
           Error
             (Error.make ~category:`Defect
                ~message:(Printf.sprintf "%s key exceeds protocol limit" label) ())
+        else if not (Temporal_base.Codec.valid_utf_8 key) then
+          Error
+            (Error.make ~category:`Defect
+               ~message:(Printf.sprintf "%s key must be valid UTF-8" label) ())
         else loop (key :: seen) rest
   in
   loop [] fields
