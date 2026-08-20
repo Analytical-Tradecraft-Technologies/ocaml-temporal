@@ -146,11 +146,14 @@ let validate_json ?(depth = 1) ?(string_limit = max_string_bytes) value =
         if List.length values > max_collection_items then
           Error (invalid ~path "JSON collection limit exceeded")
         else
-          List.fold_left
-            (fun result value ->
-              let* () = result in
-              loop (depth + 1) path value)
-            (Ok ()) values
+          let rec validate_items index = function
+            | [] -> Ok ()
+            | value :: rest ->
+                let item_path = Printf.sprintf "%s[%d]" path index in
+                let* () = loop (depth + 1) item_path value in
+                validate_items (index + 1) rest
+          in
+          validate_items 0 values
     | `Assoc entries ->
         incr nodes;
         if List.length entries > max_collection_items then

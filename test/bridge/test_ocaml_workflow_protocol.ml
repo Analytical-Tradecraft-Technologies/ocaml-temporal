@@ -809,10 +809,10 @@ let test_invalid_documents () =
     peer documents, while encoders encounter invalid UTF-8 in directly
     assembled semantic values. *)
 let test_strict_json_error_paths () =
-  check_error_path "activation duplicate" "$.jobs"
+  check_error_path "activation duplicate" "$.jobs[0]"
     (Protocol.decode_activation
        (fixture [ "invalid"; "activation-duplicate-field.json" ]));
-  check_error_path "completion duplicate" "$.commands"
+  check_error_path "completion duplicate" "$.commands[0]"
     (Protocol.decode_completion
        (fixture [ "invalid"; "completion-duplicate-field.json" ]));
   let invalid_utf_8 = String.make 1 (Char.chr 0xff) in
