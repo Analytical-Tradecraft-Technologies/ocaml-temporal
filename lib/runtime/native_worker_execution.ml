@@ -976,7 +976,10 @@ module Make (Supervisor : SUPERVISOR) = struct
                 | Error error -> retire_with_failure adapter activation error
                 | Ok (Some init) ->
                     if Run_map.mem activation.run_id adapter.runs then
-                      retire_with_failure adapter activation
+                      (* Reporting a terminal lifecycle defect also retires the
+                         existing generation; otherwise its suspended fiber can
+                         resume after Core has accepted [Fail_workflow]. *)
+                      retire_with_failure ~remove_run:true adapter activation
                         (make_error ~path:"$.run_id" "duplicate_run_id"
                            "workflow run is already present in the execution registry")
                     else

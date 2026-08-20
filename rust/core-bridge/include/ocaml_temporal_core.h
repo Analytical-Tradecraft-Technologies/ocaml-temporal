@@ -135,7 +135,7 @@ ocaml_temporal_core_status ocaml_temporal_core_v2_client_query_workflow_json(
 /* List one bounded visibility page. The page token is opaque base64 in the
  * JSON boundary and protobuf visibility values remain owned by Rust. */
 ocaml_temporal_core_status
-ocaml_temporal_core_v1_client_list_visibility_json(
+ocaml_temporal_core_v2_client_list_visibility_json(
     ocaml_temporal_core_runtime *runtime, const uint8_t *input,
     size_t input_len, ocaml_temporal_core_result *output);
 

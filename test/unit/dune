@@ -1,5 +1,16 @@
 (tests
- (names test_codec test_definition test_error test_workflow_authoring
-        test_client_worker test_activity_retry_policy test_interactions
-        test_condition test_workflow_context)
+ (names
+  test_codec
+  test_definition
+  test_error
+  test_workflow_authoring
+  test_client_worker
+  test_activity_retry_policy
+  test_interactions
+  test_condition
+  test_workflow_context)
  (libraries temporal-sdk temporal_runtime))
+
+(test
+ (name test_base_error)
+ (libraries temporal_base))

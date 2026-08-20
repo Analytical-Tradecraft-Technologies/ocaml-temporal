@@ -4,9 +4,9 @@ use std::ptr;
 
 use ocaml_temporal_core_bridge::{
     Buffer, Result as AbiResult, STATUS_INVALID_ARGUMENT, STATUS_INVALID_STATE, STATUS_OK,
-    STATUS_PROTOCOL, ocaml_temporal_core_v1_client_list_visibility_json,
-    ocaml_temporal_core_v2_client_begin_start_workflow_json,
+    STATUS_PROTOCOL, ocaml_temporal_core_v2_client_begin_start_workflow_json,
     ocaml_temporal_core_v2_client_cancel_workflow_json,
+    ocaml_temporal_core_v2_client_list_visibility_json,
     ocaml_temporal_core_v2_client_poll_start_workflow_json,
     ocaml_temporal_core_v2_client_query_workflow_json,
     ocaml_temporal_core_v2_client_signal_workflow_json,
@@ -48,7 +48,7 @@ const VISIBILITY_REQUEST: &[u8] =
     br#"{"namespace":"default","query":"","page_size":10,"next_page_token":null}"#;
 
 #[test]
-/// Null runtime handles fail without dereferencing either client operation.
+/// Null runtime handles fail without dereferencing the client operations.
 fn client_operations_reject_null_runtime() {
     let mut result = empty_result();
     assert_eq!(
@@ -85,7 +85,7 @@ fn client_operations_reject_null_runtime() {
 
     assert_eq!(
         unsafe {
-            ocaml_temporal_core_v1_client_list_visibility_json(
+            ocaml_temporal_core_v2_client_list_visibility_json(
                 ptr::null_mut(),
                 VISIBILITY_REQUEST.as_ptr(),
                 VISIBILITY_REQUEST.len(),

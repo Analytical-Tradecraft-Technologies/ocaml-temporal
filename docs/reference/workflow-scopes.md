@@ -25,8 +25,19 @@ the Temporal operation must be cancelled independently of a scope:
 `Temporal.Scope.with_scope` is the usual entry point. It creates a scope,
 passes it to the body, and requests cancellation during cleanup. Cleanup is
 idempotent and also runs when the body raises an unexpected exception; the
-exception is still propagated. A body should await every branch it intends to
-observe before returning.
+exception is still propagated. If the body succeeds but a registered hook
+fails during `with_scope`'s implicit cleanup cancellation, `with_scope` returns
+that typed cleanup error instead of reporting the body value as an overall
+success. A typed error or unexpected exception from the body remains primary
+after cleanup is attempted.
+
+An explicit `Scope.cancel` returns any hook failure only to that call. Once
+cancellation has been requested, later calls are idempotent and return
+`Ok ()`; they do not replay an earlier hook error. Consequently, if a body
+explicitly cancels its scope, discards that error, and then returns `Ok value`,
+`with_scope` also returns `Ok value`. A body should await every branch it
+intends to observe before returning and should not discard explicit
+cancellation errors.
 
 The following pattern races a workflow operation against a durable deadline.
 When the deadline wins, the operation is no longer observed by this body. If

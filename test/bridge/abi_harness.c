@@ -22,6 +22,18 @@ int main(void) {
   assert(ocaml_temporal_core_v2_result_free(&result) ==
          OCAML_TEMPORAL_CORE_STATUS_OK);
 
+  /* Every operation negotiated as ABI v2 must use the v2 symbol namespace.
+   * A null runtime exercises the visibility entry point without a server and
+   * still proves that the canonical header and linked archive agree. */
+  const uint8_t visibility_request[] =
+      "{\"namespace\":\"default\",\"query\":\"\",\"page_size\":10,"
+      "\"next_page_token\":null}";
+  assert(ocaml_temporal_core_v2_client_list_visibility_json(
+             NULL, visibility_request, sizeof(visibility_request) - 1,
+             &result) == OCAML_TEMPORAL_CORE_STATUS_INVALID_ARGUMENT);
+  assert(ocaml_temporal_core_v2_result_free(&result) ==
+         OCAML_TEMPORAL_CORE_STATUS_OK);
+
   assert(ocaml_temporal_core_v2_check_abi_version(
              OCAML_TEMPORAL_CORE_ABI_VERSION - 1, &result) ==
          OCAML_TEMPORAL_CORE_STATUS_ABI_MISMATCH);

@@ -38,7 +38,9 @@ val make :
   unit ->
   t
 
-(** Returns all fields that application code may inspect. *)
+(** Returns all fields that application code may inspect. Detail payloads are
+    copied, so mutating bytes in the returned view cannot change the error or a
+    later view. *)
 val view : t -> view
 
 (** Returns a lowercase wire/log label for the error category. *)
