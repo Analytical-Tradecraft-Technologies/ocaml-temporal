@@ -21,6 +21,27 @@ opam_dependencies=$(manifest_dependencies "$root/temporal-sdk.opam")
 locked_dependencies=$(manifest_dependencies "$root/temporal-sdk.opam.locked")
 dune_dependencies=$(dune format-dune-file "$root/dune-project")
 
+require_lf_attribute() {
+  pattern=$1
+  if ! awk -v pattern="$pattern" '
+    $1 == pattern {
+      for (field = 2; field <= NF; field++) {
+        if ($field == "text") has_text = 1
+        if ($field == "eol=lf") has_lf = 1
+      }
+    }
+    END { exit !(has_text && has_lf) }
+  ' "$root/.gitattributes"; then
+    fail ".gitattributes does not force LF checkout for $pattern"
+  fi
+}
+
+for lf_pattern in \
+  'Dockerfile*' dune-project '*.opam' '*.opam.locked' \
+  '.github/workflows/*.yml'; do
+  require_lf_attribute "$lf_pattern"
+done
+
 # The OCaml base image contains a point-in-time clone of opam-repository. New
 # conf packages declared by this project are not guaranteed to be present in
 # that clone, so refresh it in the same layer that resolves dependencies. The

@@ -2,6 +2,7 @@
  (alias runtest)
  (package temporal-sdk)
  (deps
+  ../../.gitattributes
   ../../.github/workflows/build-pr.yml
   ../../.github/workflows/build.yml
   ../../dune-project
@@ -19,6 +20,7 @@
  (alias runtest)
  (package temporal-sdk)
  (deps
+  ../../.gitattributes
   ../../.github/workflows/build-pr.yml
   ../../.github/workflows/build.yml
   ../../dune-project
