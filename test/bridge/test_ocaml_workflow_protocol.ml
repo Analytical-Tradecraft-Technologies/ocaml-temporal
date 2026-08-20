@@ -25,6 +25,16 @@ let require_error = function
   | Error _ -> ()
   | Ok _ -> failwith "expected workflow protocol validation to fail"
 
+(** Requires malformed input to retain the strict decoder's precise safe path. *)
+let check_error_path label expected = function
+  | Error error ->
+      let actual = (Protocol.error_view error).path in
+      if not (String.equal expected actual) then
+        failwith
+          (Printf.sprintf "%s path differed: expected %s, got %s" label expected
+             actual)
+  | Ok _ -> failwith (label ^ " unexpectedly passed validation")
+
 (** Requires a malformed activation to return the stable semantic error record.
     Checking the code, path, and message guards the OCaml side against
     accidentally leaking parser exceptions or returning an unstructured
@@ -794,6 +804,33 @@ let test_invalid_documents () =
       "completion-duplicate-field";
     ]
 
+(** Proves every top-level workflow codec retains the nested strict-JSON path
+    supplied by the control protocol. Decoders encounter duplicate members in
+    peer documents, while encoders encounter invalid UTF-8 in directly
+    assembled semantic values. *)
+let test_strict_json_error_paths () =
+  check_error_path "activation duplicate" "$.jobs[0]"
+    (Protocol.decode_activation
+       (fixture [ "invalid"; "activation-duplicate-field.json" ]));
+  check_error_path "completion duplicate" "$.commands[0]"
+    (Protocol.decode_completion
+       (fixture [ "invalid"; "completion-duplicate-field.json" ]));
+  let invalid_utf_8 = String.make 1 (Char.chr 0xff) in
+  let activation =
+    unwrap
+      (Protocol.decode_activation
+         (fixture [ "valid"; "activation.input.json" ]))
+  in
+  check_error_path "activation encoding" "$.run_id"
+    (Protocol.encode_activation { activation with run_id = invalid_utf_8 });
+  let completion =
+    unwrap
+      (Protocol.decode_completion
+         (fixture [ "valid"; "completion.input.json" ]))
+  in
+  check_error_path "completion encoding" "$.run_id"
+    (Protocol.encode_completion { completion with run_id = invalid_utf_8 })
+
 (** Proves the semantic parser admits payload data above the normal text limit
     while preserving that limit for ordinary user-visible text. *)
 let test_large_nested_payload () =
@@ -1344,6 +1381,7 @@ let () =
   run "child cancellation validation" test_child_cancellation_validation;
   run "continue-as-new command" test_continue_as_new_command;
   run "malformed workflow documents" test_invalid_documents;
+  run "strict JSON error paths" test_strict_json_error_paths;
   run "large nested payload" test_large_nested_payload;
   run "metadata key canonicalization" test_metadata_key_canonicalization;
   run "duplicate metadata rejected" test_duplicate_metadata_rejected;

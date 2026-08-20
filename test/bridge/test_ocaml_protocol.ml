@@ -39,6 +39,13 @@ let check_int label expected actual =
 let check_true label condition =
   if not condition then failwith (label ^ " was false")
 
+(** Requires a typed failure at one exact structural location. *)
+let check_error_path label expected = function
+  | Ok _ -> failwith (label ^ " unexpectedly succeeded")
+  | Error error ->
+      let view = Protocol.error_view error in
+      check_string (label ^ " error path") expected view.path
+
 (** Proves valid shared envelopes normalize and survive a typed round trip. *)
 let test_valid_envelopes () =
   List.iter
@@ -174,7 +181,18 @@ let test_strict_object_boundary () =
   check_string "normalized strict object" {|{"a":{"y":1},"z":2}|}
     (unwrap (Protocol.encode_object value));
   require_error (Protocol.decode_object {|[]|});
-  require_error (Protocol.encode_object (`List []))
+  require_error (Protocol.encode_object (`List []));
+  let invalid_utf_8 = String.make 1 (Char.chr 0xff) in
+  check_error_path "nested array value" "$.outer[1].name"
+    (Protocol.encode_object
+       (`Assoc
+         [
+           ( "outer",
+             `List
+               [ `Assoc [ ("name", `String "valid") ];
+                 `Assoc [ ("name", `String invalid_utf_8) ];
+               ] );
+         ]))
 
 (** Runs one test and identifies its name without exposing protocol inputs. *)
 let run name test =

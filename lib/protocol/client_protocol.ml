@@ -140,13 +140,20 @@ let error_view (error : error) : error_view =
 
 let ( let* ) = Result.bind
 
-let of_workflow_error path (error : Workflow.error) : error =
+(** Converts a workflow protocol error without rebasing its contextual path. *)
+let of_workflow_error (error : Workflow.error) : error =
+  let view = Workflow.error_view error in
+  { code = view.code; path = view.path; message = view.message }
+
+(** Converts an error from an isolated workflow wrapper at its client path. *)
+let rebase_workflow_error path (error : Workflow.error) : error =
   let view = Workflow.error_view error in
   { code = view.code; path; message = view.message }
 
-let of_control_error path (error : Control.error) : error =
+(** Converts a strict-JSON failure while retaining its safe nested path. *)
+let of_control_error (error : Control.error) : error =
   let view = Control.error_view error in
-  { code = view.code; path; message = view.message }
+  { code = view.code; path = view.path; message = view.message }
 
 let invalid ?(path = "$") message : error =
   { code = "invalid_message"; path; message }
@@ -156,30 +163,30 @@ let exact_object path fields json =
   | `Assoc _ -> (
       match Workflow.Internal.exact_object path fields json with
       | Ok entries -> Ok entries
-      | Error error -> Error (of_workflow_error path error))
+      | Error error -> Error (of_workflow_error error))
   | _ -> Error (invalid ~path "expected JSON object")
 
 let field path name entries =
   match Workflow.Internal.field path name entries with
   | Ok value -> Ok value
-  | Error error -> Error (of_workflow_error path error)
+  | Error error -> Error (of_workflow_error error)
 
 let string path json =
   match Workflow.Internal.string path json with
   | Ok value -> Ok value
-  | Error error -> Error (of_workflow_error path error)
+  | Error error -> Error (of_workflow_error error)
 
 let bool path json =
   match Workflow.Internal.bool path json with
   | Ok value -> Ok value
-  | Error error -> Error (of_workflow_error path error)
+  | Error error -> Error (of_workflow_error error)
 
 let identifier path json =
   match Workflow.Internal.identifier path json with
   | Ok value when String.contains value '\000' ->
       Error (invalid ~path "identifier contains a NUL byte")
   | Ok value -> Ok value
-  | Error error -> Error (of_workflow_error path error)
+  | Error error -> Error (of_workflow_error error)
 
 (** Validates an identifier before it is serialized. The Rust bridge applies
     the same non-empty, bounded, NUL-free rule; enforcing it here keeps an
@@ -201,7 +208,7 @@ let nullable _path (decode : Yojson.Safe.t -> ('a, error) result)
 let payload path json =
   match Workflow.Internal.payload path json with
   | Ok value -> Ok value
-  | Error error -> Error (of_workflow_error path error)
+  | Error error -> Error (of_workflow_error error)
 
 let payloads path json =
   match json with
@@ -217,7 +224,7 @@ let payloads path json =
 
 let payload_json value =
   Workflow.Internal.payload_json value
-  |> Result.map_error (of_workflow_error "$.payload")
+  |> Result.map_error (rebase_workflow_error "$.payload")
 
 let payloads_json values =
   let rec loop reversed = function
@@ -258,12 +265,12 @@ let encode_execution path (value : execution) =
 let encode_object json =
   match Control.encode_payload_object json with
   | Ok value -> Ok value
-  | Error error -> Error (of_control_error "$" error)
+  | Error error -> Error (of_control_error error)
 
 let decode_object input =
   match Control.decode_payload_object input with
   | Ok value -> Ok value
-  | Error error -> Error (of_control_error "$" error)
+  | Error error -> Error (of_control_error error)
 
 let encode_start_request (value : start_request) =
   let* () = validate_identifier "$.request_id" value.request_id in
@@ -623,7 +630,7 @@ let decode_update_outcome path json =
       let* failure =
         match Workflow.Internal.failure (path ^ ".failure") failure_json with
         | Ok failure -> Ok failure
-        | Error error -> Error (of_workflow_error (path ^ ".failure") error)
+        | Error error -> Error (of_workflow_error error)
       in
       Ok (Update_failed { failure })
   | _ -> Error (invalid ~path:(path ^ ".kind") "unknown workflow update outcome kind")
@@ -713,7 +720,7 @@ let decode_outcome json =
       let* failure =
         match Workflow.Internal.failure (path ^ ".failure") failure_json with
         | Ok value -> Ok value
-        | Error error -> Error (of_workflow_error path error)
+        | Error error -> Error (of_workflow_error error)
       in
       let* successor = decode_successor path entries in
       Ok (Failed { failure; successor })
