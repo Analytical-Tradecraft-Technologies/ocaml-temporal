@@ -363,6 +363,19 @@ let external_cancellation_wrong_run_parent =
                ~message:
                  "wrong-run cancellation target must contain workflow and run IDs"))
 
+(** Recognizes the retryable typed failure emitted by Core when an exact
+    external-signal target no longer exists. Core includes the application
+    failure type in the diagnostic because the public error view currently
+    exposes only the broad workflow category. *)
+let is_completed_external_signal_not_found error =
+  let view = Temporal.Error.view error in
+  view.category = `Workflow
+  && not view.non_retryable
+  && String.starts_with
+       ~prefix:
+         "Unable to signal external workflow because it was not found application type=ExternalWorkflowExecutionNotFound"
+       view.message
+
 (** Attempts to signal an external execution after its exact run has
     completed. Temporal must reject the terminal target with a typed not-found
     workflow failure rather than acknowledging delivery to a completed run. *)
@@ -378,12 +391,8 @@ let external_signal_completed_parent =
           with
           | Error error ->
               let view = Temporal.Error.view error in
-              if
-                String.equal (Temporal.Error.kind error) "workflow"
-                && String.starts_with ~prefix:
-                     "Unable to signal external workflow because not found"
-                     view.message
-              then Ok "SMOKE:EXTERNAL:SIGNAL:COMPLETED"
+              if is_completed_external_signal_not_found error then
+                Ok "SMOKE:EXTERNAL:SIGNAL:COMPLETED"
               else
                 Error
                   (Temporal.Error.defect
