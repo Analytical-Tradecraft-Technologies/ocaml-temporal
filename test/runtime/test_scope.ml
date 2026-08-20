@@ -243,6 +243,30 @@ let test_cancellation_hooks () =
   expect "late hook event" [ "first"; "second"; "late" ] !events;
   Workflow_context_store.shutdown context
 
+(** A successful scoped body must not hide a typed failure from its mandatory
+    cleanup cancellation. Otherwise a server-side cancellation hook can fail
+    while [with_scope] reports success to workflow code. *)
+let test_with_scope_surfaces_cleanup_error () =
+  let scheduler = Scheduler.create () in
+  let context = Workflow_context_store.create scheduler in
+  let result = ref None in
+  with_active_context scheduler context (fun () ->
+      result :=
+        Some
+          (Temporal.Scope.with_scope (fun scope ->
+               match
+                 Temporal.Scope.on_cancel scope (fun () ->
+                     Error
+                       (Temporal.Error.make ~category:`Cancelled
+                          ~message:"cleanup hook failed" ()))
+               with
+               | Error error -> Error error
+               | Ok () -> Ok 42)));
+  expect "with-scope cleanup run" "complete" (Scheduler.run_label scheduler);
+  expect_error "with-scope cleanup error" "cancelled" "cleanup hook failed"
+    (Option.get !result);
+  Workflow_context_store.shutdown context
+
 (** A scope rejects a future owned by another workflow execution as a typed
     defect instead of allowing one scheduler to await another's continuation. *)
 let test_cross_execution_future_is_rejected () =
@@ -355,5 +379,6 @@ let () =
   test_cancellation_resumes_waiter ();
   test_cancellation_is_idempotent ();
   test_cancellation_hooks ();
+  test_with_scope_surfaces_cleanup_error ();
   test_cross_execution_future_is_rejected ();
   test_foreign_scheduler_scope_operations_are_rejected ()
