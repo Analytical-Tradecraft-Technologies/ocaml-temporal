@@ -22,12 +22,14 @@ or a Rust build. It verifies:
 
 The clean-tree requirement is intentional: a preflight result must describe
 the exact inputs that would be archived or built, not a mixture of committed
-files and local output.
+files and local output. The target also runs the stale-owner rejection fixture;
+that fixture stays out of the ordinary quality target so contributors can run
+the latter from a dirty worktree.
 
 ## CI SBOM
 
-`.github/workflows/release-preflight.yml` runs the same gate on pull requests,
-pushes to `master`, and manual dispatches. It obtains the locked Cargo graph
+`.github/workflows/release-preflight.yml` runs this complete target on pull
+requests, pushes to `master`, and manual dispatches. It obtains the locked Cargo graph
 with `cargo metadata --locked`, then invokes the project-owned standard-library
 SBOM generator inside the pinned official Python image with network access
 disabled. The generated SPDX 2.3 document is deterministic: package IDs are
