@@ -15,7 +15,8 @@ or a Rust build. It verifies:
 
 - the working tree has no staged, unstaged, or untracked files;
 - the opam manifests, Dune project, README, license, and pinned Temporal Core
-  revision agree on identity, ownership, licensing, and release metadata; and
+  revision agree on identity, ownership, licensing, release metadata, and the
+  canonical GitHub repository location; and
 - generated build trees are not tracked and the sorted Git source manifest can
   be fingerprinted reproducibly.
 
