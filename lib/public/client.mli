@@ -65,9 +65,9 @@ type visibility_page = {
 
 (** Connects to the configured Temporal endpoint. [target_url] is copied into
     the private backend graph and [namespace] is required for every operation.
-    The namespace and optional identity must be non-empty, NUL-free, and no
-    more than 65,536 bytes; invalid configuration is returned as a typed
-    defect. *)
+    The namespace and optional identity must be non-empty, valid UTF-8,
+    NUL-free, and no more than 65,536 bytes; invalid configuration is returned
+    as a typed defect. *)
 val create :
   ?identity:string ->
   target_url:string ->
@@ -80,10 +80,10 @@ val create :
     cannot create a partial workflow history entry.
 
     [task_queue], [id], the workflow type name retained by [workflow], and an
-    explicitly supplied [request_id] must be non-empty, NUL-free, and no more
-    than 65,536 bytes. Invalid fields return a typed defect before transport
-    selection, so the deterministic mock and the native JSON bridge enforce
-    the same request boundary.
+    explicitly supplied [request_id] must be non-empty, valid UTF-8, NUL-free,
+    and no more than 65,536 bytes. Invalid fields return a typed defect before
+    transport selection, so the deterministic mock and the native JSON bridge
+    enforce the same request boundary.
 
     [request_id] is an optional caller-owned Temporal idempotency key. When a
     start result is uncertain, retry the same logical start with the same
@@ -93,8 +93,9 @@ val create :
 
     [memo] attaches named payloads visible when describing the execution.
     [search_attributes] attaches named indexed payloads used by visibility
-    queries. Keys are non-empty, NUL-free, at most 65,536 bytes, and unique within each collection;
-    payload values are encoded before the native bridge is called. *)
+    queries. Keys in both collections are non-empty, valid UTF-8, NUL-free, at
+    most 65,536 bytes, and unique within their respective collection. Payload
+    values are encoded before the native bridge is called. *)
 val start :
   t ->
   ?request_id:string ->
@@ -112,8 +113,9 @@ val start :
     the caller's existing client, the supplied workflow definition's codecs,
     and the successor identity. The continuation namespace must equal the
     namespace used to create [client]. All identity fields must be non-empty,
-    NUL-free, and no more than 65,536 bytes; malformed or cross-namespace
-    values are returned as typed defects before any backend operation. *)
+    valid UTF-8, NUL-free, and no more than 65,536 bytes; malformed or
+    cross-namespace values are returned as typed defects before any backend
+    operation. *)
 val follow :
   t ->
   workflow:('input, 'output) Workflow.t ->
@@ -132,8 +134,9 @@ val wait :
     workflow to stop. Call [wait handle] to observe [Cancelled]. [request_id]
     is the idempotency key for this logical control operation and should be
     supplied again if the caller retries after an uncertain transport error.
-    Both [request_id] and [reason] are limited to 65,536 bytes and may not
-    contain NUL; [reason] may be empty. *)
+    [request_id] must be non-empty and valid UTF-8. Both [request_id] and
+    [reason] are limited to 65,536 bytes and may not contain NUL; [reason] may
+    be empty. *)
 val cancel :
   ?request_id:string ->
   ?reason:string ->
@@ -155,8 +158,10 @@ val terminate :
 (** Resets the exact run at a workflow-task event boundary and returns the new
     run identity. The old run is terminated by Temporal and a new run begins;
     callers must explicitly use [follow] with the returned execution if they
-    want to wait for that new run. [workflow_task_finish_event_id] must be a
-    non-negative workflow-task event ID accepted by Temporal. *)
+    want to wait for that new run. An explicitly supplied [request_id] must be
+    non-empty, valid UTF-8, NUL-free, and no more than 65,536 bytes.
+    [workflow_task_finish_event_id] must be a non-negative workflow-task event
+    ID accepted by Temporal. *)
 val reset :
   ?request_id:string ->
   ?reason:string ->
@@ -168,9 +173,10 @@ val reset :
     call acknowledges Temporal's signal RPC; it does not wait for workflow code
     to process the message. [request_id] is optional: when omitted, the SDK
     allocates a fresh process-wide ID shared by all client handles. Supply the
-    same ID when retrying an uncertain transport result. Signal names are
-    validated when their definitions are created and input is encoded before
-    transport. *)
+    same ID when retrying an uncertain transport result. An explicitly
+    supplied ID must be non-empty, valid UTF-8, NUL-free, and no more than
+    65,536 bytes. Signal names are validated when their definitions are
+    created and input is encoded before transport. *)
 val signal :
   ?request_id:string ->
   ('workflow_input, 'workflow_output) handle ->
@@ -189,7 +195,9 @@ val query :
 
 (** Lists one bounded page of workflow executions using Temporal's visibility
     query language. [page_token] is opaque and may be passed unchanged to a
-    later call. Invalid query metadata is returned as a typed defect. *)
+    later call; when supplied, it must be non-empty, valid UTF-8, NUL-free, and
+    no more than 65,536 bytes. Invalid query metadata is returned as a typed
+    defect. *)
 val list_visibility :
   ?page_size:int ->
   ?page_token:string ->
@@ -211,8 +219,9 @@ val query_with_input :
 
 (** Starts a typed workflow update and waits until a Temporal worker accepts it.
     [update_id] is optional but should be supplied by callers that may retry
-    after an uncertain transport result. The returned handle can be polled
-    independently of other workflow handles. *)
+    after an uncertain transport result. When supplied, it must be non-empty,
+    valid UTF-8, NUL-free, and no more than 65,536 bytes. The returned handle
+    can be polled independently of other workflow handles. *)
 val start_update :
   ?update_id:string ->
   ('workflow_input, 'workflow_output) handle ->
