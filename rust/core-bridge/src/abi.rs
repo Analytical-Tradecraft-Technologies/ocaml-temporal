@@ -3039,7 +3039,7 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_client_poll_update_workflow_json
 /// The caller owns the returned result and must release it with the matching
 /// bridge free function, even when the status reports an error.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v1_client_list_visibility_json(
+pub unsafe extern "C" fn ocaml_temporal_core_v2_client_list_visibility_json(
     runtime: *mut Runtime,
     input: *const u8,
     input_len: usize,
