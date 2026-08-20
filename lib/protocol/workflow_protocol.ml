@@ -404,6 +404,11 @@ let of_control_error path error : error =
   let view = Control.error_view error in
   { code = view.code; path; message = view.message }
 
+(** Converts a foundation error without rebasing its already-contextual path. *)
+let of_control_error_at_source error : error =
+  let view = Control.error_view error in
+  of_control_error view.path error
+
 (** Sequences semantic validation without exceptions. *)
 let ( let* ) = Result.bind
 
@@ -2125,7 +2130,7 @@ let activation_from_json json =
 (** Strictly decodes one activation through the shared JSON foundation. *)
 let decode_activation input =
   match Control.decode_payload_object input with
-  | Error error -> Error (of_control_error "$" error)
+  | Error error -> Error (of_control_error_at_source error)
   | Ok json -> activation_from_json json
 
 (** Encodes and semantically reparses one activation. *)
@@ -2152,7 +2157,7 @@ let encode_activation value =
       ] @ metadata)
   in
   match Control.encode_payload_object json with
-  | Error error -> Error (of_control_error "$" error)
+  | Error error -> Error (of_control_error_at_source error)
   | Ok output ->
       let* _ = decode_activation output in
       Ok output
@@ -2842,7 +2847,7 @@ let completion_from_json json =
 (** Strictly decodes one completion through the shared JSON foundation. *)
 let decode_completion input =
   match Control.decode_payload_object input with
-  | Error error -> Error (of_control_error "$" error)
+  | Error error -> Error (of_control_error_at_source error)
   | Ok json -> completion_from_json json
 
 (** Encodes and semantically reparses one outgoing completion. *)
@@ -2850,7 +2855,7 @@ let encode_completion value =
   let* commands = completion_commands_json value.commands in
   let json = `Assoc [ ("run_id", `String value.run_id); ("commands", commands) ] in
   match Control.encode_payload_object json with
-  | Error error -> Error (of_control_error "$" error)
+  | Error error -> Error (of_control_error_at_source error)
   | Ok output ->
       let* _ = decode_completion output in
       Ok output

@@ -308,6 +308,9 @@ let test_query_protocol () =
   require_fragment "query type" "current_state" encoded;
   let response = unwrap (Protocol.decode_query_response {|{"result":[]}|}) in
   if response.result <> [] then failwith "empty query result changed shape";
+  check_error_path "query payload data" "$.result[0].data"
+    (Protocol.decode_query_response
+       {|{"result":[{"metadata":{},"data":{"encoding":"base64","data":"***"}}]}|});
   List.iter
     (fun document -> require_error (Protocol.decode_query_response document))
     [ {|{"result":[],"unexpected":true}|}; {|{"result":{}}|} ];
