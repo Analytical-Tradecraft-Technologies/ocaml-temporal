@@ -67,6 +67,14 @@ assert_third_party_actions_pinned() {
       sub(/^ */, "", text)
       if (text == "" || text ~ /^#/) next
 
+      # An action reference is a scalar token, never an opaque block body.
+      # Handle this key before the generic scalar tracker so `uses: |` and
+      # `uses: >` cannot hide a mutable reference on the following line.
+      if (text ~ /^uses:[[:space:]]*[|>]/) {
+        reject("action reference must be one unquoted token", line)
+        next
+      }
+
       # Shell bodies are opaque scalar content, not workflow mappings. Track
       # them by indentation so words such as `uses:` inside scripts cannot be
       # mistaken for action declarations.
@@ -164,6 +172,12 @@ assert_action_fixture_rejected mutable-tag \
   '        uses: evil/example@v1'
 assert_action_fixture_rejected misleading-comment \
   '        uses: evil/example@v1 # @0123456789abcdef0123456789abcdef01234567'
+assert_action_fixture_rejected literal-block-action \
+  '        uses: |-
+          evil/example@v1'
+assert_action_fixture_rejected folded-block-action \
+  '        uses: >-
+          evil/example@v1'
 
 assert_third_party_actions_pinned github-owned-fixture \
   '        uses: actions/checkout@v7'
@@ -175,7 +189,7 @@ assert_third_party_actions_pinned comment-fixture \
   '        # uses: evil/example@v1'
 assert_third_party_actions_pinned block-scalar-fixture \
   '        run: |
-          echo "uses: evil/example@v1"'
+          uses: evil/example@v1'
 
 setup_ocaml_sha=15d660006c1d3110d77c34b7faa3bddefe8b82f0
 master_setup_ocaml_count=$(printf '%s\n' "$master_workflow_text" |
