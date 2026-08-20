@@ -2,10 +2,22 @@
     truncation visible without allowing unbounded diagnostics. *)
 let max_tag_length = 256
 
-(** Bounds strings before handing them to an application reporter. *)
+(** Returns whether a byte is a UTF-8 continuation byte. *)
+let is_utf8_continuation byte = Char.code byte land 0xc0 = 0x80
+
+(** Moves a byte offset back to the start of the UTF-8 character crossing it.
+    Valid UTF-8 input therefore remains valid when truncated. *)
+let rec utf8_boundary value offset =
+  if offset = 0 || not (is_utf8_continuation value.[offset]) then offset
+  else utf8_boundary value (offset - 1)
+
+(** Bounds strings before handing them to an application reporter without
+    splitting a UTF-8 character at the truncation boundary. *)
 let bounded value =
   if String.length value <= max_tag_length then value
-  else String.sub value 0 (max_tag_length - 3) ^ "..."
+  else
+    let prefix_length = utf8_boundary value (max_tag_length - 3) in
+    String.sub value 0 prefix_length ^ "..."
 
 (** Stable log sources let applications enable verbose bridge or workflow
     detail independently from lifecycle information. *)
