@@ -35,7 +35,10 @@ let copy_detail (payload : Payload.t) : Payload.t =
 let make ?(non_retryable = false) ?(details = []) ~category ~message () =
   { category; message; non_retryable; details = List.map copy_detail details }
 
-let view error = error
+(** Returns a detached public view. Detail bytes stay mutable for application
+    decoders, so copy them before crossing the abstract error boundary rather
+    than allowing one inspection to mutate the retained error. *)
+let view error = { error with details = List.map copy_detail error.details }
 
 let kind error =
   match error.category with

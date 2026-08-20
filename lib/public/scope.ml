@@ -172,13 +172,18 @@ let await scope future =
           | Ok (Future.Right ()) -> Error (cancellation_error ()))
 
 (** Runs a body inside a fresh scope and always requests cancellation during
-    cleanup. The body remains responsible for awaiting all branches it wants
-    to observe; cleanup closes the scope's notification future when it returns
-    so no helper-created signal remains pending. *)
+    cleanup. A successful body returns a cleanup error so a failed durable
+    cancellation request cannot be reported as overall success. The body's
+    typed error or exception remains primary after cleanup is attempted. *)
 let with_scope body =
   match create () with
   | Error _ as error -> error
-  | Ok scope ->
-      Fun.protect
-        ~finally:(fun () -> ignore (cancel scope))
-        (fun () -> body scope)
+  | Ok scope -> (
+      match body scope with
+      | exception exn ->
+          ignore (cancel scope);
+          raise exn
+      | Error _ as error ->
+          ignore (cancel scope);
+          error
+      | Ok value -> Result.map (fun () -> value) (cancel scope))
