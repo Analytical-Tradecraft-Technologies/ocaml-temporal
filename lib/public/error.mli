@@ -41,7 +41,9 @@ val make :
   unit ->
   t
 
-(** Returns all publicly inspectable fields of an error. *)
+(** Returns all publicly inspectable fields of an error. Detail payloads are
+    copied, so mutating bytes in the returned view cannot change the error or a
+    later view. *)
 val view : t -> view
 
 (** Returns the lowercase category name, such as ["activity"] or ["codec"]. *)
