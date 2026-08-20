@@ -7,12 +7,31 @@ set -eu
 source_root=${1:-.}
 master_workflow=$source_root/.github/workflows/build.yml
 pr_workflow=$source_root/.github/workflows/build-pr.yml
+release_workflow=$source_root/.github/workflows/release-preflight.yml
+makefile=$source_root/Makefile
 
 # GitHub's Windows checkout can materialize tracked text with CRLF endings.
 # The contract intentionally makes exact-line assertions, so normalize only
 # the input representation before checking the workflow's semantic content.
 master_workflow_text=$(tr -d '\015' < "$master_workflow")
 pr_workflow_text=$(tr -d '\015' < "$pr_workflow")
+release_workflow_text=$(tr -d '\015' < "$release_workflow")
+makefile_text=$(tr -d '\015' < "$makefile")
+
+# Release preflight runs from a clean Actions checkout, so it is the right
+# place to execute the stale-owner rejection fixture. Keep the fixture out of
+# ordinary dirty-worktree quality checks, but assert both the Make target and
+# workflow wiring so either half cannot silently turn into a no-op.
+release_preflight_target=$(printf '%s\n' "$makefile_text" |
+  sed -n '/^release-preflight:/,/^release-tag-check:/p' |
+  sed 's/^[[:space:]]*//')
+printf '%s\n' "$release_preflight_target" | grep -Fqx 'release-preflight:'
+printf '%s\n' "$release_preflight_target" |
+  grep -Fqx 'sh scripts/check-release-preflight.sh .'
+printf '%s\n' "$release_preflight_target" |
+  grep -Fqx 'sh test/smoke/test_release_preflight_contract.sh .'
+printf '%s\n' "$release_workflow_text" |
+  grep -Fqx '        run: make release-preflight'
 
 # The changed-path detector is a safety boundary: every non-document path
 # must opt into the code and live-smoke jobs. Keep all three workflow outputs

@@ -34,6 +34,9 @@ esac
 [ -s LICENSE ] || fail "LICENSE is missing or empty"
 [ -f rust/Cargo.lock ] || fail "rust/Cargo.lock is missing"
 
+repository_url=https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal
+repository_git=git+https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal.git
+
 opam_field() {
   sed -n "s/^$1:[[:space:]]*\"\([^\"]*\)\"[[:space:]]*$/\1/p" temporal-sdk.opam | head -n 1
 }
@@ -47,22 +50,32 @@ opam_version=$(opam_field version)
 [ "$(opam_field maintainer)" = "Michael Fowlie" ] || fail "unexpected opam maintainer"
 [ "$(opam_field authors)" = "Michael Fowlie" ] || fail "unexpected opam author"
 [ "$(opam_field license)" = Apache-2.0 ] || fail "opam license must be Apache-2.0"
-[ "$(opam_field homepage)" = https://github.com/mfow/ocaml-temporal ] || fail "unexpected opam homepage"
-[ "$(opam_field dev-repo)" = "git+https://github.com/mfow/ocaml-temporal.git" ] || fail "unexpected opam dev-repo"
+[ "$(opam_field homepage)" = "$repository_url" ] || fail "unexpected opam homepage"
+[ "$(opam_field bug-reports)" = "$repository_url/issues" ] || fail "unexpected opam bug-reports URL"
+[ "$(opam_field dev-repo)" = "$repository_git" ] || fail "unexpected opam dev-repo"
 grep -F 'x-maintenance-intent: [ "(latest)" ]' temporal-sdk.opam >/dev/null ||
   fail "opam maintenance intent is missing"
 
 [ "$(locked_field name)" = "$opam_name" ] || fail "locked opam name differs"
 [ "$(locked_field version)" = "$opam_version" ] || fail "locked opam version differs"
+[ "$(locked_field homepage)" = "$repository_url" ] || fail "locked opam homepage differs"
+[ "$(locked_field bug-reports)" = "$repository_url/issues" ] || fail "locked opam bug-reports URL differs"
+[ "$(locked_field dev-repo)" = "$repository_git" ] || fail "locked opam dev-repo differs"
 grep -F '(name temporal-sdk)' dune-project >/dev/null || fail "dune package name differs"
+grep -F '(source (github Analytical-Tradecraft-Technologies/ocaml-temporal))' dune-project >/dev/null ||
+  fail "dune source repository differs"
 grep -F '(authors "Michael Fowlie")' dune-project >/dev/null || fail "dune author differs"
 grep -F '(maintainers "Michael Fowlie")' dune-project >/dev/null || fail "dune maintainer differs"
 grep -F '(maintenance_intent "(latest)")' dune-project >/dev/null || fail "dune maintenance intent is missing"
 grep -F 'Community-maintained and unofficial. Not affiliated with or endorsed by Temporal Technologies, Inc.' README.md >/dev/null ||
   fail "README disclaimer is missing"
-grep -F 'https://github.com/mfow/ocaml-temporal' README.md >/dev/null || fail "README repository link is missing"
+grep -F "$repository_url" README.md >/dev/null || fail "README repository link is missing"
 grep -Eiq 'experimental|pre-0\.1\.0' README.md || fail "README must identify the package as experimental"
 grep -F 'Apache License' LICENSE >/dev/null || fail "LICENSE is not Apache-2.0"
+grep -F "repository = \"$repository_url\"" rust/Cargo.toml >/dev/null ||
+  fail "Cargo repository metadata differs"
+grep -F "NAMESPACE = \"$repository_url/sbom/cargo\"" scripts/generate-cargo-sbom.py >/dev/null ||
+  fail "Cargo SBOM namespace differs"
 
 # Generated build trees are never valid release inputs.  Checking tracked
 # paths catches accidental commits even when a clean checkout hides ignored
