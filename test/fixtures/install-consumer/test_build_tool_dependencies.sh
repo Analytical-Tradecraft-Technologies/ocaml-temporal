@@ -14,12 +14,14 @@ fail() {
 }
 
 manifest_dependencies() {
-  OPAMCLI=2.0 opam show --file="$1" --field=depends --normalise
+  OPAMCLI=2.0 opam show --file="$1" --field=depends --normalise | tr -d '\r'
 }
 
 opam_dependencies=$(manifest_dependencies "$root/temporal-sdk.opam")
 locked_dependencies=$(manifest_dependencies "$root/temporal-sdk.opam.locked")
-dune_dependencies=$(dune format-dune-file "$root/dune-project")
+# Native Windows tools emit CRLF even when their input is checked out with LF.
+# Normalize command output before applying the line-oriented metadata checks.
+dune_dependencies=$(dune format-dune-file "$root/dune-project" | tr -d '\r')
 
 require_lf_attribute() {
   pattern=$1

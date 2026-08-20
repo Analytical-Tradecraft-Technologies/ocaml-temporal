@@ -68,20 +68,29 @@ assert_rejects_detached_pin() {
   fi
 }
 
-assert_accepts_crlf_attributes() {
+assert_accepts_crlf_metadata() {
   crlf_attributes="$fixture_root/.gitattributes.crlf"
+  tool_bin="$fixture_root/tool-bin"
+  real_dune=$(command -v dune)
 
   prepare_fixture
   awk '{ printf "%s\r\n", $0 }' "$fixture_root/.gitattributes" \
     >"$crlf_attributes"
   mv "$crlf_attributes" "$fixture_root/.gitattributes"
-  if ! sh "$checker" "$fixture_root"; then
-    echo "install consumer metadata mutation: CRLF attributes were rejected" >&2
+  mkdir -p "$tool_bin"
+  cat >"$tool_bin/dune" <<'EOF'
+#!/bin/sh
+"$REAL_DUNE" "$@" | awk '{ printf "%s\r\n", $0 }'
+EOF
+  chmod +x "$tool_bin/dune"
+  if ! PATH="$tool_bin:$PATH" REAL_DUNE="$real_dune" \
+    sh "$checker" "$fixture_root"; then
+    echo "install consumer metadata mutation: CRLF metadata was rejected" >&2
     exit 1
   fi
 }
 
-assert_accepts_crlf_attributes
+assert_accepts_crlf_metadata
 
 assert_rejects_detached_pin \
   conf-protoc 4.4.0 zz-conf-protoc-pin-sentinel
