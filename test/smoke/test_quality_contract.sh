@@ -49,11 +49,11 @@ assert_third_party_actions_pinned() {
 assert_third_party_actions_pinned build.yml "$master_workflow_text"
 assert_third_party_actions_pinned build-pr.yml "$pr_workflow_text"
 
-setup_ocaml_sha=605a7e998e76e035b82c14d618a6e1010732c4ce
+setup_ocaml_sha=15d660006c1d3110d77c34b7faa3bddefe8b82f0
 master_setup_ocaml_count=$(printf '%s\n' "$master_workflow_text" |
-  grep -Fc "ocaml/setup-ocaml@$setup_ocaml_sha # v3")
+  grep -Fc "ocaml/setup-ocaml@$setup_ocaml_sha # v3.7.0")
 pr_setup_ocaml_count=$(printf '%s\n' "$pr_workflow_text" |
-  grep -Fc "ocaml/setup-ocaml@$setup_ocaml_sha # v3")
+  grep -Fc "ocaml/setup-ocaml@$setup_ocaml_sha # v3.7.0")
 test "$master_setup_ocaml_count" -eq 1
 test "$pr_setup_ocaml_count" -eq 2
 
