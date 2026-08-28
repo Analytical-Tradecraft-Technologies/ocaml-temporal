@@ -217,6 +217,17 @@ completion, so the race cannot occur, and
 `replay_history_first_activation_initializes_workflow` fails deterministically
 if the invalid fixture is reintroduced.
 
+That fixture-validation test stops after inspecting the first activation and
+uses the explicit replay-disposal path to release its leased activation. It
+does not submit an empty completion against the already-completed history:
+doing so deliberately creates a replay nondeterminism and a follow-up eviction,
+which is useful in the dedicated completion-lifecycle tests but made this
+unrelated guard depend on an asynchronous Core shutdown. A scheduled macOS
+ARM64 run on 2026-08-28 exposed that dependency by waiting in the test until
+the native job timeout. The focused fixture guard now tests only the invariant
+named by the test, while the separate replay completion and disposal tests
+retain coverage of both cleanup paths.
+
 The OCaml bridge test in
 [`test_ocaml_bridge.ml`](../../test/bridge/test_ocaml_bridge.ml) proves that
 sender-side canonical-payload validation rejects malformed replay input before

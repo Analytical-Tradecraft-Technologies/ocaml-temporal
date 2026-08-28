@@ -528,12 +528,14 @@ fn replay_history_first_activation_initializes_workflow() {
          non-empty completion that races disposal shutdown. Jobs: {:?}",
         activation.jobs
     );
-    // Acknowledge and drain so the worker finalizes without a retained owner.
-    handle
-        .block_on(worker.complete_workflow(WorkflowActivationCompletion::empty(&activation.run_id)))
-        .expect("replay activation should accept an empty deterministic completion");
-    drain_replay_evictions_until_shutdown(&mut worker, &handle);
-    finalize_or_panic(worker, &handle);
+    // This guard has finished once it has inspected the first activation. Do
+    // not submit an empty completion against a history whose workflow already
+    // completed: that is intentionally nondeterministic and asks Core to
+    // synthesize and drain an eviction, behavior covered by the dedicated
+    // replay-completion tests below. Explicit disposal is the bounded cleanup
+    // path for abandoning this leased activation and avoids making a fixture
+    // validation test depend on Core's asynchronous nondeterminism shutdown.
+    dispose_or_panic(worker, &handle);
 }
 
 /// Disposal reports a terminal Core finalization failure while retaining the
