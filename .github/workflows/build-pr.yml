@@ -1,6 +1,8 @@
 name: Build
 
 on:
+  merge_group:
+    types: [checks_requested]
   # Keep the workflow trigger unconditional so the license audit runs for
   # documentation-only and other non-code pull requests as well.
   pull_request:
@@ -11,7 +13,7 @@ permissions:
 concurrency:
   # A pull-request number remains stable across synchronize events, so a new
   # commit replaces an older queued or running PR run.
-  group: build-${{ github.workflow }}-${{ github.event.pull_request.number }}
+  group: build-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -23,17 +25,17 @@ jobs:
       smoke: ${{ steps.changed-paths.outputs.smoke }}
       native_windows: ${{ steps.changed-paths.outputs.native_windows }}
     steps:
-      - name: Check out pull-request head
+      - name: Check out change head
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ github.event.merge_group.head_sha || github.event.pull_request.head.sha }}
       - name: Classify changed paths
         id: changed-paths
         shell: bash
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_SHA: ${{ github.event.merge_group.base_sha || github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.merge_group.head_sha || github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
           code=false
