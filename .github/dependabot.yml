@@ -1,13 +1,58 @@
+# Check every calendar day at 07:00 and 19:00 Sydney, including daylight saving.
+# Expanded ecosystem coverage authorized by the repository owner; OPAM remains unsupported.
 version: 2
-
 updates:
-  - package-ecosystem: cargo
-    directory: /rust
-    target-branch: master
-    schedule:
-      interval: cron
-      cronjob: "0 7,19 * * *"
-      timezone: Australia/Sydney
-    cooldown:
-      default-days: 3
-    open-pull-requests-limit: 10
+- package-ecosystem: cargo
+  directory: /rust
+  schedule:
+    interval: cron
+    cronjob: 0 7,19 * * *
+    timezone: Australia/Sydney
+  cooldown:
+    default-days: 3
+  groups:
+    temporal-core:
+      patterns:
+      - temporalio-client
+      - temporalio-common
+      - temporalio-sdk-core
+      - temporalio-protos
+  target-branch: master
+  open-pull-requests-limit: 10
+- package-ecosystem: docker
+  directory: /
+  schedule:
+    interval: cron
+    cronjob: 0 7,19 * * *
+    timezone: Australia/Sydney
+  cooldown:
+    default-days: 3
+- package-ecosystem: docker-compose
+  directory: /test/integration/temporal
+  schedule:
+    interval: cron
+    cronjob: 0 7,19 * * *
+    timezone: Australia/Sydney
+  cooldown:
+    default-days: 3
+  groups:
+    temporal-server:
+      patterns:
+      - temporalio/server
+      - temporalio/admin-tools
+- package-ecosystem: rust-toolchain
+  directory: /rust
+  schedule:
+    interval: cron
+    cronjob: 0 7,19 * * *
+    timezone: Australia/Sydney
+  cooldown:
+    default-days: 3
+- package-ecosystem: github-actions
+  directory: /
+  schedule:
+    interval: cron
+    cronjob: 0 7,19 * * *
+    timezone: Australia/Sydney
+  cooldown:
+    default-days: 3
