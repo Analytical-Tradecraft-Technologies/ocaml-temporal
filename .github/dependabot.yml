@@ -5,9 +5,8 @@ updates:
     directory: /rust
     target-branch: master
     schedule:
-      interval: weekly
-      day: monday
-      time: "09:00"
+      interval: cron
+      cronjob: "0 7,19 * * *"
       timezone: Australia/Sydney
     cooldown:
       default-days: 3
