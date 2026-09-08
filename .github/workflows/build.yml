@@ -175,12 +175,17 @@ jobs:
         run: >-
           rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
           --component clippy --component rustfmt
-      - name: Cache native Rust dependencies
-        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      # Cache Cargo compilation only; Dune's test-result database stays fresh.
+      - name: Cache native Rust compilation
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
-          workspaces: rust -> ../_build/rust
-          shared-key: native-${{ env.NATIVE_RUST_HOST }}-ocaml55
-          cache-bin: false
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            _build/rust
+          key: native-cargo-v1-${{ runner.os }}-${{ env.RUSTUP_TOOLCHAIN }}-${{ hashFiles('rust/**', 'scripts/build-rust-bridge.sh', '.github/workflows/build*.yml') }}
+          restore-keys: |
+            native-cargo-v1-${{ runner.os }}-${{ env.RUSTUP_TOOLCHAIN }}-
       - name: Install Protocol Buffers compiler on macOS
         if: runner.os == 'macOS'
         run: brew install protobuf
