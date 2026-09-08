@@ -1,4 +1,4 @@
-# Check every calendar day at 07:00 and 19:00 Sydney, including daylight saving.
+# Check every calendar day at 07:00 Sydney, including daylight saving.
 # Expanded ecosystem coverage authorized by the repository owner; OPAM remains unsupported.
 version: 2
 updates:
@@ -6,7 +6,7 @@ updates:
   directory: /rust
   schedule:
     interval: cron
-    cronjob: 0 7,19 * * *
+    cronjob: 0 7 * * *
     timezone: Australia/Sydney
   cooldown:
     default-days: 3
@@ -23,7 +23,7 @@ updates:
   directory: /
   schedule:
     interval: cron
-    cronjob: 0 7,19 * * *
+    cronjob: 0 7 * * *
     timezone: Australia/Sydney
   cooldown:
     default-days: 3
@@ -31,7 +31,7 @@ updates:
   directory: /test/integration/temporal
   schedule:
     interval: cron
-    cronjob: 0 7,19 * * *
+    cronjob: 0 7 * * *
     timezone: Australia/Sydney
   cooldown:
     default-days: 3
@@ -44,7 +44,7 @@ updates:
   directory: /rust
   schedule:
     interval: cron
-    cronjob: 0 7,19 * * *
+    cronjob: 0 7 * * *
     timezone: Australia/Sydney
   cooldown:
     default-days: 3
@@ -52,7 +52,7 @@ updates:
   directory: /
   schedule:
     interval: cron
-    cronjob: 0 7,19 * * *
+    cronjob: 0 7 * * *
     timezone: Australia/Sydney
   cooldown:
     default-days: 3
