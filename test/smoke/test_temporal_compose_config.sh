@@ -25,7 +25,7 @@ require_text() {
 
 require_text 'condition: service_healthy'
 require_text 'condition: service_completed_successfully'
-require_text 'temporal-postgres-data:'
+require_text 'temporal-postgres-data-v18:'
 require_text 'temporal-network:'
 require_text 'pg_isready'
 require_text 'nc -z localhost 7233'

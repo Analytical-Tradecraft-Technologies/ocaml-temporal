@@ -23,7 +23,7 @@ services:
     expose:
       - "5432"
     volumes:
-      - temporal-postgres-data:/var/lib/postgresql/data
+      - temporal-postgres-data-v18:/var/lib/postgresql
     networks:
       - temporal-network
     healthcheck:
@@ -556,4 +556,4 @@ networks:
     driver: bridge
 
 volumes:
-  temporal-postgres-data:
+  temporal-postgres-data-v18:
