@@ -23,9 +23,6 @@ require_text() {
   fi
 }
 
-require_text 'postgres:16.13-bookworm@sha256:472efd9a66f2b2f1a5aeb18b28de74332e6ef88c2b93a1a5d812fb6db67a5f60'
-require_text 'temporalio/server:1.31.0@sha256:b021b3b58c3f169634cdbb0451fcc0e69e8190b40454323362c7c52bbd4ff7b9'
-require_text 'temporalio/admin-tools:1.31.0@sha256:3e68adcd54195a7c1222e99f2dbc32a4fdbf44ad69e3bb48e21e85c4bf417c2e'
 require_text 'condition: service_healthy'
 require_text 'condition: service_completed_successfully'
 require_text 'temporal-postgres-data:'
