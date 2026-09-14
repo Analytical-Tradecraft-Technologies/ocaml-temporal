@@ -36,7 +36,7 @@ services:
 
   temporal-schema:
     profiles: [temporal]
-    image: temporalio/admin-tools:1.31.0@sha256:3e68adcd54195a7c1222e99f2dbc32a4fdbf44ad69e3bb48e21e85c4bf417c2e
+    image: temporalio/admin-tools:1.32.0@sha256:a9f84fb9a374b2374fe2e67c8efc0468ff3f1c66c8a0b14597ec86e349e62bca
     depends_on:
       postgresql:
         condition: service_healthy
@@ -58,7 +58,7 @@ services:
 
   temporal:
     profiles: [temporal]
-    image: temporalio/server:1.31.0@sha256:b021b3b58c3f169634cdbb0451fcc0e69e8190b40454323362c7c52bbd4ff7b9
+    image: temporalio/server:1.32.0@sha256:c3e752127759616bb1615e0f9ba0e21635aeb5fdeb922de4f371c350955f46ae
     depends_on:
       temporal-schema:
         condition: service_completed_successfully
@@ -90,7 +90,7 @@ services:
 
   temporal-admin-tools:
     profiles: [temporal]
-    image: temporalio/admin-tools:1.31.0@sha256:3e68adcd54195a7c1222e99f2dbc32a4fdbf44ad69e3bb48e21e85c4bf417c2e
+    image: temporalio/admin-tools:1.32.0@sha256:a9f84fb9a374b2374fe2e67c8efc0468ff3f1c66c8a0b14597ec86e349e62bca
     environment:
       TEMPORAL_ADDRESS: temporal:7233
       TEMPORAL_NAMESPACE: temporal-sdk-test
