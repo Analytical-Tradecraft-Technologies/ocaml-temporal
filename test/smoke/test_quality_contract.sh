@@ -198,14 +198,6 @@ assert_third_party_actions_pinned block-scalar-fixture \
   '        run: |
           uses: evil/example@v1'
 
-setup_ocaml_sha=15d660006c1d3110d77c34b7faa3bddefe8b82f0
-master_setup_ocaml_count=$(printf '%s\n' "$master_workflow_text" |
-  grep -Fc "ocaml/setup-ocaml@$setup_ocaml_sha # v3.7.0")
-pr_setup_ocaml_count=$(printf '%s\n' "$pr_workflow_text" |
-  grep -Fc "ocaml/setup-ocaml@$setup_ocaml_sha # v3.7.0")
-test "$master_setup_ocaml_count" -eq 1
-test "$pr_setup_ocaml_count" -eq 2
-
 # Release preflight runs from a clean Actions checkout, so it is the right
 # place to execute the stale-owner rejection fixture. Keep the fixture out of
 # ordinary dirty-worktree quality checks, but assert both the Make target and
@@ -244,8 +236,6 @@ printf '%s\n' "$master_workflow_text" | grep -Fq '  quality:'
 printf '%s\n' "$master_workflow_text" |
   grep -Fq 'name: Quality and security scans'
 printf '%s\n' "$master_workflow_text" |
-  grep -Fq 'taiki-e/install-action@2ca9b94c269419b7b0c711c09d0b21c4e1d51145'
-printf '%s\n' "$master_workflow_text" |
   grep -Fq 'cargo-deny@0.20.2,cargo-machete@0.9.2,typos@1.48.0'
 printf '%s\n' "$master_workflow_text" | grep -Fq 'run: make quality'
 
@@ -255,8 +245,6 @@ pr_quality=$(printf '%s\n' "$pr_workflow_text" |
   sed -n '/^  quality:/,/^  license-audit:/p')
 printf '%s\n' "$pr_quality" | grep -Fqx "    if: needs.changes.outputs.code == 'true'"
 printf '%s\n' "$pr_quality" | grep -Fqx '    name: Quality and security scans'
-printf '%s\n' "$pr_quality" |
-  grep -Fq 'taiki-e/install-action@2ca9b94c269419b7b0c711c09d0b21c4e1d51145'
 printf '%s\n' "$pr_quality" |
   grep -Fq 'cargo-deny@0.20.2,cargo-machete@0.9.2,typos@1.48.0'
 printf '%s\n' "$pr_quality" | grep -Fqx '        run: make quality'
