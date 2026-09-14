@@ -16,7 +16,7 @@ services:
 
   postgresql:
     profiles: [temporal]
-    image: postgres:16.13-bookworm@sha256:472efd9a66f2b2f1a5aeb18b28de74332e6ef88c2b93a1a5d812fb6db67a5f60
+    image: postgres:18.6-bookworm@sha256:1c59e2c3c818eaa0f0628f695b36e7c9e362d6b219b36a54a32df645cbd7e1af
     environment:
       POSTGRES_USER: temporal
       POSTGRES_PASSWORD: temporal
