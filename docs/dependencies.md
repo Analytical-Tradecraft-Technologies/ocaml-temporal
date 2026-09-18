@@ -197,3 +197,8 @@ not extend its narrowly approved compiler and `ocamlbuild` exceptions to
 ordinary tooling packages. `ocamlformat` remains excluded for the separate
 copyleft closure documented above. The language-neutral typo gate still checks
 OCaml identifiers, comments, and interfaces without weakening the policy.
+
+## Native OCaml setup action
+
+Native compatibility jobs use `ocaml/setup-ocaml` 3.9.0 at immutable
+commit `93303b622b2522e4411e295f9e77411a24912ac7`. The action is MIT licensed.
