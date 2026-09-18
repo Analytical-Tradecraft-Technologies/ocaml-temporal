@@ -213,3 +213,22 @@ run](https://github.com/mfow/ocaml-temporal/actions/runs/29286560471) passed the
 original sequence. An earlier local attempt was stopped by Docker
 storage/daemon failure before readiness; that infrastructure failure is not
 part of the live evidence.
+
+## Cache-eviction deadline diagnostics
+
+The cache-eviction driver retains its existing 900-second process budget.
+`run-cache-eviction-driver.sh` establishes one absolute marker deadline before
+compilation/startup, reserving 10% of that budget (at least one second, at most
+30 seconds) for reporting and shutdown. Both marker waits inherit this deadline;
+advancing to another phase never resets it. Timeout overrides must be integer
+seconds between 2 and 86400. A direct invocation without the wrapper retains the
+local wait budget for manual diagnosis.
+
+The driver prints both exact execution identities and reports its marker error
+before attempting client shutdown. The diagnostic distinguishes a missing
+cache-full eviction with B acknowledged from neither observation arriving.
+The outer watchdog remains a failure if startup, an RPC, or shutdown hangs.
+Fixing the ordering does not establish the cause of a cache-eviction stall.
+The Docker-free marker tests and Linux wrapper regression run with `dune runtest
+test/integration/temporal/cache_wait`; the live gate remains
+`make test-temporal-worker-cache-eviction OCAML_VERSION=5.5`.
