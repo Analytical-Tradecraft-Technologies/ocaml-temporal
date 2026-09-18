@@ -605,6 +605,12 @@ test-unit:
 test-runtime:
 	$(RUN) dune runtest test/runtime
 
+# Requires a disposable running Temporal server. The regression owns its worker,
+# uses a unique task queue, and terminates its workflow executions on exit.
+.PHONY: test-client-request-ids-live
+test-client-request-ids-live:
+	$(RUN) dune exec test/integration/client_request_ids/regression.exe -- check $(TEMPORAL_CLIENT_TEST_URL)
+
 lint:
 	$(RUN) dune build $(DUNE_BUILD_ARGS)
 	$(MAKE) build-examples

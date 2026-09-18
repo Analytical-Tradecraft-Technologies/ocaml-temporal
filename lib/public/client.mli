@@ -172,7 +172,7 @@ val reset :
 (** Sends one typed signal to the exact run retained by [handle]. A successful
     call acknowledges Temporal's signal RPC; it does not wait for workflow code
     to process the message. [request_id] is optional: when omitted, the SDK
-    allocates a fresh process-wide ID shared by all client handles. Supply the
+    allocates a fresh random ID across client handles and processes. Supply the
     same ID when retrying an uncertain transport result. An explicitly
     supplied ID must be non-empty, valid UTF-8, NUL-free, and no more than
     65,536 bytes. Signal names are validated when their definitions are

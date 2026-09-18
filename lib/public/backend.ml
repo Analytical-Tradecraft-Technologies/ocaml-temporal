@@ -269,13 +269,11 @@ let mock_services : ((string * string), mock_service) Hashtbl.t =
 (** Native client state retained by the private backend.
 
     [supervisor] is the sole owner of the Rust runtime, connected client, and
-    any asynchronous start tickets. [next_request_id] is language-side state
-    only; its atomic increment gives concurrent ordinary client callers unique
-    logical request IDs without adding a second lock around native state. *)
+    any asynchronous start tickets. Request identities are allocated separately
+    for each logical call and do not share mutable client state. *)
 type native_client = {
   namespace : string;
   supervisor : Native.t;
-  next_request_id : int Atomic.t;
   closed : bool Atomic.t;
 }
 
@@ -603,7 +601,6 @@ let client_create config =
                          {
                            namespace = config.namespace;
                            supervisor;
-                           next_request_id = Atomic.make 0;
                            closed = Atomic.make false;
                          })
                 | Error error ->
@@ -612,19 +609,12 @@ let client_create config =
                     ignore (Native.shutdown supervisor);
                     Error (native_supervisor_error error)))
 
-(** Allocates a process-local logical request ID without sharing mutable
-    protocol state across producer Domains. The ID identifies the logical
-    start, not an individual network retry. *)
-let native_request_id client =
-  let sequence = Atomic.fetch_and_add client.next_request_id 1 in
-  Printf.sprintf "ocaml-client-start-%d" sequence
-
 (** Converts one public start request to the closed native protocol value. *)
 let native_start_request client (request : start_request) : Client_protocol.start_request =
   let request_id =
     match request.request_id with
     | Some request_id -> request_id
-    | None -> native_request_id client
+    | None -> Temporal_base.Client_request_id.create ()
   in
   let metadata fields =
     List.map
