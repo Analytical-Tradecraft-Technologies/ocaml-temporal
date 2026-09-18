@@ -18,7 +18,7 @@ depends: [
   "base-unix" {= "base"}
   "conf-protoc" {= "4.4.0"}
   "conf-rust-2024" {= "1"}
-  "dune" {= "3.24.0"}
+  "dune" {= "3.24.2"}
   "logs" {= "0.10.0"}
   "ocaml" {= "5.2.1"}
   "ocaml-base-compiler" {= "5.2.1"}
