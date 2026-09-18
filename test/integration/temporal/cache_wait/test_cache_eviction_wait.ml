@@ -27,7 +27,8 @@ let () =
         failwith "marker wait restarted its timeout after the process deadline";
       let absent = Cache_eviction_wait.wait_for_eviction_with_second_diagnostic
           ~eviction:path ~second_ready:second ~timeout:0.3 in
-      let channel = open_out second in
+      (* Markers are exact byte sequences; text output expands LF to CRLF on Windows. *)
+      let channel = open_out_bin second in
       output_string channel "initial-completion\n";
       close_out channel;
       let acknowledged = Cache_eviction_wait.wait_for_eviction_with_second_diagnostic
