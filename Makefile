@@ -602,6 +602,11 @@ test-temporal-worker-restart-live: test-temporal-config
 test-unit:
 	$(RUN) dune runtest test/unit test/smoke
 
+# Requires a disposable server and an explicit official Temporal CLI path.
+.PHONY: test-update-outcomes-live
+test-update-outcomes-live:
+	$(RUN) dune exec test/integration/update_outcomes/regression.exe -- check $(TEMPORAL_CLIENT_TEST_URL) $(TEMPORAL_TEST_CLI)
+
 test-runtime:
 	$(RUN) dune runtest test/runtime
 
