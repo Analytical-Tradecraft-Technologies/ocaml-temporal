@@ -172,7 +172,7 @@ named `LICENSE.txt`; the reviewed upstream license is MIT. See
 ## CI-only quality tools
 
 The independent quality job installs checksum-verified release artifacts with
-`taiki-e/install-action` 2.83.1, pinned in the workflow by immutable commit.
+`taiki-e/install-action` 2.87.14, pinned in the workflow by immutable commit.
 The action is MIT OR Apache-2.0 and is configured with no installation
 fallback. It installs these exact tools without adding them to the SDK's
 runtime or build dependency graph:
