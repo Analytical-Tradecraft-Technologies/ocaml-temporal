@@ -425,7 +425,7 @@ workers. Reassess it when updating Core's permit dealer or poller balancer.
 The regression in `rust/core-bridge/tests/support/worker_slot_limits.rs` checks
 the one-entry/default-limit combination, larger cache bounds, stricter caller
 limits, uncached workers, and rejection of a one-task cached worker. Live
-qualification uses `make test-temporal-worker-cache-eviction-live`, which must
+qualification uses `make test-temporal-worker-cache-eviction`, which must
 observe A's `cache_full` eviction after starting B and typed cancellation of
 both runs. Increasing the watchdog or accepting a successful retry is not a
 substitute for those observations. CI artifact retention and release
