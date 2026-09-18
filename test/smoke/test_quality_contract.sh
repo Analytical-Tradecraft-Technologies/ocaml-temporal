@@ -236,7 +236,7 @@ printf '%s\n' "$master_workflow_text" | grep -Fq '  quality:'
 printf '%s\n' "$master_workflow_text" |
   grep -Fq 'name: Quality and security scans'
 printf '%s\n' "$master_workflow_text" |
-  grep -Fq 'cargo-deny@0.20.2,cargo-machete@0.9.2,typos@1.48.0'
+  grep -Fq 'cargo-deny@0.20.2,cargo-machete@0.9.2,typos@1.50.2'
 printf '%s\n' "$master_workflow_text" | grep -Fq 'run: make quality'
 
 # PR quality uses the same pinned tools, but is conditional so Markdown-only
@@ -246,7 +246,7 @@ pr_quality=$(printf '%s\n' "$pr_workflow_text" |
 printf '%s\n' "$pr_quality" | grep -Fqx "    if: needs.changes.outputs.code == 'true'"
 printf '%s\n' "$pr_quality" | grep -Fqx '    name: Quality and security scans'
 printf '%s\n' "$pr_quality" |
-  grep -Fq 'cargo-deny@0.20.2,cargo-machete@0.9.2,typos@1.48.0'
+  grep -Fq 'cargo-deny@0.20.2,cargo-machete@0.9.2,typos@1.50.2'
 printf '%s\n' "$pr_quality" | grep -Fqx '        run: make quality'
 
 # Master and scheduled builds are the exhaustive compatibility gate. Scope

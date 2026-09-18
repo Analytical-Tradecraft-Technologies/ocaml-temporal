@@ -181,7 +181,7 @@ runtime or build dependency graph:
 |---|---:|---|---|
 | cargo-deny | 0.20.2 | MIT OR Apache-2.0 | RustSec advisory and Cargo source-provenance checks |
 | cargo-machete | 0.9.2 | MIT | Fast detection of unused direct Rust dependencies |
-| typos | 1.48.0 | MIT OR Apache-2.0 | Low-noise spelling checks across source, documentation, and configuration |
+| typos | 1.50.2 | MIT OR Apache-2.0 | Low-noise spelling checks across source, documentation, and configuration |
 
 The versions are also enforced by `make quality` for contributors who install
 the binaries locally. Cargo-deny's license check is deliberately disabled:
