@@ -2401,11 +2401,16 @@ impl WorkerConfigInput {
                 .min(self.max_cached_workflows.max(2))
         };
 
+        let workflow_task_slots = usize::try_from(workflow_task_slots).map_err(|_| Failure {
+            status: STATUS_CONFIGURATION,
+            message: "max_outstanding_workflow_tasks exceeds platform capacity".to_owned(),
+        })?;
+
         WorkerConfig::builder()
             .namespace(self.namespace)
             .task_queue(self.task_queue)
             .max_cached_workflows(self.max_cached_workflows as usize)
-            .max_outstanding_workflow_tasks(workflow_task_slots as usize)
+            .max_outstanding_workflow_tasks(workflow_task_slots)
             .workflow_task_poller_behavior(PollerBehavior::SimpleMaximum(
                 self.max_concurrent_workflow_task_polls as usize,
             ))
