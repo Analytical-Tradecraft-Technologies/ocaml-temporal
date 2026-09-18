@@ -4,6 +4,8 @@ version: 2
 updates:
 - package-ecosystem: cargo
   directory: /rust
+  allow:
+  - dependency-type: all
   schedule:
     interval: cron
     cronjob: 0 7 * * *
