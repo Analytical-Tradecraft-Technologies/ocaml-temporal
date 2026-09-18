@@ -123,6 +123,9 @@ before publication.
 
 ## Locked Cargo closure
 
+Version-specific changes and license evidence are recorded in the
+[dependency update notes](dependency-updates/).
+
 `rust/Cargo.lock` locks 319 dependencies rooted at Temporal Core commit
 `95e97686a079dcfe6c42e3254b2f3f5e3d97408f`; metadata contains 320 packages
 including the project bridge itself. The client, common, and SDK-Core
