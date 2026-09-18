@@ -119,6 +119,11 @@ test-rust:
 test-bridge:
 	$(COMPOSE_RUN) sh test/bridge/test_abi.sh
 
+# Requires a disposable Temporal server; the driver owns its worker processes.
+.PHONY: test-completed-queries-live
+test-completed-queries-live:
+	$(RUN) dune exec test/integration/completed_queries/regression.exe -- check $(TEMPORAL_CLIENT_TEST_URL)
+
 test-install:
 	$(COMPOSE_RUN) sh test/bridge/test_install.sh
 

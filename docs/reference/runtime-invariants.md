@@ -20,6 +20,10 @@ and bridge, read the [documentation guide](../README.md) first.
 - Futures from different schedulers cannot be combined.
 - Terminal completion, failure, cancellation, eviction, and shutdown dispose
   all pending callbacks and captured continuations.
+- Terminal completion retains final workflow-local state and inline query
+  handlers until Core cache eviction. Queries can append their response to a
+  sealed context, but never restart fibers or append durable commands. Eviction
+  still releases the run and acknowledges its native lease with no command.
 - Eviction emits no workflow command. A later replay creates a fresh execution
   rather than reusing native continuations.
 - The focused runtime regression

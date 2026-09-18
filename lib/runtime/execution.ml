@@ -664,8 +664,14 @@ let activate execution jobs =
         else (
           List.iter
             (fun job ->
-              if (not execution.evicted) && not execution.terminal then
-                process_job execution job)
+              if not execution.evicted then
+                match job with
+                | Activation.Query_workflow _ | Remove_from_cache ->
+                    (* Core can query a closed execution until it evicts it.
+                       Neither path may restart the disposed scheduler. *)
+                    process_job execution job
+                | _ when not execution.terminal -> process_job execution job
+                | _ -> ())
             jobs;
           if execution.evicted then []
           else (
