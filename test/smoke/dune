@@ -125,6 +125,7 @@
   ../integration/temporal/common/smoke_definitions.ml
   ../integration/temporal/compose.yaml
   ../integration/temporal/driver/cache_eviction_driver.ml
+  ../integration/temporal/cache_wait/cache_eviction_wait.ml
   ../integration/temporal/driver/dune
   ../integration/temporal/worker/smoke_worker.ml
   ../integration/temporal/fixtures/cache-eviction/marker.json)
