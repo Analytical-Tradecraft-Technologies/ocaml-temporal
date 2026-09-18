@@ -95,18 +95,6 @@ type visibility_page = {
     randomness, which keeps client construction straightforward in tests. *)
 let default_identity = "ocaml-temporal-client"
 
-(** All public client values in one process share this allocator. Signal
-    request IDs are Temporal idempotency keys, so allocating from the client
-    record would allow two independent handles to generate the same first ID
-    for one exact execution. The atomic counter keeps concurrent callers
-    distinct without introducing another lock around the native graph. *)
-let next_signal_request_id = Atomic.make 0
-
-(** Allocates IDs for updates whose caller does not need retry-stable
-    idempotency across a process restart. This counter has no native state and
-    only distinguishes requests created by this one OCaml process. *)
-let next_update_id = Atomic.make 0
-
 (** Rejects empty, oversized, malformed UTF-8, or NUL-containing identifiers
     before they can enter a backend request. The UTF-8 and 65,536-byte bounds
     are shared by the JSON protocol and native bridge, so mock and native
@@ -475,9 +463,7 @@ let reset ?request_id ?(reason = "") ~workflow_task_finish_event_id
     one. Unlike cancellation, separate signal calls are distinct messages by
     default, even when they target the same run and signal name. Supplying an
     explicit ID gives a caller retry-safe idempotency semantics. *)
-let generated_signal_request_id () =
-  let sequence = Atomic.fetch_and_add next_signal_request_id 1 in
-  Printf.sprintf "ocaml-client-signal-%d" sequence
+let generated_signal_request_id = Temporal_base.Client_request_id.create
 
 (** Sends one typed signal to the exact run retained by [handle]. The input is
     encoded before the backend call, and success means only that Temporal
@@ -625,11 +611,9 @@ let query_with_input (handle : ('workflow_input, 'workflow_output) handle)
            (Backend.client_query handle.client.backend request)
            (fun payload -> Codec.decode (Query.output_with_input query) payload)
 
-(** Allocates a process-local update ID for callers that do not need to
-    reconcile an uncertain admission across a restart. *)
-let generated_update_id () =
-  let sequence = Atomic.fetch_and_add next_update_id 1 in
-  Printf.sprintf "ocaml-client-update-%d" sequence
+(** Allocates an independent update identity across client instances and
+    processes. Callers supply an explicit ID to reconcile an uncertain retry. *)
+let generated_update_id = Temporal_base.Client_request_id.create
 
 (** Canonical payload used when an update returns no result values. Temporal
     represents unit-like values with the same binary/null marker used by the
@@ -659,7 +643,11 @@ let start_update ?update_id
     Error
       (Error.make ~category:`Bridge ~message:"client is shut down" ())
   else
-    let update_id = Option.value update_id ~default:(generated_update_id ()) in
+    let update_id =
+      match update_id with
+      | Some update_id -> update_id
+      | None -> generated_update_id ()
+    in
     match validate_name "update id" update_id with
     | Error error -> Error error
     | Ok () -> (
