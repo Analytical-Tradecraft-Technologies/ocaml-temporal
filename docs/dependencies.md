@@ -79,9 +79,9 @@ tools are not linked into or redistributed with the future worker artifact.
 Release containers will use a separate minimal runtime stage and will receive
 their own package/SBOM audit before publication.
 
-The image copies Rust 1.94.1, Cargo, Clippy, and rustfmt from the official
-multi-architecture `rust:1.94-bookworm` image at manifest digest
-`sha256:6ae102bdbf528294bc79ad6e1fae682f6f7c2a6e6621506ba959f9685b308a55`.
+The image copies Rust 1.98.1, Cargo, Clippy, and rustfmt from the official
+multi-architecture `rust:1.98.1-bookworm` image at manifest digest
+`sha256:9a73a5088750b4c95158ab26629c854c3d6fc4b173cb7bc8079ad252d8ed7bfa`.
 That manifest contains native `linux/amd64` and `linux/arm64/v8` images. Rust
 is dual-licensed Apache-2.0 OR MIT. Debian's `protobuf-compiler` and
 `libprotobuf-dev` packages are installed as build-only tools required by

@@ -148,17 +148,17 @@ jobs:
             runner: windows-latest
             architecture: amd64
             rust-host: x86_64-pc-windows-gnu
-            rust-toolchain: 1.94.1-x86_64-pc-windows-gnu
+            rust-toolchain: 1.98.1-x86_64-pc-windows-gnu
           - label: macOS ARM64
             runner: macos-15
             architecture: arm64
             rust-host: aarch64-apple-darwin
-            rust-toolchain: 1.94.1-aarch64-apple-darwin
+            rust-toolchain: 1.98.1-aarch64-apple-darwin
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/_build/rust
       RUSTUP_TOOLCHAIN: ${{ matrix.rust-toolchain }}
       NATIVE_OCAML_VERSION: "5.5"
-      NATIVE_RUST_VERSION: 1.94.1
+      NATIVE_RUST_VERSION: 1.98.1
       NATIVE_ARCH: ${{ matrix.architecture }}
       NATIVE_RUST_HOST: ${{ matrix.rust-host }}
     steps:
