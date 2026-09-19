@@ -221,7 +221,9 @@ val query_with_input :
     [update_id] is optional but should be supplied by callers that may retry
     after an uncertain transport result. When supplied, it must be non-empty,
     valid UTF-8, NUL-free, and no more than 65,536 bytes. The returned handle
-    can be polled independently of other workflow handles. *)
+    can be polled independently of other workflow handles. Failures already
+    returned at admission, including validator rejection, are returned directly
+    as [Error.t]. A completed successful outcome is retained in the handle. *)
 val start_update :
   ?update_id:string ->
   ('workflow_input, 'workflow_output) handle ->
@@ -231,6 +233,7 @@ val start_update :
   (('input, 'output) update_handle, Error.t) result
 
 (** Waits for an accepted update to complete and decodes its typed result.
+    Uses the admission outcome when present, otherwise polls Temporal.
     Application-level update failures and transport defects are returned as
     [Error.t] values; no expected update failure is raised as an exception. *)
 val wait_update :
