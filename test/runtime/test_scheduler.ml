@@ -51,10 +51,12 @@ let test_fifo_resume () =
   in
   let seen = ref [] in
   Scheduler.spawn scheduler (fun () ->
+      seen := "first entered" :: !seen;
       match Temporal.Future.await first with
       | Ok value -> seen := value :: !seen
       | Error error -> failwith error);
   Scheduler.spawn scheduler (fun () ->
+      seen := "second entered" :: !seen;
       match Temporal.Future.await second with
       | Ok value -> seen := value :: !seen
       | Error error -> failwith error);
@@ -62,8 +64,8 @@ let test_fifo_resume () =
   resolve_second (Ok "second");
   resolve_first (Ok "first");
   expect "complete" "complete" (Scheduler.run_label scheduler);
-  expect "resolution-order resume" [ "second"; "first" ] (List.rev !seen);
-  expect "FIFO trace" [ 0; 1; 2; 3 ] (Scheduler.trace scheduler)
+  expect "FIFO roots and resolution-order resume"
+    [ "first entered"; "second entered"; "second"; "first" ] (List.rev !seen)
 
 (** Verifies that a future rejects a second result. *)
 let test_double_resolution () =
@@ -112,12 +114,12 @@ let test_immediate_and_multiple_waiters () =
   resolve (Ok 7);
   let seen = ref [] in
   Scheduler.spawn scheduler (fun () ->
-      seen := Temporal.Future.await future :: !seen);
+      seen := ("first", Temporal.Future.await future) :: !seen);
   Scheduler.spawn scheduler (fun () ->
-      seen := Temporal.Future.await future :: !seen);
+      seen := ("second", Temporal.Future.await future) :: !seen);
   expect "immediate complete" "complete" (Scheduler.run_label scheduler);
-  expect "immediate values" [ Ok 7; Ok 7 ] !seen;
-  expect "spawn trace" [ 0; 1 ] (Scheduler.trace scheduler)
+  expect "immediate values and spawn order"
+    [ ("first", Ok 7); ("second", Ok 7) ] (List.rev !seen)
 
 (** Covers error mapping and rejection of futures from different schedulers. *)
 let test_map_error_and_owner_check () =
@@ -435,7 +437,7 @@ let test_settled_future_releases_payload () =
   in
   let scheduler, weak = settled_scheduler () in
   Gc.full_major ();
-  ignore (Scheduler.trace scheduler);
+  ignore (Sys.opaque_identity scheduler);
   if Option.is_some (Weak.get weak 0) then
     failwith "settled future retained its payload through scheduler teardown"
 
@@ -449,9 +451,7 @@ let test_shutdown_skips_queued_root_thunks () =
   Scheduler.spawn scheduler (fun () -> ran_after_shutdown := true);
   expect "shutdown drain" "complete" (Scheduler.run_label scheduler);
   if !ran_after_shutdown then
-    failwith "queued root thunk ran after scheduler shutdown";
-  expect "shutdown trace excludes skipped thunk" [ 0 ]
-    (Scheduler.trace scheduler)
+    failwith "queued root thunk ran after scheduler shutdown"
 
 (** A derived future observer queued by a running thunk must become inert when
     a later thunk shuts down the scheduler before that observer is drained.
@@ -523,7 +523,33 @@ let test_shutdown_rejects_derived_await () =
   | Some (Ok _) -> failwith "derived await succeeded after scheduler shutdown"
   | None -> failwith "derived await was not evaluated"
 
+(** Draining callbacks must not retain a history proportional to elapsed work.
+    Measure live words after full collections, not heap capacity or allocations.
+    Keeping the scheduler live after each measurement prevents a false pass
+    caused by collecting the scheduler itself. The allowance is deliberately
+    much larger than fixed bookkeeping, but smaller than one trace batch. *)
+let test_drained_callbacks_release_memory () =
+  let scheduler = Scheduler.create () in
+  Scheduler.spawn scheduler (fun () -> ());
+  expect "memory warmup" "complete" (Scheduler.run_label scheduler);
+  Gc.full_major ();
+  let baseline = (Gc.stat ()).live_words in
+  for batch = 1 to 3 do
+    for _ = 1 to 10_000 do
+      Scheduler.spawn scheduler (fun () -> ());
+      ignore (Scheduler.run scheduler)
+    done;
+    Gc.full_major ();
+    let retained = (Gc.stat ()).live_words - baseline in
+    ignore (Sys.opaque_identity scheduler);
+    if retained > 4_096 then
+      failwith (Printf.sprintf "drained callbacks retained %d words after batch %d"
+        retained batch)
+  done;
+  Scheduler.shutdown scheduler
+
 let () =
+  test_drained_callbacks_release_memory ();
   test_fifo_resume ();
   test_double_resolution ();
   test_combinators ();

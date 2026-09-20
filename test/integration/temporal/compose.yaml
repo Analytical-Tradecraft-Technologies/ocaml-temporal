@@ -8,6 +8,10 @@ services:
       args:
         OCAML_IMAGE: ${OCAML_IMAGE:-ocaml/opam:debian-12-ocaml-5.2}
     working_dir: /workspace
+    environment:
+      # All worker/driver services extend dev, including isolated Dune trees.
+      TEMPORAL_RUST_BRIDGE_DIR: ${TEMPORAL_RUST_BRIDGE_DIR:-}
+      TEMPORAL_RUST_BRIDGE_KEY: ${TEMPORAL_RUST_BRIDGE_KEY:-}
     volumes:
       - ../../..:/workspace
     init: true
@@ -292,10 +296,8 @@ services:
       SMOKE_CACHE_EVICTION_SECOND_READY_FILE: /workspace/test/integration/temporal/.cache-eviction-second-ready
       SMOKE_REPLAY_DIAGNOSTICS_FILE: /workspace/test/integration/temporal/.restart-replay-diagnostics.json
     command:
-      - timeout
-      - --signal=TERM
-      - --kill-after=10s
-      - "${SMOKE_CACHE_EVICTION_TIMEOUT_SECONDS:-900}"
+      - sh
+      - /workspace/test/integration/temporal/scripts/run-cache-eviction-driver.sh
       - opam
       - exec
       - --

@@ -1,0 +1,41 @@
+name: Rust bridge producer
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        required: true
+        type: string
+      platform:
+        required: true
+        type: string
+    outputs:
+      key:
+        description: Verified bridge identity for the OCaml consumers
+        value: ${{ jobs.build.outputs.key }}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Rust / ${{ inputs.platform }}
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 30
+    outputs:
+      key: ${{ steps.bridge.outputs.key }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+      - name: Reclaim disposable GitHub-hosted runner disk
+        if: inputs.runner == 'ubuntu-24.04' && runner.environment == 'github-hosted'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+      - name: Prepare verified Rust bridge
+        id: bridge
+        uses: ./.github/actions/rust-bridge
+        with:
+          platform: ${{ inputs.platform }}
+          mode: docker

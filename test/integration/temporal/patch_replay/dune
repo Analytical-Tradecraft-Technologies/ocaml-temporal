@@ -7,7 +7,7 @@
  (name temporal_patch_replay_support)
  (wrapped false)
  (modules patch_replay_support)
- (libraries temporal-sdk unix))
+ (libraries temporal-sdk temporal_acceptance_observer unix))
 
 (executable
  (name legacy_worker)

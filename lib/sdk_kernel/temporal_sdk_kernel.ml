@@ -15,5 +15,5 @@ module Native_worker_execution = Temporal_runtime.Native_worker_execution
 module Native_activity_execution = Temporal_runtime.Native_activity_execution
 module Native_worker_loop = Temporal_runtime.Native_worker_loop
 module Native_worker_policy = Temporal_runtime.Native_worker_policy
-module Workflow_role_checkpoint = Temporal_runtime.Workflow_role_checkpoint
+module Native_worker_observer = Temporal_runtime.Native_worker_observer
 module Future = Temporal_future_kernel

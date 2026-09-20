@@ -15,6 +15,5 @@
   test_scope_server_cancel
   test_workflow_time
   test_condition
-  test_workflow_role_checkpoint
   test_external_workflow)
  (libraries temporal-sdk temporal_runtime))

@@ -1,0 +1,18 @@
+(library
+ (name cache_eviction_wait)
+ (modules cache_eviction_wait)
+ (libraries unix))
+
+(test
+ (name test_cache_eviction_wait)
+ (modules test_cache_eviction_wait)
+ (libraries cache_eviction_wait unix))
+
+(rule
+ (alias runtest)
+ (enabled_if (= %{system} linux))
+ (deps test_watchdog.sh ../scripts/run-cache-eviction-driver.sh)
+ (action
+  (run sh %{dep:test_watchdog.sh}
+   %{dep:../scripts/run-cache-eviction-driver.sh}
+   %{exe:test_cache_eviction_wait.exe})))

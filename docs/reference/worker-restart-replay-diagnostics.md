@@ -75,6 +75,42 @@ cannot compare two separate files.
 
 ## Replay diagnostics
 
+The non-installed fixture library
+[`Acceptance_observer`](../../test/integration/temporal/observer/acceptance_observer.ml)
+owns the `SMOKE_WORKER_*` replay/cache and parent/child diagnostic
+configuration, JSON validation, checkpoint state, and file writes. The smoke,
+cache, parent/child, and patch workers explicitly call its `with_worker` helper
+around one public `Worker.create`. Ordinary installed workers ignore those
+settings, including malformed values; the public package API is unchanged.
+
+The generic private
+[`Native_worker_observer`](../../lib/runtime/native_worker_observer.mli)
+only supplies construction-scoped callback selection. Scopes are isolated
+between Domains and systhreads, nest in stack order, and are restored on typed
+failure or exception. Configuration validation precedes native allocation.
+After successful construction the adapter owns the callbacks and invokes them
+synchronously under its existing mutex. Observers must not re-enter worker
+operations or retain native resources.
+
+Activation callbacks retain the existing pre-execution metadata semantics.
+Their exceptions follow the typed failure-completion path, so they cannot
+escape with an unacknowledged lease. Cache-ready and cache-full markers are
+written by the completion callback only after Core acknowledges the relevant
+completion, including retained retries. A completion-observer exception is
+contained and reported without repeating a retired lease; a missing marker
+therefore fails the acceptance controller. Atomic file replacement removes
+temporary files on failure. Replay metadata remains observation evidence and
+must still be combined with the controller's exact-run durable history checks.
+
+`make test-runtime` exercises the actual fixture callbacks with a deterministic
+native lease source, including acknowledgement retries, observer write failures,
+temporary-file cleanup, role identity, and construction-scope isolation.
+`make test-install` proves that an ordinary installed consumer cannot import
+the injection or fixture modules and that legacy settings do not alter native
+configuration behavior. Setting `TEMPORAL_TEST_INSTALLED_WORKER_ADDRESS` inside
+the test container additionally checks successful native creation and shutdown
+against a live server.
+
 The worker diagnostics document follows
 [`restart-replay-diagnostics.schema.json`](../schemas/acceptance/restart-replay-diagnostics.schema.json):
 
@@ -213,3 +249,22 @@ run](https://github.com/mfow/ocaml-temporal/actions/runs/29286560471) passed the
 original sequence. An earlier local attempt was stopped by Docker
 storage/daemon failure before readiness; that infrastructure failure is not
 part of the live evidence.
+
+## Cache-eviction deadline diagnostics
+
+The cache-eviction driver retains its existing 900-second process budget.
+`run-cache-eviction-driver.sh` establishes one absolute marker deadline before
+compilation/startup, reserving 10% of that budget (at least one second, at most
+30 seconds) for reporting and shutdown. Both marker waits inherit this deadline;
+advancing to another phase never resets it. Timeout overrides must be integer
+seconds between 2 and 86400. A direct invocation without the wrapper retains the
+local wait budget for manual diagnosis.
+
+The driver prints both exact execution identities and reports its marker error
+before attempting client shutdown. The diagnostic distinguishes a missing
+cache-full eviction with B acknowledged from neither observation arriving.
+The outer watchdog remains a failure if startup, an RPC, or shutdown hangs.
+Fixing the ordering does not establish the cause of a cache-eviction stall.
+The Docker-free marker tests and Linux wrapper regression run with `dune runtest
+test/integration/temporal/cache_wait`; the live gate remains
+`make test-temporal-worker-cache-eviction OCAML_VERSION=5.5`.

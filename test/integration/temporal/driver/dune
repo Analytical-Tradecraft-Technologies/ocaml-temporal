@@ -14,4 +14,4 @@
 
 (executable
  (name cache_eviction_driver)
- (libraries temporal-sdk temporal_two_binary_smoke_common unix))
+ (libraries temporal-sdk temporal_two_binary_smoke_common cache_eviction_wait unix))

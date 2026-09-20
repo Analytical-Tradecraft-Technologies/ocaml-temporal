@@ -490,8 +490,10 @@ module Make (Supervisor : SUPERVISOR) = struct
     (* Existential workflow definitions, built and validated before the state
        record is published. *)
     definitions : registered_definition Run_map.t;
-    (* Active workflow executions keyed by the exact Temporal run ID. A run is
-       removed only after a terminal or failure completion is acknowledged. *)
+    (* Cached workflow executions keyed by the exact Temporal run ID. Terminal
+       runs retain queryable state until Core eviction; their schedulers and
+       continuations are already shut down. Adapter failures also remove runs
+       after their failure completion is acknowledged. *)
     mutable runs : run Run_map.t;
     (* Owned copies of completions whose source acknowledgement failed. The
        value remains here until the exact same completion is accepted. *)
@@ -720,14 +722,14 @@ module Make (Supervisor : SUPERVISOR) = struct
           report Logs.Warning ~operation:"workflow_completion_diagnostic_failed" ())
 
   (** Applies bookkeeping only after the supervisor acknowledges a retained
-      completion. This is the single release point for both normal and
-      adapter-generated failure completions. *)
+      completion. The copied completion is released here, while a successfully
+      completed run keeps its final query state until Core eviction. *)
   let accepted_pending adapter pending =
     adapter.pending <- Run_map.remove pending.run_id adapter.pending;
     match pending.result with
     | Pending_completed
         { command_count; terminal; evicted; activation_info } ->
-        if terminal || evicted then drop_run adapter pending.run_id;
+        if evicted then drop_run adapter pending.run_id;
         notify_completion adapter activation_info;
         report Logs.Debug ~operation:"workflow_activation_completed" ();
         Ok
@@ -905,8 +907,8 @@ module Make (Supervisor : SUPERVISOR) = struct
     end
 
   (** A cache-eviction activation is acknowledged with a successful empty
-      completion even when its workflow run has already been removed after a
-      terminal completion. This uses the retained-completion path rather than
+      completion even when its workflow run has already been removed after an
+      adapter failure. This uses the retained-completion path rather than
       the ordinary submission path: if the native completion call raises, the
       exact empty acknowledgement remains pending for a later retry and is
       never replaced by an invalid failure command. *)
@@ -966,7 +968,7 @@ module Make (Supervisor : SUPERVISOR) = struct
             with
             | Some _, None ->
                 (* Core can evict a run after the OCaml registry has already
-                   removed it for a terminal completion. The eviction still
+                   removed it for an adapter failure. The eviction still
                    owns a native lease and must receive the exact successful
                    empty completion; a failure command is invalid here. *)
                     submit_eviction_acknowledgement adapter activation
