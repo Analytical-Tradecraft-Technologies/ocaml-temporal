@@ -7,8 +7,9 @@ RUN rustup component add clippy rustfmt
 FROM ${OCAML_IMAGE}
 
 USER root
-RUN apt-get update \
-    && apt-get install --no-install-recommends -y \
+# Retry transient package downloads without retrying the build or test suite.
+RUN apt-get -o Acquire::Retries=3 update \
+    && apt-get -o Acquire::Retries=3 install --no-install-recommends -y \
         libprotobuf-dev \
         protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
