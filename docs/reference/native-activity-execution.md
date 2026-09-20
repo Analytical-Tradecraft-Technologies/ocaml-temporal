@@ -131,7 +131,11 @@ adapter mutex:
    Temporal failure without text conversion; metadata still follows the
    runtime's strict UTF-8 key/value rules rather than becoming an unvalidated
    side channel.
-5. Validate the completion through the strict activity-protocol encoder.
+5. Validate the entire completion through the strict activity-protocol encoder
+   before admitting it to the pending-completion map. Invalid application
+   metadata (including duplicate or oversized keys) becomes a bounded,
+   non-retryable application failure with no details, retaining the exact task
+   token. Validate that replacement before admitting it too.
 6. Submit the completion to the supervisor and remove the token only after the
    supervisor returns `Ok ()`.
 
@@ -295,6 +299,15 @@ has already run.  Before polling a new task, `poll` retries one pending
 completion.  It never invokes the activity implementation again for that
 token.  A typed supervisor error or an exception leaves the completion in the
 map and returns an error to the caller because lease retirement is not proven.
+
+Only locally validated completions enter this map. A malformed application
+payload therefore cannot permanently block later activities or make
+`Worker.run` fail with a local protocol error. Once submission begins, even a
+replacement failure remains unchanged across uncertain transport outcomes;
+the adapter retires its token only after confirmed acceptance. The
+`smoke.activity_invalid_failure_details` live acceptance scenario exercises
+duplicate keys, oversized keys, and malformed UTF-8 through the public worker,
+requiring a normal activity to complete after each rejected failure.
 
 The token is copied on receipt, copied again into the completion, and never
 converted to a string.  This preserves arbitrary binary tokens, prevents

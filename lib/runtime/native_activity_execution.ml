@@ -822,28 +822,26 @@ module Make (Supervisor : SUPERVISOR) = struct
             Error error
         | _ -> operation_result))
 
-  (** Calls native completion after validation and preserves lease uncertainty
-      when either a typed native error or an exception is returned. *)
+  (** Submits an already validated, owned completion and preserves lease
+      uncertainty when a typed native error or an exception is returned. Local
+      validation happens before admission to the pending-completion map. *)
   let attempt_completion supervisor completion =
-    match validate_completion completion with
-    | Error error -> Rejected_by_supervisor error
-    | Ok () -> (
-        try
-          match Supervisor.complete_activity supervisor completion with
-          | Ok () -> Accepted
-          | Error source_error ->
-              let source =
-                supervisor_error ~path:"$.completion"
-                  ~retryable:(source_error_is_retryable source_error)
-                  ~error_code:Supervisor.error_code
-                  ~error_message:Supervisor.error_message source_error
-              in
-              Rejected_by_supervisor
-                (make_error ~path:"$.completion" ~retryable:source.retryable
-                   "completion_failed"
-                   (Printf.sprintf "supervisor rejected completion (%s): %s"
-                      source.code source.message))
-        with exception_ -> Raised_by_supervisor exception_)
+    try
+      match Supervisor.complete_activity supervisor completion with
+      | Ok () -> Accepted
+      | Error source_error ->
+          let source =
+            supervisor_error ~path:"$.completion"
+              ~retryable:(source_error_is_retryable source_error)
+              ~error_code:Supervisor.error_code
+              ~error_message:Supervisor.error_message source_error
+          in
+          Rejected_by_supervisor
+            (make_error ~path:"$.completion" ~retryable:source.retryable
+               "completion_failed"
+               (Printf.sprintf "supervisor rejected completion (%s): %s"
+                  source.code source.message))
+    with exception_ -> Raised_by_supervisor exception_
 
   (** Inserts a copied completion lease. A duplicate token is a native protocol
       violation; refusing to overwrite the existing lease preserves the original
@@ -946,9 +944,10 @@ module Make (Supervisor : SUPERVISOR) = struct
                      }))
         end
 
-  (** Creates, records, and submits one completion. Recording precedes the
-      native call so the worker's explicit retry policy can inspect an exact
-      retained completion; only a [Retryable] source classification may
+  (** Validates, records, and submits one completion. Invalid application data
+      becomes a bounded failure before anything is retained for transport retry.
+      Recording still precedes the native call so uncertain submissions retain
+      their exact completion; only a [Retryable] source classification may
       authorize resubmission, while generic transport failures remain
       fail-closed. *)
   let enqueue_and_finish adapter ~token ~activity_type ~completion
@@ -957,6 +956,25 @@ module Make (Supervisor : SUPERVISOR) = struct
     let token = Bytes.copy token in
     let completion =
       Protocol.{ completion with task_token = Bytes.copy completion.task_token }
+    in
+    let* completion, accepted_result =
+      match validate_completion completion with
+      | Ok () -> Ok (completion, accepted_result)
+      | Error error ->
+          (* No native submission has occurred. Do not retain an invalid value
+             that every subsequent poll would reject, and do not admit an async
+             handle when its handoff was replaced with a task failure. *)
+          (match accepted_result with
+          | Async_handoff handle -> ignore (Async_activity.close handle)
+          | Completed_result _ | Rejected_result _ -> ());
+          let fallback =
+            Protocol.{ task_token = Bytes.copy token;
+              result = Failed (failure_of_error error) }
+          in
+          (* A malformed supervisor token cannot be repaired by dropping
+             application details. Validate the fallback too, before admission. *)
+          let* () = validate_completion fallback in
+          Ok (fallback, Rejected_result error)
     in
     let lease = { token; activity_type; completion; accepted_result } in
     match add_lease adapter lease with

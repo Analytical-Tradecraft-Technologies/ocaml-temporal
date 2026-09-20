@@ -296,6 +296,7 @@ let run () =
                 Worker.workflow Definitions.activity_timeout_retry;
                 Worker.workflow Definitions.activity_heartbeat_timeout_retry;
                 Worker.workflow Definitions.activity_non_retryable_failure;
+                Worker.workflow Definitions.activity_invalid_failure_details;
                 Worker.workflow Definitions.child_retryable_failure;
                 Worker.workflow Definitions.parent_retries_child;
                 Worker.workflow Definitions.child_after_timer;
@@ -322,6 +323,7 @@ let run () =
                 Worker.activity Definitions.timeout_retry_activity;
                 Worker.activity Definitions.heartbeat_timeout_retry_activity;
                 Worker.activity Definitions.non_retryable_activity;
+                Worker.activity Definitions.invalid_failure_details_activity;
                 Worker.activity Definitions.child_retry_activity;
                 Worker.activity Definitions.cancellation_ready_activity;
                 Worker.activity Definitions.signal_condition_ready_activity;

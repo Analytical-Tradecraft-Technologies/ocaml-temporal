@@ -20,6 +20,56 @@ let mock_transform =
     ~input:Temporal.Codec.string ~output:Temporal.Codec.string (fun input ->
       Ok (String.uppercase_ascii input))
 
+(** Supplies invalid application failure details through the public activity
+    API. Each case must become a valid, non-retryable task failure rather than
+    stopping the worker or poisoning its completion retry queue. *)
+let invalid_failure_details_activity =
+  Temporal.Activity.define ~name:"smoke.invalid_failure_details_activity"
+    ~input:Temporal.Codec.string ~output:Temporal.Codec.string (fun case ->
+      let metadata =
+        match case with
+        | "duplicate" -> [ ("encoding", "one"); ("encoding", "two") ]
+        | "oversized" -> [ (String.make 65_537 'k', "value") ]
+        | _ -> [ ("encoding", "\255") ]
+      in
+      let detail =
+        Temporal.Codec.{ metadata; data = Bytes.of_string "invalid detail" }
+      in
+      Error
+        (Temporal.Error.make ~category:`Activity ~details:[ detail ]
+           ~message:"invalid activity failure details" ()))
+
+(** Requires a normal activity to complete after each malformed failure on the
+    same public worker. The workflow also checks that the fallback drops the
+    invalid details and cannot cause a server retry loop. *)
+let activity_invalid_failure_details =
+  Temporal.Workflow.define ~name:"smoke.activity_invalid_failure_details"
+    ~input:Temporal.Codec.string ~output:Temporal.Codec.string (fun _input ->
+      (* Exercise each case sequentially so later work proves the preceding
+         failure's completion was accepted and its lease retired. *)
+      let rec check = function
+        | [] -> Ok "SMOKE:INVALID_FAILURE_DETAILS:RECOVERED"
+        | case :: remaining -> (
+            match Temporal.Activity.execute invalid_failure_details_activity case with
+            | Ok _ ->
+                Error (Temporal.Error.defect ~message:"invalid activity succeeded")
+            | Error error ->
+                let view = Temporal.Error.view error in
+                if view.category <> `Activity || not view.non_retryable
+                   || view.details <> [] then
+                  Error
+                    (Temporal.Error.defect
+                       ~message:"invalid activity details were not safely rejected")
+                else
+                  match Temporal.Activity.execute mock_transform case with
+                  | Error error -> Error error
+                  | Ok value when String.equal value (String.uppercase_ascii case) ->
+                      check remaining
+                  | Ok _ ->
+                      Error (Temporal.Error.defect ~message:"next activity result changed"))
+      in
+      check [ "duplicate"; "oversized"; "invalid-utf8" ])
+
 (** The typed signal used by the live interaction scenario. The definition
     carries the same string codec in the driver and worker processes, so the
     client-side request and worker-side handler cannot silently disagree about
