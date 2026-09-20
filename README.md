@@ -45,135 +45,47 @@ opaque bytes and applications may choose another deterministic codec.
 
 ## What works now
 
-| Area | Current status |
+The audited source is [`beae10d0a58e`](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/commit/beae10d0a58e58fb8e076734cd38113d7a2b4466).
+Its [September 19 Build run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/35469570419)
+passed the Linux/native build matrix and a separate Linux OCaml 5.5
+Temporal/PostgreSQL live job. The [live evidence reference](docs/reference/live-acceptance-coverage.md)
+links the exact tests, controller commands, and limits; build success on other
+platforms does not establish live compatibility there.
+
+| Area | Current evidence and boundary |
 | --- | --- |
-| Workflow authoring | Ordinary OCaml functions, typed `result` errors, codecs, timers, activities, futures, workflow-local conditions, cooperative cancellation scopes, and deterministic replay-oriented scheduling are implemented and covered by unit tests. |
-| Synthetic execution | The in-memory runtime exercises activity and child-workflow scheduling, timer resolution, cancellation, replay, future aggregation, and cache cleanup without a server. |
-| Workflow patching | `Temporal.Workflow.patched` implements initial patch-in, and unit-returning `Temporal.Workflow.deprecate_patch` records the next lifecycle phase without exposing a branch decision. Focused runtime/native tests cover decisions, active/deprecated markers, mode isolation, and mixed-mode rejection. The dedicated live gate exercises marker-free→active, active→deprecated, and deprecated→removed source generations; the complete [PR #356 CI run](https://github.com/mfow/ocaml-temporal/actions/runs/29469232271) verifies all three against Temporal Server with separately compiled workers. |
-| Native worker | An HTTP(S) worker can be built with the OCaml-owned supervisor. The current native command slice polls and completes workflow/activity tasks, runs OCaml implementations, handles timers and terminal/cancellation paths, drains retryable completions safely, records activity heartbeats, and supports retained asynchronous activity completion. The [PR #302 CI run](https://github.com/mfow/ocaml-temporal/actions/runs/29351689638) first live-verified a server-delivered, non-immediate activity retry under a policy configured with a two-second backoff and required the exact `SMOKE:BACKOFF:RETRIED:SMOKE` result. The fixture rejects retries delivered in under one second, so this evidence does not measure or prove the full configured delay. The complete [PR #439 CI run](https://github.com/mfow/ocaml-temporal/actions/runs/29824441578) retains that scenario in the current 26-start Compose acceptance alongside local activities, interactions, termination, and external cancellation. The [PR #298 CI run](https://github.com/mfow/ocaml-temporal/actions/runs/29346853291) separately live-verifies retry after worker replacement; the [PR #306 CI run](https://github.com/mfow/ocaml-temporal/actions/runs/29356904816) live-verifies forced generation-one crash recovery and replacement-worker replay. |
-| Native client | The HTTP(S) client path is wired to the Rust/Core client for typed workflow starts, exact workflow/run waits, exact-run cancellation, reset, termination, typed exact-run signals, output-only or exactly-one-input queries, and bounded visibility listing. Cancellation is acknowledged by the server before the caller waits on the same handle for the eventual typed cancelled terminal result; reset and termination target the retained exact run, while visibility returns one bounded page. Signal acknowledgement likewise does not claim that a worker handler has already run. Workflow-to-workflow signal delivery and exact-run external cancellation are live-verified by the [PR #431 Build run](https://github.com/mfow/ocaml-temporal/actions/runs/29679213525), including rejection of a mismatched run ID before acknowledgement; the complete [PR #439 run](https://github.com/mfow/ocaml-temporal/actions/runs/29824441578) verifies the current 26-start baseline and records mismatched-run cancellation rejection as a retryable workflow error with `non_retryable=false`. Earlier runs remain linked below as historical evidence for smaller slices. |
-| Local development | Docker Compose supplies the OCaml development image and a separate real Temporal Server backed by PostgreSQL. Make targets are the supported interface. |
-| Safety boundary | Rust/Core protobuf handling stays in Rust. OCaml/Rust JSON validation, copied payloads, one-owner lifecycle serialization, and idempotent cleanup are covered by focused tests. |
+| Workflow authoring | Typed definitions, codecs, direct-style suspension, futures, conditions, deterministic time/randomness, and cancellation scopes have focused unit/runtime tests. Live fixtures exercise timer/activity/child waits and selected replay paths. |
+| Activities | Remote execution, retries, heartbeat details/timeouts, non-immediate retry, and retained asynchronous completion have live scenarios. `smoke.local_activity` live-verifies local activity success; local retry/backoff and cancellation variants have focused tests, not a complete live conformance suite. |
+| Child workflows | Success, propagated failure, explicit child cancellation, child retry, and duplicate-ID start failure are live-tested. Separate controllers verify exact parent/child replay after worker replacement and a child failing after replay while its parent recovers. |
+| Client and interactions | Exact-run start/wait/cancel/terminate, continue-as-new following, direct and external signals, both query forms, typed update completion, unknown-handler rejection, and external cancellation have live assertions. External signal rejection against a completed target and wrong-run cancellation rejection are also exercised. Reset, visibility, and interaction recovery/deadline coverage remain incomplete. |
+| Recovery and patching | Live controllers exercise graceful replacement, forced crash recovery, sticky-cache eviction, parent/child recovery, and marker-free to active, active to deprecated, and deprecated to removed patch histories. These fixtures do not establish arbitrary-history compatibility. |
+| Cancellation | [`Temporal.Scope`](docs/reference/workflow-scopes.md) wakes observers and invokes exactly-once cancellation hooks for remote activities and child workflows started with `~scope`. This is implemented and focused-tested; it does not preempt an activity callback or implicitly cancel timers or losing futures. |
+| Native boundary | An OCaml-owned supervisor manages the private C/Rust/Core graph. Focused tests cover copied payloads, strict protocol validation, handle ownership, retryable completion drainage, and shutdown. |
 
 ## What is deliberately still pending
 
-- The two-public-OCaml-binary gate now has 26 top-level workflow starts. The
-  driver begins with the activity, child, continuation, and signal corpus, then
-  stages direct and workflow-to-workflow interactions, update handling,
-  duplicate-ID child-start failure, termination, external cancellation, and the
-  start-to-close and heartbeat-timeout retry scenarios after the shorter
-  heartbeat path and includes a two-second-backoff retry whose second callback
-  rejects an immediate retry. It waits for the signal workflow's worker-visible readiness
-  marker before signaling it, observes delayed asynchronous completion, follows
-  a continue-as-new successor, checks the activity-level non-retryable policy
-  result, and requires a child workflow to reach its second server-owned retry
-  attempt. The complete [PR #439 CI
-  run](https://github.com/mfow/ocaml-temporal/actions/runs/29824441578) verifies
-  all 26 starts and their terminal assertions against Temporal Server and
-  PostgreSQL. The [PR #302 CI
-  run](https://github.com/mfow/ocaml-temporal/actions/runs/29351689638) is the
-  first live evidence for the long-backoff result, while the [PR #289
-  run](https://github.com/mfow/ocaml-temporal/actions/runs/29339077368) remains
-  evidence for the earlier seventeen-result slice. The [PR #277
-  run](https://github.com/mfow/ocaml-temporal/actions/runs/29318684069) remains
-  evidence for the prior fifteen-result slice, and [PR #266](https://github.com/mfow/ocaml-temporal/actions/runs/29311239247)
-  remains the focused evidence for the earlier thirteen-result signal path.
-  The separate restart/replay controller now also requires the replacement
-  worker to complete the retrying activity at attempt two; the exact result
-  marker proves the retry because Temporal compacts intermediate activity
-  retry events out of workflow history. The [PR #298 CI
-  run](https://github.com/mfow/ocaml-temporal/actions/runs/29346853291)
-  live-verifies that extension against Temporal Server and PostgreSQL.
-  Forced worker crash recovery is live-verified by the separate
-  `make test-temporal-worker-crash-recovery` gate and the [PR #306 CI run](https://github.com/mfow/ocaml-temporal/actions/runs/29356904816);
-  sticky-cache eviction is live-verified by the complete [PR #438
-  run](https://github.com/mfow/ocaml-temporal/actions/runs/29805397413); the
-  earlier [PR #322 run](https://github.com/mfow/ocaml-temporal/actions/runs/29402103748)
-  is historical evidence for the original gate. Exact parent/child
-  restart-replay is live-verified by the complete [PR #351
-  run](https://github.com/mfow/ocaml-temporal/actions/runs/29434016013), while
-  broader child failure recovery and cache/recovery cases remain separate work.
-- Child-workflow commands can be authored and are translated by the semantic
-  layer. The native worker now accepts a parent completion containing a child
-  start, retains the parent future through the start acknowledgment, and
-  resumes it from a later terminal child-resolution activation. Focused Rust,
-  OCaml, and fixture tests cover this protocol and lifecycle; the two-binary
-  Compose acceptance now proves successful, failed, and cancelled parent/child
-  paths against Temporal Server, including a child that retries to a second
-  server-owned attempt and a duplicate-ID child-start failure. The complete
-  [PR #351 run](https://github.com/mfow/ocaml-temporal/actions/runs/29434016013)
-  additionally verifies exact parent and child replay through worker
-  replacement; broader child failure recovery remains follow-up work.
-- [`Temporal.Scope`](docs/reference/workflow-scopes.md) provides an
-  experimental, workflow-local cancellation boundary for observing futures.
-  It returns typed cancellation and ownership errors without blocking an OS
-  thread, but it is intentionally cooperative: cancelling a scope does not
-  emit Temporal activity or child-workflow cancellation commands. Use activity
-  cancellation options or the public client/external-workflow cancellation
-  operation when the Temporal execution itself must be cancelled. The local
-  scope remains cooperative; those server-side cancellation paths are live-
-  verified separately.
-- `Temporal.Workflow.patched` supports initial patch-in and
-  `Temporal.Workflow.deprecate_patch` provides the focused-tested deprecation
-  phase. The
-  dedicated `make test-temporal-workflow-patching` target first checks an
-  offline contract and then exercises marker-free, active-marker, and
-  deprecated-marker histories across four separately compiled worker sources.
-  The complete [PR #348 CI
-  run](https://github.com/mfow/ocaml-temporal/actions/runs/29411260374)
-  live-verifies the two original patch-in scenarios; the complete [PR #356 CI
-  run](https://github.com/mfow/ocaml-temporal/actions/runs/29469232271) also
-  verifies active-to-deprecated and deprecated-to-removed replacement. Legacy
-  build-ID and modern deployment-based worker routing are now available
-  through `Temporal.Worker.Options` and the private Core bridge. Arbitrary
-  historical compatibility and migration tooling remain pending.
-- Typed signal, query, and update definitions plus deterministic local handler
-  dispatch are available as an experimental slice. Native signal delivery,
-  output-only and exactly-one-input query delivery, immediate one-input
-  non-suspending updates, and
-  deterministic condition waits are implemented and focused-tested. Signal
-  delivery and condition wake-up are also covered by the [PR #289 Compose
-  run](https://github.com/mfow/ocaml-temporal/actions/runs/29339077368);
-  output-only and typed-input query acceptance are live-verified by the [PR
-  #434 run](https://github.com/mfow/ocaml-temporal/actions/runs/29684113836),
-  and live update admission/completion is verified by the [PR #428
-  run](https://github.com/mfow/ocaml-temporal/actions/runs/29676120429) plus
-  the unregistered-handler rejection in the [PR #432
-  run](https://github.com/mfow/ocaml-temporal/actions/runs/29681119024).
-  Workflow-to-workflow signal delivery and exact-run external cancellation are
-  live-verified by the [PR #431 Build
-  run](https://github.com/mfow/ocaml-temporal/actions/runs/29679213525); the
-  [PR #439 run](https://github.com/mfow/ocaml-temporal/actions/runs/29824441578)
-  pins a mismatched run ID to a retryable workflow error with
-  `non_retryable=false`. Missing or already-completed targets and replay
-  interaction remain separate live scenarios.
-  Suspended update continuations, query deadlines and replay/cache-recovery
-  behavior, richer handler policies, full workflow-code versioning, Nexus, and
-  the remaining cross-SDK parity surface remain roadmap work.
-  Experimental local activities have focused protocol, bridge, and runtime
-  coverage but still need live acceptance. Continue-as-
-  new is implemented and locally tested at the workflow/native bridge boundary
-  and is verified by the [PR #253 Compose run](https://github.com/mfow/ocaml-temporal/actions/runs/29286560471).
-  Context-aware activity heartbeats are live-verified for a server-delivered
-  heartbeat detail and retry; timeout-triggered retry and delayed asynchronous
-  completion are also covered. The complete [PR #277 CI
-  run](https://github.com/mfow/ocaml-temporal/actions/runs/29318684069) additionally
-  verifies heartbeat-timeout retry and activity-level non-retryable error-type
-  matching. Native typed-input query acceptance and update admission/completion
-  are live-verified by the [PR #434
-  run](https://github.com/mfow/ocaml-temporal/actions/runs/29684113836) and the
-  [PR #428 run](https://github.com/mfow/ocaml-temporal/actions/runs/29676120429);
-  exact-run termination is live-verified by the [PR #433
-  run](https://github.com/mfow/ocaml-temporal/actions/runs/29683521094).
-  Reset, visibility, query deadlines and replay/cache-recovery behavior,
-  suspended update continuations, and the remaining interaction lifecycle work
-  remain separate work.
-- The public API, native protocol, and Temporal Core pin remain experimental
-  and may change before a stable release.
+- The SDK remains experimental and pre-`0.1.0`. A v1 support/compatibility
+  decision is tracked in [#489](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/489);
+  implemented or live-tested behavior is not a production support promise.
+- HTTP(S) endpoint configuration exists, but public authentication, custom
+  trust/mTLS/API-key configuration and secure-endpoint acceptance remain work.
+  The live fixture uses a local plaintext Temporal endpoint.
+- Running activity callbacks are serialized. Scope cancellation commands,
+  activity task cancellation, and worker shutdown are separate mechanisms;
+  application-visible cooperative callback cancellation and bounded operational
+  shutdown qualification remain incomplete.
+- A public replay API/history tool, wider history and Server/Core compatibility
+  corpora, local-activity recovery, worker deployment routing acceptance,
+  suspended-update recovery, and broader failure/load testing remain open.
+- Schedules, Nexus, interceptors, workflow side effects, and other parity work
+  remain incomplete. Release preflight and package tests exist; release delivery,
+  provenance, upgrade rehearsal, and operational qualification are separate gates.
 
-Read [the workflow guide](docs/guides/workflows.md) for the supported authoring
-model and [the documentation guide](docs/README.md) for the status of each
-layer.
+See [feature coverage](docs/reference/feature-coverage.md) for the focused-test
+boundary and [live acceptance coverage](docs/reference/live-acceptance-coverage.md)
+for named scenarios and reproducible commands. The [generated inventory](docs/reference/live-acceptance-inventory.md)
+tracks current controller and fixture definitions without repeating stale start
+totals throughout the documentation.
 
 ## Quick start
 
@@ -256,53 +168,25 @@ not part of the public OCaml API.
 ### The real Temporal smoke
 
 `make test-temporal-integration` starts the pinned Temporal Server and
-PostgreSQL containers under `test/integration/temporal/` from a fresh Compose
-project. It waits for both SQL schemas and the Temporal frontend to be healthy,
-runs the OCaml supervisor lifecycle acceptance executable, starts a public
-OCaml worker, and runs a separate public OCaml driver. The worker is the
-long-lived process that registers and executes the workflows and mock activity.
-The driver is a one-shot OCaml test runner: it does not register a worker. Its
-current implementation stages 26 top-level workflow starts, including delayed
-asynchronous activity completion, local activity execution, activity-level
-non-retryable policy matching, typed queries, direct and workflow-to-workflow
-signals, updates, termination, external cancellation, continue-as-new, and the
-duplicate-ID child-start-failure parent. Its long-backoff retry rejects an
-immediate second callback, while the start-to-close and heartbeat-timeout retry
-workflows are serialized after the shorter heartbeat path. It waits for exact
-worker-visible readiness markers before control operations, checks every
-terminal outcome, and exits nonzero if any assertion fails. The complete [PR
-#439 CI run](https://github.com/mfow/ocaml-temporal/actions/runs/29824441578)
-passed the current 26-start baseline against Temporal Server 1.31 and
-PostgreSQL. The [PR #302 CI
-run](https://github.com/mfow/ocaml-temporal/actions/runs/29351689638) first
-verified the long-backoff result, and the [PR #289 CI
-run](https://github.com/mfow/ocaml-temporal/actions/runs/29339077368) remains
-evidence for the earlier seventeen-result slice. The [PR #277 CI
-run](https://github.com/mfow/ocaml-temporal/actions/runs/29318684069) remains
-evidence for the prior fifteen-result slice, the [PR #266 CI
-run](https://github.com/mfow/ocaml-temporal/actions/runs/29311239247) remains
-focused evidence for the signal path, and the earlier [PR #253 CI
-run](https://github.com/mfow/ocaml-temporal/actions/runs/29286560471) remains evidence
-for the prior twelve-result path. The earlier [PR #210 CI
-run](https://github.com/mfow/ocaml-temporal/actions/runs/29221151859)
-live-verified the original nine assertions: four exact successes, ordinary
-activity retry, heartbeat-detail retry, parent/child success, propagated child
-failure, child cancellation, a typed non-retryable workflow failure, and
-marker-guarded exact-run cancellation. That PR was squash-merged as `f877fbf`.
-The Makefile stops the worker and checks its graceful-shutdown marker when the
-target runs.
-The target removes the PostgreSQL data volume before and after the run, so no
-database state is preserved between acceptance runs. A separate
-`make test-temporal-worker-restart` target covers graceful live worker
-replacement and replay. `make test-temporal-worker-crash-recovery` repeats the
-exact-run acceptance after a forced generation-one process kill, requiring the
-replacement worker to replay and complete before accepting the run. Broader
-child failure recovery and cache/recovery coverage remain follow-up work;
-sticky-cache eviction is live-verified by the complete [PR #438
-run](https://github.com/mfow/ocaml-temporal/actions/runs/29805397413) (the
-earlier PR #322 run is historical evidence), exact parent/child restart-replay
-by PR #351, and child retry plus duplicate-ID child-start failure by PR #289
-above.
+PostgreSQL containers from a fresh Compose project, checks SQL/frontend health,
+runs the Core lifecycle test, then runs a public OCaml worker and an independent
+public OCaml client driver. The driver stages the workflows in the
+[generated inventory](docs/reference/live-acceptance-inventory.md), waits for
+worker-visible readiness before control operations, and checks exact-run terminal
+outcomes. The timeout retry fixtures are serialized after the shorter heartbeat
+path so a busy callback lane cannot masquerade as a server timeout test.
+
+The [audited live job](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/35469570419/job/105967951226)
+passed with Temporal Server 1.32.0 and PostgreSQL 18.6 on Linux OCaml 5.5.
+It also executed the separate restart, crash recovery, cache eviction, patching,
+parent/child restart, and child-failure-after-replay controllers. See the
+[live evidence reference](docs/reference/live-acceptance-coverage.md) for
+commit-pinned definitions and the exact assertion boundaries.
+
+Each controller owns fixture cleanup. The baseline checks client shutdown and
+the worker's graceful-stop marker, and removes the PostgreSQL volume before and
+after acceptance. These checks do not measure a shutdown deadline or demonstrate
+production durability across infrastructure replacement.
 
 ### Workflow-patch replay acceptance
 
@@ -346,9 +230,12 @@ the exact child run from the exact parent's server history, replaces the worker
 while both executions are pending, and validates replay plus terminal
 correlation for both runs. The
 [acceptance reference](docs/reference/parent-child-restart-replay-acceptance.md)
-documents its private checkpoint and evidence boundary. The complete [PR #351
-CI run](https://github.com/mfow/ocaml-temporal/actions/runs/29434016013)
-live-verifies the gate against Temporal Server and PostgreSQL.
+documents its private checkpoint and evidence boundary. The
+[audited live job](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/35469570419/job/105967951226)
+also runs `make test-temporal-parent-child-failure-replay`: both executions must
+replay before the child fails and the parent returns its recovered result.
+The [failure acceptance reference](docs/reference/child-failure-replay-acceptance.md)
+explains the additional history assertions.
 
 For manual inspection, use `make temporal-start`, `make temporal-health`,
 `make temporal-status`, `make temporal-logs`, and `make temporal-clean`.

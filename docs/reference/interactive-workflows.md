@@ -23,7 +23,9 @@ also covered by the [PR #289 Actions run](https://github.com/mfow/ocaml-temporal
 The [PR #302 Actions run](https://github.com/mfow/ocaml-temporal/actions/runs/29351689638)
 first verifies the later long-backoff extension, and the complete [PR #439
 Actions run](https://github.com/mfow/ocaml-temporal/actions/runs/29824441578)
-retains both paths in the current 26-start baseline.
+retains both paths in its historical baseline. The [current evidence audit](live-acceptance-coverage.md)
+records the later successful source snapshot and the distinction between
+signal-dependent completion and focused tests of already-parked condition wake-up.
 The [PR #406 Actions run](https://github.com/mfow/ocaml-temporal/actions/runs/29557704643)
 also proves an output-only client query against the exact signal-condition run
 while it is parked. The complete [PR #434 Actions run](https://github.com/mfow/ocaml-temporal/actions/runs/29684113836)
