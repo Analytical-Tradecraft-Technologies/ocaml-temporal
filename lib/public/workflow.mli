@@ -100,7 +100,7 @@ val now : unit -> (Time.t, Error.t) result
 
 (** Returns a deterministic pseudo-random integer in [0, bound).  The stream
     is seeded by Temporal for the workflow run and replayed from the same
-    initialization metadata, so the result is stable for an identical call
+    initialization and reset metadata, so the result is stable for an identical call
     sequence.  [bound] must be positive; invalid bounds and calls outside a
     workflow return a typed defect. *)
 val random_int : bound:int -> (int, Error.t) result

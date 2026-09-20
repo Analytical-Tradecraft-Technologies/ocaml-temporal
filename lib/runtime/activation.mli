@@ -67,6 +67,8 @@ type job =
     }
   (** Reports a patch marker found in this execution's history. *)
   | Notify_has_patch of { patch_id : string }
+  (** Replaces this execution's random seed at this position in the job list. *)
+  | Update_random_seed of { randomness_seed : string }
   | Fire_timer of { seq : int64 }
   | Cancel_workflow
   | Remove_from_cache

@@ -41,6 +41,14 @@ and bridge, read the [documentation guide](../README.md) first.
   regression checks retained live words across repeated callback batches.
 - Spawn order is source execution order.
 - Activation jobs are applied in their supplied list order.
+- Core's `UpdateRandomSeed` replaces only the execution-local random stream at
+  its position in that job pass, before resumed fibers run. The complete uint64
+  seed survives the bridge as canonical decimal text; the runtime preserves
+  its existing zero-seed fallback. Earlier workflow observations are retained.
+  Strict activation validation rejects a malformed seed before any timer or
+  other pending operation is consumed. The recorded
+  [timer-reset regression](../../test/integration/temporal/reset_random_seed/README.md)
+  checks the same stream through live execution and offline Core replay.
 - Resolving a future appends its waiters in waiter-registration order.
 - No hash-table traversal determines runnable or command ordering.
 - Command sequence numbers are monotonic per execution and begin at one.

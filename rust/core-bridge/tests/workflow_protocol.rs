@@ -46,6 +46,44 @@ fn valid_core_retry_policy() -> temporalio_protos::temporal::api::common::v1::Re
     }
 }
 
+/// Reset histories replace the run seed before resuming a timer. The bridge
+/// must preserve that order and the complete unsigned seed range through JSON.
+#[test]
+fn converts_reset_random_seed_before_timer() {
+    use core_activation::workflow_activation_job::Variant;
+
+    for seed in [0, 1, i64::MAX as u64 + 1, u64::MAX] {
+        let activation = core_activation::WorkflowActivation {
+            run_id: "reset-run".to_owned(),
+            timestamp: Some(prost_wkt_types::Timestamp::default()),
+            jobs: vec![
+                core_activation::WorkflowActivationJob {
+                    variant: Some(Variant::UpdateRandomSeed(
+                        core_activation::UpdateRandomSeed {
+                            randomness_seed: seed,
+                        },
+                    )),
+                },
+                core_activation::WorkflowActivationJob {
+                    variant: Some(Variant::FireTimer(core_activation::FireTimer { seq: 1 })),
+                },
+            ],
+            ..Default::default()
+        };
+        let semantic = workflow_protocol::activation_from_core(&activation)
+            .expect("reset seed update must reach the language runtime");
+        let encoded = workflow_protocol::encode_activation(&semantic).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(json["jobs"][0]["kind"], "update_random_seed");
+        assert_eq!(json["jobs"][0]["randomness_seed"], seed.to_string());
+        assert_eq!(json["jobs"][1]["kind"], "fire_timer");
+        assert_eq!(
+            workflow_protocol::decode_activation(&encoded).unwrap(),
+            semantic
+        );
+    }
+}
+
 /// Requires a malformed activation to fail as the stable protocol error type.
 /// The path and message assertions ensure callers receive bounded diagnostics
 /// instead of a serde panic or an untyped transport failure.
@@ -75,6 +113,7 @@ fn accepts_and_normalizes_workflow_activations() {
         "child-resolution",
         "child-cancellation-before-start",
         "patch-activation",
+        "reset-activation",
     ] {
         let input = fixture(&["valid", &format!("{name}.input.json")]);
         let expected = fixture(&["valid", &format!("{name}.normalized.json")]);
@@ -84,6 +123,36 @@ fn accepts_and_normalizes_workflow_activations() {
             expected.trim()
         );
         workflow_protocol::decode_activation(expected.trim()).unwrap();
+    }
+}
+
+/// Rejects malformed reset seeds at both decoded and directly typed boundaries.
+#[test]
+fn rejects_invalid_reset_seeds() {
+    let activation =
+        workflow_protocol::decode_activation(&fixture(&["valid", "reset-activation.input.json"]))
+            .unwrap();
+    for seed in ["", "01", "-1", "+1", "1.0", "18446744073709551616"] {
+        let mut invalid = activation.clone();
+        invalid.jobs = vec![workflow_protocol::ActivationJob::UpdateRandomSeed {
+            randomness_seed: seed.to_owned(),
+        }];
+        assert!(workflow_protocol::encode_activation(&invalid).is_err());
+        assert!(
+            workflow_protocol::decode_activation(&serde_json::to_string(&invalid).unwrap())
+                .is_err()
+        );
+    }
+    for job in [
+        r#"{"kind":"update_random_seed"}"#,
+        r#"{"kind":"update_random_seed","randomness_seed":1}"#,
+        r#"{"kind":"update_random_seed","randomness_seed":"1","extra":true}"#,
+        r#"{"kind":"update_random_seed","randomness_seed":"1","randomness_seed":"2"}"#,
+    ] {
+        let json = format!(
+            r#"{{"run_id":"reset-run","timestamp":null,"is_replaying":true,"history_length":12,"jobs":[{job}]}}"#
+        );
+        assert!(workflow_protocol::decode_activation(&json).is_err());
     }
 }
 

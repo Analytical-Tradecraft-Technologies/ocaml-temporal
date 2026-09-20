@@ -14,6 +14,7 @@
   test_scope
   test_scope_server_cancel
   test_workflow_time
+  test_random_seed_reset
   test_condition
   test_external_workflow)
  (libraries temporal-sdk temporal_runtime))

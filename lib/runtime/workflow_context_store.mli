@@ -81,8 +81,13 @@ val patched : t -> patch_id:string -> bool
     retention and emission, and calls after shutdown raise [Invalid_argument]. *)
 val deprecate_patch : t -> patch_id:string -> unit
 
-(** Draws one deterministic integer in [0, bound).  The stream is seeded from
-    Temporal's initialization metadata and advances only in this execution's
+(** Replaces the deterministic stream with Core's reset seed. The activation
+    adapter validates the canonical uint64 decimal before this job is applied.
+    Raises [Invalid_argument] for malformed seeds or after shutdown. *)
+val update_random_seed : t -> randomness_seed:string -> unit
+
+(** Draws one deterministic integer in [0, bound). The stream is seeded from
+    Temporal's initialization or reset metadata and advances only in this execution's
     owner Domain.  Invalid bounds and lifecycle misuse are typed defects. *)
 val random_int : t -> bound:int -> (int, Temporal_base.Error.t) result
 

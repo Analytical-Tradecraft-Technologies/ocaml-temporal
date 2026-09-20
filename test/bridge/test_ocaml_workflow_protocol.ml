@@ -93,6 +93,7 @@ let test_valid_activations () =
       "child-resolution";
       "child-cancellation-before-start";
       "patch-activation";
+      "reset-activation";
     ]
 
 (** Proves continuation initialization metadata remains typed through the OCaml
@@ -1390,6 +1391,30 @@ let test_activity_retry_policy () =
                       backoff_coefficient_bits = "18446744073709551615";
                     }) ] })
 
+(** Rejects malformed reset seeds in both peer JSON and typed activation values. *)
+let test_invalid_reset_seeds () =
+  let activation =
+    unwrap (Protocol.decode_activation
+      (fixture [ "valid"; "reset-activation.input.json" ]))
+  in
+  List.iter
+    (fun randomness_seed ->
+      require_error (Protocol.encode_activation
+        { activation with jobs = [ Protocol.Update_random_seed { randomness_seed } ] });
+      let job = Yojson.Safe.to_string (`Assoc [
+        ("kind", `String "update_random_seed");
+        ("randomness_seed", `String randomness_seed) ]) in
+      require_error (Protocol.decode_activation (Printf.sprintf
+        {|{"run_id":"reset-run","timestamp":null,"is_replaying":true,"history_length":12,"jobs":[%s]}|} job)))
+    [ ""; "01"; "-1"; "+1"; "1.0"; "18446744073709551616" ];
+  List.iter
+    (fun job -> require_error (Protocol.decode_activation (Printf.sprintf
+        {|{"run_id":"reset-run","timestamp":null,"is_replaying":true,"history_length":12,"jobs":[%s]}|} job)))
+    [ {|{"kind":"update_random_seed"}|};
+      {|{"kind":"update_random_seed","randomness_seed":1}|};
+      {|{"kind":"update_random_seed","randomness_seed":"1","extra":true}|};
+      {|{"kind":"update_random_seed","randomness_seed":"1","randomness_seed":"2"}|} ]
+
 (** Runs one test with a stable name suitable for CI logs. *)
 let run name test =
   try
@@ -1401,6 +1426,7 @@ let run name test =
 
 let () =
   run "workflow activations" test_valid_activations;
+  run "invalid reset seeds" test_invalid_reset_seeds;
   run "continuation initialization metadata" test_continuation_initialize_metadata;
   run "workflow completion" test_valid_completion;
   run "workflow task failure" test_task_failure_completion;

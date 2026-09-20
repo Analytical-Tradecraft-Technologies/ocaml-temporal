@@ -561,6 +561,11 @@ pub enum ActivationJob {
     NotifyHasPatch {
         patch_id: String,
     },
+    /// Replaces the deterministic random stream after a workflow reset.
+    /// Decimal text preserves the complete Core uint64 seed through JSON.
+    UpdateRandomSeed {
+        randomness_seed: String,
+    },
     FireTimer {
         seq: u32,
     },
@@ -934,7 +939,7 @@ pub(crate) fn validate_time(
     Ok(())
 }
 
-/// Parses the canonical unsigned decimal used for exact floating-point bits.
+/// Parses canonical unsigned decimal seeds and exact floating-point bits.
 fn validate_uint64_decimal(value: &str, path: &str) -> Result<u64, ProtocolError> {
     if value.is_empty() || (value.len() > 1 && value.starts_with('0')) {
         return Err(ProtocolError::invalid(
@@ -1447,6 +1452,9 @@ fn validate_activation(value: &Activation) -> Result<(), ProtocolError> {
             }
             ActivationJob::NotifyHasPatch { patch_id } => {
                 identifier(patch_id, "$.jobs.patch_id")?;
+            }
+            ActivationJob::UpdateRandomSeed { randomness_seed } => {
+                validate_uint64_decimal(randomness_seed, "$.jobs.randomness_seed")?;
             }
             ActivationJob::CancelWorkflow { reason } => bounded_text(reason, "$.jobs.reason")?,
             ActivationJob::RemoveFromCache { message, .. } => {
@@ -2762,6 +2770,9 @@ pub fn activation_from_core(
                 }
                 Variant::NotifyHasPatch(value) => Ok(ActivationJob::NotifyHasPatch {
                     patch_id: value.patch_id.clone(),
+                }),
+                Variant::UpdateRandomSeed(value) => Ok(ActivationJob::UpdateRandomSeed {
+                    randomness_seed: value.randomness_seed.to_string(),
                 }),
                 Variant::FireTimer(value) => Ok(ActivationJob::FireTimer { seq: value.seq }),
                 Variant::CancelWorkflow(value) => Ok(ActivationJob::CancelWorkflow {

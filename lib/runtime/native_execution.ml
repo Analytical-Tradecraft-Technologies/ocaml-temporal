@@ -618,6 +618,13 @@ let runtime_job path = function
           None,
           None,
           None )
+  | Protocol.Update_random_seed { randomness_seed } ->
+      Ok
+        ( Activation.Update_random_seed { randomness_seed },
+          None,
+          None,
+          None,
+          None )
   | Protocol.Fire_timer { seq } ->
       let* () = validate_sequence (path ^ ".seq") seq in
       Ok
