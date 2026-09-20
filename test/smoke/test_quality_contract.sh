@@ -213,22 +213,19 @@ printf '%s\n' "$release_preflight_target" |
 printf '%s\n' "$release_workflow_text" |
   grep -Fqx '        run: make release-preflight'
 
-# The changed-path detector is a safety boundary: every non-document path
-# must opt into the code and live-smoke jobs. Keep all three workflow outputs
-# and the fail-closed defaults explicit so a refactor cannot silently skip
-# ordinary source changes before they reach the representative matrix.
+# All code jobs share one output; required workflows remain unconditional.
 printf '%s\n' "$pr_workflow_text" |
   grep -Fqx "      code: \${{ steps.changed-paths.outputs.code }}"
-printf '%s\n' "$pr_workflow_text" |
-  grep -Fqx "      smoke: \${{ steps.changed-paths.outputs.smoke }}"
-printf '%s\n' "$pr_workflow_text" |
-  grep -Fqx "      native_windows: \${{ steps.changed-paths.outputs.native_windows }}"
-printf '%s\n' "$pr_workflow_text" | grep -Fqx '          code=false'
-printf '%s\n' "$pr_workflow_text" | grep -Fqx '          smoke=false'
-printf '%s\n' "$pr_workflow_text" | grep -Fqx '          native_windows=false'
-printf '%s\n' "$pr_workflow_text" | grep -Fqx '              *)'
-printf '%s\n' "$pr_workflow_text" | grep -Fqx '                code=true'
-printf '%s\n' "$pr_workflow_text" | grep -Fqx '                smoke=true'
+for workflow_text in "$pr_workflow_text" "$release_workflow_text"; do
+  printf '%s\n' "$workflow_text" | grep -Fqx '  pull_request:'
+  printf '%s\n' "$workflow_text" | grep -Fqx '  merge_group:'
+  printf '%s\n' "$workflow_text" | grep -Fqx '    types: [checks_requested]'
+done
+for workflow_text in "$pr_workflow_text" "$release_workflow_text" "$master_workflow_text"; do
+  if printf '%s\n' "$workflow_text" | grep -Eq '^  push:|^    paths(-ignore)?:'; then
+    exit 1
+  fi
+done
 
 # Anchor the job declaration at the workflow's two-space indentation so a
 # future matrix step named "quality" cannot satisfy this contract by accident.
@@ -240,7 +237,7 @@ printf '%s\n' "$master_workflow_text" |
 printf '%s\n' "$master_workflow_text" | grep -Fq 'run: make quality'
 
 # PR quality uses the same pinned tools, but is conditional so Markdown-only
-# changes can use the inexpensive independent license job.
+# changes skip toolchain setup and builds.
 pr_quality=$(printf '%s\n' "$pr_workflow_text" |
   sed -n '/^  quality:/,/^  license-audit:/p')
 printf '%s\n' "$pr_quality" | grep -Fqx "    if: needs.changes.outputs.code == 'true'"
@@ -249,7 +246,7 @@ printf '%s\n' "$pr_quality" |
   grep -Fq 'cargo-deny@0.20.2,cargo-machete@0.9.2,typos@1.48.0'
 printf '%s\n' "$pr_quality" | grep -Fqx '        run: make quality'
 
-# Master and scheduled builds are the exhaustive compatibility gate. Scope
+# Scheduled builds are the exhaustive compatibility gate. Scope
 # every assertion to verify so a comment or another job cannot satisfy it.
 master_verify=$(printf '%s\n' "$master_workflow_text" |
   sed -n '/^  verify:/,/^    steps:/p')
@@ -291,21 +288,7 @@ printf '%s\n' "$pr_verify" | awk '
 lane_count=$(printf '%s\n' "$pr_verify" | grep -Fc '          - ocaml:')
 test "$lane_count" -eq 3
 
-# The faster macOS native job runs for each code PR. Windows is intentionally
-# conditional on bridge/build/workflow inputs, so preserve both the
-# changed-path output and its separate job instead of accidentally turning it
-# into a permanently skipped or always-expensive matrix cell.
-printf '%s\n' "$pr_workflow_text" | grep -Fq '      native_windows:'
-printf '%s\n' "$pr_workflow_text" | grep -Fq '          native_windows=false'
-printf '%s\n' "$pr_workflow_text" | grep -Fq '                native_windows=true'
-printf '%s\n' "$pr_workflow_text" | grep -Fq '  native-macos:'
-printf '%s\n' "$pr_workflow_text" | grep -Fq '  native-windows:'
-printf '%s\n' "$pr_workflow_text" |
-  grep -Fq "if: needs.changes.outputs.native_windows == 'true'"
-
-# The always-on macOS lane proves the representative desktop native link. The
-# Windows lane is deliberately conditional, but when selected it must retain
-# the matching compiler, architecture, and native verification command.
+# Both native platforms use the same all-or-nothing code gate.
 pr_native_macos=$(printf '%s\n' "$pr_workflow_text" |
   sed -n '/^  native-macos:/,/^  native-windows:/p')
 printf '%s\n' "$pr_native_macos" | grep -Fqx "    if: needs.changes.outputs.code == 'true'"
@@ -316,25 +299,22 @@ printf '%s\n' "$pr_native_macos" | grep -Fqx '        run: make native-verify'
 pr_native_windows=$(printf '%s\n' "$pr_workflow_text" |
   sed -n '/^  native-windows:/,$p')
 printf '%s\n' "$pr_native_windows" |
-  grep -Fqx "    if: needs.changes.outputs.native_windows == 'true'"
+  grep -Fqx "    if: needs.changes.outputs.code == 'true'"
 printf '%s\n' "$pr_native_windows" | grep -Fqx '    name: OCaml 5.5 / Windows x64'
 printf '%s\n' "$pr_native_windows" | grep -Fqx '    runs-on: windows-latest'
 printf '%s\n' "$pr_native_windows" | grep -Fqx '      NATIVE_ARCH: amd64'
 printf '%s\n' "$pr_native_windows" | grep -Fqx '        run: make native-verify'
 
-# License audit is intentionally unconditional. The live smoke is conditional
-# on source or fixture changes and runs both acceptance scenarios at OCaml 5.5.
+# License and live-smoke jobs use the same code gate as the matrix.
 pr_license=$(printf '%s\n' "$pr_workflow_text" |
   sed -n '/^  license-audit:/,/^  temporal-integration:/p')
 printf '%s\n' "$pr_license" | grep -Fqx '    name: Dependency license audit'
-if printf '%s\n' "$pr_license" | grep -Fq '    if:'; then
-  exit 1
-fi
+printf '%s\n' "$pr_license" | grep -Fqx "    if: needs.changes.outputs.code == 'true'"
 printf '%s\n' "$pr_license" |
   grep -Fqx '        run: make license-check OCAML_VERSION=5.2'
 pr_smoke=$(printf '%s\n' "$pr_workflow_text" |
   sed -n '/^  temporal-integration:/,/^  verify:/p')
-printf '%s\n' "$pr_smoke" | grep -Fqx "    if: needs.changes.outputs.smoke == 'true'"
+printf '%s\n' "$pr_smoke" | grep -Fqx "    if: needs.changes.outputs.code == 'true'"
 printf '%s\n' "$pr_smoke" |
   grep -Fqx '    name: Temporal/PostgreSQL integration smoke (OCaml 5.5)'
 printf '%s\n' "$pr_smoke" | grep -Fqx '    timeout-minutes: 45'
@@ -346,17 +326,6 @@ printf '%s\n' "$pr_smoke" | grep -Fqx '          make test-temporal-worker-cache
 printf '%s\n' "$pr_smoke" | grep -Fqx '          make test-temporal-workflow-patching'
 printf '%s\n' "$pr_smoke" | grep -Fqx '          make test-temporal-parent-child-restart'
 
-# The JSON schemas are protocol fixtures rather than prose. Preserve their
-# code classification while keeping ordinary Markdown-only changes inexpensive.
-# The cases are ordered, so assert the schema exception appears before the
-# broad docs/ catch-all rather than merely checking that both snippets exist.
-printf '%s\n' "$pr_workflow_text" | grep -Fq '              docs/schemas/*)'
-printf '%s\n' "$pr_workflow_text" |
-  grep -Fq '              *.md|*.markdown|LICENSE*|NOTICE*|docs/*)'
-schema_case_line=$(printf '%s\n' "$pr_workflow_text" |
-  awk '$0 == "              docs/schemas/*)" { print NR; exit }')
-docs_case_line=$(printf '%s\n' "$pr_workflow_text" |
-  awk '$0 == "              *.md|*.markdown|LICENSE*|NOTICE*|docs/*)" { print NR; exit }')
-test -n "$schema_case_line"
-test -n "$docs_case_line"
-test "$schema_case_line" -lt "$docs_case_line"
+# Exercise the actual classifier with Git histories, including PR base drift,
+# merge groups, deletions, renames, unusual filenames, and failed comparisons.
+bash "$source_root/test/smoke/test_ci_changed_paths.sh" "$source_root"

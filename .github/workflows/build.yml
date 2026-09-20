@@ -1,9 +1,6 @@
 name: Build
 
 on:
-  push:
-    branches:
-      - master
   schedule:
     # GitHub Actions cron is UTC. Sydney is UTC+10 in standard time, so this
     # runs at 05:00 Sydney time during the repository's standard-time season.
@@ -13,11 +10,7 @@ permissions:
   contents: read
 
 concurrency:
-  # A pull-request number remains stable across synchronize events, so a new
-  # commit replaces an older queued or running PR run. The master ref is the
-  # fallback for the push trigger. This cancellation is intentionally scoped
-  # to the same change and never cancels an unrelated PR.
-  group: build-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: build-scheduled-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
