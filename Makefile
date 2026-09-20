@@ -60,6 +60,15 @@ DUNE_BUILD_ARGS := $(if $(strip $(DUNE_JOBS)),-j $(DUNE_JOBS),)
 # changing the test set or the production build profile.
 CARGO_BUILD_JOBS ?= 1
 CARGO_TEST_ENV := CARGO_BUILD_JOBS=$(CARGO_BUILD_JOBS) CARGO_INCREMENTAL=0
+# CI supplies a verified, immutable bridge bundle. Each OCaml consumer still
+# builds its C stubs and runs its own tests; Rust-only checks belong to the
+# producer. Explicit test-rust/lint-rust targets always remain available.
+RUST_TEST_TARGET := $(if $(strip $(TEMPORAL_RUST_BRIDGE_DIR)),,test-rust)
+RUST_LINT_TARGET := $(if $(strip $(TEMPORAL_RUST_BRIDGE_DIR)),,lint-rust)
+NATIVE_RUST_TEST_TARGET := $(if $(strip $(TEMPORAL_RUST_BRIDGE_DIR)),,native-test-rust)
+NATIVE_RUST_LINT_TARGET := $(if $(strip $(TEMPORAL_RUST_BRIDGE_DIR)),,native-lint-rust)
+RUST_BRIDGE_DIR ?= $(CURDIR)/_build/rust-bridge
+RUST_BRIDGE_KEY ?=
 COMPOSE_RUN := OCAML_IMAGE=$(OCAML_IMAGE) $(COMPOSE) --progress quiet run --rm --build --user $(HOST_UID):$(HOST_GID) $(SERVICE)
 RUN := $(COMPOSE_RUN) opam exec --
 CARGO := $(COMPOSE_RUN) cargo
@@ -89,7 +98,7 @@ version-check:
 build:
 	$(RUN) dune build $(DUNE_BUILD_ARGS)
 	$(MAKE) build-examples
-	$(CARGO) build --manifest-path $(CARGO_MANIFEST) --locked
+	$(if $(strip $(TEMPORAL_RUST_BRIDGE_DIR)),,$(CARGO) build --manifest-path $(CARGO_MANIFEST) --locked)
 
 # Keep the examples as explicit compile targets rather than relying on Dune's
 # default alias. Every Docker and native build therefore proves that all three
@@ -107,7 +116,7 @@ test:
 	$(MAKE) test-temporal-worker-readiness-contract
 	$(MAKE) test-temporal-worker-stop-contract
 	$(RUN) dune runtest
-	$(MAKE) test-rust
+	$(if $(RUST_TEST_TARGET),$(MAKE) $(RUST_TEST_TARGET))
 	$(MAKE) test-bridge
 	$(MAKE) test-install
 	$(MAKE) test-quality-contract
@@ -150,6 +159,7 @@ release-tag-check:
 test-quality-contract:
 	sh test/smoke/test_quality_contract.sh .
 	sh test/smoke/test_release_tag_contract.sh .
+	sh test/smoke/test_rust_bridge_artifact.sh .
 
 test-temporal-config:
 	sh test/smoke/test_temporal_compose_config.sh
@@ -625,7 +635,7 @@ lint:
 	$(RUN) dune build $(DUNE_BUILD_ARGS)
 	$(MAKE) build-examples
 	$(COMPOSE_RUN) sh scripts/check-format.sh
-	$(MAKE) lint-rust
+	$(if $(RUST_LINT_TARGET),$(MAKE) $(RUST_LINT_TARGET))
 
 lint-rust:
 	$(CARGO) fmt --manifest-path $(CARGO_MANIFEST) --all -- --check
@@ -701,9 +711,9 @@ native-version-check:
 native-build:
 	$(NATIVE_ENV) $(NATIVE_RUN) dune build @install $(DUNE_BUILD_ARGS)
 	$(NATIVE_ENV) $(NATIVE_RUN) dune build $(DUNE_BUILD_ARGS) examples/workflow_worker/workflow_worker.exe examples/activity_worker/activity_worker.exe examples/client/client.exe
-	$(NATIVE_ENV) cargo build --manifest-path $(CARGO_MANIFEST) --locked
+	$(if $(strip $(TEMPORAL_RUST_BRIDGE_DIR)),,$(NATIVE_ENV) cargo build --manifest-path $(CARGO_MANIFEST) --locked)
 
-native-test: native-test-rust native-test-install test-quality-contract
+native-test: $(NATIVE_RUST_TEST_TARGET) native-test-install test-quality-contract
 	$(NATIVE_ENV) $(NATIVE_RUN) dune runtest
 
 native-test-rust:
@@ -712,7 +722,7 @@ native-test-rust:
 native-test-install:
 	$(NATIVE_ENV) sh test/bridge/test_install.sh
 
-native-lint: native-lint-rust
+native-lint: $(NATIVE_RUST_LINT_TARGET)
 	$(NATIVE_ENV) $(NATIVE_RUN) dune build $(DUNE_BUILD_ARGS)
 	$(NATIVE_ENV) $(NATIVE_RUN) dune build $(DUNE_BUILD_ARGS) examples/workflow_worker/workflow_worker.exe examples/activity_worker/activity_worker.exe examples/client/client.exe
 	sh scripts/check-format.sh
@@ -737,3 +747,20 @@ build-task-failure-fixture:
 # OCaml binaries share one build tree and have no production fixture hooks.
 test-temporal-task-failure-live: test-temporal-config build-task-failure-fixture
 	TEMPORAL_COMPOSE_PROJECT="$(TEMPORAL_COMPOSE_PROJECT)" OCAML_IMAGE="$(OCAML_IMAGE)" python3 test/integration/temporal/scripts/run-task-failure-live.py
+
+# Publish only after the pinned toolchain, Rust lint, and full Rust test suite
+# pass. Native desktop CI uses this directly; Linux uses the same gate inside
+# the Rust-only Debian image so artifacts link on every OCaml matrix image.
+.PHONY: rust-bridge native-rust-bridge
+native-rust-bridge:
+	@test -n "$(RUST_BRIDGE_KEY)" || { echo 'set RUST_BRIDGE_KEY' >&2; exit 2; }
+	$(NATIVE_ENV) sh test/smoke/test_rust_toolchain.sh
+	$(MAKE) native-lint-rust
+	$(MAKE) native-test-rust
+	$(NATIVE_ENV) sh scripts/rust-bridge-artifact.sh pack . "$(RUST_BRIDGE_DIR)" "$(RUST_BRIDGE_KEY)"
+
+rust-bridge:
+	docker build -f Dockerfile.rust-ci -t ocaml-temporal-rust-bridge:local .
+	docker run --rm --user $(HOST_UID):$(HOST_GID) --volume "$(CURDIR):/workspace" \
+		ocaml-temporal-rust-bridge:local make native-rust-bridge \
+		RUST_BRIDGE_DIR=/workspace/_build/rust-bridge RUST_BRIDGE_KEY="$(RUST_BRIDGE_KEY)"

@@ -1,0 +1,13 @@
+# Match Dockerfile.dev's Rust toolchain and Debian 12 C-library baseline.
+# Native amd64/arm64 runners build this image without cross compilation.
+FROM rust:1.94-bookworm@sha256:6ae102bdbf528294bc79ad6e1fae682f6f7c2a6e6621506ba959f9685b308a55
+RUN rustup component add clippy rustfmt \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends libprotobuf-dev protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
+ENV CARGO_HOME=/workspace/_build/cargo-home \
+    CARGO_TARGET_DIR=/workspace/_build/rust \
+    CARGO_INCREMENTAL=0 \
+    CARGO_PROFILE_DEV_DEBUG=line-tables-only \
+    CARGO_PROFILE_TEST_DEBUG=line-tables-only
+WORKDIR /workspace

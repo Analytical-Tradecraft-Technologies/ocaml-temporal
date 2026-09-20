@@ -13,6 +13,12 @@ cleanup() {
 
 trap cleanup EXIT HUP INT TERM
 
+if [ -n "${TEMPORAL_RUST_BRIDGE_DIR:-}" ]; then
+  sh scripts/rust-bridge-artifact.sh validate . "$TEMPORAL_RUST_BRIDGE_DIR" \
+    "${TEMPORAL_RUST_BRIDGE_KEY:?artifact key is required}"
+  archive="$TEMPORAL_RUST_BRIDGE_DIR/libocaml_temporal_core_bridge.a"
+  native_link_flags=$(cat "$TEMPORAL_RUST_BRIDGE_DIR/native-static-libs")
+else
 # Ask the pinned Rust toolchain for the platform libraries pulled in by the
 # static archive. Core's networking stack needs Apple frameworks on macOS and
 # a different system-library set on Linux, so duplicating the list here would
@@ -28,6 +34,7 @@ CARGO_TERM_COLOR=never cargo rustc \
   2>"$native_link_output"
 
 native_link_flags=$(sed -n 's/^note: native-static-libs: //p' "$native_link_output" | tail -n 1)
+fi
 if [ -z "$native_link_flags" ]; then
   cat "$native_link_output" >&2
   echo "rustc did not report native static-library link flags" >&2
@@ -41,6 +48,8 @@ fi
 
 mkdir -p "$output_dir"
 
+# rustc emits an ordered, whitespace-separated list of linker arguments.
+# shellcheck disable=SC2086
 cc \
   -std=c11 \
   -Wall \
