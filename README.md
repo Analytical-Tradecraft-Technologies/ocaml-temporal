@@ -109,19 +109,19 @@ pass `OCAML_VERSION`, for example `make verify OCAML_VERSION=5.5`. CI has a
 fast representative pull-request gate and an exhaustive compatibility gate. A
 code PR verifies Linux amd64 with OCaml 5.2 and 5.5, Linux arm64 with OCaml
 5.5, macOS ARM64 with OCaml 5.5, the pinned quality and dependency-license
-checks, and the OCaml 5.5 Temporal/PostgreSQL smoke. The Windows x64 OCaml 5.5
-native job is added to a PR when changes affect the native bridge,
-build/toolchain, workflow, or composite-action configuration. JSON protocol
-schemas under `docs/schemas/` are treated as code for this policy. Pushes to `master` and
-scheduled runs retain the exhaustive Linux matrix (OCaml 5.2–5.5 on amd64 and
-arm64) plus both OCaml 5.5 native desktop jobs. The standalone license audit is
-run once per workflow, not once per
+checks, the OCaml 5.5 Temporal/PostgreSQL smoke, and Windows x64 with OCaml
+5.5. PRs and merge groups use one all-or-nothing code gate: documentation-only
+changes skip all these jobs, while code, tests, build inputs, GitHub workflows,
+and composite actions run them all. JSON protocol schemas under `docs/schemas/`
+are code. Unknown file types also trigger the build. The separate release
+metadata/SBOM check still runs without compiling the SDK.
+
+Scheduled runs retain the exhaustive Linux matrix (OCaml 5.2–5.5 on amd64 and
+arm64) plus both OCaml 5.5 native desktop jobs. Pushes to `master` do not start
+builds. The standalone license audit runs once per code workflow, not per
 matrix cell. These entries describe configured jobs, not evidence that a
-particular Actions run has completed; runs may remain queued while the
-repository quota is exhausted. The workflow cancels superseded runs for the
-same pull request (or the master push ref), while each job timeout starts only
-after GitHub allocates a runner; GitHub does not provide a native timeout for a
-job that is still waiting in the quota queue.
+particular Actions run has completed. Superseded runs are cancelled for the
+same PR or merge-group ref; job timeouts start after runner allocation.
 
 CI builds the Rust bridge once per operating system and architecture, sharing
 the Linux libraries across OCaml versions and the live smoke. Exact-input
