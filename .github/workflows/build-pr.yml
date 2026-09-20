@@ -170,14 +170,27 @@ jobs:
           docker system prune --all --force --volumes
           df -h /
       - name: Run the live two-OCaml-binary Temporal Compose smoke
-        run: |
-          make test-temporal-integration
-          make test-temporal-worker-restart
-          make test-temporal-worker-crash-recovery
-          make test-temporal-worker-cache-eviction
-          make test-temporal-workflow-patching
-          make test-temporal-parent-child-restart
-          make test-temporal-parent-child-failure-replay
+        # Leave time for always() upload after a scenario step times out.
+        timeout-minutes: 40
+        env:
+          TEMPORAL_DIAGNOSTICS_DIR: ${{ github.workspace }}/_build/live-diagnostics
+        run: make test-temporal-live-ci
+      - name: Upload bounded live diagnostic bundles
+        if: always()
+        id: live-artifacts
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: live-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: _build/live-diagnostics/
+          retention-days: 7
+          if-no-files-found: warn
+      - name: Link live diagnostics and collection status
+        if: always()
+        env:
+          LIVE_ARTIFACT_URL: ${{ steps.live-artifacts.outputs.artifact-url }}
+          LIVE_UPLOAD_OUTCOME: ${{ steps.live-artifacts.outcome }}
+        run: bash test/integration/temporal/scripts/summarize-live-diagnostics.sh
 
   verify:
     if: needs.changes.outputs.code == 'true'

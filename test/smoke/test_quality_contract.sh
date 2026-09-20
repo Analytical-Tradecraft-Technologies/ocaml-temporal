@@ -339,12 +339,6 @@ printf '%s\n' "$pr_smoke" |
   grep -Fqx '    name: Temporal/PostgreSQL integration smoke (OCaml 5.5)'
 printf '%s\n' "$pr_smoke" | grep -Fqx '    timeout-minutes: 45'
 printf '%s\n' "$pr_smoke" | grep -Fqx '      OCAML_VERSION: "5.5"'
-printf '%s\n' "$pr_smoke" | grep -Fqx '          make test-temporal-integration'
-printf '%s\n' "$pr_smoke" | grep -Fqx '          make test-temporal-worker-restart'
-printf '%s\n' "$pr_smoke" | grep -Fqx '          make test-temporal-worker-crash-recovery'
-printf '%s\n' "$pr_smoke" | grep -Fqx '          make test-temporal-worker-cache-eviction'
-printf '%s\n' "$pr_smoke" | grep -Fqx '          make test-temporal-workflow-patching'
-printf '%s\n' "$pr_smoke" | grep -Fqx '          make test-temporal-parent-child-restart'
 
 # The JSON schemas are protocol fixtures rather than prose. Preserve their
 # code classification while keeping ordinary Markdown-only changes inexpensive.
@@ -360,3 +354,12 @@ docs_case_line=$(printf '%s\n' "$pr_workflow_text" |
 test -n "$schema_case_line"
 test -n "$docs_case_line"
 test "$schema_case_line" -lt "$docs_case_line"
+
+# Both live lanes share the evidence wrapper and an unconditional upload with
+# a short retention period. This ensures a controller failure cannot bypass
+# the publication gate or silently diverge between PR and scheduled jobs.
+for workflow in "$source_root/.github/workflows/build-pr.yml" "$source_root/.github/workflows/build.yml"; do
+  sed -n '/^  temporal-integration:/,/^  verify:/p' "$workflow" | grep -Fqx '        run: make test-temporal-live-ci'
+  grep -Fq 'uses: actions/upload-artifact@' "$workflow"
+  grep -Fq '          retention-days: 7' "$workflow"
+done

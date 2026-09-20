@@ -1,6 +1,6 @@
 # Worker restart/replay diagnostic contract
 
-**Status: implemented and live-verified for graceful replacement and retry in the [PR #298 Actions run](https://github.com/mfow/ocaml-temporal/actions/runs/29346853291), and for forced crash recovery in the [PR #306 CI run](https://github.com/mfow/ocaml-temporal/actions/runs/29356904816).** This document defines the small, payload-free records used by the real-Temporal restart test to coordinate a worker replacement. The private worker activation callback and the machine-readable Temporal CLI adapter are implemented. The contract target and the Compose controller both passed: the run observed the exact run, replacement, replay marker, retrying activity's attempt-two result, terminal result, normalized history, and volume cleanup. Crash mode additionally requires generation one to exit with status 137 and leave no graceful-shutdown marker. The earlier [PR #253 run](https://github.com/mfow/ocaml-temporal/actions/runs/29286560471) remains historical evidence for the original two-generation path. A deliberately failing run for bounded diagnostic preservation remains separate follow-up work.
+**Status: implemented and live-verified for graceful replacement and retry in the [PR #298 Actions run](https://github.com/mfow/ocaml-temporal/actions/runs/29346853291), and for forced crash recovery in the [PR #306 CI run](https://github.com/mfow/ocaml-temporal/actions/runs/29356904816).** This document defines the small, payload-free records used by the real-Temporal restart test to coordinate a worker replacement. The private worker activation callback and the machine-readable Temporal CLI adapter are implemented. The contract target and the Compose controller both passed: the run observed the exact run, replacement, replay marker, retrying activity's attempt-two result, terminal result, normalized history, and volume cleanup. Crash mode additionally requires generation one to exit with status 137 and leave no graceful-shutdown marker. The earlier [PR #253 run](https://github.com/mfow/ocaml-temporal/actions/runs/29286560471) remains historical evidence for the original two-generation path. Bounded diagnostic preservation is covered by the [artifact collector contract](live-diagnostic-artifacts.md); hosted download and full live-scenario evidence remain separate gates.
 
 ## Why there is a normalized document
 
@@ -122,10 +122,12 @@ scenario that still requires investigation.
 
 The current controller schema intentionally describes only successful
 lifecycle records, so it does not encode a server failure as a successful
-phase. The live harness must still perform its normal cleanup and return a
-nonzero status. A future bounded-diagnostics extension may add a closed
-failure record, but until that exists the raw server and worker diagnostics
-are the authoritative evidence for a failed run.
+phase. The live harness still performs its normal cleanup and returns a
+nonzero status. The [live diagnostic bundle](live-diagnostic-artifacts.md)
+retains the partial controller/observer/history evidence before cleanup, plus a
+separate process outcome and bounded, filtered logs. Collection warnings remain
+separate from acceptance, and missing terminal/replay evidence is never replaced
+with a successful controller phase.
 
 ## Controller lifecycle evidence
 
