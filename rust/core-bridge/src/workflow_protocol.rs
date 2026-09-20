@@ -3701,7 +3701,8 @@ pub fn completion_from_core(
         Status::Successful(success) => success,
         Status::Failed(failed) => {
             use temporalio_protos::temporal::api::enums::v1::WorkflowTaskFailedCause;
-            if failed.force_cause != WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure as i32
+            if failed.force_cause
+                != i32::from(WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure)
             {
                 return Err(unsupported("unsupported workflow task failure cause"));
             }

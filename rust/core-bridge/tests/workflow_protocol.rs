@@ -3148,7 +3148,7 @@ fn task_failure_preserves_the_workflow_execution() {
         panic!("expected failed workflow task");
     };
     assert_eq!(failed.force_cause,
-        temporalio_protos::temporal::api::enums::v1::WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure as i32);
+        i32::from(temporalio_protos::temporal::api::enums::v1::WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure));
     assert_eq!(
         workflow_protocol::completion_from_core(&core).unwrap(),
         completion
