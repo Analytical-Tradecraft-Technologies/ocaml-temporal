@@ -4,8 +4,11 @@
   dllocaml_temporal_core_bridge%{ext_dll}
   rust_static_link_flags.sexp)
  (deps
+  (env_var TEMPORAL_RUST_BRIDGE_DIR)
+  (env_var TEMPORAL_RUST_BRIDGE_KEY)
   (source_tree ../../rust)
   ../../scripts/build-rust-bridge.sh
+  ../../scripts/rust-bridge-artifact.sh
   ../../scripts/copy-rust-bridge-artifacts.sh
   ../../scripts/render-rust-link-flags.sh)
  (action
