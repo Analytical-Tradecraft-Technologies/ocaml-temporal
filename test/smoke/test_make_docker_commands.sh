@@ -73,7 +73,9 @@ echo 'expected a Compose build or run command' >&2
 exit 1
 SH
 
-BUILD_STATUS=0 RUN_MARKER="$temporary_root/ran" make --silent \
+# Recursive Make can inherit directory-printing flags. Suppress its banners
+# so these assertions inspect only the Docker command's output.
+BUILD_STATUS=0 RUN_MARKER="$temporary_root/ran" make --silent --no-print-directory \
   -f "$source_root/Makefile" cargo-metadata \
   COMPOSE="sh '$temporary_root/compose.sh'" \
   >"$temporary_root/stdout" 2>"$temporary_root/stderr"
@@ -83,7 +85,7 @@ grep -Fq 'Docker build stdout diagnostic' "$temporary_root/stderr"
 grep -Fq 'Docker build stderr diagnostic' "$temporary_root/stderr"
 rm "$temporary_root/ran"
 
-if BUILD_STATUS=100 RUN_MARKER="$temporary_root/ran" make --silent \
+if BUILD_STATUS=100 RUN_MARKER="$temporary_root/ran" make --silent --no-print-directory \
   -f "$source_root/Makefile" version-check OCAML_VERSION=5.4 \
   COMPOSE="sh '$temporary_root/compose.sh'" \
   >"$temporary_root/stdout" 2>"$temporary_root/stderr"; then
