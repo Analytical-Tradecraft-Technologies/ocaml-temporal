@@ -18,7 +18,11 @@ sh "$workspace_root/scripts/render-rust-link-flags.sh" \
   "$output" \
   '-lwinapi_ntdll -lbcrypt'
 
-expected=$(printf '("-L%s" -lwinapi_ntdll -lbcrypt)\n' "$search_dir")
+expected_dir=$search_dir
+if command -v cygpath >/dev/null 2>&1; then
+  expected_dir=$(cygpath -m "$expected_dir")
+fi
+expected=$(printf '("-L%s" -lwinapi_ntdll -lbcrypt)\n' "$expected_dir")
 actual=$(cat "$output")
 if [ "$actual" != "$expected" ]; then
   printf 'unexpected Windows Rust link flags\nexpected: %s\nactual:   %s\n' \
@@ -34,3 +38,26 @@ sh "$workspace_root/scripts/render-rust-link-flags.sh" \
   '-lpthread -ldl'
 printf '(-lpthread -ldl)\n' >"$temporary_root/expected-non-windows.sexp"
 cmp "$temporary_root/expected-non-windows.sexp" "$non_windows_output"
+
+# Relocate the complete Windows bundle and remove Cargo's registry. The new
+# linker flags must point to the downloaded import libraries, including when
+# the consumer's checkout path contains spaces.
+sh "$workspace_root/scripts/render-rust-link-flags.sh" \
+  'MINGW64_NT-test' "$temporary_root/target" "$output" \
+  '-lwinapi_ntdll -lbcrypt' "$temporary_root/bundle/import-libs"
+mv "$temporary_root/bundle" "$temporary_root/relocated bundle"
+rm -rf "$search_dir" "$temporary_root/target"
+sh "$workspace_root/scripts/render-rust-link-flags.sh" \
+  'MINGW64_NT-test' "$temporary_root/relocated bundle" "$output" \
+  '-lwinapi_ntdll -lbcrypt'
+expected_dir="$temporary_root/relocated bundle/import-libs"
+if command -v cygpath >/dev/null 2>&1; then
+  expected_dir=$(cygpath -m "$expected_dir")
+fi
+test "$(cat "$output")" = "$(printf '("-L%s" -lwinapi_ntdll -lbcrypt)' "$expected_dir")"
+rm "$temporary_root/relocated bundle/import-libs/libwinapi_ntdll.a"
+if sh "$workspace_root/scripts/render-rust-link-flags.sh" \
+  'MINGW64_NT-test' "$temporary_root/relocated bundle" "$output" \
+  '-lwinapi_ntdll -lbcrypt' 2>/dev/null; then
+  echo 'accepted missing Windows import library' >&2; exit 1
+fi

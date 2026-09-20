@@ -44,6 +44,9 @@ type ('input, 'output) update_handle = {
   run_id : string;
   update_id : string;
   input : Payload.t;
+  (* A completed admission outcome can be decoded without looking up a server
+     record that may no longer exist. Immutable across caller Domains. *)
+  outcome : Backend.update_outcome option;
 }
 
 (** Identifies a successor execution returned by Temporal after a workflow
@@ -94,18 +97,6 @@ type visibility_page = {
 (** The default identity is stable and descriptive without using process-global
     randomness, which keeps client construction straightforward in tests. *)
 let default_identity = "ocaml-temporal-client"
-
-(** All public client values in one process share this allocator. Signal
-    request IDs are Temporal idempotency keys, so allocating from the client
-    record would allow two independent handles to generate the same first ID
-    for one exact execution. The atomic counter keeps concurrent callers
-    distinct without introducing another lock around the native graph. *)
-let next_signal_request_id = Atomic.make 0
-
-(** Allocates IDs for updates whose caller does not need retry-stable
-    idempotency across a process restart. This counter has no native state and
-    only distinguishes requests created by this one OCaml process. *)
-let next_update_id = Atomic.make 0
 
 (** Rejects empty, oversized, malformed UTF-8, or NUL-containing identifiers
     before they can enter a backend request. The UTF-8 and 65,536-byte bounds
@@ -475,9 +466,7 @@ let reset ?request_id ?(reason = "") ~workflow_task_finish_event_id
     one. Unlike cancellation, separate signal calls are distinct messages by
     default, even when they target the same run and signal name. Supplying an
     explicit ID gives a caller retry-safe idempotency semantics. *)
-let generated_signal_request_id () =
-  let sequence = Atomic.fetch_and_add next_signal_request_id 1 in
-  Printf.sprintf "ocaml-client-signal-%d" sequence
+let generated_signal_request_id = Temporal_base.Client_request_id.create
 
 (** Sends one typed signal to the exact run retained by [handle]. The input is
     encoded before the backend call, and success means only that Temporal
@@ -625,11 +614,9 @@ let query_with_input (handle : ('workflow_input, 'workflow_output) handle)
            (Backend.client_query handle.client.backend request)
            (fun payload -> Codec.decode (Query.output_with_input query) payload)
 
-(** Allocates a process-local update ID for callers that do not need to
-    reconcile an uncertain admission across a restart. *)
-let generated_update_id () =
-  let sequence = Atomic.fetch_and_add next_update_id 1 in
-  Printf.sprintf "ocaml-client-update-%d" sequence
+(** Allocates an independent update identity across client instances and
+    processes. Callers supply an explicit ID to reconcile an uncertain retry. *)
+let generated_update_id = Temporal_base.Client_request_id.create
 
 (** Canonical payload used when an update returns no result values. Temporal
     represents unit-like values with the same binary/null marker used by the
@@ -659,7 +646,11 @@ let start_update ?update_id
     Error
       (Error.make ~category:`Bridge ~message:"client is shut down" ())
   else
-    let update_id = Option.value update_id ~default:(generated_update_id ()) in
+    let update_id =
+      match update_id with
+      | Some update_id -> update_id
+      | None -> generated_update_id ()
+    in
     match validate_name "update id" update_id with
     | Error error -> Error error
     | Ok () -> (
@@ -675,45 +666,54 @@ let start_update ?update_id
                 input = encoded_input;
               }
             in
-            Result.map
+            Result.bind
+              (Backend.client_update handle.client.backend request)
               (fun (response : Backend.update_response) ->
-                {
-                  client = handle.client;
-                  definition = update;
-                  workflow_id = response.workflow_id;
-                  run_id = response.run_id;
-                  update_id = response.update_id;
-                  input = encoded_input;
-                })
-              (Backend.client_update handle.client.backend request))
+                match response.outcome with
+                | Some (Backend.Update_failed error) -> Error error
+                | outcome ->
+                    Ok
+                      {
+                        client = handle.client;
+                        definition = update;
+                        workflow_id = response.workflow_id;
+                        run_id = response.run_id;
+                        update_id = response.update_id;
+                        input = encoded_input;
+                        outcome;
+                      }))
 
 (** Waits for one admitted update, retrying bounded polls until Temporal
     supplies a terminal outcome. Each retry occurs on the caller Domain; the
-    Rust bridge releases the OCaml runtime lock while its gRPC poll is active. *)
+    Rust bridge releases the OCaml runtime lock while its gRPC poll is active.
+    Outcomes already supplied at admission are decoded without another RPC. *)
 let wait_update handle =
   if Atomic.get handle.client.closed then
     Error
       (Error.make ~category:`Bridge ~message:"client is shut down" ())
   else
-    let request : Backend.update_request =
-      {
-        workflow_id = handle.workflow_id;
-        run_id = handle.run_id;
-        update_id = handle.update_id;
-        update_name = Update.name handle.definition;
-        input = handle.input;
-      }
-    in
-    let rec poll () =
-      match Backend.client_poll_update handle.client.backend request with
-      | Error error -> Error error
-      | Ok { Backend.outcome = None } ->
-          Thread.yield ();
-          poll ()
-      | Ok { Backend.outcome = Some outcome } ->
-          decode_update_output handle.definition outcome
-    in
-    poll ()
+    match handle.outcome with
+    | Some outcome -> decode_update_output handle.definition outcome
+    | None ->
+        let request : Backend.update_request =
+          {
+            workflow_id = handle.workflow_id;
+            run_id = handle.run_id;
+            update_id = handle.update_id;
+            update_name = Update.name handle.definition;
+            input = handle.input;
+          }
+        in
+        let rec poll () =
+          match Backend.client_poll_update handle.client.backend request with
+          | Error error -> Error error
+          | Ok { Backend.outcome = None } ->
+              Thread.yield ();
+              poll ()
+          | Ok { Backend.outcome = Some outcome } ->
+              decode_update_output handle.definition outcome
+        in
+        poll ()
 
 (** Returns the durable update ID retained by a typed handle. *)
 let update_id (handle : ('input, 'output) update_handle) = handle.update_id

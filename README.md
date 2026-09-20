@@ -211,6 +211,13 @@ same pull request (or the master push ref), while each job timeout starts only
 after GitHub allocates a runner; GitHub does not provide a native timeout for a
 job that is still waiting in the quota queue.
 
+CI builds the Rust bridge once per operating system and architecture, sharing
+the Linux libraries across OCaml versions and the live smoke. Exact-input
+caches populated by `master` also serve PR, merge-queue, and scheduled runs.
+The C stubs, OCaml libraries, installed consumers, and their tests still build
+in every compatibility lane. See [Rust artifact sharing](docs/reference/quality-gates.md#rust-artifact-sharing)
+for the cache boundaries and local producer/consumer commands.
+
 When Actions is queued, use `make check OCAML_VERSION=5.2` as the representative
 Docker-backed local baseline. It combines `make verify` with the package/OCaml
 license audit. Run `make quality` separately when the pinned native

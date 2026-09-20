@@ -314,9 +314,8 @@ let expect_completed ~terminal = function
         (Printf.sprintf "poll unexpectedly rejected activation: %s at %s (%s)"
            error.message error.path error.code)
 
-(** A unit workflow completes in the first activation and is removed from the
-    existential run registry only after the fake supervisor accepts its
-    completion. *)
+(** A unit workflow completes in the first activation and retires its lease
+    after the fake supervisor accepts its completion. *)
 let test_terminal_workflow () =
   let supervisor = fake_supervisor () in
   let called = ref false in
@@ -340,6 +339,82 @@ let test_terminal_workflow () =
   | Ok Adapter.Not_ready -> ()
   | _ -> failwith "empty queue did not report Not_ready"
   end
+
+(** Completed executions answer queries from retained local state without
+    restarting their fibers. Core eviction releases that state, and a later
+    initialization reconstructs a fresh queryable generation for the same run. *)
+let test_completed_workflow_queries () =
+  let supervisor = fake_supervisor () in
+  let local = Temporal.Workflow_context.Local.create () in
+  let retained = Weak.create 1 in
+  let calls = ref 0 in
+  let workflow =
+    Temporal.Workflow.define ~name:"native_worker_completed_query"
+      ~input:Temporal.Codec.unit ~output:Temporal.Codec.unit (fun () ->
+        incr calls;
+        let value = Bytes.make 1024 'x' in
+        Weak.set retained 0 (Some value);
+        Temporal.Workflow_context.Local.set local value)
+  in
+  let query_handler =
+    Raw_adapter.make_query_handler ~name:"final-size" ~dispatch:(fun _ ->
+      match Temporal.Workflow_context.Local.get local with
+      | Ok (Some value) ->
+          Temporal.Codec.encode Temporal.Codec.string
+            (string_of_int (Bytes.length value))
+          |> Result.map base_payload |> Result.map_error base_error
+      | _ -> Error (Temporal_base.Error.defect ~message:"final state missing"))
+  in
+  let worker = worker supervisor [Adapter.register ~query_handlers:[query_handler] workflow] in
+  let run_id = "run-completed-query" in
+  (* Models either the first execution or Core replay after cache eviction. *)
+  let initialize_run () =
+    enqueue supervisor (activation ~run_id
+      [initialize ~run_id ~workflow_type:"native_worker_completed_query"]);
+    expect_completed ~terminal:true (Result.get_ok (Worker.poll worker))
+  in
+  (* Queries carry no workflow work and must produce only query responses. *)
+  let query_activation name = activation ~run_id
+    [Protocol.Query_workflow {query_id = "query-final"; query_type = name;
+      arguments = []; headers = []}] in
+  (* A closed run must preserve its final value and retire the query lease. *)
+  let query_final () =
+    enqueue supervisor (query_activation "final-size");
+    expect_completed ~terminal:false (Result.get_ok (Worker.poll worker));
+    match (latest_completion supervisor).commands with
+    | [Protocol.Query_result {query_id = "query-final"; result = Query_succeeded payload}]
+      when Bytes.to_string payload.data = "\"1024\"" -> ()
+    | _ -> failwith "completed query did not return its final local state"
+  in
+  initialize_run ();
+  query_final ();
+  query_final ();
+  enqueue supervisor (query_activation "missing");
+  expect_completed ~terminal:false (Result.get_ok (Worker.poll worker));
+  (match (latest_completion supervisor).commands with
+  | [Protocol.Query_result {result = Query_failed _; _}] -> ()
+  | _ -> failwith "unknown completed query did not return a query failure");
+  query_final ();
+  if !calls <> 1 then failwith "query restarted a completed workflow";
+  Gc.full_major ();
+  if not (Weak.check retained 0) then failwith "queryable local state was released early";
+  enqueue supervisor (eviction_activation ~run_id
+    [Protocol.Remove_from_cache {message = "completed query eviction"; reason = Protocol.Cache_full}]);
+  expect_completed ~terminal:false (Result.get_ok (Worker.poll worker));
+  if (latest_completion supervisor).commands <> [] then
+    failwith "completed workflow eviction emitted a command";
+  Gc.full_major ();
+  if Weak.check retained 0 then failwith "evicted completed workflow retained local state";
+  enqueue supervisor (query_activation "final-size");
+  (match Worker.poll worker with
+  | Ok (Adapter.Rejected {error; lease_retired = true; _})
+    when error.code = "unknown_run_id" -> ()
+  | _ -> failwith "evicted completed workflow remained queryable");
+  initialize_run ();
+  query_final ();
+  if !calls <> 2 then failwith "replay did not create a fresh execution";
+  if Hashtbl.length supervisor.leased <> 0 then
+    failwith "completed query lifecycle left a native lease outstanding"
 
 (** The private replay observer receives only metadata after strict activation
     translation. This test proves that workflow identity, replay state, and the
@@ -986,8 +1061,8 @@ let test_update_completion_retry () =
   if Hashtbl.length supervisor.leased <> 0 then
     failwith "retried update completion left a native lease outstanding"
 
-(** A run that has processed an update must still be removed after its terminal
-    workflow completion. Core may then send a cache-eviction activation; the
+(** A run that has processed an update is retained after terminal completion
+    until Core sends a cache-eviction activation; the
     adapter acknowledges it with an empty completion and rejects any later job
     for the retired run without invoking the update handler again. *)
 let test_update_terminal_and_eviction_cleanup () =
@@ -1570,8 +1645,8 @@ let test_child_replay_after_eviction_restarts_pending_child () =
   if Hashtbl.length supervisor.leased <> 0 then
     failwith "replayed child parent left a native lease outstanding"
 
-(** A normal terminal completion removes its run before Core sends the later
-    cache-eviction activation. The adapter must still acknowledge that leased
+(** A normal terminal completion retains its run until Core sends the later
+    cache-eviction activation. The adapter must acknowledge that leased
     eviction with Core's exact successful empty completion instead of trying
     to report an invalid workflow failure. *)
 let test_eviction_after_terminal_completion () =
@@ -1745,11 +1820,10 @@ let test_failure_completion_exception_is_typed () =
   if Hashtbl.length supervisor.leased <> 0 then
     failwith "typed failure completion left a native lease outstanding"
 
-(** A later activation can fail after a run has already suspended. Once that
-    failure is acknowledged, the stale execution must be removed just like a
-    failure during initialization; otherwise a subsequent activation could
-    resume an execution that Temporal has already retired. *)
-let test_resumed_failure_removes_run () =
+(** A later activation can fail after a run has already suspended. The sealed
+    execution retains queryable state until eviction, but a subsequent timer
+    must neither resume its fibers nor emit another workflow command. *)
+let test_resumed_failure_seals_run () =
   let supervisor = fake_supervisor () in
   let activity =
     Temporal.Activity.remote ~name:"native_worker_resumed_activity"
@@ -1791,11 +1865,9 @@ let test_resumed_failure_removes_run () =
   enqueue supervisor
     (activation ~run_id:"run-resumed-failure"
        [ Protocol.Fire_timer { seq = timer_seq } ]);
-  begin match Worker.poll worker with
-  | Ok (Adapter.Rejected { lease_retired = true; error; _ })
-    when String.equal error.code "unknown_run_id" -> ()
-  | _ -> failwith "resumed failed run remained in the execution registry"
-  end
+  expect_completed ~terminal:false (Result.get_ok (Worker.poll worker));
+  if (latest_completion supervisor).commands <> [] then
+    failwith "sealed failed execution emitted another workflow command"
 
 (** A native activity command is submitted with its complete identifier, queue,
     argument, and timeout fields; the run remains suspended awaiting the result. *)
@@ -2139,16 +2211,15 @@ let test_duplicate_child_terminal_while_parent_pending () =
   end;
   if Hashtbl.length supervisor.leased <> 0 then
     failwith "duplicate child terminal left a native lease outstanding";
-  (* The timer remains pending in the discarded parent, so there must be no
-     later attempt to resume it after the bridge rejection retires the run. *)
+  (* Failure disposed the pending timer and fibers. Retaining the final state
+     for queries must not permit a late timer event to resume the parent. *)
   enqueue supervisor
     (activation ~run_id [ Protocol.Fire_timer { seq = timer_seq } ]);
-  match Worker.poll worker with
-  | Ok (Adapter.Rejected { error; lease_retired = true; _ })
-    when String.equal error.code "unknown_run_id" -> ()
-  | Ok _ -> failwith "duplicate child terminal retained stale parent state"
-  | Error error ->
-      failwith ("duplicate child terminal cleanup poll failed: " ^ error.message)
+  expect_completed ~terminal:false (Result.get_ok (Worker.poll worker));
+  if (latest_completion supervisor).commands <> [] then
+    failwith "late timer resumed a failed parent";
+  if Hashtbl.length supervisor.leased <> 0 then
+    failwith "late timer left a native lease outstanding"
 
 (** Checks the error observed by a parent when Core rejects a child start. The
     workflow deliberately inspects the same future after [await]: a successful
@@ -2564,6 +2635,7 @@ let test_task_queue_validation () =
 (** Runs all native worker adapter assertions. *)
 let () =
   test_terminal_workflow ();
+  test_completed_workflow_queries ();
   test_activation_metadata_hook ();
   test_completion_metadata_hook_runs_after_acknowledgement ();
   test_completion_metadata_hook_survives_retry ();
@@ -2589,7 +2661,7 @@ let () =
   test_unexpected_completion_exception_is_retried ();
   test_completion_rejection_is_drained_without_redo ();
   test_failure_completion_exception_is_typed ();
-  test_resumed_failure_removes_run ();
+  test_resumed_failure_seals_run ();
   test_activity_command_retires_lease ();
   test_discard_shuts_down_blocked_execution ();
   test_child_command_and_resolution_lifecycle ();

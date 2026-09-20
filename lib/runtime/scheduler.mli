@@ -46,9 +46,6 @@ val run : t -> status
 (** Runs the scheduler and returns a stable diagnostic label. *)
 val run_label : t -> string
 
-(** Returns executed runnable sequence numbers in execution order. *)
-val trace : t -> int list
-
 (** Permanently closes the scheduler and releases pending futures, paused
     fibers, and queued functions. Calling it more than once is safe. *)
 val shutdown : t -> unit

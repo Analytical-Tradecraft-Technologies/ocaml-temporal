@@ -116,16 +116,22 @@ already been accepted.
    and reparses the completion, checks its leased run ID against Rust's ledger,
    and retires that lease only after Core accepts it. The run entry is removed
    only after the supervisor confirms completion retirement. Terminal commands
-   remove the run; a cache-removal activation also removes it after its
-   required empty acknowledgement. Pending timer, activity, and child work
+   shut down fibers and pending operations but retain final workflow-local
+   state for inline queries. Core owns cache lifetime: its cache-removal
+   activation removes the run after the required empty acknowledgement.
+   Completed query handlers can emit only their query response; the sealed
+   scheduler never resumes. Pending timer, activity, and child work
    keeps the run entry. A child start failure retires its future immediately; a
    successful start keeps it until the matching terminal resolution arrives.
    A terminal resolution before its start acknowledgment, or a
    duplicate/unknown child sequence, is a typed bridge failure.
 
 Activations without initialization must identify a run already in the map.
-Unknown run IDs are completed with a non-retryable bridge failure, which
-retires the native lease instead of silently ignoring it.
+Unknown run IDs are completed with a non-retryable bridge failure (a query
+failure for a query-only activation), which retires the native lease instead
+of silently ignoring it. After eviction or worker replacement, Core replays
+history into a new execution before dispatching queries, including queries of
+already-completed runs.
 
 `poll` is deliberately nonblocking: `Not_ready` records only that this lane
 was empty at that instant. `Temporal.Worker.run` owns the fairness policy and
