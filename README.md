@@ -211,6 +211,13 @@ matrix cell. These entries describe configured jobs, not evidence that a
 particular Actions run has completed. Superseded runs are cancelled for the
 same PR or merge-group ref; job timeouts start after runner allocation.
 
+CI builds the Rust bridge once per operating system and architecture, sharing
+the Linux libraries across OCaml versions and the live smoke. Exact-input
+caches populated by `master` also serve PR, merge-queue, and scheduled runs.
+The C stubs, OCaml libraries, installed consumers, and their tests still build
+in every compatibility lane. See [Rust artifact sharing](docs/reference/quality-gates.md#rust-artifact-sharing)
+for the cache boundaries and local producer/consumer commands.
+
 When Actions is queued, use `make check OCAML_VERSION=5.2` as the representative
 Docker-backed local baseline. It combines `make verify` with the package/OCaml
 license audit. Run `make quality` separately when the pinned native

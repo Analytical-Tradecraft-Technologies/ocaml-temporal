@@ -5,6 +5,14 @@ workspace_root=$1
 static_output=$2
 dynamic_output=$3
 link_flags_output=$4
+bundle_output=${5:-}
+
+if [ -n "${TEMPORAL_RUST_BRIDGE_DIR:-}" ]; then
+  exec sh "$workspace_root/scripts/rust-bridge-artifact.sh" use "$workspace_root" \
+    "$TEMPORAL_RUST_BRIDGE_DIR" "${TEMPORAL_RUST_BRIDGE_KEY:?artifact key is required}" \
+    "$static_output" "$dynamic_output" "$link_flags_output"
+fi
+
 # Dune copy sandboxes expose the Rust source tree read-only. They set the
 # private fallback below to a writable sibling, while callers such as Docker
 # and the native Makefile set CARGO_TARGET_DIR directly. Keep the explicit
@@ -16,7 +24,7 @@ elif [ -n "${OCAML_TEMPORAL_RUST_TARGET_FALLBACK:-}" ]; then
   # Cargo must receive the same fallback selected for artifact copying. This
   # assignment is deliberately limited to the unset case so an existing
   # CARGO_TARGET_DIR is never replaced.
-  export CARGO_TARGET_DIR=$target_root
+  export CARGO_TARGET_DIR="$target_root"
 else
   target_root=$workspace_root/rust/target
 fi
@@ -59,6 +67,10 @@ if [ -z "$native_link_flags" ]; then
   exit 1
 fi
 
+if [ -n "$bundle_output" ]; then
+  printf '%s\n' "$native_link_flags" >"$bundle_output/native-static-libs"
+fi
+
 # rustc owns the platform-specific library list and its ordering. On Windows,
 # also preserve the Cargo build-script search path needed to resolve winapi's
 # bundled MinGW import archives from OCaml's foreign linker.
@@ -66,7 +78,8 @@ sh "$workspace_root/scripts/render-rust-link-flags.sh" \
   "$(uname -s)" \
   "$artifact_root" \
   "$link_flags_output" \
-  "$native_link_flags"
+  "$native_link_flags" \
+  "${bundle_output:+$bundle_output/import-libs}"
 
 "$workspace_root/scripts/copy-rust-bridge-artifacts.sh" \
   "$artifact_root/debug" "$static_output" "$dynamic_output"

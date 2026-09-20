@@ -234,17 +234,18 @@ let run () : (unit, Error.t) result =
       let* namespace = required_env "TEMPORAL_NAMESPACE" in
       let* stopped_file = required_env "SMOKE_WORKER_STOPPED_FILE" in
       let worker_result =
-        Worker.create ~target_url ~namespace
-          ~identity:"ocaml-temporal-parent-child-restart-worker"
-          ~task_queue:Definitions.task_queue
-          ~workflows:
-            [
-              Worker.workflow Definitions.parent_child_restart_child;
-              Worker.workflow Definitions.parent_child_restart_parent;
-              Worker.workflow Definitions.parent_child_failure_replay_child;
-              Worker.workflow Definitions.parent_child_failure_replay_parent;
-            ]
-          ~activities:[] ()
+        Acceptance_observer.with_worker (fun () ->
+          Worker.create ~target_url ~namespace
+            ~identity:"ocaml-temporal-parent-child-restart-worker"
+            ~task_queue:Definitions.task_queue
+            ~workflows:
+              [
+                Worker.workflow Definitions.parent_child_restart_child;
+                Worker.workflow Definitions.parent_child_restart_parent;
+                Worker.workflow Definitions.parent_child_failure_replay_child;
+                Worker.workflow Definitions.parent_child_failure_replay_parent;
+              ]
+            ~activities:[] ())
       in
       let* worker =
         match worker_result with

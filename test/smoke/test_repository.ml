@@ -168,7 +168,7 @@ let test_static_foreign_archives () =
     ~needle:"if [ -n \"${CARGO_TARGET_DIR:-}\" ]; then";
   require_text
     ~path:(Filename.concat source_root "scripts/build-rust-bridge.sh")
-    ~needle:"export CARGO_TARGET_DIR=$target_root";
+    ~needle:"export CARGO_TARGET_DIR=\"$target_root\"";
   if contains ~needle:"(foreign_stubs" (read bridge) then
     failwith "lib/core_bridge/dune must not build a temporary native-stubs DLL"
 
