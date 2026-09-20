@@ -2389,11 +2389,28 @@ impl WorkerConfigInput {
             });
         }
 
+        // Pinned Core caps cache-enabled permit acquisition at max(cache, 2),
+        // but its sticky/normal poller balancer reads the supplier's slot count.
+        // Give both the same effective capacity so idle sticky polls cannot
+        // reserve the slots needed to discover new workflows on the normal queue.
+        // Preserve stricter caller limits and the uncached worker behavior.
+        let workflow_task_slots = if self.max_cached_workflows == 0 {
+            self.max_outstanding_workflow_tasks
+        } else {
+            self.max_outstanding_workflow_tasks
+                .min(self.max_cached_workflows.max(2))
+        };
+
+        let workflow_task_slots = usize::try_from(workflow_task_slots).map_err(|_| Failure {
+            status: STATUS_CONFIGURATION,
+            message: "max_outstanding_workflow_tasks exceeds platform capacity".to_owned(),
+        })?;
+
         WorkerConfig::builder()
             .namespace(self.namespace)
             .task_queue(self.task_queue)
             .max_cached_workflows(self.max_cached_workflows as usize)
-            .max_outstanding_workflow_tasks(self.max_outstanding_workflow_tasks as usize)
+            .max_outstanding_workflow_tasks(workflow_task_slots)
             .workflow_task_poller_behavior(PollerBehavior::SimpleMaximum(
                 self.max_concurrent_workflow_task_polls as usize,
             ))
@@ -4283,3 +4300,7 @@ mod worker_config_tests {
 #[cfg(test)]
 #[path = "../tests/support/pending_start_cleanup.rs"]
 mod pending_start_cleanup_tests;
+
+#[cfg(test)]
+#[path = "../tests/support/worker_slot_limits.rs"]
+mod worker_slot_limits;

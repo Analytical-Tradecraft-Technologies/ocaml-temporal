@@ -412,6 +412,25 @@ Temporal Core requires at least two workflow-task pollers when
 and the JSON Schema all enforce that relationship before worker construction;
 the public native worker default is two pollers.
 
+For the pinned Core revision `95e9768`, cache-enabled workers also cap effective
+workflow-task permits at `max(max_cached_workflows, 2)`. Core's poller balancer
+reads the slot supplier's capacity rather than that independent cap. The bridge
+therefore passes the smaller of the requested task limit and this cache-derived
+capacity to Core. Otherwise, a one-entry cache with the default 1,000-task limit
+advertises 1,000 slots while allowing only two permits, so sticky polls can
+reserve capacity needed by the normal queue. This adjustment preserves the
+capacity Core already enforces, caller limits below the cap, and uncached
+workers. Reassess it when updating Core's permit dealer or poller balancer.
+
+The regression in `rust/core-bridge/tests/support/worker_slot_limits.rs` checks
+the one-entry/default-limit combination, larger cache bounds, stricter caller
+limits, uncached workers, and rejection of a one-task cached worker. Live
+qualification uses `make test-temporal-worker-cache-eviction`, which must
+observe A's `cache_full` eviction after starting B and typed cancellation of
+both runs. Increasing the watchdog or accepting a successful retry is not a
+substitute for those observations. CI artifact retention and release
+qualification remain tracked by issues #490 and #501.
+
 The public `Temporal.Worker.create` accepts validated `Temporal.Worker.Options`
 for routing and resource policy. `Options.make ~versioning:(Legacy_build_id
 "build-v2") ()` enables legacy build-ID routing. It also accepts an optional
