@@ -30,6 +30,7 @@ and specialized-controller workflows are described in the evidence reference.
 | --- | --- |
 | `activity_heartbeat_retry` | `smoke.activity_heartbeat_retry` |
 | `activity_heartbeat_timeout_retry` | `smoke.activity_heartbeat_timeout_retry` |
+| `activity_invalid_failure_details` | `smoke.activity_invalid_failure_details` |
 | `activity_long_backoff_retry` | `smoke.activity_long_backoff_retry` |
 | `activity_non_retryable_failure` | `smoke.activity_non_retryable_failure` |
 | `activity_retry` | `smoke.activity_retry` |
