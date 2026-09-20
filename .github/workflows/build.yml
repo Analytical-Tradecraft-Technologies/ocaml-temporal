@@ -139,7 +139,8 @@ jobs:
   native:
     name: OCaml 5.5 / ${{ matrix.label }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 45
+    # Allow slower Windows runs while leaving room under the 60-minute queue deadline.
+    timeout-minutes: ${{ matrix.runner == 'windows-latest' && 55 || 45 }}
     strategy:
       fail-fast: false
       matrix:
