@@ -17,6 +17,13 @@ changing a type, changing a labelled argument, changing a result/error
 contract, or exposing an implementation module is a breaking change even when
 the compiler can still build the repository itself.
 
+The [proposed v1 support policy](v1-support-policy.md) selects a narrower
+production feature/deployment contract, compatibility commitments and release
+qualification gates for maintainer review in #489. It is not an approval or a
+claim that the experimental package already satisfies those gates. Public
+export visibility and compile-time compatibility remain separate from stable
+behavioral support.
+
 The policy is intentionally conservative at the application boundary. It
 protects the source API that a downstream OCaml program sees, not the private
 Rust/Core implementation. The native bridge has its own version negotiation
@@ -64,5 +71,6 @@ When a public API change is intentional:
 Do not weaken an annotation merely to make a changed signature compile. If a
 new capability requires a new public module, add it to the explicit root
 allow-list and document why it belongs in the supported surface. Before the
-first stable release, the maintainer will turn this policy into a versioned
-compatibility promise and add the corresponding release-preflight checks.
+first stable release, maintainers must approve the v1 policy and complete its
+qualification checklist. The installed witness and private-module negative
+checks remain required even for exported capabilities labelled experimental.
