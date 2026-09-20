@@ -1,0 +1,76 @@
+{
+  "sdk_commit": "beae10d0a58e58fb8e076734cd38113d7a2b4466",
+  "tracked_source_diff_sha256": "b08ddc6f9a7ab2aadb359b1aa766d9fb18bdb9796eeae26ec6f33ee1b73a5d6f",
+  "core_revision": "95e97686a079dcfe6c42e3254b2f3f5e3d97408f",
+  "service_images": {
+    "postgresql": "postgres:18.6-bookworm@sha256:1c59e2c3c818eaa0f0628f695b36e7c9e362d6b219b36a54a32df645cbd7e1af",
+    "temporal": "temporalio/server:1.32.0@sha256:c3e752127759616bb1615e0f9ba0e21635aeb5fdeb922de4f371c350955f46ae",
+    "temporal-admin-tools": "temporalio/admin-tools:1.32.0@sha256:a9f84fb9a374b2374fe2e67c8efc0468ff3f1c66c8a0b14597ec86e349e62bca",
+    "temporal-schema": "temporalio/admin-tools:1.32.0@sha256:a9f84fb9a374b2374fe2e67c8efc0468ff3f1c66c8a0b14597ec86e349e62bca"
+  },
+  "development_image_id": "sha256:e647b1af07c189c851117c5e7a42135af1bed74abbc232f724e8f3fd28afafb2",
+  "compose_sha256": "b5622020ee845c7e734fc9241e456cf0697b0971867629382969e3b48649857c",
+  "binary_sha256": {
+    "broken_worker": "531a693da8f334518a7cea25f83df1d02cc8877380fa7bdbe9cc046ea555c192",
+    "corrected_worker": "698eeea7e98dd485f28b10dab50c0d71de16bd154a2ce0c8fcdaa37cf2fd7788",
+    "recovery_driver": "c5eba97bfb1f9ebcaf56a402dc05e0159c45936e1e4dc3ff6b3d0833986eabca"
+  },
+  "project": "ocaml-temporal-issue-511",
+  "result": "passed",
+  "executions": [
+    [
+      "body",
+      "task-failure-body",
+      "01a0be2f-c02c-77d6-9d48-0ae535904d59"
+    ],
+    [
+      "encoder",
+      "task-failure-encoder",
+      "01a0be2f-c033-7c8b-9adb-05c699a7b417"
+    ],
+    [
+      "missing",
+      "task-failure-missing",
+      "01a0be2f-c038-798b-b385-b3e39970d515"
+    ],
+    [
+      "business-retryable",
+      "task-failure-business-retryable",
+      "01a0be2f-c03d-74ef-b9e3-ff8abc523370"
+    ],
+    [
+      "business-permanent",
+      "task-failure-business-permanent",
+      "01a0be2f-c041-7925-97ba-5dc4d3798946"
+    ]
+  ],
+  "replay": "fresh corrected process replays the committed timer prefix on each original run",
+  "project_volumes_remaining": 0,
+  "history_sha256": {
+    "body": {
+      "json_sha256": "ec6c570272024ec1f3e764a24a12df21b8187dcb2d01a0a4861557fa872b43bb",
+      "protobuf_sha256": "411f720e5dbf2befe9fdd2389daa3c37bddcc74e0e2ef4e0de38a31d1898d646"
+    },
+    "encoder": {
+      "json_sha256": "10372495ba7f9cdbb05e6d6fcf7cf01b2f923ee1466975266d32c13483a940d0",
+      "protobuf_sha256": "5489f6b26fd8c07b8895d8ccfd519979ede13761babe85fa3c16fa724f44d3ef"
+    },
+    "missing": {
+      "json_sha256": "9f66ebfb91d8cd9213c9c7ae1a9a5662404baf4a3a95af8040e40a1c57054c78",
+      "protobuf_sha256": "2b2ce70eef66986331a5dadbde6e77c51f9d86ab1b6d4bf9dcef2d893a215a50"
+    },
+    "business-retryable": {
+      "json_sha256": "24f00eb60a958745ebe523d171fc208595c5a71fdac4bee69cfbb6b5fe139108",
+      "protobuf_sha256": "24088ff4c25f612ca62a8fd0397492eeea863886e78e08ec486b19182a910503"
+    },
+    "business-permanent": {
+      "json_sha256": "54710f8e0084295f8d0e7fe66c29b8b0d11fb63d621e3aac4faeaf822710d17e",
+      "protobuf_sha256": "ef678273e25a5b7ba9a9685744f651aee83233e0f680cb74a97f6d609f27098b"
+    }
+  },
+  "protobuf_export": {
+    "tool": "Python protobuf 6.33.6 json_format",
+    "descriptor_sha256": "66f4545747106ff4da8f8a6917570673200c86383cebcb587a75b1c52f34f131",
+    "descriptor_source": "Cargo-generated temporalio-protos descriptor set at the pinned Core revision"
+  }
+}

@@ -56,6 +56,8 @@ val message : t -> string
     decode. *)
 val codec : message:string -> t
 
-(** Creates a non-retryable error for an SDK bug or a violation of an API
-    requirement. *)
+(** Creates an error for an SDK bug or a violation of an API requirement.
+    Its diagnostic [non_retryable] field is true. When propagated from workflow
+    code, this fails the workflow task and leaves the execution open. Use
+    [make ~category:`Workflow] for a deliberate terminal business failure. *)
 val defect : message:string -> t

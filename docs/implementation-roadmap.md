@@ -115,3 +115,12 @@ The release artifacts and runtime container are audited independently from the
 host operating system and ephemeral CI/build environment. Build tools are
 recorded in the inventory; their licenses and whether they are redistributed
 are made explicit rather than inferred from the final binary.
+
+## Workflow defect recovery before v1 (#511)
+
+The private protocol now separates failed workflow tasks from intentional
+terminal workflow failures. The [failure contract](reference/workflow-failures.md)
+defines classification, cache/acknowledgement ownership, and the focused and
+exact-run live recovery gates. This is a prerequisite for broad fault and
+conformance qualification; passing the bounded recovery fixture does not claim
+those later qualification gates complete.

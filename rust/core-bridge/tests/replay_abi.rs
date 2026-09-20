@@ -618,3 +618,185 @@ fn replay_abi_waits_for_natural_shutdown_before_finalizing() {
 fn replay_abi_tests_use_the_current_contract() {
     assert_eq!(ABI_VERSION, 2);
 }
+
+/// Replays retained live task-failure and deliberate-failure histories through
+/// the real Core worker. Commands model the independently linked corrected
+/// OCaml generation; the live gate separately runs that OCaml code. Completion
+/// success alone is insufficient: any nondeterminism/failure eviction, missing
+/// activation, extra timer, or unretired native lease fails this regression.
+#[test]
+fn replay_live_workflow_task_failure_histories() {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use ocaml_temporal_core_bridge::workflow_protocol::{self, ActivationJob, CompletionCommand};
+    use prost::Message;
+    use std::collections::BTreeMap;
+    use temporalio_protos::temporal::api::history::v1::{History, history_event::Attributes};
+
+    let histories = [
+        (
+            "body",
+            include_bytes!("../../../test/integration/temporal/task_failure/histories/body.pb")
+                .as_slice(),
+        ),
+        (
+            "encoder",
+            include_bytes!("../../../test/integration/temporal/task_failure/histories/encoder.pb")
+                .as_slice(),
+        ),
+        (
+            "missing",
+            include_bytes!("../../../test/integration/temporal/task_failure/histories/missing.pb")
+                .as_slice(),
+        ),
+        (
+            "business-retryable",
+            include_bytes!(
+                "../../../test/integration/temporal/task_failure/histories/business-retryable.pb"
+            )
+            .as_slice(),
+        ),
+        (
+            "business-permanent",
+            include_bytes!(
+                "../../../test/integration/temporal/task_failure/histories/business-permanent.pb"
+            )
+            .as_slice(),
+        ),
+    ];
+    for (name, protobuf) in histories {
+        let history: History =
+            History::decode(protobuf).expect("live protobuf history must decode");
+        let Some(Attributes::WorkflowExecutionStartedEventAttributes(started)) =
+            history.events[0].attributes.as_ref()
+        else {
+            panic!("missing start event");
+        };
+        let run_id = started.original_execution_run_id.clone();
+        let workflow_id = format!("task-failure-{name}");
+        let document = serde_json::json!({
+            "workflow_id": workflow_id,
+            "history": {"encoding": "base64", "data": STANDARD.encode(history.encode_to_vec())}
+        })
+        .to_string();
+        let mut runtime = new_replay_runtime();
+        let mut result = empty_result();
+        assert_eq!(
+            unsafe {
+                ocaml_temporal_core_v2_replay_worker_feed_history_json(
+                    runtime,
+                    document.as_ptr(),
+                    document.len(),
+                    &mut result,
+                )
+            },
+            STATUS_OK
+        );
+        assert_status(&mut result, STATUS_OK);
+        assert_eq!(
+            unsafe { ocaml_temporal_core_v2_replay_worker_finish_input(runtime, &mut result) },
+            STATUS_OK
+        );
+        assert_status(&mut result, STATUS_OK);
+        let has_timer = matches!(name, "body" | "encoder");
+        let mut initialized = 0;
+        let mut fired = 0;
+        let mut evicted = false;
+        for _ in 0..4 {
+            let bytes = poll_replay_activation(runtime);
+            let activation =
+                workflow_protocol::decode_activation(std::str::from_utf8(&bytes).unwrap()).unwrap();
+            assert_eq!(activation.run_id, run_id);
+            let mut commands = Vec::new();
+            for job in activation.jobs {
+                match job {
+                    ActivationJob::InitializeWorkflow {
+                        workflow_id: actual_id,
+                        workflow_type,
+                        ..
+                    } => {
+                        assert_eq!(actual_id, workflow_id);
+                        assert_eq!(workflow_type, format!("task-failure.{name}"));
+                        initialized += 1;
+                        if has_timer {
+                            commands.push(CompletionCommand::StartTimer {
+                                seq: 1,
+                                start_to_fire_timeout: workflow_protocol::Duration {
+                                    seconds: 0,
+                                    nanoseconds: 100_000_000,
+                                },
+                            });
+                        } else if name.starts_with("business-") {
+                            commands.push(CompletionCommand::FailWorkflow {
+                                failure: workflow_protocol::Failure {
+                                    message: "intentional business failure".into(),
+                                    source: "ocaml".into(),
+                                    stack_trace: String::new(),
+                                    encoded_attributes: None,
+                                    cause: None,
+                                    info: workflow_protocol::FailureInfo::Application {
+                                        type_name: "workflow".into(),
+                                        non_retryable: name == "business-permanent",
+                                        details: vec![],
+                                    },
+                                },
+                            });
+                        }
+                    }
+                    ActivationJob::FireTimer { seq } => {
+                        assert_eq!(seq, 1);
+                        fired += 1;
+                    }
+                    ActivationJob::RemoveFromCache { reason, message } => {
+                        assert!(
+                            matches!(
+                                reason,
+                                workflow_protocol::EvictionReason::LangRequested
+                                    | workflow_protocol::EvictionReason::WorkflowExecutionEnding
+                            ),
+                            "unexpected replay eviction {reason:?}: {message}"
+                        );
+                        evicted = true;
+                    }
+                    other => panic!("unexpected live-history activation: {other:?}"),
+                }
+            }
+            if !evicted && (name == "missing" || fired == 1) {
+                commands.push(CompletionCommand::CompleteWorkflow {
+                    result: Some(workflow_protocol::Payload {
+                        metadata: BTreeMap::from([("encoding".into(), b"json/plain".to_vec())]),
+                        data: b"\"recovered\"".to_vec(),
+                    }),
+                });
+            }
+            let completion = workflow_protocol::Completion {
+                run_id: run_id.clone(),
+                commands,
+                task_failure: None,
+            };
+            let completion = workflow_protocol::encode_completion(&completion).unwrap();
+            assert_eq!(
+                unsafe {
+                    ocaml_temporal_core_v2_replay_worker_complete_workflow_json(
+                        runtime,
+                        completion.as_ptr(),
+                        completion.len(),
+                        &mut result,
+                    )
+                },
+                STATUS_OK
+            );
+            assert_status(&mut result, STATUS_OK);
+            if evicted {
+                break;
+            }
+        }
+        assert_eq!(initialized, 1, "{name}");
+        assert_eq!(fired, usize::from(has_timer), "{name}");
+        assert!(evicted, "{name} replay did not finish");
+        finalize_after_natural_shutdown(runtime);
+        assert_eq!(
+            unsafe { ocaml_temporal_core_v2_runtime_free(&mut runtime) },
+            STATUS_OK
+        );
+    }
+}

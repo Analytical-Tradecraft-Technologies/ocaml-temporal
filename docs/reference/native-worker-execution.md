@@ -135,7 +135,9 @@ worker loop should use that public API rather than waiting in this adapter.
 ## Rejection and failures
 
 An activation that is valid JSON but cannot be represented by the current
-runtime receives a typed `Fail_workflow` completion. `poll` returns
+runtime receives a typed failed-task completion with no commands. The
+workflow execution remains open; unsafe cached state is stopped immediately
+and its ownership record is removed after acknowledgement. `poll` returns
 `Ok (Rejected ...)` only after that completion has been accepted, and marks
 `lease_retired = true`. If the native completion operation fails, `poll` returns
 an error and leaves the exact completion in the pending map without claiming
@@ -171,9 +173,10 @@ code/path/message and performs no unsafe best-effort parsing.
 
 Expected operational failures use `result` values. Unexpected exceptions from
 workflow translation, codec execution, or completion are contained as typed
-`ocaml_exception`/`completion_failed` diagnostics. The adapter makes one
-failure-completion attempt when an ordinary completion raises; if that
-acknowledgement also fails, it returns an error and does not claim retirement.
+`ocaml_exception`/`completion_failed` diagnostics. The adapter retains the
+exact original completion when its acknowledgement raises, including when Core
+may already have accepted it. It never submits replacement failure commands or
+reruns user code to recover from an uncertain acknowledgement.
 The mutex is still released by `Fun.protect`, so a producer Domain cannot lose
 the registry lock or strand a second caller.
 
@@ -256,8 +259,8 @@ verify:
 - retention and retry of a rejected workflow completion without rerunning the
   workflow, including an explicit adapter drain;
 - unknown run rejection and lease retirement;
-- typed cleanup when completion raises, including the unacknowledged-lease
-  path when the failure completion itself raises;
+- exact completion retention when acknowledgement raises, including after
+  source acceptance, without replacement commands or workflow re-execution;
 - typed propagation of lower-layer malformed-activation errors; and
 - duplicate and remote-only registration rejection before worker publication;
 - rejection of empty, NUL-containing, oversized, and non-UTF-8 worker queues

@@ -656,13 +656,13 @@ module Make (Supervisor : SUPERVISOR) = struct
     in
     {
       run_id = completion.run_id;
+      task_failure = Option.map copy_failure completion.task_failure;
       commands = List.map copy_command completion.commands;
     }
 
-  (** Distinguishes an ordinary source rejection from an exception raised while
-      completing. The latter is allowed to reach [process_one]'s cleanup guard:
-      the adapter can then make one explicit failure-completion attempt instead
-      of silently abandoning the leased activation. *)
+  (** Distinguishes source rejection from an uncertain raised acknowledgement.
+      Both preserve the exact pending completion for retry; neither permits
+      replacement commands or re-execution of workflow code. *)
   type completion_attempt =
     | Accepted
     | Rejected_by_supervisor of error_view
@@ -786,22 +786,21 @@ module Make (Supervisor : SUPERVISOR) = struct
     then Some query_ids
     else None
 
-  (** Builds the completion for an adapter-level failure. Query activations are
-      read-only requests, so Core rejects a workflow-failure command for them;
-      each query ID must instead receive a failed query result. Ordinary and
-      mixed envelopes keep the existing workflow-failure path. The source
-      decoder guarantees query IDs are valid and unique before this helper is
-      reached. *)
-  let failure_commands (activation : Protocol.activation) error =
+  (** Query failures answer their request IDs. Other adapter defects fail the
+      workflow task with no commands, preserving its durable execution. Eviction
+      is an empty acknowledgement even if a diagnostic callback failed. *)
+  let failure_completion (activation : Protocol.activation) error =
     let failure = failure_of_error error in
     match query_only_ids activation with
     | Some query_ids ->
-        List.map
-          (fun query_id ->
-            Protocol.Query_result
-              { query_id; result = Protocol.Query_failed failure })
-          query_ids
-    | None -> [ Protocol.Fail_workflow { failure } ]
+        Protocol.{ run_id = activation.run_id; task_failure = None;
+          commands = List.map (fun query_id -> Query_result
+            { query_id; result = Query_failed failure }) query_ids }
+    | None when List.exists (function Protocol.Remove_from_cache _ -> true | _ -> false)
+        activation.jobs ->
+        Protocol.{ run_id = activation.run_id; commands = []; task_failure = None }
+    | None ->
+        Protocol.{ run_id = activation.run_id; commands = []; task_failure = Some failure }
 
   (** Encodes and submits an adapter-level failure. A successful submission is
       the lease-retirement proof for the activation; a failed submission
@@ -810,12 +809,14 @@ module Make (Supervisor : SUPERVISOR) = struct
       failed queries are read-only and must not mutate the workflow registry. *)
   let retire_with_failure ?(remove_run = false) adapter
       (activation : Protocol.activation) error =
-    let completion : Protocol.completion =
-      {
-        run_id = activation.Protocol.run_id;
-        commands = failure_commands activation error;
-      }
-    in
+    let completion = failure_completion activation error in
+    let remove_run = remove_run || Option.is_none (query_only_ids activation) in
+    (* Stop unsafe code immediately, but preserve the exact completion and its
+       release bookkeeping until the supervisor acknowledges ownership. *)
+    if remove_run then (
+      match Run_map.find_opt activation.run_id adapter.runs with
+      | Some (Run { execution; _ }) -> (try Execution.shutdown execution with _ -> ())
+      | None -> ());
     let pending =
       {
         run_id = activation.run_id;
@@ -873,7 +874,7 @@ module Make (Supervisor : SUPERVISOR) = struct
               command_count = List.length completion.commands;
               terminal = is_terminal completion;
               evicted =
-                List.exists
+                Option.is_some completion.task_failure || List.exists
                   (function Protocol.Remove_from_cache _ -> true | _ -> false)
                   activation.Protocol.jobs;
               activation_info;
@@ -890,18 +891,9 @@ module Make (Supervisor : SUPERVISOR) = struct
       | Accepted -> accepted_pending adapter pending
       | Rejected_by_supervisor error -> Error error
       | Raised_by_supervisor exception_ ->
-          (* Eviction acknowledgements must stay empty completions. Removing
-             them and re-raising lets the outer guard submit Fail_workflow,
-             which is invalid for an eviction lease. Keep the empty pending
-             entry for retry, matching [finish_pending]. *)
-          (match pending.result with
-          | Pending_completed { evicted = true; _ } ->
-              Error (completion_exception_error exception_)
-          | Pending_completed _ | Pending_rejected _ ->
-              (* Ordinary completions: preserve the historical cleanup contract
-                 so the outer guard can submit one explicit failure completion. *)
-              adapter.pending <- Run_map.remove pending.run_id adapter.pending;
-              raise exception_)
+          (* Core may already have accepted this exact value. Never replace it
+             with a task failure or rerun workflow code after an uncertain ack. *)
+          Error (completion_exception_error exception_)
     end
 
   (** A cache-eviction activation is acknowledged with a successful empty
@@ -913,7 +905,7 @@ module Make (Supervisor : SUPERVISOR) = struct
   let submit_eviction_acknowledgement adapter (activation : Protocol.activation)
       ~activation_info =
     let completion =
-      Protocol.{ run_id = activation.run_id; commands = [] }
+      Protocol.{ run_id = activation.run_id; task_failure = None; commands = [] }
     in
     let pending =
       {
@@ -978,7 +970,7 @@ module Make (Supervisor : SUPERVISOR) = struct
                     if Run_map.mem activation.run_id adapter.runs then
                       (* Reporting a terminal lifecycle defect also retires the
                          existing generation; otherwise its suspended fiber can
-                         resume after Core has accepted [Fail_workflow]. *)
+                         resume after Core has accepted the task failure. *)
                       retire_with_failure ~remove_run:true adapter activation
                         (make_error ~path:"$.run_id" "duplicate_run_id"
                            "workflow run is already present in the execution registry")

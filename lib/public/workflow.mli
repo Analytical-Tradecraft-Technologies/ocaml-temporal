@@ -19,7 +19,11 @@ type ('input, 'output) t
     more than 65,536 bytes because it crosses the native protocol into
     Temporal history. Violations raise [Invalid_argument] as construction
     defects. The implementation must remain deterministic and return expected
-    failures as [Error.t] values. *)
+    failures as [Error.t] values. Returning a [Workflow]-category error is
+    an intentional terminal failure. Unexpected exceptions and propagated
+    [Defect], [Bridge], or [Codec] errors fail only the workflow task so
+    corrected code can replay the same open execution. Result-encoder errors
+    also fail only the task. *)
 val define :
   name:string ->
   input:'input Codec.t ->

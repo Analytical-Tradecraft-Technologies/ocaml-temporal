@@ -172,9 +172,11 @@ type fake_supervisor = {
   (* One-shot completion rejection used to verify retained-completion retry
      without rerunning workflow code. *)
   reject_next_completion : bool ref;
-  (* One-shot completion exception used to verify the adapter's cleanup guard
-     and explicit failure-completion fallback. *)
+  (* One-shot completion exception used to verify exact completion retention
+     even when the native acknowledgement is uncertain. *)
   raise_next_completion : bool ref;
+  (* Models Core acceptance followed by loss of the language acknowledgement. *)
+  accept_then_raise : bool ref;
 }
 
 (** Allocates an empty fake semantic queue. *)
@@ -188,6 +190,7 @@ let fake_supervisor () =
     rejected_poll_count = ref 0;
     reject_next_completion = ref false;
     raise_next_completion = ref false;
+    accept_then_raise = ref false;
   }
 
 (** Implements the typed supervisor contract over the fake lease ledger. *)
@@ -223,6 +226,10 @@ module Fake_supervisor = struct
     end else if Hashtbl.mem supervisor.leased completion.run_id then begin
       Hashtbl.remove supervisor.leased completion.run_id;
       supervisor.completions := completion :: !(supervisor.completions);
+      if !(supervisor.accept_then_raise) then begin
+        supervisor.accept_then_raise := false;
+        failwith "accepted completion acknowledgement lost"
+      end;
       Ok ()
     end
     else Error { code = "stale_lease"; message = "run is not leased" }
@@ -1238,13 +1245,11 @@ let test_unhandled_signal_fails_closed () =
              identity = "sender";
              headers = [];
            } ]);
-  expect_completed ~terminal:true (Result.get_ok (Worker.poll worker));
+  expect_completed ~terminal:false (Result.get_ok (Worker.poll worker));
   begin
-    match (latest_completion supervisor).commands with
-    | [ Protocol.Fail_workflow
-          { failure = { message; info = Protocol.Application { non_retryable; _ }; _ } } ]
-      when non_retryable
-           && String.equal message "unhandled workflow signal: missing" ->
+    match (latest_completion supervisor).commands, (latest_completion supervisor).task_failure with
+    | [], Some { message; _ }
+      when String.equal message "unhandled workflow signal: missing" ->
         ()
     | _ -> failwith "unhandled signal did not produce a non-retryable failure"
   end;
@@ -1425,14 +1430,14 @@ let test_duplicate_initialization_retires_existing_run () =
           ("duplicate initialization completion returned the wrong error: "
          ^ error.message)
   end;
-  if !cleanups <> 0 then
-    failwith "duplicate initialization tore down its workflow before acknowledgement";
+  if !cleanups <> 1 then
+    failwith "duplicate initialization retained unsafe workflow continuations";
   if Hashtbl.length supervisor.leased <> 1 then
     failwith "rejected duplicate initialization retired its native lease too early";
   let retained = latest_attempt supervisor in
   begin
-    match retained.commands with
-    | [ Protocol.Fail_workflow _ ] -> ()
+    match retained.commands, retained.task_failure with
+    | [], Some _ -> ()
     | _ -> failwith "duplicate initialization did not retain its failure completion"
   end;
   begin
@@ -1654,14 +1659,16 @@ let test_eviction_after_terminal_completion () =
   if Hashtbl.length supervisor.leased <> 0 then
     failwith "terminal eviction left a native lease outstanding"
 
-(** An exception from an ordinary completion is caught at the transaction
-    boundary. The adapter makes one explicit failure-completion attempt, so the
-    lease is retired rather than escaping with an unacknowledged task. *)
+(** An uncertain acknowledgement retains exactly the original completion.
+    Retrying its handoff must neither run user code again nor replace it with
+    a failure that could permanently close an already-completed run. *)
 let test_unexpected_completion_exception_is_retried () =
   let supervisor = fake_supervisor () in
+  let calls = ref 0 in
   let workflow =
     Temporal.Workflow.define ~name:"native_worker_completion_exception"
-      ~input:Temporal.Codec.unit ~output:Temporal.Codec.unit (fun () -> Ok ())
+      ~input:Temporal.Codec.unit ~output:Temporal.Codec.unit
+      (fun () -> incr calls; Ok ())
   in
   enqueue supervisor
     (activation ~run_id:"run-completion-exception"
@@ -1669,17 +1676,17 @@ let test_unexpected_completion_exception_is_retried () =
            ~workflow_type:"native_worker_completion_exception" ]);
   supervisor.raise_next_completion := true;
   let worker = worker supervisor [ Adapter.register workflow ] in
-  begin match Worker.poll worker with
-  | Ok (Adapter.Rejected { lease_retired = true; error; _ })
-    when String.equal error.code "ocaml_exception" -> ()
-  | _ -> failwith "completion exception did not trigger a typed failure retry"
-  end;
-  begin match (latest_completion supervisor).commands with
-  | [ Protocol.Fail_workflow _ ] -> ()
-  | _ -> failwith "completion exception retry did not submit a failure"
-  end;
-  if Hashtbl.length supervisor.leased <> 0 then
-    failwith "completion exception retry left a native lease outstanding"
+  (match Worker.poll worker with
+  | Error { code = "completion_failed"; _ } -> ()
+  | _ -> failwith "uncertain completion did not preserve pending ownership");
+  let retained = latest_attempt supervisor in
+  if !calls <> 1 || List.length !(supervisor.attempts) <> 1 then
+    failwith "uncertain completion caused extra execution or submission";
+  expect_completed ~terminal:true (Result.get_ok (Worker.poll worker));
+  if latest_completion supervisor <> retained || !calls <> 1 then
+    failwith "completion retry changed the value or reran workflow code";
+  if retained.task_failure <> None then failwith "completion replaced by failure";
+  if Hashtbl.length supervisor.leased <> 0 then failwith "completion lease leaked"
 
 (** A workflow completion that is rejected after execution is retained exactly
     as produced. Draining the adapter acknowledges it without invoking the
@@ -1739,9 +1746,13 @@ let test_failure_completion_exception_is_typed () =
   supervisor.raise_next_completion := true;
   let worker = worker supervisor [ Adapter.register workflow ] in
   begin match Worker.poll worker with
-  | Ok (Adapter.Rejected { lease_retired = true; _ }) -> ()
+  | Error { code = "completion_failed"; _ } -> ()
   | _ -> failwith "failure completion exception was not typed"
   end;
+  let retained = latest_attempt supervisor in
+  ignore (Result.get_ok (Worker.drain worker));
+  if latest_completion supervisor <> retained then
+    failwith "uncertain completion was replaced during drain";
   if Hashtbl.length supervisor.leased <> 0 then
     failwith "typed failure completion left a native lease outstanding"
 
@@ -1783,9 +1794,9 @@ let test_resumed_failure_removes_run () =
   enqueue supervisor
     (activation ~run_id:"run-resumed-failure"
        [ Protocol.Fire_timer { seq = timer_seq } ]);
-  expect_completed ~terminal:true (Result.get_ok (Worker.poll worker));
-  begin match (latest_completion supervisor).commands with
-  | [ Protocol.Fail_workflow _ ] -> ()
+  expect_completed ~terminal:false (Result.get_ok (Worker.poll worker));
+  begin match (latest_completion supervisor).commands, (latest_completion supervisor).task_failure with
+  | [], Some _ -> ()
   | _ -> failwith "invalid timer resolution did not fail the workflow"
   end;
   enqueue supervisor
@@ -1949,7 +1960,7 @@ let test_child_command_and_resolution_lifecycle () =
     failwith "child lifecycle left a native lease outstanding"
 
 (** A terminal child result is invalid until Core has acknowledged the child
-    start. The execution turns that bridge defect into one terminal failure
+    start. The execution turns that bridge defect into one failed-task
     completion and the native adapter discards the parent execution so a later
     activation cannot resume corrupted state. *)
 let test_child_terminal_before_start_retires_parent_lease () =
@@ -1987,14 +1998,14 @@ let test_child_terminal_before_start_retires_parent_lease () =
        ]);
   begin
     match Worker.poll worker with
-    | Ok (Adapter.Completed { terminal = true; command_count = 1; _ }) -> ()
+    | Ok (Adapter.Completed { terminal = false; command_count = 0; _ }) -> ()
     | Ok _ -> failwith "terminal-before-start activation did not fail the workflow"
     | Error error ->
         failwith ("terminal-before-start failure was not acknowledged: " ^ error.message)
   end;
   begin
-    match (latest_completion supervisor).commands with
-    | [ Protocol.Fail_workflow _ ] -> ()
+    match (latest_completion supervisor).commands, (latest_completion supervisor).task_failure with
+    | [], Some _ -> ()
     | _ -> failwith "terminal-before-start did not submit a failure completion"
   end;
   if Hashtbl.length supervisor.leased <> 0 then
@@ -2045,14 +2056,14 @@ let test_duplicate_child_start_acknowledgment_retires_parent_lease () =
        ]);
   begin
     match Worker.poll worker with
-    | Ok (Adapter.Completed { terminal = true; command_count = 1; _ }) -> ()
+    | Ok (Adapter.Completed { terminal = false; command_count = 0; _ }) -> ()
     | Ok _ -> failwith "duplicate child start acknowledgment did not fail the workflow"
     | Error error ->
         failwith ("duplicate child start failure was not acknowledged: " ^ error.message)
   end;
   begin
-    match (latest_completion supervisor).commands with
-    | [ Protocol.Fail_workflow _ ] -> ()
+    match (latest_completion supervisor).commands, (latest_completion supervisor).task_failure with
+    | [], Some _ -> ()
     | _ -> failwith "duplicate child start did not submit a failure completion"
   end;
   if Hashtbl.length supervisor.leased <> 0 then
@@ -2127,14 +2138,14 @@ let test_duplicate_child_terminal_while_parent_pending () =
        ]);
   begin
     match Worker.poll worker with
-    | Ok (Adapter.Completed { terminal = true; command_count = 1; _ }) -> ()
+    | Ok (Adapter.Completed { terminal = false; command_count = 0; _ }) -> ()
     | Ok _ -> failwith "duplicate child terminal did not fail the workflow"
     | Error error ->
         failwith ("duplicate child terminal failure was not acknowledged: " ^ error.message)
   end;
   begin
-    match (latest_completion supervisor).commands with
-    | [ Protocol.Fail_workflow _ ] -> ()
+    match (latest_completion supervisor).commands, (latest_completion supervisor).task_failure with
+    | [], Some _ -> ()
     | _ -> failwith "duplicate child terminal did not submit a failure completion"
   end;
   if Hashtbl.length supervisor.leased <> 0 then
@@ -2561,8 +2572,150 @@ let test_task_queue_validation () =
   expect_invalid "oversized" (String.make 65_537 'x');
   expect_invalid "UTF-8" (String.make 1 (Char.chr 0xff))
 
+(** A body exception discards a timer buffered in that same task. Retrying a
+    failed acknowledgement preserves its exact value and never invokes code
+    again; a corrected registration can initialize the same run from scratch. *)
+let test_defect_discards_commands_and_reconstructs () =
+  let supervisor = fake_supervisor () in
+  let calls = ref 0 in
+  let define body = Temporal.Workflow.define ~name:"repairable"
+      ~input:Temporal.Codec.unit ~output:Temporal.Codec.unit body in
+  let broken = define (fun () ->
+      incr calls;
+      ignore (Temporal.Workflow.start_sleep (Temporal.Duration.of_ms 1000L));
+      failwith "repairable body defect") in
+  let run_id = "same-repaired-run" in
+  let start = activation ~run_id [ initialize ~run_id ~workflow_type:"repairable" ] in
+  enqueue supervisor start;
+  let broken_worker = worker supervisor [ Adapter.register broken ] in
+  supervisor.reject_next_completion := true;
+  begin match Worker.poll broken_worker with
+  | Error { code = "completion_failed"; _ } -> ()
+  | _ -> failwith "failed task acknowledgement was not retained"
+  end;
+  let retained = latest_attempt supervisor in
+  if retained.commands <> [] || Option.is_none retained.task_failure then
+    failwith "body defect leaked its partial timer or terminated the run";
+  expect_completed ~terminal:false (Result.get_ok (Worker.poll broken_worker));
+  if latest_completion supervisor <> retained || !calls <> 1 then
+    failwith "failed-task retry changed completion or reran body";
+  Worker.discard broken_worker;
+  let corrected = define (fun () -> Temporal.Workflow.sleep (Temporal.Duration.of_ms 1000L)) in
+  let fixed_worker = worker supervisor [ Adapter.register corrected ] in
+  enqueue supervisor start;
+  expect_completed ~terminal:false (Result.get_ok (Worker.poll fixed_worker));
+  begin match (latest_completion supervisor).commands with
+  | [ Protocol.Start_timer { seq = 1L; _ } ] -> ()
+  | _ -> failwith "corrected run retained poisoned command sequence state"
+  end;
+  enqueue supervisor (activation ~run_id [ Protocol.Fire_timer { seq = 1L } ]);
+  expect_completed ~terminal:true (Result.get_ok (Worker.poll fixed_worker));
+  if Hashtbl.length supervisor.leased <> 0 then failwith "repaired run leaked lease"
+
+(** Encoder defects invalidate the entire task even if the encoder returns a
+    misleading application-category error instead of raising an exception. *)
+let test_output_encoder_failure_is_task_failure () =
+  List.iter (fun raises ->
+      let output = Temporal.Codec.make ~encoding:"fixture/broken"
+          ~encode:(fun () -> if raises then failwith "encoder defect" else
+              Error (Temporal.Error.make ~category:`Workflow ~message:"bad encode" ()))
+          ~decode:(fun _ -> Ok ()) in
+      let definition = Temporal.Workflow.define ~name:"broken-encoder"
+          ~input:Temporal.Codec.unit ~output (fun () -> Ok ()) in
+      let supervisor = fake_supervisor () in
+      let run_id = "encoder-run" in
+      enqueue supervisor (activation ~run_id
+          [ initialize ~run_id ~workflow_type:"broken-encoder" ]);
+      let worker = worker supervisor [ Adapter.register definition ] in
+      expect_completed ~terminal:false (Result.get_ok (Worker.poll worker));
+      let completion = latest_completion supervisor in
+      if completion.commands <> [] || Option.is_none completion.task_failure then
+        failwith "output codec failure terminated the execution") [ false; true ]
+
+(** Deliberate typed Workflow failures retain both retryability choices and
+    the terminal command; the task-failure default does not swallow business errors. *)
+let test_deliberate_application_failure_remains_terminal () =
+  List.iter (fun non_retryable ->
+      let definition = Temporal.Workflow.define ~name:"business-failure"
+          ~input:Temporal.Codec.unit ~output:Temporal.Codec.unit (fun () ->
+            Error (Temporal.Error.make ~category:`Workflow ~non_retryable
+                ~message:"business declined" ())) in
+      let supervisor = fake_supervisor () in
+      let run_id = "business-run" in
+      enqueue supervisor (activation ~run_id
+          [ initialize ~run_id ~workflow_type:"business-failure" ]);
+      let worker = worker supervisor [ Adapter.register definition ] in
+      expect_completed ~terminal:true (Result.get_ok (Worker.poll worker));
+      match (latest_completion supervisor).commands, (latest_completion supervisor).task_failure with
+      | [ Protocol.Fail_workflow { failure = { info = Protocol.Application value; _ } } ], None
+        when value.non_retryable = non_retryable -> ()
+      | _ -> failwith "business failure lost terminal or retryability semantics") [ false; true ]
+
+(** If Core accepts and the acknowledgement is lost, the adapter cannot know
+    whether another semantic command is safe. It retains only the original
+    completion and blocks later activations until ownership is reconciled or
+    the native graph is torn down. *)
+let test_accepted_completion_exception_never_reexecutes () =
+  let calls = ref 0 in
+  let definition = Temporal.Workflow.define ~name:"accepted-then-raised"
+      ~input:Temporal.Codec.unit ~output:Temporal.Codec.unit (fun () ->
+        incr calls; Ok ()) in
+  let supervisor = fake_supervisor () in
+  let run_id = "uncertain-run" in
+  let start = activation ~run_id
+      [ initialize ~run_id ~workflow_type:"accepted-then-raised" ] in
+  let worker = worker supervisor [ Adapter.register definition ] in
+  supervisor.accept_then_raise := true;
+  enqueue supervisor start;
+  begin match Worker.poll worker with
+  | Error { code = "completion_failed"; _ } -> ()
+  | _ -> failwith "lost accepted acknowledgement was hidden"
+  end;
+  let retained = latest_attempt supervisor in
+  enqueue supervisor start;
+  begin match Worker.poll worker with
+  | Error { code = "completion_failed"; _ } -> ()
+  | _ -> failwith "uncertain acceptance allowed later workflow execution"
+  end;
+  if !calls <> 1 || Queue.length supervisor.queue <> 1 ||
+      List.length !(supervisor.completions) <> 1 || latest_attempt supervisor <> retained then
+    failwith "uncertain acknowledgement reran code or replaced the command";
+  Worker.discard worker
+
+(** An accepted update may mutate state and buffer commands before raising.
+    Neither those commands nor its speculative acceptance may reach history;
+    ordinary typed update rejection is covered by the separate update tests. *)
+let test_update_defect_discards_acceptance_and_commands () =
+  let update = Temporal.Update.define ~name:"broken-update"
+      ~input:Temporal.Codec.unit ~output:Temporal.Codec.unit in
+  let handler = Temporal.Update.Handler.make update (fun () ->
+      ignore (Temporal.Workflow.start_sleep (Temporal.Duration.of_ms 1000L));
+      failwith "update handler defect") in
+  let definition = Temporal.Workflow.define ~name:"update-defect"
+      ~input:Temporal.Codec.unit ~output:Temporal.Codec.unit (fun () ->
+        Temporal.Workflow.sleep (Temporal.Duration.of_ms 1000L)) in
+  let supervisor = fake_supervisor () in
+  let run_id = "update-defect-run" in
+  let worker = worker supervisor [ Adapter.register
+      ~update_handlers:[ public_update_handler handler ] definition ] in
+  enqueue supervisor (activation ~run_id
+      [ initialize ~run_id ~workflow_type:"update-defect" ]);
+  expect_completed ~terminal:false (Result.get_ok (Worker.poll worker));
+  enqueue supervisor (activation ~run_id [ update_job ~id:"broken-update"
+      ~protocol_instance_id:"broken-update-protocol" ~name:"broken-update"
+      ~input:[ encoded_protocol Temporal.Codec.unit () ] ~run_validator:true ]);
+  expect_completed ~terminal:false (Result.get_ok (Worker.poll worker));
+  let completion = latest_completion supervisor in
+  if completion.commands <> [] || Option.is_none completion.task_failure then
+    failwith "broken update leaked accepted response or buffered timer"
+
 (** Runs all native worker adapter assertions. *)
 let () =
+  test_accepted_completion_exception_never_reexecutes ();
+  test_defect_discards_commands_and_reconstructs ();
+  test_output_encoder_failure_is_task_failure ();
+  test_deliberate_application_failure_remains_terminal ();
+  test_update_defect_discards_acceptance_and_commands ();
   test_terminal_workflow ();
   test_activation_metadata_hook ();
   test_completion_metadata_hook_runs_after_acknowledgement ();
