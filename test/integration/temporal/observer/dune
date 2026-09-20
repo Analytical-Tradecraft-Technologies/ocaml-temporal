@@ -1,0 +1,10 @@
+(library
+ (name temporal_acceptance_observer)
+ (wrapped false)
+ (modules acceptance_observer workflow_role_checkpoint)
+ (libraries temporal-sdk temporal_runtime))
+
+(tests
+ (names test_acceptance_observer test_workflow_role_checkpoint)
+ (modules test_acceptance_observer test_workflow_role_checkpoint)
+ (libraries temporal_acceptance_observer temporal_runtime unix))

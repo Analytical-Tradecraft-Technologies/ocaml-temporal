@@ -2,3 +2,8 @@
  (name main)
  (modules main public_api)
  (libraries temporal-sdk))
+
+(executable
+ (name worker_environment)
+ (modules worker_environment)
+ (libraries temporal-sdk))

@@ -269,63 +269,64 @@ let run () =
         Definitions.clear_signal_condition_ready_file signal_condition_ready_file
       in
       let worker_result =
-        Worker.create ?max_cached_workflows ~target_url ~namespace
-          ~identity:"ocaml-temporal-two-binary-worker"
-          ~task_queue:Definitions.task_queue
-          ~workflows:
-            [
-              Worker.workflow ~signals:[ Definitions.signal_value_handler ]
-                ~queries:
-                  [ Definitions.signal_condition_status_handler;
-                    Definitions.signal_value_echo_handler ]
-                ~updates:[ Definitions.signal_value_update_handler ]
-                Definitions.signal_condition_workflow;
-              Worker.workflow Definitions.external_signal_parent;
-              Worker.workflow Definitions.external_signal_completed_parent;
-              Worker.workflow Definitions.external_cancellation_wrong_run_parent;
-              Worker.workflow Definitions.external_cancellation_parent;
-              Worker.workflow Definitions.fan_out;
-              Worker.workflow Definitions.timer_then_activity;
-              Worker.workflow Definitions.local_activity_workflow;
-              Worker.workflow Definitions.continue_as_new;
-              Worker.workflow Definitions.activity_retry;
-              Worker.workflow Definitions.activity_long_backoff_retry;
-              Worker.workflow Definitions.activity_heartbeat_retry;
-              Worker.workflow Definitions.async_activity_completion;
-              Worker.workflow Definitions.activity_timeout_retry;
-              Worker.workflow Definitions.activity_heartbeat_timeout_retry;
-              Worker.workflow Definitions.activity_non_retryable_failure;
-              Worker.workflow Definitions.child_retryable_failure;
-              Worker.workflow Definitions.parent_retries_child;
-              Worker.workflow Definitions.child_after_timer;
-              Worker.workflow Definitions.parent_awaits_child;
-              Worker.workflow Definitions.parent_observes_child_start_failure;
-              Worker.workflow Definitions.child_non_retryable_failure;
-              Worker.workflow Definitions.parent_awaits_failed_child;
-              Worker.workflow Definitions.child_long_running;
-              Worker.workflow Definitions.parent_cancels_child;
-              Worker.workflow Definitions.non_retryable_failure;
-              Worker.workflow Definitions.long_running_cancellation;
-              Worker.workflow Definitions.worker_restart_replay;
-              Worker.workflow
-                ~queries:[ Definitions.cache_eviction_residency_handler ]
-                Definitions.cache_eviction;
-            ]
-          ~activities:
-            [
-              Worker.activity Definitions.mock_transform;
-              Worker.activity Definitions.retry_once_activity;
-              Worker.activity Definitions.long_backoff_retry_activity;
-              Worker.activity Definitions.heartbeat_retry_activity;
-              Worker.activity Definitions.async_delayed_completion_activity;
-              Worker.activity Definitions.timeout_retry_activity;
-              Worker.activity Definitions.heartbeat_timeout_retry_activity;
-              Worker.activity Definitions.non_retryable_activity;
-              Worker.activity Definitions.child_retry_activity;
-              Worker.activity Definitions.cancellation_ready_activity;
-              Worker.activity Definitions.signal_condition_ready_activity;
-            ]
-          ()
+        Acceptance_observer.with_worker (fun () ->
+          Worker.create ?max_cached_workflows ~target_url ~namespace
+            ~identity:"ocaml-temporal-two-binary-worker"
+            ~task_queue:Definitions.task_queue
+            ~workflows:
+              [
+                Worker.workflow ~signals:[ Definitions.signal_value_handler ]
+                  ~queries:
+                    [ Definitions.signal_condition_status_handler;
+                      Definitions.signal_value_echo_handler ]
+                  ~updates:[ Definitions.signal_value_update_handler ]
+                  Definitions.signal_condition_workflow;
+                Worker.workflow Definitions.external_signal_parent;
+                Worker.workflow Definitions.external_signal_completed_parent;
+                Worker.workflow Definitions.external_cancellation_wrong_run_parent;
+                Worker.workflow Definitions.external_cancellation_parent;
+                Worker.workflow Definitions.fan_out;
+                Worker.workflow Definitions.timer_then_activity;
+                Worker.workflow Definitions.local_activity_workflow;
+                Worker.workflow Definitions.continue_as_new;
+                Worker.workflow Definitions.activity_retry;
+                Worker.workflow Definitions.activity_long_backoff_retry;
+                Worker.workflow Definitions.activity_heartbeat_retry;
+                Worker.workflow Definitions.async_activity_completion;
+                Worker.workflow Definitions.activity_timeout_retry;
+                Worker.workflow Definitions.activity_heartbeat_timeout_retry;
+                Worker.workflow Definitions.activity_non_retryable_failure;
+                Worker.workflow Definitions.child_retryable_failure;
+                Worker.workflow Definitions.parent_retries_child;
+                Worker.workflow Definitions.child_after_timer;
+                Worker.workflow Definitions.parent_awaits_child;
+                Worker.workflow Definitions.parent_observes_child_start_failure;
+                Worker.workflow Definitions.child_non_retryable_failure;
+                Worker.workflow Definitions.parent_awaits_failed_child;
+                Worker.workflow Definitions.child_long_running;
+                Worker.workflow Definitions.parent_cancels_child;
+                Worker.workflow Definitions.non_retryable_failure;
+                Worker.workflow Definitions.long_running_cancellation;
+                Worker.workflow Definitions.worker_restart_replay;
+                Worker.workflow
+                  ~queries:[ Definitions.cache_eviction_residency_handler ]
+                  Definitions.cache_eviction;
+              ]
+            ~activities:
+              [
+                Worker.activity Definitions.mock_transform;
+                Worker.activity Definitions.retry_once_activity;
+                Worker.activity Definitions.long_backoff_retry_activity;
+                Worker.activity Definitions.heartbeat_retry_activity;
+                Worker.activity Definitions.async_delayed_completion_activity;
+                Worker.activity Definitions.timeout_retry_activity;
+                Worker.activity Definitions.heartbeat_timeout_retry_activity;
+                Worker.activity Definitions.non_retryable_activity;
+                Worker.activity Definitions.child_retry_activity;
+                Worker.activity Definitions.cancellation_ready_activity;
+                Worker.activity Definitions.signal_condition_ready_activity;
+              ]
+            ())
       in
       let* worker =
         match worker_result with
