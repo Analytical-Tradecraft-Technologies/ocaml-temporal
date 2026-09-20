@@ -1,9 +1,6 @@
 name: Build
 
 on:
-  push:
-    branches:
-      - master
   schedule:
     # GitHub Actions cron is UTC. Sydney is UTC+10 in standard time, so this
     # runs at 05:00 Sydney time during the repository's standard-time season.
@@ -13,11 +10,7 @@ permissions:
   contents: read
 
 concurrency:
-  # A pull-request number remains stable across synchronize events, so a new
-  # commit replaces an older queued or running PR run. The master ref is the
-  # fallback for the push trigger. This cancellation is intentionally scoped
-  # to the same change and never cancels an unrelated PR.
-  group: build-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: build-scheduled-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -41,7 +34,7 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v7
       - name: Install pinned quality tools
-        uses: taiki-e/install-action@26e9283f268b880168bdbd2c545dfcd60ec2c6ab # v2.87.13
+        uses: taiki-e/install-action@76c2e6406e52637deed7160d77bded76bd83e06e # v2.87.14
         with:
           tool: cargo-deny@0.20.2,cargo-machete@0.9.2,typos@1.48.0
           fallback: none
@@ -195,7 +188,8 @@ jobs:
   native:
     name: OCaml 5.5 / ${{ matrix.label }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 45
+    # Allow slower Windows runs while leaving room under the 60-minute queue deadline.
+    timeout-minutes: ${{ matrix.runner == 'windows-latest' && 55 || 45 }}
     strategy:
       fail-fast: false
       matrix:
