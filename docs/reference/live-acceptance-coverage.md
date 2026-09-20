@@ -110,7 +110,9 @@ live targets and the baseline driver's referenced workflow definitions.
 `make update-live-acceptance-inventory` regenerates it after a scenario change.
 The check is part of `make test-quality-contract`, hence the existing broad
 Linux/native test gates. It checks membership rather than arbitrary start
-counts, line numbers, scheduling order, or result values.
+counts, line numbers, scheduling order, or result values. The
+`make test-live-acceptance-inventory-contract` regression checks equivalent LF
+and Windows CRLF checkouts, canonical generation and rejected membership drift.
 
 When changing a scenario, regenerate that inventory, review this matrix against
 the definition and terminal assertions, and run the affected source contract.

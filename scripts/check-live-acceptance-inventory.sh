@@ -114,7 +114,14 @@ HEADER
 inventory="$root/docs/reference/live-acceptance-inventory.md"
 if [ "$mode" = --write ]; then
   cp "$scratch/inventory.md" "$inventory"
-elif ! diff -u "$inventory" "$scratch/inventory.md"; then
-  echo "live inventory drift: run make update-live-acceptance-inventory and review the evidence matrix" >&2
-  exit 1
+else
+  # Git may check Markdown out as CRLF on Windows. Compare text with only that
+  # line-ending representation normalized; preserve internal whitespace and
+  # every inventory member. Generation stays LF and checking never rewrites
+  # the checkout. The executable script itself is pinned to LF by attributes.
+  awk '{ sub(/\r$/, ""); print }' "$inventory" > "$scratch/checked-in-inventory.md"
+  if ! diff -u "$scratch/checked-in-inventory.md" "$scratch/inventory.md"; then
+    echo "live inventory drift: run make update-live-acceptance-inventory and review the evidence matrix" >&2
+    exit 1
+  fi
 fi
