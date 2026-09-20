@@ -622,8 +622,14 @@ returned as an ordinary `Error.t` result.
 and returns after a Temporal worker has accepted it. The returned update handle retains
 the update name, exact run, caller-supplied or generated update ID, and output
 codec. It contains no native pointer and can be held while other updates or
-workflow operations are started. `Temporal.Client.wait_update` polls the same
-ID until the server returns a completed value or an application failure.
+workflow operations are started. Admission failures, including validator
+rejections, are returned directly with their original message, retryability,
+and details. A successful outcome already returned at admission is retained in
+the handle: `Temporal.Client.wait_update` decodes it without another RPC.
+Otherwise it polls the same ID until the server returns a completed value or
+an application failure. Repeated waits can decode the retained admission
+outcome even after the server no longer has the execution record; client
+shutdown still invalidates all handles.
 
 Acceptance and completion are deliberately separate: an accepted update may
 still be waiting behind workflow code, and a pending poll is not a failure.

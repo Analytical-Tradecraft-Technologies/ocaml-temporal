@@ -44,6 +44,9 @@ type ('input, 'output) update_handle = {
   run_id : string;
   update_id : string;
   input : Payload.t;
+  (* A completed admission outcome can be decoded without looking up a server
+     record that may no longer exist. Immutable across caller Domains. *)
+  outcome : Backend.update_outcome option;
 }
 
 (** Identifies a successor execution returned by Temporal after a workflow
@@ -663,45 +666,54 @@ let start_update ?update_id
                 input = encoded_input;
               }
             in
-            Result.map
+            Result.bind
+              (Backend.client_update handle.client.backend request)
               (fun (response : Backend.update_response) ->
-                {
-                  client = handle.client;
-                  definition = update;
-                  workflow_id = response.workflow_id;
-                  run_id = response.run_id;
-                  update_id = response.update_id;
-                  input = encoded_input;
-                })
-              (Backend.client_update handle.client.backend request))
+                match response.outcome with
+                | Some (Backend.Update_failed error) -> Error error
+                | outcome ->
+                    Ok
+                      {
+                        client = handle.client;
+                        definition = update;
+                        workflow_id = response.workflow_id;
+                        run_id = response.run_id;
+                        update_id = response.update_id;
+                        input = encoded_input;
+                        outcome;
+                      }))
 
 (** Waits for one admitted update, retrying bounded polls until Temporal
     supplies a terminal outcome. Each retry occurs on the caller Domain; the
-    Rust bridge releases the OCaml runtime lock while its gRPC poll is active. *)
+    Rust bridge releases the OCaml runtime lock while its gRPC poll is active.
+    Outcomes already supplied at admission are decoded without another RPC. *)
 let wait_update handle =
   if Atomic.get handle.client.closed then
     Error
       (Error.make ~category:`Bridge ~message:"client is shut down" ())
   else
-    let request : Backend.update_request =
-      {
-        workflow_id = handle.workflow_id;
-        run_id = handle.run_id;
-        update_id = handle.update_id;
-        update_name = Update.name handle.definition;
-        input = handle.input;
-      }
-    in
-    let rec poll () =
-      match Backend.client_poll_update handle.client.backend request with
-      | Error error -> Error error
-      | Ok { Backend.outcome = None } ->
-          Thread.yield ();
-          poll ()
-      | Ok { Backend.outcome = Some outcome } ->
-          decode_update_output handle.definition outcome
-    in
-    poll ()
+    match handle.outcome with
+    | Some outcome -> decode_update_output handle.definition outcome
+    | None ->
+        let request : Backend.update_request =
+          {
+            workflow_id = handle.workflow_id;
+            run_id = handle.run_id;
+            update_id = handle.update_id;
+            update_name = Update.name handle.definition;
+            input = handle.input;
+          }
+        in
+        let rec poll () =
+          match Backend.client_poll_update handle.client.backend request with
+          | Error error -> Error error
+          | Ok { Backend.outcome = None } ->
+              Thread.yield ();
+              poll ()
+          | Ok { Backend.outcome = Some outcome } ->
+              decode_update_output handle.definition outcome
+        in
+        poll ()
 
 (** Returns the durable update ID retained by a typed handle. *)
 let update_id (handle : ('input, 'output) update_handle) = handle.update_id
