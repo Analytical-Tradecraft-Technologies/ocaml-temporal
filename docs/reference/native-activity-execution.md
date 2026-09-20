@@ -256,8 +256,10 @@ the OCaml supervisor starts a deterministic workflow timer. When that timer
 fires it re-emits `ScheduleLocalActivity` with the same activity sequence and
 the attempt/schedule metadata supplied by Core. OCaml therefore never chooses
 retry policy or invents attempt numbers, and a local completion is never
-treated as a remote RPC. Local activities are experimental while live Compose
-coverage and interceptors remain future work.
+treated as a remote RPC. Local activities remain experimental. The live baseline executes
+`smoke.local_activity` and requires `LOCAL`; the [audited live evidence](live-acceptance-coverage.md)
+records its successful run. Local backoff/retry, cancellation and replay/restart
+combinations still need dedicated live cases, and interceptors remain absent.
 
 ## Cancellation
 
@@ -275,6 +277,15 @@ adapter while its token remains tracked, including after the start has been
 handed to OCaml.  If the start completed before the owner drained the queued
 update, the token is gone and the update is stale, so it is discarded without
 submitting a duplicate completion.
+
+The callback adapter is serialized: this cancellation task handling does not
+preempt a callback already running under its lock. The public activity context
+exposes heartbeat/details operations, but no cooperative cancellation probe at
+the audited baseline. Workflow-side [scope hooks](workflow-scopes.md) buffer
+activity/child cancellation commands; they do not interrupt activity code.
+Worker shutdown is a separate lifecycle/drain operation. Focused lifecycle
+tests and the live stop marker do not establish a callback-duration or
+operational termination bound.
 
 ## Completion retry and ownership
 
@@ -377,7 +388,7 @@ two-second-backoff policy and requires the exact
 under one second; it does not prove the full configured delay. The complete
 [PR #439 Compose
 run](https://github.com/mfow/ocaml-temporal/actions/runs/29824441578) retains
-that activity path in the current baseline.
+that activity path in its historical baseline. The [current evidence audit](live-acceptance-coverage.md) records the later successful source snapshot.
 
 The worker handoff uses `Will_complete_async` only for `define_async` callbacks.
 The later client endpoint rejects that marker and accepts only completed,

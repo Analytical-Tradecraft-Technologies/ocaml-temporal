@@ -142,7 +142,15 @@ release-tag-check:
 	@test -n "$(RELEASE_TAG)" || { echo "set RELEASE_TAG=vMAJOR.MINOR.PATCH" >&2; exit 2; }
 	sh scripts/check-release-tag.sh . "$(RELEASE_TAG)"
 
-test-quality-contract:
+# Source-only documentation inventory, shared by the Linux/native test gates.
+.PHONY: check-live-acceptance-inventory update-live-acceptance-inventory
+check-live-acceptance-inventory:
+	sh scripts/check-live-acceptance-inventory.sh . --check
+
+update-live-acceptance-inventory:
+	sh scripts/check-live-acceptance-inventory.sh . --write
+
+test-quality-contract: check-live-acceptance-inventory
 	sh test/smoke/test_quality_contract.sh .
 	sh test/smoke/test_release_tag_contract.sh .
 

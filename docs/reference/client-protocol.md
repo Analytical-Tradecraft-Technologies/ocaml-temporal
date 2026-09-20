@@ -208,8 +208,9 @@ of the recorded seventeen-result baseline. The [PR #302
 run](https://github.com/mfow/ocaml-temporal/actions/runs/29351689638) first
 verifies the later long-backoff extension, and the complete [PR #439
 run](https://github.com/mfow/ocaml-temporal/actions/runs/29824441578) retains
-exact-run cancellation and graceful shutdown in the current 26-start
-baseline. The earlier [PR #277 run](https://github.com/mfow/ocaml-temporal/actions/runs/29318684069)
+exact-run cancellation and graceful shutdown in its historical baseline.
+The [current evidence audit](live-acceptance-coverage.md) records the later
+successful source snapshot. The earlier [PR #277 run](https://github.com/mfow/ocaml-temporal/actions/runs/29318684069)
 remains evidence for the prior fifteen-result slice, [PR #253 run](https://github.com/mfow/ocaml-temporal/actions/runs/29286560471)
 for the prior twelve-result slice, and [PR #210](https://github.com/mfow/ocaml-temporal/actions/runs/29221151859)
 for the original nine-workflow slice. See the [live acceptance coverage](live-acceptance-coverage.md)

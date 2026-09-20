@@ -67,7 +67,7 @@ jobs:
   temporal-integration:
     name: Temporal/PostgreSQL integration smoke (OCaml 5.5)
     runs-on: ubuntu-24.04
-    # Six independent live controllers run sequentially while reusing the
+    # Independent live controllers run sequentially while reusing the
     # checked-out source and build cache. Parent/child recovery includes a
     # deliberate 120-second timer and two complete worker generations.
     timeout-minutes: 45
