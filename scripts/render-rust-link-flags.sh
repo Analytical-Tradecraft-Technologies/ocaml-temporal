@@ -5,6 +5,17 @@ operating_system=$1
 target_root=$2
 output=$3
 native_link_flags=$4
+bundle_imports=${5:-}
+
+# Checks the exact import-library set requested by rustc. Bundled libraries and
+# Cargo registry libraries follow the same validation before reaching Dune.
+complete_imports () {
+  for flag in $native_link_flags; do
+    case "$flag" in
+      -lwinapi_*) [ -f "$1/lib${flag#-l}.a" ] || return 1 ;;
+    esac
+  done
+}
 
 # Converts the path printed by a Windows Cargo build script into a spelling
 # understood by both MSYS shell tools and native Windows programs. Unix paths
@@ -28,6 +39,13 @@ windows_path () {
 # script, but --print=native-static-libs reports only -l names. Preserve the
 # corresponding -L directory for the foreign OCaml linker.
 windows_search_dir () {
+  if [ -d "$target_root/import-libs" ]; then
+    complete_imports "$target_root/import-libs" || {
+      echo 'incomplete bundled Windows import libraries' >&2; exit 1;
+    }
+    windows_path "$target_root/import-libs"
+    return
+  fi
   selected=
   for metadata in "$target_root"/debug/build/winapi-x86_64-pc-windows-gnu-*/output; do
     [ -f "$metadata" ] || continue
@@ -35,19 +53,7 @@ windows_search_dir () {
       [ -n "$candidate" ] || continue
       candidate=$(windows_path "$candidate")
 
-      complete=true
-      for flag in $native_link_flags; do
-        case "$flag" in
-          -lwinapi_*)
-            archive=$candidate/lib${flag#-l}.a
-            if [ ! -f "$archive" ]; then
-              complete=false
-              break
-            fi
-            ;;
-        esac
-      done
-      [ "$complete" = true ] || continue
+      complete_imports "$candidate" || continue
 
       if [ -n "$selected" ] && [ "$selected" != "$candidate" ]; then
         echo "multiple Cargo winapi library directories matched the Rust link flags" >&2
@@ -69,6 +75,18 @@ EOF
 case "$operating_system" in
   MINGW* | MSYS* | CYGWIN*)
     search_dir=$(windows_search_dir)
+    if [ -n "$bundle_imports" ]; then
+      mkdir -p "$bundle_imports"
+      for flag in $native_link_flags; do
+        case "$flag" in
+          -lwinapi_*) cp "$search_dir/lib${flag#-l}.a" "$bundle_imports/" ;;
+        esac
+      done
+    fi
+    # Native Windows Dune/linkers cannot resolve Cygwin /cygdrive paths.
+    if command -v cygpath >/dev/null 2>&1; then
+      search_dir=$(cygpath -m "$search_dir")
+    fi
     # Dune reads this as an S-expression. Quote and escape the generated path
     # so installations below a directory containing spaces remain valid.
     escaped_search_dir=$(printf '%s' "$search_dir" | sed 's/\\/\\\\/g; s/"/\\"/g')

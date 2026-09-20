@@ -75,6 +75,80 @@ request that changes only the live acceptance fixture under
 `test/integration/temporal/` runs the license audit and live smoke without the
 representative matrix; the smoke is the direct verification for that fixture.
 
+## Rust artifact sharing
+
+The free native GitHub runners produce four independent Rust bundles. Linux
+uses a pinned Rust image on Debian 12, matching the C-library baseline of all
+OCaml development images; the amd64 and arm64 builds run on their matching
+native runners. Windows retains the GNU/MinGW target, and macOS retains ARM64.
+There is no cross compilation or paid runner requirement.
+
+| Bundle | Producer | Consumers in the same run |
+| --- | --- | --- |
+| Linux amd64 | `rust-amd64`, `ubuntu-24.04` | All Linux amd64 OCaml lanes and the live Temporal smoke |
+| Linux arm64 | `rust-arm64`, `ubuntu-24.04-arm` | All Linux arm64 OCaml lanes |
+| macOS ARM64 | Existing native macOS job, `macos-15` | That job's OCaml/C build and tests |
+| Windows x64 GNU | Existing native Windows job, `windows-latest` | That job's OCaml/C build and tests |
+
+On a cache miss the producer checks the pinned toolchain, Rust formatting,
+Clippy with warnings denied, and the complete locked Rust test suite before
+packaging its static library, dynamic library, and native link metadata.
+Windows additionally bundles the required MinGW import archives; the consumer
+regenerates their search path after relocation. Producers disable incremental
+state and use line-table debug information, retaining file/line backtraces,
+debug assertions, and the development optimization level while reducing
+artifact size. Normal local source builds keep their existing Cargo profiles.
+
+Only the finished bundle is cached, never Cargo's registry or target tree.
+Keys include platform, the complete Rust source/header/test/lockfile tree,
+bridge build and validation scripts, Makefile, workflows, and image definitions.
+Native desktop keys additionally include the runner image version, actual Rust
+compiler, C compiler, and Protocol Buffers compiler. There are no fallback
+keys. Every consumer checks the expected key, platform, required files, and
+SHA-256 checksums before linking. Explicit prebuilt mode fails if the bundle is
+invalid; it never falls back to compiling Rust. Dune tracks the bundle path and
+key as environment dependencies; bundles are immutable for the lifetime of a
+build directory.
+
+Only successful Rust producers on `master` push/scheduled runs save shared
+caches. PR and merge-queue jobs can restore these default-branch caches without
+write credentials. OCaml-only changes therefore reuse the same Rust bundle
+across PR, queue, and master even though their commit IDs differ. A change to
+Rust or its build inputs needs a fresh producer on each event until master
+seeds the new key. This deliberately does not promote PR artifacts into
+master: GitHub scopes PR caches to their merge ref. Cache eviction or a new
+native runner image also causes a normal rebuild. Live dependency-advisory and
+license checks continue independently on every applicable workflow run.
+
+Linux producers upload their bundles as one-day Actions artifacts for fanout;
+native desktop jobs consume their bundles in place and avoid another upload.
+Each OCaml lane still compiles the private C stubs, examples, OCaml libraries,
+and tests and runs the installation/public API checks. Linux also retains the
+sanitized C ABI harness. Every live worker/driver inherits the same bundle,
+including controllers with separate Dune build directories. PR path filters,
+existing check names, the exhaustive master matrix, and the seven live smoke
+controllers remain unchanged. A cold master run compiles Rust four times
+instead of eleven; cache hits eliminate those Rust compilations too. Artifact
+transfer, OCaml/C compilation, linking, and tests still consume runner time.
+
+For local Linux production and consumption on the same architecture:
+
+```sh
+make rust-bridge RUST_BRIDGE_KEY=local-validation
+TEMPORAL_RUST_BRIDGE_DIR=/workspace/_build/rust-bridge \
+TEMPORAL_RUST_BRIDGE_KEY=local-validation make verify OCAML_VERSION=5.2
+```
+
+`make native-rust-bridge RUST_BRIDGE_KEY=local-validation` is the equivalent
+producer on a configured native host. Set `TEMPORAL_RUST_BRIDGE_DIR` to the
+absolute host bundle path when invoking `make native-verify`. The local key is
+caller-owned: use the same source checkout and never reuse it after changing
+Rust inputs. CI calculates its keys automatically. Without these environment
+variables, `make verify` and `make native-verify` retain the full source-build
+and Rust-test path. The focused `make test-quality-contract` gate includes
+artifact relocation, missing/corrupted bundle, and key/platform rejection
+tests with Cargo unavailable to consumers.
+
 ## CI jobs and local equivalents
 
 The workflow has separate jobs because the checks have different toolchain and
@@ -83,7 +157,7 @@ queued Actions run does not make the local verification boundary ambiguous:
 
 | CI job | Workflow command | Local command | What the local result proves |
 | --- | --- | --- | --- |
-| `verify` | `make verify OCAML_VERSION=<matrix version>` | `make verify OCAML_VERSION=5.2` (or another locally available image) | Docker-backed OCaml build/lint, Rust tests, bridge/install tests, and repository quality contracts. PRs use the representative cells; master and scheduled runs use the exhaustive matrix. |
+| `verify` | `make verify OCAML_VERSION=<matrix version>` with the verified bridge bundle | `make verify OCAML_VERSION=5.2` (or another locally available image) | Docker-backed OCaml build/lint, bridge/install tests, and repository quality contracts. CI gets Rust validation from its producer; the default local command also runs Rust tests. PRs use the representative cells; master and scheduled runs use the exhaustive matrix. |
 | `quality` | `make quality` | `make quality` | The pinned native `cargo-deny`, `cargo-machete`, and `typos` scans. The exact binaries must be installed on the host. |
 | `license-audit` | `make license-check OCAML_VERSION=5.2`, plus the two isolated Python Cargo-license checks | `make license-check OCAML_VERSION=5.2` | The package/OCaml dependency license policy. The locked Cargo license scanner remains a single CI-only step and is not repeated in the OCaml matrix. |
 | `native` (master) / `native-macos`, `native-windows` (PR) | `make native-verify` | `make native-verify` on a matching native host | The OCaml 5.5 and Rust native link, format, lint, install, and test path. macOS ARM64 runs for every code PR; Windows x64 runs for native-boundary PRs and unconditionally on master/scheduled runs. |
