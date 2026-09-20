@@ -61,7 +61,8 @@ job is created. A child sequence is intentionally allowed twice, once for its
 start acknowledgment and once for its terminal result; duplicate events of
 the same kind and collisions with another operation kind are rejected. An
 unknown sequence is rejected later by `Execution`, which emits a non-retryable
-bridge failure rather than silently ignoring a Core event.
+bridge task failure rather than silently ignoring a Core event. That diagnostic
+flag does not close the execution or prevent a workflow-task retry.
 
 | Protocol job | Runtime job | Information retained by the adapter |
 | --- | --- | --- |
@@ -92,7 +93,10 @@ record instead.
 `command_to_protocol` converts one runtime command only when the two types have
 an exact, lossless representation. `completion_of_commands` preserves the
 runtime's emission order and runs `Workflow_protocol.encode_completion` over
-the complete result before returning it to the bridge.
+the complete result before returning it to the bridge. A poisoned execution
+instead returns `task_failure` with an empty command list; it never translates
+its discarded commands into an execution failure. See the
+[workflow failure contract](workflow-failures.md).
 
 | Runtime command | Protocol command | Notes |
 | --- | --- | --- |

@@ -14,6 +14,7 @@ Extracted from the `temporal-integration` job in
 - `make test-temporal-integration`
 - `make test-temporal-parent-child-failure-replay`
 - `make test-temporal-parent-child-restart`
+- `make test-temporal-task-failure-live`
 - `make test-temporal-worker-cache-eviction`
 - `make test-temporal-worker-crash-recovery`
 - `make test-temporal-worker-restart`

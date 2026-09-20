@@ -1,0 +1,1 @@
+{"run_id":"task-failure-run","commands":[{"kind":"start_timer","seq":1,"start_to_fire_timeout":{"seconds":10,"nanoseconds":0}}],"task_failure":{"message":"repairable workflow defect","source":"ocaml","stack_trace":"","encoded_attributes":null,"cause":null,"info":{"kind":"application","type":"defect","non_retryable":true,"details":[]}}}

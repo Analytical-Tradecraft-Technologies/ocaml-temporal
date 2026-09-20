@@ -1193,7 +1193,7 @@ let completion_of_commands ~run_id commands =
         loop (command :: reversed) rest
   in
   let* commands = loop [] commands in
-  let completion = Protocol.{ run_id; commands } in
+  let completion = Protocol.{ run_id; task_failure = None; commands } in
   match Protocol.encode_completion completion with
   | Ok _ -> Ok completion
   | Error error -> Error (protocol_error error)
@@ -1272,7 +1272,17 @@ let activate execution activation =
   Execution.set_activation_deployment_version execution deployment_version;
   Execution.set_activation_is_replaying execution translated.is_replaying;
   let commands = Execution.activate execution translated.jobs in
-  let* completion = completion_of_commands ~run_id:translated.run_id commands in
+  let* completion =
+    match Execution.task_failure execution with
+    | None -> completion_of_commands ~run_id:translated.run_id commands
+    | Some error ->
+        let* failure = protocol_failure "$.task_failure" error in
+        let completion = Protocol.{
+          run_id = translated.run_id; commands = []; task_failure = Some failure
+        } in
+        let* _ = Protocol.encode_completion completion |> Result.map_error protocol_error in
+        Ok completion
+  in
   let* () = validate_completion_for_activation activation completion in
   match translated.cache_removal with
   | Some _ when completion.commands <> [] ->

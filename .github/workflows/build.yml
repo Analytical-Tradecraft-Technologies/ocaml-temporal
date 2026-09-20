@@ -110,6 +110,19 @@ jobs:
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
           docker system prune --all --force --volumes
           df -h /
+      - name: Recover the same workflow runs after task failures
+        # Independent of the seven existing controllers; any failed
+        # assertion fails this job after retaining this gate's evidence.
+        run: make test-temporal-task-failure-live
+      - name: Retain exact-run task failure recovery evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: workflow-task-failure-${{ github.run_id }}-${{ github.run_attempt }}
+          path: _build/task-failure-live/
+          if-no-files-found: warn
+          retention-days: 14
+
       - name: Run the live two-OCaml-binary Temporal Compose smoke
         run: |
           make test-temporal-integration

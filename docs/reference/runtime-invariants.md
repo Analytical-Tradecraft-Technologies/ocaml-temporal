@@ -121,7 +121,12 @@ and bridge, read the [documentation guide](../README.md) first.
   command.
 - Terminal command emission is retained while pending runtime state is torn
   down immediately.
-- Malformed bridge jobs fail the execution with a non-retryable bridge error.
+- Unexpected code/codec defects and malformed bridge jobs fail the workflow
+  task, discard all buffered commands and unsafe continuations, and preserve
+  the open execution for replay. Deliberate typed application errors remain
+  terminal workflow failures. See [workflow failures](workflow-failures.md).
+- Completion ownership survives an uncertain acknowledgement. The adapter
+  must retain the exact value and may not replace it or rerun workflow code.
 
 ## Replay
 

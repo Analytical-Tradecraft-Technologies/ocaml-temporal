@@ -285,7 +285,15 @@ parse boundary: a terminal-before-start, duplicate start, duplicate terminal,
 or unknown sequence returns a typed bridge defect and leaves the existing
 resolver state unchanged.
 
-A completion is a closed object sent from OCaml to Rust. Its ordered commands
+A completion is a closed object sent from OCaml to Rust. Optional
+`task_failure` distinguishes a failed workflow task from successful commands.
+Absent or null retains the original successful format; a structured failure
+requires an empty `commands` array and maps to Core failed status with
+`WorkflowWorkerUnhandledFailure`. It never closes the workflow execution.
+Query-only activations still require query answers, and eviction requires
+successful empty acknowledgement. See [workflow failures](workflow-failures.md).
+
+For successful completions, ordered commands
 cover scheduling and requesting cancellation of remote activities, starting and
 cancelling a child workflow, signalling or requesting cancellation of an
 external workflow, starting and cancelling timers, and completing,
