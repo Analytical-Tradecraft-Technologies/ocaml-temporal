@@ -722,3 +722,18 @@ native-lint-rust:
 	$(NATIVE_ENV) cargo clippy --manifest-path $(CARGO_MANIFEST) --locked --all-targets -- -D warnings
 
 native-verify: native-version-check native-build native-lint native-test
+
+# Focused bilateral task-failure protocol/runtime gates. Keep native linkers
+# bounded on developer machines with DUNE_JOBS and CARGO_BUILD_JOBS.
+.PHONY: test-workflow-task-failure build-task-failure-fixture test-temporal-task-failure-live
+test-workflow-task-failure:
+	$(RUN) dune runtest $(DUNE_BUILD_ARGS) test/runtime test/bridge test/observability test/sdk_supervisor
+	$(COMPOSE_RUN) env $(CARGO_TEST_ENV) cargo test --manifest-path $(CARGO_MANIFEST) --locked --test workflow_protocol --test workflow_retry_policy --test replay_abi
+
+build-task-failure-fixture:
+	$(RUN) dune build $(DUNE_BUILD_ARGS) test/integration/temporal/task_failure/broken_worker.exe test/integration/temporal/task_failure/corrected_worker.exe test/integration/temporal/task_failure/recovery_driver.exe
+
+# This local/CI controller uses host Python's standard library only. The three
+# OCaml binaries share one build tree and have no production fixture hooks.
+test-temporal-task-failure-live: test-temporal-config build-task-failure-fixture
+	TEMPORAL_COMPOSE_PROJECT="$(TEMPORAL_COMPOSE_PROJECT)" OCAML_IMAGE="$(OCAML_IMAGE)" python3 test/integration/temporal/scripts/run-task-failure-live.py

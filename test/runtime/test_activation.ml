@@ -433,6 +433,14 @@ let test_activity_options_and_queue () =
   | _ -> failwith "activity default timeout was not applied with schedule-to-start"
   end
 
+(** A defect must discard every workflow command and poison only the local
+    cache generation. Returning its error keeps category assertions precise. *)
+let require_task_failure execution commands =
+  if commands <> [] then failwith "failed task retained workflow commands";
+  match Raw_execution.task_failure execution with
+  | Some error -> error
+  | None -> failwith "expected a failed workflow task"
+
 (** Invalid optional activity identity is returned through the workflow's
     typed failure path and does not emit a schedule command. *)
 let test_invalid_activity_options_do_not_schedule () =
@@ -445,8 +453,9 @@ let test_invalid_activity_options_do_not_schedule () =
   in
   let execution = Execution.start invalid_workflow () in
   match Execution.activate execution [ Activation.Start_workflow ] with
-  | [ Activation.Fail_workflow error ] when public_error_kind error = "defect" ->
-      ()
+  | [] ->
+      let error = require_task_failure execution [] in
+      expect "invalid activity option task failure" "defect" (public_error_kind error)
   | [ Activation.Schedule_activity _ ] ->
       failwith "invalid activity queue emitted a schedule command"
   | _ -> failwith "invalid activity options did not fail through the workflow"
@@ -545,7 +554,8 @@ let test_bridge_defects () =
      Execution.activate execution
        [ Activation.Fire_timer { seq = 999L } ]
    with
-  | [ Activation.Fail_workflow error ] ->
+  | [] ->
+      let error = require_task_failure execution [] in
       expect "bridge category" "bridge" (public_error_kind error)
   | _ -> failwith "unknown timer did not fail the workflow");
   let duplicate = Execution.start greeting_workflow "Ada" in
@@ -563,7 +573,8 @@ let test_bridge_defects () =
           { seq = 1L; result = Ok (payload "Hello again") };
       ]
   with
-  | [ Activation.Fail_workflow error ] ->
+  | [] ->
+      let error = require_task_failure duplicate [] in
       expect "duplicate category" "bridge" (public_error_kind error)
   | _ -> failwith "duplicate activity resolution was accepted"
 
@@ -809,7 +820,8 @@ let test_child_workflow_concurrency_and_decoding () =
           };
       ]
   with
-  | [ Activation.Fail_workflow error ] ->
+  | [] ->
+      let error = require_task_failure invalid [] in
       expect "child output codec failure" "codec" (public_error_kind error)
   | _ -> failwith "invalid child output did not fail the parent"
 
@@ -871,8 +883,10 @@ let test_child_workflow_validation () =
         in
         Temporal.Child_workflow.execute ~id:"" target ())
   in
-  (match Execution.activate (Execution.start empty_id ()) [ Activation.Start_workflow ] with
-  | [ Activation.Fail_workflow error ] ->
+  let empty_execution = Execution.start empty_id () in
+  (match Execution.activate empty_execution [ Activation.Start_workflow ] with
+  | [] ->
+      let error = require_task_failure empty_execution [] in
       expect "empty child ID kind" "defect" (public_error_kind error);
       expect "empty child ID message" "child workflow id must not be empty"
         (public_error_message error)
@@ -886,10 +900,12 @@ let test_child_workflow_validation () =
         in
         Temporal.Child_workflow.execute ~id:"valid-id" target ())
   in
+  let invalid_execution = Execution.start invalid_input () in
   (match
-     Execution.activate (Execution.start invalid_input ()) [ Activation.Start_workflow ]
+     Execution.activate invalid_execution [ Activation.Start_workflow ]
    with
-  | [ Activation.Fail_workflow error ] ->
+  | [] ->
+      let error = require_task_failure invalid_execution [] in
       expect "child input codec failure" "input rejected"
         (public_error_message error)
   | _ -> failwith "invalid child input emitted a command or succeeded");
@@ -937,7 +953,8 @@ let test_child_workflow_failures_and_sequence_ownership () =
        [ Activation.Resolve_child_workflow
            { seq = 1L; result = Ok (payload "too early") } ]
    with
-  | [ Activation.Fail_workflow error ] ->
+  | [] ->
+      let error = require_task_failure premature [] in
       expect "child resolved before start" "bridge" (public_error_kind error)
   | _ -> failwith "child result was accepted before start acknowledgment");
   let failed_start = Execution.start child_parent_workflow "Ada" in
@@ -959,7 +976,7 @@ let test_child_workflow_failures_and_sequence_ownership () =
   | _ -> failwith "child start failure did not retire the pending child");
   let remote_failure = Execution.start child_parent_workflow "Ada" in
   ignore (Execution.activate remote_failure [ Activation.Start_workflow ]);
-  let child_error = base_error (Temporal.Error.defect ~message:"child failed") in
+  let child_error = base_error (Temporal.Error.make ~category:`Child_workflow ~message:"child failed" ()) in
   (match
      Execution.activate remote_failure
        [
@@ -980,7 +997,8 @@ let test_child_workflow_failures_and_sequence_ownership () =
            { seq = 999L; result = Ok (payload "unknown") };
        ]
    with
-  | [ Activation.Fail_workflow error ] ->
+  | [] ->
+      let error = require_task_failure unknown [] in
       expect "unknown child sequence" "bridge" (public_error_kind error)
   | _ -> failwith "unknown child sequence was accepted");
   let duplicate = Execution.start concurrent_child_parent () in
@@ -999,7 +1017,8 @@ let test_child_workflow_failures_and_sequence_ownership () =
           { seq = 1L; result = Ok (payload "Hello again") };
       ]
   with
-  | [ Activation.Fail_workflow error ] ->
+  | [] ->
+      let error = require_task_failure duplicate [] in
       expect "duplicate child sequence" "bridge" (public_error_kind error)
   | _ -> failwith "duplicate child resolution was accepted"
 
@@ -1485,11 +1504,8 @@ let test_continue_as_new_encode_failure_is_terminal () =
   in
   let execution = Execution.start source () in
   (match Execution.activate execution [ Activation.Start_workflow ] with
-  | [ Activation.Fail_workflow _ ] -> ()
-  | commands ->
-      failwith
-        ("expected one Fail_workflow, got "
-        ^ string_of_int (List.length commands)));
+  | [] -> ignore (require_task_failure execution [])
+  | _ -> failwith "failed continue-as-new encoding retained commands");
   expect "encode-failed continue-as-new seals the execution" []
     (Execution.activate execution [ Activation.Cancel_workflow ])
 

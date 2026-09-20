@@ -302,7 +302,7 @@ let test_condition_skips_continue_as_new_terminal () =
     continue-as-new and must likewise prevent a previously parked condition
     from being resumed by the terminal signal's state mutation. *)
 let test_condition_skips_failure_terminal () =
-  let failure = Temporal_base.Error.defect ~message:"terminal signal failure" in
+  let failure = Temporal_base.Error.make ~category:`Workflow ~message:"terminal signal failure" () in
   run_terminal_condition_regression ~label:"failure"
     ~terminate:(fun context ->
       let fail : unit -> unit =

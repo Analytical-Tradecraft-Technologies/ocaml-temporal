@@ -435,7 +435,13 @@ type completion_command =
 (** Successful completion of one activation. At most one terminal workflow
     command may appear, and it must be last. Patch commands may repeat one mode
     per ID but may not mix active and deprecated modes for the same ID. *)
-type completion = { run_id : string; commands : completion_command list }
+type completion = {
+  run_id : string;
+  commands : completion_command list;
+  task_failure : failure option;
+  (** [Some] fails the workflow task through Core, never the execution. Failed
+      tasks carry no commands. [None] preserves the successful command batch. *)
+}
 
 type error
 (** Opaque semantic or strict-JSON validation failure. *)

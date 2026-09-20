@@ -1,0 +1,11 @@
+; Separate source generations, sharing only lifecycle and intentional failures.
+(library
+ (name task_failure_support)
+ (wrapped false)
+ (modules failure_support)
+ (libraries temporal-sdk unix))
+
+(executables
+ (names broken_worker corrected_worker recovery_driver)
+ (modules broken_worker corrected_worker recovery_driver)
+ (libraries temporal-sdk task_failure_support unix))
