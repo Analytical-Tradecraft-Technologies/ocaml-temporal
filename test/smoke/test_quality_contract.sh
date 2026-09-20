@@ -334,7 +334,8 @@ printf '%s\n' "$pr_license" |
   grep -Fqx '        run: make license-check OCAML_VERSION=5.2'
 pr_smoke=$(printf '%s\n' "$pr_workflow_text" |
   sed -n '/^  temporal-integration:/,/^  verify:/p')
-printf '%s\n' "$pr_smoke" | grep -Fqx "    if: needs.changes.outputs.smoke == 'true'"
+printf '%s\n' "$pr_smoke" |
+  grep -Fqx "    if: \${{ !cancelled() && needs.changes.outputs.smoke == 'true' }}"
 printf '%s\n' "$pr_smoke" |
   grep -Fqx '    name: Temporal/PostgreSQL integration smoke (OCaml 5.5)'
 printf '%s\n' "$pr_smoke" | grep -Fqx '    timeout-minutes: 45'

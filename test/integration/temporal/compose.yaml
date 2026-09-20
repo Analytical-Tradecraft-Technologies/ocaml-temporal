@@ -8,6 +8,10 @@ services:
       args:
         OCAML_IMAGE: ${OCAML_IMAGE:-ocaml/opam:debian-12-ocaml-5.2}
     working_dir: /workspace
+    environment:
+      # All worker/driver services extend dev, including isolated Dune trees.
+      TEMPORAL_RUST_BRIDGE_DIR: ${TEMPORAL_RUST_BRIDGE_DIR:-}
+      TEMPORAL_RUST_BRIDGE_KEY: ${TEMPORAL_RUST_BRIDGE_KEY:-}
     volumes:
       - ../../..:/workspace
     init: true

@@ -21,6 +21,18 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  rust-amd64:
+    uses: ./.github/workflows/rust-bridge.yml
+    with:
+      runner: ubuntu-24.04
+      platform: linux-amd64
+
+  rust-arm64:
+    uses: ./.github/workflows/rust-bridge.yml
+    with:
+      runner: ubuntu-24.04-arm
+      platform: linux-arm64
+
   quality:
     name: Quality and security scans
     runs-on: ubuntu-24.04
@@ -65,6 +77,9 @@ jobs:
                 python3 scripts/check-cargo-licenses.py --metadata -
 
   temporal-integration:
+    # A producer failure must make the existing required consumer check fail.
+    if: ${{ !cancelled() }}
+    needs: rust-amd64
     name: Temporal/PostgreSQL integration smoke (OCaml 5.5)
     runs-on: ubuntu-24.04
     # Six independent live controllers run sequentially while reusing the
@@ -75,9 +90,20 @@ jobs:
       # Keep this as one explicit compatibility lane because it starts the
       # complete PostgreSQL/Temporal stack and two OCaml processes.
       OCAML_VERSION: "5.5"
+      TEMPORAL_RUST_BRIDGE_DIR: /workspace/_build/rust-bridge
+      TEMPORAL_RUST_BRIDGE_KEY: ${{ needs.rust-amd64.outputs.key }}
     steps:
+      - name: Require a successful Rust producer
+        env:
+          RUST_RESULT: ${{ needs.rust-amd64.result }}
+        run: test "$RUST_RESULT" = success
       - name: Check out repository
         uses: actions/checkout@v7
+      - name: Download the verified Linux amd64 bridge
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: rust-bridge-linux-amd64
+          path: _build/rust-bridge
       - name: Reclaim disposable GitHub-hosted runner disk
         # The smoke lane builds several isolated OCaml/Dune trees, each of
         # which statically links the Rust Core bridge. Reclaim the large
@@ -102,9 +128,14 @@ jobs:
           make test-temporal-parent-child-failure-replay
 
   verify:
+    if: ${{ !cancelled() }}
+    needs: [rust-amd64, rust-arm64]
     name: OCaml ${{ matrix.ocaml }} / ${{ matrix.runner }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
+    env:
+      TEMPORAL_RUST_BRIDGE_DIR: /workspace/_build/rust-bridge
+      TEMPORAL_RUST_BRIDGE_KEY: ${{ matrix.runner == 'ubuntu-24.04-arm' && needs.rust-arm64.outputs.key || needs.rust-amd64.outputs.key }}
     strategy:
       fail-fast: false
       matrix:
@@ -117,8 +148,20 @@ jobs:
           - ubuntu-24.04
           - ubuntu-24.04-arm
     steps:
+      - name: Require successful Rust producers
+        env:
+          RUST_AMD64_RESULT: ${{ needs.rust-amd64.result }}
+          RUST_ARM64_RESULT: ${{ needs.rust-arm64.result }}
+        run: |
+          test "$RUST_AMD64_RESULT" = success
+          test "$RUST_ARM64_RESULT" = success
       - name: Check out repository
         uses: actions/checkout@v7
+      - name: Download the verified platform bridge
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: rust-bridge-linux-${{ matrix.runner == 'ubuntu-24.04-arm' && 'arm64' || 'amd64' }}
+          path: _build/rust-bridge
       - name: Reclaim disposable GitHub-hosted runner disk
         # Linking the Rust static library into the OCaml test executables can
         # temporarily require more space than the preinstalled Android, .NET,
@@ -196,6 +239,15 @@ jobs:
           "$protoc_unix_path" --version
       - name: Install OCaml dependencies
         run: opam install . --deps-only --with-test --assume-depexts --yes
+      - name: Prepare verified Rust bridge
+        id: bridge
+        uses: ./.github/actions/rust-bridge
+        with:
+          platform: ${{ runner.os == 'Windows' && 'windows-amd64' || 'macos-arm64' }}
+          mode: native
       - name: Build, lint, and test natively
         shell: bash
+        env:
+          TEMPORAL_RUST_BRIDGE_DIR: ${{ github.workspace }}/_build/rust-bridge
+          TEMPORAL_RUST_BRIDGE_KEY: ${{ steps.bridge.outputs.key }}
         run: make native-verify
