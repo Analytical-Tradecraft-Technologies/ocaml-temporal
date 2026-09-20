@@ -31,6 +31,10 @@ and bridge, read the [documentation guide](../README.md) first.
 ## Deterministic scheduling
 
 - Runnable fibers receive monotonic sequence numbers and execute FIFO.
+- Completed callbacks leave no execution-history list in the scheduler.
+  Ordering tests record their own observations; production memory does not
+  grow with the number of callbacks drained by a cached workflow. A full-GC
+  regression checks retained live words across repeated callback batches.
 - Spawn order is source execution order.
 - Activation jobs are applied in their supplied list order.
 - Resolving a future appends its waiters in waiter-registration order.
