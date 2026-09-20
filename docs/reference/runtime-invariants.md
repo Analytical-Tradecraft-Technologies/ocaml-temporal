@@ -317,6 +317,11 @@ and bridge, read the [documentation guide](../README.md) first.
   releases the client/Core graph. A result already queued for an abandoned
   ticket is discarded with its receiver; it cannot cause a second task join or
   a second native free.
+- Exact-run client waits retain their history future and pagination state
+  across bounded owner turns. The runtime admits at most 64 distinct pending
+  executions and retires each on a terminal result or error. Disconnect and
+  runtime shutdown cancel all retained futures before releasing Core; no
+  background wait task outlives the owner.
 - A backend shutdown result, including `Error`, means the graph has been
   consumed or invalidated. A retryable operation must not masquerade as
   terminal shutdown while it still owns live resources.

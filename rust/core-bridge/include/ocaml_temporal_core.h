@@ -173,9 +173,9 @@ ocaml_temporal_core_status ocaml_temporal_core_v2_client_wait_start_workflow_jso
     size_t input_len, ocaml_temporal_core_result *output);
 
 /* Wait for one exact run using fixed follow_runs=false semantics. Each call
- * keeps the close-event history long poll for at most 100 ms. An open run
- * returns NOT_READY (status 10) without terminal JSON so the caller can retry;
- * this keeps the single supervisor owner responsive to lifecycle messages. A
+ * polls a retained close-event history future for at most 100 ms. NOT_READY
+ * (status 10) preserves the RPC and pagination state for the next call, keeping
+ * the single supervisor owner responsive to lifecycle messages. A
  * continued-as-new close is returned as a terminal outcome with successor
  * metadata; the bridge never follows it implicitly. */
 ocaml_temporal_core_status ocaml_temporal_core_v2_client_wait_workflow_json(

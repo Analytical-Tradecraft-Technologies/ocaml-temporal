@@ -151,10 +151,21 @@ There is no `follow_runs` escape hatch in the document: the operation always
 uses a close-event history long poll for that exact run, but each native call
 is bounded to 100 ms. If no close event arrives during that interval, the ABI
 returns status `10` (`NOT_READY`) without a terminal response; the OCaml
-caller (or a later orchestration loop) can retry through the supervisor
-mailbox. Bounding each call lets the single owner Domain admit shutdown and
-other lifecycle messages instead of being held indefinitely by a server long
-poll.
+caller (or a later orchestration loop) can resume through the supervisor
+mailbox. The runtime retains the same Rust future, including its connection
+and pagination state: 100 ms bounds owner occupancy, not RPC lifetime. Slow
+successful requests therefore make progress across calls while the owner can
+still admit shutdown and other lifecycle messages.
+
+At most 64 distinct exact-run observations may be retained per runtime. Calls
+with the same namespace, workflow ID, and run ID share an in-flight future;
+admitting a new identity at capacity returns `INVALID_STATE`. A terminal
+result or error removes its entry before returning to OCaml. A later wait may
+observe the same closed run again through a fresh request; this table is not
+a result cache. Client disconnect and both explicit and finalizer runtime
+close cancel all retained futures before releasing the connection and Core.
+These futures are polled only by the owner, so cancellation drops their RPCs
+directly without spawning or detaching tasks.
 
 Completed, failed, and timed-out close events retain any successor run ID
 exposed by Core. A continued-as-new close is returned as a terminal
@@ -206,9 +217,9 @@ arguments, ABI mismatch, a contained Rust panic, internal bridge failure,
 invalid lifecycle state, configuration, connection, worker, outstanding-task,
 not-ready, protocol, and already-started failures. Worker polling and exact-run
 client waits use the expected `NOT_READY` status. For a worker lane it means no
-task is queued; for a client wait it means the 100 ms history wait elapsed
-before a close event. In both cases the caller or a later orchestration loop
-can retry through the supervisor mailbox.
+task is queued; for a client wait it means the 100 ms owner interval elapsed
+without a terminal result. In both cases the caller or a later orchestration
+loop can resume through the supervisor mailbox.
 `OUTSTANDING_TASKS` means shutdown cannot finalize until the language side
 completes leased work.
 
@@ -566,6 +577,12 @@ drop marker after nonblocking finalization, proving aborted Tokio handles are
 joined by the cleanup thread rather than detached. Keeping the counter and
 task-drop assertions in separate test sources prevents a future lifecycle
 change from being hidden by the broad ABI test binary.
+
+The client wait regressions in `tests/support/client_wait.rs` use Core's
+callback gRPC transport to delay history responses beyond 100 ms. They count
+actual RPCs, verify retained pagination and exact-run identity, and exercise
+terminal errors, capacity, disconnect, and both runtime close paths. This
+proves that yielding the owner does not restart a slow successful request.
 
 The lifecycle regression corpus also covers the two less visible ownership
 edges. The mailbox test abandons an admitted terminal reply while the owner is
