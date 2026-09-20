@@ -71,6 +71,7 @@ fn accepts_and_normalizes_workflow_activations() {
         "activation",
         "eviction",
         "realistic-initialize",
+        "start-metadata",
         "child-initialize",
         "child-resolution",
         "child-cancellation-before-start",
@@ -1071,79 +1072,228 @@ fn converts_pinned_core_values_losslessly() {
     );
 }
 
-/// Proves Core's inherited continuation options do not make a valid successor
-/// activation fail admission. Retry policy is retained as typed context, while
-/// the other options remain compatibility metadata accepted only when
-/// continuation provenance is present; an ordinary root activation still
-/// rejects the unrepresented metadata instead of silently dropping it.
-#[test]
-fn accepts_inherited_initialize_options_on_continuation() {
-    use core_activation::workflow_activation_job::Variant;
-    use temporalio_protos::temporal::api::common::v1::{Memo, SearchAttributes};
-
-    let inherited = core_activation::InitializeWorkflow {
-        workflow_type: "workflow".to_owned(),
-        workflow_id: "workflow-1".to_owned(),
-        randomness_seed: 1,
-        attempt: 1,
+/// Builds one valid initializer with no optional scheduling or user metadata.
+fn start_metadata_initializer() -> core_activation::InitializeWorkflow {
+    core_activation::InitializeWorkflow {
+        workflow_type: "metadata".to_owned(),
+        workflow_id: "metadata-1".to_owned(),
         first_execution_run_id: "first-run".to_owned(),
-        continued_from_execution_run_id: "previous-run".to_owned(),
-        continued_initiator: 1,
-        retry_policy: Some(valid_core_retry_policy()),
-        cron_schedule: "0 * * * * *".to_owned(),
-        workflow_execution_expiration_time: Some(prost_wkt_types::Timestamp {
-            seconds: 1,
-            nanos: 2,
-        }),
-        cron_schedule_to_schedule_interval: Some(prost_wkt_types::Duration {
-            seconds: 3,
-            nanos: 4,
-        }),
-        memo: Some(Memo::default()),
-        search_attributes: Some(SearchAttributes::default()),
+        attempt: 1,
         ..Default::default()
-    };
-    let activation = core_activation::WorkflowActivation {
+    }
+}
+
+/// Wraps an initializer in a task with the required deterministic timestamp.
+fn start_metadata_activation(
+    value: core_activation::InitializeWorkflow,
+) -> core_activation::WorkflowActivation {
+    core_activation::WorkflowActivation {
         run_id: "run-1".to_owned(),
-        timestamp: Some(prost_wkt_types::Timestamp::default()),
+        timestamp: Some(Default::default()),
         jobs: vec![core_activation::WorkflowActivationJob {
-            variant: Some(Variant::InitializeWorkflow(inherited.clone())),
+            variant: Some(
+                core_activation::workflow_activation_job::Variant::InitializeWorkflow(value),
+            ),
         }],
         ..Default::default()
-    };
+    }
+}
 
-    let context = workflow_protocol::activation_from_core(&activation)
-        .expect("inherited continuation options should be compatibility metadata")
-        .jobs
-        .into_iter()
-        .find_map(|job| match job {
-            workflow_protocol::ActivationJob::InitializeWorkflow { context, .. } => context,
-            _ => None,
-        })
-        .expect("initialize context should be present");
-    assert_eq!(
-        context
-            .retry_policy
-            .expect("Core retry policy should be represented")
-            .maximum_attempts,
-        2
-    );
-
-    let mut root = inherited;
-    root.continued_from_execution_run_id.clear();
-    root.continued_initiator = 0;
-    let root_activation = core_activation::WorkflowActivation {
-        jobs: vec![core_activation::WorkflowActivationJob {
-            variant: Some(Variant::InitializeWorkflow(root)),
-        }],
+/// Checks isolated memo/search fields and their combination on both roots and
+/// continuations, including absent versus explicitly empty protobuf maps.
+#[test]
+fn preserves_start_metadata_on_roots_and_continuations() {
+    use temporalio_protos::temporal::api::common::v1::{Memo, SearchAttributes};
+    let payload = temporalio_protos::temporal::api::common::v1::Payload {
+        metadata: [("encoding".to_owned(), b"json/plain".to_vec())].into(),
+        data: br#""metadata""#.to_vec(),
         ..Default::default()
     };
-    assert_eq!(
-        workflow_protocol::activation_from_core(&root_activation)
-            .expect_err("root metadata must not be silently discarded")
-            .code,
-        workflow_protocol::CoreConversionErrorCode::Unsupported
-    );
+    for successor in [false, true] {
+        for memo in [
+            None,
+            Some(Memo::default()),
+            Some(Memo {
+                fields: [("note".to_owned(), payload.clone())].into(),
+            }),
+        ] {
+            for search in [
+                None,
+                Some(SearchAttributes::default()),
+                Some(SearchAttributes {
+                    indexed_fields: [("CustomKeywordField".to_owned(), payload.clone())].into(),
+                }),
+            ] {
+                for expiration in [
+                    None,
+                    Some(prost_wkt_types::Timestamp::default()),
+                    Some(prost_wkt_types::Timestamp {
+                        seconds: 1_800_000_000,
+                        nanos: 123,
+                    }),
+                ] {
+                    let mut init = start_metadata_initializer();
+                    init.memo = memo.clone();
+                    init.search_attributes = search.clone();
+                    init.workflow_execution_expiration_time = expiration;
+                    init.cron_schedule_to_schedule_interval = Some(Default::default());
+                    init.workflow_execution_timeout = Some(Default::default());
+                    if successor {
+                        init.continued_from_execution_run_id = "previous-run".to_owned();
+                        init.continued_initiator = 1;
+                        init.retry_policy = Some(valid_core_retry_policy());
+                    }
+                    let activation =
+                        workflow_protocol::activation_from_core(&start_metadata_activation(init))
+                            .unwrap();
+                    let workflow_protocol::ActivationJob::InitializeWorkflow {
+                        context: Some(context),
+                        ..
+                    } = &activation.jobs[0]
+                    else {
+                        panic!("missing context")
+                    };
+                    assert_eq!(
+                        context.memo.as_ref().map(|fields| fields.len()),
+                        memo.as_ref().map(|fields| fields.fields.len())
+                    );
+                    assert_eq!(
+                        context
+                            .search_attributes
+                            .as_ref()
+                            .map(|fields| fields.len()),
+                        search.as_ref().map(|fields| fields.indexed_fields.len())
+                    );
+                    for fields in [&context.memo, &context.search_attributes]
+                        .into_iter()
+                        .flatten()
+                    {
+                        for value in fields.values() {
+                            assert_eq!(value.data, payload.data);
+                            assert_eq!(value.metadata["encoding"], payload.metadata["encoding"]);
+                        }
+                    }
+                    assert_eq!(
+                        context
+                            .workflow_execution_expiration_time
+                            .map(|time| (time.seconds, time.nanoseconds)),
+                        expiration.map(|time| (time.seconds, time.nanos))
+                    );
+                    assert_eq!(context.continuation.is_some(), successor);
+                    assert_eq!(
+                        context.workflow_execution_timeout.as_ref().unwrap().seconds,
+                        0
+                    );
+                    let json = workflow_protocol::encode_activation(&activation).unwrap();
+                    assert_eq!(
+                        workflow_protocol::decode_activation(&json).unwrap(),
+                        activation
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Continuation identity must not bypass unsupported cron/delay validation or
+/// the shape checks on represented metadata and exact expiration timestamps.
+#[test]
+fn validates_start_metadata_without_continuation_bypass() {
+    use temporalio_protos::temporal::api::common::v1::{Memo, SearchAttributes};
+    for successor in [false, true] {
+        let mut baseline = start_metadata_initializer();
+        if successor {
+            baseline.continued_from_execution_run_id = "previous-run".to_owned();
+            baseline.continued_initiator = 1;
+        }
+        for field in ["cron", "cron_initiator"] {
+            let mut init = baseline.clone();
+            match field {
+                "cron" => init.cron_schedule = "0 * * * * *".to_owned(),
+                _ => {
+                    init.continued_from_execution_run_id = "previous-run".to_owned();
+                    init.continued_initiator = 3;
+                }
+            }
+            assert_eq!(
+                workflow_protocol::activation_from_core(&start_metadata_activation(init))
+                    .unwrap_err()
+                    .code,
+                workflow_protocol::CoreConversionErrorCode::Unsupported
+            );
+        }
+        for field in ["memo", "search_attributes", "expiration"] {
+            let mut init = baseline.clone();
+            match field {
+                "memo" => {
+                    init.memo = Some(Memo {
+                        fields: [(String::new(), Default::default())].into(),
+                    })
+                }
+                "search_attributes" => {
+                    init.search_attributes = Some(SearchAttributes {
+                        indexed_fields: [(String::new(), Default::default())].into(),
+                    })
+                }
+                _ => {
+                    init.workflow_execution_expiration_time = Some(prost_wkt_types::Timestamp {
+                        seconds: 1,
+                        nanos: 1_000_000_000,
+                    })
+                }
+            }
+            assert!(
+                workflow_protocol::activation_from_core(&start_metadata_activation(init)).is_err(),
+                "{field} should reject malformed metadata"
+            );
+        }
+    }
+}
+
+/// Temporal throttles a rapid continue-as-new with a nonzero first-task
+/// backoff even without cron. Preserve that server-applied duration on known
+/// workflow/retry continuations while keeping root start delay unsupported.
+#[test]
+fn preserves_server_continuation_backoff() {
+    for initiator in [0, 1, 2, 3, 99] {
+        for nanos in [0, 989_282_667, -1, 1_000_000_000] {
+            let mut init = start_metadata_initializer();
+            init.cron_schedule_to_schedule_interval =
+                Some(prost_wkt_types::Duration { seconds: 0, nanos });
+            if initiator != 0 {
+                init.continued_from_execution_run_id = "previous-run".to_owned();
+                init.continued_initiator = initiator;
+            }
+            let result = workflow_protocol::activation_from_core(&start_metadata_activation(init));
+            if ((initiator == 0 && nanos == 0) || matches!(initiator, 1 | 2))
+                && (0..1_000_000_000).contains(&nanos)
+            {
+                let activation = result.unwrap();
+                let workflow_protocol::ActivationJob::InitializeWorkflow {
+                    context: Some(context),
+                    ..
+                } = &activation.jobs[0]
+                else {
+                    panic!("missing initialization context")
+                };
+                assert_eq!(
+                    context
+                        .first_workflow_task_backoff
+                        .as_ref()
+                        .unwrap()
+                        .nanoseconds,
+                    nanos
+                );
+                let json = workflow_protocol::encode_activation(&activation).unwrap();
+                assert_eq!(
+                    workflow_protocol::decode_activation(&json).unwrap(),
+                    activation
+                );
+            } else {
+                assert!(result.is_err(), "unsupported or invalid delay was admitted");
+            }
+        }
+    }
 }
 
 /// Proves an incoming signal maps from the pinned Core protobuf oneof to the
@@ -3066,6 +3216,10 @@ fn rejects_omitted_required_nullable_fields() {
 
     let initialize = fixture(&["valid", "realistic-initialize.input.json"]);
     for field in [
+        "memo",
+        "search_attributes",
+        "workflow_execution_expiration_time",
+        "first_workflow_task_backoff",
         "parent_workflow",
         "workflow_execution_timeout",
         "workflow_run_timeout",

@@ -107,6 +107,23 @@ val random_int : bound:int -> (int, Error.t) result
     Temporal metadata and never reads process or wall-clock state. *)
 val current_deployment_version : unit -> deployment_version option
 
+(** A snapshot of metadata recorded when this workflow run started. [None]
+    means Core omitted that protobuf field; [Some []] preserves an explicitly
+    empty map. Search attributes are their initial values, before any upsert.
+    Expiration is a server-enforced deadline across the execution chain, not
+    a timer the workflow runtime should schedule. *)
+type start_metadata = {
+  memo : (string * Payload.t) list option;
+  search_attributes : (string * Payload.t) list option;
+  execution_expiration_time : Time.t option;
+}
+
+(** Returns this run's deterministic start snapshot with independently owned
+    payload bytes on every call. Replay reconstructs it from the same history;
+    a continued run receives its own inherited metadata. Calling outside a
+    workflow, or in a synthetic execution lacking metadata, returns a defect. *)
+val start_metadata : unit -> (start_metadata, Error.t) result
+
 (** Returns whether workflow code should take the new branch identified by
     [id]. On a new execution the first call returns [true] and records a patch
     marker; replay returns [true] only when Core reports that marker, otherwise

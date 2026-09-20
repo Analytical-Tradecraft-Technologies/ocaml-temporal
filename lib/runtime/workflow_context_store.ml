@@ -1,3 +1,12 @@
+(** Immutable metadata recorded on this run's start event. Payload bytes are
+    copied on installation and observation; later search-attribute upserts do
+    not change this historical snapshot. [None] and [Some []] remain distinct. *)
+type start_metadata = {
+  memo : (string * Temporal_base.Payload.t) list option;
+  search_attributes : (string * Temporal_base.Payload.t) list option;
+  execution_expiration_time : Temporal_protocol.Workflow_protocol.timestamp option;
+}
+
 (** Function saved for each pending activity. It receives the raw payload,
     decodes it to the activity's declared output type, and completes the future
     returned to workflow code. *)
@@ -89,6 +98,7 @@ let next_local_id = Atomic.make 0
 type t = {
   scheduler : Scheduler.t;
   task_queue : string;
+  mutable start_metadata : start_metadata option;
   conditions : Condition_store.t;
   mutable activation_timestamp :
     Temporal_protocol.Workflow_protocol.timestamp option;
@@ -183,6 +193,7 @@ let create ?(task_queue = "default") ?(randomness_seed = "0") scheduler =
       {
         scheduler;
         task_queue;
+        start_metadata = None;
         conditions = Condition_store.create scheduler;
         activation_timestamp = None;
         activation_deployment_version = None;
@@ -200,6 +211,22 @@ let create ?(task_queue = "default") ?(randomness_seed = "0") scheduler =
         commands_rev = [];
         sealed = false;
       }
+
+(** Copies the mutable payload bodies in the run's start snapshot. Metadata
+    strings and timestamps are immutable and can safely be shared. *)
+let copy_start_metadata (value : start_metadata) =
+  let copy = Option.map (List.map (fun (key, (payload : Temporal_base.Payload.t)) ->
+    (key, { payload with data = Bytes.copy payload.data }))) in
+  { value with memo = copy value.memo; search_attributes = copy value.search_attributes }
+
+(** Installs the snapshot before the first workflow fiber runs. Later
+    activations omit initialization and retain the same run-local value. *)
+let set_start_metadata context value =
+  context.start_metadata <- Option.map copy_start_metadata value
+
+(** Returns an independently owned snapshot so workflow code cannot mutate
+    the value observed by another handler or later activation. *)
+let start_metadata context = Option.map copy_start_metadata context.start_metadata
 
 (** Stores the currently running workflow separately on each OCaml Domain, so
     workflow code running on different Domains cannot see the wrong context. *)

@@ -14,6 +14,49 @@ implementation when a later entry documents that work as complete. The
 latest entry that records a successful live run is the authoritative status
 for the two-binary Temporal acceptance path.
 
+## 2026-09-20: Current start metadata and worker replacement (#512)
+
+`Client.start` memo and registered search attributes now reach root and
+continued OCaml workflows. `Workflow.start_metadata` returns an owned,
+replay-stable snapshot of both maps and the server expiration timestamp.
+Absent and empty maps remain distinct; exact nanoseconds and payload metadata
+are retained. Mutating an input or observed payload cannot change later reads.
+See [the start metadata contract](reference/workflow-start-metadata.md).
+
+The live continuation exposed a server-applied first-task backoff even without
+cron: the successful successor recorded `0.897940959s`. The bridge preserves
+that duration for validated workflow/retry continuations. It still rejects
+cron and nonzero root start delay, without a broad continuation bypass.
+
+Local Linux arm64 validation used OCaml 5.5.1, Rust 1.94.1, Temporal Core
+`95e97686a079dcfe6c42e3254b2f3f5e3d97408f`, Temporal Server/admin-tools 1.32.0,
+and PostgreSQL 18.6. The 45 Rust workflow protocol tests, shared OCaml protocol
+fixtures, native execution ownership/replay suite, `make lint-rust`, and
+`make test-install` passed. `make test-temporal-start-metadata-live` passed
+for memo-only, search-only, combined, continued combined, and an official
+Temporal CLI start with both maps plus execution/run/task timeouts.
+
+The live checker requires matching exact run identities; initial running
+status with durable timer history; unchanged memo/indexed values and Keyword
+type; root-to-successor linkage; a terminal history preserving the initial
+prefix; expected output; and accepted task completions from both worker
+generations. The five final run IDs were
+`01a0be2d-9c34-7523-a9b6-aa3ceb76ec1f`,
+`01a0be2d-9cf8-7c46-a208-d9795d26d473`,
+`01a0be2d-9d6e-7066-ace6-08cf002273f1`,
+`0b1f665e-6257-453c-80d4-15a4845f4cbe`, and
+`01a0be2d-a35a-7be4-aa95-68ee7841d49e`. Local raw histories, visibility
+records, and logs remain in `_build/start-metadata-evidence`. Both CI
+workflows now run the isolated metadata gate first and retain its synthetic
+evidence; hosted CI is a separate verification gate.
+
+This establishes current metadata round trips and exact-history worker
+replacement/replay. It does not close the future #499 start-policy matrix,
+#501/PR #555 cache-full eviction qualification, the #503 shared replay corpus,
+or #505 feature conformance. An initial one-slot-cache attempt encountered
+#501's polling delay; the final fixture uses ordinary worker defaults and
+forces reconstruction by replacing the entire process.
+
 ## 2026-07-21: Stable and prerelease tag consistency gate (#444)
 
 The complete [PR #444 Actions run](https://github.com/mfow/ocaml-temporal/actions/runs/29827725596)

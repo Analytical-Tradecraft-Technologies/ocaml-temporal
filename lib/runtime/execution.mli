@@ -99,6 +99,10 @@ val start :
     execution removed from the cache ignores later calls. *)
 val activate : ('input, 'output) t -> Activation.job list -> Activation.command list
 
+(** Installs the run's historical start snapshot before its first activation. *)
+val set_start_metadata :
+  ('input, 'output) t -> Workflow_context_store.start_metadata option -> unit
+
 (** Installs the timestamp carried by the activation currently being dispatched.
     The native protocol adapter calls this before [activate] so deterministic
     workflow clock reads observe the correct replay value. *)

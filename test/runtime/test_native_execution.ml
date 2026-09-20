@@ -187,6 +187,8 @@ let test_activation_metadata_and_order () =
 let test_retained_payloads_are_copied () =
   let argument = protocol_payload "input" in
   let header = protocol_payload "header" in
+  let memo = protocol_payload "memo" in
+  let search = protocol_payload "search" in
   let continuation_attributes = protocol_payload "attributes" in
   let continuation_detail = protocol_payload "detail" in
   let continuation_result = protocol_payload "result" in
@@ -214,6 +216,10 @@ let test_retained_payloads_are_copied () =
       workflow_execution_timeout = None;
       workflow_run_timeout = None;
       workflow_task_timeout = None;
+      memo = Some [ ("note", memo) ];
+      search_attributes = Some [ ("CustomKeywordField", search) ];
+      workflow_execution_expiration_time = None;
+      first_workflow_task_backoff = None;
       first_execution_run_id = "first-run";
       start_time = None;
       root_workflow = None;
@@ -247,6 +253,8 @@ let test_retained_payloads_are_copied () =
   in
   Bytes.set argument.data 0 'X';
   Bytes.set header.data 0 'Y';
+  Bytes.set memo.data 0 'X';
+  Bytes.set search.data 0 'X';
   Bytes.set continuation_attributes.data 0 'X';
   Bytes.set continuation_detail.data 0 'X';
   Bytes.set continuation_result.data 0 'X';
@@ -261,6 +269,11 @@ let test_retained_payloads_are_copied () =
         failwith "initialization argument retained caller-owned bytes";
       if Bytes.to_string header_copy.data <> "header" then
         failwith "initialization context retained caller-owned bytes";
+      List.iter (fun (expected, values) ->
+        match values with
+        | Some [ (_, value) ] when Bytes.to_string value.Protocol.data = expected -> ()
+        | _ -> failwith "start metadata retained caller-owned bytes")
+        [ ("memo", context_copy.memo); ("search", context_copy.search_attributes) ];
       begin match context_copy.continuation with
       | Some
           {
@@ -281,6 +294,77 @@ let test_retained_payloads_are_copied () =
       | _ -> failwith "continuation metadata retained caller-owned bytes"
       end
   | _ -> failwith "initialization payload copies were not retained"
+
+(** Exercises the public historical snapshot through real native translation,
+    then reconstructs a fresh execution from the same activation as replay. *)
+let test_start_metadata_snapshot () =
+  let read () = match Temporal.Workflow.start_metadata () with
+    | Ok value -> value
+    | Error error -> failwith (Temporal.Error.message error)
+  in
+  let text (value : Temporal.Workflow.start_metadata) =
+    let one = function
+      | Some [ (_, (payload : Temporal.Payload.t)) ] -> Bytes.to_string payload.data
+      | _ -> failwith "missing metadata payload"
+    in
+    let expiration = Option.get value.execution_expiration_time in
+    if Temporal.Time.seconds expiration <> 1_800_000_000L
+       || Temporal.Time.nanoseconds expiration <> 123 then
+      failwith "expiration lost timestamp precision";
+    one value.memo ^ ":" ^ one value.search_attributes
+  in
+  let workflow = Temporal.Workflow.define ~name:"metadata_snapshot"
+      ~input:Temporal.Codec.unit ~output:Temporal.Codec.string (fun () ->
+    let open Temporal.Result_syntax in
+    let initial = read () in
+    let expected = text initial in
+    let payload = List.assoc "note" (Option.get initial.memo) in
+    Bytes.fill payload.data 0 (Bytes.length payload.data) 'X';
+    if text (read ()) <> expected then failwith "accessor returned borrowed bytes";
+    let duration = Temporal.Duration.of_ms 1L in
+    let* () = Temporal.Workflow.sleep duration in
+    let after = text (read ()) in
+    if after <> expected then failwith "later activation lost start snapshot";
+    Ok after)
+  in
+  let make_initial is_replaying =
+    let context : Protocol.initialize_context = {
+      headers = []; memo = Some [ ("note", protocol_payload "memo") ];
+      search_attributes = Some [ ("CustomKeywordField", protocol_payload "search") ];
+      workflow_execution_expiration_time = Some { seconds = 1_800_000_000L; nanoseconds = 123 };
+      first_workflow_task_backoff = None;
+      identity = "client"; parent_workflow = None;
+      workflow_execution_timeout = None; workflow_run_timeout = None;
+      workflow_task_timeout = None; first_execution_run_id = "first-run";
+      start_time = None; root_workflow = None; priority = None;
+      retry_policy = None; continuation = None;
+    } in
+    (context, activation ~is_replaying [ Protocol.Initialize_workflow {
+      workflow_id = "metadata-1"; workflow_type = "metadata_snapshot";
+      arguments = []; randomness_seed = "1"; attempt = 1; context = Some context } ])
+  in
+  let run is_replaying =
+    let context, initial = make_initial is_replaying in
+    let execution = Execution.start (base_workflow workflow) () in
+    let completion = unwrap "metadata start" (Native_execution.activate execution initial) in
+    (match completion.commands with
+     | [ Protocol.Start_timer { seq = 1L; _ } ] -> ()
+     | _ -> failwith "metadata workflow did not suspend on a durable timer");
+    let original = List.assoc "note" (Option.get context.memo) in
+    Bytes.fill original.data 0 (Bytes.length original.data) 'Y';
+    let completed = unwrap "metadata resume" (Native_execution.activate execution
+      (activation ~is_replaying [ Protocol.Fire_timer { seq = 1L } ])) in
+    match completed.commands with
+    | [ Protocol.Complete_workflow { result = Some payload } ] ->
+        if Bytes.to_string payload.data <> "\"memo:search\"" then
+          failwith "metadata workflow returned changed bytes"
+    | _ -> failwith "metadata workflow did not complete"
+  in
+  run false;
+  run true;
+  match Temporal.Workflow.start_metadata () with
+  | Error error when Temporal.Error.kind error = "defect" -> ()
+  | _ -> failwith "detached metadata observation did not fail closed"
 
 (** Confirms that application details survive the common Temporal shape where an
     activity failure wraps the application failure in [cause]. *)
@@ -1473,6 +1557,7 @@ let test_unknown_sequence_becomes_failure () =
 
 (** Runs every native-execution translation assertion. *)
 let () =
+  test_start_metadata_snapshot ();
   test_activation_metadata_and_order ();
   test_retained_payloads_are_copied ();
   test_activity_failure_details_are_preserved ();

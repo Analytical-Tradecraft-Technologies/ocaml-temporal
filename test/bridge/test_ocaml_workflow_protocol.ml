@@ -89,6 +89,7 @@ let test_valid_activations () =
       "activation";
       "eviction";
       "realistic-initialize";
+      "start-metadata";
       "child-initialize";
       "child-resolution";
       "child-cancellation-before-start";
@@ -1242,6 +1243,20 @@ let test_batched_default_temporal_payloads () =
 (** Proves required-nullable members are not interchangeable with omission on
     the OCaml side of the bilateral contract. *)
 let test_required_nullable_fields () =
+  let initial = Yojson.Safe.from_string (fixture [ "valid"; "start-metadata.input.json" ]) in
+  List.iter (fun omitted ->
+    let without_field = match initial with
+      | `Assoc fields -> `Assoc (List.map (function
+          | "jobs", `List (`Assoc job :: rest) ->
+              "jobs", `List (`Assoc (List.map (function
+                | "context", `Assoc context -> "context", `Assoc (List.remove_assoc omitted context)
+                | entry -> entry) job) :: rest)
+          | entry -> entry) fields)
+      | _ -> failwith "expected activation object"
+    in
+    require_error (Protocol.decode_activation (Yojson.Safe.to_string without_field)))
+    [ "memo"; "search_attributes"; "workflow_execution_expiration_time";
+      "first_workflow_task_backoff" ];
   require_error
     (Protocol.decode_completion
        {|{"run_id":"run-required-null","commands":[{"kind":"complete_workflow"}]}|});
