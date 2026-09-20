@@ -14,7 +14,7 @@
 
 (executable
  (name cache_eviction_driver)
- (libraries temporal-sdk temporal_two_binary_smoke_common unix))
+ (libraries temporal-sdk temporal_two_binary_smoke_common cache_eviction_wait unix))
 
 ;; A standalone client/worker binary lets the live controller replace workers
 ;; without holding Dune locks or linking another copy of Core for each process.

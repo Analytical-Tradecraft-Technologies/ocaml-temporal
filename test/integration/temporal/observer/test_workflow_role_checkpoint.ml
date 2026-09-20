@@ -4,7 +4,7 @@
     They prove the pure transition rules which the public native-worker hook
     later combines with strict JSON decoding and atomic publication. *)
 
-module Checkpoint = Temporal_runtime.Workflow_role_checkpoint
+module Checkpoint = Workflow_role_checkpoint
 (** Short alias that keeps the acceptance-specific test names readable. *)
 
 (** Fails with contextual text when a simple value comparison differs. *)

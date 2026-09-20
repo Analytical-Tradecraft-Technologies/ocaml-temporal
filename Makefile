@@ -60,7 +60,19 @@ DUNE_BUILD_ARGS := $(if $(strip $(DUNE_JOBS)),-j $(DUNE_JOBS),)
 # changing the test set or the production build profile.
 CARGO_BUILD_JOBS ?= 1
 CARGO_TEST_ENV := CARGO_BUILD_JOBS=$(CARGO_BUILD_JOBS) CARGO_INCREMENTAL=0
-COMPOSE_RUN := OCAML_IMAGE=$(OCAML_IMAGE) $(COMPOSE) --progress quiet run --rm --build --user $(HOST_UID):$(HOST_GID) $(SERVICE)
+# CI supplies a verified, immutable bridge bundle. Each OCaml consumer still
+# builds its C stubs and runs its own tests; Rust-only checks belong to the
+# producer. Explicit test-rust/lint-rust targets always remain available.
+RUST_TEST_TARGET := $(if $(strip $(TEMPORAL_RUST_BRIDGE_DIR)),,test-rust)
+RUST_LINT_TARGET := $(if $(strip $(TEMPORAL_RUST_BRIDGE_DIR)),,lint-rust)
+NATIVE_RUST_TEST_TARGET := $(if $(strip $(TEMPORAL_RUST_BRIDGE_DIR)),,native-test-rust)
+NATIVE_RUST_LINT_TARGET := $(if $(strip $(TEMPORAL_RUST_BRIDGE_DIR)),,native-lint-rust)
+RUST_BRIDGE_DIR ?= $(CURDIR)/_build/rust-bridge
+RUST_BRIDGE_KEY ?=
+# Build separately so Compose's build output goes to stderr and failures stop
+# the command. Only container stdout reaches version and Cargo metadata probes.
+COMPOSE_RUN := OCAML_IMAGE=$(OCAML_IMAGE) $(COMPOSE) --progress plain build $(SERVICE) >&2 && \
+	OCAML_IMAGE=$(OCAML_IMAGE) $(COMPOSE) --progress quiet run --rm --user $(HOST_UID):$(HOST_GID) $(SERVICE)
 RUN := $(COMPOSE_RUN) opam exec --
 CARGO := $(COMPOSE_RUN) cargo
 CARGO_MANIFEST := rust/Cargo.toml
@@ -80,7 +92,8 @@ QUALITY_TYPOS_VERSION ?= 1.48.0
 
 .PHONY: version-check build build-examples cargo-metadata test test-unit test-runtime test-rust test-bridge test-install test-api release-preflight release-tag-check test-quality-contract test-temporal-config test-temporal-worker-readiness-contract test-temporal-worker-stop-contract test-temporal-worker-crash-recovery-contract test-temporal-worker-cache-eviction-contract test-core-lifecycle-integration temporal-start temporal-start-worker temporal-run-driver temporal-inspect-smoke temporal-stop-worker test-temporal-two-binary test-temporal-integration test-temporal-worker-restart test-temporal-worker-restart-contract test-temporal-worker-restart-live test-temporal-worker-crash-recovery test-temporal-worker-cache-eviction test-temporal-worker-cache-eviction-live test-temporal-workflow-patching test-temporal-workflow-patching-contract test-temporal-workflow-patching-live test-temporal-parent-child-restart test-temporal-parent-child-restart-contract test-temporal-parent-child-restart-live test-temporal-parent-child-failure-replay test-temporal-parent-child-failure-replay-contract test-temporal-parent-child-failure-replay-live temporal-health temporal-status temporal-logs temporal-stop temporal-clean lint lint-rust fmt quality quality-tool-version-check quality-rust quality-spelling license-check audit clean verify check native-version-check native-build native-test native-test-rust native-test-install native-lint native-lint-rust native-verify
 version-check:
-	@actual="$$( $(RUN) ocamlc -version | tail -n 1 )"; \
+	@output="$$( $(RUN) ocamlc -version )" || exit $$?; \
+	actual="$$(printf '%s\n' "$$output" | tail -n 1)"; \
 	case "$$actual" in \
 		$(OCAML_VERSION).*) ;; \
 		*) echo "expected OCaml $(OCAML_VERSION).x, got $$actual" >&2; exit 1 ;; \
@@ -89,7 +102,7 @@ version-check:
 build:
 	$(RUN) dune build $(DUNE_BUILD_ARGS)
 	$(MAKE) build-examples
-	$(CARGO) build --manifest-path $(CARGO_MANIFEST) --locked
+	$(if $(strip $(TEMPORAL_RUST_BRIDGE_DIR)),,$(CARGO) build --manifest-path $(CARGO_MANIFEST) --locked)
 
 # Keep the examples as explicit compile targets rather than relying on Dune's
 # default alias. Every Docker and native build therefore proves that all three
@@ -107,7 +120,7 @@ test:
 	$(MAKE) test-temporal-worker-readiness-contract
 	$(MAKE) test-temporal-worker-stop-contract
 	$(RUN) dune runtest
-	$(MAKE) test-rust
+	$(if $(RUST_TEST_TARGET),$(MAKE) $(RUST_TEST_TARGET))
 	$(MAKE) test-bridge
 	$(MAKE) test-install
 	$(MAKE) test-quality-contract
@@ -118,6 +131,11 @@ test-rust:
 
 test-bridge:
 	$(COMPOSE_RUN) sh test/bridge/test_abi.sh
+
+# Requires a disposable Temporal server; the driver owns its worker processes.
+.PHONY: test-completed-queries-live
+test-completed-queries-live:
+	$(RUN) dune exec test/integration/completed_queries/regression.exe -- check $(TEMPORAL_CLIENT_TEST_URL)
 
 test-install:
 	$(COMPOSE_RUN) sh test/bridge/test_install.sh
@@ -142,9 +160,22 @@ release-tag-check:
 	@test -n "$(RELEASE_TAG)" || { echo "set RELEASE_TAG=vMAJOR.MINOR.PATCH" >&2; exit 2; }
 	sh scripts/check-release-tag.sh . "$(RELEASE_TAG)"
 
-test-quality-contract:
+# Source-only documentation inventory, shared by the Linux/native test gates.
+.PHONY: check-live-acceptance-inventory update-live-acceptance-inventory test-live-acceptance-inventory-contract
+check-live-acceptance-inventory:
+	sh scripts/check-live-acceptance-inventory.sh . --check
+
+update-live-acceptance-inventory:
+	sh scripts/check-live-acceptance-inventory.sh . --write
+
+test-live-acceptance-inventory-contract:
+	sh test/smoke/test_live_acceptance_inventory_contract.sh .
+
+test-quality-contract: check-live-acceptance-inventory test-live-acceptance-inventory-contract
 	sh test/smoke/test_quality_contract.sh .
 	sh test/smoke/test_release_tag_contract.sh .
+	sh test/smoke/test_make_docker_commands.sh .
+	sh test/smoke/test_rust_bridge_artifact.sh .
 
 test-temporal-config:
 	sh test/smoke/test_temporal_compose_config.sh
@@ -602,14 +633,25 @@ test-temporal-worker-restart-live: test-temporal-config
 test-unit:
 	$(RUN) dune runtest test/unit test/smoke
 
+# Requires a disposable server and an explicit official Temporal CLI path.
+.PHONY: test-update-outcomes-live
+test-update-outcomes-live:
+	$(RUN) dune exec test/integration/update_outcomes/regression.exe -- check $(TEMPORAL_CLIENT_TEST_URL) $(TEMPORAL_TEST_CLI)
+
 test-runtime:
-	$(RUN) dune runtest test/runtime
+	$(RUN) dune runtest test/runtime test/integration/temporal/observer
+
+# Requires a disposable running Temporal server. The regression owns its worker,
+# uses a unique task queue, and terminates its workflow executions on exit.
+.PHONY: test-client-request-ids-live
+test-client-request-ids-live:
+	$(RUN) dune exec test/integration/client_request_ids/regression.exe -- check $(TEMPORAL_CLIENT_TEST_URL)
 
 lint:
 	$(RUN) dune build $(DUNE_BUILD_ARGS)
 	$(MAKE) build-examples
 	$(COMPOSE_RUN) sh scripts/check-format.sh
-	$(MAKE) lint-rust
+	$(if $(RUST_LINT_TARGET),$(MAKE) $(RUST_LINT_TARGET))
 
 lint-rust:
 	$(CARGO) fmt --manifest-path $(CARGO_MANIFEST) --all -- --check
@@ -685,9 +727,9 @@ native-version-check:
 native-build:
 	$(NATIVE_ENV) $(NATIVE_RUN) dune build @install $(DUNE_BUILD_ARGS)
 	$(NATIVE_ENV) $(NATIVE_RUN) dune build $(DUNE_BUILD_ARGS) examples/workflow_worker/workflow_worker.exe examples/activity_worker/activity_worker.exe examples/client/client.exe
-	$(NATIVE_ENV) cargo build --manifest-path $(CARGO_MANIFEST) --locked
+	$(if $(strip $(TEMPORAL_RUST_BRIDGE_DIR)),,$(NATIVE_ENV) cargo build --manifest-path $(CARGO_MANIFEST) --locked)
 
-native-test: native-test-rust native-test-install test-quality-contract
+native-test: $(NATIVE_RUST_TEST_TARGET) native-test-install test-quality-contract
 	$(NATIVE_ENV) $(NATIVE_RUN) dune runtest
 
 native-test-rust:
@@ -696,7 +738,7 @@ native-test-rust:
 native-test-install:
 	$(NATIVE_ENV) sh test/bridge/test_install.sh
 
-native-lint: native-lint-rust
+native-lint: $(NATIVE_RUST_LINT_TARGET)
 	$(NATIVE_ENV) $(NATIVE_RUN) dune build $(DUNE_BUILD_ARGS)
 	$(NATIVE_ENV) $(NATIVE_RUN) dune build $(DUNE_BUILD_ARGS) examples/workflow_worker/workflow_worker.exe examples/activity_worker/activity_worker.exe examples/client/client.exe
 	sh scripts/check-format.sh
@@ -714,3 +756,20 @@ test-temporal-start-metadata-live:
 	$(RUN) dune build $(DUNE_BUILD_ARGS) test/integration/temporal/driver/start_metadata_driver.exe
 	$(MAKE) temporal-start
 	TEMPORAL_COMPOSE_PROJECT=$(TEMPORAL_COMPOSE_PROJECT) TEMPORAL_METADATA_IMAGE="$(TEMPORAL_METADATA_IMAGE)" HOST_UID=$(HOST_UID) HOST_GID=$(HOST_GID) sh test/integration/temporal/scripts/run-start-metadata-live.sh
+
+# Publish only after the pinned toolchain, Rust lint, and full Rust test suite
+# pass. Native desktop CI uses this directly; Linux uses the same gate inside
+# the Rust-only Debian image so artifacts link on every OCaml matrix image.
+.PHONY: rust-bridge native-rust-bridge
+native-rust-bridge:
+	@test -n "$(RUST_BRIDGE_KEY)" || { echo 'set RUST_BRIDGE_KEY' >&2; exit 2; }
+	$(NATIVE_ENV) sh test/smoke/test_rust_toolchain.sh
+	$(MAKE) native-lint-rust
+	$(MAKE) native-test-rust
+	$(NATIVE_ENV) sh scripts/rust-bridge-artifact.sh pack . "$(RUST_BRIDGE_DIR)" "$(RUST_BRIDGE_KEY)"
+
+rust-bridge:
+	docker build -f Dockerfile.rust-ci -t ocaml-temporal-rust-bridge:local .
+	docker run --rm --user $(HOST_UID):$(HOST_GID) --volume "$(CURDIR):/workspace" \
+		ocaml-temporal-rust-bridge:local make native-rust-bridge \
+		RUST_BRIDGE_DIR=/workspace/_build/rust-bridge RUST_BRIDGE_KEY="$(RUST_BRIDGE_KEY)"

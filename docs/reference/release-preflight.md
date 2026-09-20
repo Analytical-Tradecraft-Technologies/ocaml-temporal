@@ -29,7 +29,7 @@ the latter from a dirty worktree.
 ## CI SBOM
 
 `.github/workflows/release-preflight.yml` runs this complete target on pull
-requests, pushes to `master`, and manual dispatches. It obtains the locked Cargo graph
+requests, merge groups, and manual dispatches. It obtains the locked Cargo graph
 with `cargo metadata --locked`, then invokes the project-owned standard-library
 SBOM generator inside the pinned official Python image with network access
 disabled. The generated SPDX 2.3 document is deterministic: package IDs are

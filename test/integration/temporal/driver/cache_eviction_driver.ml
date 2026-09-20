@@ -49,7 +49,7 @@ let timeout_seconds () =
   | Some value -> (
       try
         let seconds = float_of_string value in
-        if seconds > 0. then Ok seconds
+        if Float.is_finite seconds && seconds > 0. then Ok seconds
         else Error (Error.defect ~message:"SMOKE_DRIVER_TIMEOUT_SECONDS must be positive")
       with _ ->
         Error
@@ -73,75 +73,17 @@ let clear_marker path =
            (Printf.sprintf "cannot remove stale marker %s: %s" path
               (Printexc.to_string exception_)))
 
-(** Returns whether a shared marker is non-empty and, when requested, exactly
-    matches its expected payload. Atomic publication makes a complete read
-    possible, while the payload check prevents a previous run's readiness token
-    from satisfying the current run. *)
-let marker_matches path expected =
-  if not (Sys.file_exists path) || (Unix.stat path).Unix.st_size = 0 then false
-  else
-    match expected with
-    | None -> true
-    | Some expected -> (
-        try
-          let channel = open_in_bin path in
-          Fun.protect
-            ~finally:(fun () -> close_in_noerr channel)
-            (fun () ->
-              let contents =
-                really_input_string channel (in_channel_length channel)
-              in
-              String.equal contents expected)
-        with _ -> false)
-
-(** Waits for an exact completion marker before admitting the second run. The
-    worker publishes this marker after Core acknowledges A's first activation;
-    using the marker as the admission barrier keeps the driver independent of
-    query-task routing and gives the eviction assertion one deterministic
-    starting state. *)
+(** Converts a file-wait diagnostic to the driver's typed failure. Both waits
+    use the process deadline; neither grants a new budget after an earlier phase. *)
 let wait_for_marker ~path ~expected ~timeout =
-  let deadline = Unix.gettimeofday () +. timeout in
-  let rec loop () =
-    if marker_matches path (Some expected) then Ok ()
-    else if Unix.gettimeofday () >= deadline then
-      Error
-        (Error.defect
-           ~message:("timed out waiting for marker " ^ path))
-    else begin
-      Unix.sleepf 0.1;
-      loop ()
-    end
-  in
-  loop ()
+  Cache_eviction_wait.wait_for_marker ~path ~expected ~timeout
+  |> Result.map_error (fun message -> Error.defect ~message)
 
-(** Waits for A's cache-full marker while retaining B's completion marker as a
-    diagnostic only. Core buffers B when the one-slot cache is full and only
-    releases it after A's cache-removal activation is acknowledged; therefore
-    B cannot satisfy this acceptance condition. One deadline covers both
-    observations so a late B marker cannot silently grant a second timeout
-    budget before the required eviction arrives. *)
+(** Records both observations before returning the cache-pressure failure. *)
 let wait_for_eviction_with_second_diagnostic ~eviction ~second_ready ~timeout =
-  let deadline = Unix.gettimeofday () +. timeout in
-  let rec loop saw_second_acknowledgement =
-    if marker_matches eviction None then Ok ()
-    else if Unix.gettimeofday () >= deadline then
-      let message =
-        if saw_second_acknowledgement then
-          "second workflow was acknowledged but A cache-full eviction marker was not published"
-        else
-          "neither A cache-full eviction marker nor second workflow acknowledgement was published"
-      in
-      Error (Error.defect ~message)
-    else begin
-      let saw_second_acknowledgement =
-        saw_second_acknowledgement
-        || marker_matches second_ready (Some "initial-completion\n")
-      in
-      Unix.sleepf 0.1;
-      loop saw_second_acknowledgement
-    end
-  in
-  loop false
+  Cache_eviction_wait.wait_for_eviction_with_second_diagnostic
+    ~eviction ~second_ready ~timeout
+  |> Result.map_error (fun message -> Error.defect ~message)
 
 (** Requires an exact run to report Temporal's typed cancellation category. *)
 let require_cancelled label = function
@@ -200,6 +142,13 @@ let run () =
       in
       phase "client_create" "ok";
       let finish result =
+        (* Emit the causal failure before shutdown, which may itself consume
+           the watchdog reserve if the native client cannot make progress. *)
+        (match result with
+        | Ok () -> ()
+        | Error error ->
+            Printf.eprintf "cache eviction diagnostic: %s\n%!"
+              (Error.message error));
         match Client.shutdown client with
         | Ok () ->
             phase "client_shutdown" "ok";
@@ -217,6 +166,8 @@ let run () =
             ~id:"two-binary-cache-eviction-a" ~input:"first" ()
         in
         phase "start_a" "ok";
+        Printf.eprintf "cache eviction execution=a workflow_id=%s run_id=%s\n%!"
+          "two-binary-cache-eviction-a" (Client.run_id first);
         phase "cache_settling" "begin";
         let* () =
           wait_for_marker ~path:ready ~expected:"initial-completion\n" ~timeout
@@ -229,6 +180,8 @@ let run () =
             ~id:"two-binary-cache-eviction-b" ~input:"second" ()
         in
         phase "start_b" "ok";
+        Printf.eprintf "cache eviction execution=b workflow_id=%s run_id=%s\n%!"
+          "two-binary-cache-eviction-b" (Client.run_id second);
         phase "eviction_marker" "begin";
         let* () =
           wait_for_eviction_with_second_diagnostic ~eviction:marker

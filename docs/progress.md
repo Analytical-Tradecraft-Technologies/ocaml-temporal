@@ -11,8 +11,9 @@ details. For a concise statement of what users can run today, see the project
 Entries marked "Historical snapshot" preserve the status at an earlier
 milestone. Their follow-up wording is not a claim about the current
 implementation when a later entry documents that work as complete. The
-latest entry that records a successful live run is the authoritative status
-for the two-binary Temporal acceptance path.
+[commit-pinned live evidence audit](reference/live-acceptance-coverage.md)
+records the current tested source, named assertions and successful CI job for
+the Temporal acceptance controllers.
 
 ## 2026-09-20: Current start metadata and worker replacement (#512)
 

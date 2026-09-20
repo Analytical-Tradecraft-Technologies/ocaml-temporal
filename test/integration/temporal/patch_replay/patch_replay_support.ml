@@ -354,7 +354,8 @@ let run_with_signal_shutdown worker =
 
 (** Creates, advertises, runs, and tears down one of the dedicated worker
     source versions. The caller supplies only public registrations; all native
-    lifecycle and diagnostic ownership remains inside [Temporal.Worker]. *)
+    lifecycle ownership remains inside [Temporal.Worker], while the private
+    fixture observer owns diagnostic policy and artifacts. *)
 let run_worker ~workflows ~activities =
   let open Temporal.Result_syntax in
   let* configuration = worker_configuration () in
@@ -368,15 +369,16 @@ let run_worker ~workflows ~activities =
   in
   let* () = prepare_replay_diagnostics configuration in
   let* worker =
-    Worker.create ~target_url:configuration.target_url
-      ~namespace:configuration.namespace ~identity:"ocaml-temporal-patch-replay"
-      (* This fixture isolates workflow patch replay from sticky-cache
-         hand-off. Sticky eviction and replacement are covered by the
-         dedicated cache-eviction and restart gates; keeping Core's cache
-         disabled here means a replacement generation receives the durable
-         timer task from the ordinary queue instead of a queue owned by the
-         stopped generation. *)
-      ~max_cached_workflows:0 ~task_queue ~workflows ~activities ()
+    Acceptance_observer.with_worker (fun () ->
+      Worker.create ~target_url:configuration.target_url
+        ~namespace:configuration.namespace ~identity:"ocaml-temporal-patch-replay"
+        (* This fixture isolates workflow patch replay from sticky-cache
+           hand-off. Sticky eviction and replacement are covered by the
+           dedicated cache-eviction and restart gates; keeping Core's cache
+           disabled here means a replacement generation receives the durable
+           timer task from the ordinary queue instead of a queue owned by the
+           stopped generation. *)
+        ~max_cached_workflows:0 ~task_queue ~workflows ~activities ())
   in
   (* Worker creation is the ownership boundary: from this point onward every
      result path must invoke [Worker.shutdown], even if readiness publication

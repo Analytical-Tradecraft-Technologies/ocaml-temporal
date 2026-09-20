@@ -300,7 +300,8 @@ val resolve_child_workflow_start :
 (** Completes and removes the pending timer with this sequence number. *)
 val fire_timer : t -> seq:int64 -> (unit, Temporal_base.Error.t) result
 
-(** Appends a command to the current activation output buffer. *)
+(** Appends a command to the current activation output buffer. Once sealed,
+    only query responses can be appended; durable commands remain suppressed. *)
 val emit : t -> Activation.command -> unit
 
 (** Buffers a terminal command and stops the current workflow fiber. This is a

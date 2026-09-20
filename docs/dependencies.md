@@ -39,7 +39,7 @@ attributes them to the reviewed compiler distribution.
 | Package | Exact version | License | Scope | Linked into release | Redistributed | Review note |
 |---|---:|---|---|---|---|---|
 | temporal-sdk | ~dev | Apache-2.0 | project | yes | yes | Project source and binary |
-| dune | 3.24.0 | MIT | build | no | no | Build system only |
+| dune | 3.24.2 | MIT | build | no | no | Build system only |
 | logs | 0.10.0 | ISC | runtime | yes | no | Maintained application-configurable logging infrastructure; the SDK installs no reporter |
 | ocamlbuild | 0.16.1 | LGPL-2.0-or-later WITH OCaml-LGPL-linking-exception | build | no | no | Exact reviewed build-only linking-exception dependency of `logs` |
 | ocamlfind | 1.9.8 | MIT | build | no | no | Build-time library discovery required by `logs` |
@@ -147,10 +147,22 @@ Every package was already present at the exact locked version in the
 Temporal Core closure, so these declarations change package ownership metadata
 but add no package to the 319-dependency graph.
 
-Dependabot checks the Cargo workspace under `/rust` every Monday and targets
-updates at `master`. OCaml and OPAM are intentionally absent because GitHub
-Dependabot does not support that ecosystem; the locked OPAM closure continues
-to be reviewed and updated manually.
+Dependabot checks the Cargo workspace under `/rust` every calendar day at
+07:00 Australia/Sydney and targets `master`, with a three-day release cooldown
+and a maximum of ten open Cargo version-update PRs. Its explicit
+`allow: dependency-type: all` policy includes direct and transitive Cargo
+dependencies; without that rule, routine version updates cover only direct
+dependencies (security updates can still cover vulnerable lockfile entries).
+Temporal Core packages remain grouped. Cargo resolution continues to enforce
+upstream version requirements; this policy does not override those constraints.
+Docker, Docker Compose, Rust toolchains, and GitHub Actions have separate daily
+entries. Versions embedded in arbitrary scripts, Makefiles, and action inputs
+still require explicit maintenance. OCaml and OPAM are intentionally absent
+because GitHub Dependabot does not support that ecosystem; the locked OPAM
+closure continues to be reviewed and updated manually.
+
+See the [Dependabot allow reference](https://docs.github.com/en/code-security/reference/supply-chain-security/dependabot-options-reference#allow)
+for the direct/indirect update behavior.
 
 The Cargo scanner parses SPDX `AND`, `OR`, `WITH`, and parentheses rather than
 matching substrings. For an `OR`, it prints the exact approved branch selected;

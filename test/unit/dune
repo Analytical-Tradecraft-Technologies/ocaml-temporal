@@ -14,3 +14,7 @@
 (test
  (name test_base_error)
  (libraries temporal_base))
+
+(test
+ (name test_client_request_id)
+ (libraries temporal_base unix))

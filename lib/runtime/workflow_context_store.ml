@@ -465,11 +465,16 @@ let allocate_sequence context =
 
 (** Adds a command to the front of the internal list; [take_commands] restores
     creation order before returning it. After [shutdown] or [terminate] has
-    sealed the context, further emissions are ignored so discontinued waiters
-    cannot append cancellation commands after a terminal completion. *)
+    sealed the context, only query responses are allowed. Discontinued waiters
+    cannot append durable commands after a terminal completion, while Core can
+    still query the retained final state without reopening the scheduler. *)
 let emit context command =
-  if not context.sealed then
-    context.commands_rev <- command :: context.commands_rev
+  match command with
+  | Activation.Query_result _ ->
+      context.commands_rev <- command :: context.commands_rev
+  | _ ->
+      if not context.sealed then
+        context.commands_rev <- command :: context.commands_rev
 
 (** Records a terminal command before aborting the current scheduler. The
     command is therefore retained even though the calling continuation is not

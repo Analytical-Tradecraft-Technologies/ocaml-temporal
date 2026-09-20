@@ -3,7 +3,7 @@
 **Status: the original path is live-verified in the [PR #253 Actions run](https://github.com/mfow/ocaml-temporal/actions/runs/29286560471), the retry-after-restart extension is live-verified in [PR #298](https://github.com/mfow/ocaml-temporal/actions/runs/29346853291), forced crash recovery is live-verified in [PR #306](https://github.com/mfow/ocaml-temporal/actions/runs/29355426605), the repaired one-slot sticky-cache eviction gate is live-verified in the complete [PR #438 run](https://github.com/mfow/ocaml-temporal/actions/runs/29805397413), and the separate bilateral parent/child restart-replay path is live-verified in the complete [PR #351 Actions run](https://github.com/mfow/ocaml-temporal/actions/runs/29434016013).** The earlier [PR #322 run](https://github.com/mfow/ocaml-temporal/actions/runs/29402103748) remains historical evidence for the original eviction gate. The private Rust bridge validates and feeds one history at a time into a workflow-only Temporal Core replay worker. The public worker reports bounded activation metadata through a private OCaml callback, and the Compose fixture replaces generation 1 with a fresh generation 2 while an independent OCaml driver waits for the exact run. The extension requires generation 2 to complete the retrying activity at attempt two, proven by the exact result marker; Temporal compacts intermediate activity retry events out of workflow history. `make test-temporal-worker-crash-recovery` adds the same exact-run evidence after a forced generation-one process kill and now has a green live result. `make test-temporal-worker-cache-eviction` exercises the separate one-slot eviction scenario and requires Core's real `RemoveFromCache` activation, an empty acknowledgement, and continued workflow progress. The bridge format and ownership rules are documented in the [internal replay bridge reference](replay-bridge.md).
 
 This restart/replay result is not evidence for workflow-code versioning. The
-separate [`make test-temporal-workflow-patching`](workflow-patching.md#intended-live-replay-acceptance)
+separate [`make test-temporal-workflow-patching`](workflow-patching.md#live-replay-acceptance)
 target proves that a marker-free legacy history and a marker-bearing new
 history select their respective branches after worker replacement. That
 separate result is live-verified by the complete [PR #348 CI
@@ -31,8 +31,9 @@ the single-workflow restart gate described here.
 gate. `make test-temporal-worker-restart-live` runs the real PostgreSQL,
 Temporal Server, two-generation OCaml worker, and OCaml driver sequence, while
 `make test-temporal-worker-restart` runs both. The standalone CI integration job
-invokes this target after the existing thirteen-result smoke. The successful
-result is recorded in the linked PR #253 run; an earlier cold ARM64 attempt did
+invokes this target after the baseline smoke. The [current evidence audit](live-acceptance-coverage.md)
+records the tested source and successful job; PR #253 is the original evidence.
+An earlier cold ARM64 attempt did
 not reach the acceptance assertions because the Docker daemon ran out of
 storage during the native build, which was an infrastructure failure rather
 than replay evidence.
