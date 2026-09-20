@@ -110,6 +110,11 @@ invalid; it never falls back to compiling Rust. Dune tracks the bundle path and
 key as environment dependencies; bundles are immutable for the lifetime of a
 build directory.
 
+The existing required OCaml and live-smoke checks explicitly fail when their
+Rust producers fail. Their job conditions override GitHub's default dependency
+skipping, because a skipped required job would otherwise count as successful.
+Documentation-only PRs retain the existing path-based skips.
+
 Only successful Rust producers on `master` push/scheduled runs save shared
 caches. PR and merge-queue jobs can restore these default-branch caches without
 write credentials. OCaml-only changes therefore reuse the same Rust bundle
