@@ -2537,7 +2537,7 @@ fn validate_initialize_subset(
     continuation: Option<&Continuation>,
 ) -> Result<(), CoreConversionError> {
     if !value.cron_schedule.is_empty()
-        || value.continued_initiator == api_enums::ContinueAsNewInitiator::CronSchedule as i32
+        || value.continued_initiator == i32::from(api_enums::ContinueAsNewInitiator::CronSchedule)
     {
         return Err(unsupported(
             "cron schedules are not supported by the OCaml worker",
