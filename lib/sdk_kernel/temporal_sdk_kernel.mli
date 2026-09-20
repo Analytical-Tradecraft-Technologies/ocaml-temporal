@@ -43,8 +43,8 @@ module Native_worker_loop = Temporal_runtime.Native_worker_loop
 (** Closed retry and shutdown classification rules for the native loop. *)
 module Native_worker_policy = Temporal_runtime.Native_worker_policy
 
-(** Replay-safe workflow-role checkpoint support used by live acceptance. *)
-module Workflow_role_checkpoint = Temporal_runtime.Workflow_role_checkpoint
+(** Generic private observer selection scoped to one worker constructor. *)
+module Native_worker_observer = Temporal_runtime.Native_worker_observer
 
 (** Callback representation underlying the public abstract future type. *)
 module Future = Temporal_future_kernel

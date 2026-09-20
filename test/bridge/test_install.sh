@@ -57,6 +57,17 @@ for private_library in \
   test ! -e "$package_root/$private_library"
 done
 
+# Fixture policy must not enter any installed library, including package-private
+# ones. The sole runtime injection seam is generic and has no environment or I/O
+# behavior; normal consumers cannot import it (checked below).
+test ! -e "$private_root/temporal_acceptance_observer"
+test ! -e "$package_root/temporal_acceptance_observer"
+if find "$root/lib" -type f \( -name '*.ml' -o -name '*.mli' \) \
+  -exec grep -E 'SMOKE_(WORKER|REPLAY|CACHE_EVICTION|PARENT_CHILD)' {} + >/dev/null; then
+  echo "acceptance environment controls leaked into production libraries" >&2
+  exit 1
+fi
+
 # The source dependency graph has three deliberate layers. Public facade
 # modules may use the package-private OCaml kernel allow-list, but must not
 # bypass it and couple directly to JSON protocol, C/Rust bridge, deterministic
@@ -104,6 +115,7 @@ cp "$root/test/fixtures/install-consumer/dune-project" "$output_dir/"
 cp "$root/test/fixtures/install-consumer/dune" "$output_dir/"
 cp "$root/test/fixtures/install-consumer/main.ml" "$output_dir/"
 cp "$root/test/fixtures/install-consumer/public_api.ml" "$output_dir/"
+cp "$root/test/fixtures/install-consumer/worker_environment.ml" "$output_dir/"
 cp "$root/test/fixtures/install-consumer/negative-dune" "$output_dir/dune-negative"
 cp "$root/test/fixtures/install-consumer/negative/forbidden_"*.ml "$output_dir/"
 consumer_ocamlpath=$dune_install_root
@@ -111,8 +123,28 @@ if [ -n "${OCAMLPATH:-}" ]; then
   consumer_ocamlpath="${dune_install_root}${path_separator}${OCAMLPATH}"
 fi
 OCAMLPATH="$consumer_ocamlpath" opam exec -- \
-  dune build --root "$dune_output_dir" ./main.exe
+  dune build --root "$dune_output_dir" ./main.exe ./worker_environment.exe
 "$output_dir/_build/default/main.exe"
+
+# Malformed legacy settings used to fail before native client configuration.
+# The installed worker now reaches the same native path with either namespace
+# of test settings present. Live callers can supply a Temporal address to prove
+# successful native construction and shutdown using this same consumer binary.
+"$output_dir/_build/default/worker_environment.exe"
+env SMOKE_WORKER_REPLAY_DIAGNOSTICS_FILE=relative \
+  SMOKE_WORKER_GENERATION=invalid SMOKE_REPLAY_WORKFLOW_ID=unrelated \
+  SMOKE_WORKER_CACHE_EVICTION_FILE=relative \
+  SMOKE_WORKER_CACHE_EVICTION_READY_FILE=relative \
+  SMOKE_WORKER_CACHE_EVICTION_SECOND_READY_FILE=relative \
+  SMOKE_CACHE_EVICTION_SECOND_WORKFLOW_ID=unrelated \
+  "$output_dir/_build/default/worker_environment.exe"
+env SMOKE_PARENT_CHILD_REPLAY_DIAGNOSTICS_FILE=relative \
+  SMOKE_PARENT_CHILD_REPLAY_GENERATION=invalid \
+  SMOKE_PARENT_CHILD_REPLAY_PARENT_WORKFLOW_ID=unrelated \
+  SMOKE_PARENT_CHILD_REPLAY_PARENT_RUN_ID=unrelated \
+  SMOKE_PARENT_CHILD_REPLAY_CHILD_WORKFLOW_ID=unrelated \
+  SMOKE_PARENT_CHILD_REPLAY_CHILD_RUN_ID=unrelated \
+  "$output_dir/_build/default/worker_environment.exe"
 
 # Activate the negative stanzas only after the positive consumer has built. The
 # source tree keeps them in a non-Dune template so the repository's normal
@@ -128,11 +160,21 @@ for forbidden_target in \
   forbidden_sdk_kernel \
   forbidden_native_worker \
   forbidden_backend \
-  forbidden_future_kernel; do
+  forbidden_future_kernel \
+  forbidden_worker_observer \
+  forbidden_acceptance_observer; do
   if OCAMLPATH="$consumer_ocamlpath" opam exec -- \
     dune build --root "$dune_output_dir" \
       "./$forbidden_target.exe" >"$output_dir/$forbidden_target.log" 2>&1; then
     echo "$forbidden_target unexpectedly compiled from the public package" >&2
+    cat "$output_dir/$forbidden_target.log" >&2
+    exit 1
+  fi
+  # An unrelated Dune configuration failure is not evidence of API privacy.
+  # Require the compiler to reject the unavailable implementation module.
+  if ! grep -E 'Unbound module|no cmi file was found' \
+    "$output_dir/$forbidden_target.log" >/dev/null; then
+    echo "$forbidden_target failed without checking its private import" >&2
     cat "$output_dir/$forbidden_target.log" >&2
     exit 1
   fi
