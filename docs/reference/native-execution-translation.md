@@ -75,6 +75,7 @@ flag does not close the execution or prevent a workflow-task retry.
 | `Resolve_child_workflow` with `Completed` | `Resolve_child_workflow` with `Ok payload` | The translation preserves the terminal payload (including canonical null); `Workflow_context_store` resolves the child only after a successful start acknowledgment. |
 | `Resolve_child_workflow` with `Failed` or `Cancelled` | `Resolve_child_workflow` with `Error` | Child failure identity, retry state, details, cancellation category, and the bounded recursive diagnostic are retained. |
 | `Notify_has_patch` | `Notify_has_patch` | The validated patch ID is copied into execution-local patch state before workflow fibers run. Query-only activations cannot contain this or any other non-query job. |
+| `Update_random_seed` | `Update_random_seed` | The full canonical uint64 seed is retained as decimal text. The ordered job pass replaces the execution's random stream before resumed fibers run. |
 | `Fire_timer` | `Fire_timer` | The exact sequence is retained. |
 | `Cancel_workflow` | `Cancel_workflow` | The reason is retained in `translated_activation.cancellation_reason`. |
 | `Remove_from_cache` | `Remove_from_cache` | The message and eviction reason are retained in `translated_activation.cache_removal`. |

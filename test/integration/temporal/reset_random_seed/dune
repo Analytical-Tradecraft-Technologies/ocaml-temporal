@@ -1,0 +1,17 @@
+(library
+ (name reset_random_seed_fixture)
+ (wrapped false)
+ (modules reset_definition)
+ (libraries temporal-sdk))
+
+(executable
+ (name reset_worker)
+ (modules reset_worker)
+ (libraries temporal-sdk reset_random_seed_fixture unix))
+
+(test
+ (name test_reset_replay)
+ (modules test_reset_replay)
+ (deps reset-history.replay.json expected-result.txt)
+ (libraries temporal-sdk temporal_runtime temporal_sdk_supervisor
+  reset_random_seed_fixture yojson unix))

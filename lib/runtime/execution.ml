@@ -607,6 +607,8 @@ let process_job execution = function
          job pass guarantees the decision is installed before any workflow
          fiber is drained for this activation. *)
       Workflow_context_store.notify_has_patch execution.context ~patch_id
+  | Activation.Update_random_seed { randomness_seed } ->
+      Workflow_context_store.update_random_seed execution.context ~randomness_seed
   | Fire_timer { seq } -> (
       match Workflow_context_store.fire_timer execution.context ~seq with
       | Ok () -> ()

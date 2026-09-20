@@ -115,8 +115,8 @@ type t = {
      boundary is private and safe because callers can only use the same
      existentially typed key returned by [create_local]. *)
   locals : (int, Obj.t) Hashtbl.t;
-  (* Seeded deterministic pseudo-random state.  Temporal supplies one seed
-     when a run is initialized; keeping the state in the execution context
+  (* Seeded deterministic pseudo-random state. Temporal supplies the initial
+     seed and replacements after reset; keeping the state in the execution context
      makes repeated calls replay identically without consulting process-global
      randomness or the host clock. *)
   mutable random_state : int64;
@@ -150,8 +150,8 @@ let validate_task_queue task_queue =
     Error "task_queue must be valid UTF-8"
   else Ok ()
 
-(** Creates empty activity and timer tables. The tables grow normally if a
-    workflow has more than the small initial capacity. *)
+(** Converts canonical uint64 decimal text into the generator's bit pattern.
+    Zero retains the existing nonzero fallback required by xorshift. *)
 let seed_of_decimal seed =
   let maximum = "18446744073709551615" in
   if String.length seed = 0
@@ -173,6 +173,8 @@ let seed_of_decimal seed =
   in
   if Int64.equal state 0L then 1L else state
 
+(** Creates empty activity and timer tables. The tables grow normally if a
+    workflow has more than the small initial capacity. *)
 let create ?(task_queue = "default") ?(randomness_seed = "0") scheduler =
   match validate_task_queue task_queue with
   | Error message ->
@@ -314,6 +316,12 @@ let patched context ~patch_id =
     public operation exists only to record the marker lifecycle transition. *)
 let deprecate_patch context ~patch_id =
   ignore (call_patch_api context ~patch_id ~mode:Deprecated)
+
+(** Installs Core's reset seed during the ordered activation job pass, before
+    any resumed fiber can draw from the stream. Parsing finishes before mutation. *)
+let update_random_seed context ~randomness_seed =
+  if context.sealed then invalid_arg "cannot update randomness after shutdown";
+  context.random_state <- seed_of_decimal randomness_seed
 
 (** Advances the execution-local xorshift generator.  The generator is not
     exposed publicly: its only contract is that a given Temporal seed and call

@@ -128,6 +128,16 @@ host operating system and ephemeral CI/build environment. Build tools are
 recorded in the inventory; their licenses and whether they are redistributed
 are made explicit rather than inferred from the final binary.
 
+## Reset random-seed recovery (#570)
+
+The bridge and runtime now preserve and apply Core's `UpdateRandomSeed` job.
+The [timer-reset fixture](../test/integration/temporal/reset_random_seed/README.md)
+records a successful native live reset and replays that exact history through
+Core and the OCaml worker adapter in the ordinary offline test suite. This
+qualifies the missing-event regression, including deterministic random draws;
+reset remains experimental and outside production recovery guidance pending
+the broader conformance and support-policy gates. No dependency was added.
+
 ## Workflow defect recovery before v1 (#511)
 
 The private protocol now separates failed workflow tasks from intentional

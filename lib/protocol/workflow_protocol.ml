@@ -258,6 +258,8 @@ type activation_job =
     }
   (** Reports that Core found the named patch marker while replaying this run. *)
   | Notify_has_patch of { patch_id : string }
+  (** Replaces the workflow random stream using a canonical uint64 decimal seed. *)
+  | Update_random_seed of { randomness_seed : string }
   | Fire_timer of { seq : int64 }
   | Cancel_workflow of { reason : string }
   | Remove_from_cache of { message : string; reason : eviction_reason }
@@ -1879,6 +1881,11 @@ let activation_job path json =
       let* patch_id_json = field path "patch_id" entries in
       let* patch_id = identifier (path ^ ".patch_id") patch_id_json in
       Ok (Notify_has_patch { patch_id })
+  | "update_random_seed" ->
+      let* entries = exact_object path [ "kind"; "randomness_seed" ] json in
+      let* seed_json = field path "randomness_seed" entries in
+      let* randomness_seed = uint64_decimal (path ^ ".randomness_seed") seed_json in
+      Ok (Update_random_seed { randomness_seed })
   | "fire_timer" ->
       let* entries = exact_object path [ "kind"; "seq" ] json in
       let* seq_json = field path "seq" entries in
@@ -2002,6 +2009,13 @@ let activation_job_json = function
       Ok
         (`Assoc
           [ ("kind", `String "notify_has_patch"); ("patch_id", `String patch_id) ])
+  | Update_random_seed { randomness_seed } ->
+      Ok
+        (`Assoc
+          [
+            ("kind", `String "update_random_seed");
+            ("randomness_seed", `String randomness_seed);
+          ])
   | Fire_timer { seq } ->
       Ok
         (`Assoc
