@@ -124,7 +124,10 @@ val follow :
 
 (** Waits for the exact workflow ID and run ID returned by [start]. A
     continued-as-new result is returned as a value rather than followed
-    implicitly, preserving the caller's run identity choice. *)
+    implicitly, preserving the caller's run identity choice. The native client
+    retains at most 64 distinct pending runs; waiting on another run at capacity
+    returns an error. Terminal results and errors free their slots, and client
+    shutdown interrupts pending waits. *)
 val wait :
   ('input, 'output) handle ->
   ('output terminal_result, Error.t) result

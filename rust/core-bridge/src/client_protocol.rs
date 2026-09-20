@@ -133,7 +133,7 @@ pub(crate) enum StartWorkflowOutcome {
 /// There is intentionally no `follow_runs` field.  This ABI operation has
 /// fixed `follow_runs = false` semantics, so a continued-as-new event is a
 /// terminal result for the requested run and cannot silently switch identity.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WaitWorkflowRequest {
     /// Namespace containing the execution.
