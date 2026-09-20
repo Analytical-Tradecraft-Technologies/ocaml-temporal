@@ -603,7 +603,7 @@ test-unit:
 	$(RUN) dune runtest test/unit test/smoke
 
 test-runtime:
-	$(RUN) dune runtest test/runtime
+	$(RUN) dune runtest test/runtime test/integration/temporal/observer
 
 lint:
 	$(RUN) dune build $(DUNE_BUILD_ARGS)
