@@ -35,6 +35,12 @@ is a release gate, distinct from completing the long-term parity target.
 | 9 | Performance, observability, security, packaging, stability and release automation; reproducible artifacts and rehearsal | In progress. Logging, quality/license gates, installed-consumer/package checks and release preflight exist. Public authentication, performance/load evidence, support policy, provenance/publication, complete artifact audit and upgrade/release rehearsal remain release work. |
 | 10 | Parity closure; every parity row links implementation, tests and documentation | Planned. A bounded v1 decision does not claim full parity. |
 
+The focused [local activity cancellation regression](../test/integration/local_activity_cancellation/README.md)
+adds native live evidence for cancelling language-owned retry backoff under all
+three policies, including durable timer cancellation and fresh-worker history
+replay. Local activity retry/recovery qualification beyond that scenario remains
+part of phases 3 and 7.
+
 ## Plan documents
 
 1. [Foundation and deterministic runtime](superpowers/plans/2026-07-11-foundation-and-deterministic-runtime.md)

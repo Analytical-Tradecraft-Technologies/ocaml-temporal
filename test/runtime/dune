@@ -11,6 +11,7 @@
   test_native_worker_execution
   test_scheduler
   test_activity_retry_policy
+  test_local_activity_cancellation
   test_scope
   test_scope_server_cancel
   test_workflow_time

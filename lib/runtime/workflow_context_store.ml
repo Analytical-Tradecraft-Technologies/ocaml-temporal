@@ -8,7 +8,9 @@ type activity_resolution =
     after Core asks the language layer to back off. The resolver remains in the
     ordinary activity table so terminal completions use the same lifecycle;
     [backoff_timer_seq] is set while the retry timer is outstanding and makes
-    duplicate Core backoff jobs fail closed. *)
+    duplicate Core backoff jobs fail closed. [cancellation_requested] shares
+    the handle's decision so a later backoff job cannot revive a cancelled
+    operation. *)
 type local_activity_state = {
   activity_id : string;
   activity_type : string;
@@ -19,6 +21,7 @@ type local_activity_state = {
   retry_policy : Activation.retry_policy option;
   local_retry_threshold : int64 option;
   cancellation_type : Activation.activity_cancellation_type;
+  cancellation_requested : bool ref;
   mutable attempt : int64;
   mutable original_schedule_time :
     Temporal_protocol.Workflow_protocol.timestamp option;
@@ -472,6 +475,38 @@ let continue_as_new context ~workflow_type ~input =
 let bridge_error message =
   Temporal_base.Error.make ~non_retryable:true ~category:`Bridge ~message ()
 
+(** Removes the activity before invoking its resolver. If resolving triggers a
+    repeated completion immediately, the repeated sequence is rejected instead
+    of completing the same future twice. *)
+let resolve_activity context ~seq result =
+  match Hashtbl.find_opt context.activities seq with
+  | None ->
+      Error
+        (bridge_error
+           (Printf.sprintf "unknown or duplicate activity sequence %Ld" seq))
+  | Some resolve ->
+      Hashtbl.remove context.activities seq;
+      Hashtbl.remove context.local_activities seq;
+      resolve result;
+      Ok ()
+
+(** Cancels a language-owned retry delay and settles the original operation.
+    Core has already completed the preceding attempt, so there is no running
+    attempt to acknowledge cancellation under any of the cancellation policies.
+    Removing the timer callback before resolving also prevents another attempt
+    from being scheduled by a stale timer. *)
+let cancel_local_activity_backoff context ~seq state =
+  Option.iter
+    (fun timer_seq ->
+      Hashtbl.remove context.timers timer_seq;
+      state.backoff_timer_seq <- None;
+      emit context (Activation.Cancel_timer { seq = timer_seq }))
+    state.backoff_timer_seq;
+  resolve_activity context ~seq
+    (Error
+       (Temporal_base.Error.make ~category:`Cancelled
+          ~message:"local activity cancelled during retry backoff" ()))
+
 (** Saves the future resolver before emitting the schedule command. This order
     ensures even an immediate synthetic result can find the pending activity.
     The returned cancellation operation closes over the activity's terminal
@@ -531,6 +566,7 @@ let schedule_activity context ~name ~input ?activity_id ?task_queue
         retry_policy;
         local_retry_threshold = None;
         cancellation_type;
+        cancellation_requested;
         attempt = 1L;
         original_schedule_time = None;
         backoff_timer_seq = None;
@@ -591,7 +627,10 @@ let schedule_activity context ~name ~input ?activity_id ?task_queue
                  Activation.Request_cancel_local_activity { seq }
                else Activation.Request_cancel_activity { seq });
             cancellation_requested := true;
-            Ok ())
+            (match Hashtbl.find_opt context.local_activities seq with
+            | Some ({ backoff_timer_seq = Some _; _ } as state) ->
+                cancel_local_activity_backoff context ~seq state
+            | _ -> Ok ()))
     | _ ->
         Error
           (Temporal_base.Error.defect
@@ -600,8 +639,9 @@ let schedule_activity context ~name ~input ?activity_id ?task_queue
   (future, cancel)
 
 (** Schedules a local activity through Core's local activity manager. The
-    callback still runs through the worker's typed activity registry, while
-    Core owns retry timers and records the eventual result as a history marker.
+    callback still runs through the worker's typed activity registry. Core
+    records results as history markers and delegates long retry delays to
+    language-owned workflow timers.
     Local activities intentionally ignore remote-only task queue, heartbeat,
     priority, and eager-execution controls. *)
 let schedule_local_activity context ~name ~input ?activity_id
@@ -725,21 +765,6 @@ let cancel_external_workflow context ~workflow_id ~run_id ~reason () =
        { seq; workflow_id; run_id; reason });
   future
 
-(** Removes the activity before invoking its resolver. If resolving triggers a
-    repeated completion immediately, the repeated sequence is rejected instead
-    of completing the same future twice. *)
-let resolve_activity context ~seq result =
-  match Hashtbl.find_opt context.activities seq with
-  | None ->
-      Error
-        (bridge_error
-           (Printf.sprintf "unknown or duplicate activity sequence %Ld" seq))
-  | Some resolve ->
-      Hashtbl.remove context.activities seq;
-      Hashtbl.remove context.local_activities seq;
-      resolve result;
-      Ok ()
-
 (** Starts the language-owned timer requested by Core for a local retry. The
     original activity sequence stays pending while the timer uses its own
     sequence; when it fires, the callback updates the attempt metadata and
@@ -776,6 +801,8 @@ let resolve_local_activity_backoff context ~seq ~attempt ~backoff_milliseconds
                (Printf.sprintf
                   "local activity backoff attempt %Ld does not advance sequence %Ld"
                   attempt seq))
+      | None when !(state.cancellation_requested) ->
+          cancel_local_activity_backoff context ~seq state
       | None ->
           let timer_seq = allocate_sequence context in
           state.backoff_timer_seq <- Some timer_seq;

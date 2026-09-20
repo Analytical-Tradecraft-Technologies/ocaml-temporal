@@ -102,6 +102,18 @@ and bridge, read the [documentation guide](../README.md) first.
   terminal result before start, duplicate acknowledgment, or unknown sequence
   is a non-retryable bridge defect; no event is silently dropped.
 - Activities, child workflows, and timers share one monotonic command sequence.
+- When Core delegates a local activity retry delay, the original activity
+  resolver and cancellation decision remain live while a separate workflow
+  timer owns the delay. Cancelling during that delay removes the timer callback,
+  emits its cancellation, and settles the original future as cancelled under
+  every policy: the preceding attempt has already finished. A backoff delivered
+  after cancellation settles the future without starting a timer. If the timer
+  fires first, the next attempt is already scheduled and Core owns its
+  cancellation according to the selected policy. Repeated cancellation never
+  emits another command or revives a retry. The focused
+  [runtime regression](../../test/runtime/test_local_activity_cancellation.ml)
+  and [live history/replay fixture](../../test/integration/local_activity_cancellation/README.md)
+  cover these ownership boundaries.
 - An activity retry policy is immutable once attached to a command. Its initial
   interval is positive, its maximum interval is at least the initial interval,
   its finite backoff coefficient is at least 1.0, and its maximum-attempt count

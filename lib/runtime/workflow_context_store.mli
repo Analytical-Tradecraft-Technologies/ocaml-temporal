@@ -169,7 +169,11 @@ val schedule_activity :
 (** Schedules one local activity through Temporal Core's local-activity lane.
     Unlike [schedule_activity], this command has no remote task queue,
     heartbeat timeout, priority, or eager-execution setting; Core retries it
-    locally and records the result in workflow history for replay. *)
+    locally and records the result in workflow history for replay. Core can
+    delegate long retry delays to language-owned workflow timers. Cancellation
+    during such a delay removes the timer and settles the original future with
+    [Cancelled] under every policy, since no attempt is running. Cancellation
+    of a running attempt still follows Core's selected policy. *)
 val schedule_local_activity :
   t ->
   name:string ->

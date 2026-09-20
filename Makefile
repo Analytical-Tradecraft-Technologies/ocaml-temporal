@@ -137,6 +137,11 @@ test-bridge:
 test-completed-queries-live:
 	$(RUN) dune exec test/integration/completed_queries/regression.exe -- check $(TEMPORAL_CLIENT_TEST_URL)
 
+# Requires a disposable server and an explicit official Temporal CLI path.
+.PHONY: test-local-activity-cancellation-live
+test-local-activity-cancellation-live:
+	$(RUN) dune exec test/integration/local_activity_cancellation/regression.exe -- check $(TEMPORAL_CLIENT_TEST_URL) $(TEMPORAL_TEST_CLI)
+
 test-install:
 	$(COMPOSE_RUN) sh test/bridge/test_install.sh
 
