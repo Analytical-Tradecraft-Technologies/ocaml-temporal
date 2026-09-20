@@ -55,7 +55,7 @@ case "$command" in
     printf '%s\n' "$expected_key" >"$bundle/key"
     platform >"$bundle/platform"
     (
-      cd "$bundle"
+      cd "$bundle" || exit 1
       sha256 libocaml_temporal_core_bridge.a bridge.dynamic native-static-libs key platform >SHA256SUMS
       if [ -d import-libs ]; then
         sha256 import-libs/*.a >>SHA256SUMS

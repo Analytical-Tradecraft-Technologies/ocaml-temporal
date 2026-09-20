@@ -10,11 +10,13 @@ bundle_imports=${5:-}
 # Checks the exact import-library set requested by rustc. Bundled libraries and
 # Cargo registry libraries follow the same validation before reaching Dune.
 complete_imports () {
-  for flag in $native_link_flags; do
+  while IFS= read -r flag; do
     case "$flag" in
       -lwinapi_*) [ -f "$1/lib${flag#-l}.a" ] || return 1 ;;
     esac
-  done
+  done <<EOF
+$(printf '%s\n' "$native_link_flags" | tr '[:space:]' '\n')
+EOF
 }
 
 # Converts the path printed by a Windows Cargo build script into a spelling
@@ -77,11 +79,13 @@ case "$operating_system" in
     search_dir=$(windows_search_dir)
     if [ -n "$bundle_imports" ]; then
       mkdir -p "$bundle_imports"
-      for flag in $native_link_flags; do
+      while IFS= read -r flag; do
         case "$flag" in
           -lwinapi_*) cp "$search_dir/lib${flag#-l}.a" "$bundle_imports/" ;;
         esac
-      done
+      done <<EOF
+$(printf '%s\n' "$native_link_flags" | tr '[:space:]' '\n')
+EOF
     fi
     # Native Windows Dune/linkers cannot resolve Cygwin /cygdrive paths.
     if command -v cygpath >/dev/null 2>&1; then
