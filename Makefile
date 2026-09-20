@@ -119,6 +119,11 @@ test-rust:
 test-bridge:
 	$(COMPOSE_RUN) sh test/bridge/test_abi.sh
 
+# Requires a disposable Temporal server; the driver owns its worker processes.
+.PHONY: test-completed-queries-live
+test-completed-queries-live:
+	$(RUN) dune exec test/integration/completed_queries/regression.exe -- check $(TEMPORAL_CLIENT_TEST_URL)
+
 test-install:
 	$(COMPOSE_RUN) sh test/bridge/test_install.sh
 
@@ -602,8 +607,19 @@ test-temporal-worker-restart-live: test-temporal-config
 test-unit:
 	$(RUN) dune runtest test/unit test/smoke
 
+# Requires a disposable server and an explicit official Temporal CLI path.
+.PHONY: test-update-outcomes-live
+test-update-outcomes-live:
+	$(RUN) dune exec test/integration/update_outcomes/regression.exe -- check $(TEMPORAL_CLIENT_TEST_URL) $(TEMPORAL_TEST_CLI)
+
 test-runtime:
 	$(RUN) dune runtest test/runtime
+
+# Requires a disposable running Temporal server. The regression owns its worker,
+# uses a unique task queue, and terminates its workflow executions on exit.
+.PHONY: test-client-request-ids-live
+test-client-request-ids-live:
+	$(RUN) dune exec test/integration/client_request_ids/regression.exe -- check $(TEMPORAL_CLIENT_TEST_URL)
 
 lint:
 	$(RUN) dune build $(DUNE_BUILD_ARGS)

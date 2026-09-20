@@ -72,7 +72,12 @@ not invent OCaml-side defaults. The public `Temporal.Client.start` function
 accepts an optional `request_id`. When it is supplied, that caller-owned value
 is sent unchanged to Temporal; callers should reuse it when retrying a start
 whose outcome is uncertain. When it is omitted, the adapter allocates one fresh
-ID for that call. The resulting protocol request is created once and reused by
+128-bit random ID for that call, independently of other clients, Domains, and
+processes. Signals and updates use the same client-only allocator when their
+IDs are omitted. A fresh system-seeded random state per allocation avoids
+counter resets and shared generator state; these IDs are deduplication keys,
+not credentials or replay-safe workflow randomness.
+The resulting protocol request is created once and reused by
 the bounded ticket polls, so polling does not accidentally change the
 idempotency key. A request ID identifies one logical start and must not be
 reused for unrelated workflow starts.
@@ -347,9 +352,9 @@ shape again before constructing Temporal's official
 used for the RPC; callers cannot provide a second identity or redirect the
 request to another namespace.
 
-When `request_id` is omitted, OCaml allocates a fresh process-wide ID shared by
-all `Temporal.Client.t` values in that process. This keeps two independent
-handles from accidentally presenting the same signal as a retry of an earlier
+When `request_id` is omitted, OCaml allocates a fresh random ID independently of
+other `Temporal.Client.t` values and processes. This keeps independent
+callers from accidentally presenting the same signal as a retry of an earlier
 delivery. Supply an explicit ID when retrying an uncertain transport result so
 Temporal can deduplicate the same logical signal. An idempotency key must not be
 reused for a different signal name or payload: the deterministic mock accepts
@@ -617,8 +622,14 @@ returned as an ordinary `Error.t` result.
 and returns after a Temporal worker has accepted it. The returned update handle retains
 the update name, exact run, caller-supplied or generated update ID, and output
 codec. It contains no native pointer and can be held while other updates or
-workflow operations are started. `Temporal.Client.wait_update` polls the same
-ID until the server returns a completed value or an application failure.
+workflow operations are started. Admission failures, including validator
+rejections, are returned directly with their original message, retryability,
+and details. A successful outcome already returned at admission is retained in
+the handle: `Temporal.Client.wait_update` decodes it without another RPC.
+Otherwise it polls the same ID until the server returns a completed value or
+an application failure. Repeated waits can decode the retained admission
+outcome even after the server no longer has the execution record; client
+shutdown still invalidates all handles.
 
 Acceptance and completion are deliberately separate: an accepted update may
 still be waiting behind workflow code, and a pending poll is not a failure.

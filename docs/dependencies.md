@@ -39,7 +39,7 @@ attributes them to the reviewed compiler distribution.
 | Package | Exact version | License | Scope | Linked into release | Redistributed | Review note |
 |---|---:|---|---|---|---|---|
 | temporal-sdk | ~dev | Apache-2.0 | project | yes | yes | Project source and binary |
-| dune | 3.24.0 | MIT | build | no | no | Build system only |
+| dune | 3.24.2 | MIT | build | no | no | Build system only |
 | logs | 0.10.0 | ISC | runtime | yes | no | Maintained application-configurable logging infrastructure; the SDK installs no reporter |
 | ocamlbuild | 0.16.1 | LGPL-2.0-or-later WITH OCaml-LGPL-linking-exception | build | no | no | Exact reviewed build-only linking-exception dependency of `logs` |
 | ocamlfind | 1.9.8 | MIT | build | no | no | Build-time library discovery required by `logs` |
