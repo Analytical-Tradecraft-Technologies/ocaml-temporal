@@ -4,40 +4,60 @@
 ; graph.
 (executable
  (name forbidden_mailbox)
+ (modules forbidden_mailbox)
  (libraries temporal-sdk))
 
 (executable
  (name forbidden_supervisor)
+ (modules forbidden_supervisor)
  (libraries temporal-sdk))
 
 (executable
  (name forbidden_bridge)
+ (modules forbidden_bridge)
  (libraries temporal-sdk))
 
 (executable
  (name forbidden_base)
+ (modules forbidden_base)
  (libraries temporal-sdk))
 
 (executable
  (name forbidden_runtime)
+ (modules forbidden_runtime)
  (libraries temporal-sdk))
 
 (executable
  (name forbidden_protocol)
+ (modules forbidden_protocol)
  (libraries temporal-sdk))
 
 (executable
  (name forbidden_sdk_kernel)
+ (modules forbidden_sdk_kernel)
  (libraries temporal-sdk))
 
 (executable
  (name forbidden_native_worker)
+ (modules forbidden_native_worker)
  (libraries temporal-sdk))
 
 (executable
  (name forbidden_backend)
+ (modules forbidden_backend)
  (libraries temporal-sdk))
 
 (executable
  (name forbidden_future_kernel)
+ (modules forbidden_future_kernel)
+ (libraries temporal-sdk))
+
+(executable
+ (name forbidden_worker_observer)
+ (modules forbidden_worker_observer)
+ (libraries temporal-sdk))
+
+(executable
+ (name forbidden_acceptance_observer)
+ (modules forbidden_acceptance_observer)
  (libraries temporal-sdk))

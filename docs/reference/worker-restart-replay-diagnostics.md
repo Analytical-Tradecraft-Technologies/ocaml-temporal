@@ -75,6 +75,42 @@ cannot compare two separate files.
 
 ## Replay diagnostics
 
+The non-installed fixture library
+[`Acceptance_observer`](../../test/integration/temporal/observer/acceptance_observer.ml)
+owns the `SMOKE_WORKER_*` replay/cache and parent/child diagnostic
+configuration, JSON validation, checkpoint state, and file writes. The smoke,
+cache, parent/child, and patch workers explicitly call its `with_worker` helper
+around one public `Worker.create`. Ordinary installed workers ignore those
+settings, including malformed values; the public package API is unchanged.
+
+The generic private
+[`Native_worker_observer`](../../lib/runtime/native_worker_observer.mli)
+only supplies construction-scoped callback selection. Scopes are isolated
+between Domains and systhreads, nest in stack order, and are restored on typed
+failure or exception. Configuration validation precedes native allocation.
+After successful construction the adapter owns the callbacks and invokes them
+synchronously under its existing mutex. Observers must not re-enter worker
+operations or retain native resources.
+
+Activation callbacks retain the existing pre-execution metadata semantics.
+Their exceptions follow the typed failure-completion path, so they cannot
+escape with an unacknowledged lease. Cache-ready and cache-full markers are
+written by the completion callback only after Core acknowledges the relevant
+completion, including retained retries. A completion-observer exception is
+contained and reported without repeating a retired lease; a missing marker
+therefore fails the acceptance controller. Atomic file replacement removes
+temporary files on failure. Replay metadata remains observation evidence and
+must still be combined with the controller's exact-run durable history checks.
+
+`make test-runtime` exercises the actual fixture callbacks with a deterministic
+native lease source, including acknowledgement retries, observer write failures,
+temporary-file cleanup, role identity, and construction-scope isolation.
+`make test-install` proves that an ordinary installed consumer cannot import
+the injection or fixture modules and that legacy settings do not alter native
+configuration behavior. Setting `TEMPORAL_TEST_INSTALLED_WORKER_ADDRESS` inside
+the test container additionally checks successful native creation and shutdown
+against a live server.
+
 The worker diagnostics document follows
 [`restart-replay-diagnostics.schema.json`](../schemas/acceptance/restart-replay-diagnostics.schema.json):
 

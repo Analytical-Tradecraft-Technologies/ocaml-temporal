@@ -613,7 +613,7 @@ test-update-outcomes-live:
 	$(RUN) dune exec test/integration/update_outcomes/regression.exe -- check $(TEMPORAL_CLIENT_TEST_URL) $(TEMPORAL_TEST_CLI)
 
 test-runtime:
-	$(RUN) dune runtest test/runtime
+	$(RUN) dune runtest test/runtime test/integration/temporal/observer
 
 # Requires a disposable running Temporal server. The regression owns its worker,
 # uses a unique task queue, and terminates its workflow executions on exit.
