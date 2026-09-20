@@ -498,11 +498,10 @@ let update_signal_condition_workflow handle input =
           Error error)
 
 (** Confirms the live server rejects an update whose name is absent from the
-    workflow registration. Temporal may reject this request at admission with
-    the stable [not_found] RPC response, or admit it and return the typed
-    non-retryable Core failure; the smoke accepts only those exact contracts.
-    A successful update is a defect, since it would prove the handler registry
-    was bypassed. *)
+    workflow registration. Admission must preserve the typed non-retryable
+    failure, including the backend's appended diagnostic fields. Polling an
+    accepted handle and receiving [not_found] would hide the lost admission
+    outcome that this regression is intended to detect. *)
 let update_missing_handler handle =
   let operation = "update_missing:" ^ Client.workflow_id handle in
   let started = Unix.gettimeofday () in
@@ -519,14 +518,11 @@ let update_missing_handler handle =
     let expected_update_failure =
       String.equal (Error.kind error) "update"
       && view.non_retryable
-      && String.equal view.message
-           "unhandled workflow update: smoke.update_not_registered"
+      && String.starts_with
+           ~prefix:"unhandled workflow update: smoke.update_not_registered "
+           view.message
     in
-    let expected_admission_rejection =
-      String.equal (Error.kind error) "bridge"
-      && String.equal view.message "Temporal client RPC failed: not_found"
-    in
-    if not (expected_update_failure || expected_admission_rejection) then
+    if not expected_update_failure then
       Error
         (Error.defect
            ~message:
@@ -540,15 +536,10 @@ let update_missing_handler handle =
       ~update:missing_update ~input:"unknown" ()
   with
   | Error error -> reject_error error
-  | Ok update_handle -> (
-      match Client.wait_update update_handle with
-      | Error error -> reject_error error
-      | Ok value ->
-          Error
-            (Error.defect
-               ~message:
-                 (Printf.sprintf
-                    "unknown update unexpectedly completed with %S" value)))
+  | Ok _ ->
+      Error
+        (Error.defect
+           ~message:"unknown update was reported as accepted")
 
 (** Confirms the live server rejects an unknown query handler with the
     documented invalid-argument boundary. Accepting any error here would let a

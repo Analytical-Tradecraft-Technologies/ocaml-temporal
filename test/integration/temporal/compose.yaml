@@ -296,10 +296,8 @@ services:
       SMOKE_CACHE_EVICTION_SECOND_READY_FILE: /workspace/test/integration/temporal/.cache-eviction-second-ready
       SMOKE_REPLAY_DIAGNOSTICS_FILE: /workspace/test/integration/temporal/.restart-replay-diagnostics.json
     command:
-      - timeout
-      - --signal=TERM
-      - --kill-after=10s
-      - "${SMOKE_CACHE_EVICTION_TIMEOUT_SECONDS:-900}"
+      - sh
+      - /workspace/test/integration/temporal/scripts/run-cache-eviction-driver.sh
       - opam
       - exec
       - --

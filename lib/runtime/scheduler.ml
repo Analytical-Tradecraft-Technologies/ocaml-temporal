@@ -1,5 +1,5 @@
-(** Pairs queued work with a number assigned when it enters the queue. Tests use
-    the number to verify first-in, first-out execution order. *)
+(** Pairs queued work with its enqueue sequence. These values live only until
+    the work is drained; the scheduler retains no completed-work history. *)
 type runnable = Runnable of int * (unit -> unit)
 
 (** Private effect used by terminal workflow operations. The interface is
@@ -28,7 +28,6 @@ type t = {
   mutable active : bool;
   mutable pending : int;
   mutable failures : exn list;
-  mutable trace_rev : int list;
   mutable teardowns : teardown_token list;
   mutable abort_requested : bool;
 }
@@ -49,7 +48,6 @@ let create () =
     active = true;
     pending = 0;
     failures = [];
-    trace_rev = [];
     teardowns = [];
     abort_requested = false;
   }
@@ -167,12 +165,9 @@ let run scheduler =
             (not (Queue.is_empty scheduler.queue))
             && not scheduler.abort_requested
           do
-            let (Runnable (sequence, thunk)) = Queue.pop scheduler.queue in
+            let (Runnable (_, thunk)) = Queue.pop scheduler.queue in
             (* Once shutdown is requested, root thunks are inert but queued
-               future callbacks must still run their owner-aware cleanup path.
-               Do not record skipped work in the execution trace. *)
-            if scheduler.active then
-              scheduler.trace_rev <- sequence :: scheduler.trace_rev;
+               future callbacks must still run their owner-aware cleanup path. *)
             (try thunk ()
              with Future_store.Scheduler_shutdown | Workflow_aborted -> ()
              | exception_ ->
@@ -189,9 +184,6 @@ let run_label scheduler =
   | Complete -> "complete"
   | Failed _ -> "failed"
   | Blocked -> "blocked"
-
-(** Returns the recorded queue sequence numbers in the order they ran. *)
-let trace scheduler = List.rev scheduler.trace_rev
 
 (** Closes pending futures in creation order, then drains any already-queued
     resumptions. Waiters parked on futures that settled before shutdown were
