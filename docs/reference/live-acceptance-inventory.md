@@ -15,6 +15,7 @@ Extracted from the `temporal-integration` job in
 - `make test-temporal-parent-child-failure-replay`
 - `make test-temporal-parent-child-restart`
 - `make test-temporal-start-metadata-live`
+- `make test-temporal-task-failure-live`
 - `make test-temporal-worker-cache-eviction`
 - `make test-temporal-worker-crash-recovery`
 - `make test-temporal-worker-restart`
@@ -31,6 +32,7 @@ and specialized-controller workflows are described in the evidence reference.
 | --- | --- |
 | `activity_heartbeat_retry` | `smoke.activity_heartbeat_retry` |
 | `activity_heartbeat_timeout_retry` | `smoke.activity_heartbeat_timeout_retry` |
+| `activity_invalid_failure_details` | `smoke.activity_invalid_failure_details` |
 | `activity_long_backoff_retry` | `smoke.activity_long_backoff_retry` |
 | `activity_non_retryable_failure` | `smoke.activity_non_retryable_failure` |
 | `activity_retry` | `smoke.activity_retry` |

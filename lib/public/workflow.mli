@@ -19,7 +19,11 @@ type ('input, 'output) t
     more than 65,536 bytes because it crosses the native protocol into
     Temporal history. Violations raise [Invalid_argument] as construction
     defects. The implementation must remain deterministic and return expected
-    failures as [Error.t] values. *)
+    failures as [Error.t] values. Returning a [Workflow]-category error is
+    an intentional terminal failure. Unexpected exceptions and propagated
+    [Defect], [Bridge], or [Codec] errors fail only the workflow task so
+    corrected code can replay the same open execution. Result-encoder errors
+    also fail only the task. *)
 val define :
   name:string ->
   input:'input Codec.t ->
@@ -96,7 +100,7 @@ val now : unit -> (Time.t, Error.t) result
 
 (** Returns a deterministic pseudo-random integer in [0, bound).  The stream
     is seeded by Temporal for the workflow run and replayed from the same
-    initialization metadata, so the result is stable for an identical call
+    initialization and reset metadata, so the result is stable for an identical call
     sequence.  [bound] must be positive; invalid bounds and calls outside a
     workflow return a typed defect. *)
 val random_int : bound:int -> (int, Error.t) result

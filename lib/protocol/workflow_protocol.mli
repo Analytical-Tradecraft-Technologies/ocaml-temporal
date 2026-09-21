@@ -294,6 +294,8 @@ type activation_job =
     }
   (** Reports a patch marker already present in this run's history. *)
   | Notify_has_patch of { patch_id : string }
+  (** Replaces the workflow random stream using a canonical uint64 decimal seed. *)
+  | Update_random_seed of { randomness_seed : string }
   | Fire_timer of { seq : int64 }
   | Cancel_workflow of { reason : string }
   | Remove_from_cache of { message : string; reason : eviction_reason }
@@ -441,7 +443,13 @@ type completion_command =
 (** Successful completion of one activation. At most one terminal workflow
     command may appear, and it must be last. Patch commands may repeat one mode
     per ID but may not mix active and deprecated modes for the same ID. *)
-type completion = { run_id : string; commands : completion_command list }
+type completion = {
+  run_id : string;
+  commands : completion_command list;
+  task_failure : failure option;
+  (** [Some] fails the workflow task through Core, never the execution. Failed
+      tasks carry no commands. [None] preserves the successful command batch. *)
+}
 
 type error
 (** Opaque semantic or strict-JSON validation failure. *)

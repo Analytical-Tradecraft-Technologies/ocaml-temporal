@@ -122,3 +122,7 @@ val set_activation_is_replaying : ('input, 'output) t -> bool -> unit
     Idempotent. Call when removing a run from a worker registry if a terminal
     or eviction path has not already shut the execution down. *)
 val shutdown : ('input, 'output) t -> unit
+
+(** Returns the failure of a poisoned cache generation. Such an activation has
+    no commands and must be submitted as a failed task, never a failed workflow. *)
+val task_failure : ('input, 'output) t -> Temporal_base.Error.t option

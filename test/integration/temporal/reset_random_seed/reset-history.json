@@ -1,0 +1,292 @@
+{
+  "events": [
+    {
+      "eventId": "1",
+      "eventTime": "2026-09-20T18:00:23.952493Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_EXECUTION_STARTED",
+      "taskId": "1048629",
+      "workflowExecutionStartedEventAttributes": {
+        "workflowType": {
+          "name": "reset-random-seed"
+        },
+        "taskQueue": {
+          "name": "reset-random-seed",
+          "kind": "TASK_QUEUE_KIND_NORMAL"
+        },
+        "input": {
+          "payloads": [
+            {
+              "metadata": {
+                "encoding": "anNvbi9wbGFpbg=="
+              },
+              "data": "ImZpeHR1cmUi"
+            }
+          ]
+        },
+        "workflowExecutionTimeout": "0s",
+        "workflowRunTimeout": "0s",
+        "workflowTaskTimeout": "10s",
+        "originalExecutionRunId": "01a0bff9-f290-7781-a0de-dbd4fc5d16a3",
+        "identity": "reset-random-seed-fixture",
+        "firstExecutionRunId": "01a0bff9-f290-7781-a0de-dbd4fc5d16a3",
+        "attempt": 1,
+        "firstWorkflowTaskBackoff": "0s",
+        "header": {},
+        "workflowId": "reset-random-seed-570-v2"
+      }
+    },
+    {
+      "eventId": "2",
+      "eventTime": "2026-09-20T18:00:23.952594Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_SCHEDULED",
+      "taskId": "1048630",
+      "workflowTaskScheduledEventAttributes": {
+        "taskQueue": {
+          "name": "reset-random-seed",
+          "kind": "TASK_QUEUE_KIND_NORMAL"
+        },
+        "startToCloseTimeout": "10s",
+        "attempt": 1
+      }
+    },
+    {
+      "eventId": "3",
+      "eventTime": "2026-09-20T18:00:23.955868Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_STARTED",
+      "taskId": "1048635",
+      "workflowTaskStartedEventAttributes": {
+        "scheduledEventId": "2",
+        "identity": "reset-random-seed-fixture",
+        "requestId": "3736ecfc-e3bf-4f8c-a626-2e4cac037cd3",
+        "historySizeBytes": "316",
+        "workerVersion": {
+          "buildId": "ocaml-temporal"
+        }
+      }
+    },
+    {
+      "eventId": "4",
+      "eventTime": "2026-09-20T18:00:23.964465Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_COMPLETED",
+      "taskId": "1048639",
+      "workflowTaskCompletedEventAttributes": {
+        "scheduledEventId": "2",
+        "startedEventId": "3",
+        "identity": "reset-random-seed-fixture",
+        "workerVersion": {
+          "buildId": "ocaml-temporal"
+        },
+        "sdkMetadata": {
+          "coreUsedFlags": [
+            2,
+            3,
+            1
+          ],
+          "sdkName": "temporal-rust",
+          "sdkVersion": "0.5.0"
+        },
+        "meteringMetadata": {}
+      }
+    },
+    {
+      "eventId": "5",
+      "eventTime": "2026-09-20T18:00:23.964608Z",
+      "eventType": "EVENT_TYPE_TIMER_STARTED",
+      "taskId": "1048640",
+      "timerStartedEventAttributes": {
+        "timerId": "1",
+        "startToFireTimeout": "1s",
+        "workflowTaskCompletedEventId": "4"
+      }
+    },
+    {
+      "eventId": "6",
+      "eventTime": "2026-09-20T18:00:24.966431Z",
+      "eventType": "EVENT_TYPE_TIMER_FIRED",
+      "taskId": "1048644",
+      "timerFiredEventAttributes": {
+        "timerId": "1",
+        "startedEventId": "5"
+      }
+    },
+    {
+      "eventId": "7",
+      "eventTime": "2026-09-20T18:00:24.966506Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_SCHEDULED",
+      "taskId": "1048645",
+      "workflowTaskScheduledEventAttributes": {
+        "taskQueue": {
+          "name": "reset-random-seed-fixture-8673125db3fd4ee9b344cf244d3a2096",
+          "kind": "TASK_QUEUE_KIND_STICKY",
+          "normalName": "reset-random-seed"
+        },
+        "startToCloseTimeout": "10s",
+        "attempt": 1
+      }
+    },
+    {
+      "eventId": "8",
+      "eventTime": "2026-09-20T18:00:24.968599Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_STARTED",
+      "taskId": "1048649",
+      "workflowTaskStartedEventAttributes": {
+        "scheduledEventId": "7",
+        "identity": "reset-random-seed-fixture",
+        "requestId": "e5bb0ea9-79c1-4758-9a6b-2fe9adfb98e7",
+        "historySizeBytes": "719",
+        "workerVersion": {
+          "buildId": "ocaml-temporal"
+        }
+      }
+    },
+    {
+      "eventId": "9",
+      "eventTime": "2026-09-20T18:01:09.570969Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_FAILED",
+      "taskId": "1048673",
+      "workflowTaskFailedEventAttributes": {
+        "scheduledEventId": "7",
+        "startedEventId": "8",
+        "cause": "WORKFLOW_TASK_FAILED_CAUSE_RESET_WORKFLOW",
+        "failure": {
+          "message": "Reset random seed regression",
+          "resetWorkflowFailureInfo": {}
+        },
+        "identity": "reset-random-seed-fixture",
+        "baseRunId": "01a0bff9-f290-7781-a0de-dbd4fc5d16a3",
+        "newRunId": "5ac6e66a-8a2f-4424-bf89-5b4ff2821a4e"
+      }
+    },
+    {
+      "eventId": "10",
+      "eventTime": "2026-09-20T18:01:09.571068Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_SCHEDULED",
+      "taskId": "1048674",
+      "workflowTaskScheduledEventAttributes": {
+        "taskQueue": {
+          "name": "reset-random-seed",
+          "kind": "TASK_QUEUE_KIND_NORMAL"
+        },
+        "startToCloseTimeout": "10s",
+        "attempt": 1
+      }
+    },
+    {
+      "eventId": "11",
+      "eventTime": "2026-09-20T18:01:09.573466Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_STARTED",
+      "taskId": "1048679",
+      "workflowTaskStartedEventAttributes": {
+        "scheduledEventId": "10",
+        "identity": "reset-random-seed-fixture",
+        "requestId": "a6ce331e-2adf-49a4-8f3a-8155816f760c",
+        "historySizeBytes": "1059",
+        "workerVersion": {
+          "buildId": "ocaml-temporal"
+        }
+      }
+    },
+    {
+      "eventId": "12",
+      "eventTime": "2026-09-20T18:01:09.580112Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_COMPLETED",
+      "taskId": "1048683",
+      "workflowTaskCompletedEventAttributes": {
+        "scheduledEventId": "10",
+        "startedEventId": "11",
+        "identity": "reset-random-seed-fixture",
+        "workerVersion": {
+          "buildId": "ocaml-temporal"
+        },
+        "sdkMetadata": {},
+        "meteringMetadata": {}
+      }
+    },
+    {
+      "eventId": "13",
+      "eventTime": "2026-09-20T18:01:09.580131Z",
+      "eventType": "EVENT_TYPE_TIMER_STARTED",
+      "taskId": "1048684",
+      "timerStartedEventAttributes": {
+        "timerId": "2",
+        "startToFireTimeout": "2.861s",
+        "workflowTaskCompletedEventId": "12"
+      }
+    },
+    {
+      "eventId": "14",
+      "eventTime": "2026-09-20T18:01:12.444864Z",
+      "eventType": "EVENT_TYPE_TIMER_FIRED",
+      "taskId": "1048687",
+      "timerFiredEventAttributes": {
+        "timerId": "2",
+        "startedEventId": "13"
+      }
+    },
+    {
+      "eventId": "15",
+      "eventTime": "2026-09-20T18:01:12.444884Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_SCHEDULED",
+      "taskId": "1048688",
+      "workflowTaskScheduledEventAttributes": {
+        "taskQueue": {
+          "name": "reset-random-seed-fixture-8673125db3fd4ee9b344cf244d3a2096",
+          "kind": "TASK_QUEUE_KIND_STICKY",
+          "normalName": "reset-random-seed"
+        },
+        "startToCloseTimeout": "10s",
+        "attempt": 1
+      }
+    },
+    {
+      "eventId": "16",
+      "eventTime": "2026-09-20T18:01:12.449287Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_STARTED",
+      "taskId": "1048692",
+      "workflowTaskStartedEventAttributes": {
+        "scheduledEventId": "15",
+        "identity": "reset-random-seed-fixture",
+        "requestId": "4ef3c36d-8001-4fdc-baf0-51e5774c1b63",
+        "historySizeBytes": "1441",
+        "workerVersion": {
+          "buildId": "ocaml-temporal"
+        }
+      }
+    },
+    {
+      "eventId": "17",
+      "eventTime": "2026-09-20T18:01:12.492930Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_COMPLETED",
+      "taskId": "1048696",
+      "workflowTaskCompletedEventAttributes": {
+        "scheduledEventId": "15",
+        "startedEventId": "16",
+        "identity": "reset-random-seed-fixture",
+        "workerVersion": {
+          "buildId": "ocaml-temporal"
+        },
+        "sdkMetadata": {},
+        "meteringMetadata": {}
+      }
+    },
+    {
+      "eventId": "18",
+      "eventTime": "2026-09-20T18:01:12.492975Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_EXECUTION_COMPLETED",
+      "taskId": "1048697",
+      "workflowExecutionCompletedEventAttributes": {
+        "result": {
+          "payloads": [
+            {
+              "metadata": {
+                "encoding": "anNvbi9wbGFpbg=="
+              },
+              "data": "IjcyNzk0Mjo0OTM4NjEi"
+            }
+          ]
+        },
+        "workflowTaskCompletedEventId": "17"
+      }
+    }
+  ]
+}

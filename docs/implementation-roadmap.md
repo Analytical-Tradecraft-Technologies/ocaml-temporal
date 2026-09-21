@@ -35,6 +35,12 @@ is a release gate, distinct from completing the long-term parity target.
 | 9 | Performance, observability, security, packaging, stability and release automation; reproducible artifacts and rehearsal | In progress. Logging, quality/license gates, installed-consumer/package checks and release preflight exist. Public authentication, performance/load evidence, support policy, provenance/publication, complete artifact audit and upgrade/release rehearsal remain release work. |
 | 10 | Parity closure; every parity row links implementation, tests and documentation | Planned. A bounded v1 decision does not claim full parity. |
 
+The focused [local activity cancellation regression](../test/integration/local_activity_cancellation/README.md)
+adds native live evidence for cancelling language-owned retry backoff under all
+three policies, including durable timer cancellation and fresh-worker history
+replay. Local activity retry/recovery qualification beyond that scenario remains
+part of phases 3 and 7.
+
 ## Plan documents
 
 1. [Foundation and deterministic runtime](superpowers/plans/2026-07-11-foundation-and-deterministic-runtime.md)
@@ -121,3 +127,22 @@ The release artifacts and runtime container are audited independently from the
 host operating system and ephemeral CI/build environment. Build tools are
 recorded in the inventory; their licenses and whether they are redistributed
 are made explicit rather than inferred from the final binary.
+
+## Reset random-seed recovery (#570)
+
+The bridge and runtime now preserve and apply Core's `UpdateRandomSeed` job.
+The [timer-reset fixture](../test/integration/temporal/reset_random_seed/README.md)
+records a successful native live reset and replays that exact history through
+Core and the OCaml worker adapter in the ordinary offline test suite. This
+qualifies the missing-event regression, including deterministic random draws;
+reset remains experimental and outside production recovery guidance pending
+the broader conformance and support-policy gates. No dependency was added.
+
+## Workflow defect recovery before v1 (#511)
+
+The private protocol now separates failed workflow tasks from intentional
+terminal workflow failures. The [failure contract](reference/workflow-failures.md)
+defines classification, cache/acknowledgement ownership, and the focused and
+exact-run live recovery gates. This is a prerequisite for broad fault and
+conformance qualification; passing the bounded recovery fixture does not claim
+those later qualification gates complete.

@@ -94,6 +94,7 @@ let test_valid_activations () =
       "child-resolution";
       "child-cancellation-before-start";
       "patch-activation";
+      "reset-activation";
     ]
 
 (** Proves continuation initialization metadata remains typed through the OCaml
@@ -196,6 +197,21 @@ let test_valid_completion () =
   check_string "completion" expected (unwrap (Protocol.encode_completion value));
   ignore (unwrap (Protocol.decode_completion expected))
 
+(** A failed task crosses the same owned JSON buffer as successful commands,
+    but cannot carry even one command from the abandoned activation. *)
+let test_task_failure_completion () =
+  let completion = unwrap (Protocol.decode_completion
+      (fixture [ "valid"; "task-failure.input.json" ])) in
+  if completion.commands <> [] || Option.is_none completion.task_failure then
+    failwith "task failure decoded as an ordinary completion";
+  check_string "task failure" (String.trim
+      (fixture [ "valid"; "task-failure.normalized.json" ]))
+    (unwrap (Protocol.encode_completion completion));
+  require_error (Protocol.decode_completion
+      (fixture [ "invalid"; "task-failure-with-commands.json" ]));
+  require_error (Protocol.encode_completion { completion with
+      commands = [ Protocol.Cancel_timer { seq = 1L } ] })
+
 (** Proves local-activity scheduling keeps attempt, original schedule time,
     retry threshold, and cancellation policy across the strict JSON boundary. *)
 let test_local_activity_protocol_slice () =
@@ -220,6 +236,7 @@ let test_local_activity_protocol_slice () =
   let completion =
     {
       Protocol.run_id = "local-run";
+      task_failure = None;
       commands = [ command; Protocol.Request_cancel_local_activity { seq = 4L } ];
     }
   in
@@ -291,6 +308,7 @@ let test_patch_marker_protocol_slice () =
   let repeated : Protocol.completion =
     {
       run_id = "patch-run";
+      task_failure = None;
       commands =
         [ Protocol.Set_patch_marker
             { patch_id = "orders.v2"; deprecated = false };
@@ -369,6 +387,7 @@ let test_query_protocol_slice () =
   let successful : Protocol.completion =
     {
       run_id = "query-run";
+      task_failure = None;
       commands =
         [
           Protocol.Query_result
@@ -468,6 +487,7 @@ let test_update_protocol_slice () =
   let completion : Protocol.completion =
     {
       run_id = "update-run";
+      task_failure = None;
       commands =
         [
           Protocol.Update_response
@@ -486,6 +506,7 @@ let test_update_protocol_slice () =
   let later_completion =
     {
       Protocol.run_id = "update-run";
+      task_failure = None;
       commands =
         [
           Protocol.Update_response
@@ -540,6 +561,7 @@ let test_start_child_workflow_command () =
   let completion : Protocol.completion =
     {
       run_id = "parent-run";
+      task_failure = None;
       commands =
         [
           Start_child_workflow
@@ -575,6 +597,7 @@ let test_external_workflow_commands () =
   let completion : Protocol.completion =
     {
       run_id = "parent-run";
+      task_failure = None;
       commands =
         [ Protocol.Signal_external_workflow
             {
@@ -626,6 +649,7 @@ let test_all_child_cancellation_policies () =
       let completion : Protocol.completion =
         {
           run_id = "parent-run";
+          task_failure = None;
           commands =
             [
               Start_child_workflow
@@ -717,6 +741,7 @@ let test_child_cancellation_validation () =
   let completion : Protocol.completion =
     {
       run_id = "parent-run";
+      task_failure = None;
       commands =
         [
           Start_child_workflow
@@ -748,6 +773,7 @@ let test_continue_as_new_command () =
   let completion : Protocol.completion =
     {
       run_id = "current-run";
+      task_failure = None;
       commands =
         [
           Continue_as_new
@@ -841,6 +867,7 @@ let test_large_nested_payload () =
   let completion : Protocol.completion =
     {
       run_id = "run-large";
+      task_failure = None;
       commands = [ Complete_workflow { result = Some payload } ];
     }
   in
@@ -878,6 +905,7 @@ let test_metadata_key_canonicalization () =
   let completion : Protocol.completion =
     {
       run_id = "run-map";
+      task_failure = None;
       commands = [ Complete_workflow { result = Some payload } ];
     }
   in
@@ -912,6 +940,7 @@ let test_duplicate_metadata_rejected () =
   let completion : Protocol.completion =
     {
       run_id = "run-duplicate-metadata";
+      task_failure = None;
       commands = [ Complete_workflow { result = Some payload } ];
     }
   in
@@ -922,13 +951,13 @@ let test_duplicate_metadata_rejected () =
     enforced. *)
 let test_identifier_safety_limit () =
   let long_id = String.make 300 'i' in
-  let completion : Protocol.completion = { run_id = long_id; commands = [] } in
+  let completion : Protocol.completion = { run_id = long_id; task_failure = None; commands = [] } in
   let encoded = unwrap (Protocol.encode_completion completion) in
   let decoded = unwrap (Protocol.decode_completion encoded) in
   check_string "long identifier" long_id decoded.run_id;
   require_error
     (Protocol.encode_completion
-       { run_id = String.make 65_537 'i'; commands = [] })
+       { run_id = String.make 65_537 'i'; task_failure = None; commands = [] })
 
 (** Proves Core initialization ordering and nullable eviction timestamps are
     checked independently of structural JSON validation. *)
@@ -1017,6 +1046,7 @@ let test_recursive_failure_depth () =
   let completion cause_count : Protocol.completion =
     {
       run_id = "run-nested-failure";
+      task_failure = None;
       commands =
         [ Fail_workflow { failure = nested_application_failure cause_count } ];
     }
@@ -1030,6 +1060,7 @@ let test_failure_field_semantics () =
   let application : Protocol.completion =
     {
       run_id = "run-failure";
+      task_failure = None;
       commands =
         [
           Fail_workflow
@@ -1046,6 +1077,7 @@ let test_failure_field_semantics () =
   let invalid_activity scheduled_event_id started_event_id identity =
     ({
        run_id = "run-failure";
+       task_failure = None;
        commands =
          [
            Fail_workflow
@@ -1086,6 +1118,7 @@ let test_timeout_failure_info () =
   let completion : Protocol.completion =
     {
       run_id = "run-timeout";
+      task_failure = None;
       commands =
         [
           Fail_workflow
@@ -1234,6 +1267,7 @@ let test_batched_default_temporal_payloads () =
   let completion : Protocol.completion =
     {
       run_id = "run-batched-payloads";
+      task_failure = None;
       commands = [ Complete_workflow { result = Some payload } ];
     }
   in
@@ -1302,7 +1336,7 @@ let test_activity_retry_policy () =
       }
   in
   let command = schedule (Some policy) in
-  let completion = { Protocol.run_id = "run-retry"; commands = [ command ] } in
+  let completion = { Protocol.run_id = "run-retry"; task_failure = None; commands = [ command ] } in
   let encoded = unwrap (Protocol.encode_completion completion) in
   if not (String.contains encoded '"') then failwith "policy JSON was empty";
   let retry_policy_json =
@@ -1343,7 +1377,7 @@ let test_activity_retry_policy () =
     failwith "retry policy did not round-trip"
   else
     let no_policy =
-      { Protocol.run_id = "run-default"; commands = [ schedule None ] }
+      { Protocol.run_id = "run-default"; task_failure = None; commands = [ schedule None ] }
     in
     let no_policy_json = unwrap (Protocol.encode_completion no_policy) in
     let no_retry_policy_json =
@@ -1372,6 +1406,30 @@ let test_activity_retry_policy () =
                       backoff_coefficient_bits = "18446744073709551615";
                     }) ] })
 
+(** Rejects malformed reset seeds in both peer JSON and typed activation values. *)
+let test_invalid_reset_seeds () =
+  let activation =
+    unwrap (Protocol.decode_activation
+      (fixture [ "valid"; "reset-activation.input.json" ]))
+  in
+  List.iter
+    (fun randomness_seed ->
+      require_error (Protocol.encode_activation
+        { activation with jobs = [ Protocol.Update_random_seed { randomness_seed } ] });
+      let job = Yojson.Safe.to_string (`Assoc [
+        ("kind", `String "update_random_seed");
+        ("randomness_seed", `String randomness_seed) ]) in
+      require_error (Protocol.decode_activation (Printf.sprintf
+        {|{"run_id":"reset-run","timestamp":null,"is_replaying":true,"history_length":12,"jobs":[%s]}|} job)))
+    [ ""; "01"; "-1"; "+1"; "1.0"; "18446744073709551616" ];
+  List.iter
+    (fun job -> require_error (Protocol.decode_activation (Printf.sprintf
+        {|{"run_id":"reset-run","timestamp":null,"is_replaying":true,"history_length":12,"jobs":[%s]}|} job)))
+    [ {|{"kind":"update_random_seed"}|};
+      {|{"kind":"update_random_seed","randomness_seed":1}|};
+      {|{"kind":"update_random_seed","randomness_seed":"1","extra":true}|};
+      {|{"kind":"update_random_seed","randomness_seed":"1","randomness_seed":"2"}|} ]
+
 (** Runs one test with a stable name suitable for CI logs. *)
 let run name test =
   try
@@ -1383,8 +1441,10 @@ let run name test =
 
 let () =
   run "workflow activations" test_valid_activations;
+  run "invalid reset seeds" test_invalid_reset_seeds;
   run "continuation initialization metadata" test_continuation_initialize_metadata;
   run "workflow completion" test_valid_completion;
+  run "workflow task failure" test_task_failure_completion;
   run "local activity protocol" test_local_activity_protocol_slice;
   run "local activity backoff protocol" test_local_activity_backoff_protocol_slice;
   run "workflow patch marker protocol" test_patch_marker_protocol_slice;

@@ -538,19 +538,10 @@ let test_signal_workflow_translation_and_activation () =
     unwrap "signal activation"
       (Native_execution.activate execution (activation [ signal ]))
   in
-  begin match completion.commands with
-  | [ Protocol.Fail_workflow
-        {
-          failure =
-            {
-              message;
-              info = Protocol.Application { non_retryable = true; _ };
-              _;
-            };
-        } ]
-    when String.equal message "unhandled workflow signal: order_updated" ->
-      ()
-  | _ -> failwith "unhandled signal did not fail the workflow explicitly"
+  begin match completion.commands, completion.task_failure with
+  | [], Some { message; _ }
+    when String.equal message "unhandled workflow signal: order_updated" -> ()
+  | _ -> failwith "unhandled signal did not fail only the workflow task"
   end
 
 (** Proves the native query slice preserves query identity and executes the
@@ -632,6 +623,7 @@ let test_query_workflow_translation_and_activation () =
     Protocol.
       {
         run_id = "run-native-translation";
+        task_failure = None;
         commands =
           [ Query_result
               { query_id; result = Query_succeeded (protocol_payload "answer") } ];
@@ -643,7 +635,7 @@ let test_query_workflow_translation_and_activation () =
        (query_completion "query-expected"));
   expect_error_code "missing query result" "invalid_message"
     (Native_execution.validate_completion_for_activation query_activation
-       { Protocol.run_id = "run-native-translation"; commands = [] });
+       { Protocol.run_id = "run-native-translation"; task_failure = None; commands = [] });
   expect_error_code "mismatched query result" "invalid_message"
     (Native_execution.validate_completion_for_activation query_activation
        (query_completion "query-other"));
@@ -663,6 +655,7 @@ let test_query_workflow_translation_and_activation () =
     (Native_execution.validate_completion_for_activation query_activation
        {
          Protocol.run_id = "run-native-translation";
+         task_failure = None;
          commands =
            [ Query_result
                {
@@ -1535,7 +1528,7 @@ let test_duplicate_sequence_rejected () =
           ]))
 
 (** An unknown sequence delivered to an already-created runtime becomes one
-    typed terminal bridge failure, preserving Core's completion semantics. *)
+    typed workflow-task failure, preserving the execution for replay. *)
 let test_unknown_sequence_becomes_failure () =
   let workflow =
     Temporal_base.Definition.make ~name:"native_unknown"
@@ -1548,10 +1541,8 @@ let test_unknown_sequence_becomes_failure () =
       (Native_execution.activate execution
          (activation [ Protocol.Fire_timer { seq = 99L } ]))
   in
-  match completion.commands with
-  | [
-   Protocol.Fail_workflow { failure = { info = Protocol.Application _; _ } };
-  ] ->
+  match completion.commands, completion.task_failure with
+  | [], Some { info = Protocol.Application _; _ } ->
       ()
   | _ -> failwith "unknown sequence did not become a protocol failure"
 

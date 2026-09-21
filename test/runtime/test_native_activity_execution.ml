@@ -86,6 +86,8 @@ type fake_supervisor = {
   leased : bytes list ref;
   (* Completions accepted by the fake source, newest first for assertions. *)
   completions : Protocol.completion list ref;
+  (* Validated submissions, including attempts whose acknowledgement fails. *)
+  completion_attempts : Protocol.completion list ref;
   (* Heartbeats accepted while their corresponding token remains leased. *)
   heartbeats : Protocol.heartbeat list ref;
   (* One-shot transport rejection used to verify completion retry without a
@@ -107,6 +109,7 @@ let fake_supervisor () =
     queue = Queue.create ();
     leased = ref [];
     completions = ref [];
+    completion_attempts = ref [];
     heartbeats = ref [];
     reject_next_completion = ref false;
     raise_next_completion = ref false;
@@ -169,6 +172,8 @@ module Fake_supervisor = struct
       rejection leaves the native lease untouched so the adapter must retry the
       same completion without invoking the OCaml implementation again. *)
   let complete_activity supervisor (completion : Protocol.completion) =
+    supervisor.completion_attempts :=
+      copy_completion completion :: !(supervisor.completion_attempts);
     if !(supervisor.raise_next_completion) then begin
       supervisor.raise_next_completion := false;
       raise Transient_completion_failure
@@ -479,6 +484,101 @@ let test_typed_failure () =
       failwith
         "typed activity failure did not preserve retryability or details"
   end
+
+(** Malformed application details must fail only their own activity. Each case
+    queues unrelated work behind the rejected task to detect a poisoned retry
+    entry as well as checking the bounded failure and exact binary token. *)
+let test_invalid_failure_details_allow_next_activity () =
+  let cases =
+    [ ("duplicate", [ ("encoding", "binary/plain"); ("encoding", "binary/plain") ]);
+      ("oversized", [ (String.make 65_537 'k', "value") ]);
+      ("empty", [ ("", "value") ]);
+      ("nul", [ ("bad\000key", "value") ]);
+      ("invalid-key", [ ("\255", "value") ]);
+      ("invalid-value", [ ("encoding", "\255") ]) ]
+  in
+  List.iter
+    (fun (label, metadata) ->
+      let supervisor = fake_supervisor () in
+      let detail : Temporal.Payload.t =
+        { metadata; data = Bytes.of_string "private-invalid-detail" }
+      in
+      let bad =
+        Temporal.Activity.define ~name:"bad-details" ~input:Temporal.Codec.unit
+          ~output:Temporal.Codec.unit (fun () ->
+            Error (Temporal.Error.make ~category:`Activity ~details:[ detail ]
+              ~message:"application failure" ()))
+      in
+      let good_calls = ref 0 in
+      let good =
+        Temporal.Activity.define ~name:"after-bad-details" ~input:Temporal.Codec.unit
+          ~output:Temporal.Codec.unit (fun () -> incr good_calls; Ok ())
+      in
+      let token = Bytes.of_string ("\000bad\255-" ^ label) in
+      enqueue supervisor (start_task ~token ~activity_type:"bad-details" ~input:[]);
+      enqueue supervisor (start_task ~token:(Bytes.of_string "next-token")
+        ~activity_type:"after-bad-details" ~input:[]);
+      let adapter = worker supervisor [ Adapter.register bad; Adapter.register good ] in
+      (match Worker.poll adapter with
+      | Ok (Adapter.Rejected { lease_retired = true;
+          error = { code = "invalid_message"; retryable = false; _ }; _ }) -> ()
+      | _ -> failwith (label ^ ": malformed details did not retire as a task failure"));
+      let completion = latest_completion supervisor in
+      if not (Bytes.equal completion.task_token token) then
+        failwith (label ^ ": rejection changed the task token");
+      (match completion.result with
+      | Protocol.Failed { message; info = Protocol.Application
+          { non_retryable = true; details = []; _ }; _ }
+        when String.length message <= 1_024 -> ()
+      | _ -> failwith (label ^ ": invalid details survived the bounded failure"));
+      if !(supervisor.leased) <> [] then
+        failwith (label ^ ": rejected task lease was not retired");
+      expect_completed Adapter.Succeeded (Worker.poll adapter);
+      if !good_calls <> 1 || List.length !(supervisor.completions) <> 2 then
+        failwith (label ^ ": unrelated activity did not complete exactly once");
+      match Worker.drain adapter with
+      | Ok () when !(supervisor.leased) = [] -> ()
+      | _ -> failwith (label ^ ": malformed completion poisoned the drain"))
+    cases
+
+(** Once a valid replacement failure has been submitted, a transport rejection
+    must retain that exact completion, even if the original application payload
+    changes. Retrying must neither redispatch the callback nor poll later work. *)
+let test_invalid_failure_completion_retry () =
+  let supervisor = fake_supervisor () in
+  let calls = ref 0 in
+  let detail : Temporal.Payload.t =
+    { metadata = [ ("duplicate", "one"); ("duplicate", "two") ];
+      data = Bytes.of_string "private-detail" }
+  in
+  let activity =
+    Temporal.Activity.define ~name:"bad-details-retry" ~input:Temporal.Codec.unit
+      ~output:Temporal.Codec.unit (fun () ->
+        incr calls;
+        Error (Temporal.Error.make ~category:`Activity ~details:[ detail ]
+          ~message:"application failure" ()))
+  in
+  let token = Bytes.of_string "\000retry-invalid\255-token" in
+  enqueue supervisor (start_task ~token ~activity_type:"bad-details-retry" ~input:[]);
+  enqueue supervisor (start_task ~token:(Bytes.of_string "later-task")
+    ~activity_type:"bad-details-retry" ~input:[]);
+  supervisor.reject_next_completion := true;
+  let adapter = worker supervisor [ Adapter.register activity ] in
+  (match Worker.poll adapter with
+  | Error { code = "completion_failed"; retryable = true; _ } -> ()
+  | _ -> failwith "replacement failure did not reach the transient transport boundary");
+  if List.length !(supervisor.leased) <> 1 || !(supervisor.completions) <> [] then
+    failwith "unacknowledged replacement failure retired its lease";
+  Bytes.fill detail.data 0 (Bytes.length detail.data) 'x';
+  (match Worker.poll adapter with
+  | Ok (Adapter.Rejected { lease_retired = true; _ }) -> ()
+  | _ -> failwith "replacement failure could not be retried");
+  (match !(supervisor.completion_attempts) with
+  | [ second; first ] when Protocol.encode_completion first = Protocol.encode_completion second
+      && Bytes.equal second.task_token token -> ()
+  | _ -> failwith "transport retry changed the replacement completion");
+  if !calls <> 1 || !(supervisor.leased) <> [] || Queue.length supervisor.queue <> 1 then
+    failwith "replacement retry reran the activity, retained its lease, or polled later work"
 
 (** An unknown activity type is acknowledged with a typed non-retryable failure,
     preventing a leased task from being silently abandoned. *)
@@ -931,6 +1031,8 @@ let test_poll_error_is_typed () =
 let () =
   test_successful_dispatch ();
   test_typed_failure ();
+  test_invalid_failure_details_allow_next_activity ();
+  test_invalid_failure_completion_retry ();
   test_unknown_activity_retires_lease ();
   test_cancellation ();
   test_completion_retry_does_not_redo_activity ();

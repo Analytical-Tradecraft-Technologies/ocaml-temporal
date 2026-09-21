@@ -8,6 +8,7 @@ use serde::Deserialize;
 use std::collections::{HashMap, hash_map::Entry};
 use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::pin::Pin;
 use std::ptr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -98,11 +99,13 @@ const MAX_GRACEFUL_SHUTDOWN_MS: u64 = 24 * 60 * 60 * 1_000;
 /// Maximum time one exact-run client wait may occupy the supervisor owner.
 ///
 /// The Temporal history request remains a close-event long poll, but the
-/// outer ABI operation is deliberately bounded.  When the deadline elapses,
-/// Tokio drops the in-flight request and the caller receives `NOT_READY` so
-/// its mailbox can admit shutdown or another lifecycle operation before it
-/// retries the wait.
+/// outer ABI operation is deliberately bounded. When the interval elapses,
+/// the owner retains the in-flight request and returns `NOT_READY` so its
+/// mailbox can service other operations before resuming the same future.
 const CLIENT_WAIT_TIMEOUT: Duration = Duration::from_millis(100);
+/// Bounds retained exact-run observations, including their RPC and page state.
+/// Completed or failed waits release their slot; disconnect cancels all waits.
+const MAX_PENDING_WAITS: usize = 64;
 /// Bounds the number of in-flight client starts retained by one supervisor.
 ///
 /// Each entry owns one Tokio task, a response channel, and the validated
@@ -149,27 +152,27 @@ static RUNTIMES_CREATED: AtomicU64 = AtomicU64::new(0);
 /// Monotonic test instrumentation for Core instances whose destructor ran.
 static RUNTIMES_CLEANED: AtomicU64 = AtomicU64::new(0);
 
-/// Runs one exact-run history request for a bounded interval.
+/// Borrows one exact-run history future for a bounded owner interval.
 ///
 /// A Temporal history long poll can otherwise hold the single supervisor
 /// owner Domain inside `Handle::block_on` until the workflow closes.  The
-/// timeout is applied outside the Core request so its cancellation drops the
-/// tonic future, rather than leaving a detached native operation alive.  A
-/// timeout is an expected pending result (`Ok(None)`), while request errors
-/// continue through the existing typed client-error conversion path.
+/// timeout drops only this borrow: the runtime owner retains the future and
+/// its pagination state for the next mailbox turn. No detached task is
+/// spawned. A timeout is an expected pending result (`Ok(None)`); terminal
+/// results and errors tell the owner to retire the retained future.
 async fn bounded_client_wait<F>(
-    future: F,
+    future: Pin<&mut F>,
 ) -> std::result::Result<
     Option<client_protocol::WaitWorkflowResponse>,
     client_protocol::ClientOperationError,
 >
 where
     F: Future<
-        Output = std::result::Result<
-            client_protocol::WaitWorkflowResponse,
-            client_protocol::ClientOperationError,
-        >,
-    >,
+            Output = std::result::Result<
+                client_protocol::WaitWorkflowResponse,
+                client_protocol::ClientOperationError,
+            >,
+        > + ?Sized,
 {
     match tokio::time::timeout(CLIENT_WAIT_TIMEOUT, future).await {
         Ok(response) => response.map(Some),
@@ -262,8 +265,26 @@ pub struct Runtime {
     workflow_activations: HashMap<String, workflow_protocol::Activation>,
     activity_tasks: HashMap<Vec<u8>, Vec<activity_protocol::ActivityTask>>,
     pending_starts: HashMap<String, PendingStart>,
+    pending_waits: HashMap<client_protocol::WaitWorkflowRequest, PendingWait>,
     cleanup: std::sync::mpsc::Sender<RuntimeCleanup>,
 }
+
+/// One exact-run history observation, polled only by its runtime owner.
+///
+/// The future owns its connection clone and pagination state across mailbox
+/// turns. Dropping it synchronously cancels the request; there is no spawned
+/// task to join. Identical requests share an in-flight observation, while each
+/// terminal result or error removes the entry before returning to OCaml.
+type PendingWait = Pin<
+    Box<
+        dyn Future<
+                Output = std::result::Result<
+                    client_protocol::WaitWorkflowResponse,
+                    client_protocol::ClientOperationError,
+                >,
+            > + Send,
+    >,
+>;
 
 /// One Rust-owned asynchronous start operation indexed by an opaque ticket.
 ///
@@ -384,6 +405,7 @@ impl Runtime {
             workflow_activations: HashMap::new(),
             activity_tasks: HashMap::new(),
             pending_starts: HashMap::new(),
+            pending_waits: HashMap::new(),
             cleanup,
         })
     }
@@ -970,12 +992,33 @@ impl Runtime {
                 message: "Temporal runtime is already closed".to_owned(),
             })?
             .tokio_handle();
-        let response = handle
-            .block_on(bounded_client_wait(client_protocol::wait_workflow(
-                connection, request,
-            )))
-            .map_err(client_operation_failure)?;
-        let response = response.ok_or_else(client_wait_not_ready)?;
+        if !self.pending_waits.contains_key(&request) {
+            if self.pending_waits.len() >= MAX_PENDING_WAITS {
+                return Err(Failure {
+                    status: STATUS_INVALID_STATE,
+                    message: "too many Temporal workflow waits are pending".to_owned(),
+                });
+            }
+            self.pending_waits.try_reserve(1).map_err(|_| Failure {
+                status: STATUS_INTERNAL,
+                message: "could not reserve a Temporal workflow wait slot".to_owned(),
+            })?;
+            self.pending_waits.insert(
+                request.clone(),
+                Box::pin(client_protocol::wait_workflow(connection, request.clone())),
+            );
+        }
+        let pending = self.pending_waits.get_mut(&request).expect("retained wait");
+        let response = handle.block_on(bounded_client_wait(pending.as_mut()));
+        if matches!(response, Ok(None)) {
+            return Err(client_wait_not_ready());
+        }
+        // Retire even a failed request before encoding or returning it. A new
+        // wait for this exact run may then make a fresh observation.
+        self.pending_waits.remove(&request);
+        let response = response
+            .map_err(client_operation_failure)?
+            .expect("terminal wait response");
         let encoded = client_protocol::encode_wait_response(&response).map_err(protocol_failure)?;
         Ok(encoded.into_bytes())
     }
@@ -1853,7 +1896,8 @@ impl Runtime {
         Ok(Vec::new())
     }
 
-    /// Drops the client only after its worker child is absent.
+    /// Cancels retained history waits and drops the client after its worker
+    /// child and workflow starts are absent.
     fn disconnect_client(&mut self) -> Operation {
         if self.worker.is_some() {
             return Err(Failure {
@@ -1868,6 +1912,7 @@ impl Runtime {
                     .to_owned(),
             });
         }
+        self.pending_waits.clear();
         self.client.take();
         Ok(Vec::new())
     }
@@ -1878,6 +1923,9 @@ impl Runtime {
     /// not wait on this caller, so a custom-block finalizer never stalls the
     /// collector; the dedicated cleanup thread joins any aborted start tasks.
     fn close(mut self, wait: bool) -> Status {
+        // Cancel borrowed history futures before transferring their executor
+        // and connection to the cleanup thread, including GC fallback close.
+        self.pending_waits.clear();
         let pending_start_tasks = self.abort_pending_starts(wait);
         let Some(core) = self.core.take() else {
             return STATUS_OK;
@@ -4010,81 +4058,8 @@ pub fn test_worker_bridge_status(error: WorkerBridgeError) -> Status {
 mod rejection_tests;
 
 #[cfg(test)]
-mod client_wait_tests {
-    use super::bounded_client_wait;
-    use crate::client_protocol::{ExecutionRef, WaitWorkflowResponse, WorkflowOutcome};
-    use std::future::Future;
-    use std::pin::Pin;
-    use std::sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    };
-    use std::task::{Context, Poll};
-
-    /// Future used to prove a timed-out client request is dropped promptly.
-    struct PendingWait {
-        /// Set by [`Drop`] when timeout cancellation releases the request.
-        dropped: Arc<AtomicBool>,
-    }
-
-    impl Future for PendingWait {
-        type Output =
-            std::result::Result<WaitWorkflowResponse, crate::client_protocol::ClientOperationError>;
-
-        /// Remains pending forever, like an open Temporal history long poll.
-        fn poll(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<Self::Output> {
-            Poll::Pending
-        }
-    }
-
-    impl Drop for PendingWait {
-        /// Records that timeout cancellation reclaimed the in-flight request.
-        fn drop(&mut self) {
-            self.dropped.store(true, Ordering::Release);
-        }
-    }
-
-    /// Builds a runtime with Tokio's timer driver for bounded-wait tests.
-    fn test_runtime() -> tokio::runtime::Runtime {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()
-            .expect("client wait test runtime should build")
-    }
-
-    #[test]
-    /// Returns `None` and drops a request that never produces a close event.
-    fn timeout_cancels_pending_client_wait() {
-        let runtime = test_runtime();
-        let dropped = Arc::new(AtomicBool::new(false));
-        let result = runtime.block_on(bounded_client_wait(PendingWait {
-            dropped: Arc::clone(&dropped),
-        }));
-
-        assert_eq!(result, Ok(None));
-        assert!(dropped.load(Ordering::Acquire));
-    }
-
-    #[test]
-    /// Preserves a completed terminal response instead of turning it pending.
-    fn completed_client_wait_passes_through() {
-        let runtime = test_runtime();
-        let response = WaitWorkflowResponse {
-            execution: ExecutionRef {
-                namespace: "default".to_owned(),
-                workflow_id: "workflow-1".to_owned(),
-                run_id: "run-1".to_owned(),
-            },
-            outcome: WorkflowOutcome::Completed {
-                result: Vec::new(),
-                successor: None,
-            },
-        };
-        let result = runtime.block_on(bounded_client_wait(async { Ok(response.clone()) }));
-
-        assert_eq!(result, Ok(Some(response)));
-    }
-}
+#[path = "../tests/support/client_wait.rs"]
+mod persistent_client_wait_tests;
 
 #[cfg(test)]
 mod async_activity_error_tests {

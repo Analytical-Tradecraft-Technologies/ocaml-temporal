@@ -46,6 +46,44 @@ fn valid_core_retry_policy() -> temporalio_protos::temporal::api::common::v1::Re
     }
 }
 
+/// Reset histories replace the run seed before resuming a timer. The bridge
+/// must preserve that order and the complete unsigned seed range through JSON.
+#[test]
+fn converts_reset_random_seed_before_timer() {
+    use core_activation::workflow_activation_job::Variant;
+
+    for seed in [0, 1, i64::MAX as u64 + 1, u64::MAX] {
+        let activation = core_activation::WorkflowActivation {
+            run_id: "reset-run".to_owned(),
+            timestamp: Some(prost_wkt_types::Timestamp::default()),
+            jobs: vec![
+                core_activation::WorkflowActivationJob {
+                    variant: Some(Variant::UpdateRandomSeed(
+                        core_activation::UpdateRandomSeed {
+                            randomness_seed: seed,
+                        },
+                    )),
+                },
+                core_activation::WorkflowActivationJob {
+                    variant: Some(Variant::FireTimer(core_activation::FireTimer { seq: 1 })),
+                },
+            ],
+            ..Default::default()
+        };
+        let semantic = workflow_protocol::activation_from_core(&activation)
+            .expect("reset seed update must reach the language runtime");
+        let encoded = workflow_protocol::encode_activation(&semantic).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(json["jobs"][0]["kind"], "update_random_seed");
+        assert_eq!(json["jobs"][0]["randomness_seed"], seed.to_string());
+        assert_eq!(json["jobs"][1]["kind"], "fire_timer");
+        assert_eq!(
+            workflow_protocol::decode_activation(&encoded).unwrap(),
+            semantic
+        );
+    }
+}
+
 /// Requires a malformed activation to fail as the stable protocol error type.
 /// The path and message assertions ensure callers receive bounded diagnostics
 /// instead of a serde panic or an untyped transport failure.
@@ -76,6 +114,7 @@ fn accepts_and_normalizes_workflow_activations() {
         "child-resolution",
         "child-cancellation-before-start",
         "patch-activation",
+        "reset-activation",
     ] {
         let input = fixture(&["valid", &format!("{name}.input.json")]);
         let expected = fixture(&["valid", &format!("{name}.normalized.json")]);
@@ -85,6 +124,36 @@ fn accepts_and_normalizes_workflow_activations() {
             expected.trim()
         );
         workflow_protocol::decode_activation(expected.trim()).unwrap();
+    }
+}
+
+/// Rejects malformed reset seeds at both decoded and directly typed boundaries.
+#[test]
+fn rejects_invalid_reset_seeds() {
+    let activation =
+        workflow_protocol::decode_activation(&fixture(&["valid", "reset-activation.input.json"]))
+            .unwrap();
+    for seed in ["", "01", "-1", "+1", "1.0", "18446744073709551616"] {
+        let mut invalid = activation.clone();
+        invalid.jobs = vec![workflow_protocol::ActivationJob::UpdateRandomSeed {
+            randomness_seed: seed.to_owned(),
+        }];
+        assert!(workflow_protocol::encode_activation(&invalid).is_err());
+        assert!(
+            workflow_protocol::decode_activation(&serde_json::to_string(&invalid).unwrap())
+                .is_err()
+        );
+    }
+    for job in [
+        r#"{"kind":"update_random_seed"}"#,
+        r#"{"kind":"update_random_seed","randomness_seed":1}"#,
+        r#"{"kind":"update_random_seed","randomness_seed":"1","extra":true}"#,
+        r#"{"kind":"update_random_seed","randomness_seed":"1","randomness_seed":"2"}"#,
+    ] {
+        let json = format!(
+            r#"{{"run_id":"reset-run","timestamp":null,"is_replaying":true,"history_length":12,"jobs":[{job}]}}"#
+        );
+        assert!(workflow_protocol::decode_activation(&json).is_err());
     }
 }
 
@@ -144,6 +213,7 @@ fn converts_patch_markers_losslessly() {
         deprecated: false,
     };
     let completion = workflow_protocol::Completion {
+        task_failure: None,
         run_id: "patch-run".to_owned(),
         commands: vec![
             command.clone(),
@@ -214,6 +284,7 @@ fn converts_search_attribute_upserts_losslessly() {
         },
     );
     let completion = workflow_protocol::Completion {
+        task_failure: None,
         run_id: "search-run".to_owned(),
         commands: vec![
             workflow_protocol::CompletionCommand::UpsertSearchAttributes {
@@ -270,6 +341,7 @@ fn rejects_invalid_patch_marker_documents() {
     assert!(workflow_protocol::decode_completion(conflicting_modes).is_err());
 
     let conflicting_semantic = workflow_protocol::Completion {
+        task_failure: None,
         run_id: "r".to_owned(),
         commands: vec![
             workflow_protocol::CompletionCommand::SetPatchMarker {
@@ -308,6 +380,7 @@ fn rejects_invalid_patch_marker_documents() {
         assert!(workflow_protocol::encode_activation(&semantic_activation).is_err());
 
         let semantic_completion = workflow_protocol::Completion {
+            task_failure: None,
             run_id: "r".to_owned(),
             commands: vec![workflow_protocol::CompletionCommand::SetPatchMarker {
                 patch_id: invalid_id.clone(),
@@ -413,6 +486,7 @@ fn converts_start_child_workflow_command() {
         data: Vec::new(),
     };
     let completion = workflow_protocol::Completion {
+        task_failure: None,
         run_id: "parent-run".to_owned(),
         commands: vec![workflow_protocol::CompletionCommand::StartChildWorkflow {
             seq: 2,
@@ -482,6 +556,7 @@ fn converts_local_activity_and_cancellation_commands() {
         data: Vec::new(),
     };
     let completion = workflow_protocol::Completion {
+        task_failure: None,
         run_id: "local-run".to_owned(),
         commands: vec![
             workflow_protocol::CompletionCommand::ScheduleLocalActivity {
@@ -547,6 +622,7 @@ fn converts_external_workflow_commands() {
         data: br#""hello""#.to_vec(),
     };
     let completion = workflow_protocol::Completion {
+        task_failure: None,
         run_id: "parent-run".to_owned(),
         commands: vec![
             workflow_protocol::CompletionCommand::SignalExternalWorkflow {
@@ -628,6 +704,7 @@ fn injects_worker_namespace_into_child_workflow_command() {
         metadata: None,
     };
     let completion = workflow_protocol::Completion {
+        task_failure: None,
         run_id: "parent-run".to_owned(),
         commands: vec![workflow_protocol::CompletionCommand::StartChildWorkflow {
             seq: 1,
@@ -703,6 +780,7 @@ fn converts_all_child_cancellation_policies() {
 
     for (policy, core_policy, wire_name) in policies {
         let completion = workflow_protocol::Completion {
+            task_failure: None,
             run_id: "parent-run".to_owned(),
             commands: vec![workflow_protocol::CompletionCommand::StartChildWorkflow {
                 seq: 2,
@@ -747,6 +825,7 @@ fn converts_all_child_cancellation_policies() {
 #[test]
 fn converts_cancel_child_workflow_command() {
     let completion = workflow_protocol::Completion {
+        task_failure: None,
         run_id: "parent-run".to_owned(),
         commands: vec![workflow_protocol::CompletionCommand::CancelChildWorkflow {
             seq: 7,
@@ -825,6 +904,7 @@ fn rejects_invalid_child_cancellation_commands() {
         );
     }
     let outgoing_nul = workflow_protocol::Completion {
+        task_failure: None,
         run_id: "parent-run".to_owned(),
         commands: vec![workflow_protocol::CompletionCommand::StartChildWorkflow {
             seq: 7,
@@ -861,6 +941,7 @@ fn converts_continue_as_new_command() {
         data: Vec::new(),
     };
     let completion = workflow_protocol::Completion {
+        task_failure: None,
         run_id: "current-run".to_owned(),
         commands: vec![workflow_protocol::CompletionCommand::ContinueAsNew {
             workflow_type: "counter".to_owned(),
@@ -917,6 +998,7 @@ fn converts_continue_as_new_command() {
 #[test]
 fn rejects_continue_as_new_with_follow_up_command() {
     let completion = workflow_protocol::Completion {
+        task_failure: None,
         run_id: "current-run".to_owned(),
         commands: vec![
             workflow_protocol::CompletionCommand::ContinueAsNew {
@@ -1498,6 +1580,7 @@ fn converts_query_results_and_matches_activation_ids() {
         metadata: None,
     };
     let succeeded = workflow_protocol::Completion {
+        task_failure: None,
         run_id: "run-query".to_owned(),
         commands: vec![workflow_protocol::CompletionCommand::QueryResult {
             query_id: "query-42".to_owned(),
@@ -1541,6 +1624,7 @@ fn converts_query_results_and_matches_activation_ids() {
         },
     };
     let failed = workflow_protocol::Completion {
+        task_failure: None,
         run_id: "run-query".to_owned(),
         commands: vec![workflow_protocol::CompletionCommand::QueryResult {
             query_id: "query-42".to_owned(),
@@ -1574,6 +1658,7 @@ fn converts_query_results_and_matches_activation_ids() {
         ..activation.clone()
     };
     let missing = workflow_protocol::Completion {
+        task_failure: None,
         run_id: "run-query".to_owned(),
         commands: vec![workflow_protocol::CompletionCommand::QueryResult {
             query_id: "query-42".to_owned(),
@@ -1593,6 +1678,7 @@ fn converts_query_results_and_matches_activation_ids() {
     );
 
     let extra = workflow_protocol::Completion {
+        task_failure: None,
         run_id: "run-query".to_owned(),
         commands: vec![
             workflow_protocol::CompletionCommand::QueryResult {
@@ -1634,6 +1720,7 @@ fn converts_query_results_and_matches_activation_ids() {
     );
 
     let mixed = workflow_protocol::Completion {
+        task_failure: None,
         run_id: "run-query".to_owned(),
         commands: vec![
             workflow_protocol::CompletionCommand::QueryResult {
@@ -1662,6 +1749,7 @@ fn converts_query_results_and_matches_activation_ids() {
     );
 
     let mismatched = workflow_protocol::Completion {
+        task_failure: None,
         run_id: "run-query".to_owned(),
         commands: vec![workflow_protocol::CompletionCommand::QueryResult {
             query_id: "other-query".to_owned(),
@@ -1815,6 +1903,7 @@ fn converts_update_responses_and_enforces_phases() {
         metadata: None,
     };
     let immediate = workflow_protocol::Completion {
+        task_failure: None,
         run_id: "run-update".to_owned(),
         commands: vec![
             workflow_protocol::CompletionCommand::UpdateResponse {
@@ -1861,6 +1950,7 @@ fn converts_update_responses_and_enforces_phases() {
     );
 
     let later = workflow_protocol::Completion {
+        task_failure: None,
         run_id: "run-update".to_owned(),
         commands: vec![workflow_protocol::CompletionCommand::UpdateResponse {
             protocol_instance_id: "protocol-42".to_owned(),
@@ -1871,6 +1961,7 @@ fn converts_update_responses_and_enforces_phases() {
         .expect("completion-only response must be valid in a later activation");
 
     let accepted_then_rejected = workflow_protocol::Completion {
+        task_failure: None,
         run_id: "run-update".to_owned(),
         commands: vec![
             workflow_protocol::CompletionCommand::UpdateResponse {
@@ -1900,6 +1991,7 @@ fn converts_update_responses_and_enforces_phases() {
         .expect("accepted then rejected is a valid terminal update response");
 
     let duplicate_terminal = workflow_protocol::Completion {
+        task_failure: None,
         run_id: "run-update".to_owned(),
         commands: vec![
             workflow_protocol::CompletionCommand::UpdateResponse {
@@ -2481,6 +2573,7 @@ fn converts_timeout_failure_info_losslessly() {
         },
     };
     let completion = workflow_protocol::Completion {
+        task_failure: None,
         run_id: "parent-run".to_owned(),
         commands: vec![workflow_protocol::CompletionCommand::FailWorkflow {
             failure: semantic_failure.clone(),
@@ -2517,6 +2610,7 @@ fn converts_timeout_failure_info_losslessly() {
     );
 
     let empty_completion = workflow_protocol::Completion {
+        task_failure: None,
         run_id: "parent-run".to_owned(),
         commands: vec![workflow_protocol::CompletionCommand::FailWorkflow {
             failure: workflow_protocol::Failure {
@@ -2821,6 +2915,7 @@ fn enforces_core_absence_and_eviction_invariants() {
     let eviction =
         workflow_protocol::decode_activation(&fixture(&["valid", "eviction.input.json"])).unwrap();
     let nonempty = workflow_protocol::Completion {
+        task_failure: None,
         run_id: eviction.run_id.clone(),
         commands: vec![workflow_protocol::CompletionCommand::CancelTimer { seq: 1 }],
     };
@@ -2835,6 +2930,7 @@ fn enforces_core_absence_and_eviction_invariants() {
     // no commands or metadata; this is the only valid response after a
     // terminal run has already left the language worker's registry.
     let empty = workflow_protocol::Completion {
+        task_failure: None,
         run_id: eviction.run_id.clone(),
         commands: Vec::new(),
     };
@@ -2904,6 +3000,7 @@ fn converts_official_core_eviction_activation() {
 #[test]
 fn accepts_large_nested_payload_but_rejects_large_text() {
     let completion = workflow_protocol::Completion {
+        task_failure: None,
         run_id: "run-large".to_owned(),
         commands: vec![workflow_protocol::CompletionCommand::CompleteWorkflow {
             result: Some(workflow_protocol::Payload {
@@ -2944,6 +3041,7 @@ fn canonicalizes_payload_metadata_keys() {
 fn preserves_identifiers_above_255_bytes() {
     let long_id = "i".repeat(300);
     let completion = workflow_protocol::Completion {
+        task_failure: None,
         run_id: long_id.clone(),
         commands: Vec::new(),
     };
@@ -2956,6 +3054,7 @@ fn preserves_identifiers_above_255_bytes() {
     );
 
     let oversized = workflow_protocol::Completion {
+        task_failure: None,
         run_id: "i".repeat(65_537),
         commands: Vec::new(),
     };
@@ -3054,6 +3153,7 @@ fn nested_application_failure(cause_count: usize) -> workflow_protocol::Failure 
 #[test]
 fn enforces_recursive_failure_depth_safely() {
     let completion = |cause_count| workflow_protocol::Completion {
+        task_failure: None,
         run_id: "run-nested-failure".to_owned(),
         commands: vec![workflow_protocol::CompletionCommand::FailWorkflow {
             failure: nested_application_failure(cause_count),
@@ -3069,6 +3169,7 @@ fn enforces_recursive_failure_depth_safely() {
 #[test]
 fn accepts_application_failure_type_as_bounded_text() {
     let application = workflow_protocol::Completion {
+        task_failure: None,
         run_id: "run-failure".to_owned(),
         commands: vec![workflow_protocol::CompletionCommand::FailWorkflow {
             failure: failure_with_info(workflow_protocol::FailureInfo::Application {
@@ -3088,6 +3189,7 @@ fn accepts_application_failure_type_as_bounded_text() {
 fn rejects_invalid_activity_failure_fields() {
     let invalid_activity =
         |scheduled_event_id, started_event_id, identity: String| workflow_protocol::Completion {
+            task_failure: None,
             run_id: "run-failure".to_owned(),
             commands: vec![workflow_protocol::CompletionCommand::FailWorkflow {
                 failure: failure_with_info(workflow_protocol::FailureInfo::Activity {
@@ -3139,6 +3241,7 @@ fn accepts_batched_default_temporal_payloads() {
     const DEFAULT_TEMPORAL_BLOB_BYTES: usize = 2 * 1024 * 1024;
     let bytes = vec![b'x'; DEFAULT_TEMPORAL_BLOB_BYTES];
     let completion = workflow_protocol::Completion {
+        task_failure: None,
         run_id: "run-batched-payloads".to_owned(),
         commands: vec![workflow_protocol::CompletionCommand::CompleteWorkflow {
             result: Some(workflow_protocol::Payload {
@@ -3247,4 +3350,58 @@ fn rejects_omitted_required_nullable_fields() {
         ))
         .is_err()
     );
+}
+
+/// The bilateral fixture represents Core's failed status, never a successful
+/// FailWorkflowExecution command. A poisoned activation cannot leak commands,
+/// and query/eviction leases retain their operation-specific acknowledgements.
+#[test]
+fn task_failure_preserves_the_workflow_execution() {
+    let completion =
+        workflow_protocol::decode_completion(&fixture(&["valid", "task-failure.input.json"]))
+            .unwrap();
+    assert_eq!(
+        workflow_protocol::encode_completion(&completion).unwrap(),
+        fixture(&["valid", "task-failure.normalized.json"]).trim()
+    );
+    let core = workflow_protocol::completion_to_core(&completion).unwrap();
+    let Some(core_completion::workflow_activation_completion::Status::Failed(failed)) =
+        core.status.as_ref()
+    else {
+        panic!("expected failed workflow task");
+    };
+    assert_eq!(failed.force_cause,
+        i32::from(temporalio_protos::temporal::api::enums::v1::WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure));
+    assert_eq!(
+        workflow_protocol::completion_from_core(&core).unwrap(),
+        completion
+    );
+    assert!(
+        workflow_protocol::decode_completion(&fixture(&[
+            "invalid",
+            "task-failure-with-commands.json",
+        ]))
+        .is_err()
+    );
+    let mut activation =
+        workflow_protocol::decode_activation(&fixture(&["valid", "eviction.input.json"])).unwrap();
+    activation.run_id.clone_from(&completion.run_id);
+    assert!(
+        workflow_protocol::completion_to_core_for_activation(&activation, &completion).is_err()
+    );
+    activation.jobs = vec![workflow_protocol::ActivationJob::QueryWorkflow {
+        query_id: "query-id".into(),
+        query_type: "status".into(),
+        arguments: vec![],
+        headers: BTreeMap::new(),
+    }];
+    assert!(
+        workflow_protocol::completion_to_core_for_activation(&activation, &completion).is_err()
+    );
+    let failure = completion.task_failure.clone().unwrap();
+    let invalid = workflow_protocol::Completion {
+        commands: vec![workflow_protocol::CompletionCommand::FailWorkflow { failure }],
+        ..completion
+    };
+    assert!(workflow_protocol::completion_to_core(&invalid).is_err());
 }

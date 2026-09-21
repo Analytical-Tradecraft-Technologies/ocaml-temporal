@@ -262,6 +262,8 @@ type activation_job =
     }
   (** Reports that Core found the named patch marker while replaying this run. *)
   | Notify_has_patch of { patch_id : string }
+  (** Replaces the workflow random stream using a canonical uint64 decimal seed. *)
+  | Update_random_seed of { randomness_seed : string }
   | Fire_timer of { seq : int64 }
   | Cancel_workflow of { reason : string }
   | Remove_from_cache of { message : string; reason : eviction_reason }
@@ -392,7 +394,13 @@ type completion_command =
   | Continue_as_new of { workflow_type : string; input : payload list }
   | Cancel_workflow_execution
 
-type completion = { run_id : string; commands : completion_command list }
+type completion = {
+  run_id : string;
+  commands : completion_command list;
+  task_failure : failure option;
+  (** [Some] fails the workflow task through Core, never the execution. Failed
+      tasks carry no commands. [None] preserves the successful command batch. *)
+}
 type error = { code : string; path : string; message : string }
 type error_view = { code : string; path : string; message : string }
 
@@ -1907,6 +1915,11 @@ let activation_job path json =
       let* patch_id_json = field path "patch_id" entries in
       let* patch_id = identifier (path ^ ".patch_id") patch_id_json in
       Ok (Notify_has_patch { patch_id })
+  | "update_random_seed" ->
+      let* entries = exact_object path [ "kind"; "randomness_seed" ] json in
+      let* seed_json = field path "randomness_seed" entries in
+      let* randomness_seed = uint64_decimal (path ^ ".randomness_seed") seed_json in
+      Ok (Update_random_seed { randomness_seed })
   | "fire_timer" ->
       let* entries = exact_object path [ "kind"; "seq" ] json in
       let* seq_json = field path "seq" entries in
@@ -2030,6 +2043,13 @@ let activation_job_json = function
       Ok
         (`Assoc
           [ ("kind", `String "notify_has_patch"); ("patch_id", `String patch_id) ])
+  | Update_random_seed { randomness_seed } ->
+      Ok
+        (`Assoc
+          [
+            ("kind", `String "update_random_seed");
+            ("randomness_seed", `String randomness_seed);
+          ])
   | Fire_timer { seq } ->
       Ok
         (`Assoc
@@ -2867,7 +2887,13 @@ let validate_patch_marker_modes path commands =
 
 (** Converts a strict completion object to typed values. *)
 let completion_from_json json =
-  let* entries = exact_object "$" [ "run_id"; "commands" ] json in
+  let fields =
+    match json with
+    | `Assoc entries when List.mem_assoc "task_failure" entries ->
+        [ "run_id"; "commands"; "task_failure" ]
+    | _ -> [ "run_id"; "commands" ]
+  in
+  let* entries = exact_object "$" fields json in
   let* run_json = field "$" "run_id" entries in
   let* run_id = identifier "$.run_id" run_json in
   let* commands_json = field "$" "commands" entries in
@@ -2876,7 +2902,14 @@ let completion_from_json json =
   let* () = validate_query_results "$.commands" commands in
   let* () = validate_update_responses "$.commands" commands in
   let* () = validate_patch_marker_modes "$.commands" commands in
-  Ok { run_id; commands }
+  let* task_failure =
+    match List.assoc_opt "task_failure" entries with
+    | None | Some `Null -> Ok None
+    | Some value -> Result.map Option.some (failure "$.task_failure" value)
+  in
+  if Option.is_some task_failure && commands <> [] then
+    Error (invalid "$.commands" "failed workflow task cannot contain commands")
+  else Ok { run_id; task_failure; commands }
 
 (** Strictly decodes one completion through the shared JSON foundation. *)
 let decode_completion input =
@@ -2887,7 +2920,16 @@ let decode_completion input =
 (** Encodes and semantically reparses one outgoing completion. *)
 let encode_completion value =
   let* commands = completion_commands_json value.commands in
-  let json = `Assoc [ ("run_id", `String value.run_id); ("commands", commands) ] in
+  let* fields =
+    match value.task_failure with
+    | None -> Ok []
+    | Some value ->
+        let* failure = failure_json value in
+        Ok [ ("task_failure", failure) ]
+  in
+  let json =
+    `Assoc ([ ("run_id", `String value.run_id); ("commands", commands) ] @ fields)
+  in
   match Control.encode_payload_object json with
   | Error error -> Error (of_control_error_at_source error)
   | Ok output ->

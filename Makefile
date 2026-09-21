@@ -82,7 +82,7 @@ ifeq ($(strip $(NATIVE_CARGO_TARGET_DIR)),)
 NATIVE_CARGO_TARGET_DIR := $(CURDIR)/_build/rust
 endif
 NATIVE_OCAML_VERSION ?= 5.5
-NATIVE_RUST_VERSION ?= 1.94.1
+NATIVE_RUST_VERSION ?= 1.97.1
 NATIVE_ARCH ?=
 NATIVE_RUST_HOST ?=
 NATIVE_ENV := CARGO_TARGET_DIR="$(NATIVE_CARGO_TARGET_DIR)"
@@ -136,6 +136,11 @@ test-bridge:
 .PHONY: test-completed-queries-live
 test-completed-queries-live:
 	$(RUN) dune exec test/integration/completed_queries/regression.exe -- check $(TEMPORAL_CLIENT_TEST_URL)
+
+# Requires a disposable server and an explicit official Temporal CLI path.
+.PHONY: test-local-activity-cancellation-live
+test-local-activity-cancellation-live:
+	$(RUN) dune exec test/integration/local_activity_cancellation/regression.exe -- check $(TEMPORAL_CLIENT_TEST_URL) $(TEMPORAL_TEST_CLI)
 
 test-install:
 	$(COMPOSE_RUN) sh test/bridge/test_install.sh
@@ -756,6 +761,21 @@ test-temporal-start-metadata-live:
 	$(RUN) dune build $(DUNE_BUILD_ARGS) test/integration/temporal/driver/start_metadata_driver.exe
 	$(MAKE) temporal-start
 	TEMPORAL_COMPOSE_PROJECT=$(TEMPORAL_COMPOSE_PROJECT) TEMPORAL_METADATA_IMAGE="$(TEMPORAL_METADATA_IMAGE)" HOST_UID=$(HOST_UID) HOST_GID=$(HOST_GID) sh test/integration/temporal/scripts/run-start-metadata-live.sh
+
+# Focused bilateral task-failure protocol/runtime gates. Keep native linkers
+# bounded on developer machines with DUNE_JOBS and CARGO_BUILD_JOBS.
+.PHONY: test-workflow-task-failure build-task-failure-fixture test-temporal-task-failure-live
+test-workflow-task-failure:
+	$(RUN) dune runtest $(DUNE_BUILD_ARGS) test/runtime test/bridge test/observability test/sdk_supervisor
+	$(COMPOSE_RUN) env $(CARGO_TEST_ENV) cargo test --manifest-path $(CARGO_MANIFEST) --locked --test workflow_protocol --test workflow_retry_policy --test replay_abi
+
+build-task-failure-fixture:
+	$(RUN) dune build $(DUNE_BUILD_ARGS) test/integration/temporal/task_failure/broken_worker.exe test/integration/temporal/task_failure/corrected_worker.exe test/integration/temporal/task_failure/recovery_driver.exe
+
+# This local/CI controller uses host Python's standard library only. The three
+# OCaml binaries share one build tree and have no production fixture hooks.
+test-temporal-task-failure-live: test-temporal-config build-task-failure-fixture
+	TEMPORAL_COMPOSE_PROJECT="$(TEMPORAL_COMPOSE_PROJECT)" OCAML_IMAGE="$(OCAML_IMAGE)" python3 test/integration/temporal/scripts/run-task-failure-live.py
 
 # Publish only after the pinned toolchain, Rust lint, and full Rust test suite
 # pass. Native desktop CI uses this directly; Linux uses the same gate inside

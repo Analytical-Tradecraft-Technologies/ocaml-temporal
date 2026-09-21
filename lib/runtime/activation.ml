@@ -71,6 +71,8 @@ type job =
       The execution applies this metadata before running workflow fibers so
       [Temporal.Workflow.patched] can reproduce the historical branch. *)
   | Notify_has_patch of { patch_id : string }
+  (** Replaces this execution's random seed at this position in the job list. *)
+  | Update_random_seed of { randomness_seed : string }
   | Fire_timer of { seq : int64 }
   | Cancel_workflow
   | Remove_from_cache
