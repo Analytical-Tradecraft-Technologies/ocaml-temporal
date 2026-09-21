@@ -176,7 +176,7 @@ update-live-acceptance-inventory:
 test-live-acceptance-inventory-contract:
 	sh test/smoke/test_live_acceptance_inventory_contract.sh .
 
-test-quality-contract: check-live-acceptance-inventory test-live-acceptance-inventory-contract
+test-quality-contract: check-live-acceptance-inventory test-live-acceptance-inventory-contract test-temporal-namespace-readiness
 	sh test/smoke/test_quality_contract.sh .
 	sh test/smoke/test_release_tag_contract.sh .
 	sh test/smoke/test_make_docker_commands.sh .
@@ -785,3 +785,8 @@ rust-bridge:
 	docker run --rm --user $(HOST_UID):$(HOST_GID) --volume "$(CURDIR):/workspace" \
 		ocaml-temporal-rust-bridge:local make native-rust-bridge \
 		RUST_BRIDGE_DIR=/workspace/_build/rust-bridge RUST_BRIDGE_KEY="$(RUST_BRIDGE_KEY)"
+
+# Exercises namespace propagation failures without a live server or Docker.
+.PHONY: test-temporal-namespace-readiness
+test-temporal-namespace-readiness:
+	sh test/smoke/test_temporal_namespace_readiness.sh .
