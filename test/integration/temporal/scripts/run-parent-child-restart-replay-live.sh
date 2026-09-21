@@ -100,6 +100,7 @@ reap_driver() {
 cleanup() {
   status=$?
   trap - EXIT HUP INT TERM
+  sh "$fixture/scripts/collect-live-diagnostics.sh" cleanup || echo "live diagnostic snapshot failed" >&2
   if [ -n "$driver_pid" ] && kill -0 "$driver_pid" 2>/dev/null; then
     # The Compose CLI may still be building, before the named container exists.
     # In that case there is nothing for [docker stop] to terminate, so signal
@@ -303,6 +304,7 @@ stop_and_remove_worker() {
   }
   exit_code=$(docker inspect --format '{{.State.ExitCode}}' "$container_id")
   [ "$exit_code" -eq 0 ] || return 1
+  sh "$fixture/scripts/collect-live-diagnostics.sh" pre-worker-removal || echo "live diagnostic snapshot failed" >&2
   compose rm --force "$service" >/dev/null
   remaining_containers=$(docker ps -aq \
     --filter "label=com.docker.compose.project=$project" \
@@ -475,6 +477,7 @@ done
 
 stop_and_remove_worker "$worker_two" "$worker_two_stopped" 2 \
   "$generation_two_container"
+sh "$fixture/scripts/collect-live-diagnostics.sh" pre-stack-removal || echo "live diagnostic snapshot failed" >&2
 compose down --volumes --remove-orphans >/dev/null
 remaining_volumes=$(project_volume_count)
 [ "$remaining_volumes" -eq 0 ]
@@ -536,5 +539,6 @@ sh "$controller_validator" --controller "$controller" \
   --child-workflow-id "$child_workflow_id" --child-run-id "$child_run_id" \
   --initiated-event-id "$initiated_event_id"
 
+sh "$fixture/scripts/collect-live-diagnostics.sh" validated || echo "live diagnostic snapshot failed" >&2
 trap - EXIT HUP INT TERM
 remove_artifacts
