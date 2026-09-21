@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 import time
 
 ROOT = Path(__file__).resolve().parents[4]
@@ -28,10 +29,37 @@ COMPOSE = ["docker", "compose", "--project-directory", str(FIXTURE), "-f",
 BINARY_DIR = "_build/default/test/integration/temporal/task_failure"
 
 
+def diagnostic_text(value):
+    """Decode timeout output, which can remain bytes even in subprocess text mode."""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value or ""
+
+
 def command(args, timeout=120):
-    """Run a bounded command and keep stderr out of parsed machine output."""
-    return subprocess.run(args, cwd=ROOT, text=True, stdout=subprocess.PIPE,
-                          stderr=subprocess.PIPE, check=True, timeout=timeout).stdout
+    """Keep successful stdout parseable; retain failed commands before cleanup."""
+    try:
+        return subprocess.run(args, cwd=ROOT, text=True, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, check=True, timeout=timeout).stdout
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as error:
+        diagnostic = {
+            "argv": [str(arg) for arg in args], "cwd": str(ROOT),
+            "error": f"{type(error).__name__}: {error}",
+            "returncode": getattr(error, "returncode", None), "timeout_seconds": timeout,
+            "stdout": diagnostic_text(getattr(error, "stdout", None)),
+            "stderr": diagnostic_text(getattr(error, "stderr", None)),
+        }
+        # Append so a teardown failure cannot overwrite the original startup
+        # failure. Also print to Actions when no containers ever produced logs.
+        report = json.dumps(diagnostic, ensure_ascii=True)
+        print(f"Task-failure command diagnostic: {report}", file=sys.stderr, flush=True)
+        try:
+            ARTIFACTS.mkdir(parents=True, exist_ok=True)
+            with (ARTIFACTS / "command-failures.jsonl").open("a", encoding="utf-8") as output:
+                output.write(report + "\n")
+        except OSError as logging_error:
+            print(f"Could not retain command diagnostic: {logging_error}", file=sys.stderr)
+        raise
 
 
 def save_json(name, value):
