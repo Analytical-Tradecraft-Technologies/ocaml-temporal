@@ -1,4 +1,4 @@
-ARG RUST_IMAGE=rust:1.94-bookworm@sha256:6ae102bdbf528294bc79ad6e1fae682f6f7c2a6e6621506ba959f9685b308a55
+ARG RUST_IMAGE=rust:1.97-bookworm@sha256:0e2bcaef56d041a486784e54104a81aebe0da44bd03019bd70bc0401e42e4a97
 ARG OCAML_IMAGE=ocaml/opam:debian-12-ocaml-5.2
 
 FROM ${RUST_IMAGE} AS rust-toolchain
