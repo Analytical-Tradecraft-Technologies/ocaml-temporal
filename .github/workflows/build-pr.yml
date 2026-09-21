@@ -293,7 +293,7 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v7
       - name: Set up OCaml 5.5
-        uses: ocaml/setup-ocaml@e89b2ded52a6e13f50162220cf5fe47290162032 # v3.8.0
+        uses: ocaml/setup-ocaml@93303b622b2522e4411e295f9e77411a24912ac7 # v3.9.0
         with:
           ocaml-compiler: "5.5"
       - name: Set up pinned Rust toolchain
@@ -335,7 +335,7 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v7
       - name: Set up OCaml 5.5
-        uses: ocaml/setup-ocaml@e89b2ded52a6e13f50162220cf5fe47290162032 # v3.8.0
+        uses: ocaml/setup-ocaml@93303b622b2522e4411e295f9e77411a24912ac7 # v3.9.0
         with:
           ocaml-compiler: "5.5"
           windows-compiler: mingw
