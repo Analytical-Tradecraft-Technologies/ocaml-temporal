@@ -93,6 +93,7 @@ remove_artifacts() {
 cleanup() {
   status=$?
   trap - EXIT HUP INT TERM
+  sh "$fixture/scripts/collect-live-diagnostics.sh" cleanup || echo "live diagnostic snapshot failed" >&2
   if [ -n "$driver_pid" ] && kill -0 "$driver_pid" 2>/dev/null; then
     kill -TERM "$driver_pid" 2>/dev/null || true
   fi
@@ -190,6 +191,7 @@ stop_worker() {
     echo "$service exited with $exit_code" >&2
     return 1
   }
+  sh "$fixture/scripts/collect-live-diagnostics.sh" pre-worker-removal || echo "live diagnostic snapshot failed" >&2
   compose rm --force "$service" >/dev/null
   remaining=$(compose ps -aq patch-replay-legacy-worker \
     patch-replay-patched-worker patch-replay-deprecated-worker \
@@ -455,6 +457,7 @@ removal_marker_deprecated=$(jq -c \
 stop_worker patch-replay-removed-worker "$removal_stopped" \
   "$removal_generation_two_container"
 
+sh "$fixture/scripts/collect-live-diagnostics.sh" pre-stack-removal || echo "live diagnostic snapshot failed" >&2
 compose down --volumes --remove-orphans >/dev/null
 remaining_project_volumes=$(project_volume_count)
 [ "$remaining_project_volumes" -eq 0 ]

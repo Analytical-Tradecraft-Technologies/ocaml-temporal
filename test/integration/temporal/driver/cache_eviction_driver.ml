@@ -26,6 +26,13 @@ module Definitions = Smoke_definitions
 let phase operation status =
   Printf.eprintf "cache eviction phase=%s status=%s\n%!" operation status
 
+(** Binds start and verified terminal observations to the exact client handle.
+    The diagnostic bundle keeps these identifiers but never a payload. *)
+let execution_phase operation status handle =
+  Printf.eprintf
+    "cache eviction phase=%s status=%s workflow_id=%s run_id=%s\n%!" operation
+    status (Client.workflow_id handle) (Client.run_id handle)
+
 (** Reads a required non-empty environment value as a typed configuration
     result rather than raising while the executable is initializing. *)
 let required_env name =
@@ -166,6 +173,7 @@ let run () =
             ~id:"two-binary-cache-eviction-a" ~input:"first" ()
         in
         phase "start_a" "ok";
+        execution_phase "start_a" "accepted" first;
         Printf.eprintf "cache eviction execution=a workflow_id=%s run_id=%s\n%!"
           "two-binary-cache-eviction-a" (Client.run_id first);
         phase "cache_settling" "begin";
@@ -180,6 +188,7 @@ let run () =
             ~id:"two-binary-cache-eviction-b" ~input:"second" ()
         in
         phase "start_b" "ok";
+        execution_phase "start_b" "accepted" second;
         Printf.eprintf "cache eviction execution=b workflow_id=%s run_id=%s\n%!"
           "two-binary-cache-eviction-b" (Client.run_id second);
         phase "eviction_marker" "begin";
@@ -195,13 +204,16 @@ let run () =
         let* second_outcome = Client.wait second in
         phase "wait_b" "ok";
         let* () = require_cancelled "cache eviction run B" second_outcome in
+        execution_phase "wait_b" "cancelled" second;
         phase "cancel_a" "begin";
         let* () = cancel first ~request_id:"two-binary-cache-eviction-cancel-a" in
         phase "cancel_a" "ok";
         phase "wait_a" "begin";
         let* first_outcome = Client.wait first in
         phase "wait_a" "ok";
-        require_cancelled "cache eviction run A" first_outcome
+        let* () = require_cancelled "cache eviction run A" first_outcome in
+        execution_phase "wait_a" "cancelled" first;
+        Ok ()
       in
       finish result
   | _ ->

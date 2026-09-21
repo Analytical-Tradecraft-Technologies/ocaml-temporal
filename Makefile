@@ -90,6 +90,7 @@ QUALITY_CARGO_DENY_VERSION ?= 0.20.2
 QUALITY_CARGO_MACHETE_VERSION ?= 0.9.2
 QUALITY_TYPOS_VERSION ?= 1.48.0
 
+.PHONY: test-temporal-live-ci test-temporal-diagnostics-contract
 .PHONY: version-check build build-examples cargo-metadata test test-unit test-runtime test-rust test-bridge test-install test-api release-preflight release-tag-check test-quality-contract test-temporal-config test-temporal-worker-readiness-contract test-temporal-worker-stop-contract test-temporal-worker-crash-recovery-contract test-temporal-worker-cache-eviction-contract test-core-lifecycle-integration temporal-start temporal-start-worker temporal-run-driver temporal-inspect-smoke temporal-stop-worker test-temporal-two-binary test-temporal-integration test-temporal-worker-restart test-temporal-worker-restart-contract test-temporal-worker-restart-live test-temporal-worker-crash-recovery test-temporal-worker-cache-eviction test-temporal-worker-cache-eviction-live test-temporal-workflow-patching test-temporal-workflow-patching-contract test-temporal-workflow-patching-live test-temporal-parent-child-restart test-temporal-parent-child-restart-contract test-temporal-parent-child-restart-live test-temporal-parent-child-failure-replay test-temporal-parent-child-failure-replay-contract test-temporal-parent-child-failure-replay-live temporal-health temporal-status temporal-logs temporal-stop temporal-clean lint lint-rust fmt quality quality-tool-version-check quality-rust quality-spelling license-check audit clean verify check native-version-check native-build native-test native-test-rust native-test-install native-lint native-lint-rust native-verify
 version-check:
 	@output="$$( $(RUN) ocamlc -version )" || exit $$?; \
@@ -124,6 +125,7 @@ test:
 	$(MAKE) test-bridge
 	$(MAKE) test-install
 	$(MAKE) test-quality-contract
+	$(MAKE) test-temporal-diagnostics-contract
 
 test-rust:
 	$(COMPOSE_RUN) sh test/smoke/test_rust_toolchain.sh
@@ -319,11 +321,28 @@ temporal-clean:
 		"$(SMOKE_CACHE_EVICTION_READY_FILE)" "$(SMOKE_CACHE_EVICTION_SECOND_READY_FILE)" \
 		"$(SMOKE_CACHE_EVICTION_DRIVER_LOG_FILE)"
 
+# CI uses the same controllers as local acceptance, each with a bounded log
+# wrapper. A failed scenario stops the suite; workflow finalizers upload all
+# snapshots already captured, including the deliberate collector regressions.
+test-temporal-live-ci:
+	$(MAKE) test-temporal-diagnostics-contract
+	bash test/integration/temporal/scripts/run-with-live-diagnostics.sh integration $(MAKE) test-temporal-integration
+	bash test/integration/temporal/scripts/run-with-live-diagnostics.sh restart $(MAKE) test-temporal-worker-restart
+	bash test/integration/temporal/scripts/run-with-live-diagnostics.sh crash $(MAKE) test-temporal-worker-crash-recovery
+	bash test/integration/temporal/scripts/run-with-live-diagnostics.sh cache-eviction $(MAKE) test-temporal-worker-cache-eviction
+	bash test/integration/temporal/scripts/run-with-live-diagnostics.sh patching $(MAKE) test-temporal-workflow-patching
+	bash test/integration/temporal/scripts/run-with-live-diagnostics.sh parent-child-restart $(MAKE) test-temporal-parent-child-restart
+	bash test/integration/temporal/scripts/run-with-live-diagnostics.sh child-failure-replay $(MAKE) test-temporal-parent-child-failure-replay
+
+test-temporal-diagnostics-contract:
+	bash test/integration/temporal/scripts/test-live-diagnostics-contract.sh
+
 test-temporal-integration: test-temporal-config
 	@set -eu; \
 	cleanup() { \
 		status=$$?; \
 		trap - EXIT HUP INT TERM; \
+		sh test/integration/temporal/scripts/collect-live-diagnostics.sh cleanup || echo "live diagnostic snapshot failed" >&2; \
 		if [ "$$status" -ne 0 ]; then \
 			$(MAKE) temporal-logs || true; \
 		fi; \
@@ -452,6 +471,7 @@ test-temporal-worker-cache-eviction-live: test-temporal-config
 	cleanup() { \
 		status=$$?; \
 		trap - EXIT HUP INT TERM; \
+		sh test/integration/temporal/scripts/collect-live-diagnostics.sh cleanup || echo "live diagnostic snapshot failed" >&2; \
 		if [ "$$status" -ne 0 ]; then cat "$(SMOKE_CACHE_EVICTION_DRIVER_LOG_FILE)" 2>/dev/null || true; $(TEMPORAL_COMPOSE) logs --no-color --tail 200 smoke-cache-eviction-worker 2>/dev/null || true; $(MAKE) temporal-logs || true; fi; \
 		cleanup_driver; \
 		cleanup_cache_worker; \
@@ -505,6 +525,7 @@ test-temporal-worker-restart-live: test-temporal-config
 	cleanup() { \
 		status=$$?; \
 		trap - EXIT HUP INT TERM; \
+		sh test/integration/temporal/scripts/collect-live-diagnostics.sh cleanup || echo "live diagnostic snapshot failed" >&2; \
 		cleanup_driver; \
 		if [ "$$status" -ne 0 ]; then cat "$$driver_log" 2>/dev/null || true; $(MAKE) temporal-logs || true; fi; \
 		$(MAKE) temporal-clean || true; \
@@ -581,6 +602,7 @@ test-temporal-worker-restart-live: test-temporal-config
 		generation_one_exit_code=0; \
 		generation_one_shutdown_marker=true; \
 	fi; \
+	sh test/integration/temporal/scripts/collect-live-diagnostics.sh pre-worker-removal || echo "live diagnostic snapshot failed" >&2; \
 	$(TEMPORAL_COMPOSE) rm --force smoke-worker >/dev/null; \
 	remaining_workers=$$(docker ps -aq --filter label=com.docker.compose.project=$(TEMPORAL_COMPOSE_PROJECT) --filter label=com.docker.compose.service=smoke-worker | wc -l | tr -d ' '); \
 	[ "$$remaining_workers" -eq 0 ] || { echo "generation one worker container was not removed" >&2; exit 1; }; \
@@ -614,6 +636,7 @@ test-temporal-worker-restart-live: test-temporal-config
 		--stage terminal --require-replay >/dev/null; \
 	replay_history=$$(jq -r '.records[1].history_length' "$$diagnostics_file"); \
 	$(MAKE) temporal-stop-worker; \
+	sh test/integration/temporal/scripts/collect-live-diagnostics.sh pre-worker-removal || echo "live diagnostic snapshot failed" >&2; \
 	$(TEMPORAL_COMPOSE) rm --force smoke-worker >/dev/null; \
 	generation_two_remaining_workers=$$(docker ps -aq --filter label=com.docker.compose.project=$(TEMPORAL_COMPOSE_PROJECT) --filter label=com.docker.compose.service=smoke-worker | wc -l | tr -d ' '); \
 	[ "$$generation_two_remaining_workers" -eq 0 ] || { echo "generation two worker container was not removed" >&2; exit 1; }; \
@@ -632,6 +655,7 @@ test-temporal-worker-restart-live: test-temporal-config
 		'{workflow_id:$$workflow_id,run_id:$$run_id,events:[{step:"stack_ready",status:"ok",stale_project_volumes_before_cleanup:$$stale_project_volumes_before_cleanup,remaining_project_volumes_before_start:$$project_volumes_before,temporal_healthy:true},{step:"driver_accepted",status:"ok",workflow_id:$$workflow_id,run_id:$$run_id},{step:"history_checked",status:"ok",stage:"initial",event_count:$$initial_count},{step:"driver_waiting",status:"ok"},{step:"generation_one_replaced",status:"ok",generation:1,container_id:$$generation_one_container,exit_code:$$generation_one_exit_code,replacement_mode:$$replacement_mode,shutdown_marker:$$generation_one_shutdown_marker},{step:"generation_one_removed",status:"ok",generation:1,container_id:$$generation_one_container,remaining_worker_containers:0},{step:"generation_two_ready",status:"ok",generation:2,container_id:$$generation_two_container,readiness_generation:2,fresh_container:true},{step:"replay_observed",status:"ok",generation:2,is_replaying:true,history_length:$$history_length},{step:"history_checked",status:"ok",stage:"terminal",event_count:$$terminal_count},{step:"driver_completed",status:"ok",outcome:"completed"},{step:"generation_two_stopped",status:"ok",generation:2,container_id:$$generation_two_container,exit_code:0,shutdown_marker:true},{step:"generation_two_removed",status:"ok",generation:2,container_id:$$generation_two_container,remaining_worker_containers:$$generation_two_remaining_workers},{step:"postgres_volume_removed",status:"ok",remaining_project_volumes:$$remaining_volumes}]}' \
 		>"$$controller_file"; \
 	sh "$$controller_validator" --controller "$$controller_file" --workflow-id "$$workflow_id" --run-id "$$run_id" --replacement-mode "$$replacement_mode"; \
+	sh test/integration/temporal/scripts/collect-live-diagnostics.sh validated || echo "live diagnostic snapshot failed" >&2; \
 	trap - EXIT HUP INT TERM; \
 	$(MAKE) temporal-clean
 

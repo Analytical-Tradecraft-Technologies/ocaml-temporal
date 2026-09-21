@@ -481,6 +481,8 @@ if [ "$(grep -Fc '  temporal-integration:' "$workflow")" -ne 1 ]; then
   echo "GitHub Actions must define one standalone Temporal integration job" >&2
   exit 1
 fi
+# The shared diagnostic wrapper keeps the same seven live controllers in the
+# Makefile so PR/nightly evidence uses one invocation path.
 master_smoke=$(sed -n '/^  temporal-integration:/,/^  verify:/p' "$workflow")
 require_master_smoke_text() {
   needle=$1
@@ -489,16 +491,17 @@ require_master_smoke_text() {
     exit 1
   fi
 }
+require_master_smoke_text 'make test-temporal-live-ci'
 require_master_smoke_text 'name: Temporal/PostgreSQL integration smoke (OCaml 5.5)'
 require_master_smoke_text 'timeout-minutes: 45'
 require_master_smoke_text 'OCAML_VERSION: "5.5"'
-require_master_smoke_text 'make test-temporal-integration'
-require_master_smoke_text 'make test-temporal-worker-restart'
-require_master_smoke_text 'make test-temporal-worker-crash-recovery'
-require_master_smoke_text 'make test-temporal-worker-cache-eviction'
-require_master_smoke_text 'make test-temporal-workflow-patching'
-require_master_smoke_text 'make test-temporal-parent-child-restart'
-require_master_smoke_text 'make test-temporal-parent-child-failure-replay'
+require_source_text "$makefile" '$(MAKE) test-temporal-integration'
+require_source_text "$makefile" '$(MAKE) test-temporal-worker-restart'
+require_source_text "$makefile" '$(MAKE) test-temporal-worker-crash-recovery'
+require_source_text "$makefile" '$(MAKE) test-temporal-worker-cache-eviction'
+require_source_text "$makefile" '$(MAKE) test-temporal-workflow-patching'
+require_source_text "$makefile" '$(MAKE) test-temporal-parent-child-restart'
+require_source_text "$makefile" '$(MAKE) test-temporal-parent-child-failure-replay'
 require_workflow_text() {
   needle=$1
   if ! grep -F -- "$needle" "$workflow" >/dev/null; then
