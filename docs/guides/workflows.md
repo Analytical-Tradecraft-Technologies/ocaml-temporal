@@ -891,13 +891,15 @@ describes the typed definition and deterministic handler boundary. The client
 signal bridge and mock lifecycle are focused-tested at this baseline. The
 complete [PR #266 CI
 run](https://github.com/mfow/ocaml-temporal/actions/runs/29311239247) live-verifies
-typed signal delivery and condition wake-up, and the expanded [PR #289 CI
+typed signal delivery and signal-dependent completion, and the expanded [PR #289 CI
 run](https://github.com/mfow/ocaml-temporal/actions/runs/29333761719) retains those
 assertions in the historical seventeen-result baseline. The [PR #302 CI
 run](https://github.com/mfow/ocaml-temporal/actions/runs/29351689638) first
 verified the long-backoff retry extension, and the complete [PR #439 CI
 run](https://github.com/mfow/ocaml-temporal/actions/runs/29824441578) retains
-the signal and retry paths in the current 26-start baseline. A successful
+the signal and retry paths in its historical baseline. See the
+[current evidence audit](../reference/live-acceptance-coverage.md) for the
+later successful source snapshot and remaining condition/recovery limits. A successful
 signal call still acknowledges Temporal's RPC
 rather than the later execution of the worker-side handler.
 

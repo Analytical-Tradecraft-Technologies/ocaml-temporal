@@ -2,14 +2,16 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/mfow/ocaml-temporal/docs/schemas/bridge/workflow-completion.schema.json",
   "title": "Workflow completion",
-  "description": "A closed semantic command batch sent from the private OCaml workflow runtime to the Rust Temporal Core bridge.",
+  "description": "A closed successful command batch or a failed workflow task sent from the private OCaml workflow runtime to the Rust Temporal Core bridge.",
   "type": "object",
   "additionalProperties": false,
   "required": ["run_id", "commands"],
   "properties": {
     "run_id": {"$ref": "#/$defs/identifier"},
+    "task_failure": {"oneOf": [{"$ref": "#/$defs/failure"}, {"type": "null"}], "description": "When present and non-null, fail only the workflow task. Commands must be empty. Absent or null preserves the successful-completion format."},
     "commands": {"type": "array", "maxItems": 201326592, "items": {"$ref": "#/$defs/command"}}
   },
+  "allOf": [{"if": {"required": ["task_failure"], "properties": {"task_failure": {"type": "object"}}}, "then": {"properties": {"commands": {"maxItems": 0}}}}],
   "$defs": {
     "payload": {"$ref": "temporal-payload.schema.json"},
     "payload_map": {

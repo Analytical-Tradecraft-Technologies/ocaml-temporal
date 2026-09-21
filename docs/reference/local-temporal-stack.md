@@ -97,24 +97,17 @@ validating the readiness path and before validating later marker settings; its
 finalizer removes the marker again.
 This ordering prevents a reused container from reporting a previous run's
 readiness while the current worker is still being constructed or has failed.
-The driver implementation starts twelve smoke workflows before waiting for any
-result, waits for the signal workflow's worker-visible readiness marker before signaling it, then starts the timeout-retry workflow after the heartbeat result is
-terminal. This includes the successful parent/child, propagated child-failure,
-and child-cancellation scenarios, delayed asynchronous completion, and
-continue-as-new successor following. For
-the heartbeat workflow, the first activity attempt records a progress detail
-with a 500 ms heartbeat timeout and returns a retryable error; the driver
-requires the second attempt to receive that detail and timeout from Temporal.
-For the long-running workflow, it waits for the test-only marker activity to
-publish the current run token after the durable timer and marker commands are
-accepted together, then sends `Temporal.Client.cancel` for that exact handle.
-The local assertion checks all thirteen exact success or typed terminal outcomes,
-including timeout retry, one typed non-retryable workflow failure, one typed
-child failure, one typed child cancellation, and one typed `Cancelled` result
-for the same workflow/run pair. The parent/child and ordinary retry scenarios
-are part of the same driver and are also started before the first wait. The
-complete [PR #266 CI run](https://github.com/mfow/ocaml-temporal/actions/runs/29311239247)
-live-verified all thirteen assertions, typed signal delivery, and the driver/worker shutdown markers.
+The baseline driver stages the workflows in the
+[generated inventory](live-acceptance-inventory.md). It waits for per-run
+worker-visible readiness markers before signal/update/cancellation/termination
+operations and serializes timeout-retry fixtures after the shorter heartbeat
+path. It requires exact successes or typed terminal failures, including local
+activity success, asynchronous completion, continuation, child outcomes and
+completed-target external signal rejection.
+The [live evidence audit](live-acceptance-coverage.md) pins the tested source,
+successful job, Compose images and exact assertion boundaries. Historical
+PR #266 verified an earlier, smaller baseline; its scenario total does not
+describe the current driver.
 After the driver exits, the Makefile stops
 the worker and requires the current run's exact `.worker-stopped` marker; the
 driver's successful `client_shutdown` phase provides the corresponding client

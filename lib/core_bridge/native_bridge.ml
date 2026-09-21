@@ -624,10 +624,10 @@ let client_wait_start_workflow_json runtime input =
       decode (client_wait_start_workflow_json_raw runtime input))
 
 (** Waits for one exact run through the Rust-owned client. Each native call
-    performs the close-event long poll for at most 100 ms while the C binding
-    releases the OCaml runtime lock. An open run returns [Not_ready] so a
-    caller or later orchestration loop can retry without occupying the
-    supervisor owner indefinitely. *)
+    polls the retained history future for at most 100 ms while the C binding
+    releases the OCaml runtime lock. [Not_ready] preserves the RPC and its
+    pagination state so the caller can resume through the supervisor mailbox
+    without occupying the owner indefinitely. *)
 let client_wait_workflow_json runtime input =
   bridge_call "client_wait_workflow_json" (fun () ->
       decode (client_wait_workflow_json_raw runtime input))

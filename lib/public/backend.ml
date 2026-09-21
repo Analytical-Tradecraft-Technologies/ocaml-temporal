@@ -722,9 +722,9 @@ let client_start client request =
   | Mock_client client -> mock_client_start client request
   | Native_client client -> native_client_start client request
 
-(** Waits for one exact native run. Open runs return [Not_ready] from each
-    bounded history wait; retrying through the supervisor preserves exact-run
-    identity while allowing shutdown to linearize between attempts. *)
+(** Waits for one exact native run. [Not_ready] resumes the same retained
+    history request on the next supervisor turn, preserving pagination and
+    exact-run identity while allowing shutdown to linearize between turns. *)
 let native_client_wait (client : native_client) (request : wait_request) =
   if Atomic.get client.closed then Error (bridge_error "client is shut down")
   else

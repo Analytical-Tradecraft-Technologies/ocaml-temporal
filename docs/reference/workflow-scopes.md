@@ -2,11 +2,13 @@
 
 `Temporal.Scope` is an experimental, workflow-local boundary for deciding
 which future a workflow still wants to observe. Cancelling a scope always
-wakes its waiters with a typed cancellation error. When an activity or child
+wakes its waiters with a typed cancellation error. When a remote activity or child
 workflow was started with the optional `~scope` argument, cancellation also
 invokes that operation's server-side cancellation hook exactly once. Timers
 and operations started without `~scope` remain observation-only and are
 cleaned up by the normal Temporal/runtime lifecycle.
+
+The local-activity start API does not expose `~scope`.
 
 Use a scope when a workflow wants one cancellation decision to cover both its
 local waiters and selected durable operations. Use an operation handle when
@@ -112,3 +114,17 @@ For a complete public-module index, see the [public API map](public-api-map.md).
 For server-facing activity and child cancellation behavior, see the
 [durable operation policy reference](durable-operation-policies.md), the
 [workflow guide](../guides/workflows.md), and the relevant protocol references.
+
+## Evidence and callback boundary
+
+The [audited evidence](live-acceptance-coverage.md#cancellation-and-non-live-evidence)
+pins the scope, activity and child implementations and their focused tests.
+The live child-cancellation fixture uses an explicit child handle; it does not
+invoke scope cancellation, so it is not direct live evidence for `~scope`.
+
+A successful hook buffers a command; it does not wait for a server terminal
+outcome or preempt an OCaml activity callback. Activity task cancellation and
+worker shutdown use separate lifecycle paths. The public activity context has
+no cooperative callback cancellation probe at the audited baseline, and the
+serialized adapter cannot drain a cancellation update while its callback is
+still executing. See [native activity cancellation](native-activity-execution.md#cancellation).

@@ -81,8 +81,13 @@ val patched : t -> patch_id:string -> bool
     retention and emission, and calls after shutdown raise [Invalid_argument]. *)
 val deprecate_patch : t -> patch_id:string -> unit
 
-(** Draws one deterministic integer in [0, bound).  The stream is seeded from
-    Temporal's initialization metadata and advances only in this execution's
+(** Replaces the deterministic stream with Core's reset seed. The activation
+    adapter validates the canonical uint64 decimal before this job is applied.
+    Raises [Invalid_argument] for malformed seeds or after shutdown. *)
+val update_random_seed : t -> randomness_seed:string -> unit
+
+(** Draws one deterministic integer in [0, bound). The stream is seeded from
+    Temporal's initialization or reset metadata and advances only in this execution's
     owner Domain.  Invalid bounds and lifecycle misuse are typed defects. *)
 val random_int : t -> bound:int -> (int, Temporal_base.Error.t) result
 
@@ -169,7 +174,11 @@ val schedule_activity :
 (** Schedules one local activity through Temporal Core's local-activity lane.
     Unlike [schedule_activity], this command has no remote task queue,
     heartbeat timeout, priority, or eager-execution setting; Core retries it
-    locally and records the result in workflow history for replay. *)
+    locally and records the result in workflow history for replay. Core can
+    delegate long retry delays to language-owned workflow timers. Cancellation
+    during such a delay removes the timer and settles the original future with
+    [Cancelled] under every policy, since no attempt is running. Cancellation
+    of a running attempt still follows Core's selected policy. *)
 val schedule_local_activity :
   t ->
   name:string ->

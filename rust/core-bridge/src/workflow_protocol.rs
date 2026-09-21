@@ -561,6 +561,11 @@ pub enum ActivationJob {
     NotifyHasPatch {
         patch_id: String,
     },
+    /// Replaces the deterministic random stream after a workflow reset.
+    /// Decimal text preserves the complete Core uint64 seed through JSON.
+    UpdateRandomSeed {
+        randomness_seed: String,
+    },
     FireTimer {
         seq: u32,
     },
@@ -797,12 +802,16 @@ pub enum UpdateResponseResult {
     Completed { payload: Payload },
 }
 
-/// Successful activation completion for one workflow run.
+/// One activation outcome. A task failure discards every command and preserves
+/// the execution so a corrected worker can reconstruct it from history.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Completion {
     pub run_id: String,
     pub commands: Vec<CompletionCommand>,
+    /// Optional task failure; omitted on successful completions for wire compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_failure: Option<Failure>,
 }
 
 /// Converts the duplicate-aware foundation tree to Serde's owned value.
@@ -930,7 +939,7 @@ pub(crate) fn validate_time(
     Ok(())
 }
 
-/// Parses the canonical unsigned decimal used for exact floating-point bits.
+/// Parses canonical unsigned decimal seeds and exact floating-point bits.
 fn validate_uint64_decimal(value: &str, path: &str) -> Result<u64, ProtocolError> {
     if value.is_empty() || (value.len() > 1 && value.starts_with('0')) {
         return Err(ProtocolError::invalid(
@@ -1444,6 +1453,9 @@ fn validate_activation(value: &Activation) -> Result<(), ProtocolError> {
             ActivationJob::NotifyHasPatch { patch_id } => {
                 identifier(patch_id, "$.jobs.patch_id")?;
             }
+            ActivationJob::UpdateRandomSeed { randomness_seed } => {
+                validate_uint64_decimal(randomness_seed, "$.jobs.randomness_seed")?;
+            }
             ActivationJob::CancelWorkflow { reason } => bounded_text(reason, "$.jobs.reason")?,
             ActivationJob::RemoveFromCache { message, .. } => {
                 bounded_text(message, "$.jobs.message")?
@@ -1476,6 +1488,15 @@ fn validate_activation(value: &Activation) -> Result<(), ProtocolError> {
 /// Applies completion-wide ordering, identity, and cross-command invariants.
 fn validate_completion(value: &Completion) -> Result<(), ProtocolError> {
     identifier(&value.run_id, "$.run_id")?;
+    if let Some(failure) = &value.task_failure {
+        if !value.commands.is_empty() {
+            return Err(ProtocolError::invalid(
+                "$.commands",
+                "failed workflow task cannot contain commands",
+            ));
+        }
+        validate_failure(failure, "$.task_failure")?;
+    }
     // Core retains the first patch-marker command for an ID. Tracking modes
     // while validating prevents a private caller from making durable
     // deprecation depend silently on command order. Same-mode repetitions are
@@ -2750,6 +2771,9 @@ pub fn activation_from_core(
                 Variant::NotifyHasPatch(value) => Ok(ActivationJob::NotifyHasPatch {
                     patch_id: value.patch_id.clone(),
                 }),
+                Variant::UpdateRandomSeed(value) => Ok(ActivationJob::UpdateRandomSeed {
+                    randomness_seed: value.randomness_seed.to_string(),
+                }),
                 Variant::FireTimer(value) => Ok(ActivationJob::FireTimer { seq: value.seq }),
                 Variant::CancelWorkflow(value) => Ok(ActivationJob::CancelWorkflow {
                     reason: value.reason.clone(),
@@ -3535,7 +3559,7 @@ fn command_from_core(
     }
 }
 
-/// Converts semantic commands to the official successful activation completion.
+/// Converts semantic commands or a task failure to the official completion status.
 pub fn completion_to_core(
     value: &Completion,
 ) -> Result<core_completion::WorkflowActivationCompletion, CoreConversionError> {
@@ -3553,6 +3577,13 @@ fn completion_to_core_with_child_namespace(
 ) -> Result<core_completion::WorkflowActivationCompletion, CoreConversionError> {
     validate_completion(value)
         .map_err(|_| invalid_core("semantic completion violates protocol invariants"))?;
+    if let Some(failure) = &value.task_failure {
+        return Ok(core_completion::WorkflowActivationCompletion::fail(
+            value.run_id.clone(),
+            failure_to_core(failure)?,
+            Some(temporalio_protos::temporal::api::enums::v1::WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure),
+        ));
+    }
     Ok(core_completion::WorkflowActivationCompletion {
         run_id: value.run_id.clone(),
         status: Some(
@@ -3617,7 +3648,7 @@ fn completion_to_core_for_activation_with_optional_namespace(
         activation.jobs.as_slice(),
         [ActivationJob::RemoveFromCache { .. }]
     );
-    if eviction && !completion.commands.is_empty() {
+    if eviction && (!completion.commands.is_empty() || completion.task_failure.is_some()) {
         return Err(invalid_core(
             "cache eviction activation must have an empty completion",
         ));
@@ -3641,6 +3672,11 @@ fn completion_to_core_for_activation_with_optional_namespace(
             ));
         }
     } else {
+        if completion.task_failure.is_some() {
+            return Err(invalid_core(
+                "query activation requires query results, not a task failure",
+            ));
+        }
         let mut result_ids = BTreeSet::new();
         for command in &completion.commands {
             let CompletionCommand::QueryResult { query_id, .. } = command else {
@@ -3663,7 +3699,7 @@ fn completion_to_core_for_activation_with_optional_namespace(
     completion_to_core_with_child_namespace(completion, child_workflow_namespace)
 }
 
-/// Converts a successful official completion without silently dropping flags or status.
+/// Converts supported official success/failure statuses without dropping flags or causes.
 pub fn completion_from_core(
     value: &core_completion::WorkflowActivationCompletion,
 ) -> Result<Completion, CoreConversionError> {
@@ -3674,10 +3710,26 @@ pub fn completion_from_core(
         .ok_or_else(|| invalid_core("Core completion status is absent"))?
     {
         Status::Successful(success) => success,
-        Status::Failed(_) => {
-            return Err(unsupported(
-                "failed activation completion is not represented by this command protocol",
-            ));
+        Status::Failed(failed) => {
+            use temporalio_protos::temporal::api::enums::v1::WorkflowTaskFailedCause;
+            if failed.force_cause
+                != i32::from(WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure)
+            {
+                return Err(unsupported("unsupported workflow task failure cause"));
+            }
+            let completion = Completion {
+                run_id: value.run_id.clone(),
+                commands: Vec::new(),
+                task_failure: Some(failure_from_core(
+                    failed
+                        .failure
+                        .as_ref()
+                        .ok_or_else(|| invalid_core("workflow task failure is absent"))?,
+                )?),
+            };
+            validate_completion(&completion)
+                .map_err(|_| invalid_core("Core task failure violates protocol invariants"))?;
+            return Ok(completion);
         }
     };
     if !success.used_internal_flags.is_empty() || success.versioning_behavior != 0 {
@@ -3686,6 +3738,7 @@ pub fn completion_from_core(
         ));
     }
     let completion = Completion {
+        task_failure: None,
         run_id: value.run_id.clone(),
         commands: success
             .commands

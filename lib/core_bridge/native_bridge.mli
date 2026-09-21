@@ -148,9 +148,9 @@ val client_poll_start_workflow_json : runtime -> bytes -> (bytes, error) result
     [Not_ready] asks the supervisor to service its mailbox and retry. *)
 val client_wait_start_workflow_json : runtime -> bytes -> (bytes, error) result
 
-(** Waits for one exact workflow run. Rust performs a close-event long poll for
-    at most 100 ms while the C stub releases the OCaml runtime lock. An open
-    run returns [Not_ready] without a terminal response so a caller can retry;
+(** Waits for one exact workflow run. Each call polls the retained Rust history
+    future for at most 100 ms while the C stub releases the OCaml runtime lock.
+    [Not_ready] preserves the request and pagination state for the next call;
     continued-as-new is returned as a terminal response and is never followed
     implicitly. *)
 val client_wait_workflow_json : runtime -> bytes -> (bytes, error) result

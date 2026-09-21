@@ -41,6 +41,14 @@ and bridge, read the [documentation guide](../README.md) first.
   regression checks retained live words across repeated callback batches.
 - Spawn order is source execution order.
 - Activation jobs are applied in their supplied list order.
+- Core's `UpdateRandomSeed` replaces only the execution-local random stream at
+  its position in that job pass, before resumed fibers run. The complete uint64
+  seed survives the bridge as canonical decimal text; the runtime preserves
+  its existing zero-seed fallback. Earlier workflow observations are retained.
+  Strict activation validation rejects a malformed seed before any timer or
+  other pending operation is consumed. The recorded
+  [timer-reset regression](../../test/integration/temporal/reset_random_seed/README.md)
+  checks the same stream through live execution and offline Core replay.
 - Resolving a future appends its waiters in waiter-registration order.
 - No hash-table traversal determines runnable or command ordering.
 - Command sequence numbers are monotonic per execution and begin at one.
@@ -102,6 +110,18 @@ and bridge, read the [documentation guide](../README.md) first.
   terminal result before start, duplicate acknowledgment, or unknown sequence
   is a non-retryable bridge defect; no event is silently dropped.
 - Activities, child workflows, and timers share one monotonic command sequence.
+- When Core delegates a local activity retry delay, the original activity
+  resolver and cancellation decision remain live while a separate workflow
+  timer owns the delay. Cancelling during that delay removes the timer callback,
+  emits its cancellation, and settles the original future as cancelled under
+  every policy: the preceding attempt has already finished. A backoff delivered
+  after cancellation settles the future without starting a timer. If the timer
+  fires first, the next attempt is already scheduled and Core owns its
+  cancellation according to the selected policy. Repeated cancellation never
+  emits another command or revives a retry. The focused
+  [runtime regression](../../test/runtime/test_local_activity_cancellation.ml)
+  and [live history/replay fixture](../../test/integration/local_activity_cancellation/README.md)
+  cover these ownership boundaries.
 - An activity retry policy is immutable once attached to a command. Its initial
   interval is positive, its maximum interval is at least the initial interval,
   its finite backoff coefficient is at least 1.0, and its maximum-attempt count
@@ -121,7 +141,12 @@ and bridge, read the [documentation guide](../README.md) first.
   command.
 - Terminal command emission is retained while pending runtime state is torn
   down immediately.
-- Malformed bridge jobs fail the execution with a non-retryable bridge error.
+- Unexpected code/codec defects and malformed bridge jobs fail the workflow
+  task, discard all buffered commands and unsafe continuations, and preserve
+  the open execution for replay. Deliberate typed application errors remain
+  terminal workflow failures. See [workflow failures](workflow-failures.md).
+- Completion ownership survives an uncertain acknowledgement. The adapter
+  must retain the exact value and may not replace it or rerun workflow code.
 
 ## Replay
 
@@ -312,6 +337,11 @@ and bridge, read the [documentation guide](../README.md) first.
   releases the client/Core graph. A result already queued for an abandoned
   ticket is discarded with its receiver; it cannot cause a second task join or
   a second native free.
+- Exact-run client waits retain their history future and pagination state
+  across bounded owner turns. The runtime admits at most 64 distinct pending
+  executions and retires each on a terminal result or error. Disconnect and
+  runtime shutdown cancel all retained futures before releasing Core; no
+  background wait task outlives the owner.
 - A backend shutdown result, including `Error`, means the graph has been
   consumed or invalidated. A retryable operation must not masquerade as
   terminal shutdown while it still owns live resources.

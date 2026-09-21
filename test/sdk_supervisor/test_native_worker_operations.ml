@@ -143,7 +143,7 @@ let test_protocol_serialization () =
   if not (Bytes.equal task.task_token (Bytes.of_string "\000\001\002")) then
     failwith "activity token changed while decoding";
   let workflow_completion : Workflow.completion =
-    { run_id = "run-1"; commands = [] }
+    { run_id = "run-1"; task_failure = None; commands = [] }
   in
   expect "workflow completion JSON"
     (Bytes.of_string {|{"commands":[],"run_id":"run-1"}|})
@@ -174,7 +174,7 @@ let test_protocol_failures_are_typed () =
       then failwith "workflow protocol error exposed source JSON"
   | _ -> failwith "invalid workflow activation was not a protocol error");
   let invalid_completion : Workflow.completion =
-    { run_id = ""; commands = [] }
+    { run_id = ""; task_failure = None; commands = [] }
   in
   match
     Supervisor.Protocol_adapter.encode_workflow_completion invalid_completion
@@ -453,7 +453,7 @@ let test_native_lifecycle_guards () =
   | Error (Supervisor.Backend { Bridge.status = Invalid_state; _ }) -> ()
   | _ -> failwith "activity readiness wait without worker was accepted");
   let invalid_completion : Workflow.completion =
-    { run_id = ""; commands = [] }
+    { run_id = ""; task_failure = None; commands = [] }
   in
   (match
      Supervisor.perform supervisor
@@ -462,7 +462,7 @@ let test_native_lifecycle_guards () =
   | Error (Supervisor.Backend { Bridge.status = Protocol; _ }) -> ()
   | _ -> failwith "invalid completion reached the native worker");
   let workflow_completion : Workflow.completion =
-    { run_id = "run-1"; commands = [] }
+    { run_id = "run-1"; task_failure = None; commands = [] }
   in
   (match
      Supervisor.perform supervisor

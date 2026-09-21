@@ -61,7 +61,8 @@ job is created. A child sequence is intentionally allowed twice, once for its
 start acknowledgment and once for its terminal result; duplicate events of
 the same kind and collisions with another operation kind are rejected. An
 unknown sequence is rejected later by `Execution`, which emits a non-retryable
-bridge failure rather than silently ignoring a Core event.
+bridge task failure rather than silently ignoring a Core event. That diagnostic
+flag does not close the execution or prevent a workflow-task retry.
 
 | Protocol job | Runtime job | Information retained by the adapter |
 | --- | --- | --- |
@@ -74,6 +75,7 @@ bridge failure rather than silently ignoring a Core event.
 | `Resolve_child_workflow` with `Completed` | `Resolve_child_workflow` with `Ok payload` | The translation preserves the terminal payload (including canonical null); `Workflow_context_store` resolves the child only after a successful start acknowledgment. |
 | `Resolve_child_workflow` with `Failed` or `Cancelled` | `Resolve_child_workflow` with `Error` | Child failure identity, retry state, details, cancellation category, and the bounded recursive diagnostic are retained. |
 | `Notify_has_patch` | `Notify_has_patch` | The validated patch ID is copied into execution-local patch state before workflow fibers run. Query-only activations cannot contain this or any other non-query job. |
+| `Update_random_seed` | `Update_random_seed` | The full canonical uint64 seed is retained as decimal text. The ordered job pass replaces the execution's random stream before resumed fibers run. |
 | `Fire_timer` | `Fire_timer` | The exact sequence is retained. |
 | `Cancel_workflow` | `Cancel_workflow` | The reason is retained in `translated_activation.cancellation_reason`. |
 | `Remove_from_cache` | `Remove_from_cache` | The message and eviction reason are retained in `translated_activation.cache_removal`. |
@@ -92,7 +94,10 @@ record instead.
 `command_to_protocol` converts one runtime command only when the two types have
 an exact, lossless representation. `completion_of_commands` preserves the
 runtime's emission order and runs `Workflow_protocol.encode_completion` over
-the complete result before returning it to the bridge.
+the complete result before returning it to the bridge. A poisoned execution
+instead returns `task_failure` with an empty command list; it never translates
+its discarded commands into an execution failure. See the
+[workflow failure contract](workflow-failures.md).
 
 | Runtime command | Protocol command | Notes |
 | --- | --- | --- |

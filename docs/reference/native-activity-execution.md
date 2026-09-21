@@ -131,7 +131,11 @@ adapter mutex:
    Temporal failure without text conversion; metadata still follows the
    runtime's strict UTF-8 key/value rules rather than becoming an unvalidated
    side channel.
-5. Validate the completion through the strict activity-protocol encoder.
+5. Validate the entire completion through the strict activity-protocol encoder
+   before admitting it to the pending-completion map. Invalid application
+   metadata (including duplicate or oversized keys) becomes a bounded,
+   non-retryable application failure with no details, retaining the exact task
+   token. Validate that replacement before admitting it too.
 6. Submit the completion to the supervisor and remove the token only after the
    supervisor returns `Ok ()`.
 
@@ -256,8 +260,10 @@ the OCaml supervisor starts a deterministic workflow timer. When that timer
 fires it re-emits `ScheduleLocalActivity` with the same activity sequence and
 the attempt/schedule metadata supplied by Core. OCaml therefore never chooses
 retry policy or invents attempt numbers, and a local completion is never
-treated as a remote RPC. Local activities are experimental while live Compose
-coverage and interceptors remain future work.
+treated as a remote RPC. Local activities remain experimental. The live baseline executes
+`smoke.local_activity` and requires `LOCAL`; the [audited live evidence](live-acceptance-coverage.md)
+records its successful run. Local backoff/retry, cancellation and replay/restart
+combinations still need dedicated live cases, and interceptors remain absent.
 
 ## Cancellation
 
@@ -276,6 +282,15 @@ handed to OCaml.  If the start completed before the owner drained the queued
 update, the token is gone and the update is stale, so it is discarded without
 submitting a duplicate completion.
 
+The callback adapter is serialized: this cancellation task handling does not
+preempt a callback already running under its lock. The public activity context
+exposes heartbeat/details operations, but no cooperative cancellation probe at
+the audited baseline. Workflow-side [scope hooks](workflow-scopes.md) buffer
+activity/child cancellation commands; they do not interrupt activity code.
+Worker shutdown is a separate lifecycle/drain operation. Focused lifecycle
+tests and the live stop marker do not establish a callback-duration or
+operational termination bound.
+
 ## Completion retry and ownership
 
 The adapter keeps a small token-keyed map of pending completions.  The map is
@@ -284,6 +299,15 @@ has already run.  Before polling a new task, `poll` retries one pending
 completion.  It never invokes the activity implementation again for that
 token.  A typed supervisor error or an exception leaves the completion in the
 map and returns an error to the caller because lease retirement is not proven.
+
+Only locally validated completions enter this map. A malformed application
+payload therefore cannot permanently block later activities or make
+`Worker.run` fail with a local protocol error. Once submission begins, even a
+replacement failure remains unchanged across uncertain transport outcomes;
+the adapter retires its token only after confirmed acceptance. The
+`smoke.activity_invalid_failure_details` live acceptance scenario exercises
+duplicate keys, oversized keys, and malformed UTF-8 through the public worker,
+requiring a normal activity to complete after each rejected failure.
 
 The token is copied on receipt, copied again into the completion, and never
 converted to a string.  This preserves arbitrary binary tokens, prevents
@@ -377,7 +401,7 @@ two-second-backoff policy and requires the exact
 under one second; it does not prove the full configured delay. The complete
 [PR #439 Compose
 run](https://github.com/mfow/ocaml-temporal/actions/runs/29824441578) retains
-that activity path in the current baseline.
+that activity path in its historical baseline. The [current evidence audit](live-acceptance-coverage.md) records the later successful source snapshot.
 
 The worker handoff uses `Will_complete_async` only for `define_async` callbacks.
 The later client endpoint rejects that marker and accepts only completed,
