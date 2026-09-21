@@ -1,0 +1,3 @@
+[default.extend-identifiers]
+# Standard OCaml open_flag constructor for opening an output channel.
+Open_wronly = "Open_wronly"

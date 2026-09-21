@@ -157,6 +157,9 @@ type ('input, 'output) t = {
   mutable started : bool;
   mutable terminal : bool;
   mutable evicted : bool;
+  mutable task_failure : Temporal_base.Error.t option;
+  (** A failed activation poisons this generation until the adapter retires its
+      completion and Core supplies a fresh initialization for replay. *)
 }
 
 (** Creates execution state without calling user workflow code. The code starts
@@ -206,6 +209,7 @@ let start ?(task_queue = "default") ?(randomness_seed = "0")
       started = false;
       terminal = false;
       evicted = false;
+      task_failure = None;
     }
   in
   let tags =
@@ -275,8 +279,38 @@ let emit_terminal execution command =
     | Upsert_search_attributes _
     | Continue_as_new _ -> ())
 
-(** Fails the workflow through the same one-terminal-command check. *)
+(** Categories that describe incompatible code or SDK state rather than a
+    deliberate business/application failure. Retryability flags affect workflow
+    execution retries only; they never turn these defects into terminal commands. *)
+let is_task_failure error =
+  match (Temporal_base.Error.view error).category with
+  | `Bridge | `Codec | `Defect -> true
+  | _ -> false
+
+(** Discards the entire unsafe command batch and closes this cache generation.
+    The adapter retains the failed completion separately until acknowledged. *)
+let fail_task execution error =
+  if Option.is_none execution.task_failure then begin
+    execution.task_failure <- Some error;
+    execution.terminal <- true;
+    clear_pending_updates execution;
+    (try Workflow_context_store.shutdown execution.context with _ -> ());
+    ignore (Workflow_context_store.take_commands execution.context);
+    report ~src:Observability.Source.workflow Logs.Error
+      ~tags:(Observability.tags ~operation:"workflow_task_failed"
+        ~workflow_type:(workflow_type execution)
+        ~error_kind:(Temporal_base.Error.kind error) ())
+      "workflow task failed; execution remains recoverable"
+  end
+
+(** Exposes the poisoned generation's task failure to the native adapter. *)
+let task_failure execution = execution.task_failure
+
+(** Deliberate application/operational failures close the execution; defects
+    reject only the current task so corrected code can replay the same run. *)
 let fail execution error =
+  if is_task_failure error then fail_task execution error
+  else begin
   if not execution.terminal then (
     let tags =
       Observability.tags ~operation:"workflow_failed"
@@ -286,6 +320,7 @@ let fail execution error =
     report ~src:Observability.Source.workflow Logs.Error ~tags
       "workflow failed");
   emit_terminal execution (Activation.Fail_workflow error)
+  end
 
 (** Creates a non-retryable error when Core and the OCaml runtime disagree about
     activation state. This is an SDK/bridge failure, not an application error. *)
@@ -336,7 +371,7 @@ let start_workflow execution =
                              ("workflow result encoder raised: "
                              ^ Printexc.to_string exn))
                 with
-                | Error error -> fail execution error
+                | Error error -> fail_task execution error
                 | Ok payload ->
                     emit_terminal execution (Activation.Complete_workflow payload)
                 end
@@ -516,10 +551,18 @@ let process_job execution = function
                            ("update handler raised: " ^ Printexc.to_string exn))
               in
                 begin match dispatched with
-                | Error error -> reject error
+                | Error error ->
+                    (* Typed validation/input rejection remains local to the
+                       update. After acceptance, codec failures invalidate any
+                       commands/mutable state produced by its handler. *)
+                    if (is_task_failure error && (!accepted ||
+                        (Temporal_base.Error.view error).category <> `Codec))
+                    then fail_task execution error
+                    else reject error
                 | Ok payload ->
                     if not !accepted then
-                      reject (bridge_error "workflow update completed without validation acknowledgement")
+                      fail_task execution
+                        (bridge_error "workflow update completed without validation acknowledgement")
                     else begin
                       Hashtbl.remove execution.pending_updates protocol_instance_id;
                       emit (`Completed payload)
@@ -539,9 +582,8 @@ let process_job execution = function
           in
           report ~src:Observability.Source.workflow Logs.Error ~tags
             "workflow signal has no registered handler";
-          fail execution
-            (Temporal_base.Error.make ~non_retryable:true ~category:`Workflow
-               ~message:("unhandled workflow signal: " ^ signal_name) ())
+          fail_task execution
+            (bridge_error ("unhandled workflow signal: " ^ signal_name))
       | Some handler ->
           let tags =
             Observability.tags ~operation:"workflow_signal_received"
@@ -565,6 +607,8 @@ let process_job execution = function
          job pass guarantees the decision is installed before any workflow
          fiber is drained for this activation. *)
       Workflow_context_store.notify_has_patch execution.context ~patch_id
+  | Activation.Update_random_seed { randomness_seed } ->
+      Workflow_context_store.update_random_seed execution.context ~randomness_seed
   | Fire_timer { seq } -> (
       match Workflow_context_store.fire_timer execution.context ~seq with
       | Ok () -> ()
@@ -600,16 +644,10 @@ let run_scheduler execution =
     in
     (match status with
     | Scheduler.Failed exception_ ->
-        (* A sibling fiber may have raised after continue-as-new or terminate
-           already buffered a terminal command. Do not append a second
-           terminal; the existing command remains authoritative. *)
-        if
-          execution.terminal
-          || Workflow_context_store.has_buffered_terminal execution.context
-        then ()
-        else
-          fail execution
-            (Temporal_base.Error.defect ~message:(Printexc.to_string exception_))
+        (* A defect invalidates this whole activation, including commands that
+           a sibling buffered before the exception. Core must replay it. *)
+        fail_task execution
+          (Temporal_base.Error.defect ~message:(Printexc.to_string exception_))
     | Scheduler.Complete | Scheduler.Blocked -> ());
     (* Predicates are checked only after runnable workflow code has drained.
        If a state mutation satisfies one, resolving its private signal queues a
@@ -680,6 +718,15 @@ let activate execution jobs =
                query answers and could retain a continuation at the boundary. *)
             if not execution.terminal && not query_only then run_scheduler execution;
             let commands = Workflow_context_store.take_commands execution.context in
+            let commands =
+              match List.find_map
+                (function
+                  | Activation.Fail_workflow error when is_task_failure error -> Some error
+                  | _ -> None) commands
+              with
+              | None -> commands
+              | Some error -> fail_task execution error; []
+            in
             (* Terminal commands emitted through [terminate] (continue-as-new or
                a Fail_workflow from a failed continue-as-new encode) do not go
                through [emit_terminal], so finalize here after the scheduler

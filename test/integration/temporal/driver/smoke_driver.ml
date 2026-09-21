@@ -770,6 +770,12 @@ let run () =
             ~task_queue:Definitions.task_queue
             ~id:"two-binary-activity-non-retryable-failure" ~input:"smoke"
         in
+        let* invalid_failure_details_handle =
+          start_workflow client
+            ~workflow:Definitions.activity_invalid_failure_details
+            ~task_queue:Definitions.task_queue
+            ~id:"two-binary-activity-invalid-failure-details" ~input:"smoke"
+        in
         let* child_retry_handle =
           start_workflow client ~workflow:Definitions.parent_retries_child
             ~task_queue:Definitions.task_queue
@@ -1087,6 +1093,14 @@ let run () =
           require_completed "smoke.activity_non_retryable_failure"
             "SMOKE:ACTIVITY_NON_RETRYABLE:OBSERVED"
             (Ok activity_non_retryable_result)
+        in
+        let* invalid_failure_details_result =
+          wait_workflow invalid_failure_details_handle
+        in
+        let* () =
+          require_completed "smoke.activity_invalid_failure_details"
+            "SMOKE:INVALID_FAILURE_DETAILS:RECOVERED"
+            (Ok invalid_failure_details_result)
         in
         let* child_retry_result = wait_workflow child_retry_handle in
         let* () =

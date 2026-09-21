@@ -11,8 +11,9 @@ details. For a concise statement of what users can run today, see the project
 Entries marked "Historical snapshot" preserve the status at an earlier
 milestone. Their follow-up wording is not a claim about the current
 implementation when a later entry documents that work as complete. The
-latest entry that records a successful live run is the authoritative status
-for the two-binary Temporal acceptance path.
+[commit-pinned live evidence audit](reference/live-acceptance-coverage.md)
+records the current tested source, named assertions and successful CI job for
+the Temporal acceptance controllers.
 
 ## 2026-07-21: Stable and prerelease tag consistency gate (#444)
 
@@ -2519,3 +2520,45 @@ outcome, including `WorkflowExecutionFailed` in the child and
 `ChildWorkflowExecutionFailed` in the parent. The live Compose controller is
 intentionally marked pending until its complete CI run proves the real
 Temporal replay and typed failure propagation.
+
+## 2026-09-20: Preserve open workflows after task defects (#511)
+
+Unexpected workflow/encoder/registration/SDK defects now produce Core failed
+workflow tasks with no commands. Deliberate typed application failures retain
+terminal semantics and retryability. The adapter discards unsafe state while
+retaining the exact completion and its ownership until acknowledgement, including
+an acknowledgement exception after source acceptance. The before-v1 contract and
+operation-specific query/update behavior are documented in
+[workflow failures](reference/workflow-failures.md).
+
+Local verification used the cached development image
+`ocaml-temporal-501-dev:latest` (OCaml 5.5.1, Rust 1.94.1, Dune 3.24.2), selected
+with Make's `COMPOSE_RUN` override and single-job Dune/Cargo builds. The focused
+runtime/bridge/observability/supervisor suites passed; Rust protocol and retry
+policy tests passed (44 + 5), and the existing replay ABI suite passed all ten
+tests including the five retained live histories. Scoped warning-denying Clippy,
+Rust formatting, repository whitespace, quality contract, and Compose
+configuration checks passed. The full cross-version/platform matrix remains the
+hosted CI gate; no dependency pin changed.
+
+The live `make test-temporal-task-failure-live` run captured in
+`20260920T093940780862Z` passed against Core
+`95e97686a079dcfe6c42e3254b2f3f5e3d97408f`, Temporal 1.32.0, and PostgreSQL 18.6.
+The source baseline plus patch hash, exact original run IDs, executable hashes,
+and image digests are in the checked-in
+[regression manifest](../test/integration/temporal/task_failure/histories/manifest.json).
+The broken worker recorded workflow-task failures for body, output encoder, and
+missing registration while each execution remained running. A fresh corrected
+executable replayed the committed timer prefix and completed the same three
+client handles. Both deliberate business failures closed their original runs
+with the expected retryability flags and no installed workflow retry policy.
+No speculative timer reached durable history. Both workers stopped gracefully,
+and the task-owned Compose stack and volume were removed; raw initial/terminal
+histories, describe responses and process/server logs remain under
+`_build/task-failure-live/20260920T093940780862Z/`.
+
+CI runs this recovery gate before the existing seven live controllers and
+uploads its bounded synthetic evidence immediately, even on failure. The
+retained protobuf histories also replay offline through the existing private
+Core ABI; this does not introduce a public replay API or establish the broader
+transport-fault/mixed-deployment qualification required by later issues.

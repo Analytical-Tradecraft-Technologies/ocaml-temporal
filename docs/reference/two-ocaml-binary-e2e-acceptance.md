@@ -1,10 +1,12 @@
 # Two-OCaml-binary Temporal acceptance design
 
-**Status:** The complete [PR #439 Actions
-run](https://github.com/mfow/ocaml-temporal/actions/runs/29824441578) verifies
-the current 26-start baseline against real Temporal Server and PostgreSQL. It
-includes local and remote activities, typed queries, direct and
-workflow-to-workflow signals, updates, termination, and external cancellation.
+**Status:** The [September 19 live job](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/35469570419/job/105967951226)
+passes the baseline at `beae10d0a58e`. The [evidence audit](live-acceptance-coverage.md)
+pins the definitions, scenarios, outcomes and platform/server limits; the
+[generated inventory](live-acceptance-inventory.md) tracks current membership.
+It includes local/remote activities, typed queries, direct/external signals,
+updates, termination, external cancellation and completed-target signal
+rejection. The PR runs below are historical milestones, not suite inventories.
 The historical [PR #289 Actions
 run](https://github.com/mfow/ocaml-temporal/actions/runs/29333761719) verifies
 the earlier seventeen-result baseline; the [PR #302 Actions
@@ -39,18 +41,19 @@ PR #289 added delayed asynchronous activity completion, continue-as-new
 successor following, typed signal/condition acceptance, and live child-start
 rejection to the timeout path, for seventeen top-level assertions. PR #302
 added and live-verified the long-backoff retry assertion as the eighteenth
-result. Later interaction and control scenarios bring the current fixture to
-26 top-level starts, all live-verified by PR #439.
+result. Later interaction and control scenarios were live-verified by PR #439.
+Subsequent source changes are recorded in the evidence audit above.
 
 The baseline driver/worker smoke is not workflow-code versioning evidence. The
-separate [`make test-temporal-workflow-patching`](workflow-patching.md#intended-live-replay-acceptance)
+separate [`make test-temporal-workflow-patching`](workflow-patching.md#live-replay-acceptance)
 target uses the same client-only-driver/worker role split but replaces workers
 around both a marker-free legacy history and a marker-bearing new history. Its
 real-server result is independently verified by the complete [PR #348 CI
 run](https://github.com/mfow/ocaml-temporal/actions/runs/29411260374); it must
 not be inferred from the baseline's green historical runs.
 
-The current implementation stages 26 top-level workflow starts. It begins with
+The current implementation stages the workflows in the generated inventory.
+It begins with
 the core activity, child, continuation, and signal scenarios before terminal
 waits, then adds direct signal, workflow-to-workflow signal, update,
 child-start-failure, termination, and external-cancellation workflows behind
@@ -675,7 +678,7 @@ for PR head `47c9a93`, later squash-merged as `f877fbf`:
    `non_retryable=false` and the stable message `workflow execution was
     cancelled`.
 
-The current fixture stages 26 top-level workflow starts and waits, including
+The current fixture stages named workflows and exact-run waits, including
 `smoke.activity_long_backoff_retry`, then starts
 `smoke.activity_timeout_retry` and `smoke.activity_heartbeat_timeout_retry` in
 serialized order. The child-start-failure parent returns
@@ -733,8 +736,8 @@ have their own live acceptance references and [coverage boundaries](live-accepta
 
 ## Completion criteria for this design
 
-The current 26-start baseline was verified by the complete [PR #439 CI
-run](https://github.com/mfow/ocaml-temporal/actions/runs/29824441578). The
+The current baseline is verified by the [audited CI job](live-acceptance-coverage.md#verified-ci-boundary).
+PR #439 remains historical evidence for its earlier interaction/control slice. The
 separate two-generation restart/replay acceptance was verified by the complete
 [PR #253 CI run](https://github.com/mfow/ocaml-temporal/actions/runs/29286560471).
 The baseline driver assertions and the restart controller are separate gates:
@@ -746,7 +749,7 @@ and ten-workflow milestones.
 
 The previous nine-workflow acceptance contract was verified by the complete
 [PR #210 CI run](https://github.com/mfow/ocaml-temporal/actions/runs/29221151859)
-for PR head `47c9a93` before the squash merge as `f877fbf`. The current
+for PR head `47c9a93` before the squash merge as `f877fbf`. The historical
 ten-workflow contract, including the updated timeout ordering, was verified by
 the complete [PR #229 CI run](https://github.com/mfow/ocaml-temporal/actions/runs/29235144016)
 for PR head `c244733` before the squash merge as `bfbd568`. PR #226's complete

@@ -325,6 +325,15 @@
         },
         {
           "type": "object", "additionalProperties": false,
+          "required": ["kind", "randomness_seed"],
+          "properties": {
+            "kind": {"const": "update_random_seed"},
+            "randomness_seed": {"$ref": "#/$defs/u64_decimal"}
+          },
+          "description": "Replaces the deterministic workflow random stream after reset. The seed is canonical uint64 decimal text and the job retains its position before resumed workflow code."
+        },
+        {
+          "type": "object", "additionalProperties": false,
           "required": ["kind", "seq"],
           "properties": {"kind": {"const": "fire_timer"}, "seq": {"$ref": "#/$defs/u32"}}
         },

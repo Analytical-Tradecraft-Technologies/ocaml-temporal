@@ -1,0 +1,157 @@
+{
+  "events": [
+    {
+      "eventId": "1",
+      "eventTime": "2026-09-20T09:39:55.576626299Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_EXECUTION_STARTED",
+      "taskId": "1048587",
+      "workflowExecutionStartedEventAttributes": {
+        "workflowType": {
+          "name": "task-failure.missing"
+        },
+        "taskQueue": {
+          "name": "ocaml-task-failure-recovery",
+          "kind": "TASK_QUEUE_KIND_NORMAL"
+        },
+        "input": {
+          "payloads": [
+            {
+              "metadata": {
+                "encoding": "YmluYXJ5L251bGw="
+              }
+            }
+          ]
+        },
+        "workflowTaskTimeout": "10s",
+        "originalExecutionRunId": "01a0be2f-c038-798b-b385-b3e39970d515",
+        "identity": "task-failure-client",
+        "firstExecutionRunId": "01a0be2f-c038-798b-b385-b3e39970d515",
+        "attempt": 1,
+        "firstWorkflowTaskBackoff": "0s",
+        "workflowId": "task-failure-missing"
+      }
+    },
+    {
+      "eventId": "2",
+      "eventTime": "2026-09-20T09:39:55.576653382Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_SCHEDULED",
+      "taskId": "1048588",
+      "workflowTaskScheduledEventAttributes": {
+        "taskQueue": {
+          "name": "ocaml-task-failure-recovery",
+          "kind": "TASK_QUEUE_KIND_NORMAL"
+        },
+        "startToCloseTimeout": "10s",
+        "attempt": 1
+      }
+    },
+    {
+      "eventId": "3",
+      "eventTime": "2026-09-20T09:39:55.582346882Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_STARTED",
+      "taskId": "1048593",
+      "workflowTaskStartedEventAttributes": {
+        "scheduledEventId": "2",
+        "identity": "task-failure-broken",
+        "requestId": "5ece906a-64cc-4a91-83af-f58ecfd1777c",
+        "historySizeBytes": "310",
+        "workerVersion": {
+          "buildId": "ocaml-temporal"
+        }
+      }
+    },
+    {
+      "eventId": "4",
+      "eventTime": "2026-09-20T09:39:55.625093132Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_FAILED",
+      "taskId": "1048607",
+      "workflowTaskFailedEventAttributes": {
+        "scheduledEventId": "2",
+        "startedEventId": "3",
+        "cause": "WORKFLOW_TASK_FAILED_CAUSE_WORKFLOW_WORKER_UNHANDLED_FAILURE",
+        "failure": {
+          "message": "no executable workflow is registered for type task-failure.missing",
+          "source": "ocaml-temporal",
+          "applicationFailureInfo": {
+            "type": "ocaml_temporal_native_worker",
+            "nonRetryable": true,
+            "details": {}
+          }
+        },
+        "identity": "task-failure-broken"
+      }
+    },
+    {
+      "eventId": "5",
+      "eventTime": "2026-09-20T09:40:05.630521054Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_SCHEDULED",
+      "taskId": "1048624",
+      "workflowTaskScheduledEventAttributes": {
+        "taskQueue": {
+          "name": "ocaml-task-failure-recovery",
+          "kind": "TASK_QUEUE_KIND_NORMAL"
+        },
+        "startToCloseTimeout": "10s",
+        "attempt": 3
+      }
+    },
+    {
+      "eventId": "6",
+      "eventTime": "2026-09-20T09:40:05.639168804Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_STARTED",
+      "taskId": "1048625",
+      "workflowTaskStartedEventAttributes": {
+        "scheduledEventId": "5",
+        "identity": "task-failure-corrected",
+        "requestId": "6dc9e286-2812-494b-ac74-9edaa9636808",
+        "historySizeBytes": "595",
+        "workerVersion": {
+          "buildId": "ocaml-temporal"
+        }
+      }
+    },
+    {
+      "eventId": "7",
+      "eventTime": "2026-09-20T09:40:05.648770679Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_COMPLETED",
+      "taskId": "1048626",
+      "workflowTaskCompletedEventAttributes": {
+        "scheduledEventId": "5",
+        "startedEventId": "6",
+        "identity": "task-failure-corrected",
+        "workerVersion": {
+          "buildId": "ocaml-temporal"
+        },
+        "sdkMetadata": {
+          "coreUsedFlags": [
+            3,
+            2,
+            1
+          ],
+          "sdkName": "temporal-rust",
+          "sdkVersion": "0.5.0"
+        },
+        "meteringMetadata": {}
+      }
+    },
+    {
+      "eventId": "8",
+      "eventTime": "2026-09-20T09:40:05.648804179Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_EXECUTION_COMPLETED",
+      "taskId": "1048627",
+      "workflowExecutionCompletedEventAttributes": {
+        "result": {
+          "payloads": [
+            {
+              "metadata": {
+                "encoding": "anNvbi9wbGFpbg=="
+              },
+              "data": "InJlY292ZXJlZCI="
+            }
+          ]
+        },
+        "workflowTaskCompletedEventId": "7"
+      }
+    }
+  ]
+}

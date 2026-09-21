@@ -69,7 +69,10 @@ NATIVE_RUST_TEST_TARGET := $(if $(strip $(TEMPORAL_RUST_BRIDGE_DIR)),,native-tes
 NATIVE_RUST_LINT_TARGET := $(if $(strip $(TEMPORAL_RUST_BRIDGE_DIR)),,native-lint-rust)
 RUST_BRIDGE_DIR ?= $(CURDIR)/_build/rust-bridge
 RUST_BRIDGE_KEY ?=
-COMPOSE_RUN := OCAML_IMAGE=$(OCAML_IMAGE) $(COMPOSE) --progress quiet run --rm --build --user $(HOST_UID):$(HOST_GID) $(SERVICE)
+# Build separately so Compose's build output goes to stderr and failures stop
+# the command. Only container stdout reaches version and Cargo metadata probes.
+COMPOSE_RUN := OCAML_IMAGE=$(OCAML_IMAGE) $(COMPOSE) --progress plain build $(SERVICE) >&2 && \
+	OCAML_IMAGE=$(OCAML_IMAGE) $(COMPOSE) --progress quiet run --rm --user $(HOST_UID):$(HOST_GID) $(SERVICE)
 RUN := $(COMPOSE_RUN) opam exec --
 CARGO := $(COMPOSE_RUN) cargo
 CARGO_MANIFEST := rust/Cargo.toml
@@ -79,7 +82,7 @@ ifeq ($(strip $(NATIVE_CARGO_TARGET_DIR)),)
 NATIVE_CARGO_TARGET_DIR := $(CURDIR)/_build/rust
 endif
 NATIVE_OCAML_VERSION ?= 5.5
-NATIVE_RUST_VERSION ?= 1.94.1
+NATIVE_RUST_VERSION ?= 1.97.1
 NATIVE_ARCH ?=
 NATIVE_RUST_HOST ?=
 NATIVE_ENV := CARGO_TARGET_DIR="$(NATIVE_CARGO_TARGET_DIR)"
@@ -90,7 +93,8 @@ QUALITY_TYPOS_VERSION ?= 1.48.0
 .PHONY: test-temporal-live-ci test-temporal-diagnostics-contract
 .PHONY: version-check build build-examples cargo-metadata test test-unit test-runtime test-rust test-bridge test-install test-api release-preflight release-tag-check test-quality-contract test-temporal-config test-temporal-worker-readiness-contract test-temporal-worker-stop-contract test-temporal-worker-crash-recovery-contract test-temporal-worker-cache-eviction-contract test-core-lifecycle-integration temporal-start temporal-start-worker temporal-run-driver temporal-inspect-smoke temporal-stop-worker test-temporal-two-binary test-temporal-integration test-temporal-worker-restart test-temporal-worker-restart-contract test-temporal-worker-restart-live test-temporal-worker-crash-recovery test-temporal-worker-cache-eviction test-temporal-worker-cache-eviction-live test-temporal-workflow-patching test-temporal-workflow-patching-contract test-temporal-workflow-patching-live test-temporal-parent-child-restart test-temporal-parent-child-restart-contract test-temporal-parent-child-restart-live test-temporal-parent-child-failure-replay test-temporal-parent-child-failure-replay-contract test-temporal-parent-child-failure-replay-live temporal-health temporal-status temporal-logs temporal-stop temporal-clean lint lint-rust fmt quality quality-tool-version-check quality-rust quality-spelling license-check audit clean verify check native-version-check native-build native-test native-test-rust native-test-install native-lint native-lint-rust native-verify
 version-check:
-	@actual="$$( $(RUN) ocamlc -version | tail -n 1 )"; \
+	@output="$$( $(RUN) ocamlc -version )" || exit $$?; \
+	actual="$$(printf '%s\n' "$$output" | tail -n 1)"; \
 	case "$$actual" in \
 		$(OCAML_VERSION).*) ;; \
 		*) echo "expected OCaml $(OCAML_VERSION).x, got $$actual" >&2; exit 1 ;; \
@@ -135,6 +139,11 @@ test-bridge:
 test-completed-queries-live:
 	$(RUN) dune exec test/integration/completed_queries/regression.exe -- check $(TEMPORAL_CLIENT_TEST_URL)
 
+# Requires a disposable server and an explicit official Temporal CLI path.
+.PHONY: test-local-activity-cancellation-live
+test-local-activity-cancellation-live:
+	$(RUN) dune exec test/integration/local_activity_cancellation/regression.exe -- check $(TEMPORAL_CLIENT_TEST_URL) $(TEMPORAL_TEST_CLI)
+
 test-install:
 	$(COMPOSE_RUN) sh test/bridge/test_install.sh
 
@@ -158,9 +167,21 @@ release-tag-check:
 	@test -n "$(RELEASE_TAG)" || { echo "set RELEASE_TAG=vMAJOR.MINOR.PATCH" >&2; exit 2; }
 	sh scripts/check-release-tag.sh . "$(RELEASE_TAG)"
 
-test-quality-contract:
+# Source-only documentation inventory, shared by the Linux/native test gates.
+.PHONY: check-live-acceptance-inventory update-live-acceptance-inventory test-live-acceptance-inventory-contract
+check-live-acceptance-inventory:
+	sh scripts/check-live-acceptance-inventory.sh . --check
+
+update-live-acceptance-inventory:
+	sh scripts/check-live-acceptance-inventory.sh . --write
+
+test-live-acceptance-inventory-contract:
+	sh test/smoke/test_live_acceptance_inventory_contract.sh .
+
+test-quality-contract: check-live-acceptance-inventory test-live-acceptance-inventory-contract
 	sh test/smoke/test_quality_contract.sh .
 	sh test/smoke/test_release_tag_contract.sh .
+	sh test/smoke/test_make_docker_commands.sh .
 	sh test/smoke/test_rust_bridge_artifact.sh .
 
 test-temporal-config:
@@ -756,6 +777,21 @@ native-lint-rust:
 	$(NATIVE_ENV) cargo clippy --manifest-path $(CARGO_MANIFEST) --locked --all-targets -- -D warnings
 
 native-verify: native-version-check native-build native-lint native-test
+
+# Focused bilateral task-failure protocol/runtime gates. Keep native linkers
+# bounded on developer machines with DUNE_JOBS and CARGO_BUILD_JOBS.
+.PHONY: test-workflow-task-failure build-task-failure-fixture test-temporal-task-failure-live
+test-workflow-task-failure:
+	$(RUN) dune runtest $(DUNE_BUILD_ARGS) test/runtime test/bridge test/observability test/sdk_supervisor
+	$(COMPOSE_RUN) env $(CARGO_TEST_ENV) cargo test --manifest-path $(CARGO_MANIFEST) --locked --test workflow_protocol --test workflow_retry_policy --test replay_abi
+
+build-task-failure-fixture:
+	$(RUN) dune build $(DUNE_BUILD_ARGS) test/integration/temporal/task_failure/broken_worker.exe test/integration/temporal/task_failure/corrected_worker.exe test/integration/temporal/task_failure/recovery_driver.exe
+
+# This local/CI controller uses host Python's standard library only. The three
+# OCaml binaries share one build tree and have no production fixture hooks.
+test-temporal-task-failure-live: test-temporal-config build-task-failure-fixture
+	TEMPORAL_COMPOSE_PROJECT="$(TEMPORAL_COMPOSE_PROJECT)" OCAML_IMAGE="$(OCAML_IMAGE)" python3 test/integration/temporal/scripts/run-task-failure-live.py
 
 # Publish only after the pinned toolchain, Rust lint, and full Rust test suite
 # pass. Native desktop CI uses this directly; Linux uses the same gate inside

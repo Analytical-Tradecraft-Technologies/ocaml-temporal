@@ -200,7 +200,7 @@ let waiting_workflow =
 let failing_workflow =
   Temporal.Workflow.define ~name:"failing_logging_fixture"
     ~input:Temporal.Codec.unit ~output:Temporal.Codec.unit (fun () ->
-      Error (Temporal.Error.defect ~message:"fixture failure"))
+      Error (Temporal.Error.make ~category:`Workflow ~message:"fixture failure" ()))
 
 (** Stable source and tag names are the filtering contract applications use. *)
 let test_source_and_tag_names () =
@@ -338,7 +338,7 @@ let test_workflow_events_and_privacy () =
       ignore (Execution.activate execution [ Activation.Start_workflow ]);
       let failure =
         require_event ~source:"temporal.sdk.workflow" ~level:Logs.Error
-          ~operation:"workflow_failed"
+          ~operation:"workflow_task_failed"
       in
       assert
         (Logs.Tag.find Observability.Tag.error_kind failure.tags = Some "bridge"))

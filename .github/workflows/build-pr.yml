@@ -3,8 +3,7 @@ name: Build
 on:
   merge_group:
     types: [checks_requested]
-  # Keep the workflow trigger unconditional so the license audit runs for
-  # documentation-only and other non-code pull requests as well.
+  # Required check names must still be reported for documentation-only changes.
   pull_request:
 
 permissions:
@@ -22,81 +21,49 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       code: ${{ steps.changed-paths.outputs.code }}
-      smoke: ${{ steps.changed-paths.outputs.smoke }}
-      native_windows: ${{ steps.changed-paths.outputs.native_windows }}
     steps:
-      - name: Check out change head
+      - name: Check out repository
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
-          ref: ${{ github.event.merge_group.head_sha || github.event.pull_request.head.sha }}
       - name: Classify changed paths
         id: changed-paths
         shell: bash
         env:
-          BASE_SHA: ${{ github.event.merge_group.base_sha || github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.merge_group.head_sha || github.event.pull_request.head.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
         run: |
           set -euo pipefail
           code=false
-          smoke=false
-          native_windows=false
 
-          while IFS= read -r path; do
-            # JSON schemas are executable protocol contracts even though they
-            # live beneath docs/. Validate them like code so an envelope shape
-            # change cannot silently receive license-only verification.
+          # Use the PR merge base so unrelated changes on master cannot turn
+          # a docs-only PR into a code build. For a merge group, base_sha is
+          # its ancestor and this includes every queued change in the group.
+          # Materialize the diff first: a failed git command must fail this
+          # required job, never silently classify the change as docs-only.
+          git diff --no-renames --name-only -z "$BASE_SHA...$HEAD_SHA" > "$RUNNER_TEMP/changed-paths"
+          while IFS= read -r -d '' path; do
             case "$path" in
-              docs/schemas/*)
+              # Workflow/action configuration and protocol schemas are code,
+              # including any Markdown fixtures under those directories.
+              .github/workflows/*|.github/actions/*|docs/schemas/*)
                 code=true
-                smoke=true
                 ;;
-              # Markdown and legal documentation retain the independent
-              # license audit but do not spend a compatibility matrix.
-              # Everything else fails closed into the normal code and
-              # live-smoke gates so a new build input is not silently
-              # license-only.
-              *.md|*.markdown|LICENSE*|NOTICE*|docs/*)
+              *.md|*.markdown|LICENSE*|NOTICE*)
                 continue
                 ;;
-              # The live acceptance fixture is intentionally smoke-specific:
-              # it exercises the complete Temporal/PostgreSQL topology but
-              # does not alter the ordinary library source or build graph.
-              test/integration/temporal/*)
-                smoke=true
-                continue
-                ;;
+              # Unknown paths fail closed, including new build inputs and
+              # live integration fixtures: the SDK builds as a single unit.
               *)
                 code=true
-                smoke=true
                 ;;
             esac
+          done < "$RUNNER_TEMP/changed-paths"
 
-            # The macOS native link is the representative desktop gate for
-            # every code PR. Windows is much slower, so run it before merge
-            # when a change can affect the Rust/C bridge, native build graph,
-            # or workflow configuration itself. The exhaustive
-            # master/scheduled matrix always runs Windows regardless of this
-            # classification.
-            case "$path" in
-              rust/*|lib/core_bridge/*|lib/sdk_supervisor/*|\
-              lib/public/native_worker.*|lib/runtime/native_*|test/bridge/*|\
-              *.c|*.h|Makefile|Dockerfile*|.dockerignore|dune|dune-project|\
-              dune-workspace|*.opam|*.opam.locked|*/dune|scripts/*|\
-              .github/workflows/*|.github/actions/*)
-                native_windows=true
-                ;;
-            esac
-          done < <(git diff --name-only "$BASE_SHA" "$HEAD_SHA")
-
-          {
-            echo "code=$code"
-            echo "smoke=$smoke"
-            echo "native_windows=$native_windows"
-          } >> "$GITHUB_OUTPUT"
+          echo "code=$code" >> "$GITHUB_OUTPUT"
 
   rust-amd64:
-    if: needs.changes.outputs.code == 'true' || needs.changes.outputs.smoke == 'true'
+    if: needs.changes.outputs.code == 'true'
     needs: changes
     uses: ./.github/workflows/rust-bridge.yml
     with:
@@ -121,7 +88,7 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v7
       - name: Install pinned quality tools
-        uses: taiki-e/install-action@26e9283f268b880168bdbd2c545dfcd60ec2c6ab # v2.87.13
+        uses: taiki-e/install-action@76c2e6406e52637deed7160d77bded76bd83e06e # v2.87.14
         with:
           tool: cargo-deny@0.20.2,cargo-machete@0.9.2,typos@1.48.0
           fallback: none
@@ -129,6 +96,8 @@ jobs:
         run: make quality
 
   license-audit:
+    if: needs.changes.outputs.code == 'true'
+    needs: changes
     name: Dependency license audit
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -158,11 +127,11 @@ jobs:
 
   temporal-integration:
     # Required checks must fail, rather than be skipped, when a producer fails.
-    if: ${{ !cancelled() && needs.changes.outputs.smoke == 'true' }}
+    if: ${{ !cancelled() && needs.changes.outputs.code == 'true' }}
     needs: [changes, rust-amd64]
     name: Temporal/PostgreSQL integration smoke (OCaml 5.5)
     runs-on: ubuntu-24.04
-    # Six independent live controllers run sequentially while reusing the
+    # Independent live controllers run sequentially while reusing the
     # checked-out source and build cache. Parent/child recovery includes a
     # deliberate 120-second timer and two complete worker generations.
     timeout-minutes: 45
@@ -197,6 +166,19 @@ jobs:
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
           docker system prune --all --force --volumes
           df -h /
+      - name: Recover the same workflow runs after task failures
+        # Independent of the seven existing controllers; any failed
+        # assertion fails this job after retaining this gate's evidence.
+        run: make test-temporal-task-failure-live
+      - name: Retain exact-run task failure recovery evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: workflow-task-failure-${{ github.run_id }}-${{ github.run_attempt }}
+          path: _build/task-failure-live/
+          if-no-files-found: warn
+          retention-days: 14
+
       - name: Run the live two-OCaml-binary Temporal Compose smoke
         # Leave time for always() upload after a scenario step times out.
         timeout-minutes: 40
@@ -236,7 +218,7 @@ jobs:
         # PRs exercise the compatibility floor and current release on the
         # primary Linux architecture, plus the current release on ARM64.
         # build.yml retains the exhaustive 5.2–5.5 × amd64/arm64 matrix for
-        # every master push and scheduled run.
+        # scheduled runs.
         include:
           - ocaml: "5.2"
             runner: ubuntu-24.04
@@ -279,17 +261,14 @@ jobs:
   native-macos:
     if: needs.changes.outputs.code == 'true'
     needs: changes
-    # macOS ARM64 provides a representative non-Linux native-link check for
-    # every code PR. It is intentionally separate from the conditional
-    # Windows job below so a normal PR does not wait for both desktop hosts.
     name: OCaml 5.5 / macOS ARM64
     runs-on: macos-15
     timeout-minutes: 45
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/_build/rust
-      RUSTUP_TOOLCHAIN: 1.94.1-aarch64-apple-darwin
+      RUSTUP_TOOLCHAIN: 1.97.1-aarch64-apple-darwin
       NATIVE_OCAML_VERSION: "5.5"
-      NATIVE_RUST_VERSION: 1.94.1
+      NATIVE_RUST_VERSION: 1.97.1
       NATIVE_ARCH: arm64
       NATIVE_RUST_HOST: aarch64-apple-darwin
     steps:
@@ -322,20 +301,16 @@ jobs:
         run: make native-verify
 
   native-windows:
-    # A Windows native build is required before merge when the cross-language
-    # ABI, its build toolchain, or the workflow that invokes it changes. Pure
-    # OCaml changes still receive Linux amd64/arm64 and macOS ARM validation;
-    # master and scheduled runs retain unconditional Windows coverage.
-    if: needs.changes.outputs.native_windows == 'true'
+    if: needs.changes.outputs.code == 'true'
     needs: changes
     name: OCaml 5.5 / Windows x64
     runs-on: windows-latest
     timeout-minutes: 45
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/_build/rust
-      RUSTUP_TOOLCHAIN: 1.94.1-x86_64-pc-windows-gnu
+      RUSTUP_TOOLCHAIN: 1.97.1-x86_64-pc-windows-gnu
       NATIVE_OCAML_VERSION: "5.5"
-      NATIVE_RUST_VERSION: 1.94.1
+      NATIVE_RUST_VERSION: 1.97.1
       NATIVE_ARCH: amd64
       NATIVE_RUST_HOST: x86_64-pc-windows-gnu
     steps:

@@ -285,7 +285,15 @@ parse boundary: a terminal-before-start, duplicate start, duplicate terminal,
 or unknown sequence returns a typed bridge defect and leaves the existing
 resolver state unchanged.
 
-A completion is a closed object sent from OCaml to Rust. Its ordered commands
+A completion is a closed object sent from OCaml to Rust. Optional
+`task_failure` distinguishes a failed workflow task from successful commands.
+Absent or null retains the original successful format; a structured failure
+requires an empty `commands` array and maps to Core failed status with
+`WorkflowWorkerUnhandledFailure`. It never closes the workflow execution.
+Query-only activations still require query answers, and eviction requires
+successful empty acknowledgement. See [workflow failures](workflow-failures.md).
+
+For successful completions, ordered commands
 cover scheduling and requesting cancellation of remote activities, starting and
 cancelling a child workflow, signalling or requesting cancellation of an
 external workflow, starting and cancelling timers, and completing,
@@ -338,6 +346,22 @@ invalid UTF-8, NUL bytes, and oversized values before Core sees a command.
 The complete shapes are defined by
 [`workflow-activation.schema.json`](../schemas/bridge/workflow-activation.schema.json)
 and [`workflow-completion.schema.json`](../schemas/bridge/workflow-completion.schema.json).
+
+### Reset randomness
+
+Core's `UpdateRandomSeed` becomes
+`{"kind":"update_random_seed","randomness_seed":"18446744073709551615"}`.
+Both codecs require canonical unsigned decimal text in the complete uint64
+range. Missing, numeric, signed, padded, overflowing, duplicate, and unknown
+fields are rejected. Decimal text avoids signed OCaml integer limits and JSON
+floating-point rounding.
+
+The bridge retains the job's position. During the ordered activation pass the
+runtime replaces its deterministic random state before draining runnable
+fibers, including a timer resumed alongside the reset notification. This
+metadata job emits no command. Query-only and eviction-only activation rules
+still apply. See the [recorded reset fixture](../../test/integration/temporal/reset_random_seed/README.md)
+for bounded live and offline replay evidence; reset remains experimental.
 
 ### Patch notification and marker
 
