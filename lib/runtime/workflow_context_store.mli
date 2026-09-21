@@ -1,3 +1,12 @@
+(** Immutable metadata recorded on this run's start event. Payload bytes are
+    copied on installation and observation; later search-attribute upserts do
+    not change this historical snapshot. [None] and [Some []] remain distinct. *)
+type start_metadata = {
+  memo : (string * Temporal_base.Payload.t) list option;
+  search_attributes : (string * Temporal_base.Payload.t) list option;
+  execution_expiration_time : Temporal_protocol.Workflow_protocol.timestamp option;
+}
+
 (** The activities, timers, and commands belonging to one workflow execution.
     The runtime temporarily makes this context current while running that
     workflow's OCaml code. *)
@@ -36,6 +45,13 @@ val get_local : t -> 'a local -> 'a option
 
 (** Writes a key in one execution context. *)
 val set_local : t -> 'a local -> 'a -> unit
+
+(** Installs this run's start snapshot before workflow code executes. *)
+val set_start_metadata : t -> start_metadata option -> unit
+
+(** Returns a copy of the historical start snapshot, or [None] when this is a
+    synthetic execution without initialization metadata. *)
+val start_metadata : t -> start_metadata option
 
 (** Records the timestamp attached to the activation that is about to run user
     workflow code. [None] is used for synthetic runtime activations, such as

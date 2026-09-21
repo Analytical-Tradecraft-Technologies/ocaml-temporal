@@ -232,6 +232,18 @@ pub struct Continuation {
 pub struct InitializeContext {
     /// User headers delivered to workflow interceptors.
     pub headers: BTreeMap<String, Payload>,
+    /// Start memo, preserving absent versus explicitly empty protobuf maps.
+    #[serde(deserialize_with = "required_nullable")]
+    pub memo: Option<BTreeMap<String, Payload>>,
+    /// Indexed values recorded on this run's start event, including inherited values.
+    #[serde(deserialize_with = "required_nullable")]
+    pub search_attributes: Option<BTreeMap<String, Payload>>,
+    /// Server-enforced execution-chain deadline; zero remains a present timestamp.
+    #[serde(deserialize_with = "required_nullable")]
+    pub workflow_execution_expiration_time: Option<Timestamp>,
+    /// Server-applied delay before this run's first task, including continuation throttling.
+    #[serde(deserialize_with = "required_nullable")]
+    pub first_workflow_task_backoff: Option<Duration>,
     /// Identity of the client that started this execution.
     pub identity: String,
     /// Parent execution for a child workflow, otherwise absent.
@@ -1262,6 +1274,32 @@ fn validate_activation(value: &Activation) -> Result<(), ProtocolError> {
                 if let Some(context) = context {
                     for key in context.headers.keys() {
                         identifier(key, "$.jobs.context.headers")?;
+                    }
+                    for (name, fields) in [
+                        ("memo", &context.memo),
+                        ("search_attributes", &context.search_attributes),
+                    ] {
+                        if let Some(fields) = fields {
+                            for key in fields.keys() {
+                                identifier(key, &format!("$.jobs.context.{name}"))?;
+                            }
+                        }
+                    }
+                    if let Some(expiration) = context.workflow_execution_expiration_time {
+                        validate_time(
+                            expiration.seconds,
+                            expiration.nanoseconds,
+                            false,
+                            "$.jobs.context.workflow_execution_expiration_time",
+                        )?;
+                    }
+                    if let Some(backoff) = context.first_workflow_task_backoff {
+                        validate_time(
+                            backoff.seconds,
+                            backoff.nanoseconds,
+                            true,
+                            "$.jobs.context.first_workflow_task_backoff",
+                        )?;
                     }
                     bounded_text(&context.identity, "$.jobs.context.identity")?;
                     if let Some(parent) = &context.parent_workflow {
@@ -2512,44 +2550,34 @@ fn eviction_reason_from_core(value: i32) -> Result<EvictionReason, CoreConversio
     )
 }
 
-/// Checks that initialize fields omitted from this first slice are either
-/// defaulted or carry only a documented Core compatibility default.
-///
-/// Temporal Core maps the server's `first_workflow_task_backoff` field to
-/// `cron_schedule_to_schedule_interval`. The Temporal server serializes a
-/// normal, non-cron start with an explicit zero duration in that field. Zero
-/// has no scheduling meaning and therefore does not need a public semantic
-/// representation; every non-zero value remains rejected so a cron delay or
-/// another start-time delay cannot be silently discarded.
-///
-/// A successor activation is different from an ordinary root activation.
-/// Core deliberately carries memo, search attributes, and
-/// execution-expiration metadata into that activation, even when the command
-/// used the defaults. The retry policy is retained in `InitializeContext`,
-/// while the remaining fields have no representation in this first OCaml
-/// workflow-context slice. Rejecting those remaining fields would make the
-/// public continue-as-new command unusable against a real Temporal Server.
-/// Once continuation provenance is present, they are therefore accepted as
-/// compatibility metadata while the represented continuation identity,
-/// retry policy, and terminal payloads remain validated below.
+/// Rejects cron and root start-delay semantics. The server also inserts a
+/// first-task backoff for rapid continue-as-new and retry runs; that already
+/// applied duration is validated and retained rather than mistaken for cron.
 fn validate_initialize_subset(
     value: &core_activation::InitializeWorkflow,
+    continuation: Option<&Continuation>,
 ) -> Result<(), CoreConversionError> {
-    let is_continuation = !value.continued_from_execution_run_id.is_empty()
-        || value.continued_initiator != 0
-        || value.continued_failure.is_some()
-        || value.last_completion_result.is_some();
-    let has_unsupported_root_metadata = !value.cron_schedule.is_empty()
-        || value.workflow_execution_expiration_time.is_some()
-        || value
+    if !value.cron_schedule.is_empty()
+        || value.continued_initiator == i32::from(api_enums::ContinueAsNewInitiator::CronSchedule)
+    {
+        return Err(unsupported(
+            "cron schedules are not supported by the OCaml worker",
+        ));
+    }
+    let supported_continuation = continuation.is_some_and(|value| {
+        matches!(
+            value.initiator,
+            ContinueAsNewInitiator::Workflow | ContinueAsNewInitiator::Retry
+        )
+    });
+    if !supported_continuation
+        && value
             .cron_schedule_to_schedule_interval
             .as_ref()
             .is_some_and(|duration| duration.seconds != 0 || duration.nanos != 0)
-        || value.memo.is_some()
-        || value.search_attributes.is_some();
-    if !is_continuation && has_unsupported_root_metadata {
+    {
         return Err(unsupported(
-            "initialize workflow contains fields not represented by this protocol slice",
+            "root start delay is not supported by the OCaml worker",
         ));
     }
     Ok(())
@@ -2585,7 +2613,8 @@ pub fn activation_from_core(
                 .ok_or_else(|| invalid_core("Core activation job variant is absent"))?
             {
                 Variant::InitializeWorkflow(value) => {
-                    validate_initialize_subset(value)?;
+                    let continuation = continuation_from_core(value)?;
+                    validate_initialize_subset(value, continuation.as_ref())?;
                     Ok(ActivationJob::InitializeWorkflow {
                         workflow_id: value.workflow_id.clone(),
                         workflow_type: value.workflow_type.clone(),
@@ -2604,6 +2633,45 @@ pub fn activation_from_core(
                                     Ok((key.clone(), payload_from_core(payload)?))
                                 })
                                 .collect::<Result<_, CoreConversionError>>()?,
+                            memo: value
+                                .memo
+                                .as_ref()
+                                .map(|memo| {
+                                    memo.fields
+                                        .iter()
+                                        .map(|(key, payload)| {
+                                            Ok((key.clone(), payload_from_core(payload)?))
+                                        })
+                                        .collect::<Result<_, CoreConversionError>>()
+                                })
+                                .transpose()?,
+                            search_attributes: value
+                                .search_attributes
+                                .as_ref()
+                                .map(|attributes| {
+                                    attributes
+                                        .indexed_fields
+                                        .iter()
+                                        .map(|(key, payload)| {
+                                            Ok((key.clone(), payload_from_core(payload)?))
+                                        })
+                                        .collect::<Result<_, CoreConversionError>>()
+                                })
+                                .transpose()?,
+                            workflow_execution_expiration_time: value
+                                .workflow_execution_expiration_time
+                                .as_ref()
+                                .map(|time| Timestamp {
+                                    seconds: time.seconds,
+                                    nanoseconds: time.nanos,
+                                }),
+                            first_workflow_task_backoff: value
+                                .cron_schedule_to_schedule_interval
+                                .as_ref()
+                                .map(|time| Duration {
+                                    seconds: time.seconds,
+                                    nanoseconds: time.nanos,
+                                }),
                             identity: value.identity.clone(),
                             parent_workflow: value.parent_workflow_info.as_ref().map(|parent| {
                                 NamespacedWorkflowExecution {
@@ -2648,7 +2716,7 @@ pub fn activation_from_core(
                                 .as_ref()
                                 .map(retry_policy_from_core)
                                 .transpose()?,
-                            continuation: continuation_from_core(value)?,
+                            continuation,
                         })),
                     })
                 }

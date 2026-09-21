@@ -778,6 +778,14 @@ native-lint-rust:
 
 native-verify: native-version-check native-build native-lint native-test
 
+# Retains exact metadata histories in _build for the conformance/corpus gates.
+# The caller chooses the Compose project and owns the server lifecycle.
+.PHONY: test-temporal-start-metadata-live
+test-temporal-start-metadata-live:
+	$(RUN) dune build $(DUNE_BUILD_ARGS) test/integration/temporal/driver/start_metadata_driver.exe
+	$(MAKE) temporal-start
+	TEMPORAL_COMPOSE_PROJECT=$(TEMPORAL_COMPOSE_PROJECT) TEMPORAL_METADATA_IMAGE="$(TEMPORAL_METADATA_IMAGE)" HOST_UID=$(HOST_UID) HOST_GID=$(HOST_GID) sh test/integration/temporal/scripts/run-start-metadata-live.sh
+
 # Focused bilateral task-failure protocol/runtime gates. Keep native linkers
 # bounded on developer machines with DUNE_JOBS and CARGO_BUILD_JOBS.
 .PHONY: test-workflow-task-failure build-task-failure-fixture test-temporal-task-failure-live

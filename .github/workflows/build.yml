@@ -110,6 +110,24 @@ jobs:
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
           docker system prune --all --force --volumes
           df -h /
+      - name: Verify workflow start metadata and exact-history worker replacement
+        env:
+          TEMPORAL_COMPOSE_PROJECT: ocaml-temporal-metadata-ci
+        run: |
+          trap 'make temporal-clean' EXIT
+          make test-temporal-start-metadata-live
+      - name: Retain synthetic workflow start metadata evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: workflow-start-metadata-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            _build/start-metadata-evidence/*.json
+            _build/start-metadata-evidence/*.tsv
+            _build/start-metadata-evidence/*.roots
+            _build/start-metadata-evidence/*.log
+          if-no-files-found: warn
+          retention-days: 7
       - name: Recover the same workflow runs after task failures
         # Independent of the seven existing controllers; any failed
         # assertion fails this job after retaining this gate's evidence.

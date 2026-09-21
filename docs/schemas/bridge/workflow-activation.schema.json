@@ -47,9 +47,13 @@
     "initialize_context": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["headers", "identity", "parent_workflow", "workflow_execution_timeout", "workflow_run_timeout", "workflow_task_timeout", "first_execution_run_id", "start_time", "root_workflow", "priority", "retry_policy", "continuation"],
+      "required": ["headers", "memo", "search_attributes", "workflow_execution_expiration_time", "first_workflow_task_backoff", "identity", "parent_workflow", "workflow_execution_timeout", "workflow_run_timeout", "workflow_task_timeout", "first_execution_run_id", "start_time", "root_workflow", "priority", "retry_policy", "continuation"],
       "properties": {
         "headers": {"type": "object", "maxProperties": 201326592, "additionalProperties": {"$ref": "#/$defs/payload"}},
+        "memo": {"oneOf": [{"type": "object", "maxProperties": 201326592, "additionalProperties": {"$ref": "#/$defs/payload"}}, {"type": "null"}]},
+        "search_attributes": {"oneOf": [{"type": "object", "maxProperties": 201326592, "additionalProperties": {"$ref": "#/$defs/payload"}}, {"type": "null"}]},
+        "first_workflow_task_backoff": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/duration"}]},
+        "workflow_execution_expiration_time": {"oneOf": [{"$ref": "#/$defs/timestamp"}, {"type": "null"}]},
         "identity": {"type": "string", "maxLength": 65536},
         "parent_workflow": {"oneOf": [{"$ref": "#/$defs/namespaced_workflow_execution"}, {"type": "null"}]},
         "workflow_execution_timeout": {"oneOf": [{"$ref": "#/$defs/duration"}, {"type": "null"}]},

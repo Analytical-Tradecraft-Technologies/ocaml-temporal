@@ -114,6 +114,10 @@ type continuation = {
 
 type initialize_context = {
   headers : (string * payload) list;
+  memo : (string * payload) list option;
+  search_attributes : (string * payload) list option;
+  workflow_execution_expiration_time : timestamp option;
+  first_workflow_task_backoff : duration option;
   identity : string;
   parent_workflow : namespaced_workflow_execution option;
   workflow_execution_timeout : duration option;
@@ -1532,6 +1536,9 @@ let initialize_context path json =
   let fields =
     [
       "headers";
+      "memo";
+      "search_attributes";
+      "workflow_execution_expiration_time"; "first_workflow_task_backoff";
       "identity";
       "parent_workflow";
       "workflow_execution_timeout";
@@ -1548,6 +1555,16 @@ let initialize_context path json =
   let* entries = exact_object path fields json in
   let* headers_json = field path "headers" entries in
   let* headers = payload_map (path ^ ".headers") headers_json in
+  let metadata name =
+    let* value = field path name entries in
+    nullable (path ^ "." ^ name) payload_map value
+  in
+  let* memo = metadata "memo" in
+  let* search_attributes = metadata "search_attributes" in
+  let* expiration_json = field path "workflow_execution_expiration_time" entries in
+  let* workflow_execution_expiration_time =
+    nullable (path ^ ".workflow_execution_expiration_time") timestamp expiration_json
+  in
   let* identity_json = field path "identity" entries in
   let* identity = string (path ^ ".identity") identity_json in
   let* parent_json = field path "parent_workflow" entries in
@@ -1556,6 +1573,7 @@ let initialize_context path json =
     let* value = field path name entries in
     nullable (path ^ "." ^ name) duration value
   in
+  let* first_workflow_task_backoff = timeout "first_workflow_task_backoff" in
   let* workflow_execution_timeout = timeout "workflow_execution_timeout" in
   let* workflow_run_timeout = timeout "workflow_run_timeout" in
   let* workflow_task_timeout = timeout "workflow_task_timeout" in
@@ -1574,6 +1592,9 @@ let initialize_context path json =
   Ok
     {
       headers;
+      memo;
+      search_attributes;
+      workflow_execution_expiration_time; first_workflow_task_backoff;
       identity;
       parent_workflow;
       workflow_execution_timeout;
@@ -1611,6 +1632,12 @@ let retry_policy_json value =
 (** Encodes a first-workflow initialization context. *)
 let initialize_context_json value =
   let* headers = payload_map_json "$.context.headers" value.headers in
+  let optional_metadata name = function
+    | None -> Ok `Null
+    | Some values -> payload_map_json ("$.context." ^ name) values
+  in
+  let* memo = optional_metadata "memo" value.memo in
+  let* search_attributes = optional_metadata "search_attributes" value.search_attributes in
   let optional_time = function
     | None -> `Null
     | Some value -> time_json value.seconds value.nanoseconds
@@ -1661,6 +1688,13 @@ let initialize_context_json value =
     (`Assoc
       [
         ("headers", headers);
+        ("memo", memo);
+        ("search_attributes", search_attributes);
+        ("workflow_execution_expiration_time",
+          match value.workflow_execution_expiration_time with
+          | None -> `Null
+          | Some value -> time_json value.seconds value.nanoseconds);
+        ("first_workflow_task_backoff", optional_time value.first_workflow_task_backoff);
         ("identity", `String value.identity);
         ("parent_workflow", parent_workflow);
         ("workflow_execution_timeout", optional_time value.workflow_execution_timeout);

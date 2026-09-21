@@ -313,3 +313,32 @@ let continue_as_new definition next_input =
       | Error error ->
           Temporal_sdk_kernel.Workflow_context_store.terminate context
             (Temporal_sdk_kernel.Activation.Fail_workflow error))
+
+(** Independently owned metadata observed on the run's durable start event. *)
+type start_metadata = {
+  memo : (string * Payload.t) list option;
+  search_attributes : (string * Payload.t) list option;
+  execution_expiration_time : Time.t option;
+}
+
+(** Converts the retained exact expiration timestamp to public time without
+    changing the server-owned deadline or scheduling a workflow command. *)
+let start_metadata () =
+  match Temporal_sdk_kernel.Workflow_context_store.current () with
+  | None -> Error (Error.defect
+      ~message:"Temporal.Workflow.start_metadata used outside a workflow execution")
+  | Some context ->
+      match Temporal_sdk_kernel.Workflow_context_store.start_metadata context with
+      | None -> Error (Error.defect
+          ~message:"Temporal.Workflow.start_metadata is unavailable for this execution")
+      | Some metadata ->
+          let expiration = match metadata.execution_expiration_time with
+            | None -> Ok None
+            | Some time ->
+                Result.map Option.some
+                  (Time.of_unix ~seconds:time.seconds ~nanoseconds:time.nanoseconds)
+          in
+          Result.map (fun execution_expiration_time ->
+            { memo = Option.map (List.map (fun (key, value) -> (key, Payload_private.of_base value))) metadata.memo;
+              search_attributes = Option.map (List.map (fun (key, value) -> (key, Payload_private.of_base value))) metadata.search_attributes;
+              execution_expiration_time }) expiration

@@ -152,9 +152,15 @@ type continuation = {
 }
 
 (** Initialization fields delivered by Core, including optional continuation
-    provenance for a successor run. *)
+    provenance for a successor run. Metadata maps preserve absent versus empty.
+    [first_workflow_task_backoff] is an already-applied server delay, including
+    rapid continuation throttling; the language runtime never schedules it again. *)
 type initialize_context = {
   headers : (string * payload) list;
+  memo : (string * payload) list option;
+  search_attributes : (string * payload) list option;
+  workflow_execution_expiration_time : timestamp option;
+  first_workflow_task_backoff : duration option;
   identity : string;
   parent_workflow : namespaced_workflow_execution option;
   workflow_execution_timeout : duration option;

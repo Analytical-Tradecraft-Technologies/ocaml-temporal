@@ -224,6 +224,10 @@ let start ?(task_queue = "default") ?(randomness_seed = "0")
 let workflow_type execution =
   Temporal_base.Definition.name execution.definition
 
+(** Installs independently owned start metadata before the initial fiber runs. *)
+let set_start_metadata execution metadata =
+  Workflow_context_store.set_start_metadata execution.context metadata
+
 (** Updates the reusable execution context with the current activation clock.
     Keeping this setter behind the execution abstraction prevents native code
     from reaching into the context record or bypassing its lifecycle rules. *)
