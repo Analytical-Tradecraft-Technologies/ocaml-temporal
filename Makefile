@@ -178,7 +178,7 @@ update-live-acceptance-inventory:
 test-live-acceptance-inventory-contract:
 	sh test/smoke/test_live_acceptance_inventory_contract.sh .
 
-test-quality-contract: check-live-acceptance-inventory test-live-acceptance-inventory-contract
+test-quality-contract: check-live-acceptance-inventory test-live-acceptance-inventory-contract test-temporal-namespace-readiness
 	sh test/smoke/test_quality_contract.sh .
 	sh test/smoke/test_release_tag_contract.sh .
 	sh test/smoke/test_make_docker_commands.sh .
@@ -814,3 +814,8 @@ rust-bridge:
 .PHONY: test-task-failure-command-logging
 test-task-failure-command-logging:
 	python3 -m unittest discover -s test/smoke -p 'test_task_failure_command_logging.py'
+
+# Exercises namespace propagation failures without a live server or Docker.
+.PHONY: test-temporal-namespace-readiness
+test-temporal-namespace-readiness:
+	sh test/smoke/test_temporal_namespace_readiness.sh .
