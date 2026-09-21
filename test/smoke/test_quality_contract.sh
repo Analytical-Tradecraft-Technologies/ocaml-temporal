@@ -320,12 +320,15 @@ printf '%s\n' "$pr_smoke" |
   grep -Fqx '    name: Temporal/PostgreSQL integration smoke (OCaml 5.5)'
 printf '%s\n' "$pr_smoke" | grep -Fqx '    timeout-minutes: 45'
 printf '%s\n' "$pr_smoke" | grep -Fqx '      OCAML_VERSION: "5.5"'
-printf '%s\n' "$pr_smoke" | grep -Fqx '          make test-temporal-integration'
-printf '%s\n' "$pr_smoke" | grep -Fqx '          make test-temporal-worker-restart'
-printf '%s\n' "$pr_smoke" | grep -Fqx '          make test-temporal-worker-crash-recovery'
-printf '%s\n' "$pr_smoke" | grep -Fqx '          make test-temporal-worker-cache-eviction'
-printf '%s\n' "$pr_smoke" | grep -Fqx '          make test-temporal-workflow-patching'
-printf '%s\n' "$pr_smoke" | grep -Fqx '          make test-temporal-parent-child-restart'
+
+# Both live lanes share the evidence wrapper and an unconditional upload with
+# a short retention period. This ensures a controller failure cannot bypass
+# the publication gate or silently diverge between PR and scheduled jobs.
+for workflow in "$source_root/.github/workflows/build-pr.yml" "$source_root/.github/workflows/build.yml"; do
+  sed -n '/^  temporal-integration:/,/^  verify:/p' "$workflow" | grep -Fqx '        run: make test-temporal-live-ci'
+  grep -Fq 'uses: actions/upload-artifact@' "$workflow"
+  grep -Fq '          retention-days: 7' "$workflow"
+done
 
 # Exercise the actual classifier with Git histories, including PR base drift,
 # merge groups, deletions, renames, unusual filenames, and failed comparisons.
