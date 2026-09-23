@@ -735,8 +735,10 @@ check: verify license-check
 
 # Native targets are used by the non-Linux compatibility jobs. The default
 # developer path remains Docker Compose so no host OCaml toolchain is required.
+# Windows OCaml writes CRLF; normalize its output before exact comparisons.
 native-version-check:
-	@actual_ocaml="$$( $(NATIVE_RUN) ocamlc -version )"; \
+	@output="$$( $(NATIVE_RUN) ocamlc -version )" || exit $$?; \
+	actual_ocaml="$$(printf '%s' "$$output" | tr -d '\r')"; \
 	case "$$actual_ocaml" in \
 		$(NATIVE_OCAML_VERSION)|$(NATIVE_OCAML_VERSION).*) ;; \
 		*) echo "expected OCaml $(NATIVE_OCAML_VERSION), got $$actual_ocaml" >&2; exit 1 ;; \
@@ -746,7 +748,8 @@ native-version-check:
 		echo "expected rustc $(NATIVE_RUST_VERSION), got $$actual_rust" >&2; exit 1; \
 	fi
 	@if [ -n "$(NATIVE_ARCH)" ]; then \
-		actual_arch="$$( $(NATIVE_RUN) ocamlc -config-var architecture )"; \
+		output="$$( $(NATIVE_RUN) ocamlc -config-var architecture )" || exit $$?; \
+		actual_arch="$$(printf '%s' "$$output" | tr -d '\r')"; \
 		if [ "$$actual_arch" != "$(NATIVE_ARCH)" ]; then \
 			echo "expected OCaml architecture $(NATIVE_ARCH), got $$actual_arch" >&2; exit 1; \
 		fi; \

@@ -47,6 +47,29 @@ if PROBE_OUTPUT=5.5.0 PROBE_STATUS=0 make --no-print-directory \
   exit 1
 fi
 
+# Native Windows OCaml emits CRLF. Check the exact-version probe with that
+# output while replacing rustc, so the fixture needs no installed toolchains.
+cat >"$temporary_root/rustc" <<'SH'
+#!/bin/sh
+set -eu
+[ "$*" = --version ]
+printf '%s\n' 'rustc 1.98.1 (fixture)'
+SH
+chmod +x "$temporary_root/rustc"
+PROBE_OUTPUT=$(printf '5.5.1\r') PROBE_STATUS=0 PATH="$temporary_root:$PATH" \
+  make --no-print-directory -f "$source_root/Makefile" native-version-check \
+  NATIVE_OCAML_VERSION=5.5.1 NATIVE_RUST_VERSION=1.98.1 \
+  NATIVE_ARCH= NATIVE_RUST_HOST= NATIVE_RUN="sh '$temporary_root/compiler.sh'"
+if PROBE_OUTPUT=$(printf '5.5.0\r') PROBE_STATUS=0 PATH="$temporary_root:$PATH" \
+  make --no-print-directory -f "$source_root/Makefile" native-version-check \
+  NATIVE_OCAML_VERSION=5.5.1 NATIVE_RUST_VERSION=1.98.1 \
+  NATIVE_ARCH= NATIVE_RUST_HOST= NATIVE_RUN="sh '$temporary_root/compiler.sh'" \
+  >"$temporary_root/log" 2>&1; then
+  echo 'native-version-check accepted another patch release' >&2
+  exit 1
+fi
+grep -Fq 'expected OCaml 5.5.1, got 5.5.0' "$temporary_root/log"
+
 # Preserve failure and its original diagnostic with either empty stdout or
 # a valid-looking version; neither case may be reported as a version mismatch.
 for output in '' 5.4.1; do
