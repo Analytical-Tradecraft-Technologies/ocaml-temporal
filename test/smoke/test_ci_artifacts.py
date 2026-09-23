@@ -142,6 +142,31 @@ class SmokeTests(unittest.TestCase):
         self.binary.unlink()
         self.assertNotEqual(subprocess.run(build, cwd=self.root, env=env, capture_output=True).returncode, 0)
 
+    def test_source_build_concurrency(self):
+        """Unset/empty Make limits preserve Dune defaults; explicit limits pass."""
+        tools = self.root / "tools"
+        tools.mkdir()
+        opam = tools / "opam"
+        opam.write_text(
+            '#!/bin/sh\nset -eu\n'
+            '# Model Dune rejecting an exported but empty concurrency value.\n'
+            'if [ "${DUNE_JOBS+x}" = x ] && [ -z "$DUNE_JOBS" ]; then exit 2; fi\n'
+            'printf "%s\\n" "${DUNE_JOBS-unset}" "$@"\n'
+        )
+        opam.chmod(0o755)
+        env = {**os.environ, "TEMPORAL_PREBUILT_SMOKE": "0", "PATH": f"{tools}:{os.environ['PATH']}"}
+        command = ["sh", str(ROOT / "scripts/build-temporal-executables.sh"), self.name]
+        for limit in (None, "", "2", "auto"):
+            with self.subTest(limit=limit):
+                env.pop("DUNE_JOBS", None)
+                if limit is not None:
+                    env["DUNE_JOBS"] = limit
+                result = subprocess.run(command, cwd=self.root, env=env, capture_output=True, text=True, check=True)
+                expected = [limit or "unset", "exec", "--", "dune", "build"]
+                if limit:
+                    expected += ["-j", limit]
+                self.assertEqual(result.stdout.splitlines(), expected + [self.name])
+
 
 class ReleaseTests(unittest.TestCase):
     """Require complete verified native platform bundles before publication."""

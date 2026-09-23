@@ -11,5 +11,8 @@ else
   if [ -n "${DUNE_JOBS:-}" ]; then
     exec opam exec -- dune build -j "$DUNE_JOBS" "$@"
   fi
+  # Make supplies an empty value when no limit was requested. Dune also reads
+  # this variable itself, and rejects an empty value instead of using auto.
+  unset DUNE_JOBS
   exec opam exec -- dune build "$@"
 fi

@@ -182,12 +182,14 @@ jobs:
       OCAML_VERSION: "5.5.1"
       TEMPORAL_PREBUILT_SMOKE: "1"
     steps:
+      # Always make failure-reporting scripts available, even if a producer
+      # failed and the dependency gate below stops the live test steps.
+      - name: Check out repository
+        uses: actions/checkout@v7
       - name: Require successful OCaml builds
         env:
           OCAML_RESULT: ${{ needs.verify.result }}
         run: test "$OCAML_RESULT" = success
-      - name: Check out repository
-        uses: actions/checkout@v7
       - name: Download compiled smoke executables
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
