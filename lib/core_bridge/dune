@@ -2,7 +2,9 @@
  (targets
   libocaml_temporal_core_bridge.a
   dllocaml_temporal_core_bridge%{ext_dll}
-  rust_static_link_flags.sexp)
+  rust_static_link_flags.sexp
+  rust_ocaml_link_flags.sexp
+  (dir rust-imports))
  (deps
   (env_var TEMPORAL_RUST_BRIDGE_DIR)
   (env_var TEMPORAL_RUST_BRIDGE_KEY)
@@ -20,11 +22,25 @@
   (setenv
    OCAML_TEMPORAL_RUST_TARGET_FALLBACK
    %{workspace_root}/rust-target
-   (run
-    sh
-    %{workspace_root}/scripts/build-rust-bridge.sh
-    %{workspace_root}
-    %{targets}))))
+   (setenv
+    TEMPORAL_OCAML_IMPORT_DIR
+    rust-imports
+    (setenv
+     TEMPORAL_OCAML_LINK_FLAGS
+     rust_ocaml_link_flags.sexp
+     (run
+      sh
+      %{workspace_root}/scripts/build-rust-bridge.sh
+      %{workspace_root}
+      libocaml_temporal_core_bridge.a
+      dllocaml_temporal_core_bridge%{ext_dll}
+      rust_static_link_flags.sexp))))))
+
+;; Keep MinGW import archives beside the installed cmxa. $CAMLORIGIN in its
+;; link options follows this directory when a compiled SDK bundle is moved.
+(install
+ (section lib)
+ (dirs (rust-imports as __private__/temporal_core_bridge/rust-imports)))
 
 (foreign_library
  (archive_name temporal_native_stubs)
@@ -40,5 +56,6 @@
  (modules native_bridge)
  (libraries temporal_base temporal_protocol yojson)
  (foreign_archives temporal_native_stubs ocaml_temporal_core_bridge)
+ (library_flags (:include rust_ocaml_link_flags.sexp))
  (c_library_flags
   (:include rust_static_link_flags.sexp)))

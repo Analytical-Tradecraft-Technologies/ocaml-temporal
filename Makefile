@@ -150,6 +150,7 @@ test-local-activity-cancellation-live:
 	$(RUN) dune exec test/integration/local_activity_cancellation/regression.exe -- check $(TEMPORAL_CLIENT_TEST_URL) $(TEMPORAL_TEST_CLI)
 
 test-install:
+	$(RUN) sh test/bridge/test_relocatable_link_flags.sh .
 	$(COMPOSE_RUN) sh test/bridge/test_install.sh
 
 # The API witness is part of the installed-consumer regression. Keep a named
@@ -773,6 +774,7 @@ native-test-rust:
 	$(NATIVE_ENV) $(CARGO_TEST_ENV) cargo test --manifest-path $(CARGO_MANIFEST) --locked
 
 native-test-install:
+	$(NATIVE_ENV) $(NATIVE_RUN) sh test/bridge/test_relocatable_link_flags.sh .
 	$(NATIVE_ENV) sh test/bridge/test_install.sh
 
 native-lint: $(NATIVE_RUST_LINT_TARGET)
@@ -844,4 +846,38 @@ build-smoke-executables:
 	$(COMPOSE_RUN) env DUNE_JOBS="$(DUNE_JOBS)" sh scripts/build-temporal-executables.sh $(shell cat scripts/ci-smoke-executables.txt)
 
 test-ci-artifacts:
-	python3 -m unittest discover -s test/smoke -p 'test_ci_artifacts.py'
+	python3 -m unittest discover -s test/smoke -p 'test_*artifact*.py'
+
+# Package verified installed libraries, then link an independent application
+# with only the relocated installation mounted into its compiler container.
+# Python handles CI transport on the host; it is not added to compiler images.
+PYTHON ?= python3
+OCAML_ARTIFACT_COMMIT ?= $(shell git rev-parse HEAD)
+OCAML_ARTIFACT_PLATFORM ?= linux-$(if $(filter arm64 aarch64,$(shell uname -m)),arm64,amd64)
+OCAML_ARTIFACT_OCAML ?= $(OCAML_VERSION)
+OCAML_LIBRARY_IMAGE ?= $(TEMPORAL_COMPOSE_PROJECT)-$(SERVICE)
+OCAML_LIBRARY_ARGS = --directory _build/ocaml-library-artifact --commit "$(OCAML_ARTIFACT_COMMIT)" --ocaml "$(OCAML_ARTIFACT_OCAML)" --platform "$(OCAML_ARTIFACT_PLATFORM)" --profile "$(RUST_BRIDGE_PROFILE)"
+OCAML_LIBRARY_CONSUMER = docker run --rm --network none --user $(HOST_UID):$(HOST_GID) --volume "$(CURDIR)/_build/ocaml-library-consumer:/consumer" --workdir /consumer "$(OCAML_LIBRARY_IMAGE)"
+
+.PHONY: library-artifact native-library-artifact package-ocaml-library unpack-ocaml-library
+package-ocaml-library:
+	$(PYTHON) scripts/ocaml-library-artifact.py pack $(OCAML_LIBRARY_ARGS) --stage _build/ocaml-library-stage --bridge-key "$$(cat _build/rust-bridge/key)"
+	$(PYTHON) scripts/ocaml-library-artifact.py prepare-consumer --directory _build/ocaml-library-consumer
+
+unpack-ocaml-library:
+	$(PYTHON) scripts/ocaml-library-artifact.py unpack $(OCAML_LIBRARY_ARGS) --environment _build/ocaml-library-consumer/environment.txt --prefix _build/ocaml-library-consumer/sdk
+
+library-artifact:
+	$(COMPOSE_RUN) sh scripts/stage-ocaml-library.sh _build/ocaml-library-stage
+	$(MAKE) package-ocaml-library
+	$(OCAML_LIBRARY_CONSUMER) opam exec -- sh environment.sh > _build/ocaml-library-consumer/environment.txt
+	$(MAKE) unpack-ocaml-library
+	$(OCAML_LIBRARY_CONSUMER) sh test.sh
+
+native-library-artifact: OCAML_ARTIFACT_OCAML = $(NATIVE_OCAML_VERSION)
+native-library-artifact:
+	sh scripts/stage-ocaml-library.sh _build/ocaml-library-stage
+	$(MAKE) package-ocaml-library OCAML_ARTIFACT_OCAML=$(NATIVE_OCAML_VERSION)
+	opam exec -- sh scripts/ocaml-library-environment.sh > _build/ocaml-library-consumer/environment.txt
+	$(MAKE) unpack-ocaml-library OCAML_ARTIFACT_OCAML=$(NATIVE_OCAML_VERSION)
+	cd _build/ocaml-library-consumer && sh test.sh

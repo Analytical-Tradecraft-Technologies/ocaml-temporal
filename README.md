@@ -127,7 +127,10 @@ CI builds the Rust bridge once per operating system and architecture, sharing
 the Linux libraries across OCaml versions and the live smoke. Exact-input
 caches populated by `master` also serve PR, merge-queue, and scheduled runs.
 The C stubs, OCaml libraries, installed consumers, and their tests still build
-in every compatibility lane. See [Rust artifact sharing](docs/reference/quality-gates.md#rust-artifact-sharing)
+in every compatibility lane. Each lane also publishes a tested
+[compiled OCaml SDK bundle](docs/reference/prebuilt-ocaml.md) for compatible
+downstream applications to link without rebuilding the SDK.
+See [Rust artifact sharing](docs/reference/quality-gates.md#rust-artifact-sharing)
 for the cache boundaries and local producer/consumer commands.
 
 When Actions is queued, use `make check OCAML_VERSION=5.2` as the representative
@@ -150,7 +153,7 @@ parallelism used by CI.
 
 The checked-in package version is `0.1.0~rc.1` (Git tag `v0.1.0-rc.1`).
 See the [release workflow guide](docs/reference/release-preflight.md) for build
-coverage, prebuilt Rust assets, and automated publication. To install the checkout into
+coverage, prebuilt Rust/OCaml assets, and automated publication. To install the checkout into
 an existing OPAM switch, use OCaml 5.2 or newer, Dune 3.18 or newer, and Rust
 1.94 or newer, with the Protocol Buffers compiler (`protoc`) available, then
 run:

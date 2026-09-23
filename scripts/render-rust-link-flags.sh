@@ -6,6 +6,14 @@ target_root=$2
 output=$3
 native_link_flags=$4
 bundle_imports=${5:-}
+# Dune owns this directory target even on platforms needing no import files.
+if [ -n "${TEMPORAL_OCAML_IMPORT_DIR:-}" ]; then
+  : "${TEMPORAL_OCAML_LINK_FLAGS:?set the OCaml compiler link-flags output}"
+  mkdir -p "$TEMPORAL_OCAML_IMPORT_DIR"
+  printf '%s\n' 'Platform import libraries for the precompiled Rust bridge; Windows only.' \
+    >"$TEMPORAL_OCAML_IMPORT_DIR/README"
+  printf '()\n' >"$TEMPORAL_OCAML_LINK_FLAGS"
+fi
 
 # Checks the exact import-library set requested by rustc. Bundled libraries and
 # Cargo registry libraries follow the same validation before reaching Dune.
@@ -90,6 +98,21 @@ EOF
     # Native Windows Dune/linkers cannot resolve Cygwin /cygdrive paths.
     if command -v cygpath >/dev/null 2>&1; then
       search_dir=$(cygpath -m "$search_dir")
+    fi
+    if [ -n "${TEMPORAL_OCAML_IMPORT_DIR:-}" ]; then
+      while IFS= read -r flag; do
+        case "$flag" in
+          -lwinapi_*) cp "$search_dir/lib${flag#-l}.a" "$TEMPORAL_OCAML_IMPORT_DIR/" ;;
+        esac
+      done <<EOF
+$(printf '%s\n' "$native_link_flags" | tr '[:space:]' '\n')
+EOF
+      # OCaml expands CAMLORIGIN only in -ccopt, not -cclib. Dune passes
+      # c_library_flags through -cclib, so emit the search option separately
+      # through library_flags to retain relocation in the installed cmxa/cma.
+      printf '%s\n' '(-ccopt "-L\"$CAMLORIGIN/rust-imports\"")' >"$TEMPORAL_OCAML_LINK_FLAGS"
+      printf '(%s)\n' "$native_link_flags" >"$output"
+      exit 0
     fi
     # Dune reads this as an S-expression. Quote and escape the generated path
     # so installations below a directory containing spaces remain valid.

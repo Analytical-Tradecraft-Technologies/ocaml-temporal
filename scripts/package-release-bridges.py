@@ -3,13 +3,14 @@
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import re
 import tarfile
 from pathlib import Path
 
 
-# The Rust ABI is independent of OCaml: consumers compile the C stubs themselves.
+# Rust-only bundles remain useful for compilers outside the published SDK matrix.
 PLATFORMS = {
     "linux-amd64": "x86_64-unknown-linux-gnu; Debian 12/glibc",
     "linux-arm64": "aarch64-unknown-linux-gnu; Debian 12/glibc",
@@ -86,15 +87,45 @@ def package_bridges(bundles, output, tag, commit):
     (output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
 
 
+def package_libraries(bundles, output, tag, commit):
+    """Require all sixteen tested SDKs and their matching released Rust inputs."""
+    spec = importlib.util.spec_from_file_location("ocaml_artifact", Path(__file__).with_name("ocaml-library-artifact.py"))
+    artifact = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(artifact)
+    spec = importlib.util.spec_from_file_location("ci_matrix", Path(__file__).with_name("ci-matrix.py"))
+    matrix = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(matrix)
+    manifest_path = output / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    libraries = {}
+    for platform in PLATFORMS:
+        for ocaml in matrix.COMPILERS:
+            identity = f"{platform}-ocaml-{ocaml}"
+            bundle = bundles / f"ocaml-sdk-{identity}"
+            metadata = artifact.validate(bundle, commit, ocaml, platform, "release")
+            if metadata["rust_bridge_key"] != manifest["bridges"][platform]["key"]:
+                raise ValueError(f"SDK and released Rust bridge differ: {identity}")
+            archive = output / f"ocaml-temporal-sdk-{tag}-{identity}.tar.gz"
+            with tarfile.open(archive, "w:gz", compresslevel=1) as tar:
+                for name in ("library.tar.gz", "manifest.json", *artifact.TOOLS):
+                    tar.add(bundle / name, arcname=name, recursive=False)
+            libraries[identity] = {"asset": archive.name, "sha256": sha256(archive),
+                                   "ocaml": ocaml, "platform": platform}
+    manifest["ocaml_libraries"] = libraries
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+
+
 def main():
     """Read paths and the independently supplied release identity from CI."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bundles", required=True, type=Path)
+    parser.add_argument("--ocaml-bundles", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--tag", required=True)
     parser.add_argument("--commit", required=True)
     args = parser.parse_args()
     package_bridges(args.bundles, args.output, args.tag, args.commit)
+    package_libraries(args.ocaml_bundles, args.output, args.tag, args.commit)
 
 
 if __name__ == "__main__":

@@ -32,6 +32,9 @@ Release builds use a separate optimized profile for tests and packaging.
 
 OCaml jobs download their platform's Rust bundle, validate its identity and
 checksums, and compile the OCaml library and C stubs for the selected compiler.
+Each job then packages that installed SDK and verifies an independent consumer
+against its relocated, source-free installation before uploading it. Downstream
+applications can [link the compiled SDK directly](prebuilt-ocaml.md).
 Local source builds still compile Rust when no bundle is provided. An invalid
 explicit bundle fails instead of falling back to a Rust build.
 
@@ -43,7 +46,7 @@ and SHA-256 digests, then runs all existing Temporal/PostgreSQL controllers.
 It does not copy Dune build state or compile worker/driver programs again.
 Local smoke commands retain the normal source-build behavior.
 
-Rust bundles, compiled smoke executables, and the audited Cargo SBOM are retained
+Rust bundles, compiled OCaml SDKs, smoke executables, and the audited Cargo SBOM are retained
 for 90 days through `RUST_BRIDGE_ARTIFACT_RETENTION_DAYS`, managed in infra.
 Diagnostic uploads retain their existing shorter lifetimes. Actions artifact
 downloads require GitHub authentication; published public release assets do not.
@@ -58,17 +61,19 @@ that manual dispatch is automated:
    unused tag.
 2. Build/test all four Rust platforms and all sixteen OCaml combinations, plus
    the single live smoke job, quality/security scans, and dependency audits.
-3. Validate all bridge bundles, archive the exact source commit, audit the Cargo
+3. Validate all bridge and OCaml SDK bundles, archive the exact source commit, audit the Cargo
    SPDX SBOM, and generate the release manifest and asset checksums.
 4. Atomically create the Git tag at the exact tested commit. A concurrent or
    existing tag fails publication instead of moving or reusing that tag.
 5. Upload assets to a draft release and publish it as a prerelease when the tag
    has a prerelease suffix. No manual tagging or asset upload is required.
 
-The release contains four compiler-independent Rust bridge archives, source,
-`manifest.json`, the Cargo SBOM, and `SHA256SUMS`. Applications compile the OCaml
-library and C stubs using their own compiler; these are not precompiled OCaml
-package distributions. Linux assets target Debian 12/glibc, not musl/Alpine.
+The release contains four compiler-independent Rust bridge archives, sixteen
+compiled OCaml SDK archives, source, `manifest.json`, the Cargo SBOM, and
+`SHA256SUMS`. Compatible applications link the OCaml SDK, C stubs and Rust bridge
+directly without rebuilding them. Each SDK records its exact compiler and compiled
+dependency identities; incompatible environments must use matching dependencies
+or build from source. Linux assets target Debian 12/glibc, not musl/Alpine.
 
 For the next version, first update the three version files in a PR and then
 enter the matching new tag at dispatch. Published tags are immutable. If an

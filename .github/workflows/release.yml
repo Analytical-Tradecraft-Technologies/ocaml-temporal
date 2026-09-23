@@ -75,12 +75,18 @@ jobs:
         with:
           name: release-cargo-sbom
           path: _build/release-assets
+      - name: Download all sixteen tested OCaml libraries
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: ocaml-sdk-*
+          path: _build/release-ocaml-bundles
       - name: Assemble and verify release assets
         run: |
           set -euo pipefail
           make release-tag-check RELEASE_TAG="$RELEASE_TAG"
           python3 scripts/package-release-bridges.py \
             --bundles _build/release-bundles \
+            --ocaml-bundles _build/release-ocaml-bundles \
             --output _build/release-assets \
             --tag "$RELEASE_TAG" --commit "$GITHUB_SHA"
           git archive --format=tar --prefix="ocaml-temporal-${RELEASE_TAG#v}/" HEAD \
@@ -97,7 +103,9 @@ jobs:
 
           Includes optimized Rust bridge libraries for Linux x64 and ARM64
           (Debian 12/glibc), macOS ARM64, and Windows x64 GNU/MinGW.
-          OCaml libraries and C stubs are compiled by the consuming application.
+          Includes compiled OCaml SDK libraries and C stubs for every tested
+          compiler/platform combination. Compatible downstream applications
+          link these directly without rebuilding the SDK or Rust bridge.
           Local builds from source remain supported.
 
           See manifest.json for bridge identities and SHA256SUMS for asset digests.

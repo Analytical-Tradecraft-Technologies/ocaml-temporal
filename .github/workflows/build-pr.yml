@@ -273,6 +273,8 @@ jobs:
     timeout-minutes: 30
     env:
       TEMPORAL_RUST_BRIDGE_DIR: /workspace/_build/rust-bridge
+      OCAML_ARTIFACT_COMMIT: ${{ github.sha }}
+      RUST_BRIDGE_PROFILE: ${{ inputs.bridge-profile || 'ci' }}
       TEMPORAL_RUST_BRIDGE_KEY: ${{ matrix.runner == 'ubuntu-24.04-arm' && needs.rust-arm64.outputs.key || needs.rust-amd64.outputs.key }}
     strategy:
       fail-fast: false
@@ -310,6 +312,18 @@ jobs:
         env:
           OCAML_VERSION: ${{ matrix.ocaml }}
         run: make verify
+      - name: Package and consume the compiled OCaml library
+        env:
+          OCAML_VERSION: ${{ matrix.ocaml }}
+        run: make library-artifact
+      - name: Upload the verified OCaml library
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ocaml-sdk-linux-${{ matrix.runner == 'ubuntu-24.04-arm' && 'arm64' || 'amd64' }}-ocaml-${{ matrix.ocaml }}
+          path: _build/ocaml-library-artifact/
+          if-no-files-found: error
+          retention-days: ${{ vars.RUST_BRIDGE_ARTIFACT_RETENTION_DAYS || '90' }}
+          compression-level: 0
       - name: Compile the live smoke executables once
         if: matrix.runner == 'ubuntu-24.04' && matrix.ocaml == '5.5.1'
         env:
@@ -340,6 +354,8 @@ jobs:
       CARGO_TARGET_DIR: ${{ github.workspace }}/_build/rust
       RUSTUP_TOOLCHAIN: 1.98.1-aarch64-apple-darwin
       NATIVE_OCAML_VERSION: ${{ matrix.ocaml }}
+      OCAML_ARTIFACT_COMMIT: ${{ github.sha }}
+      RUST_BRIDGE_PROFILE: ${{ inputs.bridge-profile || 'ci' }}
       NATIVE_RUST_VERSION: 1.98.1
       NATIVE_ARCH: arm64
       NATIVE_RUST_HOST: aarch64-apple-darwin
@@ -377,6 +393,17 @@ jobs:
           TEMPORAL_RUST_BRIDGE_DIR: ${{ github.workspace }}/_build/rust-bridge
           TEMPORAL_RUST_BRIDGE_KEY: ${{ needs.rust-macos.outputs.key }}
         run: make native-verify
+      - name: Package and consume the compiled OCaml library
+        shell: bash
+        run: make native-library-artifact OCAML_ARTIFACT_PLATFORM=macos-arm64 PYTHON=python3
+      - name: Upload the verified OCaml library
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ocaml-sdk-macos-arm64-ocaml-${{ matrix.ocaml }}
+          path: _build/ocaml-library-artifact/
+          if-no-files-found: error
+          retention-days: ${{ vars.RUST_BRIDGE_ARTIFACT_RETENTION_DAYS || '90' }}
+          compression-level: 0
 
   native-windows:
     if: ${{ !cancelled() && needs.changes.outputs.code == 'true' }}
@@ -391,6 +418,8 @@ jobs:
       CARGO_TARGET_DIR: ${{ github.workspace }}/_build/rust
       RUSTUP_TOOLCHAIN: 1.98.1-x86_64-pc-windows-gnu
       NATIVE_OCAML_VERSION: ${{ matrix.ocaml }}
+      OCAML_ARTIFACT_COMMIT: ${{ github.sha }}
+      RUST_BRIDGE_PROFILE: ${{ inputs.bridge-profile || 'ci' }}
       NATIVE_RUST_VERSION: 1.98.1
       NATIVE_ARCH: amd64
       NATIVE_RUST_HOST: x86_64-pc-windows-gnu
@@ -442,3 +471,14 @@ jobs:
           TEMPORAL_RUST_BRIDGE_DIR: ${{ github.workspace }}/_build/rust-bridge
           TEMPORAL_RUST_BRIDGE_KEY: ${{ needs.rust-windows.outputs.key }}
         run: make native-verify
+      - name: Package and consume the compiled OCaml library
+        shell: bash
+        run: make native-library-artifact OCAML_ARTIFACT_PLATFORM=windows-amd64 PYTHON=python
+      - name: Upload the verified OCaml library
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ocaml-sdk-windows-amd64-ocaml-${{ matrix.ocaml }}
+          path: _build/ocaml-library-artifact/
+          if-no-files-found: error
+          retention-days: ${{ vars.RUST_BRIDGE_ARTIFACT_RETENTION_DAYS || '90' }}
+          compression-level: 0
