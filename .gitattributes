@@ -13,3 +13,7 @@ dune-project text eol=lf
 *.opam text eol=lf
 *.opam.locked text eol=lf
 .github/workflows/*.yml text eol=lf
+
+# Bundle manifests and composite actions are also read by native POSIX tools.
+.github/actions/*/action.yml text eol=lf
+scripts/ci-smoke-executables.txt text eol=lf

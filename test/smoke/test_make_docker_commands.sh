@@ -1,6 +1,10 @@
 #!/bin/sh
 set -eu
 
+# These probes own their fake Docker command. A caller's local verification
+# overrides must not replace it through recursive Make's command-line flags.
+unset MAKEFLAGS MFLAGS MAKEOVERRIDES
+
 # Exercise the real Make recipe without Docker, including a failed command
 # whose stdout could otherwise be mistaken for a successful compiler probe.
 source_root=${1:-.}
@@ -30,7 +34,18 @@ if PROBE_OUTPUT=5.3.0 PROBE_STATUS=0 make --no-print-directory \
   echo 'version-check accepted the wrong compiler' >&2
   exit 1
 fi
-grep -Fq 'expected OCaml 5.4.x, got 5.3.0' "$temporary_root/log"
+grep -Fq 'expected OCaml 5.4, got 5.3.0' "$temporary_root/log"
+
+# Exact CI patches must not resolve to another patch in the same series.
+PROBE_OUTPUT=5.5.1 PROBE_STATUS=0 make --no-print-directory \
+  -f "$source_root/Makefile" version-check OCAML_VERSION=5.5.1 \
+  RUN="sh '$temporary_root/compiler.sh'"
+if PROBE_OUTPUT=5.5.0 PROBE_STATUS=0 make --no-print-directory \
+  -f "$source_root/Makefile" version-check OCAML_VERSION=5.5.1 \
+  RUN="sh '$temporary_root/compiler.sh'" >"$temporary_root/log" 2>&1; then
+  echo 'version-check accepted another patch release' >&2
+  exit 1
+fi
 
 # Preserve failure and its original diagnostic with either empty stdout or
 # a valid-looking version; neither case may be reported as a version mismatch.

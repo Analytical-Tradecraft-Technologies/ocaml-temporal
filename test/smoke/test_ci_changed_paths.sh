@@ -6,7 +6,7 @@ fixture=$(mktemp -d)
 trap 'rm -rf "$fixture"' EXIT
 awk '
   /^        run: \|$/ { copying = 1; next }
-  copying && /^  [a-zA-Z0-9_-]+:/ { exit }
+  copying && (/^  [a-zA-Z0-9_-]+:/ || /^      - name:/) { exit }
   copying { sub(/^          /, ""); print }
 ' "$source_root/.github/workflows/build-pr.yml" > "$fixture/classify.sh"
 mkdir "$fixture/repo"

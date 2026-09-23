@@ -9,6 +9,9 @@ on:
       platform:
         required: true
         type: string
+      profile:
+        type: string
+        default: ci
     outputs:
       key:
         description: Verified bridge identity for the OCaml consumers
@@ -21,7 +24,7 @@ jobs:
   build:
     name: Rust / ${{ inputs.platform }}
     runs-on: ${{ inputs.runner }}
-    timeout-minutes: 30
+    timeout-minutes: 45
     outputs:
       key: ${{ steps.bridge.outputs.key }}
     steps:
@@ -33,9 +36,31 @@ jobs:
         run: |
           set -euo pipefail
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+      - name: Set up Windows GNU build tools
+        if: inputs.platform == 'windows-amd64'
+        uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
+        with:
+          msystem: MINGW64
+          path-type: inherit
+          install: make mingw-w64-x86_64-gcc mingw-w64-x86_64-protobuf mingw-w64-x86_64-cmake
+      - name: Install Protocol Buffers compiler on macOS
+        if: inputs.platform == 'macos-arm64'
+        run: brew install protobuf
+      - name: Install the pinned native Rust toolchain
+        if: inputs.platform == 'macos-arm64' || inputs.platform == 'windows-amd64'
+        shell: bash
+        env:
+          RUST_HOST: ${{ inputs.platform == 'macos-arm64' && 'aarch64-apple-darwin' || 'x86_64-pc-windows-gnu' }}
+        run: |
+          set -euo pipefail
+          rustup toolchain install "1.98.1-$RUST_HOST" --profile minimal --component clippy --component rustfmt
+          echo "RUSTUP_TOOLCHAIN=1.98.1-$RUST_HOST" >> "$GITHUB_ENV"
       - name: Prepare verified Rust bridge
         id: bridge
         uses: ./.github/actions/rust-bridge
         with:
           platform: ${{ inputs.platform }}
-          mode: docker
+          mode: ${{ startsWith(inputs.platform, 'linux-') && 'docker' || 'native' }}
+          shell: ${{ inputs.platform == 'windows-amd64' && 'msys2 {0}' || 'bash' }}
+          profile: ${{ inputs.profile }}
+          retention-days: ${{ vars.RUST_BRIDGE_ARTIFACT_RETENTION_DAYS || '90' }}

@@ -148,7 +148,9 @@ parallelism used by CI.
 
 ### Install from a source checkout
 
-The checked-in package version is `~dev`. To install the current checkout into
+The checked-in package version is `0.1.0~rc.1` (Git tag `v0.1.0-rc.1`).
+See the [release workflow guide](docs/reference/release-preflight.md) for build
+coverage, prebuilt Rust assets, and automated publication. To install the checkout into
 an existing OPAM switch, use OCaml 5.2 or newer, Dune 3.18 or newer, and Rust
 1.94 or newer, with the Protocol Buffers compiler (`protoc`) available, then
 run:
