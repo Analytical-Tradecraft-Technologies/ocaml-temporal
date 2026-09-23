@@ -284,9 +284,9 @@ jobs:
     timeout-minutes: 45
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/_build/rust
-      RUSTUP_TOOLCHAIN: 1.97.1-aarch64-apple-darwin
+      RUSTUP_TOOLCHAIN: 1.98.1-aarch64-apple-darwin
       NATIVE_OCAML_VERSION: "5.5"
-      NATIVE_RUST_VERSION: 1.97.1
+      NATIVE_RUST_VERSION: 1.98.1
       NATIVE_ARCH: arm64
       NATIVE_RUST_HOST: aarch64-apple-darwin
     steps:
@@ -326,9 +326,9 @@ jobs:
     timeout-minutes: 45
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/_build/rust
-      RUSTUP_TOOLCHAIN: 1.97.1-x86_64-pc-windows-gnu
+      RUSTUP_TOOLCHAIN: 1.98.1-x86_64-pc-windows-gnu
       NATIVE_OCAML_VERSION: "5.5"
-      NATIVE_RUST_VERSION: 1.97.1
+      NATIVE_RUST_VERSION: 1.98.1
       NATIVE_ARCH: amd64
       NATIVE_RUST_HOST: x86_64-pc-windows-gnu
     steps:
