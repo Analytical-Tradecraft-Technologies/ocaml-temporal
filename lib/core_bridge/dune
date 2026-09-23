@@ -36,11 +36,7 @@
       dllocaml_temporal_core_bridge%{ext_dll}
       rust_static_link_flags.sexp))))))
 
-;; Keep MinGW import archives beside the installed cmxa. $CAMLORIGIN in its
-;; link options follows this directory when a compiled SDK bundle is moved.
-(install
- (section lib)
- (dirs (rust-imports as __private__/temporal_core_bridge/rust-imports)))
+(include install-rust-imports.inc)
 
 (foreign_library
  (archive_name temporal_native_stubs)
