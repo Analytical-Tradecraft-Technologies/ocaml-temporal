@@ -18,15 +18,13 @@ let outside_error () = Temporal.Error.defect ~message:"outside scheduler"
 let public_future future =
   Temporal_future_kernel.make
     ~await:(fun () -> Temporal_runtime.Future_store.await future)
-    ~await_gate:(fun register ->
-      Temporal_runtime.Future_store.await_gate future register)
+    ~await_gate:(Temporal_runtime.Future_store.await_gate future)
     ~observe:(Temporal_runtime.Future_store.observe future)
     ~is_ready:(fun () -> Temporal_runtime.Future_store.is_ready future)
     ~peek:(fun () -> Temporal_runtime.Future_store.peek future)
     ~owner_id:(Temporal_runtime.Future_store.owner_id future)
     ~outside_error
-    ~callbacks_live:(fun () ->
-      Temporal_runtime.Future_store.callbacks_live future)
+    ~callbacks_live:(Temporal_runtime.Future_store.callback_liveness future)
     ~enqueue:(Temporal_runtime.Future_store.enqueue future)
 
 (** Creates a scheduler-owned public promise and retains its internal resolver

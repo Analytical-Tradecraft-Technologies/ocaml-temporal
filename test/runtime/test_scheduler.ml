@@ -17,14 +17,13 @@ let outside_error () = Temporal.Error.defect ~message:"outside scheduler"
 let public_future ~outside_error future =
   Temporal_future_kernel.make
     ~await:(fun () -> Temporal_runtime.Future_store.await future)
-    ~await_gate:(fun register ->
-      Temporal_runtime.Future_store.await_gate future register)
+    ~await_gate:(Temporal_runtime.Future_store.await_gate future)
     ~observe:(Temporal_runtime.Future_store.observe future)
     ~is_ready:(fun () -> Temporal_runtime.Future_store.is_ready future)
     ~peek:(fun () -> Temporal_runtime.Future_store.peek future)
     ~owner_id:(Temporal_runtime.Future_store.owner_id future)
     ~outside_error
-    ~callbacks_live:(fun () -> Temporal_runtime.Future_store.callbacks_live future)
+    ~callbacks_live:(Temporal_runtime.Future_store.callback_liveness future)
     ~enqueue:(Temporal_runtime.Future_store.enqueue future)
 
 (** Creates a test-controlled scheduler promise and exposes it through the
@@ -278,6 +277,64 @@ let test_first_releases_winner_from_pending_loser () =
   expect "first loser remains pending" "blocked" (Scheduler.run_label scheduler);
   if Option.is_some (Weak.get weak_payload 0) then
     failwith "pending first loser retained the resolved winner payload"
+
+(** Error mapping must detach the outside-error callback as well as the
+    scheduler callbacks. Otherwise a small mapped error retains its source. *)
+let test_map_error_releases_source () =
+  let scheduler = Scheduler.create () in
+  let build () =
+    let weak = Weak.create 1 in
+    let source, resolve =
+      Scheduler.promise scheduler ~outside_error:(fun () -> Bytes.empty)
+    in
+    let runtime_mapped = Temporal_runtime.Future_store.map_error Bytes.length source in
+    let mapped =
+      Temporal.Future.map_error Bytes.length
+        (public_future ~outside_error:(fun () -> Bytes.empty) source)
+    in
+    let payload = Bytes.make 1_048_576 'e' in
+    Weak.set weak 0 (Some payload);
+    resolve (Error payload);
+    expect "error map drain" "complete" (Scheduler.run_label scheduler);
+    weak, runtime_mapped, mapped
+  in
+  let weak, runtime_mapped, mapped = build () in
+  Gc.full_major ();
+  Gc.full_major ();
+  if Weak.check weak 0 then failwith "mapped error retained its source payload";
+  expect "runtime mapped error" (Some (Error 1_048_576))
+    (Temporal_runtime.Future_store.peek runtime_mapped);
+  expect "public mapped error" (Some (Error 1_048_576))
+    (Temporal.Future.peek mapped);
+  expect "error map owner remains active" true (Scheduler.is_active scheduler);
+  Scheduler.shutdown scheduler
+
+(** A ready ownership defect preserves the owner's gate, but must not retain
+    the successful source result merely to service later combinators. *)
+let test_ready_like_releases_source () =
+  let scheduler = Scheduler.create () in
+  let foreign_scheduler = Scheduler.create () in
+  let build () =
+    let weak = Weak.create 1 in
+    let source, resolve = promise scheduler ~outside_error in
+    let foreign, resolve_foreign = promise foreign_scheduler ~outside_error in
+    let failed = Temporal.Future.both source foreign in
+    let payload = Bytes.make 1_048_576 'x' in
+    Weak.set weak 0 (Some payload);
+    resolve (Ok payload);
+    resolve_foreign (Ok ());
+    weak, failed
+  in
+  let weak, failed = build () in
+  Gc.full_major ();
+  Gc.full_major ();
+  if Weak.check weak 0 then failwith "ownership defect retained its source payload";
+  expect_error_message "ready ownership defect"
+    "Temporal future combinator received futures from different workflow executions"
+    (Temporal.Future.await failed);
+  expect "ready defect owner remains active" true (Scheduler.is_active scheduler);
+  Scheduler.shutdown scheduler;
+  Scheduler.shutdown foreign_scheduler
 
 (** Confirms [first] settles on an error as a completion event and does not
     wait for or cancel later candidates. *)
@@ -564,6 +621,8 @@ let () =
   test_race_order_and_loser ();
   test_race_releases_winner_from_pending_loser ();
   test_first_releases_winner_from_pending_loser ();
+  test_map_error_releases_source ();
+  test_ready_like_releases_source ();
   test_first_completion_error ();
   test_mapper_defect_is_contained ();
   test_both_observes_sibling_after_error ();
