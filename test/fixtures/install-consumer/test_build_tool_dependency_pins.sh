@@ -80,17 +80,64 @@ assert_accepts_crlf_metadata() {
   mkdir -p "$tool_bin"
   cat >"$tool_bin/dune" <<'EOF'
 #!/bin/sh
-"$REAL_DUNE" "$@" | awk '{ printf "%s\r\n", $0 }'
+set -eu
+"$REAL_DUNE" "$@" >"$DUNE_OUTPUT"
+awk '{ printf "%s\r\n", $0 }' "$DUNE_OUTPUT"
 EOF
   chmod +x "$tool_bin/dune"
-  if ! PATH="$tool_bin:$PATH" REAL_DUNE="$real_dune" \
+  if ! PATH="$tool_bin:$PATH" REAL_DUNE="$real_dune" DUNE_OUTPUT="$fixture_root/dune-output" \
     sh "$checker" "$fixture_root"; then
     echo "install consumer metadata mutation: CRLF metadata was rejected" >&2
     exit 1
   fi
 }
 
+# A native tool can emit complete-looking output before failing. The checker
+# must propagate that failure instead of accepting the following tr's status.
+assert_rejects_failed_tool() {
+  tool=$1
+  diagnostic=$2
+  real_tool=$(command -v "$tool")
+  tool_bin="$fixture_root/failed-$tool"
+  log="$fixture_root/failed-$tool.log"
+
+  prepare_fixture
+  mkdir -p "$tool_bin"
+  cat >"$tool_bin/$tool" <<'EOF'
+#!/bin/sh
+"$REAL_TOOL" "$@"
+exit 23
+EOF
+  chmod +x "$tool_bin/$tool"
+  if PATH="$tool_bin:$PATH" REAL_TOOL="$real_tool" \
+    sh "$checker" "$fixture_root" >"$log" 2>&1; then
+    echo "install consumer metadata mutation: failed $tool unexpectedly passed" >&2
+    exit 1
+  fi
+  if ! grep -F "$diagnostic" "$log" >/dev/null; then
+    cat "$log" >&2
+    echo "install consumer metadata mutation: $tool failed for the wrong reason" >&2
+    exit 1
+  fi
+}
+
+# Loading a project extension is unnecessary for formatting its metadata. An
+# unavailable extension makes accidental workspace initialization observable
+# without relying on the timing of concurrent Windows formatters.
+assert_ignores_build_workspace() {
+  prepare_fixture
+  printf '%s\n' '(using metadata-test-unavailable-extension 1.0)' \
+    >>"$fixture_root/dune-project"
+  if ! sh "$checker" "$fixture_root"; then
+    echo "install consumer metadata mutation: formatter initialized the build workspace" >&2
+    exit 1
+  fi
+}
+
 assert_accepts_crlf_metadata
+assert_rejects_failed_tool opam 'could not parse'
+assert_rejects_failed_tool dune 'could not format'
+assert_ignores_build_workspace
 
 assert_rejects_detached_pin \
   conf-protoc 4.4.0 zz-conf-protoc-pin-sentinel
