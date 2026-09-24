@@ -10,9 +10,9 @@ type ('left, 'right) race = Left of 'left | Right of 'right
 (** Builds a private future handle.  Only package-private adapters call this;
     keeping the function out of [future.mli] prevents arbitrary construction
     outside the SDK's deterministic lifecycle. *)
-let make_repr ~await ~await_gate ~observe ~is_ready ~peek ~owner_id
+let make_repr ~await ~await_gate ~subscribe ~is_ready ~peek ~owner_id
     ~outside_error ~callbacks_live ~enqueue =
-  Temporal_sdk_kernel.Future.make ~await ~await_gate ~observe ~is_ready ~peek ~owner_id
+  Temporal_sdk_kernel.Future.make ~await ~await_gate ~subscribe ~is_ready ~peek ~owner_id
     ~outside_error ~callbacks_live ~enqueue
 
 (** Converts one internal runtime future to the public error vocabulary. This
@@ -24,8 +24,8 @@ let of_internal ~outside_error future =
     ~await:(fun () -> map_error (Temporal_sdk_kernel.Future_store.await future))
     ~await_gate:(fun register ->
       Temporal_sdk_kernel.Future_store.await_gate future register)
-    ~observe:(fun observer ->
-      Temporal_sdk_kernel.Future_store.observe future (fun result ->
+    ~subscribe:(fun observer ->
+      Temporal_sdk_kernel.Future_store.subscribe future (fun result ->
           observer (map_error result)))
     ~is_ready:(fun () -> Temporal_sdk_kernel.Future_store.is_ready future)
     ~peek:(fun () -> Option.map map_error (Temporal_sdk_kernel.Future_store.peek future))
@@ -60,17 +60,26 @@ let make_derived ~parent ~outside_error =
         List.iter
           (fun callback ->
             Temporal_sdk_kernel.Future.enqueue parent (fun () ->
+                let action = !callback in
+                callback := None;
                 if Temporal_sdk_kernel.Future.callbacks_live parent then
-                  callback value))
+                  Option.iter (fun action -> action value) action))
           callbacks
   in
-  let observe callback =
-    match !result with
+  (* Clearing a token suppresses queued delivery as well as unlinking it. *)
+  let subscribe callback =
+    let token = ref (Some callback) in
+    (match !result with
     | Some value ->
         Temporal_sdk_kernel.Future.enqueue parent (fun () ->
+            let action = !token in
+            token := None;
             if Temporal_sdk_kernel.Future.callbacks_live parent then
-              callback value)
-    | None -> observers := callback :: !observers
+              Option.iter (fun action -> action value) action)
+    | None -> observers := token :: !observers);
+    fun () ->
+      token := None;
+      observers := List.filter (fun current -> current != token) !observers
   in
   let await_gate register = Temporal_sdk_kernel.Future.await_gate parent register in
   let await () =
@@ -88,14 +97,15 @@ let make_derived ~parent ~outside_error =
         else
           let observed = ref None in
           await_gate (fun signal ->
-              observe (fun value ->
+              let (_ : unit -> unit) = subscribe (fun value ->
                   if Option.is_none !observed then (
                     observed := Some value;
-                    signal ())));
+                    signal ())) in
+              ());
           Option.value !observed ~default:(Error (outside_error ()))
   in
   let future =
-    make_repr ~await ~await_gate ~observe
+    make_repr ~await ~await_gate ~subscribe
       ~is_ready:(fun () -> Option.is_some !result)
       ~peek:(fun () -> !result)
       ~owner_id:(Temporal_sdk_kernel.Future.owner_id parent) ~outside_error
@@ -113,16 +123,12 @@ let make_derived ~parent ~outside_error =
     real owner regardless of [source]'s own readiness, so this is safe even
     though [source] itself is already settled. *)
 let ready_like source result =
-  make_repr ~await:(fun () -> result)
-    ~await_gate:(fun register -> Temporal_sdk_kernel.Future.await_gate source register)
-    ~observe:(fun callback ->
-      Temporal_sdk_kernel.Future.enqueue source (fun () ->
-          if Temporal_sdk_kernel.Future.callbacks_live source then callback result))
-    ~is_ready:(fun () -> true) ~peek:(fun () -> Some result)
-    ~owner_id:(Temporal_sdk_kernel.Future.owner_id source)
-    ~outside_error:(Temporal_sdk_kernel.Future.outside_error source)
-    ~callbacks_live:(fun () -> Temporal_sdk_kernel.Future.callbacks_live source)
-    ~enqueue:(Temporal_sdk_kernel.Future.enqueue source)
+  let future, resolve =
+    make_derived ~parent:source
+      ~outside_error:(Temporal_sdk_kernel.Future.outside_error source)
+  in
+  resolve result;
+  future
 
 (** Builds the structured defect shared by aggregate ownership checks. *)
 let ownership_error () =
@@ -198,7 +204,7 @@ let all futures =
           make_repr
             ~await:(fun () -> Ok [])
             ~await_gate:(fun register -> register (fun () -> ()))
-            ~observe:(fun observer -> observer (Ok []))
+            ~subscribe:(fun observer -> observer (Ok []); fun () -> ())
             ~is_ready:(fun () -> true) ~peek:(fun () -> Some (Ok []))
             ~owner_id:(-1) ~outside_error:ownership_error
             ~callbacks_live:(fun () -> true)
@@ -262,22 +268,26 @@ let race left right =
         ~outside_error:(Temporal_sdk_kernel.Future.outside_error left)
     in
     let settled = ref false in
-    (* A losing future may remain pending for the rest of the workflow. Keep
-       the observer itself so that the operation can still settle normally,
-       but drop the aggregate resolver as soon as a winner is known. Without
-       this indirection the loser would retain the resolved aggregate (and its
-       value) through the observer closure until the loser finished or the
-       workflow shut down. *)
+    let subscriptions = ref [] in
+    (* Inert ready futures can deliver inline, before [subscribe] returns its
+       remover. Detach that late token immediately if a winner already ran. *)
+    let register subscribe =
+      let remove = subscribe () in
+      if !settled then remove () else subscriptions := remove :: !subscriptions
+    in
     let resolution = ref (Some resolve) in
     let finish wrap result =
       if not !settled then (
         settled := true;
         let resolve = Option.get !resolution in
         resolution := None;
+        let removals = !subscriptions in
+        subscriptions := [];
+        List.iter (fun remove -> remove ()) removals;
         resolve (Result.map wrap result))
     in
-    Temporal_sdk_kernel.Future.observe left (finish (fun value -> Left value));
-    Temporal_sdk_kernel.Future.observe right (finish (fun value -> Right value));
+    register (fun () -> Temporal_sdk_kernel.Future.subscribe left (finish (fun value -> Left value)));
+    register (fun () -> Temporal_sdk_kernel.Future.subscribe right (finish (fun value -> Right value)));
     combined
 
 (** Settles with the first completion of a non-empty homogeneous collection. *)
@@ -290,19 +300,25 @@ let first leading rest =
         ~outside_error:(Temporal_sdk_kernel.Future.outside_error leading)
     in
     let settled = ref false in
-    (* Preserve the losers' ability to finish their own operations while
-       releasing the selected future's resolver immediately after the first
-       completion. This avoids retaining the winner through a long-lived
-       losing activity or child workflow. *)
+    let subscriptions = ref [] in
+    (* Inert ready futures can deliver inline, before [subscribe] returns its
+       remover. Detach that late token immediately if a winner already ran. *)
+    let register subscribe =
+      let remove = subscribe () in
+      if !settled then remove () else subscriptions := remove :: !subscriptions
+    in
     let resolution = ref (Some resolve) in
     let finish result =
       if not !settled then (
         settled := true;
         let resolve = Option.get !resolution in
         resolution := None;
+        let removals = !subscriptions in
+        subscriptions := [];
+        List.iter (fun remove -> remove ()) removals;
         resolve result)
     in
     List.iter
-      (fun future -> Temporal_sdk_kernel.Future.observe future finish)
+      (fun future -> register (fun () -> Temporal_sdk_kernel.Future.subscribe future finish))
       (leading :: rest);
     combined

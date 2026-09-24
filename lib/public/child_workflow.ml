@@ -136,7 +136,7 @@ let start_handle ?scope ?(cancellation_type = Try_cancel) ?retry_policy ~id
                         (* Scope ownership was checked before scheduling, so
                            this registration cannot race another Domain. *)
                         ignore
-                          (Scope.on_cancel scope (fun () ->
+                          (Scope.on_cancel ~until:(Future_private.of_internal future) scope (fun () ->
                                request_cancel ~reason:"cancelled by workflow")))
                       scope
                   in

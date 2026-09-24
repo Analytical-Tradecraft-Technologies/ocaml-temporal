@@ -14,7 +14,7 @@ type ('value, 'error) t
 val make :
   await:(unit -> ('value, 'error) result) ->
   await_gate:((((unit -> unit) -> unit) -> unit)) ->
-  observe:((('value, 'error) result -> unit) -> unit) ->
+  subscribe:((('value, 'error) result -> unit) -> (unit -> unit)) ->
   is_ready:(unit -> bool) ->
   peek:(unit -> ('value, 'error) result option) ->
   owner_id:int ->
@@ -32,6 +32,12 @@ val await_gate : ('value, 'error) t -> (((unit -> unit) -> unit) -> unit)
 (** Registers an observer for a scheduler-owned result notification. *)
 val observe :
   ('value, 'error) t -> (('value, 'error) result -> unit) -> unit
+
+(** Registers a removable observer. The returned owner-scheduler action is
+    idempotent, unlinks pending registration storage, and suppresses delivery
+    if the callback has already been queued but has not started. *)
+val subscribe :
+  ('value, 'error) t -> (('value, 'error) result -> unit) -> (unit -> unit)
 
 (** Reports whether the scheduler-owned result is settled. *)
 val is_ready : ('value, 'error) t -> bool
