@@ -18,8 +18,8 @@ let of_internal ?outside_error future =
       map_error (Temporal_sdk_kernel.Future_store.await future))
     ~await_gate:(fun register ->
       Temporal_sdk_kernel.Future_store.await_gate future register)
-    ~observe:(fun observer ->
-      Temporal_sdk_kernel.Future_store.observe future (fun result ->
+    ~subscribe:(fun observer ->
+      Temporal_sdk_kernel.Future_store.subscribe future (fun result ->
           observer (map_error result)))
     ~is_ready:(fun () -> Temporal_sdk_kernel.Future_store.is_ready future)
     ~peek:(fun () ->
@@ -35,7 +35,7 @@ let resolved ~outside_error result =
   Temporal_sdk_kernel.Future.make
     ~await:(fun () -> result)
     ~await_gate:(fun register -> register (fun () -> ()))
-    ~observe:(fun observer -> observer result)
+    ~subscribe:(fun observer -> observer result; fun () -> ())
     ~is_ready:(fun () -> true) ~peek:(fun () -> Some result) ~owner_id:(-1)
     ~outside_error ~callbacks_live:(fun () -> true)
     ~enqueue:(fun thunk -> thunk ())

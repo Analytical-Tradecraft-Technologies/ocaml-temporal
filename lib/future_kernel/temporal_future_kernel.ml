@@ -7,7 +7,7 @@ type ('value, 'error) t = {
   (* Registers a continuation with the scheduler's suspension gate. *)
   await_gate_impl : (((unit -> unit) -> unit) -> unit);
   (* Registers a callback for the next owner-scheduler notification. *)
-  observe_impl : (('value, 'error) result -> unit) -> unit;
+  subscribe_impl : (('value, 'error) result -> unit) -> (unit -> unit);
   (* Reports whether this operation has already settled. *)
   is_ready_impl : unit -> bool;
   (* Reads a settled result without consuming it. *)
@@ -25,12 +25,12 @@ type ('value, 'error) t = {
 (** Constructs a kernel future from callbacks owned by one scheduler.  The
     callbacks remain the source of truth for lifecycle and cleanup; this
     record only groups those callbacks behind the private package boundary. *)
-let make ~await ~await_gate ~observe ~is_ready ~peek ~owner_id ~outside_error
+let make ~await ~await_gate ~subscribe ~is_ready ~peek ~owner_id ~outside_error
     ~callbacks_live ~enqueue =
   {
     await_impl = await;
     await_gate_impl = await_gate;
-    observe_impl = observe;
+    subscribe_impl = subscribe;
     is_ready_impl = is_ready;
     peek_impl = peek;
     owner_id_impl = owner_id;
@@ -46,7 +46,12 @@ let await future = future.await_impl ()
 let await_gate future register = future.await_gate_impl register
 
 (** Registers an observer for a scheduler-owned result notification. *)
-let observe future callback = future.observe_impl callback
+let observe future callback =
+  let (_ : unit -> unit) = future.subscribe_impl callback in
+  ()
+
+(** Subscribes until delivery or explicit removal on the owning scheduler. *)
+let subscribe future callback = future.subscribe_impl callback
 
 (** Reports whether the scheduler-owned result is settled. *)
 let is_ready future = future.is_ready_impl ()
