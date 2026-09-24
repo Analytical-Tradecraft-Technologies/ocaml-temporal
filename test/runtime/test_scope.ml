@@ -19,7 +19,7 @@ let public_future future =
   Temporal_future_kernel.make
     ~await:(fun () -> Temporal_runtime.Future_store.await future)
     ~await_gate:(Temporal_runtime.Future_store.await_gate future)
-    ~observe:(Temporal_runtime.Future_store.observe future)
+    ~subscribe:(Temporal_runtime.Future_store.subscribe future)
     ~is_ready:(fun () -> Temporal_runtime.Future_store.is_ready future)
     ~peek:(fun () -> Temporal_runtime.Future_store.peek future)
     ~owner_id:(Temporal_runtime.Future_store.owner_id future)

@@ -32,7 +32,7 @@ type ('value, 'error) waiter =
     Lists are reversed so adding a new entry is constant time. *)
 type ('value, 'error) pending = {
   mutable waiters : ('value, 'error) waiter list;
-  mutable observers : (('value, 'error) result -> unit) list;
+  mutable observers : (('value, 'error) result -> unit) option ref list;
 }
 
 (** [Closed] means the workflow ended before this future received a result and
@@ -94,6 +94,7 @@ let teardown promise () =
       promise.owner.on_settled ();
       let waiters = List.rev pending.waiters in
       pending.waiters <- [];
+      List.iter (fun observer -> observer := None) pending.observers;
       pending.observers <- [];
       List.iter
         (fun continuation ->
@@ -139,7 +140,10 @@ let create ~owner ~outside_error =
         List.iter
           (fun observer ->
             owner.enqueue (fun () ->
-                if owner.callbacks_live () then observer result))
+                let callback = !observer in
+                observer := None;
+                if owner.callbacks_live () then
+                  Option.iter (fun callback -> callback result) callback))
           (List.rev pending.observers);
         pending.waiters <- [];
         pending.observers <- []
@@ -215,17 +219,31 @@ let add_waiter promise continuation =
     through the workflow scheduler without pausing a fiber; callbacks queued
     when the owner shuts down become no-ops after runtime teardown. Public
     derived wrappers use the same liveness signal to avoid scheduling work
-    from these skipped callbacks. *)
+    from these skipped callbacks. The returned owner-only removal action also
+    unlinks pending list storage and suppresses callbacks already queued. *)
+let subscribe promise observer =
+  let token = ref (Some observer) in
+  let deliver result () =
+    let callback = !token in
+    token := None;
+    if promise.owner.callbacks_live () then
+      Option.iter (fun callback -> callback result) callback
+  in
+  (match promise.state with
+  | Pending pending -> pending.observers <- token :: pending.observers
+  | Ready result -> promise.owner.enqueue (deliver result)
+  | Closed -> promise.owner.enqueue (deliver (Error (promise.outside_error ()))));
+  fun () ->
+    token := None;
+    match promise.state with
+    | Pending pending ->
+        pending.observers <- List.filter (fun current -> current != token) pending.observers
+    | Ready _ | Closed -> ()
+
+(** Registers an observer whose lifetime ends at delivery or owner teardown. *)
 let observe promise observer =
-  match promise.state with
-  | Pending pending -> pending.observers <- observer :: pending.observers
-  | Ready result ->
-      promise.owner.enqueue (fun () ->
-          if promise.owner.callbacks_live () then observer result)
-  | Closed ->
-      promise.owner.enqueue (fun () ->
-          if promise.owner.callbacks_live () then
-            observer (Error (promise.outside_error ())))
+  let (_ : unit -> unit) = subscribe promise observer in
+  ()
 
 (** Waits for an arbitrary notification associated with [promise] without
     exposing an OCaml effect to higher layers. [register] receives a
@@ -354,13 +372,26 @@ let race ~ownership_error left right =
       create ~owner:left.owner ~outside_error:left.outside_error
     in
     let settled = ref false in
+    let subscriptions = ref [] in
+    (* Inert ready futures can deliver inline, before [subscribe] returns its
+       remover. Detach that late token immediately if a winner already ran. *)
+    let register subscribe =
+      let remove = subscribe () in
+      if !settled then remove () else subscriptions := remove :: !subscriptions
+    in
+    let resolution = ref (Some resolve) in
     let finish wrap result =
       if not !settled then (
         settled := true;
+        let resolve = Option.get !resolution in
+        resolution := None;
+        let removals = !subscriptions in
+        subscriptions := [];
+        List.iter (fun remove -> remove ()) removals;
         resolve (Result.map wrap result))
     in
-    observe left (finish (fun value -> Left value));
-    observe right (finish (fun value -> Right value));
+    register (fun () -> subscribe left (finish (fun value -> Left value)));
+    register (fun () -> subscribe right (finish (fun value -> Right value)));
     combined
 
 (** Settles with the first completion from a non-empty homogeneous collection.
@@ -372,12 +403,25 @@ let first ~ownership_error leading rest =
       create ~owner:leading.owner ~outside_error:leading.outside_error
     in
     let settled = ref false in
+    let subscriptions = ref [] in
+    (* Inert ready futures can deliver inline, before [subscribe] returns its
+       remover. Detach that late token immediately if a winner already ran. *)
+    let register subscribe =
+      let remove = subscribe () in
+      if !settled then remove () else subscriptions := remove :: !subscriptions
+    in
+    let resolution = ref (Some resolve) in
     let finish result =
       if not !settled then (
         settled := true;
+        let resolve = Option.get !resolution in
+        resolution := None;
+        let removals = !subscriptions in
+        subscriptions := [];
+        List.iter (fun remove -> remove ()) removals;
         resolve result)
     in
-    List.iter (fun future -> observe future finish) (leading :: rest);
+    List.iter (fun future -> register (fun () -> subscribe future finish)) (leading :: rest);
     combined
 
 (** Checks the state directly without pausing or scheduling work. *)

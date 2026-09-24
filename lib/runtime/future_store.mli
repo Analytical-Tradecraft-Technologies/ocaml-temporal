@@ -104,6 +104,11 @@ val add_waiter :
 val observe :
   ('value, 'error) t -> (('value, 'error) result -> unit) -> unit
 
+(** Registers an observer with idempotent owner-scheduler removal. Removal
+    unlinks pending storage and suppresses an already queued callback. *)
+val subscribe :
+  ('value, 'error) t -> (('value, 'error) result -> unit) -> (unit -> unit)
+
 (** Suspends the current workflow fiber until [register] invokes its signal.
     The signal is single-use; duplicate calls are ignored. This is a
     scheduler-aware gate for internal combinators and never blocks an OS

@@ -17,7 +17,7 @@ type t = {
   (* Hooks are kept by the owning scheduler and invoked in registration order
      when this scope is cancelled.  They are the bridge from cooperative OCaml
      observation to real Temporal cancellation commands. *)
-  mutable cancel_hooks : (unit -> (unit, Error.t) result) list;
+  mutable cancel_hooks : (unit -> (unit, Error.t) result) option ref list;
 }
 
 (** Constructs the stable public error returned when a scope has been
@@ -94,7 +94,11 @@ let cancel scope =
           List.fold_left
             (fun first_error hook ->
               let result =
-                try hook () with
+                try
+                  match !hook with
+                  | None -> Ok ()
+                  | Some action -> hook := None; action ()
+                with
                 | exn ->
                     Error
                       (Error.defect
@@ -110,25 +114,54 @@ let cancel scope =
         in
         match first_error with None -> Ok () | Some error -> Error error
 
-(** Registers a server-side cancellation action.  An active scope stores the
-    hook until cancellation; registering after cancellation runs it
-    immediately, closing the cancel-before-registration race without another
-    lock or Domain. *)
-let on_cancel scope hook =
+(** Registers a cancellation action, optionally bounded by a same-owner
+    terminal future. Removing a completed operation unlinks its list cell as
+    well as its closure. Cancellation also detaches the completion observer,
+    so either winner releases both sides of the registration. *)
+let on_cancel ?until scope hook =
   if not (owns_scheduler scope) then Error (ownership_error "on_cancel")
+  else if Option.fold ~none:false
+      ~some:(fun future -> Temporal_sdk_kernel.Future.owner_id future <> scope.owner_id)
+      until then
+    Error (Error.defect
+      ~message:"Temporal.Scope.on_cancel received a future from a different workflow execution")
   else
-    match scope.state with
-    | Active ->
-        scope.cancel_hooks <- hook :: scope.cancel_hooks;
-        Ok ()
-    | Cancelled ->
-        (try hook () with
+    (* Read readiness again at cancellation, before any queued cleanup runs. *)
+    let completed () = Option.fold ~none:false ~some:Future.is_ready until in
+    let invoke () =
+      if completed () then Ok ()
+      else
+        try hook () with
         | exn ->
             Error
               (Error.defect
                  ~message:
                    ("Temporal.Scope cancellation hook raised: "
-                   ^ Printexc.to_string exn)))
+                   ^ Printexc.to_string exn))
+    in
+    match scope.state with
+    | Cancelled -> invoke ()
+    | Active when completed () -> Ok ()
+    | Active ->
+        let token = ref None in
+        let subscription = ref None in
+        (* Either completion or cancellation releases both registration sides. *)
+        let detach () =
+          token := None;
+          scope.cancel_hooks <-
+            List.filter (fun current -> current != token) scope.cancel_hooks;
+          Option.iter (fun remove -> remove ()) !subscription;
+          subscription := None
+        in
+        token := Some (fun () -> detach (); invoke ());
+        scope.cancel_hooks <- token :: scope.cancel_hooks;
+        Option.iter
+          (fun future ->
+            let remove = Temporal_sdk_kernel.Future.subscribe future (fun _ -> detach ()) in
+            if Option.is_none !token then remove ()
+            else subscription := Some remove)
+          until;
+        Ok ()
 
 (** Reports the scope state without scheduling work or touching the resolver.
     Status is an owner-domain operation just like [cancel]: returning a typed
