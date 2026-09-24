@@ -1,6 +1,7 @@
 name: Release preflight
 
 on:
+  workflow_call:
   merge_group:
     types: [checks_requested]
   pull_request:
@@ -10,7 +11,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: release-preflight-${{ github.workflow }}-${{ github.ref }}
+  group: release-preflight-${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -39,7 +40,6 @@ jobs:
             python3 scripts/generate-cargo-sbom.py --metadata /tmp/cargo-metadata.json \
             > "$RUNNER_TEMP/ocaml-temporal-cargo.spdx.json"
           test -s "$RUNNER_TEMP/ocaml-temporal-cargo.spdx.json"
-
       - name: Audit generated SBOM
         shell: bash
         run: |
@@ -50,3 +50,11 @@ jobs:
             --workdir /workspace \
             python:3.14-slim-bookworm@sha256:4ff4b92a68355dbdb52584ab3391dff8d371a61d4e063468bfd0130e3189c6d9 \
             python3 scripts/generate-cargo-sbom.py --audit /tmp/ocaml-temporal-cargo.spdx.json
+
+      - name: Retain the Cargo SBOM for release publication
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-cargo-sbom
+          path: ${{ runner.temp }}/ocaml-temporal-cargo.spdx.json
+          if-no-files-found: error
+          retention-days: ${{ vars.RUST_BRIDGE_ARTIFACT_RETENTION_DAYS || '90' }}

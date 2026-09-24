@@ -1,0 +1,133 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Version tag matching the package version
+        required: true
+        type: string
+        default: v0.1.0-rc.1
+
+permissions:
+  contents: read
+
+# A second request must never replace an in-progress publication.
+concurrency:
+  group: release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate release request
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out the exact requested commit
+        uses: actions/checkout@v7
+      - name: Validate the version and release source
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          test "$RELEASE_REF" = refs/heads/master
+          git check-ref-format "refs/tags/$RELEASE_TAG"
+          make release-preflight
+          make release-tag-check RELEASE_TAG="$RELEASE_TAG"
+          # Exit 2 means no matching remote tag; network errors must fail.
+          status=0
+          git ls-remote --exit-code --tags origin "refs/tags/$RELEASE_TAG" || status=$?
+          if [ "$status" -ne 2 ]; then
+            echo 'Release tag already exists, or its availability could not be verified.' >&2
+            exit 1
+          fi
+
+  build:
+    needs: validate
+    uses: ./.github/workflows/build-pr.yml
+    with:
+      tier: release
+      bridge-profile: release
+
+  metadata:
+    needs: validate
+    uses: ./.github/workflows/release-preflight.yml
+
+  publish:
+    name: Publish the tested release
+    needs: [build, metadata]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ inputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check out the exact tested commit
+        uses: actions/checkout@v7
+      - name: Download all four tested bridge bundles
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: rust-bridge-*
+          path: _build/release-bundles
+      - name: Download the audited Cargo SBOM
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: release-cargo-sbom
+          path: _build/release-assets
+      - name: Download all sixteen tested OCaml libraries
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: ocaml-sdk-*
+          path: _build/release-ocaml-bundles
+      - name: Assemble and verify release assets
+        run: |
+          set -euo pipefail
+          make release-tag-check RELEASE_TAG="$RELEASE_TAG"
+          python3 scripts/package-release-bridges.py \
+            --bundles _build/release-bundles \
+            --ocaml-bundles _build/release-ocaml-bundles \
+            --output _build/release-assets \
+            --tag "$RELEASE_TAG" --commit "$GITHUB_SHA"
+          git archive --format=tar --prefix="ocaml-temporal-${RELEASE_TAG#v}/" HEAD \
+            | gzip -n > "_build/release-assets/ocaml-temporal-$RELEASE_TAG-source.tar.gz"
+          python3 scripts/generate-cargo-sbom.py \
+            --audit _build/release-assets/ocaml-temporal-cargo.spdx.json
+          (
+            cd _build/release-assets
+            sha256sum ./*.tar.gz ./*.json > SHA256SUMS
+            sha256sum --check SHA256SUMS
+          )
+          cat > "$RUNNER_TEMP/release-notes.md" <<EOF
+          Experimental OCaml Temporal SDK, built and tested from commit $GITHUB_SHA.
+
+          Includes optimized Rust bridge libraries for Linux x64 and ARM64
+          (Debian 12/glibc), macOS ARM64, and Windows x64 GNU/MinGW.
+          Includes compiled OCaml SDK libraries and C stubs for every tested
+          compiler/platform combination. Compatible downstream applications
+          link these directly without rebuilding the SDK or Rust bridge.
+          Local builds from source remain supported.
+
+          See manifest.json for bridge identities and SHA256SUMS for asset digests.
+          The SPDX document covers the Rust dependency graph; it is not a full
+          application or OCaml dependency SBOM.
+          EOF
+      - name: Create the tag and publish the complete release
+        run: |
+          set -euo pipefail
+          flags=(--latest)
+          case "$RELEASE_TAG" in
+            *-*|*~*) flags=(--prerelease --latest=false) ;;
+          esac
+          # Creating the ref is atomic: an existing tag fails rather than
+          # publishing assets against an unrelated or concurrently created tag.
+          gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
+            -f ref="refs/tags/$RELEASE_TAG" -f sha="$GITHUB_SHA"
+          # Assets are uploaded to a draft before anything is published.
+          gh release create "$RELEASE_TAG" _build/release-assets/* \
+            --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --draft --title "$RELEASE_TAG" --notes-file "$RUNNER_TEMP/release-notes.md" \
+            "${flags[@]}"
+          gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --json url --jq '.url' >> "$GITHUB_STEP_SUMMARY"

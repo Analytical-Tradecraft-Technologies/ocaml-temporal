@@ -1,6 +1,14 @@
 name: Build
 
 on:
+  workflow_call:
+    inputs:
+      tier:
+        type: string
+        default: pr
+      bridge-profile:
+        type: string
+        default: ci
   merge_group:
     types: [checks_requested]
   # Required check names must still be reported for documentation-only changes.
@@ -12,8 +20,8 @@ permissions:
 concurrency:
   # A pull-request number remains stable across synchronize events, so a new
   # commit replaces an older queued or running PR run.
-  group: build-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  group: build-${{ github.workflow }}-${{ inputs.tier == 'release' && github.run_id || github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ inputs.tier != 'release' }}
 
 jobs:
   changes:
@@ -21,6 +29,8 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       code: ${{ steps.changed-paths.outputs.code }}
+      linux: ${{ steps.matrix.outputs.linux }}
+      native: ${{ steps.matrix.outputs.native }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
@@ -34,6 +44,10 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
         run: |
           set -euo pipefail
+          if [ -z "$BASE_SHA" ] && [ -z "$HEAD_SHA" ]; then
+            echo 'code=true' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           code=false
 
           # Use the PR merge base so unrelated changes on master cannot turn
@@ -61,6 +75,11 @@ jobs:
           done < "$RUNNER_TEMP/changed-paths"
 
           echo "code=$code" >> "$GITHUB_OUTPUT"
+      - name: Select exact compiler versions
+        id: matrix
+        env:
+          BUILD_TIER: ${{ inputs.tier || 'pr' }}
+        run: python3 scripts/ci-matrix.py "$BUILD_TIER" >> "$GITHUB_OUTPUT"
 
   rust-amd64:
     if: needs.changes.outputs.code == 'true'
@@ -69,6 +88,7 @@ jobs:
     with:
       runner: ubuntu-24.04
       platform: linux-amd64
+      profile: ${{ inputs.bridge-profile || 'ci' }}
 
   rust-arm64:
     if: needs.changes.outputs.code == 'true'
@@ -77,6 +97,25 @@ jobs:
     with:
       runner: ubuntu-24.04-arm
       platform: linux-arm64
+      profile: ${{ inputs.bridge-profile || 'ci' }}
+
+  rust-macos:
+    if: needs.changes.outputs.code == 'true'
+    needs: changes
+    uses: ./.github/workflows/rust-bridge.yml
+    with:
+      runner: macos-15
+      platform: macos-arm64
+      profile: ${{ inputs.bridge-profile || 'ci' }}
+
+  rust-windows:
+    if: needs.changes.outputs.code == 'true'
+    needs: changes
+    uses: ./.github/workflows/rust-bridge.yml
+    with:
+      runner: windows-latest
+      platform: windows-amd64
+      profile: ${{ inputs.bridge-profile || 'ci' }}
 
   quality:
     if: needs.changes.outputs.code == 'true'
@@ -87,6 +126,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
+      - name: Test matrix selection and artifact failure cases
+        run: make test-ci-artifacts
       - name: Install pinned quality tools
         uses: taiki-e/install-action@9114bf4d891761788c546334fd37538eae1bf8b3 # v2.87.16
         with:
@@ -128,7 +169,7 @@ jobs:
   temporal-integration:
     # Required checks must fail, rather than be skipped, when a producer fails.
     if: ${{ !cancelled() && needs.changes.outputs.code == 'true' }}
-    needs: [changes, rust-amd64]
+    needs: [changes, verify]
     name: Temporal/PostgreSQL integration smoke (OCaml 5.5)
     runs-on: ubuntu-24.04
     # Independent live controllers run sequentially while reusing the
@@ -138,24 +179,27 @@ jobs:
     env:
       # Keep this as one explicit compatibility lane because it starts the
       # complete PostgreSQL/Temporal stack and two OCaml processes.
-      OCAML_VERSION: "5.5"
-      TEMPORAL_RUST_BRIDGE_DIR: /workspace/_build/rust-bridge
-      TEMPORAL_RUST_BRIDGE_KEY: ${{ needs.rust-amd64.outputs.key }}
+      OCAML_VERSION: "5.5.1"
+      TEMPORAL_PREBUILT_SMOKE: "1"
     steps:
-      - name: Require a successful Rust producer
-        env:
-          RUST_RESULT: ${{ needs.rust-amd64.result }}
-        run: test "$RUST_RESULT" = success
+      # Always make failure-reporting scripts available, even if a producer
+      # failed and the dependency gate below stops the live test steps.
       - name: Check out repository
         uses: actions/checkout@v7
-      - name: Download the verified Linux amd64 bridge
+      - name: Require successful OCaml builds
+        env:
+          OCAML_RESULT: ${{ needs.verify.result }}
+        run: test "$OCAML_RESULT" = success
+      - name: Download compiled smoke executables
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          name: rust-bridge-linux-amd64
-          path: _build/rust-bridge
+          name: temporal-smoke-linux-amd64-ocaml-5.5.1
+          path: _build/smoke-artifact
+      - name: Verify and unpack the exact tested executables
+        run: python3 scripts/smoke-artifact.py unpack --directory _build/smoke-artifact --commit "$GITHUB_SHA" --ocaml "$OCAML_VERSION"
       - name: Reclaim disposable GitHub-hosted runner disk
-        # The smoke lane builds several isolated OCaml/Dune trees, each of
-        # which statically links the Rust Core bridge. Reclaim the large
+        # The smoke lane downloads executables that statically link Rust.
+        # Leave enough space for their extraction and the live server images. Reclaim the large
         # preinstalled SDKs before the first Compose build so a valid native
         # link cannot fail because the disposable runner ran out of space.
         if: runner.environment == 'github-hosted'
@@ -224,26 +268,17 @@ jobs:
     # Override the implicit success() dependency check so the gate below runs.
     if: ${{ !cancelled() && needs.changes.outputs.code == 'true' }}
     needs: [changes, rust-amd64, rust-arm64]
-    name: OCaml ${{ matrix.ocaml }} / ${{ matrix.runner }}
+    name: OCaml ${{ matrix.label }} / ${{ matrix.runner }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     env:
       TEMPORAL_RUST_BRIDGE_DIR: /workspace/_build/rust-bridge
+      OCAML_ARTIFACT_COMMIT: ${{ github.sha }}
+      RUST_BRIDGE_PROFILE: ${{ inputs.bridge-profile || 'ci' }}
       TEMPORAL_RUST_BRIDGE_KEY: ${{ matrix.runner == 'ubuntu-24.04-arm' && needs.rust-arm64.outputs.key || needs.rust-amd64.outputs.key }}
     strategy:
       fail-fast: false
-      matrix:
-        # PRs exercise the compatibility floor and current release on the
-        # primary Linux architecture, plus the current release on ARM64.
-        # build.yml retains the exhaustive 5.2–5.5 × amd64/arm64 matrix for
-        # scheduled runs.
-        include:
-          - ocaml: "5.2"
-            runner: ubuntu-24.04
-          - ocaml: "5.5"
-            runner: ubuntu-24.04
-          - ocaml: "5.5"
-            runner: ubuntu-24.04-arm
+      matrix: ${{ fromJSON(needs.changes.outputs.linux) }}
     steps:
       - name: Require successful Rust producers
         env:
@@ -274,28 +309,70 @@ jobs:
           docker system prune --all --force --volumes
           df -h /
       - name: Build, lint, and test
-        run: make verify OCAML_VERSION=${{ matrix.ocaml }}
+        env:
+          OCAML_VERSION: ${{ matrix.ocaml }}
+        run: make verify
+      - name: Package and consume the compiled OCaml library
+        env:
+          OCAML_VERSION: ${{ matrix.ocaml }}
+        run: make library-artifact
+      - name: Upload the verified OCaml library
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ocaml-sdk-linux-${{ matrix.runner == 'ubuntu-24.04-arm' && 'arm64' || 'amd64' }}-ocaml-${{ matrix.ocaml }}
+          path: _build/ocaml-library-artifact/
+          if-no-files-found: error
+          retention-days: ${{ vars.RUST_BRIDGE_ARTIFACT_RETENTION_DAYS || '90' }}
+          compression-level: 0
+      - name: Compile the live smoke executables once
+        if: matrix.runner == 'ubuntu-24.04' && matrix.ocaml == '5.5.1'
+        env:
+          OCAML_VERSION: ${{ matrix.ocaml }}
+        run: |
+          make build-smoke-executables
+          python3 scripts/smoke-artifact.py pack --directory _build/smoke-artifact --commit "$GITHUB_SHA" --ocaml "$OCAML_VERSION"
+      - name: Upload compiled smoke executables
+        if: matrix.runner == 'ubuntu-24.04' && matrix.ocaml == '5.5.1'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: temporal-smoke-linux-amd64-ocaml-5.5.1
+          path: _build/smoke-artifact/
+          if-no-files-found: error
+          retention-days: ${{ vars.RUST_BRIDGE_ARTIFACT_RETENTION_DAYS || '90' }}
+          compression-level: 0
 
   native-macos:
-    if: needs.changes.outputs.code == 'true'
-    needs: changes
-    name: OCaml 5.5 / macOS ARM64
+    if: ${{ !cancelled() && needs.changes.outputs.code == 'true' }}
+    needs: [changes, rust-macos]
+    name: OCaml ${{ matrix.label }} / macOS ARM64
     runs-on: macos-15
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.changes.outputs.native) }}
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/_build/rust
       RUSTUP_TOOLCHAIN: 1.98.1-aarch64-apple-darwin
-      NATIVE_OCAML_VERSION: "5.5"
+      NATIVE_OCAML_VERSION: ${{ matrix.ocaml }}
+      OCAML_ARTIFACT_COMMIT: ${{ github.sha }}
+      RUST_BRIDGE_PROFILE: ${{ inputs.bridge-profile || 'ci' }}
       NATIVE_RUST_VERSION: 1.98.1
       NATIVE_ARCH: arm64
       NATIVE_RUST_HOST: aarch64-apple-darwin
+      TEMPORAL_RUST_BRIDGE_DIR: ${{ github.workspace }}/_build/rust-bridge
+      TEMPORAL_RUST_BRIDGE_KEY: ${{ needs.rust-macos.outputs.key }}
     steps:
+      - name: Require a successful Rust producer
+        shell: bash
+        env:
+          RUST_RESULT: ${{ needs.rust-macos.result }}
+        run: test "$RUST_RESULT" = success
       - name: Check out repository
         uses: actions/checkout@v7
-      - name: Set up OCaml 5.5
+      - name: Set up the exact OCaml compiler
         uses: ocaml/setup-ocaml@93303b622b2522e4411e295f9e77411a24912ac7 # v3.9.0
         with:
-          ocaml-compiler: "5.5"
+          ocaml-compiler: ${{ matrix.ocaml }}
       - name: Set up pinned Rust toolchain
         shell: bash
         run: >-
@@ -305,39 +382,61 @@ jobs:
         run: brew install protobuf
       - name: Install OCaml dependencies
         run: opam install . --deps-only --with-test --assume-depexts --yes
-      - name: Prepare verified Rust bridge
-        id: bridge
-        uses: ./.github/actions/rust-bridge
+      - name: Download the verified platform bridge
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          platform: macos-arm64
-          mode: native
+          name: rust-bridge-macos-arm64
+          path: _build/rust-bridge
       - name: Build, lint, and test natively
         shell: bash
         env:
           TEMPORAL_RUST_BRIDGE_DIR: ${{ github.workspace }}/_build/rust-bridge
-          TEMPORAL_RUST_BRIDGE_KEY: ${{ steps.bridge.outputs.key }}
+          TEMPORAL_RUST_BRIDGE_KEY: ${{ needs.rust-macos.outputs.key }}
         run: make native-verify
+      - name: Package and consume the compiled OCaml library
+        shell: bash
+        run: make native-library-artifact OCAML_ARTIFACT_PLATFORM=macos-arm64 PYTHON=python3
+      - name: Upload the verified OCaml library
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ocaml-sdk-macos-arm64-ocaml-${{ matrix.ocaml }}
+          path: _build/ocaml-library-artifact/
+          if-no-files-found: error
+          retention-days: ${{ vars.RUST_BRIDGE_ARTIFACT_RETENTION_DAYS || '90' }}
+          compression-level: 0
 
   native-windows:
-    if: needs.changes.outputs.code == 'true'
-    needs: changes
-    name: OCaml 5.5 / Windows x64
+    if: ${{ !cancelled() && needs.changes.outputs.code == 'true' }}
+    needs: [changes, rust-windows]
+    name: OCaml ${{ matrix.label }} / Windows x64
     runs-on: windows-latest
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.changes.outputs.native) }}
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/_build/rust
       RUSTUP_TOOLCHAIN: 1.98.1-x86_64-pc-windows-gnu
-      NATIVE_OCAML_VERSION: "5.5"
+      NATIVE_OCAML_VERSION: ${{ matrix.ocaml }}
+      OCAML_ARTIFACT_COMMIT: ${{ github.sha }}
+      RUST_BRIDGE_PROFILE: ${{ inputs.bridge-profile || 'ci' }}
       NATIVE_RUST_VERSION: 1.98.1
       NATIVE_ARCH: amd64
       NATIVE_RUST_HOST: x86_64-pc-windows-gnu
+      TEMPORAL_RUST_BRIDGE_DIR: ${{ github.workspace }}/_build/rust-bridge
+      TEMPORAL_RUST_BRIDGE_KEY: ${{ needs.rust-windows.outputs.key }}
     steps:
+      - name: Require a successful Rust producer
+        shell: bash
+        env:
+          RUST_RESULT: ${{ needs.rust-windows.result }}
+        run: test "$RUST_RESULT" = success
       - name: Check out repository
         uses: actions/checkout@v7
-      - name: Set up OCaml 5.5
+      - name: Set up the exact OCaml compiler
         uses: ocaml/setup-ocaml@93303b622b2522e4411e295f9e77411a24912ac7 # v3.9.0
         with:
-          ocaml-compiler: "5.5"
+          ocaml-compiler: ${{ matrix.ocaml }}
           windows-compiler: mingw
           windows-environment: cygwin
       - name: Set up pinned Rust toolchain
@@ -361,15 +460,25 @@ jobs:
           "$protoc_unix_path" --version
       - name: Install OCaml dependencies
         run: opam install . --deps-only --with-test --assume-depexts --yes
-      - name: Prepare verified Rust bridge
-        id: bridge
-        uses: ./.github/actions/rust-bridge
+      - name: Download the verified platform bridge
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          platform: windows-amd64
-          mode: native
+          name: rust-bridge-windows-amd64
+          path: _build/rust-bridge
       - name: Build, lint, and test natively
         shell: bash
         env:
           TEMPORAL_RUST_BRIDGE_DIR: ${{ github.workspace }}/_build/rust-bridge
-          TEMPORAL_RUST_BRIDGE_KEY: ${{ steps.bridge.outputs.key }}
+          TEMPORAL_RUST_BRIDGE_KEY: ${{ needs.rust-windows.outputs.key }}
         run: make native-verify
+      - name: Package and consume the compiled OCaml library
+        shell: bash
+        run: make native-library-artifact OCAML_ARTIFACT_PLATFORM=windows-amd64 PYTHON=python
+      - name: Upload the verified OCaml library
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ocaml-sdk-windows-amd64-ocaml-${{ matrix.ocaml }}
+          path: _build/ocaml-library-artifact/
+          if-no-files-found: error
+          retention-days: ${{ vars.RUST_BRIDGE_ARTIFACT_RETENTION_DAYS || '90' }}
+          compression-level: 0

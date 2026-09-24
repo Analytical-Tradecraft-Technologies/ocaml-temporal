@@ -12,6 +12,7 @@ services:
       # All worker/driver services extend dev, including isolated Dune trees.
       TEMPORAL_RUST_BRIDGE_DIR: ${TEMPORAL_RUST_BRIDGE_DIR:-}
       TEMPORAL_RUST_BRIDGE_KEY: ${TEMPORAL_RUST_BRIDGE_KEY:-}
+      TEMPORAL_PREBUILT_SMOKE: ${TEMPORAL_PREBUILT_SMOKE:-0}
     volumes:
       - ../../..:/workspace
     init: true
@@ -136,11 +137,8 @@ services:
       SMOKE_CACHE_EVICTION_SECOND_WORKFLOW_ID: "${SMOKE_CACHE_EVICTION_SECOND_WORKFLOW_ID:-}"
       SMOKE_REPLAY_WORKFLOW_ID: "${SMOKE_REPLAY_WORKFLOW_ID:-two-binary-worker-restart-replay}"
     command:
-      - opam
-      - exec
-      - --
-      - dune
-      - exec
+      - sh
+      - /workspace/scripts/run-temporal-executable.sh
       - --build-dir=/workspace/_build/smoke-worker
       - test/integration/temporal/worker/smoke_worker.exe
     healthcheck:
@@ -189,11 +187,8 @@ services:
       # activation, while learning the run ID from the activation itself.
       SMOKE_REPLAY_WORKFLOW_ID: "${SMOKE_REPLAY_WORKFLOW_ID:-}"
     command:
-      - opam
-      - exec
-      - --
-      - dune
-      - exec
+      - sh
+      - /workspace/scripts/run-temporal-executable.sh
       - --build-dir=/workspace/_build/smoke-cache-eviction-worker
       - test/integration/temporal/worker/cache_eviction_worker.exe
     healthcheck:
@@ -232,11 +227,8 @@ services:
       - --signal=TERM
       - --kill-after=10s
       - "${SMOKE_DRIVER_TIMEOUT_SECONDS:-300}"
-      - opam
-      - exec
-      - --
-      - dune
-      - exec
+      - sh
+      - /workspace/scripts/run-temporal-executable.sh
       - --build-dir=/workspace/_build/smoke-driver
       - test/integration/temporal/driver/smoke_driver.exe
     init: true
@@ -265,11 +257,8 @@ services:
       - --signal=TERM
       - --kill-after=10s
       - "${SMOKE_DRIVER_TIMEOUT_SECONDS:-300}"
-      - opam
-      - exec
-      - --
-      - dune
-      - exec
+      - sh
+      - /workspace/scripts/run-temporal-executable.sh
       - --build-dir=/workspace/_build/smoke-restart-driver
       - test/integration/temporal/driver/restart_driver.exe
     init: true
@@ -298,11 +287,8 @@ services:
     command:
       - sh
       - /workspace/test/integration/temporal/scripts/run-cache-eviction-driver.sh
-      - opam
-      - exec
-      - --
-      - dune
-      - exec
+      - sh
+      - /workspace/scripts/run-temporal-executable.sh
       - --build-dir=/workspace/_build/smoke-cache-eviction-driver
       - test/integration/temporal/driver/cache_eviction_driver.exe
     init: true
@@ -329,11 +315,8 @@ services:
       SMOKE_WORKER_GENERATION: "${PATCH_REPLAY_GENERATION:-1}"
       SMOKE_REPLAY_WORKFLOW_ID: "${PATCH_REPLAY_WORKFLOW_ID:-two-binary-patch-replay-legacy}"
     command:
-      - opam
-      - exec
-      - --
-      - dune
-      - exec
+      - sh
+      - /workspace/scripts/run-temporal-executable.sh
       - --build-dir=/workspace/_build/patch-replay-legacy-worker
       - test/integration/temporal/patch_replay/legacy_worker.exe
     healthcheck:
@@ -363,11 +346,8 @@ services:
       SMOKE_WORKER_GENERATION: "${PATCH_REPLAY_GENERATION:-2}"
       SMOKE_REPLAY_WORKFLOW_ID: "${PATCH_REPLAY_WORKFLOW_ID:-two-binary-patch-replay-legacy}"
     command:
-      - opam
-      - exec
-      - --
-      - dune
-      - exec
+      - sh
+      - /workspace/scripts/run-temporal-executable.sh
       - --build-dir=/workspace/_build/patch-replay-patched-worker
       - test/integration/temporal/patch_replay/patched_worker.exe
     healthcheck:
@@ -386,11 +366,8 @@ services:
     extends:
       service: patch-replay-patched-worker
     command:
-      - opam
-      - exec
-      - --
-      - dune
-      - exec
+      - sh
+      - /workspace/scripts/run-temporal-executable.sh
       - --build-dir=/workspace/_build/patch-replay-deprecated-worker
       - test/integration/temporal/patch_replay/deprecated_worker.exe
 
@@ -401,11 +378,8 @@ services:
     extends:
       service: patch-replay-patched-worker
     command:
-      - opam
-      - exec
-      - --
-      - dune
-      - exec
+      - sh
+      - /workspace/scripts/run-temporal-executable.sh
       - --build-dir=/workspace/_build/patch-replay-removed-worker
       - test/integration/temporal/patch_replay/removed_worker.exe
 
@@ -433,11 +407,8 @@ services:
       - --signal=TERM
       - --kill-after=10s
       - "${SMOKE_DRIVER_TIMEOUT_SECONDS:-300}"
-      - opam
-      - exec
-      - --
-      - dune
-      - exec
+      - sh
+      - /workspace/scripts/run-temporal-executable.sh
       - --build-dir=/workspace/_build/patch-replay-driver
       - test/integration/temporal/patch_replay/patch_replay_driver.exe
     init: true
@@ -468,11 +439,8 @@ services:
       SMOKE_PARENT_CHILD_REPLAY_CHILD_WORKFLOW_ID: "${SMOKE_PARENT_CHILD_REPLAY_CHILD_WORKFLOW_ID:-two-binary-parent-child-restart-child-smoke}"
       SMOKE_PARENT_CHILD_REPLAY_SCENARIO: "${SMOKE_PARENT_CHILD_REPLAY_SCENARIO:-success}"
     command:
-      - opam
-      - exec
-      - --
-      - dune
-      - exec
+      - sh
+      - /workspace/scripts/run-temporal-executable.sh
       - --build-dir=/workspace/_build/parent-child-restart-worker
       - test/integration/temporal/worker/parent_child_restart_worker.exe
     healthcheck:
@@ -506,11 +474,8 @@ services:
       SMOKE_PARENT_CHILD_REPLAY_CHILD_RUN_ID: "${SMOKE_PARENT_CHILD_REPLAY_CHILD_RUN_ID:-not-configured}"
       SMOKE_PARENT_CHILD_REPLAY_SCENARIO: "${SMOKE_PARENT_CHILD_REPLAY_SCENARIO:-success}"
     command:
-      - opam
-      - exec
-      - --
-      - dune
-      - exec
+      - sh
+      - /workspace/scripts/run-temporal-executable.sh
       - --build-dir=/workspace/_build/parent-child-restart-worker
       - test/integration/temporal/worker/parent_child_restart_worker.exe
     healthcheck:
@@ -544,11 +509,8 @@ services:
       - --signal=TERM
       - --kill-after=10s
       - "${SMOKE_PARENT_CHILD_RESTART_TIMEOUT_SECONDS:-900}"
-      - opam
-      - exec
-      - --
-      - dune
-      - exec
+      - sh
+      - /workspace/scripts/run-temporal-executable.sh
       - --build-dir=/workspace/_build/parent-child-restart-driver
       - test/integration/temporal/driver/parent_child_restart_driver.exe
     init: true

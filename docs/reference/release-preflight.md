@@ -1,11 +1,86 @@
 # Release preflight
 
-The package is still experimental and uses `~dev` as its checked-in
-development version. The one-line `.release-version` file is the single
-source-of-truth for that value; `temporal-sdk.opam` and its locked manifest
-must contain the same package name and version. A future release preparation
-change will replace `~dev` with a concrete version and add a tag only after the
-release evidence is complete.
+The initial prerelease is `v0.1.0-rc.1`. OPAM records it as `0.1.0~rc.1`
+in `.release-version`, `temporal-sdk.opam`, and `temporal-sdk.opam.locked`.
+Those three files must agree with the version tag supplied to the release
+workflow; changing the Run workflow field alone does not change package metadata.
+
+## Build coverage and artifact reuse
+
+All event types call the graph in `.github/workflows/build-pr.yml`:
+
+| Platform | PR and merge queue | Master and nightly | Release |
+| --- | --- | --- | --- |
+| Linux x64 | 5.2.1, 5.5.1 | All four | All four |
+| Linux ARM64 | 5.5.1 | All four | All four |
+| macOS ARM64 | 5.5.1 | 5.5.1 | All four |
+| Windows x64 GNU/MinGW | 5.5.1 | 5.5.1 | All four |
+
+The supported exact versions are **5.2.1, 5.3.0, 5.4.1, and 5.5.1**.
+Status-check labels retain their existing minor-series names for branch
+protection. A compiler version probe verifies the full requested patch.
+`scripts/ci-matrix.py` is the matrix source of truth.
+
+Four Rust producer jobs run independently of OCaml. Linux producers use the
+pinned Debian 12 Rust image; desktop producers install the pinned Rust toolchain
+without installing OCaml. Windows uses the MIT-licensed `msys2/setup-msys2`
+action and the GNU/MinGW toolchain. Each producer runs Rust formatting, Clippy,
+and the locked Rust tests before packaging static/dynamic libraries and native
+link dependencies. An exact cache hit reuses the verified bundle; its key
+includes sources, tests, build machinery, profile, and native environment.
+Release builds use a separate optimized profile for tests and packaging.
+
+OCaml jobs download their platform's Rust bundle, validate its identity and
+checksums, and compile the OCaml library and C stubs for the selected compiler.
+Each job then packages that installed SDK and verifies an independent consumer
+against its relocated, source-free installation before uploading it. Downstream
+applications can [link the compiled SDK directly](prebuilt-ocaml.md).
+Local source builds still compile Rust when no bundle is provided. An invalid
+explicit bundle fails instead of falling back to a Rust build.
+
+The Linux x64/5.5.1 OCaml job also compiles every live smoke executable once.
+Other compiler jobs build the installed library, examples, and unit tests;
+their lint targets use `@install` rather than Dune's all-executables default.
+One downstream smoke job verifies their commit, compiler, platform, file list,
+and SHA-256 digests, then runs all existing Temporal/PostgreSQL controllers.
+It does not copy Dune build state or compile worker/driver programs again.
+Local smoke commands retain the normal source-build behavior.
+
+Rust bundles, compiled OCaml SDKs, smoke executables, and the audited Cargo SBOM are retained
+for 90 days through `RUST_BRIDGE_ARTIFACT_RETENTION_DAYS`, managed in infra.
+Diagnostic uploads retain their existing shorter lifetimes. Actions artifact
+downloads require GitHub authentication; published public release assets do not.
+
+## Publish a prerelease
+
+After merging the workflow, open **Actions → Release → Run workflow**, select
+`master`, and enter **Version tag**, initially `v0.1.0-rc.1`. Everything after
+that manual dispatch is automated:
+
+1. Require master, matching version metadata, a clean source checkout, and an
+   unused tag.
+2. Build/test all four Rust platforms and all sixteen OCaml combinations, plus
+   the single live smoke job, quality/security scans, and dependency audits.
+3. Validate all bridge and OCaml SDK bundles, archive the exact source commit, audit the Cargo
+   SPDX SBOM, and generate the release manifest and asset checksums.
+4. Atomically create the Git tag at the exact tested commit. A concurrent or
+   existing tag fails publication instead of moving or reusing that tag.
+5. Upload assets to a draft release and publish it as a prerelease when the tag
+   has a prerelease suffix. No manual tagging or asset upload is required.
+
+The release contains four compiler-independent Rust bridge archives, sixteen
+compiled OCaml SDK archives, source, `manifest.json`, the Cargo SBOM, and
+`SHA256SUMS`. Compatible applications link the OCaml SDK, C stubs and Rust bridge
+directly without rebuilding them. Each SDK records its exact compiler and compiled
+dependency identities; incompatible environments must use matching dependencies
+or build from source. Linux assets target Debian 12/glibc, not musl/Alpine.
+
+For the next version, first update the three version files in a PR and then
+enter the matching new tag at dispatch. Published tags are immutable. If an
+upload fails after tag creation, leave the draft unpublished and inspect it;
+a rerun deliberately fails on the existing tag rather than replacing assets.
+The source SHA and checksums in the manifest identify what was built, but are
+not a signed provenance attestation.
 
 ## Local gate
 
@@ -37,13 +112,11 @@ derived from Cargo IDs, package order is stable, and its creation timestamp is
 fixed. A second isolated invocation validates the document before the job
 finishes. The SBOM is a CI artifact/input check and is not committed to the
 repository. It covers the locked Cargo package graph only; it is not yet the
-complete OCaml package, runtime-container, or release-artifact SBOM required for
-publication.
+complete OCaml package or runtime-container SBOM.
 
-This workflow does not publish packages, create tags, or claim that a release
-is ready. Those actions require a later, explicitly reviewed release process
-including live acceptance, replay evidence, API compatibility review, and
-artifact provenance.
+The preflight workflow does not publish or tag by itself. The manually
+dispatched Release workflow requires it alongside the full build/test graph
+before publishing.
 
 ## Tag consistency gate
 

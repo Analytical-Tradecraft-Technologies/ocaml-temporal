@@ -209,3 +209,14 @@ not extend its narrowly approved compiler and `ocamlbuild` exceptions to
 ordinary tooling packages. `ocamlformat` remains excluded for the separate
 copyleft closure documented above. The language-neutral typo gate still checks
 OCaml identifiers, comments, and interfaces without weakening the policy.
+
+## Standalone Windows Rust producer
+
+The Rust producer uses `msys2/setup-msys2` (MIT), pinned to
+`66cd2cce69caa17b53920067426061ca1de3a884`, to install GNU/MinGW build tools
+without installing OCaml. It selects MINGW64 to match the existing Windows
+GNU ABI; the MSYS2 project deprecates this environment in favor of UCRT64,
+so a future CRT migration must update and validate both producers and consumers.
+MSYS2/GCC are build tools, not new SDK library dependencies. The distributed
+Rust bridge retains the existing locked dependency and native import-library
+license checks. The action must also be allowed by the infra repository policy.

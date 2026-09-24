@@ -15,13 +15,17 @@ trap 'rm -rf "$scratch"' EXIT HUP INT TERM
 
 # Restrict extraction to the server job: source-only contract targets from
 # other jobs must not be presented as additional live controllers.
+workflow="$root/.github/workflows/build.yml"
+if grep -F 'uses: ./.github/workflows/build-pr.yml' "$workflow" >/dev/null; then
+  workflow="$root/.github/workflows/build-pr.yml"
+fi
 awk '
   /^  temporal-integration:/ { active = 1; next }
   active && /^  [[:alnum:]_-]+:/ { exit }
   active && match($0, /make test-temporal-[[:alnum:]-]+/) {
     print substr($0, RSTART + 5, RLENGTH - 5)
   }
-' "$root/.github/workflows/build.yml" > "$scratch/entrypoints"
+' "$workflow" > "$scratch/entrypoints"
 
 # The CI diagnostics wrapper introduced alongside this audit retains explicit
 # public controller calls in one Makefile recipe. Expand that wrapper while

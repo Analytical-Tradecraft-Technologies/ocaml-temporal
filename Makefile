@@ -46,7 +46,8 @@ SMOKE_CACHE_EVICTION_SECOND_WORKFLOW_ID ?=
 SMOKE_REPLAY_WORKFLOW_ID ?= two-binary-worker-restart-replay
 SERVICE ?= dev
 OCAML_VERSION ?= 5.2
-OCAML_IMAGE ?= ocaml/opam:debian-12-ocaml-$(OCAML_VERSION)
+OCAML_SERIES = $(shell printf '%s' "$(OCAML_VERSION)" | cut -d. -f1,2)
+OCAML_IMAGE ?= ocaml/opam:debian-12-ocaml-$(OCAML_SERIES)
 HOST_UID ?= $(shell id -u)
 HOST_GID ?= $(shell id -g)
 # Leave Dune's worker count unchanged by default. A constrained Docker VM can
@@ -69,6 +70,10 @@ NATIVE_RUST_TEST_TARGET := $(if $(strip $(TEMPORAL_RUST_BRIDGE_DIR)),,native-tes
 NATIVE_RUST_LINT_TARGET := $(if $(strip $(TEMPORAL_RUST_BRIDGE_DIR)),,native-lint-rust)
 RUST_BRIDGE_DIR ?= $(CURDIR)/_build/rust-bridge
 RUST_BRIDGE_KEY ?=
+RUST_BRIDGE_PROFILE ?= ci
+# Apply the release configuration to toolchain checks, lint, tests and packaging
+# alike, so the tested library is the one that is subsequently published.
+RUST_PROFILE_ENV = $(if $(filter release,$(RUST_BRIDGE_PROFILE)),CARGO_PROFILE_DEV_OPT_LEVEL=3 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_DEV_DEBUG_ASSERTIONS=false CARGO_PROFILE_DEV_INCREMENTAL=false CARGO_PROFILE_TEST_OPT_LEVEL=3 CARGO_PROFILE_TEST_DEBUG=0 CARGO_PROFILE_TEST_DEBUG_ASSERTIONS=false)
 # Build separately so Compose's build output goes to stderr and failures stop
 # the command. Only container stdout reaches version and Cargo metadata probes.
 COMPOSE_RUN := OCAML_IMAGE=$(OCAML_IMAGE) $(COMPOSE) --progress plain build $(SERVICE) >&2 && \
@@ -96,8 +101,8 @@ version-check:
 	@output="$$( $(RUN) ocamlc -version )" || exit $$?; \
 	actual="$$(printf '%s\n' "$$output" | tail -n 1)"; \
 	case "$$actual" in \
-		$(OCAML_VERSION).*) ;; \
-		*) echo "expected OCaml $(OCAML_VERSION).x, got $$actual" >&2; exit 1 ;; \
+		$(OCAML_VERSION)|$(OCAML_VERSION).*) ;; \
+		*) echo "expected OCaml $(OCAML_VERSION), got $$actual" >&2; exit 1 ;; \
 	esac
 
 build:
@@ -145,6 +150,7 @@ test-local-activity-cancellation-live:
 	$(RUN) dune exec test/integration/local_activity_cancellation/regression.exe -- check $(TEMPORAL_CLIENT_TEST_URL) $(TEMPORAL_TEST_CLI)
 
 test-install:
+	$(RUN) sh test/bridge/test_relocatable_link_flags.sh .
 	$(COMPOSE_RUN) sh test/bridge/test_install.sh
 
 # The API witness is part of the installed-consumer regression. Keep a named
@@ -201,7 +207,7 @@ test-temporal-worker-stop-contract:
 # This command runs inside the OCaml development container but connects to the
 # real Temporal service on the shared Compose network.
 test-core-lifecycle-integration:
-	$(COMPOSE_RUN) env TEMPORAL_ADDRESS=http://temporal:7233 TEMPORAL_NAMESPACE=temporal-sdk-test opam exec -- dune exec test/integration/test_core_lifecycle.exe
+	$(COMPOSE_RUN) env TEMPORAL_ADDRESS=http://temporal:7233 TEMPORAL_NAMESPACE=temporal-sdk-test sh scripts/run-temporal-executable.sh --build-dir=/workspace/_build/core-lifecycle test/integration/test_core_lifecycle.exe
 
 # The live stack is intentionally separate from unit verification. Native
 # Windows and macOS jobs build the SDK directly and never start Linux services.
@@ -677,7 +683,7 @@ test-client-request-ids-live:
 	$(RUN) dune exec test/integration/client_request_ids/regression.exe -- check $(TEMPORAL_CLIENT_TEST_URL)
 
 lint:
-	$(RUN) dune build $(DUNE_BUILD_ARGS)
+	$(RUN) dune build @install $(DUNE_BUILD_ARGS)
 	$(MAKE) build-examples
 	$(COMPOSE_RUN) sh scripts/check-format.sh
 	$(if $(RUST_LINT_TARGET),$(MAKE) $(RUST_LINT_TARGET))
@@ -730,18 +736,21 @@ check: verify license-check
 
 # Native targets are used by the non-Linux compatibility jobs. The default
 # developer path remains Docker Compose so no host OCaml toolchain is required.
+# Windows OCaml writes CRLF; normalize its output before exact comparisons.
 native-version-check:
-	@actual_ocaml="$$( $(NATIVE_RUN) ocamlc -version )"; \
+	@output="$$( $(NATIVE_RUN) ocamlc -version )" || exit $$?; \
+	actual_ocaml="$$(printf '%s' "$$output" | tr -d '\r')"; \
 	case "$$actual_ocaml" in \
-		$(NATIVE_OCAML_VERSION).*) ;; \
-		*) echo "expected OCaml $(NATIVE_OCAML_VERSION).x, got $$actual_ocaml" >&2; exit 1 ;; \
+		$(NATIVE_OCAML_VERSION)|$(NATIVE_OCAML_VERSION).*) ;; \
+		*) echo "expected OCaml $(NATIVE_OCAML_VERSION), got $$actual_ocaml" >&2; exit 1 ;; \
 	esac
 	@actual_rust="$$(rustc --version | awk '{ print $$2 }')"; \
 	if [ "$$actual_rust" != "$(NATIVE_RUST_VERSION)" ]; then \
 		echo "expected rustc $(NATIVE_RUST_VERSION), got $$actual_rust" >&2; exit 1; \
 	fi
 	@if [ -n "$(NATIVE_ARCH)" ]; then \
-		actual_arch="$$( $(NATIVE_RUN) ocamlc -config-var architecture )"; \
+		output="$$( $(NATIVE_RUN) ocamlc -config-var architecture )" || exit $$?; \
+		actual_arch="$$(printf '%s' "$$output" | tr -d '\r')"; \
 		if [ "$$actual_arch" != "$(NATIVE_ARCH)" ]; then \
 			echo "expected OCaml architecture $(NATIVE_ARCH), got $$actual_arch" >&2; exit 1; \
 		fi; \
@@ -765,10 +774,11 @@ native-test-rust:
 	$(NATIVE_ENV) $(CARGO_TEST_ENV) cargo test --manifest-path $(CARGO_MANIFEST) --locked
 
 native-test-install:
+	$(NATIVE_ENV) $(NATIVE_RUN) sh test/bridge/test_relocatable_link_flags.sh .
 	$(NATIVE_ENV) sh test/bridge/test_install.sh
 
 native-lint: $(NATIVE_RUST_LINT_TARGET)
-	$(NATIVE_ENV) $(NATIVE_RUN) dune build $(DUNE_BUILD_ARGS)
+	$(NATIVE_ENV) $(NATIVE_RUN) dune build @install $(DUNE_BUILD_ARGS)
 	$(NATIVE_ENV) $(NATIVE_RUN) dune build $(DUNE_BUILD_ARGS) examples/workflow_worker/workflow_worker.exe examples/activity_worker/activity_worker.exe examples/client/client.exe
 	sh scripts/check-format.sh
 
@@ -782,7 +792,7 @@ native-verify: native-version-check native-build native-lint native-test
 # The caller chooses the Compose project and owns the server lifecycle.
 .PHONY: test-temporal-start-metadata-live
 test-temporal-start-metadata-live:
-	$(RUN) dune build $(DUNE_BUILD_ARGS) test/integration/temporal/driver/start_metadata_driver.exe
+	$(COMPOSE_RUN) env DUNE_JOBS="$(DUNE_JOBS)" sh scripts/build-temporal-executables.sh test/integration/temporal/driver/start_metadata_driver.exe
 	$(MAKE) temporal-start
 	TEMPORAL_COMPOSE_PROJECT=$(TEMPORAL_COMPOSE_PROJECT) TEMPORAL_METADATA_IMAGE="$(TEMPORAL_METADATA_IMAGE)" HOST_UID=$(HOST_UID) HOST_GID=$(HOST_GID) sh test/integration/temporal/scripts/run-start-metadata-live.sh
 
@@ -794,7 +804,7 @@ test-workflow-task-failure:
 	$(COMPOSE_RUN) env $(CARGO_TEST_ENV) cargo test --manifest-path $(CARGO_MANIFEST) --locked --test workflow_protocol --test workflow_retry_policy --test replay_abi
 
 build-task-failure-fixture:
-	$(RUN) dune build $(DUNE_BUILD_ARGS) test/integration/temporal/task_failure/broken_worker.exe test/integration/temporal/task_failure/corrected_worker.exe test/integration/temporal/task_failure/recovery_driver.exe
+	$(COMPOSE_RUN) env DUNE_JOBS="$(DUNE_JOBS)" sh scripts/build-temporal-executables.sh test/integration/temporal/task_failure/broken_worker.exe test/integration/temporal/task_failure/corrected_worker.exe test/integration/temporal/task_failure/recovery_driver.exe
 
 # This local/CI controller uses host Python's standard library only. The three
 # OCaml binaries share one build tree and have no production fixture hooks.
@@ -807,16 +817,18 @@ test-temporal-task-failure-live: test-task-failure-command-logging test-temporal
 .PHONY: rust-bridge native-rust-bridge
 native-rust-bridge:
 	@test -n "$(RUST_BRIDGE_KEY)" || { echo 'set RUST_BRIDGE_KEY' >&2; exit 2; }
-	$(NATIVE_ENV) sh test/smoke/test_rust_toolchain.sh
-	$(MAKE) native-lint-rust
-	$(MAKE) native-test-rust
-	$(NATIVE_ENV) sh scripts/rust-bridge-artifact.sh pack . "$(RUST_BRIDGE_DIR)" "$(RUST_BRIDGE_KEY)"
+	@case "$(RUST_BRIDGE_PROFILE)" in ci|release) ;; *) echo 'unsupported bridge profile' >&2; exit 2 ;; esac
+	$(RUST_PROFILE_ENV) $(NATIVE_ENV) sh test/smoke/test_rust_toolchain.sh
+	$(RUST_PROFILE_ENV) $(MAKE) native-lint-rust
+	$(RUST_PROFILE_ENV) $(MAKE) native-test-rust
+	$(RUST_PROFILE_ENV) $(NATIVE_ENV) sh scripts/rust-bridge-artifact.sh pack . "$(RUST_BRIDGE_DIR)" "$(RUST_BRIDGE_KEY)"
 
 rust-bridge:
 	docker build -f Dockerfile.rust-ci -t ocaml-temporal-rust-bridge:local .
 	docker run --rm --user $(HOST_UID):$(HOST_GID) --volume "$(CURDIR):/workspace" \
 		ocaml-temporal-rust-bridge:local make native-rust-bridge \
-		RUST_BRIDGE_DIR=/workspace/_build/rust-bridge RUST_BRIDGE_KEY="$(RUST_BRIDGE_KEY)"
+		RUST_BRIDGE_DIR=/workspace/_build/rust-bridge RUST_BRIDGE_KEY="$(RUST_BRIDGE_KEY)" \
+		RUST_BRIDGE_PROFILE="$(RUST_BRIDGE_PROFILE)"
 
 # Test the Python live controller without Docker or compiling the SDK.
 .PHONY: test-task-failure-command-logging
@@ -827,3 +839,45 @@ test-task-failure-command-logging:
 .PHONY: test-temporal-namespace-readiness
 test-temporal-namespace-readiness:
 	sh test/smoke/test_temporal_namespace_readiness.sh .
+
+# Compile once in the selected Linux OCaml job; the live job only executes them.
+.PHONY: build-smoke-executables test-ci-artifacts
+build-smoke-executables:
+	$(COMPOSE_RUN) env DUNE_JOBS="$(DUNE_JOBS)" sh scripts/build-temporal-executables.sh $(shell cat scripts/ci-smoke-executables.txt)
+
+test-ci-artifacts:
+	python3 -m unittest discover -s test/smoke -p 'test_*artifact*.py'
+
+# Package verified installed libraries, then link an independent application
+# with only the relocated installation mounted into its compiler container.
+# Python handles CI transport on the host; it is not added to compiler images.
+PYTHON ?= python3
+OCAML_ARTIFACT_COMMIT ?= $(shell git rev-parse HEAD)
+OCAML_ARTIFACT_PLATFORM ?= linux-$(if $(filter arm64 aarch64,$(shell uname -m)),arm64,amd64)
+OCAML_ARTIFACT_OCAML ?= $(OCAML_VERSION)
+OCAML_LIBRARY_IMAGE ?= $(TEMPORAL_COMPOSE_PROJECT)-$(SERVICE)
+OCAML_LIBRARY_ARGS = --directory _build/ocaml-library-artifact --commit "$(OCAML_ARTIFACT_COMMIT)" --ocaml "$(OCAML_ARTIFACT_OCAML)" --platform "$(OCAML_ARTIFACT_PLATFORM)" --profile "$(RUST_BRIDGE_PROFILE)"
+OCAML_LIBRARY_CONSUMER = docker run --rm --network none --user $(HOST_UID):$(HOST_GID) --volume "$(CURDIR)/_build/ocaml-library-consumer:/consumer" --workdir /consumer "$(OCAML_LIBRARY_IMAGE)"
+
+.PHONY: library-artifact native-library-artifact package-ocaml-library unpack-ocaml-library
+package-ocaml-library:
+	$(PYTHON) scripts/ocaml-library-artifact.py pack $(OCAML_LIBRARY_ARGS) --stage _build/ocaml-library-stage --bridge-key "$$(cat _build/rust-bridge/key)"
+	$(PYTHON) scripts/ocaml-library-artifact.py prepare-consumer --directory _build/ocaml-library-consumer
+
+unpack-ocaml-library:
+	$(PYTHON) scripts/ocaml-library-artifact.py unpack $(OCAML_LIBRARY_ARGS) --environment _build/ocaml-library-consumer/environment.txt --prefix _build/ocaml-library-consumer/sdk
+
+library-artifact:
+	$(COMPOSE_RUN) sh scripts/stage-ocaml-library.sh _build/ocaml-library-stage
+	$(MAKE) package-ocaml-library
+	$(OCAML_LIBRARY_CONSUMER) opam exec -- sh environment.sh > _build/ocaml-library-consumer/environment.txt
+	$(MAKE) unpack-ocaml-library
+	$(OCAML_LIBRARY_CONSUMER) sh test.sh
+
+native-library-artifact: OCAML_ARTIFACT_OCAML = $(NATIVE_OCAML_VERSION)
+native-library-artifact:
+	sh scripts/stage-ocaml-library.sh _build/ocaml-library-stage
+	$(MAKE) package-ocaml-library OCAML_ARTIFACT_OCAML=$(NATIVE_OCAML_VERSION)
+	opam exec -- sh scripts/ocaml-library-environment.sh > _build/ocaml-library-consumer/environment.txt
+	$(MAKE) unpack-ocaml-library OCAML_ARTIFACT_OCAML=$(NATIVE_OCAML_VERSION)
+	cd _build/ocaml-library-consumer && sh test.sh

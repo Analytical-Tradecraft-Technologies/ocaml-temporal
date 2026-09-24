@@ -7,6 +7,15 @@ inputs:
   mode:
     description: docker for Debian Linux consumers, native for Windows and macOS
     required: true
+  shell:
+    description: Native producer shell (MSYS2 on Windows)
+    default: bash
+  profile:
+    description: ci for diagnostic builds or release for optimized bridge libraries
+    default: ci
+  retention-days:
+    description: Number of days to retain the uploaded platform bundle
+    default: '90'
 outputs:
   key:
     description: Exact identity that consumers must validate
@@ -16,15 +25,17 @@ runs:
   steps:
     - name: Identify Rust inputs and native environment
       id: identity
-      shell: bash
+      shell: ${{ inputs.shell }}
       env:
         BRIDGE_PLATFORM: ${{ inputs.platform }}
         BRIDGE_MODE: ${{ inputs.mode }}
+        BRIDGE_PROFILE: ${{ inputs.profile }}
         # Include tests and build machinery: a previously passing library is
         # reusable only when its validation and construction inputs match too.
         SOURCE_HASH: ${{ hashFiles('rust/**', 'scripts/*rust*', 'test/smoke/test_rust*', 'Dockerfile.rust-ci', 'Dockerfile.dev', 'Makefile', '.github/actions/rust-bridge/action.yml', '.github/workflows/build*.yml', '.github/workflows/rust-bridge.yml') }}
       run: |
         set -euo pipefail
+        case "$BRIDGE_PROFILE" in ci|release) ;; *) echo 'unsupported bridge profile' >&2; exit 1 ;; esac
         test "$(sh scripts/rust-bridge-artifact.sh platform .)" = "$BRIDGE_PLATFORM"
         if [ "$BRIDGE_MODE" = docker ]; then
           environment=debian12-pinned-rust-image
@@ -45,7 +56,7 @@ runs:
         else
           environment_hash=$(printf '%s' "$environment" | shasum -a 256 | cut -d ' ' -f 1)
         fi
-        echo "key=rust-bridge-v1-$BRIDGE_PLATFORM-$environment_hash-$SOURCE_HASH" >> "$GITHUB_OUTPUT"
+        echo "key=rust-bridge-v2-$BRIDGE_PLATFORM-$BRIDGE_PROFILE-$environment_hash-$SOURCE_HASH" >> "$GITHUB_OUTPUT"
     - name: Restore verified platform libraries
       id: cache
       uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
@@ -55,10 +66,11 @@ runs:
         # No fallback keys: a different source, compiler, or ABI is a miss.
     - name: Build and test Rust once on a cache miss
       if: steps.cache.outputs.cache-hit != 'true'
-      shell: bash
+      shell: ${{ inputs.shell }}
       env:
         BRIDGE_MODE: ${{ inputs.mode }}
         RUST_BRIDGE_KEY: ${{ steps.identity.outputs.key }}
+        RUST_BRIDGE_PROFILE: ${{ inputs.profile }}
         # Keep file/line backtraces, debug assertions, and the dev optimization
         # level, without shipping full Rust type debug data to every consumer.
         CARGO_INCREMENTAL: "0"
@@ -72,7 +84,7 @@ runs:
           make native-rust-bridge
         fi
     - name: Validate the complete bundle
-      shell: bash
+      shell: ${{ inputs.shell }}
       env:
         BRIDGE_KEY: ${{ steps.identity.outputs.key }}
       run: sh scripts/rust-bridge-artifact.sh validate . _build/rust-bridge "$BRIDGE_KEY"
@@ -84,13 +96,12 @@ runs:
       with:
         path: _build/rust-bridge
         key: ${{ steps.identity.outputs.key }}
-    - name: Share libraries with this run's consumers
-      if: inputs.mode == 'docker'
+    - name: Upload the verified platform libraries
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
       with:
         name: rust-bridge-${{ inputs.platform }}
         path: _build/rust-bridge/
         if-no-files-found: error
         compression-level: 1
-        retention-days: 1
+        retention-days: ${{ inputs.retention-days }}
         overwrite: true
