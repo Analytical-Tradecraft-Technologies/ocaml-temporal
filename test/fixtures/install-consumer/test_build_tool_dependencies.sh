@@ -8,20 +8,38 @@ set -eu
 root=${1:-.}
 required_dependencies='conf-rust-2024 conf-protoc'
 
+# Capture native output synchronously in workspace-local files before CRLF
+# normalization. A pipeline would hide a failing producer behind tr's success;
+# local paths also work for native Windows tools invoked from Cygwin.
+metadata_dir=$(mktemp -d "./temporal-sdk-build-metadata.XXXXXX")
+cleanup() {
+  rm -rf -- "$metadata_dir"
+}
+trap cleanup EXIT HUP INT TERM
+
 fail() {
   echo "install consumer metadata: $*" >&2
   exit 1
 }
 
 manifest_dependencies() {
-  OPAMCLI=2.0 opam show --file="$1" --field=depends --normalise | tr -d '\r'
+  OPAMCLI=2.0 opam show --file="$1" --field=depends --normalise >"$2" ||
+    fail "could not parse $1"
 }
 
-opam_dependencies=$(manifest_dependencies "$root/temporal-sdk.opam")
-locked_dependencies=$(manifest_dependencies "$root/temporal-sdk.opam.locked")
+manifest_dependencies "$root/temporal-sdk.opam" "$metadata_dir/opam"
+manifest_dependencies "$root/temporal-sdk.opam.locked" "$metadata_dir/locked"
+# An explicit language version bypasses workspace/scheduler initialization.
+# Otherwise concurrent formatters contend over _build/.lock just to format a
+# file, even inside the parent Dune test action. Keep this at dune-project's
+# language version.
+dune format-dune-file --dune-version 3.18 "$root/dune-project" >"$metadata_dir/dune" ||
+  fail "could not format $root/dune-project"
 # Native Windows tools emit CRLF even when their input is checked out with LF.
 # Normalize command output before applying the line-oriented metadata checks.
-dune_dependencies=$(dune format-dune-file "$root/dune-project" | tr -d '\r')
+opam_dependencies=$(tr -d '\r' <"$metadata_dir/opam")
+locked_dependencies=$(tr -d '\r' <"$metadata_dir/locked")
+dune_dependencies=$(tr -d '\r' <"$metadata_dir/dune")
 
 require_lf_attribute() {
   pattern=$1

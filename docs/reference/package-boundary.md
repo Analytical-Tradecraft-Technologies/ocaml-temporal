@@ -143,6 +143,13 @@ package declaration to require `conf-rust-2024` and `conf-protoc`. This makes
 the Cargo/Rust and Protocol Buffers compiler prerequisites explicit during
 source-install dependency resolution rather than letting the private bridge
 build fail later with a missing executable.
+The formatter selects Dune language 3.18 explicitly, matching `dune-project`,
+to avoid initializing another workspace and scheduler inside the test action.
+Concurrent formatters must not contend over `_build/.lock`. Native tool output
+is captured in workspace-local files before CRLF normalization so a failing
+parser cannot be hidden by a successful pipeline consumer. Mutation fixtures
+cover complete-looking output followed by a tool failure, unavailable project
+extensions, CRLF output, and dependency pins attached to the wrong package.
 Changes that intentionally publish an implementation component must update
 this document, the public API review, and the install regression rather than
 silently widening the package surface.
