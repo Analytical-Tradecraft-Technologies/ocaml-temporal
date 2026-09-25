@@ -10,6 +10,7 @@
   test_native_worker_lifecycle
   test_native_worker_execution
   test_scheduler
+  test_future_retention
   test_activity_retry_policy
   test_local_activity_cancellation
   test_scope

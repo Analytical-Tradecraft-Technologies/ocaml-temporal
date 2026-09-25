@@ -59,6 +59,12 @@ and bridge, read the [documentation guide](../README.md) first.
 - A promise resolves at most once; unknown or duplicate external resolutions
   are bridge defects.
 - A captured one-shot continuation is continued or discontinued exactly once.
+- Derived futures retain scheduler identity, queueing, callback liveness, and
+  suspension gates independently of the source result. A retained mapped summary
+  must not keep its discarded activity payload alive. Ready ownership errors
+  preserve a real suspension gate for later pending combinators. The activity
+  weak-reference and live-heap probe in `test/runtime/test_future_retention.ml`
+  checks collection while the owner and summary futures remain active.
 - Awaiting a ready future does not perform an effect.
 - Awaiting a pending future outside its owning running scheduler returns a
   structured defect.

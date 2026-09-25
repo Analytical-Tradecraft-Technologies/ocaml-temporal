@@ -22,8 +22,7 @@ let of_internal ~outside_error future =
   let map_error result = Result.map_error Error_private.of_base result in
   make_repr
     ~await:(fun () -> map_error (Temporal_sdk_kernel.Future_store.await future))
-    ~await_gate:(fun register ->
-      Temporal_sdk_kernel.Future_store.await_gate future register)
+    ~await_gate:(Temporal_sdk_kernel.Future_store.await_gate future)
     ~subscribe:(fun observer ->
       Temporal_sdk_kernel.Future_store.subscribe future (fun result ->
           observer (map_error result)))
@@ -31,7 +30,7 @@ let of_internal ~outside_error future =
     ~peek:(fun () -> Option.map map_error (Temporal_sdk_kernel.Future_store.peek future))
     ~owner_id:(Temporal_sdk_kernel.Future_store.owner_id future)
     ~outside_error
-    ~callbacks_live:(fun () -> Temporal_sdk_kernel.Future_store.callbacks_live future)
+    ~callbacks_live:(Temporal_sdk_kernel.Future_store.callback_liveness future)
     ~enqueue:(Temporal_sdk_kernel.Future_store.enqueue future)
 
 (** Returns the result, suspending the current workflow fiber only when the
@@ -48,6 +47,12 @@ let peek future = Temporal_sdk_kernel.Future.peek future
     notifications in scheduler order. Derived futures do not add a second
     pending counter; the source operations already keep the workflow blocked. *)
 let make_derived ~parent ~outside_error =
+  (* Extract these before constructing closures: retaining the parent handle
+     would also retain its completed result, even after a size-reducing map. *)
+  let owner_id = Temporal_sdk_kernel.Future.owner_id parent in
+  let enqueue = Temporal_sdk_kernel.Future.enqueue parent in
+  let callbacks_live = Temporal_sdk_kernel.Future.callback_liveness parent in
+  let await_gate = Temporal_sdk_kernel.Future.await_gate parent in
   let result = ref None in
   let observers = ref [] in
   let resolve value =
@@ -59,10 +64,10 @@ let make_derived ~parent ~outside_error =
         observers := [];
         List.iter
           (fun callback ->
-            Temporal_sdk_kernel.Future.enqueue parent (fun () ->
+            enqueue (fun () ->
                 let action = !callback in
                 callback := None;
-                if Temporal_sdk_kernel.Future.callbacks_live parent then
+                if callbacks_live () then
                   Option.iter (fun action -> action value) action))
           callbacks
   in
@@ -71,17 +76,16 @@ let make_derived ~parent ~outside_error =
     let token = ref (Some callback) in
     (match !result with
     | Some value ->
-        Temporal_sdk_kernel.Future.enqueue parent (fun () ->
+        enqueue (fun () ->
             let action = !token in
             token := None;
-            if Temporal_sdk_kernel.Future.callbacks_live parent then
+            if callbacks_live () then
               Option.iter (fun action -> action value) action)
     | None -> observers := token :: !observers);
     fun () ->
       token := None;
       observers := List.filter (fun current -> current != token) !observers
   in
-  let await_gate register = Temporal_sdk_kernel.Future.await_gate parent register in
   let await () =
     match !result with
     | Some value -> value
@@ -90,9 +94,8 @@ let make_derived ~parent ~outside_error =
            allocating a gate future on the parent scheduler (which would race
            another Domain or leak after shutdown). *)
         if not
-             (Temporal_sdk_kernel.Future_store.current_owner_matches
-                (Temporal_sdk_kernel.Future.owner_id parent))
-             || not (Temporal_sdk_kernel.Future.callbacks_live parent)
+             (Temporal_sdk_kernel.Future_store.current_owner_matches owner_id)
+             || not (callbacks_live ())
         then Error (outside_error ())
         else
           let observed = ref None in
@@ -108,9 +111,7 @@ let make_derived ~parent ~outside_error =
     make_repr ~await ~await_gate ~subscribe
       ~is_ready:(fun () -> Option.is_some !result)
       ~peek:(fun () -> !result)
-      ~owner_id:(Temporal_sdk_kernel.Future.owner_id parent) ~outside_error
-      ~callbacks_live:(fun () -> Temporal_sdk_kernel.Future.callbacks_live parent)
-      ~enqueue:(Temporal_sdk_kernel.Future.enqueue parent)
+      ~owner_id ~outside_error ~callbacks_live ~enqueue
   in
   (future, resolve)
 
@@ -158,10 +159,10 @@ let map mapper source =
 
 (** Maps both stored errors and errors returned outside the owner scheduler. *)
 let map_error mapper source =
+  let outside_error = Temporal_sdk_kernel.Future.outside_error source in
   let mapped, resolve =
     make_derived ~parent:source
-      ~outside_error:(fun () ->
-        mapper ((Temporal_sdk_kernel.Future.outside_error source) ()))
+      ~outside_error:(fun () -> mapper (outside_error ()))
   in
   Temporal_sdk_kernel.Future.observe source (fun result ->
       resolve (Result.map_error mapper result));

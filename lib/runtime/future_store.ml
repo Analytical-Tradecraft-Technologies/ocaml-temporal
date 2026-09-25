@@ -168,15 +168,17 @@ let resolved ~outside_error result =
 
 let owner_id promise = promise.owner.id
 
-(** Reports whether callbacks queued for [promise] may still run. The scheduler
+(** Extracts the owner-only callback liveness predicate. The scheduler
     turns this false during shutdown, while the inert owner for resolved
     outside-workflow values keeps it true for immediate combinators. *)
-let callbacks_live promise = promise.owner.callbacks_live ()
+let callback_liveness promise = promise.owner.callbacks_live
 
-(** Queues one callback on the scheduler that owns [promise]. This is the
-    low-level escape hatch used by public wrappers to preserve the same FIFO
-    execution ordering as native future completions. *)
-let enqueue promise thunk = promise.owner.enqueue thunk
+(** Reports callback liveness without transferring the predicate. *)
+let callbacks_live promise = callback_liveness promise ()
+
+(** Extracts the owner queue function without retaining [promise]. Public
+    wrappers pass this function directly to preserve FIFO callback order. *)
+let enqueue promise = promise.owner.enqueue
 
 (** Returns a ready result, or pauses only when called from the active fiber of
     the scheduler that owns this future. [is_running] alone is insufficient:
@@ -248,17 +250,20 @@ let observe promise observer =
     single-use signal callback; the callback must be invoked by the observer
     that makes the notification ready. The temporary gate is owned by the
     same scheduler, so the calling workflow fiber is suspended rather than a
-    scheduler thread being blocked. *)
-let await_gate promise register =
-  let gate, resolve = create ~owner:promise.owner ~outside_error:(fun () -> ()) in
-  let signaled = ref false in
-  let signal () =
-    if not !signaled then (
-      signaled := true;
-      resolve (Ok ()))
-  in
-  register signal;
-  ignore (await gate)
+    scheduler thread being blocked. Extract the owner before building the
+    closure so a retained gate does not also retain the source result. *)
+let await_gate promise =
+  let owner = promise.owner in
+  fun register ->
+    let gate, resolve = create ~owner ~outside_error:(fun () -> ()) in
+    let signaled = ref false in
+    let signal () =
+      if not !signaled then (
+        signaled := true;
+        resolve (Ok ()))
+    in
+    register signal;
+    ignore (await gate)
 
 (** Maps a successful result into a new future owned by the same scheduler. *)
 let map mapper source =
@@ -271,9 +276,10 @@ let map mapper source =
 (** Maps both a stored error and the error returned for use outside the owning
     workflow scheduler. *)
 let map_error mapper source =
+  let outside_error = source.outside_error in
   let mapped, resolve =
     create ~owner:source.owner
-      ~outside_error:(fun () -> mapper (source.outside_error ()))
+      ~outside_error:(fun () -> mapper (outside_error ()))
   in
   observe source (fun result -> resolve (Result.map_error mapper result));
   mapped

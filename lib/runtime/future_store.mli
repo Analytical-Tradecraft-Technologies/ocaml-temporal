@@ -58,6 +58,11 @@ val resolved :
 (** Returns the identity of the workflow scheduler that created the future. *)
 val owner_id : ('value, 'error) t -> int
 
+(** Extracts the owner's liveness predicate without retaining this future's
+    result. Adapters must pass this callback directly, without wrapping a call
+    that captures the source future. *)
+val callback_liveness : ('value, 'error) t -> (unit -> bool)
+
 (** Reports whether callbacks queued for the future's owner may still run. *)
 val callbacks_live : ('value, 'error) t -> bool
 
@@ -73,7 +78,7 @@ val current_owner_matches : int -> bool
 
 (** Queues [thunk] on the scheduler that owns [future]. The callback is never
     run inline for an active workflow, which keeps completion ordering
-    deterministic. *)
+    deterministic. Partial application retains only the owner callback. *)
 val enqueue : ('value, 'error) t -> (unit -> unit) -> unit
 
 (** Returns the result when ready. If called by the future's active workflow
@@ -107,7 +112,8 @@ val subscribe :
 (** Suspends the current workflow fiber until [register] invokes its signal.
     The signal is single-use; duplicate calls are ignored. This is a
     scheduler-aware gate for internal combinators and never blocks an OS
-    thread. *)
+    thread. Partial application extracts only the owner, so retaining the gate
+    does not retain the source result. *)
 val await_gate :
   ('value, 'error) t -> (((unit -> unit) -> unit) -> unit)
 

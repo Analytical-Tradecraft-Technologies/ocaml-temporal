@@ -42,8 +42,8 @@ let make ~await ~await_gate ~subscribe ~is_ready ~peek ~owner_id ~outside_error
 (** Invokes the scheduler-owned result callback. *)
 let await future = future.await_impl ()
 
-(** Registers a continuation with the scheduler-owned suspension gate. *)
-let await_gate future register = future.await_gate_impl register
+(** Extracts the stored gate without closing over the source future. *)
+let await_gate future = future.await_gate_impl
 
 (** Registers an observer for a scheduler-owned result notification. *)
 let observe future callback =
@@ -65,8 +65,11 @@ let owner_id future = future.owner_id_impl
 (** Builds the error returned when the value is used outside its owner. *)
 let outside_error future = future.outside_error_impl
 
-(** Reports whether queued callbacks may still run for this future's owner. *)
-let callbacks_live future = future.callbacks_live_impl ()
+(** Extracts the stored owner predicate without closing over the future. *)
+let callback_liveness future = future.callbacks_live_impl
 
-(** Queues a callback on the scheduler that owns this value. *)
-let enqueue future callback = future.enqueue_impl callback
+(** Reports callback liveness without transferring the predicate. *)
+let callbacks_live future = callback_liveness future ()
+
+(** Extracts the stored queue function without closing over the future. *)
+let enqueue future = future.enqueue_impl

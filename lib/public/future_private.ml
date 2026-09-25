@@ -16,8 +16,7 @@ let of_internal ?outside_error future =
   Temporal_sdk_kernel.Future.make
     ~await:(fun () ->
       map_error (Temporal_sdk_kernel.Future_store.await future))
-    ~await_gate:(fun register ->
-      Temporal_sdk_kernel.Future_store.await_gate future register)
+    ~await_gate:(Temporal_sdk_kernel.Future_store.await_gate future)
     ~subscribe:(fun observer ->
       Temporal_sdk_kernel.Future_store.subscribe future (fun result ->
           observer (map_error result)))
@@ -26,7 +25,7 @@ let of_internal ?outside_error future =
       Option.map map_error (Temporal_sdk_kernel.Future_store.peek future))
     ~owner_id:(Temporal_sdk_kernel.Future_store.owner_id future)
     ~outside_error
-    ~callbacks_live:(fun () -> Temporal_sdk_kernel.Future_store.callbacks_live future)
+    ~callbacks_live:(Temporal_sdk_kernel.Future_store.callback_liveness future)
     ~enqueue:(Temporal_sdk_kernel.Future_store.enqueue future)
 
 (** Creates a settled public value for validation failures and detached calls;

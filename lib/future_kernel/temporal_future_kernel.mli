@@ -26,7 +26,8 @@ val make :
 (** Invokes the scheduler-owned result callback. *)
 val await : ('value, 'error) t -> ('value, 'error) result
 
-(** Registers a continuation with the scheduler-owned suspension gate. *)
+(** Extracts the scheduler-owned suspension gate without retaining the future's
+    result. *)
 val await_gate : ('value, 'error) t -> (((unit -> unit) -> unit) -> unit)
 
 (** Registers an observer for a scheduler-owned result notification. *)
@@ -51,8 +52,13 @@ val owner_id : ('value, 'error) t -> int
 (** Builds the error returned when the value is used outside its owner. *)
 val outside_error : ('value, 'error) t -> unit -> 'error
 
+(** Extracts the owner's liveness predicate without retaining this future's
+    result. Adapters must pass this callback directly, without wrapping a call
+    that captures the source future. *)
+val callback_liveness : ('value, 'error) t -> (unit -> bool)
+
 (** Reports whether queued callbacks may still run for this future's owner. *)
 val callbacks_live : ('value, 'error) t -> bool
 
-(** Queues a callback on the scheduler that owns this value. *)
+(** Extracts the owner queue callback without retaining this value. *)
 val enqueue : ('value, 'error) t -> (unit -> unit) -> unit
