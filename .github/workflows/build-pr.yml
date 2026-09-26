@@ -129,7 +129,7 @@ jobs:
       - name: Test matrix selection and artifact failure cases
         run: make test-ci-artifacts
       - name: Install pinned quality tools
-        uses: taiki-e/install-action@dfae9bf3d6f6c6f20ef4ebb3486c01a51341ff12 # v2.87.18
+        uses: taiki-e/install-action@7623a79cdfecb99d681017af368ca353d9f49bb5 # v2.87.19
         with:
           tool: cargo-deny@0.20.2,cargo-machete@0.9.2,typos@1.48.0
           fallback: none
