@@ -79,8 +79,11 @@ and bridge, read the [documentation guide](../README.md) first.
   creates no waiter. Notification snapshots waiters in registration order,
   removes each waiter before resolving it, and re-drains newly queued
   continuations so a state mutation in the same activation can release a
-  condition without a synthetic timer. Predicates must be deterministic,
-  non-blocking, and non-suspending. Context teardown deactivates every waiter
+  condition without a synthetic timer. Deferred checks run before the scheduler
+  releases its owner marker and callback liveness, so they can read workflow-local
+  scope state just like the initial check. The notifier has no fiber effect
+  handler: predicates must remain deterministic, non-blocking, and non-suspending.
+  Context teardown deactivates every waiter
   before scheduler shutdown, so a late notification cannot retain or resume
   an ended workflow.
 - A `Temporal.Scope` signal belongs to the same scheduler as the workflow

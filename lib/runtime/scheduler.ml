@@ -57,7 +57,8 @@ let create () =
     waits before they retain a continuation. *)
 let id scheduler = scheduler.id
 
-(** Reports whether a scheduler is currently draining queued workflow work. *)
+(** Reports whether a scheduler is draining workflow work or checking its
+    synchronous idle callbacks under the same owner context. *)
 let is_running scheduler = scheduler.running
 
 (** Reports whether the scheduler still accepts workflow futures and queued
@@ -148,8 +149,11 @@ let spawn scheduler thunk =
     completions during the run. An uncaught exception is reported before
     [Blocked] or [Complete]. Publishes this scheduler as the Domain-local owner
     for the entire drain so [Future_store.await] accepts parking only on this
-    execution's futures, including after a fiber resumes from a prior await. *)
-let run scheduler =
+    execution's futures, including after a fiber resumes from a prior await.
+    [on_idle] checks synchronous predicates after all runnable work, while the
+    owner is still live. It has no fiber effect handler and must not suspend.
+    Any work it queues is drained before the next idle check. *)
+let run ?(on_idle = fun () -> ()) scheduler =
   if not scheduler.active then invalid_arg "Temporal scheduler is shut down";
   if scheduler.running then invalid_arg "Temporal scheduler is already running";
   (* Abort is a per-drain control flag. Clearing it here lets a later
@@ -161,18 +165,30 @@ let run scheduler =
     ~finally:(fun () -> scheduler.running <- false)
     (fun () ->
       Future_store.with_current_owner_id (Some scheduler.id) (fun () ->
-          while
-            (not (Queue.is_empty scheduler.queue))
-            && not scheduler.abort_requested
-          do
-            let (Runnable (_, thunk)) = Queue.pop scheduler.queue in
-            (* Once shutdown is requested, root thunks are inert but queued
-               future callbacks must still run their owner-aware cleanup path. *)
-            (try thunk ()
-             with Future_store.Scheduler_shutdown | Workflow_aborted -> ()
-             | exception_ ->
-                 scheduler.failures <- exception_ :: scheduler.failures)
-          done;
+          (* Contain callback failures at the same boundary as queued work. *)
+          let invoke thunk =
+            try thunk () with
+            | Future_store.Scheduler_shutdown | Workflow_aborted -> ()
+            | exception_ ->
+                scheduler.failures <- exception_ :: scheduler.failures
+          in
+          (* Alternate FIFO drains and idle checks until no new work is queued. *)
+          let rec drain () =
+            while
+              (not (Queue.is_empty scheduler.queue))
+              && not scheduler.abort_requested
+            do
+              let (Runnable (_, thunk)) = Queue.pop scheduler.queue in
+              (* Once shutdown is requested, root thunks are inert but queued
+                 future callbacks still run their owner-aware cleanup path. *)
+              invoke thunk
+            done;
+            if scheduler.active && not scheduler.abort_requested
+               && scheduler.failures = [] then (
+              invoke on_idle;
+              if not (Queue.is_empty scheduler.queue) then drain ())
+          in
+          drain ();
           match List.rev scheduler.failures with
           | failure :: _ -> Failed failure
           | [] when scheduler.pending > 0 -> Blocked
