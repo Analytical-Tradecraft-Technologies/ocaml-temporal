@@ -11,6 +11,7 @@ module Failure_diagnostic = Temporal_protocol.Failure_diagnostic
 module Activation = Temporal_runtime.Activation
 module Workflow_context_store = Temporal_runtime.Workflow_context_store
 module Future_store = Temporal_runtime.Future_store
+module Scheduler = Temporal_runtime.Scheduler
 module Native_worker_execution = Temporal_runtime.Native_worker_execution
 module Native_activity_execution = Temporal_runtime.Native_activity_execution
 module Native_worker_loop = Temporal_runtime.Native_worker_loop

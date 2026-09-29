@@ -100,6 +100,11 @@ and bridge, read the [documentation guide](../README.md) first.
 - Combining futures from different executions returns a ready typed defect
   owned by the leading input rather than raising an operational exception.
 - User callback exceptions are contained and reported as scheduler defects.
+- Private scheduler shutdown and terminal-control exceptions pass through
+  signal/update callback wrappers unchanged. Discontinuing an unfinished
+  handler must release its continuation without turning teardown into a task
+  defect or discarding the chosen terminal command. This does not drain
+  unfinished handlers or imply that an accepted update completed.
 - The implementation uses typed closures and GADTs, not `Obj.magic` or a
   heterogeneous untyped value store.
 
