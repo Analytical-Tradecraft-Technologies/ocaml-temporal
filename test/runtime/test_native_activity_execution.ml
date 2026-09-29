@@ -64,12 +64,35 @@ let base_activity (definition : ('input, 'output) Temporal.Activity.t) =
     ~input:(base_codec (Temporal.Activity.input definition))
     ~output:(base_codec (Temporal.Activity.output definition)) ~implementation
 
+(** Converts asynchronous definitions so context rejection can be exercised
+    through both dispatch paths. These tests never admit a deferred handle. *)
+let base_async_activity (definition : ('input, 'output) Temporal.Activity.t) =
+  let implementation =
+    Option.map
+      (fun implementation context input ->
+        match implementation context input with
+        | Temporal.Activity.Completed output ->
+            Temporal_base.Async_activity.Completed output
+        | Temporal.Activity.Failed error ->
+            Temporal_base.Async_activity.Failed (base_error error)
+        | Temporal.Activity.Will_complete_async handle ->
+            Temporal_base.Async_activity.Will_complete_async handle)
+      (Temporal.Activity.implementation_async definition)
+  in
+  Temporal_base.Definition.make ~name:(Temporal.Activity.name definition)
+    ~input:(base_codec (Temporal.Activity.input definition))
+    ~output:(base_codec (Temporal.Activity.output definition)) ~implementation
+
 (** Keeps the test-facing registration call ergonomic while making the
     public-to-base conversion explicit at the private runtime boundary. *)
 module Adapter = struct
   include Raw_adapter
 
   let register definition = Raw_adapter.register (base_activity definition)
+
+  (** Registers the asynchronous callback through the same production adapter. *)
+  let register_async definition =
+    Raw_adapter.register_async (base_async_activity definition)
 end
 
 type source_error = { code : string; message : string; retryable : bool }
@@ -580,6 +603,121 @@ let test_invalid_failure_completion_retry () =
   if !calls <> 1 || !(supervisor.leased) <> [] || Queue.length supervisor.queue <> 1 then
     failwith "replacement retry reran the activity, retained its lease, or polled later work"
 
+(** Wire-valid context values which the runtime cannot represent must fail only
+    their own task. Exercise both callback styles, immediate acknowledgement,
+    and transport retry through poll and drain before running unrelated work. *)
+let test_unrepresentable_context_retires_lease () =
+  List.iter
+    (fun async ->
+      List.iter
+        (fun binary_metadata ->
+          List.iter
+            (fun retry ->
+              let supervisor = fake_supervisor () in
+              let bad_calls = ref 0 in
+              let good_calls = ref 0 in
+              let bad =
+                if async then
+                  Adapter.register_async
+                    (Temporal.Activity.define_async ~name:"bad-context"
+                       ~input:Temporal.Codec.unit ~output:Temporal.Codec.unit
+                       (fun _context () ->
+                         incr bad_calls;
+                         Temporal.Activity.Completed ()))
+                else
+                  Adapter.register
+                    (Temporal.Activity.define ~name:"bad-context"
+                       ~input:Temporal.Codec.unit ~output:Temporal.Codec.unit
+                       (fun () -> incr bad_calls; Ok ()))
+              in
+              let good =
+                Temporal.Activity.define ~name:"after-bad-context"
+                  ~input:Temporal.Codec.unit ~output:Temporal.Codec.unit
+                  (fun () -> incr good_calls; Ok ())
+              in
+              let heartbeat_details, heartbeat_timeout, path =
+                if binary_metadata then
+                  ([ Protocol.{ metadata = [ ("opaque", Bytes.of_string "\255") ];
+                       data = Bytes.of_string "private-heartbeat" } ],
+                   None, "$.variant.heartbeat_details[0].metadata.opaque")
+                else
+                  ([], Some Protocol.{ seconds = 1L; nanoseconds = 1 },
+                   "$.variant.heartbeat_timeout.nanoseconds")
+              in
+              let token = Bytes.of_string "\000bad-context\255" in
+              let task =
+                start_task_with_heartbeat ~heartbeat_details ~heartbeat_timeout
+                  ~token ~activity_type:"bad-context" ~input:[]
+              in
+              (* These are valid native tasks, not malformed wire envelopes. *)
+              let task =
+                match Result.bind (Protocol.encode_task task) Protocol.decode_task with
+                | Ok task -> task
+                | Error _ -> failwith "context fixture is not wire-valid"
+              in
+              enqueue supervisor task;
+              enqueue supervisor
+                (start_task ~token:(Bytes.of_string "next-context-token")
+                   ~activity_type:"after-bad-context" ~input:[]);
+              let adapter = worker supervisor [ bad; Adapter.register good ] in
+              if retry then begin
+                supervisor.reject_next_completion := true;
+                (match Worker.poll adapter with
+                | Error { code = "completion_failed"; retryable = true; _ } -> ()
+                | _ -> failwith "context failure did not reach completion transport");
+                supervisor.reject_next_completion := true;
+                (match Worker.drain adapter with
+                | Error { code = "completion_failed"; retryable = true; _ } -> ()
+                | _ -> failwith "drain lost the rejected context completion");
+                if !(supervisor.leased) <> [ token ]
+                   || !(supervisor.completions) <> []
+                   || Queue.length supervisor.queue <> 1 then
+                  failwith "unacknowledged context failure lost its lease or polled ahead"
+              end;
+              (match Worker.poll adapter with
+              | Ok (Adapter.Rejected { lease_retired = true;
+                  error = { code = "unsupported"; path = actual; _ }; _ })
+                when String.equal actual path -> ()
+              | _ -> failwith "unsupported context escaped without retiring its task");
+              let completion = latest_completion supervisor in
+              (match completion.result with
+              | Protocol.Failed { message; info = Protocol.Application
+                  { non_retryable = true; details = []; _ }; _ }
+                when String.length message <= 1_024 -> ()
+              | _ -> failwith "context failure did not produce a bounded rejection");
+              if not (Bytes.equal completion.task_token token)
+                 || !(supervisor.leased) <> [] || !bad_calls <> 0 then
+                failwith "context rejection changed the token or dispatched its callback";
+              if List.length !(supervisor.completion_attempts) <> (if retry then 3 else 1)
+                 || not (List.for_all
+                   (fun attempt -> Protocol.encode_completion attempt
+                     = Protocol.encode_completion completion)
+                   !(supervisor.completion_attempts)) then
+                failwith "context rejection changed across submission attempts";
+              let module Loop = Temporal_runtime.Native_worker_loop in
+              (* Use the production loop's progress contract to ensure later
+                 work runs after rejection without a readiness wait. *)
+              let poll_activity () =
+                match Worker.poll adapter with
+                | Ok (Adapter.Completed _) -> Ok Loop.Progress
+                | Ok (Adapter.Rejected { lease_retired = true; _ }) -> Ok Loop.Progress
+                | Error error -> Error error
+                | _ -> failwith "queued activity did not make progress"
+              in
+              (match Loop.run ~closed:(fun () -> !good_calls = 1)
+                 ~poll_workflow:(fun () -> Ok Loop.Not_ready) ~poll_activity
+                 ~wait_for_lane:(fun ~workflow_lane:_ -> failwith "unexpected idle wait")
+                 ~retry_pending:(fun ~workflow_lane:_ -> failwith "unexpected retry wait")
+               with
+              | Ok () -> ()
+              | Error _ -> failwith "context rejection stopped the worker loop");
+              match Worker.drain adapter with
+              | Ok () when !(supervisor.leased) = [] && !good_calls = 1 -> ()
+              | _ -> failwith "context rejection left unaccounted completion debt")
+            [ false; true ])
+        [ true; false ])
+    [ false; true ]
+
 (** An unknown activity type is acknowledged with a typed non-retryable failure,
     preventing a leased task from being silently abandoned. *)
 let test_unknown_activity_retires_lease () =
@@ -1033,6 +1171,7 @@ let () =
   test_typed_failure ();
   test_invalid_failure_details_allow_next_activity ();
   test_invalid_failure_completion_retry ();
+  test_unrepresentable_context_retires_lease ();
   test_unknown_activity_retires_lease ();
   test_cancellation ();
   test_completion_retry_does_not_redo_activity ();
