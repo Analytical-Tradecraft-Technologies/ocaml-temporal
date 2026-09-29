@@ -6,18 +6,28 @@
     the single SDK supervisor. Keeping lifecycle state here makes handle
     methods safe when they are called from several OCaml Domains. *)
 
-(** An encoded operation submitted to the private native adapter. Payloads are
-    already copied and validated by the caller before they reach this module. *)
+(** An encoded operation submitted to the private native adapter. The public
+    boundary copies payloads; the adapter must validate the entire wire request
+    before submitting it to the supervisor. *)
 type operation =
   | Complete of Payload.t
   | Fail of Error.t
   | Cancel of Payload.t list
   | Heartbeat of Payload.t list
 
-(** A callback result used by the state machine. The callback must return a
-    typed error when acceptance is unknown; the pending operation is retained
-    so the caller can retry the exact request. *)
+(** The result exposed by handle methods and lifecycle transitions. *)
 type submit_result = (unit, Error.t) result
+
+(** Private submission disposition, independent of the public diagnostic's
+    error category. [Not_submitted] proves local validation prevented any
+    native call, permitting a corrected or different operation unless an
+    earlier submission is still unresolved. An explicitly retryable submission
+    retains the exact request key; a terminal native rejection or closed
+    capability retires the handle. *)
+type submission_error =
+  | Not_submitted of Error.t
+  | Retryable_submission of Error.t
+  | Terminal_submission of Error.t
 
 (** An opaque handle paired with the output type of its activity definition. *)
 type 'output handle
@@ -47,7 +57,7 @@ type ('input, 'output) implementation =
     retained by the handle so callers can complete it with the activity's
     typed output rather than constructing a wire payload themselves. *)
 val create :
-  submit:(operation -> submit_result) ->
+  submit:(operation -> (unit, submission_error) result) ->
   encode_output:('output -> (Payload.t, Error.t) result) ->
   'output handle
 
