@@ -1,0 +1,45 @@
+{
+  "jobs": [
+    {
+      "seq": 7,
+      "kind": "resolve_child_workflow",
+      "result": {
+        "kind": "failed",
+        "failure": {
+          "message": "Child Workflow execution terminated",
+          "source": "",
+          "stack_trace": "",
+          "encoded_attributes": null,
+          "cause": {
+            "message": "Terminated",
+            "source": "",
+            "stack_trace": "",
+            "encoded_attributes": null,
+            "cause": null,
+            "info": {
+              "kind": "terminated",
+              "identity": "operator"
+            }
+          },
+          "info": {
+            "kind": "child_workflow",
+            "namespace": "default",
+            "workflow_id": "child-id",
+            "run_id": "child-run",
+            "workflow_type": "child",
+            "initiated_event_id": 5,
+            "started_event_id": 6,
+            "retry_state": "non_retryable_failure"
+          }
+        }
+      }
+    }
+  ],
+  "run_id": "parent-run",
+  "timestamp": {
+    "seconds": 1720000000,
+    "nanoseconds": 0
+  },
+  "is_replaying": true,
+  "history_length": 9
+}

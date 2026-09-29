@@ -565,6 +565,7 @@ module Make (Supervisor : SUPERVISOR) = struct
           Protocol.Canceled
             { details = List.map copy_payload details; identity }
       | Protocol.Activity _ as info -> info
+      | Protocol.Terminated _ as info -> info
       | Protocol.Child_workflow _ as info -> info
       | Protocol.Timeout_failure { timeout_type; last_heartbeat_details } ->
           Protocol.Timeout_failure

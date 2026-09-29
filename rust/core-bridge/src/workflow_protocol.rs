@@ -362,6 +362,8 @@ pub enum FailureInfo {
         details: Vec<Payload>,
         identity: String,
     },
+    /// A terminated execution, including the identity supplied by Core.
+    Terminated { identity: String },
     Activity {
         scheduled_event_id: i64,
         started_event_id: i64,
@@ -1088,6 +1090,7 @@ pub(crate) fn validate_failure(value: &Failure, path: &str) -> Result<(), Protoc
             bounded_text(identity, path)?;
             validate_failure_payloads(details, &format!("{path}.details"))?;
         }
+        FailureInfo::Terminated { identity } => bounded_text(identity, path)?,
         FailureInfo::Activity {
             scheduled_event_id,
             started_event_id,
@@ -2176,6 +2179,9 @@ pub(crate) fn failure_from_core(
             details: payloads_from_core(info.details.as_ref())?,
             identity: info.identity.clone(),
         },
+        Core::TerminatedFailureInfo(info) => FailureInfo::Terminated {
+            identity: info.identity.clone(),
+        },
         Core::ActivityFailureInfo(info) => FailureInfo::Activity {
             scheduled_event_id: info.scheduled_event_id,
             started_event_id: info.started_event_id,
@@ -2253,6 +2259,11 @@ pub(crate) fn failure_to_core(
         FailureInfo::Canceled { details, identity } => {
             Core::CanceledFailureInfo(api_failure::CanceledFailureInfo {
                 details: Some(payloads_to_core(details)?),
+                identity: identity.clone(),
+            })
+        }
+        FailureInfo::Terminated { identity } => {
+            Core::TerminatedFailureInfo(api_failure::TerminatedFailureInfo {
                 identity: identity.clone(),
             })
         }

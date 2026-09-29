@@ -57,6 +57,8 @@ type failure_info =
       details : payload list;
     }
   | Canceled of { details : payload list; identity : string }
+  | Terminated of { identity : string }
+  (** Core's termination cause carries identity but no payload details. *)
   | Activity of {
       scheduled_event_id : int64;
       started_event_id : int64;
@@ -148,6 +150,7 @@ let failure_non_retryable failure =
     match value.info with
     | Application { non_retryable; _ } -> non_retryable
     | Canceled _ -> false
+    | Terminated _ -> true
     | Activity { retry_state; _ } | Child_workflow { retry_state; _ } -> (
         match retry_state with
         | Non_retryable_failure | Maximum_attempts_reached -> true
@@ -753,6 +756,11 @@ let failure_info path json =
       let* identity_json = field path "identity" entries in
       let* identity = string (path ^ ".identity") identity_json in
       Ok (Canceled { details; identity })
+  | "terminated" ->
+      let* entries = exact_object path [ "kind"; "identity" ] json in
+      let* identity_json = field path "identity" entries in
+      let* identity = string (path ^ ".identity") identity_json in
+      Ok (Terminated { identity })
   | "activity" ->
       let* entries =
         exact_object path
@@ -946,6 +954,8 @@ let rec failure_info_json = function
             ("details", details);
             ("identity", `String identity);
           ])
+  | Terminated { identity } ->
+      Ok (`Assoc [ ("kind", `String "terminated"); ("identity", `String identity) ])
   | Activity
       {
         scheduled_event_id;

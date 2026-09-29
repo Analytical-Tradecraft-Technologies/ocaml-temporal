@@ -92,6 +92,7 @@ let test_valid_activations () =
       "start-metadata";
       "child-initialize";
       "child-resolution";
+      "child-terminated";
       "child-cancellation-before-start";
       "patch-activation";
       "reset-activation";
@@ -1430,6 +1431,27 @@ let test_invalid_reset_seeds () =
       {|{"kind":"update_random_seed","randomness_seed":"1","extra":true}|};
       {|{"kind":"update_random_seed","randomness_seed":"1","randomness_seed":"2"}|} ]
 
+(** Termination preserves its identity in both directions and remains a closed,
+    bounded failure variant, including when Core supplies an empty identity. *)
+let test_terminated_failure_info () =
+  List.iter (fun identity ->
+    let failure = failure_with_info (Protocol.Terminated { identity }) in
+    let completion : Protocol.completion =
+      { run_id = "terminated-run"; task_failure = None;
+        commands = [ Protocol.Fail_workflow { failure } ] } in
+    let encoded = unwrap (Protocol.encode_completion completion) in
+    assert (unwrap (Protocol.decode_completion encoded) = completion);
+    assert (Protocol.failure_non_retryable failure)) [ ""; "operator" ];
+  let document info = Printf.sprintf
+    {|{"run_id":"terminated-run","commands":[{"kind":"fail_workflow","failure":{"message":"Terminated","source":"","stack_trace":"","encoded_attributes":null,"cause":null,"info":%s}}]}|}
+    info in
+  List.iter (fun info -> require_error (Protocol.decode_completion (document info)))
+    [ {|{"kind":"terminated"}|};
+      {|{"kind":"terminated","identity":"","details":[]}|};
+      {|{"kind":"terminated","identity":null}|};
+      {|{"kind":"terminated","identity":"a","identity":"b"}|};
+      Printf.sprintf {|{"kind":"terminated","identity":"%s"}|} (String.make 65_537 'i') ]
+
 (** Runs one test with a stable name suitable for CI logs. *)
 let run name test =
   try
@@ -1440,6 +1462,7 @@ let run name test =
     exit 1
 
 let () =
+  run "terminated failure info" test_terminated_failure_info;
   run "workflow activations" test_valid_activations;
   run "invalid reset seeds" test_invalid_reset_seeds;
   run "continuation initialization metadata" test_continuation_initialize_metadata;
