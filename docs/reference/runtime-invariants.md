@@ -41,6 +41,15 @@ and bridge, read the [documentation guide](../README.md) first.
   regression checks retained live words across repeated callback batches.
 - Spawn order is source execution order.
 - Activation jobs are applied in their supplied list order.
+- Initialization records the workflow start during that job pass, then queues
+  the root fiber after the initial signal/update handlers. Those handlers are
+  invoked in activation order before the root's first instruction, even when
+  the root completes without suspending. A handler that suspends allows later
+  handlers and the root to proceed; initialization does not wait for every
+  handler to finish. Duplicate initialization, cancellation, eviction, and
+  handler failure still prevent an invalid root invocation. The offline
+  [initial-signals replay](../../test/integration/temporal/initial_signals/README.md)
+  qualifies the ordering through Core and the production worker adapter.
 - Core's `UpdateRandomSeed` replaces only the execution-local random stream at
   its position in that job pass, before resumed fibers run. The complete uint64
   seed survives the bridge as canonical decimal text; the runtime preserves

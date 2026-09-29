@@ -1,0 +1,4 @@
+(test
+ (name test_initial_signals_replay)
+ (deps history.replay.json)
+ (libraries temporal-sdk temporal_runtime temporal_sdk_supervisor unix))
