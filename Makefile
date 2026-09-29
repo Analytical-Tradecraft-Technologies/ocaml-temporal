@@ -808,7 +808,7 @@ build-task-failure-fixture:
 
 # This local/CI controller uses host Python's standard library only. The three
 # OCaml binaries share one build tree and have no production fixture hooks.
-test-temporal-task-failure-live: test-task-failure-command-logging test-temporal-config build-task-failure-fixture
+test-temporal-task-failure-live: test-task-failure-command-logging test-task-failure-markers test-temporal-config build-task-failure-fixture
 	TEMPORAL_COMPOSE_PROJECT="$(TEMPORAL_COMPOSE_PROJECT)" OCAML_IMAGE="$(OCAML_IMAGE)" python3 test/integration/temporal/scripts/run-task-failure-live.py
 
 # Publish only after the pinned toolchain, Rust lint, and full Rust test suite
@@ -834,6 +834,11 @@ rust-bridge:
 .PHONY: test-task-failure-command-logging
 test-task-failure-command-logging:
 	python3 -m unittest discover -s test/smoke -p 'test_task_failure_command_logging.py'
+
+# Reproduce marker publication/exit races without a live server or Docker.
+.PHONY: test-task-failure-markers
+test-task-failure-markers:
+	python3 -m unittest discover -s test/smoke -p 'test_task_failure_markers.py'
 
 # Exercises namespace propagation failures without a live server or Docker.
 .PHONY: test-temporal-namespace-readiness

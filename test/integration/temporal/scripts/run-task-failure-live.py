@@ -116,6 +116,18 @@ def marker(name, producer):
     return running(producer) and (ARTIFACTS / name).is_file()
 
 
+def completion_marker(name, producer):
+    """Accept completed results even when the one-shot driver has already exited."""
+    state = json.loads(command(["docker", "inspect", producer]))[0]["State"]
+    # Sample liveness first: a stopped driver has finished publishing. Checking
+    # the file first can miss publication immediately before a successful exit.
+    published = (ARTIFACTS / name).is_file()
+    if not state["Running"]:
+        assert state["ExitCode"] == 0, f"{producer} exited unsuccessfully: {state}"
+        assert published, f"{producer} exited before marker: {state}"
+    return published
+
+
 def stop_worker(generation, container):
     """Require public shutdown, zero exit, and removal before replacement."""
     command(["docker", "stop", "--time", "30", container], timeout=45)
@@ -243,8 +255,8 @@ def main():
         corrected = launch("corrected", "corrected_worker")
         processes.append(corrected)
         wait_for(lambda: marker("corrected.ready", corrected), "corrected worker")
-        wait_for(lambda: (ARTIFACTS / "completed.tsv").is_file() or
-                 (running(driver) and False), "same-handle results", seconds=240)
+        wait_for(lambda: completion_marker("completed.tsv", driver),
+                 "same-handle results", seconds=240)
         assert (ARTIFACTS / "accepted.tsv").read_bytes() == (ARTIFACTS / "completed.tsv").read_bytes()
         assert command(["docker", "wait", driver]).strip() == "0"
         for name, workflow_id, run_id in rows:
