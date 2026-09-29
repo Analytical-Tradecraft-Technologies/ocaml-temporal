@@ -318,6 +318,135 @@ let test_condition_skips_failure_terminal () =
             ("failure expected one terminal command, got "
             ^ string_of_int (List.length commands)))
 
+(** Adapts public condition errors to the runtime definition boundary. *)
+let base_error error =
+  let view = Temporal.Error.view error in
+  Temporal_base.Error.make ~category:view.category ~message:view.message
+    ~non_retryable:view.non_retryable
+    ~details:(List.map
+      (fun (payload : Temporal.Payload.t) : Temporal_base.Payload.t ->
+        { metadata = payload.metadata; data = Bytes.copy payload.data })
+      view.details) ()
+
+(** Builds a unit workflow whose body exercises the real public condition API. *)
+let public_definition implementation =
+  Temporal_base.Definition.make ~name:"public-condition"
+    ~input:Temporal_base.Codec.unit ~output:Temporal_base.Codec.unit
+    ~implementation:(Some (fun () -> Result.map_error base_error (implementation ())))
+
+(** Creates a signal job with no payload for these runtime-only handlers. *)
+let signal name =
+  Activation.Signal_workflow
+    { signal_name = name; input = []; identity = "test"; headers = [] }
+
+(** Requires successful completion rather than an empty, failed command batch. *)
+let expect_completed label execution commands =
+  expect (label ^ " task failure") None (Execution.task_failure execution);
+  match commands with
+  | [ Activation.Complete_workflow _ ] -> ()
+  | _ -> failwith (label ^ " did not complete")
+
+(** Reads an owning scope on both initial and deferred evaluations, then
+    cancels it in a later signal activation. Rechecks must follow every queued
+    signal, and ownership must be restored when the activation returns. *)
+let test_scope_condition ~initially_cancelled =
+  let scope_ref = ref None in
+  let evaluations = ref 0 in
+  let seen = ref [] in
+  let implementation () =
+    match Temporal.Scope.create () with
+    | Error _ as error -> error
+    | Ok scope ->
+        scope_ref := Some scope;
+        if initially_cancelled then ignore (Temporal.Scope.cancel scope);
+        Result.map (fun () -> seen := "resumed" :: !seen)
+          (Temporal.Condition.wait_until_result (fun () ->
+               incr evaluations;
+               Temporal.Scope.is_cancelled scope))
+  in
+  let cancel =
+    Execution.make_signal_handler ~name:"cancel" ~dispatch:(fun _ ->
+        seen := "cancel" :: !seen;
+        Temporal.Scope.cancel (Option.get !scope_ref) |> Result.map_error base_error)
+  in
+  let after =
+    Execution.make_signal_handler ~name:"after" ~dispatch:(fun _ ->
+        seen := "after" :: !seen;
+        Ok ())
+  in
+  let execution =
+    Execution.start ~signal_handlers:[ cancel; after ]
+      (public_definition implementation) ()
+  in
+  let commands = Execution.activate execution [ Activation.Start_workflow ] in
+  expect "scope condition initial task failure" None (Execution.task_failure execution);
+  if initially_cancelled then (
+    expect_completed "already cancelled scope" execution commands;
+    expect "already cancelled predicate count" 1 !evaluations)
+  else (
+    expect "scope condition remains parked" [] commands;
+    expect "scope predicate first recheck" 2 !evaluations;
+    expect_base_error "scope between activations" "defect"
+      "Temporal.Scope.is_cancelled used outside its owning workflow scheduler"
+      (Temporal.Scope.is_cancelled (Option.get !scope_ref) |> Result.map_error base_error);
+    expect "scope condition false recheck" [] (Execution.activate execution []);
+    expect "scope condition false recheck failure" None (Execution.task_failure execution);
+    expect "scope predicate repeated false" 3 !evaluations;
+    expect_completed "scope cancellation" execution
+      (Execution.activate execution [ signal "cancel"; signal "after" ]);
+    expect "condition runs after all signals" [ "cancel"; "after"; "resumed" ]
+      (List.rev !seen);
+    expect "scope predicate final recheck" 4 !evaluations);
+  expect_base_error "scope after completion" "defect"
+    "Temporal.Scope.is_cancelled used outside its owning workflow scheduler"
+    (Temporal.Scope.is_cancelled (Option.get !scope_ref) |> Result.map_error base_error)
+
+(** A deferred predicate still rejects a scope owned by another execution,
+    whether that owner remains live or has already shut down. *)
+let test_foreign_scope_recheck ~stale =
+  let scheduler, context = context () in
+  let scope_ref = ref None in
+  Scheduler.spawn scheduler (fun () ->
+      Workflow_context_store.with_context context (fun () ->
+          match Temporal.Scope.create () with
+          | Ok scope -> scope_ref := Some scope
+          | Error error -> failwith (Temporal.Error.message error)));
+  ignore (Scheduler.run scheduler);
+  if stale then Workflow_context_store.shutdown context;
+  let evaluations = ref 0 in
+  let execution =
+    Execution.start
+      (public_definition (fun () ->
+           Temporal.Condition.wait_until_result (fun () ->
+               incr evaluations;
+               if !evaluations = 1 then Ok false
+               else Temporal.Scope.is_cancelled (Option.get !scope_ref)))) ()
+  in
+  expect "foreign scope commands" [] (Execution.activate execution [ Activation.Start_workflow ]);
+  expect "foreign scope deferred evaluation" 2 !evaluations;
+  expect_base_error "foreign scope recheck" "defect"
+    "Temporal.Scope.is_cancelled used outside its owning workflow scheduler"
+    (Error (Option.get (Execution.task_failure execution)));
+  Workflow_context_store.shutdown context
+
+(** Predicate errors, exceptions, and attempts to suspend on a deferred check
+    must settle the wait as a task defect rather than parking the notifier. *)
+let test_failed_recheck predicate =
+  let evaluations = ref 0 in
+  let execution =
+    Execution.start
+      (public_definition (fun () ->
+           Temporal.Condition.wait_until_result (fun () ->
+               incr evaluations;
+               if !evaluations = 1 then Ok false else predicate ()))) ()
+  in
+  expect "failed predicate discards commands" []
+    (Execution.activate execution [ Activation.Start_workflow ]);
+  expect "failed predicate is deferred" 2 !evaluations;
+  match Execution.task_failure execution with
+  | Some error -> expect "failed predicate category" "defect" (Temporal_base.Error.kind error)
+  | None -> failwith "deferred predicate did not return its defect"
+
 (** Executes every deterministic condition-store and activation scenario. *)
 let () =
   test_immediate_success ();
@@ -328,4 +457,12 @@ let () =
   test_teardown_removes_waiter ();
   test_activation_rechecks_after_signal_mutation ();
   test_condition_skips_continue_as_new_terminal ();
-  test_condition_skips_failure_terminal ()
+  test_condition_skips_failure_terminal ();
+  test_scope_condition ~initially_cancelled:false;
+  test_scope_condition ~initially_cancelled:true;
+  test_foreign_scope_recheck ~stale:false;
+  test_foreign_scope_recheck ~stale:true;
+  test_failed_recheck (fun () -> Error (Temporal.Error.defect ~message:"bad state"));
+  test_failed_recheck (fun () -> raise Exit);
+  test_failed_recheck (fun () ->
+      Result.map (fun () -> true) (Temporal.Workflow.sleep (Temporal.Duration.of_ms 1L)))

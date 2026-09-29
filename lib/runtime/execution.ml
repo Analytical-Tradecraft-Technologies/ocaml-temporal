@@ -643,35 +643,26 @@ let process_job execution = function
     uncaught OCaml exception becomes a non-retryable defect instead of escaping
     the worker loop. *)
 let run_scheduler execution =
-  let rec drain () =
-    let status =
-      Workflow_context_store.with_context execution.context (fun () ->
-          Scheduler.run execution.scheduler)
-    in
-    (match status with
-    | Scheduler.Failed exception_ ->
-        (* A defect invalidates this whole activation, including commands that
-           a sibling buffered before the exception. Core must replay it. *)
-        fail_task execution
-          (Temporal_base.Error.defect ~message:(Printexc.to_string exception_))
-    | Scheduler.Complete | Scheduler.Blocked -> ());
-    (* Predicates are checked only after runnable workflow code has drained.
-       If a state mutation satisfies one, resolving its private signal queues a
-       continuation; drain again so that continuation participates in this
-       activation instead of waiting for a synthetic timer or later task. *)
-    if
-      execution.terminal
-      || execution.evicted
-      || Workflow_context_store.has_buffered_terminal execution.context
-    then ()
-    else
-      let woke =
-        Workflow_context_store.with_context execution.context (fun () ->
-            Workflow_context_store.notify_conditions execution.context)
-      in
-      if woke then drain ()
+  let on_idle () =
+    (* Recheck only after queued workflow code has drained, but before the
+       scheduler clears its owner marker and callback liveness. Predicates
+       can read their own scope, and any satisfied wait rejoins this activation.
+       A buffered terminal command must still suppress all later rechecks. *)
+    if not (execution.terminal || execution.evicted
+            || Workflow_context_store.has_buffered_terminal execution.context)
+    then ignore (Workflow_context_store.notify_conditions execution.context)
   in
-  drain ()
+  let status =
+    Workflow_context_store.with_context execution.context (fun () ->
+        Scheduler.run ~on_idle execution.scheduler)
+  in
+  match status with
+  | Scheduler.Failed exception_ ->
+      (* A defect invalidates this whole activation, including commands that
+         a sibling buffered before the exception. Core must replay it. *)
+      fail_task execution
+        (Temporal_base.Error.defect ~message:(Printexc.to_string exception_))
+  | Scheduler.Complete | Scheduler.Blocked -> ()
 
 (** Releases every paused fiber and pending operation table for this execution.
     Safe to call more than once: the context and scheduler ignore a second

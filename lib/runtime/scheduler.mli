@@ -38,10 +38,14 @@ val promise :
 (** Adds a new workflow fiber after work already waiting in the queue. *)
 val spawn : t -> (unit -> unit) -> unit
 
-(** Runs queued fibers in order until none can continue. Returns the earliest
-    uncaught exception as [Failed]. Calling [run] from inside itself raises
+(** Runs queued fibers in order until none can continue. [on_idle], when given,
+    runs after each successful drain with the owning scheduler still active;
+    any work it queues is drained before another idle check. This synchronous
+    callback has no fiber effect handler and must not suspend. It is skipped
+    after failure, shutdown, or terminal abort. Returns the earliest uncaught
+    exception as [Failed]. Re-entering the same scheduler raises
     [Invalid_argument]. *)
-val run : t -> status
+val run : ?on_idle:(unit -> unit) -> t -> status
 
 (** Runs the scheduler and returns a stable diagnostic label. *)
 val run_label : t -> string
