@@ -175,6 +175,17 @@ rejects negative, sub-millisecond, or out-of-range values instead of rounding
 or overflowing them. An accepted timeout is therefore exposed as an exact
 whole-millisecond `Duration.t`.
 
+Heartbeat-context conversion failures follow the same task-rejection path as
+input codec failures, for both synchronous and asynchronous definitions. For
+example, binary heartbeat metadata which cannot be represented by runtime
+strings, or a sub-millisecond timeout, produces a bounded non-retryable failure
+for the exact leased token without invoking the callback. The adapter retains
+that validated failure until native acknowledgement, so a transient submission
+failure remains visible to polling and shutdown drain. Once acknowledged,
+unrelated queued activities can run normally. The deterministic adapter tests
+cover both context failures, both definition styles, and unchanged completion
+retries through polling and drain.
+
 The context is valid only while its activity attempt is executing. The adapter
 invalidates it before returning from dispatch, including exceptional and
 completion-error paths. A retained context therefore returns a typed error

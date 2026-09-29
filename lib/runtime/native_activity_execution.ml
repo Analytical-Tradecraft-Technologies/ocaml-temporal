@@ -434,6 +434,23 @@ let decode_input definition arguments =
   | Ok input -> Ok input
   | Error error -> Error (application_error ~path:"$.variant.input" error)
 
+(** Converts all callback inputs before dispatch. Callers must route any
+    conversion error through [reject_task]: a wire-valid task already owns a
+    native completion lease even when its heartbeat context is unsupported. *)
+let decode_start definition (start : Protocol.activity_start) =
+  let* input = decode_input definition start.input in
+  let* details =
+    runtime_payloads "$.variant.heartbeat_details" start.heartbeat_details
+  in
+  let* heartbeat_timeout =
+    match start.heartbeat_timeout with
+    | None -> Ok None
+    | Some timeout ->
+        Result.map (fun timeout -> Some timeout)
+          (runtime_duration "$.variant.heartbeat_timeout" timeout)
+  in
+  Ok (input, details, heartbeat_timeout)
+
 (** Finds an executable definition by the Temporal activity type. *)
 let find_definition definitions activity_type =
   match Name_map.find_opt activity_type definitions with
@@ -1011,20 +1028,9 @@ module Make (Supervisor : SUPERVISOR) = struct
       (start : Protocol.activity_start) =
     let activity_type = Some start.activity_type in
     let process () =
-      match decode_input definition start.input with
+      match decode_start definition start with
       | Error error -> reject_task adapter ~token ~activity_type error
-      | Ok input ->
-          let* _details =
-            runtime_payloads "$.variant.heartbeat_details"
-              start.heartbeat_details
-          in
-          let* _heartbeat_timeout =
-            match start.heartbeat_timeout with
-            | None -> Ok None
-            | Some timeout ->
-                Result.map (fun timeout -> Some timeout)
-                  (runtime_duration "$.variant.heartbeat_timeout" timeout)
-          in
+      | Ok (input, _details, _heartbeat_timeout) ->
           (match Definition.implementation definition with
           | None ->
               reject_task adapter ~token ~activity_type
@@ -1129,20 +1135,9 @@ module Make (Supervisor : SUPERVISOR) = struct
                 (make_error ~path:"$.variant.activity_type" "not_executable"
                    "registered activity has no local implementation")
           | Some implementation ->
-              (match decode_input definition start.input with
+              (match decode_start definition start with
               | Error error -> reject_task adapter ~token ~activity_type error
-              | Ok input ->
-                  let* details =
-                    runtime_payloads "$.variant.heartbeat_details"
-                      start.heartbeat_details
-                  in
-                  let* heartbeat_timeout =
-                    match start.heartbeat_timeout with
-                    | None -> Ok None
-                    | Some timeout ->
-                        Result.map (fun timeout -> Some timeout)
-                          (runtime_duration "$.variant.heartbeat_timeout" timeout)
-                  in
+              | Ok (input, details, heartbeat_timeout) ->
                   let context =
                     activity_context adapter ~token ~details ~heartbeat_timeout
                   in
