@@ -66,6 +66,12 @@ and bridge, read the [documentation guide](../README.md) first.
   weak-reference and live-heap probe in `test/runtime/test_future_retention.ml`
   checks collection while the owner and summary futures remain active.
 - Awaiting a ready future does not perform an effect.
+- External signal/cancellation validation and encoding failures created inside
+  a workflow retain its scheduler owner, callback liveness, and suspension gate.
+  They emit no command or durable sequence, preserve their original typed error
+  through joins, and obey the same ready-input ordering as successful futures.
+  Calls outside a workflow remain inert; actual cross-workflow combinations
+  still return an ownership defect.
 - Awaiting a pending future outside its owning running scheduler returns a
   structured defect.
 - `Future.both` and `Future.all` observe every input before settling and select
