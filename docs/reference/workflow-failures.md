@@ -92,6 +92,13 @@ and no speculative second timer may appear. Two other workflows deliberately
 return typed application errors, exercising both retryability flags without
 an installed retry policy.
 
+The one-shot client publishes `completed.tsv` before shutting down. The
+controller samples its container state before reading that marker, so a clean
+exit during polling cannot hide completed results. It still requires identical
+accepted/completed identities and exit zero; worker readiness markers continue
+to require a live producer. `make test-task-failure-markers` exercises these
+publication/exit cases without Docker.
+
 Each invocation retains raw initial/terminal histories, separate exact-run
 `describe` responses, client identities, process/server logs, SDK commit and
 diff hash, binary SHA-256 hashes, Core revision, pinned image configuration,
