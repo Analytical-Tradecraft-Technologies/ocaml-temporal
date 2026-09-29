@@ -641,186 +641,128 @@ module Make (Supervisor : SUPERVISOR) = struct
         Printf.sprintf "%s failed (%s): %s" operation error.code error.message)
       ()
 
-  (** Calls the namespace-bound async client for one retained handle operation.
-      The adapter mutex is held for the complete reservation, native call, and
-      state transition. This intentionally serializes retained async
-      operations: shutdown must not be able to discard the registry between a
-      native call returning and its lease state being committed. Rust/Core
-      owns network concurrency; this OCaml lock protects only the small
-      cross-language ownership ledger. *)
-  let submit_async_operation adapter ~token operation : Async_activity.submit_result =
+  (** Owned, fully validated requests ready to cross the supervisor boundary.
+      Preparing these values never changes either lease ledger. *)
+  type async_request =
+    | Async_completion of Protocol.completion
+    | Async_heartbeat of Protocol.heartbeat
+
+  (** Copies and validates an entire late operation before any native call.
+      Payload conversion alone cannot detect duplicate metadata or wire limits;
+      the strict encoder must also accept the complete request. *)
+  let prepare_async_request ~token operation =
+    let task_token = Bytes.copy token in
+    (* Converts ordered detail payloads without retaining caller-owned bytes. *)
+    let details path payloads =
+      let rec loop reversed = function
+        | [] -> Ok (List.rev reversed)
+        | payload :: rest ->
+            let* payload = protocol_payload path payload in
+            loop (payload :: reversed) rest
+      in
+      loop [] payloads
+    in
+    let* request =
+      match operation with
+      | Async_activity.Complete payload ->
+          let* payload = protocol_payload "$.async_completion.result" payload in
+          Ok (Async_completion Protocol.{ task_token; result = Completed (Some payload) })
+      | Async_activity.Fail failure ->
+          let diagnostic = application_error ~path:"$.async_failure" failure in
+          let* failure = failure_of_application_error diagnostic failure in
+          Ok (Async_completion Protocol.{ task_token; result = Failed failure })
+      | Async_activity.Cancel payloads ->
+          let* details = details "$.async_cancellation.details" payloads in
+          let failure = cancellation_failure ~details Protocol.Cancellation_requested in
+          Ok (Async_completion Protocol.{ task_token; result = Cancelled failure })
+      | Async_activity.Heartbeat payloads ->
+          let* details = details "$.async_heartbeat.details" payloads in
+          Ok (Async_heartbeat Protocol.{ task_token; details })
+    in
+    let* () =
+      match request with
+      | Async_completion completion -> validate_completion completion
+      | Async_heartbeat heartbeat ->
+          (match Protocol.encode_heartbeat heartbeat with
+          | Ok _ -> Ok ()
+          | Error error -> Error (protocol_error ~path:"$.async_heartbeat" error))
+    in
+    Ok request
+
+  (** Maps a native outcome to one lifecycle decision shared by the adapter
+      registry and handle state machine. Local preflight errors never enter
+      this classifier, even when their public category is [Bridge]. *)
+  let async_submission_error operation (error : error_view) =
+    let diagnostic = base_operation_error operation error in
+    if error.retryable then Async_activity.Retryable_submission diagnostic
+    else Async_activity.Terminal_submission diagnostic
+
+  (** Calls the namespace-bound client only after local validation succeeds.
+      The async mutex covers preparation, native submission, and registry
+      updates, so shutdown cannot discard a lease during this transaction.
+      Only accepted terminal operations or terminal native errors retire it. *)
+  let submit_async_operation adapter ~token operation
+      : (unit, Async_activity.submission_error) result =
     Mutex.lock adapter.async_mutex;
     Fun.protect
       ~finally:(fun () -> Mutex.unlock adapter.async_mutex)
       (fun () ->
         match Token_map.find_opt token adapter.async_leases with
-        | None -> Error (base_operation_error "async activity handle" (make_error
-            ~path:"$.async_handle" "closed" "asynchronous activity handle is no longer active"))
+        | None ->
+            Error (async_submission_error "async activity handle" (make_error
+              ~path:"$.async_handle" "closed" "asynchronous activity handle is no longer active"))
         | Some (Async_lease lease) when lease.in_flight ->
-            Error (base_operation_error "async activity handle" (make_error
-              ~path:"$.async_handle" "busy" "asynchronous activity operation is already in flight"))
+            Error (Async_activity.Not_submitted
+              (base_operation_error "async activity handle" (make_error
+                ~path:"$.async_handle" "busy" "asynchronous activity operation is already in flight")))
         | Some (Async_lease lease) ->
-            lease.in_flight <- true;
-        let terminal =
-          match operation with
-          | Async_activity.Complete _
-          | Async_activity.Fail _
-          | Async_activity.Cancel _ -> true
-          | Async_activity.Heartbeat _ -> false
-        in
-        let operation_result =
-          try
-            let protocol_error_to_base error =
-              base_operation_error "async activity payload" error
+            let prepared =
+              try prepare_async_request ~token operation with exception_ ->
+                Error (exception_error ~path:"$.async_payload" exception_)
             in
-            match operation with
-          | Async_activity.Complete payload ->
-              (match protocol_payload "$.async_completion.result" payload with
-              | Error error -> Error (protocol_error_to_base error)
-              | Ok payload ->
-                  let completion =
-                    Protocol.
-                      {
-                        task_token = Bytes.copy token;
-                        result = Completed (Some payload);
-                      }
-                  in
-                  (try
-                     match
-                       Supervisor.complete_async_activity adapter.supervisor
-                         completion
-                     with
-                     | Ok () -> Ok ()
-                     | Error source_error ->
-                         Error
-                           (base_operation_error "async activity completion"
-                              (supervisor_error ~path:"$.async_completion"
-                                 ~retryable:(source_error_is_retryable source_error)
-                                 ~error_code:Supervisor.error_code
-                                 ~error_message:Supervisor.error_message
-                                 source_error))
-                   with exception_ ->
-                     Error
-                       (base_operation_error "async activity completion"
-                          (exception_error ~path:"$.async_completion" exception_))))
-          | Async_activity.Fail failure ->
-              let diagnostic = application_error ~path:"$.async_failure" failure in
-              (match failure_of_application_error diagnostic failure with
-              | Error error -> Error (base_operation_error "async activity failure" error)
-              | Ok failure ->
-                  let completion =
-                    Protocol.{ task_token = Bytes.copy token; result = Failed failure }
-                  in
-                  (try
-                     match
-                       Supervisor.complete_async_activity adapter.supervisor
-                         completion
-                     with
-                     | Ok () -> Ok ()
-                     | Error source_error ->
-                         Error
-                           (base_operation_error "async activity failure"
-                              (supervisor_error ~path:"$.async_failure"
-                                 ~retryable:(source_error_is_retryable source_error)
-                                 ~error_code:Supervisor.error_code
-                                 ~error_message:Supervisor.error_message
-                                 source_error))
-                   with exception_ ->
-                     Error
-                       (base_operation_error "async activity failure"
-                          (exception_error ~path:"$.async_failure" exception_))))
-          | Async_activity.Cancel details ->
-              let rec convert reversed = function
-                | [] -> Ok (List.rev reversed)
-                | payload :: rest ->
-                    let* payload =
-                      protocol_payload "$.async_cancellation.details" payload
+            match prepared with
+            | Error error ->
+                Error (Async_activity.Not_submitted
+                  (base_operation_error "async activity payload" error))
+            | Ok request ->
+                lease.in_flight <- true;
+                Fun.protect ~finally:(fun () -> lease.in_flight <- false)
+                  (fun () ->
+                    let terminal, name, path =
+                      match request with
+                      | Async_completion _ ->
+                          (true, "async activity completion", "$.async_completion")
+                      | Async_heartbeat _ ->
+                          (false, "async activity heartbeat", "$.async_heartbeat")
                     in
-                    convert (payload :: reversed) rest
-              in
-              (match convert [] details with
-              | Error error -> Error (protocol_error_to_base error)
-              | Ok details ->
-                  let completion =
-                    Protocol.
-                      {
-                        task_token = Bytes.copy token;
-                        result =
-                          Cancelled
-                            (cancellation_failure
-                               ~details Protocol.Cancellation_requested);
-                      }
-                  in
-                  (try
-                     match
-                       Supervisor.complete_async_activity adapter.supervisor
-                         completion
-                     with
-                     | Ok () -> Ok ()
-                     | Error source_error ->
-                         Error
-                           (base_operation_error "async activity cancellation"
-                              (supervisor_error ~path:"$.async_cancellation"
-                                 ~retryable:(source_error_is_retryable source_error)
-                                 ~error_code:Supervisor.error_code
-                                 ~error_message:Supervisor.error_message
-                                 source_error))
-                   with exception_ ->
-                     Error
-                       (base_operation_error "async activity cancellation"
-                          (exception_error ~path:"$.async_cancellation" exception_))))
-          | Async_activity.Heartbeat details ->
-              let rec convert reversed = function
-                | [] -> Ok (List.rev reversed)
-                | payload :: rest ->
-                    let* payload =
-                      protocol_payload "$.async_heartbeat.details" payload
+                    let result =
+                      try
+                        let submitted =
+                          match request with
+                          | Async_completion completion ->
+                              Supervisor.complete_async_activity adapter.supervisor completion
+                          | Async_heartbeat heartbeat ->
+                              Supervisor.record_async_activity_heartbeat adapter.supervisor heartbeat
+                        in
+                        match submitted with
+                        | Ok () -> Ok ()
+                        | Error source_error ->
+                            Error (async_submission_error name
+                              (supervisor_error ~path
+                                ~retryable:(source_error_is_retryable source_error)
+                                ~error_code:Supervisor.error_code
+                                ~error_message:Supervisor.error_message source_error))
+                      with exception_ ->
+                        Error (async_submission_error name (exception_error ~path exception_))
                     in
-                    convert (payload :: reversed) rest
-              in
-              (match convert [] details with
-              | Error error -> Error (protocol_error_to_base error)
-              | Ok details ->
-                  let heartbeat = Protocol.{ task_token = Bytes.copy token; details } in
-                  (try
-                     match
-                       Supervisor.record_async_activity_heartbeat
-                         adapter.supervisor heartbeat
-                     with
-                     | Ok () -> Ok ()
-                     | Error source_error ->
-                         Error
-                           (base_operation_error "async activity heartbeat"
-                              (supervisor_error ~path:"$.async_heartbeat"
-                                 ~retryable:(source_error_is_retryable source_error)
-                                 ~error_code:Supervisor.error_code
-                                 ~error_message:Supervisor.error_message
-                                 source_error))
-                   with exception_ ->
-                     Error
-                       (base_operation_error "async activity heartbeat"
-                          (exception_error ~path:"$.async_heartbeat" exception_))))
-          with exception_ ->
-            lease.in_flight <- false;
-            raise exception_
-        in
-        lease.in_flight <- false;
-        (match operation_result with
-        | Ok () when terminal ->
-            adapter.async_leases <- Token_map.remove token adapter.async_leases;
-            Ok ()
-        | Error error ->
-            let view = Base_error.view error in
-            if view.category = `Bridge && view.non_retryable then begin
-              (* A non-retryable native result is terminal for this retained
-                 capability. Remove the adapter lease before returning the
-                 error; the base state machine closes its corresponding handle
-                 from the same classification, so neither side can retain a
-                 stale task token after Temporal has rejected it permanently. *)
-              adapter.async_leases <- Token_map.remove token adapter.async_leases
-            end;
-            Error error
-        | _ -> operation_result))
+                    (match result with
+                    | Ok () when terminal ->
+                        adapter.async_leases <- Token_map.remove token adapter.async_leases
+                    | Error (Async_activity.Terminal_submission _) ->
+                        adapter.async_leases <- Token_map.remove token adapter.async_leases
+                    | Ok () | Error (Async_activity.Not_submitted _
+                        | Async_activity.Retryable_submission _) -> ());
+                    result))
 
   (** Submits an already validated, owned completion and preserves lease
       uncertainty when a typed native error or an exception is returned. Local

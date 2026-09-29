@@ -17,9 +17,17 @@ type operation =
   | Cancel of Payload.t list
   | Heartbeat of Payload.t list
 
-(** A supervisor submission either proves acceptance or returns an error whose
-    retryability determines whether the pending operation remains available. *)
+(** The result exposed by handle methods and lifecycle transitions. *)
 type submit_result = (unit, Error.t) result
+
+(** The adapter explicitly distinguishes preflight rejection from native
+    outcomes. [Not_submitted] releases a new operation key while preserving
+    the handle; unresolved earlier submissions retain it, and terminal native
+    outcomes close the handle. *)
+type submission_error =
+  | Not_submitted of Error.t
+  | Retryable_submission of Error.t
+  | Terminal_submission of Error.t
 
 (** The handle lifecycle is protected by [handle.mutex]. [Handoff_pending]
     closes the gap between a callback returning [Will_complete_async] and the
@@ -29,10 +37,13 @@ type lifecycle = Dormant | Handoff_pending | Active | Terminal | Closed
 
 (** The one operation currently reserved by this handle. [in_flight] is set
     while the supervisor callback runs, allowing a transport error to retain
-    the request for an explicit retry without allowing concurrent duplicates. *)
+    the request for an explicit retry without allowing concurrent duplicates.
+    [retry_pending] preserves an earlier uncertain submission even if a later
+    retry is rejected before reaching the supervisor. *)
 type pending = {
   key : string;
   mutable in_flight : bool;
+  mutable retry_pending : bool;
 }
 
 (** Mutable state shared by every Domain that retains one completion handle.
@@ -42,7 +53,7 @@ type 'output handle = {
   mutex : Mutex.t;
   mutable lifecycle : lifecycle;
   mutable pending : pending option;
-  submit : operation -> submit_result;
+  submit : operation -> (unit, submission_error) result;
   encode_output : 'output -> (Payload.t, Error.t) result;
 }
 
@@ -158,7 +169,7 @@ let begin_operation handle ~key operation =
               pending.in_flight <- true;
               Ok (pending, operation)
           | None ->
-              let pending = { key; in_flight = true } in
+              let pending = { key; in_flight = true; retry_pending = false } in
               handle.pending <- Some pending;
               Ok (pending, operation)))
 
@@ -217,18 +228,11 @@ let operation_key operation =
       add_payloads buffer payloads);
   Buffer.contents buffer
 
-(** Identifies bridge errors that prove the retained native capability is
-    terminal, such as an expired or already-completed task token. Such errors
-    close local state too; retryable transport failures retain the pending key
-    for an explicit retry. *)
-let should_close_after_error (error : Error.t) =
-  let view = Error.view error in
-  view.category = `Bridge && view.non_retryable
-
 (** Executes one supervisor submission outside the mutex, then commits its
     result under the mutex. A successful terminal operation clears the pending
     key and closes the handle; a retryable failure clears only [in_flight], so a
-    later call can repeat the exact operation without rerunning user code. *)
+    later call can repeat the exact operation without rerunning user code.
+    Local rejection releases the invalid key so a corrected operation can run. *)
 let submit_operation handle ~terminal operation =
   let key = operation_key operation in
   match begin_operation handle ~key operation with
@@ -237,31 +241,29 @@ let submit_operation handle ~terminal operation =
       let result =
         try handle.submit operation with exception_ ->
           Error
-            (Error.make ~non_retryable:false ~category:`Bridge
+            (Retryable_submission (Error.make ~non_retryable:false ~category:`Bridge
                ~message:
                  (Printf.sprintf
                     "asynchronous activity operation raised: %s"
                     (Printexc.to_string exception_))
-               ())
+               ()))
       in
       with_mutex handle.mutex (fun () ->
+          pending.in_flight <- false;
           match result with
-          | Error _ ->
-              (* Keep the pending key so only the byte-identical request can
-                 be retried. The callback is never rerun. A terminal bridge
-                 error instead closes the capability and drops the pending
-                 request, because retaining it could make a stale native token
-                 appear retryable. *)
-              pending.in_flight <- false;
-              (match result with
-              | Error error when should_close_after_error error ->
-                  handle.lifecycle <- Closed;
-                  handle.pending <- None
-              | Error _ -> ()
-              | Ok () -> ());
-              result
+          | Error (Not_submitted error) ->
+              if not pending.retry_pending then handle.pending <- None;
+              Error error
+          | Error (Retryable_submission error) ->
+              (* Native acceptance is unresolved. Only the byte-identical
+                 request may retry; local validation cannot erase that debt. *)
+              pending.retry_pending <- true;
+              Error error
+          | Error (Terminal_submission error) ->
+              handle.lifecycle <- Closed;
+              handle.pending <- None;
+              Error error
           | Ok () ->
-              pending.in_flight <- false;
               handle.pending <- None;
               if terminal then handle.lifecycle <- Terminal;
               Ok ())
