@@ -173,6 +173,7 @@ let rec copy_failure (value : Protocol.failure) : Protocol.failure =
         Protocol.Timeout_failure
           { info with last_heartbeat_details = copy_payloads last_heartbeat_details }
     | Protocol.Activity _ as info -> info
+    | Protocol.Terminated _ as info -> info
     | Protocol.Child_workflow _ as info -> info
   in
   Protocol.
@@ -282,7 +283,7 @@ let failure_details (failure : Protocol.failure) =
           List.rev_append details reversed
       | Protocol.Timeout_failure { last_heartbeat_details; _ } ->
           List.rev_append last_heartbeat_details reversed
-      | Protocol.Activity _ | Protocol.Child_workflow _ -> reversed
+      | Protocol.Activity _ | Protocol.Child_workflow _ | Protocol.Terminated _ -> reversed
     in
     match value.cause with
     | Some cause when depth < 128 -> loop (depth + 1) reversed cause

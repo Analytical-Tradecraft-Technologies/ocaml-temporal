@@ -27,6 +27,7 @@ let failure_info_summary = function
   | Canceled { details; identity } ->
       Printf.sprintf "canceled identity=%s details=%d" identity
         (List.length details)
+  | Terminated { identity } -> Printf.sprintf "terminated identity=%s" identity
   | Activity
       {
         scheduled_event_id;

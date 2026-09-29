@@ -87,6 +87,8 @@ type failure_info =
       details : payload list;
     }
   | Canceled of { details : payload list; identity : string }
+  | Terminated of { identity : string }
+  (** Core's termination cause carries identity but no payload details. *)
   | Activity of {
       scheduled_event_id : int64;
       started_event_id : int64;

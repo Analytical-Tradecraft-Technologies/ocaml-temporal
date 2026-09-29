@@ -130,6 +130,12 @@ and bridge, read the [documentation guide](../README.md) first.
   terminal result before start, duplicate acknowledgment, or unknown sequence
   is a non-retryable bridge defect; no event is silently dropped.
 - Activities, child workflows, and timers share one monotonic command sequence.
+- A terminated child resolves its pending future with a typed child-workflow
+  error, including the termination cause and identity in its diagnostic. The
+  parent can recover and schedule further work without rejecting its activation
+  or stopping the worker. The native adapter regression covers this behavior
+  with both live-mode and replay-mode activations and a subsequent run; the
+  Rust regression obtains the termination from the pinned Core replay machine.
 - When Core delegates a local activity retry delay, the original activity
   resolver and cancellation decision remain live while a separate workflow
   timer owns the delay. Cancelling during that delay removes the timer callback,

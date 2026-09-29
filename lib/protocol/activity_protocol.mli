@@ -59,6 +59,7 @@ type failure_info = Workflow_protocol.failure_info =
       details : payload list;
     }
   | Canceled of { details : payload list; identity : string }
+  | Terminated of { identity : string }
   | Activity of {
       scheduled_event_id : int64;
       started_event_id : int64;

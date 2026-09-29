@@ -2523,7 +2523,7 @@ let test_retryable_child_failure_preserves_retryability () =
           info = Protocol.Child_workflow { info with retry_state = Protocol.Timeout };
         }
     | Protocol.Application _ | Protocol.Canceled _ | Protocol.Activity _
-    | Protocol.Timeout_failure _ ->
+    | Protocol.Timeout_failure _ | Protocol.Terminated _ ->
         failwith "child terminal failure fixture lost its child-workflow info"
   in
   let child =
@@ -2799,8 +2799,67 @@ let test_update_defect_discards_acceptance_and_commands () =
   if completion.commands <> [] || Option.is_none completion.task_failure then
     failwith "broken update leaked accepted response or buffered timer"
 
+(** A terminated child resolves as an ordinary typed error. The parent handles
+    it, schedules more work, and completes; another run on the same worker can
+    then progress with no outstanding native lease. Replay uses the same path. *)
+let test_terminated_child_recovery () =
+  List.iter (fun is_replaying ->
+    let observed = ref 0 in
+    let child = Temporal.Workflow.remote ~name:"terminated-child"
+        ~input:Temporal.Codec.unit ~output:Temporal.Codec.unit in
+    let definition = Temporal.Workflow.define ~name:"termination-parent"
+        ~input:Temporal.Codec.unit ~output:Temporal.Codec.unit (fun () ->
+      match Temporal.Child_workflow.execute ~id:"terminated-child" child () with
+      | Ok () -> failwith "terminated child unexpectedly succeeded"
+      | Error error ->
+          let view = Temporal.Error.view error in
+          assert (view.category = `Child_workflow && view.non_retryable);
+          assert (view.details = []);
+          assert (String.equal view.message
+            "Child Workflow execution terminated child_workflow namespace=default id=terminated-child run_id=child-run type=terminated-child initiated_event_id=5 started_event_id=6 retry_state=non_retryable_failure | Terminated terminated identity=operator");
+          incr observed;
+          Temporal.Workflow.sleep (Temporal.Duration.of_ms 1L)) in
+    let supervisor = fake_supervisor () in
+    let worker = worker supervisor [ Adapter.register definition ] in
+    let poll run_id jobs terminal =
+      let value = { (activation ~run_id jobs) with is_replaying } in
+      (* Include the strict JSON boundary, just as the native supervisor does. *)
+      let value = Result.get_ok (Protocol.decode_activation
+        (Result.get_ok (Protocol.encode_activation value))) in
+      enqueue supervisor value;
+      expect_completed ~terminal (Result.get_ok (Worker.poll worker));
+      assert (Option.is_none (latest_completion supervisor).task_failure);
+      assert (Hashtbl.length supervisor.leased = 0)
+    in
+    let failure : Protocol.failure =
+      { message = "Child Workflow execution terminated"; source = "";
+        stack_trace = ""; encoded_attributes = None;
+        cause = Some { message = "Terminated"; source = ""; stack_trace = "";
+          encoded_attributes = None; cause = None;
+          info = Protocol.Terminated { identity = "operator" } };
+        info = Protocol.Child_workflow { namespace = "default";
+          workflow_id = "terminated-child"; run_id = "child-run";
+          workflow_type = "terminated-child"; initiated_event_id = 5L;
+          started_event_id = 6L; retry_state = Protocol.Non_retryable_failure } } in
+    List.iter (fun run_id ->
+      poll run_id [ initialize ~run_id ~workflow_type:"termination-parent" ] false;
+      poll run_id [ Protocol.Resolve_child_workflow_start
+          { seq = 1L; result = Protocol.Child_start_succeeded "child-run" } ] false;
+      poll run_id [ Protocol.Resolve_child_workflow
+          { seq = 1L; result = Protocol.Child_failed failure } ] false;
+      let timer_seq = match (latest_completion supervisor).commands with
+        | [ Protocol.Start_timer { seq; _ } ] -> seq
+        | _ -> failwith "parent did not recover and schedule a timer" in
+      poll run_id [ Protocol.Fire_timer { seq = timer_seq } ] true;
+      assert ((latest_completion supervisor).commands =
+        [ Protocol.Complete_workflow { result = None } ]))
+      [ "termination-parent-1"; "termination-parent-2" ];
+    assert (!observed = 2);
+    assert (Worker.poll worker = Ok Adapter.Not_ready)) [ false; true ]
+
 (** Runs all native worker adapter assertions. *)
 let () =
+  test_terminated_child_recovery ();
   test_accepted_completion_exception_never_reexecutes ();
   test_defect_discards_commands_and_reconstructs ();
   test_output_encoder_failure_is_task_failure ();

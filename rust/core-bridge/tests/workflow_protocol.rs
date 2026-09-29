@@ -112,6 +112,7 @@ fn accepts_and_normalizes_workflow_activations() {
         "start-metadata",
         "child-initialize",
         "child-resolution",
+        "child-terminated",
         "child-cancellation-before-start",
         "patch-activation",
         "reset-activation",
@@ -3125,6 +3126,45 @@ fn failure_with_info(info: workflow_protocol::FailureInfo) -> workflow_protocol:
         encoded_attributes: None,
         cause: None,
         info,
+    }
+}
+
+/// Termination retains identity through JSON and official Core conversion;
+/// unrepresented fields and out-of-bounds identities remain invalid.
+#[test]
+fn termination_failure_is_lossless_and_strict() {
+    for identity in ["", "operator"] {
+        let completion = workflow_protocol::Completion {
+            run_id: "terminated-run".to_owned(),
+            task_failure: None,
+            commands: vec![workflow_protocol::CompletionCommand::FailWorkflow {
+                failure: failure_with_info(workflow_protocol::FailureInfo::Terminated {
+                    identity: identity.to_owned(),
+                }),
+            }],
+        };
+        let encoded = workflow_protocol::encode_completion(&completion).unwrap();
+        assert_eq!(
+            workflow_protocol::decode_completion(&encoded).unwrap(),
+            completion
+        );
+        let core = workflow_protocol::completion_to_core(&completion).unwrap();
+        assert_eq!(
+            workflow_protocol::completion_from_core(&core).unwrap(),
+            completion
+        );
+
+        let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        for malformed in [
+            serde_json::json!({"kind": "terminated"}),
+            serde_json::json!({"kind": "terminated", "identity": null}),
+            serde_json::json!({"kind": "terminated", "identity": "", "details": []}),
+            serde_json::json!({"kind": "terminated", "identity": "i".repeat(65_537)}),
+        ] {
+            let mut invalid = value.clone();
+            invalid["commands"][0]["failure"]["info"] = malformed;
+            assert!(workflow_protocol::decode_completion(&invalid.to_string()).is_err());
+        }
     }
 }
 

@@ -45,6 +45,15 @@
         {
           "type": "object",
           "additionalProperties": false,
+          "required": ["kind", "identity"],
+          "properties": {
+            "kind": {"const": "terminated"},
+            "identity": {"type": "string", "maxLength": 65536}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
           "required": ["kind", "scheduled_event_id", "started_event_id", "identity", "activity_type", "activity_id", "retry_state"],
           "properties": {
             "kind": {"const": "activity"},

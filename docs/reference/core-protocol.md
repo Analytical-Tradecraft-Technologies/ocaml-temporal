@@ -457,11 +457,15 @@ timestamps allow signed seconds with the same nanosecond range. Payload metadata
 and initialization header maps normalize keys lexicographically on both sides.
 Payload values preserve opaque data and metadata bytes using the canonical
 base64 wrapper. Supported structured failures are application, cancellation,
-activity, child-workflow, and timeout failures, including recursive causes,
+termination, activity, child-workflow, and timeout failures, including recursive causes,
 child execution identity, event IDs, and retry state. A timeout failure keeps
 Core's exact `timeout_type` (`unspecified`, `start_to_close`,
 `schedule_to_start`, `schedule_to_close`, or `heartbeat`) and the ordered
-`last_heartbeat_details` payload list. Unknown
+`last_heartbeat_details` payload list. A termination cause uses
+`{"kind":"terminated","identity":"..."}`; its identity is bounded text and
+may be empty, as in Core's child-termination result. Termination is preserved
+through nested child failures so the parent receives a typed child-workflow
+error instead of a bridge rejection. Unknown
 protobuf oneofs, enum values, external payload references, unsupported failure
 variants, or omitted Core fields with non-default values fail conversion.
 
