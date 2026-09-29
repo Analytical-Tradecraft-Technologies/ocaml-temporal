@@ -1,6 +1,7 @@
 (tests
  (names
   test_activation
+  test_handler_teardown
   test_native_execution
   test_native_activity_execution
   test_native_async_activity

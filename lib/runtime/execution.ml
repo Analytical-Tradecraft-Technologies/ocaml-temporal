@@ -548,6 +548,8 @@ let process_job execution = function
                 in
                 let dispatched =
                   try handler.dispatch ~run_validator ~on_validated update with
+                | Scheduler.Workflow_aborted as exn -> raise exn
+                | Future_store.Scheduler_shutdown as exn -> raise exn
                 | exn ->
                     Error
                       (Temporal_base.Error.defect
