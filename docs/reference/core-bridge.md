@@ -146,6 +146,15 @@ the namespace, workflow ID, and run ID allocated by Temporal. Both request and
 response are strictly decoded, re-encoded, and reparsed before crossing the
 boundary.
 
+Starts invoke `WorkflowService` on Core's `Connection`, which applies Core's
+retry policy to transient transport failures. Calling the connection's
+underlying `workflow_service()` stub bypasses that policy. Retries preserve
+the entire request, including `request_id`, and share the existing ten-second
+overall deadline. A definitive rejection remains terminal; an unanswered
+request remains uncertain when the deadline expires. Callback-transport tests
+under `tests/support/client_start.rs` cover recovery, request identity,
+non-retryable rejection, and cancellation of a hung request.
+
 The wait request names `namespace`, `workflow_id`, and one concrete `run_id`.
 There is no `follow_runs` escape hatch in the document: the operation always
 uses a close-event history long poll for that exact run, but each native call
