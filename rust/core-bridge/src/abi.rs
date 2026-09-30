@@ -4062,6 +4062,10 @@ mod rejection_tests;
 mod persistent_client_wait_tests;
 
 #[cfg(test)]
+#[path = "../tests/support/client_start.rs"]
+mod client_start_retry_tests;
+
+#[cfg(test)]
 mod async_activity_error_tests {
     use super::{STATUS_CONNECTION, STATUS_INVALID_STATE, async_activity_failure};
     use temporalio_client::{errors::AsyncActivityError, tonic::Status};
