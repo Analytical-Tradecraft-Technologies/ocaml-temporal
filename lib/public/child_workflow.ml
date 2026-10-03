@@ -14,6 +14,12 @@ type cancellation_type =
   | Abandon
   | Wait_cancellation_requested
 
+(** The server action when a parent closes, distinct from explicit cancellation. *)
+module Parent_close_policy = struct
+  (** [Abandon] lets the child continue independently after parent closure. *)
+  type t = Terminate | Abandon | Request_cancel
+end
+
 (** Couples a typed child result future with the only cancellation operation
     that may target its private sequence. The record is hidden by the public
     interface so callers cannot forge a sequence number. *)
@@ -83,6 +89,24 @@ let runtime_cancellation_type = function
   | Wait_cancellation_requested ->
       Temporal_sdk_kernel.Activation.Child_wait_cancellation_requested
 
+(** Maps the explicit parent-close policy at the private runtime boundary. *)
+let runtime_parent_close_policy = function
+  | Parent_close_policy.Terminate -> Temporal_sdk_kernel.Activation.Parent_terminate
+  | Parent_close_policy.Abandon -> Temporal_sdk_kernel.Activation.Parent_abandon
+  | Parent_close_policy.Request_cancel -> Temporal_sdk_kernel.Activation.Parent_request_cancel
+
+(** Validates optional routing before allocating a durable command sequence. *)
+let validate_task_queue = function
+  | None -> Ok ()
+  | Some queue ->
+      if String.equal queue "" || String.contains queue '\000'
+         || String.length queue > max_id_utf_8_bytes
+         || not (Temporal_base.Codec.valid_utf_8 queue) then
+        Error
+          (Error.defect
+             ~message:"child workflow task queue must be a non-empty UTF-8 identifier of at most 65536 bytes without NUL")
+      else Ok ()
+
 (** Builds a handle for a request that failed before a child command could be
     emitted. The future is ready and cancellation returns the same typed
     defect, so invalid lifecycle requests cannot leave hidden state. *)
@@ -99,9 +123,9 @@ let check_scope = function
 (** Validates durable identity and encodes input before allocating a private
     sequence number. Consequently invalid requests cannot change command order
     or appear in replay history. *)
-let start_handle ?scope ?(cancellation_type = Try_cancel) ?retry_policy ~id
-    definition input =
-  match check_scope scope with
+let start_handle ?scope ?(cancellation_type = Try_cancel) ?retry_policy
+    ?task_queue ?parent_close_policy ~id definition input =
+  match Result.bind (validate_task_queue task_queue) (fun () -> check_scope scope) with
   | Error error -> failed_handle error
   | Ok () ->
       match validate_id id with
@@ -118,7 +142,8 @@ let start_handle ?scope ?(cancellation_type = Try_cancel) ?retry_policy ~id
               | Some context ->
                   let future, cancel =
                     Temporal_sdk_kernel.Workflow_context_store.start_child_workflow
-                      context ~id ~name:(Workflow.name definition) ~input
+                      context ~id ~name:(Workflow.name definition) ~input ?task_queue
+                      ?parent_close_policy:(Option.map runtime_parent_close_policy parent_close_policy)
                       ?retry_policy:
                         (Option.map Retry_policy_private.to_runtime retry_policy)
                       ~cancellation_type:
@@ -159,12 +184,16 @@ let cancel ?(reason = "cancelled by workflow") handle = handle.cancel ~reason
 
 (** Starts a child workflow and returns only its future. Callers that need to
     cancel explicitly should retain the handle returned by [start_handle]. *)
-let start ?scope ?cancellation_type ?retry_policy ~id definition input =
+let start ?scope ?cancellation_type ?retry_policy ?task_queue ?parent_close_policy
+    ~id definition input =
   future
-    (start_handle ?scope ?cancellation_type ?retry_policy ~id definition input)
+    (start_handle ?scope ?cancellation_type ?retry_policy ?task_queue
+       ?parent_close_policy ~id definition input)
 
 (** Implements the direct-style child call as start followed by an effect-backed
     wait. Expected child and codec failures remain explicit [result] values. *)
-let execute ?scope ?cancellation_type ?retry_policy ~id definition input =
+let execute ?scope ?cancellation_type ?retry_policy ?task_queue ?parent_close_policy
+    ~id definition input =
   Future.await
-    (start ?scope ?cancellation_type ?retry_policy ~id definition input)
+    (start ?scope ?cancellation_type ?retry_policy ?task_queue
+       ?parent_close_policy ~id definition input)

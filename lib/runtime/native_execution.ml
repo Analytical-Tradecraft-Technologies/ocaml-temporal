@@ -1025,10 +1025,15 @@ let command_to_protocol command =
                cancellation_type = protocol_cancellation_type cancellation_type;
              })
   | Activation.Start_child_workflow
-      { seq; id; name; input; retry_policy; cancellation_type } ->
+      { seq; id; name; input; retry_policy; cancellation_type; task_queue; parent_close_policy } ->
       let* () = validate_sequence "$.command.seq" seq in
       let* () = validate_identifier "$.command.id" id in
       let* () = validate_identifier "$.command.name" name in
+      let* () = match task_queue with None -> Ok () | Some queue -> validate_identifier "$.command.task_queue" queue in
+      let parent_close_policy = Option.map (function
+        | Activation.Parent_terminate -> Protocol.Parent_terminate
+        | Activation.Parent_abandon -> Protocol.Parent_abandon
+        | Activation.Parent_request_cancel -> Protocol.Parent_request_cancel) parent_close_policy in
       let* input = protocol_payload "$.command.input" input in
       let* retry_policy =
         match retry_policy with
@@ -1067,6 +1072,7 @@ let command_to_protocol command =
              seq;
              workflow_id = id;
              workflow_type = name;
+             task_queue; parent_close_policy;
              input = [ input ];
              retry_policy;
              cancellation_type = protocol_child_cancellation_type cancellation_type;

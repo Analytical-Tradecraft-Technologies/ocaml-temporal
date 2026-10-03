@@ -628,6 +628,18 @@ pub enum ChildWorkflowCancellationType {
     WaitCancellationRequested,
 }
 
+/// Server action when the parent closes, independent of explicit cancellation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChildWorkflowParentClosePolicy {
+    /// Terminate the child when its parent closes.
+    Terminate,
+    /// Leave the child running independently.
+    Abandon,
+    /// Request cancellation without waiting for the child to accept it.
+    RequestCancel,
+}
+
 /// Retry policy supplied with one scheduled activity.
 ///
 /// The coefficient remains an unsigned decimal rendering of its IEEE-754
@@ -706,6 +718,10 @@ pub enum CompletionCommand {
     /// code.
     StartChildWorkflow {
         seq: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task_queue: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_close_policy: Option<ChildWorkflowParentClosePolicy>,
         workflow_id: String,
         workflow_type: String,
         input: Vec<Payload>,
@@ -1656,6 +1672,7 @@ fn validate_completion(value: &Completion) -> Result<(), ProtocolError> {
                 }
             }
             CompletionCommand::StartChildWorkflow {
+                task_queue,
                 workflow_id,
                 workflow_type,
                 retry_policy,
@@ -1663,6 +1680,9 @@ fn validate_completion(value: &Completion) -> Result<(), ProtocolError> {
             } => {
                 identifier(workflow_id, "$.commands.workflow_id")?;
                 identifier(workflow_type, "$.commands.workflow_type")?;
+                if let Some(task_queue) = task_queue {
+                    identifier(task_queue, "$.commands.task_queue")?;
+                }
                 if let Some(retry_policy) = retry_policy {
                     validate_retry_policy(retry_policy, "$.commands.retry_policy")?;
                 }
@@ -3039,6 +3059,32 @@ fn child_cancellation_from_core(
     )
 }
 
+/// Maps a parent-close policy without merging it with child cancellation semantics.
+fn parent_close_to_core(value: Option<ChildWorkflowParentClosePolicy>) -> i32 {
+    use core_child_workflow::ParentClosePolicy as Core;
+    i32::from(match value {
+        None => Core::Unspecified,
+        Some(ChildWorkflowParentClosePolicy::Terminate) => Core::Terminate,
+        Some(ChildWorkflowParentClosePolicy::Abandon) => Core::Abandon,
+        Some(ChildWorkflowParentClosePolicy::RequestCancel) => Core::RequestCancel,
+    })
+}
+
+/// Rejects unknown Core policy numbers and preserves an unspecified server default.
+fn parent_close_from_core(
+    value: i32,
+) -> Result<Option<ChildWorkflowParentClosePolicy>, CoreConversionError> {
+    use core_child_workflow::ParentClosePolicy as Core;
+    Ok(
+        match Core::try_from(value).map_err(|_| invalid_core("unknown Core parent close policy"))? {
+            Core::Unspecified => None,
+            Core::Terminate => Some(ChildWorkflowParentClosePolicy::Terminate),
+            Core::Abandon => Some(ChildWorkflowParentClosePolicy::Abandon),
+            Core::RequestCancel => Some(ChildWorkflowParentClosePolicy::RequestCancel),
+        },
+    )
+}
+
 /// Builds one official Core command with unsupported optional fields defaulted explicitly.
 fn command_to_core(
     value: &CompletionCommand,
@@ -3131,6 +3177,8 @@ fn command_to_core(
             })
         }
         CompletionCommand::StartChildWorkflow {
+            task_queue,
+            parent_close_policy,
             seq,
             workflow_id,
             workflow_type,
@@ -3139,6 +3187,8 @@ fn command_to_core(
             cancellation_type,
         } => Variant::StartChildWorkflowExecution(core_commands::StartChildWorkflowExecution {
             seq: *seq,
+            task_queue: task_queue.clone().unwrap_or_default(),
+            parent_close_policy: parent_close_to_core(*parent_close_policy),
             workflow_id: workflow_id.clone(),
             workflow_type: workflow_type.clone(),
             input: input
@@ -3155,7 +3205,7 @@ fn command_to_core(
             // helper intentionally leaves it at Core's default for isolated
             // protocol round-trip tests; it is never submitted to a worker.
             namespace: child_workflow_namespace.unwrap_or_default().to_owned(),
-            // Task queue, timeouts, and the other child options remain at Core
+            // Timeouts and the other child options remain at Core
             // defaults until they have a stable public representation.
             ..Default::default()
         }),
@@ -3430,11 +3480,9 @@ fn command_from_core(
         }
         Variant::StartChildWorkflowExecution(value) => {
             if !value.namespace.is_empty()
-                || !value.task_queue.is_empty()
                 || value.workflow_execution_timeout.is_some()
                 || value.workflow_run_timeout.is_some()
                 || value.workflow_task_timeout.is_some()
-                || value.parent_close_policy != 0
                 || value.workflow_id_reuse_policy != 0
                 || !value.cron_schedule.is_empty()
                 || !value.headers.is_empty()
@@ -3449,6 +3497,12 @@ fn command_from_core(
             }
             Ok(CompletionCommand::StartChildWorkflow {
                 seq: value.seq,
+                task_queue: if value.task_queue.is_empty() {
+                    None
+                } else {
+                    Some(value.task_queue.clone())
+                },
+                parent_close_policy: parent_close_from_core(value.parent_close_policy)?,
                 workflow_id: value.workflow_id.clone(),
                 workflow_type: value.workflow_type.clone(),
                 input: value

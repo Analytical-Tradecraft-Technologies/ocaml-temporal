@@ -119,6 +119,26 @@ natural child completion or a failed child start. The child's own retry policy
 still belongs to the child-start command; cancelling the parent handle does
 not convert a retryable child failure into an application retry loop.
 
+### Routing and parent closure
+
+`Child_workflow.start`, `start_handle`, and `execute` accept `~task_queue` to
+route a child to a different worker, including a worker implemented by another
+SDK. Omission inherits the parent queue. Empty, malformed UTF-8, NUL-containing,
+and oversized queues are rejected before input encoding or command allocation.
+
+`~parent_close_policy:Child_workflow.Parent_close_policy.Abandon` asks the
+server to leave an accepted child running when its parent closes. `Terminate`
+and `Request_cancel` select the other explicit policies; omission retains the
+server default. Parent-close policy is independent of `~cancellation_type`,
+which controls an explicit cancellation request made through a child handle or
+scope. These options do not expose a child-start acknowledgement: callers that
+close a parent immediately after scheduling must not assume the child has
+already been accepted by the server.
+
+The deterministic runtime and bilateral bridge tests cover all three policies,
+queue validation, default compatibility, and lossless Core conversion. This
+coverage does not claim a live cross-queue server acceptance test.
+
 ## Choosing the right mechanism
 
 These mechanisms affect different owners:

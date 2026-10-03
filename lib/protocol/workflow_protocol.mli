@@ -321,6 +321,13 @@ type activity_cancellation_type =
   | Wait_cancellation_completed
   | Abandon
 
+(** The server action when a parent closes, independent of explicit cancellation.
+    An absent policy preserves the server default. *)
+type child_workflow_parent_close_policy =
+  | Parent_terminate
+  | Parent_abandon
+  | Parent_request_cancel
+
 (** Controls how Core reports a child-workflow cancellation request to the
     parent.  The policy is part of the command so replay sees the same
     cancellation semantics on every activation. *)
@@ -382,6 +389,8 @@ type completion_command =
       [retry_policy] is optional because Core's default policy remains valid
       when callers do not configure retries. *)
   | Start_child_workflow of {
+      task_queue : string option;
+      parent_close_policy : child_workflow_parent_close_policy option;
       seq : int64;
       workflow_id : string;
       workflow_type : string;

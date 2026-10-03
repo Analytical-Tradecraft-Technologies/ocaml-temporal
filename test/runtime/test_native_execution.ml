@@ -1457,7 +1457,7 @@ let test_activity_command_translation_and_validation () =
     unwrap "child command translation"
       (Native_execution.command_to_protocol
          (Activation.Start_child_workflow
-            {
+            { task_queue = None; parent_close_policy = None;
               seq = 2L;
               id = "child/1";
               name = "child";
@@ -1467,7 +1467,7 @@ let test_activity_command_translation_and_validation () =
             }))
   with
   | Protocol.Start_child_workflow
-      {
+      { task_queue = None; parent_close_policy = None;
         seq = 2L;
         workflow_id = "child/1";
         workflow_type = "child";

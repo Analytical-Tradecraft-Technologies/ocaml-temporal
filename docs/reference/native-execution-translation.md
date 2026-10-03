@@ -156,7 +156,10 @@ is a programmer configuration defect rather than an operational workflow failure
 These errors are a planned compatibility boundary, not a hidden drop path.
 Activity scheduling and child lifecycle translation are enabled because the
 runtime, protocol, and translator carry every field currently exposed by the
-OCaml API, including child retry policy. Future child options remain explicit
+OCaml API, including child retry policy, optional task queue, and optional
+parent-close policy. Explicit queues are validated before sequence allocation
+and again at translation; parent-close policies remain distinct from explicit
+child cancellation. Future child options remain explicit
 Core defaults until the public OCaml surface models them; a non-default Core
 value is still rejected rather than silently discarded.
 

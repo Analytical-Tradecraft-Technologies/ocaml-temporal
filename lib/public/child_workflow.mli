@@ -9,6 +9,14 @@ type cancellation_type =
   | Abandon
   | Wait_cancellation_requested
 
+(** The server action when this child's parent closes. This differs from the
+    cancellation type, which controls an explicit child cancellation request. *)
+module Parent_close_policy : sig
+  (** [Abandon] preserves a child after parent closure; the other policies ask
+      the server to terminate or request cancellation of it. *)
+  type t = Terminate | Abandon | Request_cancel
+end
+
 (** An opaque typed child operation. The handle owns the result future and can
     emit one deterministic cancellation command for that exact child. *)
 type 'output handle
@@ -23,11 +31,17 @@ type 'output handle
     detached calls return ready failed handles, so no command or sequence
     number is created. When [scope] is supplied, cancelling it emits the
     child's Core cancellation command with the stable default reason
-    ["cancelled by workflow"]. *)
+    ["cancelled by workflow"]. [task_queue] routes the child to another worker;
+    omission inherits the parent's queue. A supplied queue must be a non-empty
+    UTF-8 identifier of at most 65,536 bytes without NUL. [parent_close_policy]
+    controls the server action after parent closure; omission keeps the server
+    default. Choose [Parent_close_policy.Abandon] for independently paid work. *)
 val start_handle :
   ?scope:Scope.t ->
   ?cancellation_type:cancellation_type ->
   ?retry_policy:Activity.Retry_policy.t ->
+  ?task_queue:string ->
+  ?parent_close_policy:Parent_close_policy.t ->
   id:string ->
   ('input, 'output) Workflow.t ->
   'input ->
@@ -59,6 +73,8 @@ val start :
   ?scope:Scope.t ->
   ?cancellation_type:cancellation_type ->
   ?retry_policy:Activity.Retry_policy.t ->
+  ?task_queue:string ->
+  ?parent_close_policy:Parent_close_policy.t ->
   id:string ->
   ('input, 'output) Workflow.t ->
   'input ->
@@ -73,6 +89,8 @@ val execute :
   ?scope:Scope.t ->
   ?cancellation_type:cancellation_type ->
   ?retry_policy:Activity.Retry_policy.t ->
+  ?task_queue:string ->
+  ?parent_close_policy:Parent_close_policy.t ->
   id:string ->
   ('input, 'output) Workflow.t ->
   'input ->

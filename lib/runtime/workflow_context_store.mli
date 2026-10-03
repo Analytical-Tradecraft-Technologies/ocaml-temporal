@@ -226,6 +226,8 @@ val start_child_workflow :
   name:string ->
   input:Temporal_base.Codec.payload ->
   ?retry_policy:Activation.retry_policy ->
+  ?task_queue:string ->
+  ?parent_close_policy:Activation.child_workflow_parent_close_policy ->
   ?cancellation_type:Activation.child_workflow_cancellation_type ->
   decode:(Temporal_base.Codec.payload -> ('output, Temporal_base.Error.t) result) ->
   unit ->

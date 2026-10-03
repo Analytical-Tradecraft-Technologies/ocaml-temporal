@@ -48,6 +48,8 @@ fn child_completion(policy: Option<RetryPolicy>) -> Completion {
         task_failure: None,
         run_id: "run-child".to_owned(),
         commands: vec![CompletionCommand::StartChildWorkflow {
+            task_queue: None,
+            parent_close_policy: None,
             seq: 2,
             workflow_id: "child-1".to_owned(),
             workflow_type: "example.child".to_owned(),

@@ -692,7 +692,7 @@ let schedule_local_activity context ~name ~input ?activity_id
     into the command for Core's durable retry state machine; the private [seq]
     only correlates Core completion jobs with this in-memory execution. *)
 let start_child_workflow context ~id ~name ~input
-    ?retry_policy ?(cancellation_type = Activation.Child_try_cancel) ~decode () =
+    ?retry_policy ?task_queue ?parent_close_policy ?(cancellation_type = Activation.Child_try_cancel) ~decode () =
   let seq = allocate_sequence context in
   (* Keep this bit in the handle closure rather than in the pending table so a
     repeated cancel remains idempotent even after Core has removed the child
@@ -726,7 +726,7 @@ let start_child_workflow context ~id ~name ~input
     };
   emit context
     (Activation.Start_child_workflow
-       { seq; id; name; input; retry_policy; cancellation_type });
+       { seq; id; name; input; retry_policy; cancellation_type; task_queue; parent_close_policy });
   let cancel ~reason =
     match current () with
     | Some current when current == context ->

@@ -285,6 +285,13 @@ type activity_cancellation_type =
   | Wait_cancellation_completed
   | Abandon
 
+(** The server action when a parent closes, independent of explicit cancellation.
+    An absent policy preserves the server default. *)
+type child_workflow_parent_close_policy =
+  | Parent_terminate
+  | Parent_abandon
+  | Parent_request_cancel
+
 (** Controls how Core reports a child-workflow cancellation request to the
     parent.  The policy is part of the command so replay sees the same
     cancellation semantics on every activation. *)
@@ -341,6 +348,8 @@ type completion_command =
       cancellation_type : activity_cancellation_type;
     }
   | Start_child_workflow of {
+      task_queue : string option;
+      parent_close_policy : child_workflow_parent_close_policy option;
       seq : int64;
       workflow_id : string;
       workflow_type : string;
@@ -2423,9 +2432,12 @@ let completion_command path json =
                cancellation_type;
              })
   | "start_child_workflow" ->
+      let optional_fields = match json with
+        | `Assoc entries -> List.filter (fun name -> List.mem_assoc name entries) ["task_queue"; "parent_close_policy"]
+        | _ -> [] in
       let* entries =
         exact_object path
-          [
+          ([
             "kind";
             "seq";
             "workflow_id";
@@ -2433,7 +2445,7 @@ let completion_command path json =
             "input";
             "retry_policy";
             "cancellation_type";
-          ]
+          ] @ optional_fields)
           json
       in
       let* seq_json = field path "seq" entries in
@@ -2442,6 +2454,15 @@ let completion_command path json =
       let* workflow_id = identifier (path ^ ".workflow_id") workflow_id_json in
       let* workflow_type_json = field path "workflow_type" entries in
       let* workflow_type = identifier (path ^ ".workflow_type") workflow_type_json in
+      let* task_queue = match List.assoc_opt "task_queue" entries with
+        | None | Some `Null -> Ok None
+        | Some json -> let* value = identifier (path ^ ".task_queue") json in Ok (Some value) in
+      let* parent_close_policy = match List.assoc_opt "parent_close_policy" entries with
+        | None | Some `Null -> Ok None
+        | Some (`String "terminate") -> Ok (Some Parent_terminate)
+        | Some (`String "abandon") -> Ok (Some Parent_abandon)
+        | Some (`String "request_cancel") -> Ok (Some Parent_request_cancel)
+        | Some _ -> Error (invalid (path ^ ".parent_close_policy") "unknown parent close policy") in
       let* input_json = field path "input" entries in
       let* input = list (path ^ ".input") payload input_json in
       let* retry_policy_json = field path "retry_policy" entries in
@@ -2458,7 +2479,7 @@ let completion_command path json =
       Ok
         (Start_child_workflow
            { seq; workflow_id; workflow_type; input; retry_policy;
-             cancellation_type })
+             cancellation_type; task_queue; parent_close_policy })
   | "cancel_child_workflow" ->
       let* entries = exact_object path [ "kind"; "seq"; "reason" ] json in
       let* seq_json = field path "seq" entries in
@@ -2667,16 +2688,20 @@ let completion_command_json = function
             ("seq", `Intlit (Int64.to_string seq));
           ])
   | Start_child_workflow
-      { seq; workflow_id; workflow_type; input; retry_policy; cancellation_type } ->
+      { seq; workflow_id; workflow_type; input; retry_policy; cancellation_type; task_queue; parent_close_policy } ->
       let* input = payloads_json input in
       let* retry_policy =
         match retry_policy with
         | None -> Ok `Null
         | Some value -> retry_policy_json value
       in
+      let options =
+        (match task_queue with None -> [] | Some value -> ["task_queue", `String value]) @
+        (match parent_close_policy with None -> [] | Some value ->
+          ["parent_close_policy", `String (match value with Parent_terminate -> "terminate" | Parent_abandon -> "abandon" | Parent_request_cancel -> "request_cancel")]) in
       Ok
         (`Assoc
-          [
+          (options @ [
             ("kind", `String "start_child_workflow");
             ("seq", `Intlit (Int64.to_string seq));
             ("workflow_id", `String workflow_id);
@@ -2685,7 +2710,7 @@ let completion_command_json = function
             ("retry_policy", retry_policy);
             ( "cancellation_type",
               `String (child_cancellation_type_string cancellation_type) );
-          ])
+          ]))
   | Cancel_child_workflow { seq; reason } ->
       Ok
         (`Assoc
