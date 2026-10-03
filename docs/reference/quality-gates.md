@@ -83,8 +83,8 @@ There is no cross compilation or paid runner requirement.
 | --- | --- | --- |
 | Linux amd64 | `rust-amd64`, `ubuntu-24.04` | All Linux amd64 OCaml lanes and the live Temporal smoke |
 | Linux arm64 | `rust-arm64`, `ubuntu-24.04-arm` | All Linux arm64 OCaml lanes |
-| macOS ARM64 | Existing native macOS job, `macos-15` | That job's OCaml/C build and tests |
-| Windows x64 GNU | Existing native Windows job, `windows-latest` | That job's OCaml/C build and tests |
+| macOS ARM64 | `rust-macos`, `macos-15` | All macOS OCaml lanes |
+| Windows x64 GNU | `rust-windows`, `windows-latest` | All Windows OCaml lanes |
 
 On a cache miss the producer checks the pinned toolchain, Rust formatting,
 Clippy with warnings denied, and the complete locked Rust test suite before
@@ -121,16 +121,18 @@ master: GitHub scopes PR caches to their merge ref. Cache eviction or a new
 native runner image also causes a normal rebuild. Live dependency-advisory and
 license checks continue independently on every applicable workflow run.
 
-Linux producers upload their bundles as one-day Actions artifacts for fanout;
-native desktop jobs consume their bundles in place and avoid another upload.
+All four producers upload their verified bundles as 90-day Actions artifacts.
 Each OCaml lane still compiles the private C stubs, examples, OCaml libraries,
-and tests and runs the installation/public API checks. Linux also retains the
-sanitized C ABI harness. Every live worker/driver inherits the same bundle,
-including controllers with separate Dune build directories. PR path filters,
-existing check names, the exhaustive scheduled matrix, and the seven live smoke
-controllers remain unchanged. A cold scheduled run compiles Rust four times
-instead of eleven; cache hits eliminate those Rust compilations too. Artifact
-transfer, OCaml/C compilation, linking, and tests still consume runner time.
+and tests and runs the installation/public API checks. Each lane packages its
+compiled SDK and links/runs an independent relocated consumer before uploading
+the SDK. Compatible downstream applications can use these libraries without
+recompilation; see [precompiled OCaml SDKs](prebuilt-ocaml.md). Linux also retains
+the sanitized C ABI harness. One Linux amd64/5.5.1 producer compiles the live
+smoke programs; the downstream Temporal/PostgreSQL job runs those verified
+executables without compiling them again. A cold run compiles Rust four times;
+cache hits eliminate those Rust compilations too. Artifact transfer, OCaml/C
+compilation in the producer lanes, application linking, and tests still consume
+runner time.
 
 For local Linux production and consumption on the same architecture:
 

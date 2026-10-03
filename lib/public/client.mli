@@ -95,7 +95,15 @@ val create :
     [search_attributes] attaches named indexed payloads used by visibility
     queries. Keys in both collections are non-empty, valid UTF-8, NUL-free, at
     most 65,536 bytes, and unique within their respective collection. Payload
-    values are encoded before the native bridge is called. *)
+    values are encoded before the native bridge is called. Search attributes
+    must be registered in the namespace with matching server types. Workers
+    can read the recorded values through [Workflow.start_metadata].
+
+    This client does not expose cron schedules, delayed starts, or workflow
+    execution/run/task timeout options yet. OCaml workers reject cron and
+    nonzero root start delay; do not start those policies from another SDK on
+    a queue served by this worker. Server-applied workflow/retry continuation
+    backoff, timeouts, and execution expiration metadata are preserved. *)
 val start :
   t ->
   ?request_id:string ->

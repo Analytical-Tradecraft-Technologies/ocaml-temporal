@@ -1,4 +1,6 @@
 (lang dune 3.18)
+; Generated MinGW import libraries are installed as a relocatable directory.
+(using directory-targets 0.1)
 (name temporal-sdk)
 (generate_opam_files false)
 (source (github Analytical-Tradecraft-Technologies/ocaml-temporal))

@@ -85,9 +85,19 @@ The four handle methods are typed and return `(unit, Error.t) result`:
 All payloads and task tokens are copied before crossing a boundary. The
 handle's private state allows one operation at a time and rejects a different
 operation while a retryable request remains in flight or unresolved. Terminal
-state is retired only after native acceptance. On the native worker path, an
-operation key is retained after a failed submission only when the supervisor
-explicitly classifies the failure as retryable; the current bilateral policy
+state is retired after native acceptance or a terminal native rejection. The
+adapter validates each complete request through the strict activity-protocol
+encoder before calling the supervisor, including metadata uniqueness and size
+limits. For a new request, local codec or payload validation failures preserve
+the handle and its asynchronous lease, and release the invalid operation key.
+The caller may then submit corrected data or choose a different operation;
+shutdown still reports the outstanding lease until a terminal operation completes.
+If an earlier submission is still uncertain, a local rejection of its retry
+cannot clear the original operation key or allow a conflicting request.
+
+On the native worker path, an operation key is retained after a failed
+submission only when the supervisor explicitly classifies the failure as
+retryable; the current bilateral policy
 uses the dedicated `Retryable` bridge status for that classification. Generic
 `Connection` failures, `NotFound`, and other non-retryable bridge failures
 close the handle and remove the pending operation because they do not prove
@@ -174,6 +184,17 @@ Before constructing the context, the adapter validates the server timeout: it
 rejects negative, sub-millisecond, or out-of-range values instead of rounding
 or overflowing them. An accepted timeout is therefore exposed as an exact
 whole-millisecond `Duration.t`.
+
+Heartbeat-context conversion failures follow the same task-rejection path as
+input codec failures, for both synchronous and asynchronous definitions. For
+example, binary heartbeat metadata which cannot be represented by runtime
+strings, or a sub-millisecond timeout, produces a bounded non-retryable failure
+for the exact leased token without invoking the callback. The adapter retains
+that validated failure until native acknowledgement, so a transient submission
+failure remains visible to polling and shutdown drain. Once acknowledged,
+unrelated queued activities can run normally. The deterministic adapter tests
+cover both context failures, both definition styles, and unchanged completion
+retries through polling and drain.
 
 The context is valid only while its activity attempt is executing. The adapter
 invalidates it before returning from dispatch, including exceptional and

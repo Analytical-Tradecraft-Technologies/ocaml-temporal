@@ -141,7 +141,11 @@ val implementation_async :
   ('input, 'output) t ->
   ('input, 'output) async_implementation option
 
-(** Operations on the opaque asynchronous completion capability. *)
+(** Operations on the opaque asynchronous completion capability. A local
+    codec or payload-validation error leaves the handle active, so the caller
+    may correct the data or choose a different operation. Once submitted,
+    explicitly retryable native failures permit only the identical request;
+    terminal native failures close the handle. *)
 module Async_handle : sig
   (** The handle type paired with one asynchronous activity output. *)
   type 'output t = 'output async_handle

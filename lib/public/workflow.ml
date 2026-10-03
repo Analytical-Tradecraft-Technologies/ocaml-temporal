@@ -117,6 +117,15 @@ let validate_external_target ~workflow_id ~run_id =
   | Error _ as error -> error
   | Ok () -> validate_optional "external run id" run_id
 
+(** Returns a local operation failure on the current workflow's scheduler.
+    Retaining that owner and its suspension gate lets ready errors compose
+    with both ready and pending workflow futures without a false ownership
+    defect. Resolving this private future emits no command or durable sequence. *)
+let failed_external_operation context error =
+  Future_private.of_internal
+    (Temporal_sdk_kernel.Workflow_context_store.resolved context
+       (Error (Error_private.to_base error)))
+
 (** Sends a typed signal to another workflow execution. The returned future
     suspends the current workflow until Core reports delivery or a structured
     failure; it does not perform nondeterministic network I/O itself. *)
@@ -130,12 +139,11 @@ let signal_external_workflow ~workflow_id ~run_id ~(signal : 'input Signal.t)
   | Some context -> (
       match validate_external_target ~workflow_id ~run_id with
       | Error error ->
-          Future_private.resolved ~outside_error (Error error)
+          failed_external_operation context error
       | Ok () -> (
           match Codec_private.encode_base (Signal.input signal) input with
           | Error error ->
-              Future_private.resolved ~outside_error
-                (Error (Error_private.of_base error))
+              failed_external_operation context (Error_private.of_base error)
           | Ok payload ->
               let future =
                 Temporal_sdk_kernel.Workflow_context_store.signal_external_workflow
@@ -156,19 +164,19 @@ let cancel_external_workflow ~workflow_id ~run_id ~reason =
   | Some context -> (
       match validate_external_target ~workflow_id ~run_id with
       | Error error ->
-          Future_private.resolved ~outside_error (Error error)
+          failed_external_operation context error
       | Ok () when String.equal reason "" ->
-          Future_private.resolved ~outside_error
-            (Error (Error.defect ~message:"external cancellation reason must not be empty"))
+          failed_external_operation context
+            (Error.defect ~message:"external cancellation reason must not be empty")
       | Ok () when String.contains reason '\000' ->
-          Future_private.resolved ~outside_error
-            (Error (Error.defect ~message:"external cancellation reason must not contain NUL"))
+          failed_external_operation context
+            (Error.defect ~message:"external cancellation reason must not contain NUL")
       | Ok () when String.length reason > max_name_bytes ->
-          Future_private.resolved ~outside_error
-            (Error (Error.defect ~message:"external cancellation reason exceeds 65536 bytes"))
+          failed_external_operation context
+            (Error.defect ~message:"external cancellation reason exceeds 65536 bytes")
       | Ok () when not (Temporal_base.Codec.valid_utf_8 reason) ->
-          Future_private.resolved ~outside_error
-            (Error (Error.defect ~message:"external cancellation reason must be valid UTF-8"))
+          failed_external_operation context
+            (Error.defect ~message:"external cancellation reason must be valid UTF-8")
       | Ok () ->
           Future_private.of_internal
             (Temporal_sdk_kernel.Workflow_context_store.cancel_external_workflow
@@ -313,3 +321,32 @@ let continue_as_new definition next_input =
       | Error error ->
           Temporal_sdk_kernel.Workflow_context_store.terminate context
             (Temporal_sdk_kernel.Activation.Fail_workflow error))
+
+(** Independently owned metadata observed on the run's durable start event. *)
+type start_metadata = {
+  memo : (string * Payload.t) list option;
+  search_attributes : (string * Payload.t) list option;
+  execution_expiration_time : Time.t option;
+}
+
+(** Converts the retained exact expiration timestamp to public time without
+    changing the server-owned deadline or scheduling a workflow command. *)
+let start_metadata () =
+  match Temporal_sdk_kernel.Workflow_context_store.current () with
+  | None -> Error (Error.defect
+      ~message:"Temporal.Workflow.start_metadata used outside a workflow execution")
+  | Some context ->
+      match Temporal_sdk_kernel.Workflow_context_store.start_metadata context with
+      | None -> Error (Error.defect
+          ~message:"Temporal.Workflow.start_metadata is unavailable for this execution")
+      | Some metadata ->
+          let expiration = match metadata.execution_expiration_time with
+            | None -> Ok None
+            | Some time ->
+                Result.map Option.some
+                  (Time.of_unix ~seconds:time.seconds ~nanoseconds:time.nanoseconds)
+          in
+          Result.map (fun execution_expiration_time ->
+            { memo = Option.map (List.map (fun (key, value) -> (key, Payload_private.of_base value))) metadata.memo;
+              search_attributes = Option.map (List.map (fun (key, value) -> (key, Payload_private.of_base value))) metadata.search_attributes;
+              execution_expiration_time }) expiration

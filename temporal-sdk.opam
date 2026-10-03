@@ -1,6 +1,6 @@
 opam-version: "2.0"
 name: "temporal-sdk"
-version: "~dev"
+version: "0.1.0~rc.1"
 synopsis: "Experimental Temporal workflows in modern OCaml"
 description: "An experimental typed OCaml 5 workflow SDK backed by Temporal Core"
 maintainer: "Michael Fowlie"

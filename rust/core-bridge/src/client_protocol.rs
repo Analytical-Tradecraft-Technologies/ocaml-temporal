@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Duration;
 use temporalio_client::Connection;
+use temporalio_client::grpc::WorkflowService;
 use temporalio_client::tonic::{Code, IntoRequest, Status};
 use temporalio_common::protos::temporal::api::{
     common::v1::{Memo, Payloads, SearchAttributes, WorkflowExecution, WorkflowType},
@@ -1355,7 +1356,8 @@ pub fn encode_wait_response(
 /// Temporal may have accepted the workflow after the client gave up.
 const START_RPC_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Starts one workflow through Core's raw workflow service trait.
+/// Starts one workflow through Core's retrying connection, retaining the same
+/// request and idempotency key across transport attempts within one deadline.
 pub async fn start_workflow(
     connection: Connection,
     request: StartWorkflowRequest,
@@ -1365,7 +1367,9 @@ pub async fn start_workflow(
     let search_attributes = metadata_to_search_attributes(&request.search_attributes)
         .map_err(ClientOperationError::Core)?;
     let workflow_id = request.workflow_id.clone();
-    let mut service = connection.workflow_service();
+    // Connection owns Core's retry policy; its underlying workflow service
+    // skips that policy and gives up on the first transient transport error.
+    let mut service = connection.clone();
     let response = match tokio::time::timeout(
         START_RPC_TIMEOUT,
         service.start_workflow_execution(

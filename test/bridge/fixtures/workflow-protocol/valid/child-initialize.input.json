@@ -12,7 +12,11 @@
     "attempt": 1,
     "context": {
       "headers": {},
-      "identity": "parent-worker",
+      "memo": null,
+        "search_attributes": null,
+        "first_workflow_task_backoff": null,
+        "workflow_execution_expiration_time": null,
+        "identity": "parent-worker",
       "parent_workflow": {"namespace": "default", "workflow_id": "parent-1", "run_id": "parent-run"},
       "workflow_execution_timeout": null,
       "workflow_run_timeout": null,

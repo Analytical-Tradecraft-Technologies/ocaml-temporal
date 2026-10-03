@@ -60,7 +60,8 @@ module Handler = struct
   (** Decodes and invokes one signal payload, converting callback exceptions to
       non-retryable defects at the same boundary as workflow dispatch. A
       raising codec is contained the same way: user/codec decoders must not
-      escape dispatch half-applied. *)
+      escape dispatch half-applied. Private terminal/shutdown exceptions must
+      reach the scheduler unchanged so teardown cannot invalidate completion. *)
   let dispatch (Handler { definition; implementation }) payload =
     match Codec.decode definition.input payload with
     | result -> (
@@ -68,6 +69,10 @@ module Handler = struct
         | Error error -> Error error
         | Ok input -> (
             try implementation input with
+            | Temporal_sdk_kernel.Scheduler.Workflow_aborted as exception_ ->
+                raise exception_
+            | Temporal_sdk_kernel.Future_store.Scheduler_shutdown as exception_ ->
+                raise exception_
             | exception_ ->
                 Error
                   (Error.defect

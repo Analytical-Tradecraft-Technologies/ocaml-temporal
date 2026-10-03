@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 import time
 
 ROOT = Path(__file__).resolve().parents[4]
@@ -28,10 +29,37 @@ COMPOSE = ["docker", "compose", "--project-directory", str(FIXTURE), "-f",
 BINARY_DIR = "_build/default/test/integration/temporal/task_failure"
 
 
+def diagnostic_text(value):
+    """Decode timeout output, which can remain bytes even in subprocess text mode."""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value or ""
+
+
 def command(args, timeout=120):
-    """Run a bounded command and keep stderr out of parsed machine output."""
-    return subprocess.run(args, cwd=ROOT, text=True, stdout=subprocess.PIPE,
-                          stderr=subprocess.PIPE, check=True, timeout=timeout).stdout
+    """Keep successful stdout parseable; retain failed commands before cleanup."""
+    try:
+        return subprocess.run(args, cwd=ROOT, text=True, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, check=True, timeout=timeout).stdout
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as error:
+        diagnostic = {
+            "argv": [str(arg) for arg in args], "cwd": str(ROOT),
+            "error": f"{type(error).__name__}: {error}",
+            "returncode": getattr(error, "returncode", None), "timeout_seconds": timeout,
+            "stdout": diagnostic_text(getattr(error, "stdout", None)),
+            "stderr": diagnostic_text(getattr(error, "stderr", None)),
+        }
+        # Append so a teardown failure cannot overwrite the original startup
+        # failure. Also print to Actions when no containers ever produced logs.
+        report = json.dumps(diagnostic, ensure_ascii=True)
+        print(f"Task-failure command diagnostic: {report}", file=sys.stderr, flush=True)
+        try:
+            ARTIFACTS.mkdir(parents=True, exist_ok=True)
+            with (ARTIFACTS / "command-failures.jsonl").open("a", encoding="utf-8") as output:
+                output.write(report + "\n")
+        except OSError as logging_error:
+            print(f"Could not retain command diagnostic: {logging_error}", file=sys.stderr)
+        raise
 
 
 def save_json(name, value):
@@ -86,6 +114,18 @@ def running(name):
 def marker(name, producer):
     """A ready file is accepted only while its exact producer still runs."""
     return running(producer) and (ARTIFACTS / name).is_file()
+
+
+def completion_marker(name, producer):
+    """Accept completed results even when the one-shot driver has already exited."""
+    state = json.loads(command(["docker", "inspect", producer]))[0]["State"]
+    # Sample liveness first: a stopped driver has finished publishing. Checking
+    # the file first can miss publication immediately before a successful exit.
+    published = (ARTIFACTS / name).is_file()
+    if not state["Running"]:
+        assert state["ExitCode"] == 0, f"{producer} exited unsuccessfully: {state}"
+        assert published, f"{producer} exited before marker: {state}"
+    return published
 
 
 def stop_worker(generation, container):
@@ -215,8 +255,8 @@ def main():
         corrected = launch("corrected", "corrected_worker")
         processes.append(corrected)
         wait_for(lambda: marker("corrected.ready", corrected), "corrected worker")
-        wait_for(lambda: (ARTIFACTS / "completed.tsv").is_file() or
-                 (running(driver) and False), "same-handle results", seconds=240)
+        wait_for(lambda: completion_marker("completed.tsv", driver),
+                 "same-handle results", seconds=240)
         assert (ARTIFACTS / "accepted.tsv").read_bytes() == (ARTIFACTS / "completed.tsv").read_bytes()
         assert command(["docker", "wait", driver]).strip() == "0"
         for name, workflow_id, run_id in rows:

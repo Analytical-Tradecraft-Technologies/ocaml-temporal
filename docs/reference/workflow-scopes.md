@@ -83,6 +83,30 @@ successful cancellation is idempotent, and it wakes scope waiters. A
 cancellation request that arrives after an operation has already completed
 does not rewrite that result; its hook is simply not registered as live work.
 
+## Completed registrations
+
+Activity and child hooks use `Scope.on_cancel ~until:terminal_future`. Both
+successful and failed terminal results remove the hook, including a rejected
+child start. Custom hooks can use the same optional argument with a future
+owned by the scope's workflow; without it they live until cancellation.
+Cancellation removes the corresponding terminal observer as well. A terminal
+result already visible when cancellation runs suppresses the hook even if its
+cleanup callback is still queued.
+
+`Future.race` and `Future.first` detach their input observers after either a
+successful or failed winner. Removing an observer also suppresses a callback
+already queued for delivery, without cancelling the underlying operation.
+Registration order and the scheduler's FIFO queue continue to decide ties.
+Only outstanding work contributes registrations to a long-lived scope.
+
+The deterministic [retention regression](../../test/runtime/test_scope_retention.ml)
+keeps one scope alive for three batches of 10,000 completed operations and
+measures live OCaml words after full major GC, before cancelling the scope.
+It covers activities, child terminal/start failures, scoped awaits, runtime
+and derived race inputs, duplicate inputs, and inline ready delivery. It uses
+the scheduler after trace removal (#551), with no trace subtraction or cache
+eviction. This establishes language-layer retention, not live server behavior.
+
 ## Lifecycle and ownership
 
 - `Temporal.Scope.create ()` succeeds only while a workflow execution is active

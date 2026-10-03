@@ -85,8 +85,8 @@ let settle store waiter result =
 
 (** Registers a false predicate after the initial evaluation.  Registration and
     suspension happen on the owning scheduler Domain, so no notification can
-    interleave between these operations; the first later activation performs
-    the next predicate evaluation.  Keeping the initial check single-shot is
+    interleave between these operations; the next post-drain notification
+    performs the next predicate evaluation. Keeping registration single-shot is
     important for both deterministic replay and predicates that are costly to
     evaluate. *)
 let register store predicate =

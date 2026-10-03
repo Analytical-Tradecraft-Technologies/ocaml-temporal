@@ -1,6 +1,8 @@
 (tests
  (names
   test_activation
+  test_handler_teardown
+  test_initial_handlers
   test_native_execution
   test_native_activity_execution
   test_native_async_activity
@@ -10,9 +12,11 @@
   test_native_worker_lifecycle
   test_native_worker_execution
   test_scheduler
+  test_future_retention
   test_activity_retry_policy
   test_local_activity_cancellation
   test_scope
+  test_scope_retention
   test_scope_server_cancel
   test_workflow_time
   test_random_seed_reset

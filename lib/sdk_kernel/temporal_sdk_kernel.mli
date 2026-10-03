@@ -31,6 +31,9 @@ module Workflow_context_store = Temporal_runtime.Workflow_context_store
 (** Scheduler-owned future state used by workflow operations. *)
 module Future_store = Temporal_runtime.Future_store
 
+(** Private workflow control exceptions preserved by public callback wrappers. *)
+module Scheduler = Temporal_runtime.Scheduler
+
 (** Semantic workflow activation adapter over the private native source. *)
 module Native_worker_execution = Temporal_runtime.Native_worker_execution
 

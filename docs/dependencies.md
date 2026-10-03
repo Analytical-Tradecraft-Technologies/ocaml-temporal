@@ -79,9 +79,9 @@ tools are not linked into or redistributed with the future worker artifact.
 Release containers will use a separate minimal runtime stage and will receive
 their own package/SBOM audit before publication.
 
-The image copies Rust 1.97.1, Cargo, Clippy, and rustfmt from the official
-multi-architecture `rust:1.97-bookworm` image at manifest digest
-`sha256:0e2bcaef56d041a486784e54104a81aebe0da44bd03019bd70bc0401e42e4a97`.
+The image copies Rust 1.98.1, Cargo, Clippy, and rustfmt from the official
+multi-architecture `rust:1.98-bookworm` image at manifest digest
+`sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e`.
 That manifest contains native `linux/amd64` and `linux/arm64/v8` images. Rust
 is dual-licensed Apache-2.0 OR MIT. Debian's `protobuf-compiler` and
 `libprotobuf-dev` packages are installed as build-only tools required by
@@ -209,3 +209,14 @@ not extend its narrowly approved compiler and `ocamlbuild` exceptions to
 ordinary tooling packages. `ocamlformat` remains excluded for the separate
 copyleft closure documented above. The language-neutral typo gate still checks
 OCaml identifiers, comments, and interfaces without weakening the policy.
+
+## Standalone Windows Rust producer
+
+The Rust producer uses `msys2/setup-msys2` (MIT), pinned to
+`66cd2cce69caa17b53920067426061ca1de3a884`, to install GNU/MinGW build tools
+without installing OCaml. It selects MINGW64 to match the existing Windows
+GNU ABI; the MSYS2 project deprecates this environment in favor of UCRT64,
+so a future CRT migration must update and validate both producers and consumers.
+MSYS2/GCC are build tools, not new SDK library dependencies. The distributed
+Rust bridge retains the existing locked dependency and native import-library
+license checks. The action must also be allowed by the infra repository policy.

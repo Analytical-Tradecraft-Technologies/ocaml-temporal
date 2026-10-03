@@ -128,16 +128,23 @@ handles can be added later only with the same strict identity validation.
 
 ## Retry and shutdown
 
-The adapter keeps terminal client requests in the asynchronous-lease registry
-until the supervisor reports acceptance. A typed transport failure or an
-exception leaves the copied token and operation key available for retry; the
-activity implementation is never run again. The current state machine retains
-the key rather than the original operation value, so a retry must reconstruct
-the byte-identical request. The current bridge maps native async-client
-failures through the generic typed bridge error path. A dedicated
-non-retryable Core `NotFound` status and bounded native wait are follow-up
-hardening work, so callers must treat an uncertain result as unresolved and
-must not issue a different operation for the same handle.
+The adapter distinguishes local rejection, explicitly retryable submission,
+and terminal native rejection at the private handle boundary. Conversion and
+strict protocol validation happen before the supervisor call. A local error
+keeps the asynchronous lease and clears a newly reserved invalid request key,
+allowing a corrected or different operation without rerunning the activity
+callback. A local rejection during a retry preserves any earlier unresolved
+submission and its original key.
+
+After native submission, an explicitly retryable result retains the copied
+token and operation key; a terminal result, including `NotFound`, closes the
+handle and retires its adapter lease. Generic connection failures remain
+fail-closed. The state machine retains the key rather than the original
+operation value, so a permitted retry must reconstruct the byte-identical
+request. Callers must not issue a different operation while that request is
+unresolved. Focused regressions cover local metadata conversion errors,
+duplicate and oversized metadata caught by full request validation, corrected
+requests through all four methods, and retained versus terminal native errors.
 
 Worker shutdown first stops new polling, then drains ordinary worker leases as
 it does today. It also accounts for asynchronous leases: if an admitted client

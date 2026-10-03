@@ -658,7 +658,7 @@ let start_handle_internal ?scope ?activity_id ?task_queue ?schedule_to_close_tim
                             (* Scope ownership was checked before scheduling;
                                this registration is therefore deterministic and
                                cannot race another Domain. *)
-                            ignore (Scope.on_cancel scope request_cancel))
+                            ignore (Scope.on_cancel ~until:(Future_private.of_internal future) scope request_cancel))
                           scope
                       in
                       {

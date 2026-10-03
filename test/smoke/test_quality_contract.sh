@@ -213,123 +213,43 @@ printf '%s\n' "$release_preflight_target" |
 printf '%s\n' "$release_workflow_text" |
   grep -Fqx '        run: make release-preflight'
 
-# All code jobs share one output; required workflows remain unconditional.
-printf '%s\n' "$pr_workflow_text" |
-  grep -Fqx "      code: \${{ steps.changed-paths.outputs.code }}"
-for workflow_text in "$pr_workflow_text" "$release_workflow_text"; do
-  printf '%s\n' "$workflow_text" | grep -Fqx '  pull_request:'
-  printf '%s\n' "$workflow_text" | grep -Fqx '  merge_group:'
-  printf '%s\n' "$workflow_text" | grep -Fqx '    types: [checks_requested]'
+# One shared graph owns scans, OCaml matrices and the expensive live stack.
+for workflow in "$pr_workflow" "$release_workflow"; do
+  grep -Fqx '  pull_request:' "$workflow"
+  grep -Fqx '  merge_group:' "$workflow"
+  if grep -Eq '^  push:|^    paths(-ignore)?:' "$workflow"; then exit 1; fi
 done
-for workflow_text in "$pr_workflow_text" "$release_workflow_text" "$master_workflow_text"; do
-  if printf '%s\n' "$workflow_text" | grep -Eq '^  push:|^    paths(-ignore)?:'; then
-    exit 1
-  fi
+for workflow in "$master_workflow" "$source_root/.github/workflows/release.yml"; do
+  grep -Fqx '    uses: ./.github/workflows/build-pr.yml' "$workflow"
 done
-
-# Anchor the job declaration at the workflow's two-space indentation so a
-# future matrix step named "quality" cannot satisfy this contract by accident.
-printf '%s\n' "$master_workflow_text" | grep -Fq '  quality:'
-printf '%s\n' "$master_workflow_text" |
-  grep -Fq 'name: Quality and security scans'
-printf '%s\n' "$master_workflow_text" |
-  grep -Fq 'cargo-deny@0.20.2,cargo-machete@0.9.2,typos@1.48.0'
-printf '%s\n' "$master_workflow_text" | grep -Fq 'run: make quality'
-
-# PR quality uses the same pinned tools, but is conditional so Markdown-only
-# changes skip toolchain setup and builds.
-pr_quality=$(printf '%s\n' "$pr_workflow_text" |
-  sed -n '/^  quality:/,/^  license-audit:/p')
+grep -Fqx '      tier: master' "$master_workflow"
+grep -Fqx '  push:' "$master_workflow"
+grep -Fqx '  workflow_dispatch:' "$master_workflow"
+grep -Fqx '      tier: release' "$source_root/.github/workflows/release.yml"
+for workflow in "$source_root"/.github/workflows/*.yml "$source_root"/.github/actions/*/action.yml; do
+  assert_third_party_actions_pinned "$workflow" "$(cat "$workflow")"
+done
+# Source-only histories preserve fail-closed docs skipping for PR/merge queue.
+bash "$source_root/test/smoke/test_ci_changed_paths.sh" "$source_root"
+pr_quality=$(printf '%s\n' "$pr_workflow_text" | sed -n '/^  quality:/,/^  license-audit:/p')
 printf '%s\n' "$pr_quality" | grep -Fqx "    if: needs.changes.outputs.code == 'true'"
 printf '%s\n' "$pr_quality" | grep -Fqx '    name: Quality and security scans'
-printf '%s\n' "$pr_quality" |
-  grep -Fq 'cargo-deny@0.20.2,cargo-machete@0.9.2,typos@1.48.0'
+printf '%s\n' "$pr_quality" | grep -Fq 'cargo-deny@0.20.2,cargo-machete@0.9.2,typos@1.48.0'
 printf '%s\n' "$pr_quality" | grep -Fqx '        run: make quality'
-
-# Scheduled builds are the exhaustive compatibility gate. Scope
-# every assertion to verify so a comment or another job cannot satisfy it.
-master_verify=$(printf '%s\n' "$master_workflow_text" |
-  sed -n '/^  verify:/,/^    steps:/p')
-for version in 5.2 5.3 5.4 5.5; do
-  printf '%s\n' "$master_verify" | grep -Fqx "          - \"$version\""
+grep -Fqx '    name: Dependency license audit' "$pr_workflow"
+grep -Fqx '        run: make license-check OCAML_VERSION=5.2' "$pr_workflow"
+grep -Fqx '      matrix: ${{ fromJSON(needs.changes.outputs.linux) }}' "$pr_workflow"
+# Native consumer failures stay visible even when their producer fails.
+for platform in macos windows; do
+  section=$(sed -n "/^  native-$platform:/,/^  [a-z][a-z-]*:/p" "$pr_workflow")
+  printf '%s\n' "$section" | grep -Fq 'if: ${{ !cancelled()'
+  printf '%s\n' "$section" | grep -Fqx "    needs: [changes, rust-$platform]"
+  printf '%s\n' "$section" | grep -Fqx '        run: make native-verify'
 done
-master_version_count=$(printf '%s\n' "$master_verify" | grep -Fc '          - "5.')
-test "$master_version_count" -eq 4
-printf '%s\n' "$master_verify" | grep -Fqx '          - ubuntu-24.04'
-printf '%s\n' "$master_verify" | grep -Fqx '          - ubuntu-24.04-arm'
-master_native=$(printf '%s\n' "$master_workflow_text" |
-  sed -n '/^  native:/,$p')
-printf '%s\n' "$master_native" | grep -Fqx '          - label: Windows x64'
-printf '%s\n' "$master_native" | grep -Fqx '          - label: macOS ARM64'
-
-# The PR matrix is deliberately an explicit three-lane include list rather
-# than a Cartesian product: oldest/current amd64 and current ARM64. This keeps
-# the compatibility floor, current release, and ARM build covered before
-# merge, while avoiding five redundant Linux runner allocations.
-pr_verify=$(printf '%s\n' "$pr_workflow_text" |
-  sed -n '/^  verify:/,/^    steps:/p')
-# Check the adjacent OCaml/runner fields rather than merely their presence.
-# That preserves the intended floor/current pairing if the list is reordered
-# or a future edit accidentally assigns the compatibility floor to ARM64.
-printf '%s\n' "$pr_verify" | awk '
-  $0 == "          - ocaml: \"5.2\"" {
-    if ((getline runner) > 0 && runner == "            runner: ubuntu-24.04") {
-      floor_amd64 = 1
-    }
-  }
-  $0 == "          - ocaml: \"5.5\"" {
-    if ((getline runner) > 0) {
-      if (runner == "            runner: ubuntu-24.04") current_amd64 = 1
-      if (runner == "            runner: ubuntu-24.04-arm") current_arm64 = 1
-    }
-  }
-  END { exit !(floor_amd64 && current_amd64 && current_arm64) }
-'
-lane_count=$(printf '%s\n' "$pr_verify" | grep -Fc '          - ocaml:')
-test "$lane_count" -eq 3
-
-# Both native platforms use the same all-or-nothing code gate.
-pr_native_macos=$(printf '%s\n' "$pr_workflow_text" |
-  sed -n '/^  native-macos:/,/^  native-windows:/p')
-printf '%s\n' "$pr_native_macos" | grep -Fqx "    if: needs.changes.outputs.code == 'true'"
-printf '%s\n' "$pr_native_macos" | grep -Fqx '    name: OCaml 5.5 / macOS ARM64'
-printf '%s\n' "$pr_native_macos" | grep -Fqx '    runs-on: macos-15'
-printf '%s\n' "$pr_native_macos" | grep -Fqx '      NATIVE_ARCH: arm64'
-printf '%s\n' "$pr_native_macos" | grep -Fqx '        run: make native-verify'
-pr_native_windows=$(printf '%s\n' "$pr_workflow_text" |
-  sed -n '/^  native-windows:/,$p')
-printf '%s\n' "$pr_native_windows" |
-  grep -Fqx "    if: needs.changes.outputs.code == 'true'"
-printf '%s\n' "$pr_native_windows" | grep -Fqx '    name: OCaml 5.5 / Windows x64'
-printf '%s\n' "$pr_native_windows" | grep -Fqx '    runs-on: windows-latest'
-printf '%s\n' "$pr_native_windows" | grep -Fqx '      NATIVE_ARCH: amd64'
-printf '%s\n' "$pr_native_windows" | grep -Fqx '        run: make native-verify'
-
-# License and live-smoke jobs use the same code gate as the matrix.
-pr_license=$(printf '%s\n' "$pr_workflow_text" |
-  sed -n '/^  license-audit:/,/^  temporal-integration:/p')
-printf '%s\n' "$pr_license" | grep -Fqx '    name: Dependency license audit'
-printf '%s\n' "$pr_license" | grep -Fqx "    if: needs.changes.outputs.code == 'true'"
-printf '%s\n' "$pr_license" |
-  grep -Fqx '        run: make license-check OCAML_VERSION=5.2'
-pr_smoke=$(printf '%s\n' "$pr_workflow_text" |
-  sed -n '/^  temporal-integration:/,/^  verify:/p')
-printf '%s\n' "$pr_smoke" |
-  grep -Fqx "    if: \${{ !cancelled() && needs.changes.outputs.code == 'true' }}"
-printf '%s\n' "$pr_smoke" |
-  grep -Fqx '    name: Temporal/PostgreSQL integration smoke (OCaml 5.5)'
-printf '%s\n' "$pr_smoke" | grep -Fqx '    timeout-minutes: 45'
-printf '%s\n' "$pr_smoke" | grep -Fqx '      OCAML_VERSION: "5.5"'
-
-# Both live lanes share the evidence wrapper and an unconditional upload with
-# a short retention period. This ensures a controller failure cannot bypass
-# the publication gate or silently diverge between PR and scheduled jobs.
-for workflow in "$source_root/.github/workflows/build-pr.yml" "$source_root/.github/workflows/build.yml"; do
-  sed -n '/^  temporal-integration:/,/^  verify:/p' "$workflow" | grep -Fqx '        run: make test-temporal-live-ci'
-  grep -Fq 'uses: actions/upload-artifact@' "$workflow"
-  grep -Fq '          retention-days: 7' "$workflow"
-done
-
-# Exercise the actual classifier with Git histories, including PR base drift,
-# merge groups, deletions, renames, unusual filenames, and failed comparisons.
-bash "$source_root/test/smoke/test_ci_changed_paths.sh" "$source_root"
+pr_smoke=$(sed -n '/^  temporal-integration:/,/^  verify:/p' "$pr_workflow")
+printf '%s\n' "$pr_smoke" | grep -Fqx '    needs: [changes, verify]'
+printf '%s\n' "$pr_smoke" | grep -Fqx '    name: Temporal/PostgreSQL integration smoke (OCaml 5.5)'
+printf '%s\n' "$pr_smoke" | grep -Fqx '      OCAML_VERSION: "5.5.1"'
+printf '%s\n' "$pr_smoke" | grep -Fqx '      TEMPORAL_PREBUILT_SMOKE: "1"'
+printf '%s\n' "$pr_smoke" | grep -Fqx '        run: make test-temporal-live-ci'
+printf '%s\n' "$pr_smoke" | grep -Fqx '          retention-days: 7'

@@ -1,6 +1,6 @@
 # Match Dockerfile.dev's Rust toolchain and Debian 12 C-library baseline.
 # Native amd64/arm64 runners build this image without cross compilation.
-FROM rust:1.97-bookworm@sha256:0e2bcaef56d041a486784e54104a81aebe0da44bd03019bd70bc0401e42e4a97
+FROM rust:1.98-bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
 RUN rustup component add clippy rustfmt \
     && apt-get update \
     && apt-get install -y --no-install-recommends libprotobuf-dev protobuf-compiler \

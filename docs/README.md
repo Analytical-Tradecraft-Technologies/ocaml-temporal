@@ -92,6 +92,8 @@ The remaining reference documents are useful when changing one subsystem:
   protects the public `Temporal` surface.
 - [Public API compatibility](reference/api-stability.md) documents the
   pre-`0.1.0` compatibility policy and the installed-consumer type witness.
+- [Precompiled OCaml SDK](reference/prebuilt-ocaml.md) describes compatible binary
+  installations and downstream linking without recompiling the SDK.
 - [Proposed v1 support policy](reference/v1-support-policy.md) selects the
   production scope, authentication/platform targets, compatibility commitments
   and qualification responsibilities pending maintainer approval in #489.

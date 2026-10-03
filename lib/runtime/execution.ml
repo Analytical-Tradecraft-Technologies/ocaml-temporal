@@ -154,6 +154,8 @@ type ('input, 'output) t = {
       still suspended. This table belongs to the execution owner and is never
       accessed by Rust or another Domain. *)
   pending_updates : (string, unit) Hashtbl.t;
+  (** Set when the start job is accepted, before the activation queues the root.
+      This also detects a duplicate initialization within the same job batch. *)
   mutable started : bool;
   mutable terminal : bool;
   mutable evicted : bool;
@@ -223,6 +225,10 @@ let start ?(task_queue = "default") ?(randomness_seed = "0")
 (** Returns the registered type used for bounded workflow log metadata. *)
 let workflow_type execution =
   Temporal_base.Definition.name execution.definition
+
+(** Installs independently owned start metadata before the initial fiber runs. *)
+let set_start_metadata execution metadata =
+  Workflow_context_store.set_start_metadata execution.context metadata
 
 (** Updates the reusable execution context with the current activation clock.
     Keeping this setter behind the execution abstraction prevents native code
@@ -327,62 +333,61 @@ let fail execution error =
 let bridge_error message =
   Temporal_base.Error.make ~non_retryable:true ~category:`Bridge ~message ()
 
-(** Starts the workflow function exactly once. Its output is encoded inside the
-    scheduled fiber so an exception or codec failure follows the normal
-    workflow-failure path. *)
-let start_workflow execution =
-  if execution.started then
-    fail execution (bridge_error "workflow received duplicate start job")
-  else if not execution.terminal then begin
-    execution.started <- true;
-    let tags =
-      Observability.tags ~operation:"workflow_started"
-        ~workflow_type:(workflow_type execution) ()
-    in
-    report ~src:Observability.Source.workflow Logs.Info ~tags
-      "workflow started";
-    Scheduler.spawn execution.scheduler (fun () ->
-        match Temporal_base.Definition.implementation execution.definition with
-        | None -> fail execution (bridge_error "remote workflow has no implementation")
-        | Some implementation ->
-            begin match
-              try implementation execution.input with
-              | Scheduler.Workflow_aborted as exn -> raise exn
-              | Future_store.Scheduler_shutdown as exn -> raise exn
-              | exn ->
-                  Error
-                    (Temporal_base.Error.defect
-                       ~message:
-                         ("workflow implementation raised: "
-                         ^ Printexc.to_string exn))
-            with
-            | Error error -> fail execution error
-            | Ok output ->
-                begin match
-                  try
-                    Temporal_base.Codec.encode
-                      (Temporal_base.Definition.output execution.definition)
-                      output
-                  with
-                  | exn ->
-                      Error
-                        (Temporal_base.Error.defect
-                           ~message:
-                             ("workflow result encoder raised: "
-                             ^ Printexc.to_string exn))
+(** Queues the root once, after the initialization activation's job pass has
+    queued its signal/update handlers. A handler may suspend and let the root
+    proceed; it must at least be invoked before the root makes decisions or
+    completes. Output encoding stays inside the fiber's normal failure path. *)
+let enqueue_workflow execution =
+  let tags =
+    Observability.tags ~operation:"workflow_started"
+      ~workflow_type:(workflow_type execution) ()
+  in
+  report ~src:Observability.Source.workflow Logs.Info ~tags
+    "workflow started";
+  Scheduler.spawn execution.scheduler (fun () ->
+      match Temporal_base.Definition.implementation execution.definition with
+      | None -> fail execution (bridge_error "remote workflow has no implementation")
+      | Some implementation ->
+          begin match
+            try implementation execution.input with
+            | Scheduler.Workflow_aborted as exn -> raise exn
+            | Future_store.Scheduler_shutdown as exn -> raise exn
+            | exn ->
+                Error
+                  (Temporal_base.Error.defect
+                     ~message:
+                       ("workflow implementation raised: "
+                       ^ Printexc.to_string exn))
+          with
+          | Error error -> fail execution error
+          | Ok output ->
+              begin match
+                try
+                  Temporal_base.Codec.encode
+                    (Temporal_base.Definition.output execution.definition)
+                    output
                 with
-                | Error error -> fail_task execution error
-                | Ok payload ->
-                    emit_terminal execution (Activation.Complete_workflow payload)
-                end
-            end)
-  end
+                | exn ->
+                    Error
+                      (Temporal_base.Error.defect
+                         ~message:
+                           ("workflow result encoder raised: "
+                           ^ Printexc.to_string exn))
+              with
+              | Error error -> fail_task execution error
+              | Ok payload ->
+                  emit_terminal execution (Activation.Complete_workflow payload)
+              end
+          end)
 
 (** Applies one activation job. Activity and timer sequence numbers locate the
     future created by the earlier command. Unknown or repeated numbers fail the
     workflow because ignoring them would make replay disagree with Core. *)
 let process_job execution = function
-  | Activation.Start_workflow -> start_workflow execution
+  | Activation.Start_workflow ->
+      if execution.started then
+        fail execution (bridge_error "workflow received duplicate start job")
+      else execution.started <- true
   | Resolve_activity { seq; result } -> (
       match Workflow_context_store.resolve_activity execution.context ~seq result with
       | Ok () -> ()
@@ -544,6 +549,8 @@ let process_job execution = function
                 in
                 let dispatched =
                   try handler.dispatch ~run_validator ~on_validated update with
+                | Scheduler.Workflow_aborted as exn -> raise exn
+                | Future_store.Scheduler_shutdown as exn -> raise exn
                 | exn ->
                     Error
                       (Temporal_base.Error.defect
@@ -637,35 +644,26 @@ let process_job execution = function
     uncaught OCaml exception becomes a non-retryable defect instead of escaping
     the worker loop. *)
 let run_scheduler execution =
-  let rec drain () =
-    let status =
-      Workflow_context_store.with_context execution.context (fun () ->
-          Scheduler.run execution.scheduler)
-    in
-    (match status with
-    | Scheduler.Failed exception_ ->
-        (* A defect invalidates this whole activation, including commands that
-           a sibling buffered before the exception. Core must replay it. *)
-        fail_task execution
-          (Temporal_base.Error.defect ~message:(Printexc.to_string exception_))
-    | Scheduler.Complete | Scheduler.Blocked -> ());
-    (* Predicates are checked only after runnable workflow code has drained.
-       If a state mutation satisfies one, resolving its private signal queues a
-       continuation; drain again so that continuation participates in this
-       activation instead of waiting for a synthetic timer or later task. *)
-    if
-      execution.terminal
-      || execution.evicted
-      || Workflow_context_store.has_buffered_terminal execution.context
-    then ()
-    else
-      let woke =
-        Workflow_context_store.with_context execution.context (fun () ->
-            Workflow_context_store.notify_conditions execution.context)
-      in
-      if woke then drain ()
+  let on_idle () =
+    (* Recheck only after queued workflow code has drained, but before the
+       scheduler clears its owner marker and callback liveness. Predicates
+       can read their own scope, and any satisfied wait rejoins this activation.
+       A buffered terminal command must still suppress all later rechecks. *)
+    if not (execution.terminal || execution.evicted
+            || Workflow_context_store.has_buffered_terminal execution.context)
+    then ignore (Workflow_context_store.notify_conditions execution.context)
   in
-  drain ()
+  let status =
+    Workflow_context_store.with_context execution.context (fun () ->
+        Scheduler.run ~on_idle execution.scheduler)
+  in
+  match status with
+  | Scheduler.Failed exception_ ->
+      (* A defect invalidates this whole activation, including commands that
+         a sibling buffered before the exception. Core must replay it. *)
+      fail_task execution
+        (Temporal_base.Error.defect ~message:(Printexc.to_string exception_))
+  | Scheduler.Complete | Scheduler.Blocked -> ()
 
 (** Releases every paused fiber and pending operation table for this execution.
     Safe to call more than once: the context and scheduler ignore a second
@@ -700,6 +698,7 @@ let activate execution jobs =
             ~tags "activation ignored after cache eviction";
           [])
         else (
+          let was_started = execution.started in
           List.iter
             (fun job ->
               if not execution.evicted then
@@ -716,7 +715,13 @@ let activate execution jobs =
             (* A query-only activation must not run ordinary workflow fibers:
                doing so could append commands while Core is expecting only
                query answers and could retain a continuation at the boundary. *)
-            if not execution.terminal && not query_only then run_scheduler execution;
+            if not execution.terminal && not query_only then begin
+              (* Initialization records the start immediately for duplicate
+                 detection, but handlers from this activation enter the FIFO
+                 before the root. Later activations never queue another root. *)
+              if not was_started && execution.started then enqueue_workflow execution;
+              run_scheduler execution
+            end;
             let commands = Workflow_context_store.take_commands execution.context in
             let commands =
               match List.find_map

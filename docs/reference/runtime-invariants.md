@@ -41,6 +41,15 @@ and bridge, read the [documentation guide](../README.md) first.
   regression checks retained live words across repeated callback batches.
 - Spawn order is source execution order.
 - Activation jobs are applied in their supplied list order.
+- Initialization records the workflow start during that job pass, then queues
+  the root fiber after the initial signal/update handlers. Those handlers are
+  invoked in activation order before the root's first instruction, even when
+  the root completes without suspending. A handler that suspends allows later
+  handlers and the root to proceed; initialization does not wait for every
+  handler to finish. Duplicate initialization, cancellation, eviction, and
+  handler failure still prevent an invalid root invocation. The offline
+  [initial-signals replay](../../test/integration/temporal/initial_signals/README.md)
+  qualifies the ordering through Core and the production worker adapter.
 - Core's `UpdateRandomSeed` replaces only the execution-local random stream at
   its position in that job pass, before resumed fibers run. The complete uint64
   seed survives the bridge as canonical decimal text; the runtime preserves
@@ -59,7 +68,19 @@ and bridge, read the [documentation guide](../README.md) first.
 - A promise resolves at most once; unknown or duplicate external resolutions
   are bridge defects.
 - A captured one-shot continuation is continued or discontinued exactly once.
+- Derived futures retain scheduler identity, queueing, callback liveness, and
+  suspension gates independently of the source result. A retained mapped summary
+  must not keep its discarded activity payload alive. Ready ownership errors
+  preserve a real suspension gate for later pending combinators. The activity
+  weak-reference and live-heap probe in `test/runtime/test_future_retention.ml`
+  checks collection while the owner and summary futures remain active.
 - Awaiting a ready future does not perform an effect.
+- External signal/cancellation validation and encoding failures created inside
+  a workflow retain its scheduler owner, callback liveness, and suspension gate.
+  They emit no command or durable sequence, preserve their original typed error
+  through joins, and obey the same ready-input ordering as successful futures.
+  Calls outside a workflow remain inert; actual cross-workflow combinations
+  still return an ownership defect.
 - Awaiting a pending future outside its owning running scheduler returns a
   structured defect.
 - `Future.both` and `Future.all` observe every input before settling and select
@@ -73,8 +94,11 @@ and bridge, read the [documentation guide](../README.md) first.
   creates no waiter. Notification snapshots waiters in registration order,
   removes each waiter before resolving it, and re-drains newly queued
   continuations so a state mutation in the same activation can release a
-  condition without a synthetic timer. Predicates must be deterministic,
-  non-blocking, and non-suspending. Context teardown deactivates every waiter
+  condition without a synthetic timer. Deferred checks run before the scheduler
+  releases its owner marker and callback liveness, so they can read workflow-local
+  scope state just like the initial check. The notifier has no fiber effect
+  handler: predicates must remain deterministic, non-blocking, and non-suspending.
+  Context teardown deactivates every waiter
   before scheduler shutdown, so a late notification cannot retain or resume
   an ended workflow.
 - A `Temporal.Scope` signal belongs to the same scheduler as the workflow
@@ -94,6 +118,11 @@ and bridge, read the [documentation guide](../README.md) first.
 - Combining futures from different executions returns a ready typed defect
   owned by the leading input rather than raising an operational exception.
 - User callback exceptions are contained and reported as scheduler defects.
+- Private scheduler shutdown and terminal-control exceptions pass through
+  signal/update callback wrappers unchanged. Discontinuing an unfinished
+  handler must release its continuation without turning teardown into a task
+  defect or discarding the chosen terminal command. This does not drain
+  unfinished handlers or imply that an accepted update completed.
 - The implementation uses typed closures and GADTs, not `Obj.magic` or a
   heterogeneous untyped value store.
 
@@ -110,6 +139,12 @@ and bridge, read the [documentation guide](../README.md) first.
   terminal result before start, duplicate acknowledgment, or unknown sequence
   is a non-retryable bridge defect; no event is silently dropped.
 - Activities, child workflows, and timers share one monotonic command sequence.
+- A terminated child resolves its pending future with a typed child-workflow
+  error, including the termination cause and identity in its diagnostic. The
+  parent can recover and schedule further work without rejecting its activation
+  or stopping the worker. The native adapter regression covers this behavior
+  with both live-mode and replay-mode activations and a subsequent run; the
+  Rust regression obtains the termination from the pinned Core replay machine.
 - When Core delegates a local activity retry delay, the original activity
   resolver and cancellation decision remain live while a separate workflow
   timer owns the delay. Cancelling during that delay removes the timer callback,

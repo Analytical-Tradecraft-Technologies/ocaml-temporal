@@ -102,8 +102,10 @@ boundary.
   reproducing every OCaml version locally: validate one representative version,
   push, and use the GitHub Actions matrix as the cross-version/platform gate.
 - Keep the dependency-license audit as one independent CI job rather than
-  repeating it for every OCaml version. Linux CI covers OCaml 5.2 through 5.5
-  on amd64 and arm64; native CI covers OCaml 5.5 on Windows x64 and macOS ARM.
+  repeating it for every OCaml version. Master CI covers OCaml 5.2 through 5.5
+  on Linux amd64/arm64 and 5.5 on Windows x64/macOS ARM; releases cover all
+  four compiler series on all four platforms. PRs use the smaller matrix in
+  `scripts/ci-matrix.py`. Rust producers are shared across compiler versions.
 - End-to-end Temporal tests must eventually use Docker Compose with Temporal
   Server and PostgreSQL. Native Windows/macOS jobs test the library and bridge
   directly and should not run a Linux Docker Compose stack.

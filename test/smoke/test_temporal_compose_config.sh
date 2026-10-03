@@ -476,7 +476,7 @@ fi
 
 # The expensive live stack belongs in exactly one standalone CI job. It is
 # deliberately not copied into the OCaml compiler/architecture matrix.
-workflow="$root/.github/workflows/build.yml"
+workflow="$root/.github/workflows/build-pr.yml"
 if [ "$(grep -Fc '  temporal-integration:' "$workflow")" -ne 1 ]; then
   echo "GitHub Actions must define one standalone Temporal integration job" >&2
   exit 1
@@ -494,7 +494,7 @@ require_master_smoke_text() {
 require_master_smoke_text 'make test-temporal-live-ci'
 require_master_smoke_text 'name: Temporal/PostgreSQL integration smoke (OCaml 5.5)'
 require_master_smoke_text 'timeout-minutes: 45'
-require_master_smoke_text 'OCAML_VERSION: "5.5"'
+require_master_smoke_text 'OCAML_VERSION: "5.5.1"'
 require_source_text "$makefile" '$(MAKE) test-temporal-integration'
 require_source_text "$makefile" '$(MAKE) test-temporal-worker-restart'
 require_source_text "$makefile" '$(MAKE) test-temporal-worker-crash-recovery'

@@ -173,6 +173,7 @@ let rec copy_failure (value : Protocol.failure) : Protocol.failure =
         Protocol.Timeout_failure
           { info with last_heartbeat_details = copy_payloads last_heartbeat_details }
     | Protocol.Activity _ as info -> info
+    | Protocol.Terminated _ as info -> info
     | Protocol.Child_workflow _ as info -> info
   in
   Protocol.
@@ -205,6 +206,10 @@ let copy_initialize_context (value : Protocol.initialize_context) =
         List.map
           (fun (key, payload) -> (key, copy_protocol_payload payload))
           value.headers;
+      memo = Option.map (List.map (fun (key, payload) ->
+        (key, copy_protocol_payload payload))) value.memo;
+      search_attributes = Option.map (List.map (fun (key, payload) ->
+        (key, copy_protocol_payload payload))) value.search_attributes;
       continuation = Option.map copy_continuation value.continuation;
     }
 
@@ -278,7 +283,7 @@ let failure_details (failure : Protocol.failure) =
           List.rev_append details reversed
       | Protocol.Timeout_failure { last_heartbeat_details; _ } ->
           List.rev_append last_heartbeat_details reversed
-      | Protocol.Activity _ | Protocol.Child_workflow _ -> reversed
+      | Protocol.Activity _ | Protocol.Child_workflow _ | Protocol.Terminated _ -> reversed
     in
     match value.cause with
     | Some cause when depth < 128 -> loop (depth + 1) reversed cause
@@ -1264,6 +1269,31 @@ let validate_completion_for_activation activation completion =
     runtime jobs and translates its resulting command batch. *)
 let activate execution activation =
   let* translated = translate_activation activation in
+  let* () =
+    match translated.initialization with
+    | None -> Ok ()
+    | Some initialization ->
+        let* metadata = match initialization.context with
+          | None -> Ok None
+          | Some context ->
+              let payloads path = function
+                | None -> Ok None
+                | Some values ->
+                    let rec loop reversed = function
+                      | [] -> Ok (Some (List.rev reversed))
+                      | (key, value) :: rest ->
+                          let* value = runtime_payload (path ^ "." ^ key) value in
+                          loop ((key, value) :: reversed) rest
+                    in loop [] values
+              in
+              let* memo = payloads "$.jobs.context.memo" context.memo in
+              let* search_attributes = payloads "$.jobs.context.search_attributes" context.search_attributes in
+              Ok (Some Workflow_context_store.{ memo; search_attributes;
+                execution_expiration_time = context.workflow_execution_expiration_time })
+        in
+        Execution.set_start_metadata execution metadata;
+        Ok ()
+  in
   (* Install the activation's deterministic clock before entering user code.
      The execution context is reused across tasks, so synthetic activations
      explicitly clear the previous value rather than leaving stale time

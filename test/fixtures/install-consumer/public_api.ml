@@ -673,3 +673,7 @@ let _result_bind :
 
 let _result_map : ('a, 'error) result -> ('a -> 'b) -> ('b, 'error) result =
   T.Result_syntax.( let+ )
+
+(** Installed consumers can inspect start metadata without private types. *)
+let _workflow_start_metadata : unit -> (T.Workflow.start_metadata, T.Error.t) result =
+  T.Workflow.start_metadata

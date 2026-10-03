@@ -14,7 +14,7 @@ type ('value, 'error) t
 val make :
   await:(unit -> ('value, 'error) result) ->
   await_gate:((((unit -> unit) -> unit) -> unit)) ->
-  observe:((('value, 'error) result -> unit) -> unit) ->
+  subscribe:((('value, 'error) result -> unit) -> (unit -> unit)) ->
   is_ready:(unit -> bool) ->
   peek:(unit -> ('value, 'error) result option) ->
   owner_id:int ->
@@ -26,12 +26,19 @@ val make :
 (** Invokes the scheduler-owned result callback. *)
 val await : ('value, 'error) t -> ('value, 'error) result
 
-(** Registers a continuation with the scheduler-owned suspension gate. *)
+(** Extracts the scheduler-owned suspension gate without retaining the future's
+    result. *)
 val await_gate : ('value, 'error) t -> (((unit -> unit) -> unit) -> unit)
 
 (** Registers an observer for a scheduler-owned result notification. *)
 val observe :
   ('value, 'error) t -> (('value, 'error) result -> unit) -> unit
+
+(** Registers a removable observer. The returned owner-scheduler action is
+    idempotent, unlinks pending registration storage, and suppresses delivery
+    if the callback has already been queued but has not started. *)
+val subscribe :
+  ('value, 'error) t -> (('value, 'error) result -> unit) -> (unit -> unit)
 
 (** Reports whether the scheduler-owned result is settled. *)
 val is_ready : ('value, 'error) t -> bool
@@ -45,8 +52,13 @@ val owner_id : ('value, 'error) t -> int
 (** Builds the error returned when the value is used outside its owner. *)
 val outside_error : ('value, 'error) t -> unit -> 'error
 
+(** Extracts the owner's liveness predicate without retaining this future's
+    result. Adapters must pass this callback directly, without wrapping a call
+    that captures the source future. *)
+val callback_liveness : ('value, 'error) t -> (unit -> bool)
+
 (** Reports whether queued callbacks may still run for this future's owner. *)
 val callbacks_live : ('value, 'error) t -> bool
 
-(** Queues a callback on the scheduler that owns this value. *)
+(** Extracts the owner queue callback without retaining this value. *)
 val enqueue : ('value, 'error) t -> (unit -> unit) -> unit

@@ -37,8 +37,13 @@ val cancel : t -> (unit, Error.t) result
     if several fail, [cancel] returns the first structured error after the
     scope's own cancellation signal has still been delivered. Registering on
     an already-cancelled scope runs the action immediately. The callback must
-    not block, perform nondeterministic I/O, or retain the scope indefinitely. *)
-val on_cancel : t -> (unit -> (unit, Error.t) result) -> (unit, Error.t) result
+    not block, perform nondeterministic I/O, or retain the scope indefinitely.
+    With [until], the action is removed when that same-workflow future becomes
+    terminal (success or failure); an already-terminal future skips the action.
+    Activities and children use this to retain only outstanding work. *)
+val on_cancel :
+  ?until:('value, 'error) Future.t ->
+  t -> (unit -> (unit, Error.t) result) -> (unit, Error.t) result
 
 (** Reports whether cancellation has been requested for [scope]. The query is
     owner-checked just like [cancel], so a foreign Domain or a retained scope

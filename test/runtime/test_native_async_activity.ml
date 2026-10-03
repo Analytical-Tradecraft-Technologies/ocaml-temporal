@@ -101,6 +101,8 @@ type fake_supervisor = {
   async_completions : Protocol.completion list ref;
   heartbeats : Protocol.heartbeat list ref;
   async_heartbeats : Protocol.heartbeat list ref;
+  async_completion_calls : int ref;
+  async_heartbeat_calls : int ref;
   reject_next_async_completion : bool ref;
   reject_next_async_completion_terminal : bool ref;
   reject_next_async_heartbeat : bool ref;
@@ -118,6 +120,8 @@ let fake_supervisor () =
     async_completions = ref [];
     heartbeats = ref [];
     async_heartbeats = ref [];
+    async_completion_calls = ref 0;
+    async_heartbeat_calls = ref 0;
     reject_next_async_completion = ref false;
     reject_next_async_completion_terminal = ref false;
     reject_next_async_heartbeat = ref false;
@@ -182,6 +186,7 @@ module Fake_supervisor = struct
       one-shot rejection proves that the OCaml handle retains and retries the
       exact request without rerunning user code. *)
   let complete_async_activity supervisor (completion : Protocol.completion) =
+    incr supervisor.async_completion_calls;
     if !(supervisor.reject_next_async_completion_terminal) then begin
       supervisor.reject_next_async_completion_terminal := false;
       (* A terminal [NotFound] response means the native task token is no
@@ -225,6 +230,7 @@ module Fake_supervisor = struct
 
   (** Records heartbeat details against the namespace-bound async lease. *)
   let record_async_activity_heartbeat supervisor (heartbeat : Protocol.heartbeat) =
+    incr supervisor.async_heartbeat_calls;
     if !(supervisor.reject_next_async_heartbeat) then begin
       supervisor.reject_next_async_heartbeat := false;
       Error
@@ -439,6 +445,150 @@ let test_deferred_lifecycle () =
     | Ok () -> failwith "terminal async handle accepted a heartbeat"
   end
 
+(** Admits a handle with a caller-supplied output codec so payload validation
+    can be tested independently of callback dispatch and worker handoff. *)
+let payload_validation_fixture output =
+  let supervisor = fake_supervisor () in
+  let calls = ref 0 in
+  let retained = ref None in
+  let activity =
+    Temporal_base.Definition.make ~name:"async_payload_validation"
+      ~input:Temporal_base.Codec.unit ~output
+      ~implementation:(Some (fun context () ->
+        incr calls;
+        let handle = Base_async.handle context in
+        retained := Some handle;
+        Base_async.Will_complete_async handle))
+  in
+  let token = Bytes.of_string "\000async-validation\255" in
+  enqueue supervisor
+    (start_task ~token ~activity_type:"async_payload_validation"
+       ~input:[ encode_input Temporal.Codec.unit () ]);
+  let worker = worker supervisor [ Raw_adapter.register_async activity ] in
+  expect_deferred (Worker.poll worker);
+  (supervisor, worker, Option.get !retained, calls, token)
+
+(** Local validation errors must preserve both lease registries and release
+    the invalid request key. Exercise each handle method with a conversion
+    error and two errors caught only by the complete protocol encoder. *)
+let test_invalid_async_payload_preserves_handle () =
+  let codec = Temporal_base.Codec.of_payload
+      ~encode:(fun payload -> Ok (base_payload payload))
+      ~decode:(fun _ -> Error (Temporal_base.Error.codec
+        ~message:"output-only test codec")) in
+  let cases =
+    [ ("invalid-utf8", [ ("opaque", "\255") ]);
+      ("duplicate", [ ("opaque", "one"); ("opaque", "two") ]);
+      ("oversized", [ (String.make 65_537 'k', "value") ]) ]
+  in
+  List.iter
+    (fun (label, metadata) ->
+      List.iter
+        (fun operation ->
+          List.iter
+            (fun correct_same_method ->
+              let supervisor, worker, handle, calls, token =
+                payload_validation_fixture codec
+              in
+              let invalid : Temporal.Payload.t =
+                { metadata; data = Bytes.of_string "private-invalid-payload" }
+              in
+              let valid : Temporal.Payload.t =
+                { metadata = [ ("encoding", "binary/plain") ];
+                  data = Bytes.of_string "corrected" }
+              in
+              (* Complete obtains the invalid payload from its registered
+                 codec; the other methods accept detail payloads directly. *)
+              let submit payload =
+                match operation with
+                | `Complete -> Temporal.Activity.Async_handle.complete handle payload
+                | `Fail -> Temporal.Activity.Async_handle.fail handle
+                    (Temporal.Error.make ~category:`Activity ~message:"failure"
+                       ~details:[ payload ] ())
+                | `Cancel -> Temporal.Activity.Async_handle.cancel handle [ payload ]
+                | `Heartbeat -> Temporal.Activity.Async_handle.heartbeat handle [ payload ]
+              in
+              (match submit invalid with
+              | Error _ -> ()
+              | Ok () -> failwith (label ^ ": invalid async payload was accepted"));
+              if !(supervisor.async_completion_calls) <> 0
+                 || !(supervisor.async_heartbeat_calls) <> 0 then
+                failwith (label ^ ": local rejection reached the native supervisor");
+              if !(supervisor.async_leased) <> [ token ] then
+                failwith (label ^ ": local rejection retired the native lease");
+              (match Worker.drain worker with
+              | Error { code = "outstanding_async_leases"; retryable = true; _ } -> ()
+              | _ -> failwith (label ^ ": local rejection lost the adapter lease"));
+              let corrected =
+                if correct_same_method then submit valid
+                else Temporal.Activity.Async_handle.complete handle valid
+              in
+              (match corrected with
+              | Ok () -> ()
+              | Error error -> failwith (label ^ ": corrected request failed: "
+                  ^ Temporal.Error.message error));
+              if correct_same_method && operation = `Heartbeat then begin
+                (match Worker.drain worker with
+                | Error { code = "outstanding_async_leases"; _ } -> ()
+                | _ -> failwith "corrected heartbeat retired the completion capability");
+                match Temporal.Activity.Async_handle.complete handle valid with
+                | Ok () -> ()
+                | Error error -> failwith (Temporal.Error.message error)
+              end;
+              if !calls <> 1 || !(supervisor.async_completion_calls) <> 1
+                 || List.length !(supervisor.async_completions) <> 1
+                 || !(supervisor.async_heartbeat_calls)
+                    <> (if correct_same_method && operation = `Heartbeat then 1 else 0)
+                 || !(supervisor.async_leased) <> [] then
+                failwith (label ^ ": corrected request did not retire exactly one lease");
+              match Worker.drain worker with
+              | Ok () -> ()
+              | Error _ -> failwith "completed handle still blocked drain")
+            [ true; false ])
+        [ `Complete; `Fail; `Cancel; `Heartbeat ])
+    cases
+
+(** A codec's own typed rejection happens before an operation is reserved and
+    must continue to allow a later, successfully encoded output. *)
+let test_async_codec_error_preserves_handle () =
+  let codec = Temporal.Codec.make ~encoding:"binary/plain"
+      ~encode:(fun valid ->
+        if valid then Ok Bytes.empty
+        else Error (Temporal.Error.codec ~message:"invalid output"))
+      ~decode:(fun _ -> Ok true) in
+  let supervisor, worker, handle, _, _ = payload_validation_fixture (base_codec codec) in
+  (match Temporal.Activity.Async_handle.complete handle false with
+  | Error _ -> ()
+  | Ok () -> failwith "codec rejected output was submitted");
+  if !(supervisor.async_completion_calls) <> 0 then
+    failwith "codec failure reached the supervisor";
+  (match Temporal.Activity.Async_handle.complete handle true with
+  | Ok () -> ()
+  | Error error -> failwith (Temporal.Error.message error));
+  match Worker.drain worker with
+  | Ok () when !(supervisor.async_leased) = [] -> ()
+  | _ -> failwith "codec recovery left completion debt"
+
+(** A public codec can emit an invalid encoding marker while successfully
+    encoding its body. A corrected option value must still complete normally. *)
+let test_async_invalid_encoding_preserves_handle () =
+  let codec = Temporal.Codec.option
+      (Temporal.Codec.make ~encoding:"\255"
+        ~encode:(fun value -> Ok (Bytes.of_string value))
+        ~decode:(fun bytes -> Ok (Bytes.to_string bytes))) in
+  let supervisor, worker, handle, _, _ = payload_validation_fixture (base_codec codec) in
+  (match Temporal.Activity.Async_handle.complete handle (Some "value") with
+  | Error _ -> ()
+  | Ok () -> failwith "invalid public codec encoding was accepted");
+  if !(supervisor.async_completion_calls) <> 0 then
+    failwith "invalid public codec encoding reached the supervisor";
+  (match Temporal.Activity.Async_handle.complete handle None with
+  | Ok () -> ()
+  | Error error -> failwith (Temporal.Error.message error));
+  match Worker.drain worker with
+  | Ok () when !(supervisor.async_leased) = [] -> ()
+  | _ -> failwith "corrected public codec output left completion debt"
+
 (** A rejected late completion retains the exact request key. Retrying it
     succeeds without invoking the asynchronous implementation again. *)
 let test_async_completion_retry () =
@@ -470,6 +620,15 @@ let test_async_completion_retry () =
   if !calls <> 1 then failwith "async completion retry reran the callback";
   if not (has_token token !(supervisor.async_leased)) then
     failwith "async completion rejection retired the client lease";
+  (match Temporal.Activity.Async_handle.complete handle "different" with
+  | Error _ -> ()
+  | Ok () -> failwith "uncertain completion allowed a different output");
+  (match Temporal.Activity.Async_handle.heartbeat handle [] with
+  | Error _ -> ()
+  | Ok () -> failwith "uncertain completion allowed a different operation");
+  if !(supervisor.async_completion_calls) <> 1
+     || !(supervisor.async_heartbeat_calls) <> 0 then
+    failwith "conflicting retry entered the native supervisor";
   begin
     match Temporal.Activity.Async_handle.complete handle "once" with
     | Ok () -> ()
@@ -478,7 +637,9 @@ let test_async_completion_retry () =
   end;
   if !calls <> 1 then failwith "accepted async retry reran the callback";
   if List.length !(supervisor.async_completions) <> 1 then
-    failwith "async completion retry submitted more than one accepted result"
+    failwith "async completion retry submitted more than one accepted result";
+  if !(supervisor.async_completion_calls) <> 2 then
+    failwith "async completion did not submit exactly one identical retry"
 
 (** A terminal native rejection closes both sides of the retained capability.
     The adapter must drop its lease so worker drain cannot wait forever, while
@@ -774,7 +935,7 @@ let test_operation_key_boundaries () =
     Base_async.create
       ~submit:(fun _operation ->
         incr submitted;
-        Error failure)
+        Error (Base_async.Retryable_submission failure))
       ~encode_output:(fun _ ->
         Ok Temporal_base.Payload.{ metadata = []; data = Bytes.empty })
   in
@@ -794,11 +955,44 @@ let test_operation_key_boundaries () =
   if !submitted <> 1 then
     failwith "different payload-list shape retried the retained operation"
 
+(** A failed preflight on a later retry cannot erase an earlier uncertain
+    submission. A different operation stays blocked until that request settles. *)
+let test_local_rejection_preserves_earlier_uncertainty () =
+  let attempts = ref 0 in
+  let error = Temporal_base.Error.make ~category:`Bridge ~message:"unavailable" () in
+  let handle = Base_async.create
+      ~encode_output:(fun text -> Ok Temporal_base.Payload.
+        { metadata = []; data = Bytes.of_string text })
+      ~submit:(fun _ ->
+        incr attempts;
+        match !attempts with
+        | 1 -> Error (Base_async.Retryable_submission error)
+        | 2 -> Error (Base_async.Not_submitted error)
+        | _ -> Ok ()) in
+  ignore (Base_async.activate handle);
+  (match Base_async.complete handle "original" with
+  | Error _ -> ()
+  | Ok () -> failwith "uncertain submission was accepted");
+  (match Base_async.complete handle "original" with
+  | Error _ -> ()
+  | Ok () -> failwith "locally rejected retry was accepted");
+  (match Base_async.complete handle "different" with
+  | Error _ -> ()
+  | Ok () -> failwith "local rejection erased earlier submission uncertainty");
+  if !attempts <> 2 then failwith "conflicting request crossed the submit boundary";
+  match Base_async.complete handle "original" with
+  | Ok () when !attempts = 3 -> ()
+  | _ -> failwith "original uncertain request could not be retried"
+
 (** Runs the isolated async lifecycle assertions. *)
 let () =
   test_base_state_machine ();
   test_operation_key_boundaries ();
+  test_local_rejection_preserves_earlier_uncertainty ();
   test_deferred_lifecycle ();
+  test_invalid_async_payload_preserves_handle ();
+  test_async_codec_error_preserves_handle ();
+  test_async_invalid_encoding_preserves_handle ();
   test_async_completion_retry ();
   test_async_terminal_rejection_closes_lease ();
   test_async_heartbeat_and_cancel ();

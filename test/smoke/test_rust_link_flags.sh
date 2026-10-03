@@ -55,6 +55,25 @@ if command -v cygpath >/dev/null 2>&1; then
   expected_dir=$(cygpath -m "$expected_dir")
 fi
 test "$(cat "$output")" = "$(printf '("-L%s" -lwinapi_ntdll -lbcrypt)' "$expected_dir")"
+
+# Installed OCaml archives must retain no producer checkout path. Their import
+# archives travel beside the cmxa; the compiler expands CAMLORIGIN at final link.
+TEMPORAL_OCAML_IMPORT_DIR="$temporary_root/installed/rust-imports" \
+  TEMPORAL_OCAML_LINK_FLAGS="$temporary_root/ocaml-flags.sexp" \
+  sh "$workspace_root/scripts/render-rust-link-flags.sh" \
+  'MINGW64_NT-test' "$temporary_root/relocated bundle" "$output" \
+  '-lwinapi_ntdll -lbcrypt'
+test "$(cat "$output")" = '(-lwinapi_ntdll -lbcrypt)'
+test "$(cat "$temporary_root/ocaml-flags.sexp")" = '(-ccopt "-L\"$CAMLORIGIN/rust-imports\"")'
+cmp "$temporary_root/installed/rust-imports/libwinapi_ntdll.a" \
+  "$temporary_root/relocated bundle/import-libs/libwinapi_ntdll.a"
+TEMPORAL_OCAML_IMPORT_DIR="$temporary_root/linux/rust-imports" \
+  TEMPORAL_OCAML_LINK_FLAGS="$temporary_root/ocaml-flags.sexp" \
+  sh "$workspace_root/scripts/render-rust-link-flags.sh" \
+  Linux "$temporary_root/relocated bundle" "$output" '-lpthread -ldl'
+test -s "$temporary_root/linux/rust-imports/README"
+test "$(cat "$output")" = '(-lpthread -ldl)'
+test "$(cat "$temporary_root/ocaml-flags.sexp")" = '()'
 rm "$temporary_root/relocated bundle/import-libs/libwinapi_ntdll.a"
 if sh "$workspace_root/scripts/render-rust-link-flags.sh" \
   'MINGW64_NT-test' "$temporary_root/relocated bundle" "$output" \
