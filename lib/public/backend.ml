@@ -1191,9 +1191,10 @@ let native_client_list_visibility (client : native_client)
             next_page_token = page.next_page_token;
           }
 
-(** Lists deterministic mock executions. The mock intentionally accepts only
-    an empty query: it is a unit-test ledger, not a second visibility query
-    language. Native HTTP(S) clients send the caller's full Temporal query. *)
+(** Lists every retained mock run, including executions retired by reset.
+    The mock intentionally accepts only an empty query: it is a unit-test
+    ledger, not a second visibility query language. Native HTTP(S) clients
+    send the caller's full Temporal query. *)
 let mock_client_list_visibility (client : mock_client)
     (request : visibility_request) : (visibility_page, Error.t) result =
   if request.page_size < 1 || request.page_size > 1_000 then
@@ -1215,8 +1216,8 @@ let mock_client_list_visibility (client : mock_client)
         if client.closed then Error (bridge_error "client is shut down")
         else
           let executions : visibility_execution list =
-            Hashtbl.to_seq service.executions
-            |> Seq.map (fun (workflow_id, (execution : mock_execution)) ->
+            Hashtbl.to_seq service.history
+            |> Seq.map (fun ((workflow_id, _run_id), (execution : mock_execution)) ->
                    let status =
                      match execution.terminal with
                      | Mock_pending -> "running"
@@ -1235,7 +1236,11 @@ let mock_client_list_visibility (client : mock_client)
             |> List.of_seq
             |> List.sort (fun (left : visibility_execution)
                               (right : visibility_execution) ->
-                    String.compare left.workflow_id right.workflow_id)
+                    let workflow_order =
+                      String.compare left.workflow_id right.workflow_id
+                    in
+                    if workflow_order <> 0 then workflow_order
+                    else String.compare left.run_id right.run_id)
           in
           Ok ({ executions; next_page_token = None } : visibility_page))
 

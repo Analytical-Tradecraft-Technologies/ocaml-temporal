@@ -484,6 +484,24 @@ let test_exact_run_reset () =
   in
   assert (execution.workflow_id = "unit-reset");
   assert (execution.run_id <> old_run);
+  let visibility =
+    unwrap (Temporal.Client.list_visibility client ~query:"" ())
+  in
+  assert (List.length visibility.executions = 2);
+  let old_row =
+    List.find
+      (fun (row : Temporal.Client.visibility_execution) ->
+        String.equal row.run_id old_run)
+      visibility.executions
+  in
+  let successor_row =
+    List.find
+      (fun (row : Temporal.Client.visibility_execution) ->
+        String.equal row.run_id execution.run_id)
+      visibility.executions
+  in
+  assert (old_row.status = "terminated");
+  assert (successor_row.status = "running");
   (match Temporal.Client.wait handle with
   | Ok (Temporal.Client.Terminated error) ->
       assert ((Temporal.Error.view error).category = `Terminated)

@@ -770,3 +770,7 @@ and
 [`client-visibility-response.schema.json`](../schemas/bridge/client-visibility-response.schema.json).
 Temporal's protobuf/gRPC communication remains entirely inside Rust; JSON is
 only the ownership-safe OCaml/Rust boundary.
+
+The deterministic `mock://` backend lists every retained run, including an
+old run retired by reset and its running successor. It orders rows by workflow
+ID and run ID so tests can inspect both exact identities consistently.
