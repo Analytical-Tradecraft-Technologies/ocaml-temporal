@@ -6,7 +6,9 @@ set -eu
 root=${1:-.}
 script="$root/scripts/check-release-tag.sh"
 fixture=$(mktemp -d "${TMPDIR:-/tmp}/temporal-release-tag.XXXXXX")
-trap 'rm -rf "$fixture"' EXIT HUP INT TERM
+injection_marker_name="release-tag-injected-$$"
+injection_marker="$root/$injection_marker_name"
+trap 'rm -rf "$fixture"; rm -f "$injection_marker"' EXIT HUP INT TERM
 
 # Fixtures must not depend on the repository still having its initial ~dev
 # version: the same rejection tests also run on concrete release candidates.
@@ -29,9 +31,11 @@ sh "$script" "$fixture" v1.0.0~beta.1
 
 # Git accepts some shell metacharacters in ref names. A release tag must never
 # become shell source when passed through the public Make target.
-injection_marker="$fixture/make-injected"
-injection_tag=$(printf 'v1.0.0";touch>%s;#' "$injection_marker")
-git check-ref-format "refs/tags/$injection_tag"
+injection_tag=$(printf 'v1.0.0";touch>%s;#' "$injection_marker_name")
+if ! git check-ref-format "refs/tags/$injection_tag"; then
+  echo "release tag contract fixture is not a Git-valid tag" >&2
+  exit 1
+fi
 if make --no-print-directory -C "$root" release-tag-check \
     RELEASE_TAG="$injection_tag" >/dev/null 2>&1; then
   echo "release tag contract accepted a shell metacharacter tag" >&2
