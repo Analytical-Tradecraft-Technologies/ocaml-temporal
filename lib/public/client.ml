@@ -186,6 +186,31 @@ let validate_metadata_fields label fields =
   in
   loop [] fields
 
+(** Validates keys inside each caller-supplied payload before either backend
+    sees it. Native start serializes these lists as JSON objects, while the mock
+    does not serialize them, so the public boundary must enforce one contract. *)
+let validate_payload_metadata label fields =
+  let rec loop = function
+    | [] -> Ok ()
+    | (_, (payload : Payload.t)) :: rest -> (
+        match
+          validate_metadata_fields (label ^ " payload metadata") payload.metadata
+        with
+        | Error _ as error -> error
+        | Ok () -> loop rest)
+  in
+  loop fields
+
+(** Validates both levels of start metadata before encoding input or creating
+    a mock execution. Payload metadata values remain arbitrary binary bytes. *)
+let validate_start_metadata ~memo ~search_attributes =
+  let validate label fields =
+    Result.bind (validate_metadata_fields label fields) (fun () ->
+        validate_payload_metadata label fields)
+  in
+  Result.bind (validate "memo" memo) (fun () ->
+      validate "search attribute" search_attributes)
+
 (** Starts a workflow after encoding its typed input and checking the backend's
     response still refers to the request. The response check prevents an
     adapter bug from creating a handle for a different execution. *)
@@ -201,12 +226,9 @@ let start client ?request_id ?(memo = []) ?(search_attributes = []) ~workflow
     with
     | Error error -> Error error
     | Ok () -> (
-        match validate_metadata_fields "memo" memo with
+        match validate_start_metadata ~memo ~search_attributes with
         | Error error -> Error error
         | Ok () -> (
-          match validate_metadata_fields "search attribute" search_attributes with
-          | Error error -> Error error
-          | Ok () ->
             match Codec.encode (Workflow.input workflow) input with
         | Error error -> Error error
         | Ok encoded_input ->

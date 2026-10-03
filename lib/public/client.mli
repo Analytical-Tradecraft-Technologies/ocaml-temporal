@@ -95,8 +95,10 @@ val create :
     [search_attributes] attaches named indexed payloads used by visibility
     queries. Keys in both collections are non-empty, valid UTF-8, NUL-free, at
     most 65,536 bytes, and unique within their respective collection. Payload
-    values are encoded before the native bridge is called. Search attributes
-    must be registered in the namespace with matching server types. Workers
+    metadata keys obey the same constraints within each payload. Payload
+    metadata values may contain arbitrary bytes. Values are encoded before the
+    native bridge is called. Search attributes must be registered in the
+    namespace with matching server types. Workers
     can read the recorded values through [Workflow.start_metadata].
 
     This client does not expose cron schedules, delayed starts, or workflow

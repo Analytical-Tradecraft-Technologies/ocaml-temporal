@@ -874,6 +874,58 @@ let test_client_identifier_utf_8_validation () =
        ~search_attributes:[ (malformed_utf_8, metadata_value) ] ());
   unwrap (Temporal.Client.shutdown client)
 
+(** Invalid keys inside caller-supplied memo and search-attribute payloads
+    must fail before the mock creates a run, matching the native start encoder.
+    A valid retry with the same workflow ID proves the rejected start was inert.
+    Binary metadata values remain valid because only keys are JSON names. *)
+let test_client_start_payload_metadata_validation () =
+  let client =
+    unwrap
+      (Temporal.Client.create ~target_url:"mock://client"
+         ~namespace:"unit-test" ())
+  in
+  let valid_payload : Temporal.Payload.t =
+    {
+      metadata = [ ("encoding", "json/plain"); ("trace", "\255\000") ];
+      data = Bytes.empty;
+    }
+  in
+  let cases =
+    [
+      ("duplicate", [ ("encoding", "one"); ("encoding", "two") ], "duplicate");
+      ("empty", [ ("", "value") ], "invalid");
+      ("oversized", [ (String.make 65_537 'x', "value") ], "protocol limit");
+      ("utf8", [ (String.make 1 '\255', "value") ], "valid UTF-8");
+    ]
+  in
+  List.iter
+    (fun (case, metadata, diagnostic) ->
+      let invalid_payload : Temporal.Payload.t =
+        { metadata; data = Bytes.empty }
+      in
+      let memo_id = "invalid-inner-memo-" ^ case in
+      expect_error_message_contains "defect" diagnostic
+        (Temporal.Client.start client ~workflow:echo_workflow
+           ~task_queue:"unit-test" ~id:memo_id ~input:"ignored"
+           ~memo:[ ("entry", invalid_payload) ] ());
+      ignore
+        (unwrap
+           (Temporal.Client.start client ~workflow:echo_workflow
+              ~task_queue:"unit-test" ~id:memo_id ~input:"ignored"
+              ~memo:[ ("entry", valid_payload) ] ()));
+      let search_id = "invalid-inner-search-" ^ case in
+      expect_error_message_contains "defect" diagnostic
+        (Temporal.Client.start client ~workflow:echo_workflow
+           ~task_queue:"unit-test" ~id:search_id ~input:"ignored"
+           ~search_attributes:[ ("entry", invalid_payload) ] ());
+      ignore
+        (unwrap
+           (Temporal.Client.start client ~workflow:echo_workflow
+              ~task_queue:"unit-test" ~id:search_id ~input:"ignored"
+              ~search_attributes:[ ("entry", valid_payload) ] ())))
+    cases;
+  unwrap (Temporal.Client.shutdown client)
+
 (** An HTTP-shaped endpoint is deliberately handed to the native configuration
     validator rather than the deterministic mock. The malformed host fails
     before a runtime or network connection is allocated, proving the public
@@ -999,6 +1051,7 @@ let () =
   test_client_validation_errors ();
   test_client_identifier_size_validation ();
   test_client_identifier_utf_8_validation ();
+  test_client_start_payload_metadata_validation ();
   test_native_client_configuration_boundary ();
   test_worker_validation_errors ();
   test_native_worker_configuration_boundary ();
