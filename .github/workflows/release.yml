@@ -32,8 +32,8 @@ jobs:
           set -euo pipefail
           test "$RELEASE_REF" = refs/heads/master
           git check-ref-format "refs/tags/$RELEASE_TAG"
+          sh scripts/check-release-tag.sh . "$RELEASE_TAG"
           make release-preflight
-          make release-tag-check RELEASE_TAG="$RELEASE_TAG"
           # Exit 2 means no matching remote tag; network errors must fail.
           status=0
           git ls-remote --exit-code --tags origin "refs/tags/$RELEASE_TAG" || status=$?
@@ -83,7 +83,7 @@ jobs:
       - name: Assemble and verify release assets
         run: |
           set -euo pipefail
-          make release-tag-check RELEASE_TAG="$RELEASE_TAG"
+          sh scripts/check-release-tag.sh . "$RELEASE_TAG"
           python3 scripts/package-release-bridges.py \
             --bundles _build/release-bundles \
             --ocaml-bundles _build/release-ocaml-bundles \
