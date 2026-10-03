@@ -1784,16 +1784,16 @@ fn validate_terminate_request(
     Ok(())
 }
 
-/// Validates one exact-run reset request and its non-negative event boundary.
+/// Validates one exact-run reset request and its Temporal event boundary.
 fn validate_reset_request(value: &ResetWorkflowRequest) -> Result<(), protocol::ProtocolError> {
     validate_identifier(&value.namespace, "$.namespace")?;
     validate_identifier(&value.workflow_id, "$.workflow_id")?;
     validate_identifier(&value.run_id, "$.run_id")?;
     validate_identifier(&value.request_id, "$.request_id")?;
-    if value.workflow_task_finish_event_id < 0 {
+    if value.workflow_task_finish_event_id <= 1 {
         return Err(protocol::ProtocolError::invalid(
             "$.workflow_task_finish_event_id",
-            "event ID must be non-negative",
+            "event ID must be greater than 1",
         ));
     }
     if value.reason.len() > protocol::MAX_STRING_BYTES {
@@ -2456,19 +2456,21 @@ mod tests {
     }
 
     #[test]
-    /// Negative event boundaries are rejected before any Temporal RPC can be
-    /// attempted, preventing an accidental reset to an invalid history point.
-    fn reset_request_rejects_negative_event_boundary() {
-        let json = serde_json::json!({
-            "namespace":"default",
-            "workflow_id":"workflow-1",
-            "run_id":"run-1",
-            "request_id":"reset-1",
-            "reason":"",
-            "workflow_task_finish_event_id":-1
-        })
-        .to_string();
-        assert!(decode_reset_request(&json).is_err());
+    /// Event IDs at or below the first history event cannot be workflow-task
+    /// finish events, so reject them before attempting a Temporal RPC.
+    fn reset_request_rejects_early_event_boundaries() {
+        for event_id in [-1, 0, 1] {
+            let json = serde_json::json!({
+                "namespace":"default",
+                "workflow_id":"workflow-1",
+                "run_id":"run-1",
+                "request_id":"reset-1",
+                "reason":"",
+                "workflow_task_finish_event_id":event_id
+            })
+            .to_string();
+            assert!(decode_reset_request(&json).is_err());
+        }
     }
 
     #[test]

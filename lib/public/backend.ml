@@ -1009,6 +1009,11 @@ let mock_client_reset (client : mock_client) (request : reset_request) =
     ~finally:(fun () -> Mutex.unlock service.mutex)
     (fun () ->
       if client.closed then Error (bridge_error "client is shut down")
+      else if request.workflow_task_finish_event_id <= 1L then
+        Error
+          (Error.defect
+             ~message:
+               "reset workflow-task finish event ID must be greater than 1")
       else
         match
           Hashtbl.find_opt service.reset_requests

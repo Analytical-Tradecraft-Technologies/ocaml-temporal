@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/mfow/ocaml-temporal/docs/schemas/bridge/client-reset-request.schema.json",
   "title": "OCaml Temporal native client exact-run reset request",
-  "description": "Closed JSON document used only by the private Rust client bridge. The event boundary is a signed Temporal event ID and must be non-negative. Runtime validators also reject duplicate keys, NUL bytes, and strings over the 65,536-byte safety limit; maxLength is the character-count bound expressible in standard JSON Schema.",
+  "description": "Closed JSON document used only by the private Rust client bridge. The event boundary is a signed Temporal workflow-task finish event ID and must be greater than 1. Runtime validators also reject duplicate keys, NUL bytes, and strings over the 65,536-byte safety limit; maxLength is the character-count bound expressible in standard JSON Schema.",
   "type": "object",
   "additionalProperties": false,
   "required": ["namespace", "workflow_id", "run_id", "request_id", "reason", "workflow_task_finish_event_id"],
@@ -12,6 +12,6 @@
     "run_id": {"type": "string", "minLength": 1, "maxLength": 65536, "pattern": "^[^\\u0000]+$"},
     "request_id": {"type": "string", "minLength": 1, "maxLength": 65536, "pattern": "^[^\\u0000]+$"},
     "reason": {"type": "string", "maxLength": 65536, "pattern": "^[^\\u0000]*$"},
-    "workflow_task_finish_event_id": {"type": "integer", "minimum": 0}
+    "workflow_task_finish_event_id": {"type": "integer", "minimum": 2}
   }
 }

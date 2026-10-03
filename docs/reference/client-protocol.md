@@ -266,7 +266,7 @@ the next evidence boundary.
 exact execution up to a supplied workflow-task finish event. It is an
 operator-facing recovery operation: it does not mutate the existing run and
 it never means “reset whichever run is latest”. The public function requires
-the original run handle and a non-negative `workflow_task_finish_event_id`,
+the original run handle and a `workflow_task_finish_event_id` greater than 1,
 then returns the new execution identity on success. Callers use `follow` to
 construct a typed handle for that successor.
 
@@ -312,11 +312,12 @@ match the original handle before exposing it:
 ```
 
 Both sides reject missing, duplicate, or unknown members; empty or NUL-
-containing identifiers; oversized reasons; negative event IDs; and responses
-whose identity does not correlate to the request. A successful response means
-Temporal accepted the reset and supplied a new run identity, not that the new
-run has completed. Call `Temporal.Client.wait` with the returned handle to
-observe it. The request and response schemas are
+containing identifiers; oversized reasons; event IDs at or below 1; and
+responses whose identity does not correlate to the request. A successful
+response means Temporal accepted the reset and supplied a new run identity,
+not that the new run has completed. Call `Temporal.Client.follow` with the
+returned identity,
+then wait on that handle to observe it. The request and response schemas are
 [`client-reset-request.schema.json`](../schemas/bridge/client-reset-request.schema.json)
 and
 [`client-reset-response.schema.json`](../schemas/bridge/client-reset-response.schema.json).
