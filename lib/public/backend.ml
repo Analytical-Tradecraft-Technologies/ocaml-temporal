@@ -990,11 +990,10 @@ let equal_reset_request (left : reset_request) (right : reset_request) =
   && Int64.equal left.workflow_task_finish_event_id
        right.workflow_task_finish_event_id
 
-(** Resets a mock execution while retaining the retired run in exact history.
-    The mock cannot replay history, so it preserves the original input and
-    marks that run terminated before creating a pending successor. Retaining
-    both the old run and the request fingerprint makes exact waits and retries
-    behave like the native Temporal operation. *)
+(** Resets the exact source run retained in history, including a run retired
+    by an earlier reset. The mock cannot replay history, so it preserves the
+    source input and terminates any current pending run before installing the
+    new successor. Closed runs keep their terminal result. *)
 let mock_client_reset (client : mock_client) (request : reset_request) =
   let service = client.service in
   Mutex.lock service.mutex;
@@ -1013,13 +1012,18 @@ let mock_client_reset (client : mock_client) (request : reset_request) =
                    "reset request ID was already used for different reset data"
                  ())
         | None ->
-          match Hashtbl.find_opt service.executions request.workflow_id with
-        | None -> Error (bridge_error "workflow execution was not started")
-        | Some execution
-          when not (String.equal execution.run_id request.run_id) ->
+          match
+            Hashtbl.find_opt service.history
+              (request.workflow_id, request.run_id)
+          with
+        | None when Hashtbl.mem service.executions request.workflow_id ->
             Error (bridge_error "workflow run id does not match the started run")
+        | None -> Error (bridge_error "workflow execution was not started")
         | Some execution ->
-            execution.terminal <- Mock_terminated;
+            (match Hashtbl.find_opt service.executions request.workflow_id with
+            | Some current when current.terminal = Mock_pending ->
+                current.terminal <- Mock_terminated
+            | Some _ | None -> ());
             service.next_run <- service.next_run + 1;
             let run_id = Printf.sprintf "mock-run-%d" service.next_run in
             let successor =

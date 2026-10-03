@@ -285,6 +285,12 @@ reset; if the caller omits it, OCaml derives a deterministic value from the
 exact run and event boundary. Retrying an uncertain transport result with the
 same request ID is therefore safe.
 
+The deterministic `mock://` backend keeps closed runs addressable by their
+exact run IDs. A new request ID may reset the same retained source run again;
+if its previous successor is still running, that successor is terminated
+before the new one starts. Reusing a prior request ID returns its original
+successor instead of creating another run.
+
 Temporal returns the new run ID. The bridge wraps it in the same execution
 object used by `start`, and OCaml verifies that namespace and workflow ID still
 match the original handle before exposing it:
