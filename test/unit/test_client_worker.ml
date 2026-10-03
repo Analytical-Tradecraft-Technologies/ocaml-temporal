@@ -286,6 +286,38 @@ let test_typed_start_and_wait_handle () =
     (Temporal.Client.start client ~workflow:echo_workflow
        ~task_queue:"unit-test" ~id:"after-shutdown" ~input:"ignored" ())
 
+(** Retrying the same accepted explicit start ID returns its first run, while
+    changing request data under that ID is rejected before a second run starts. *)
+let test_mock_start_idempotent_retry () =
+  let client =
+    unwrap
+      (Temporal.Client.create ~target_url:"mock://client"
+         ~namespace:"unit-test" ())
+  in
+  let start input =
+    Temporal.Client.start client ~workflow:echo_workflow
+      ~request_id:"start-retry-1" ~task_queue:"unit-test" ~id:"retry-id"
+      ~input ()
+  in
+  let first = unwrap (start "original") in
+  let retried = unwrap (start "original") in
+  assert (Temporal.Client.run_id first = Temporal.Client.run_id retried);
+  expect_error_message_contains "workflow" "different start data"
+    (start "changed");
+  let visibility =
+    unwrap (Temporal.Client.list_visibility client ~query:"" ())
+  in
+  assert (List.length visibility.executions = 1);
+  (match Temporal.Client.wait first with
+  | Ok (Temporal.Client.Completed "original") -> ()
+  | Ok _ -> failwith "first start returned the wrong result"
+  | Error error -> failwith (Temporal.Error.message error));
+  (match Temporal.Client.wait retried with
+  | Ok (Temporal.Client.Completed "original") -> ()
+  | Ok _ -> failwith "retried start returned the wrong result"
+  | Error error -> failwith (Temporal.Error.message error));
+  unwrap (Temporal.Client.shutdown client)
+
 (** A closed mock run releases its workflow ID for a new run, while its exact
     handle still observes the original result from the retained history. *)
 let test_mock_start_reuses_closed_workflow_id () =
@@ -315,6 +347,17 @@ let test_mock_start_reuses_closed_workflow_id () =
          ~input:"second" ())
   in
   assert (Temporal.Client.run_id first <> Temporal.Client.run_id second);
+  let retried_first =
+    unwrap
+      (Temporal.Client.start client ~workflow:echo_workflow
+         ~request_id:"reuse-first" ~task_queue:"unit-test" ~id:"reuse-id"
+         ~input:"first" ())
+  in
+  assert (Temporal.Client.run_id retried_first = Temporal.Client.run_id first);
+  expect_error_message_contains "workflow" "different start data"
+    (Temporal.Client.start client ~workflow:echo_workflow
+       ~request_id:"reuse-first" ~task_queue:"unit-test" ~id:"reuse-id"
+       ~input:"changed" ());
   (match Temporal.Client.wait first with
   | Ok (Temporal.Client.Completed "first") -> ()
   | Ok _ -> failwith "first exact handle lost its original run"
@@ -983,6 +1026,7 @@ let () =
   test_mock_worker_rejects_async_activity_without_stopping ();
   test_worker_run_after_shutdown_is_rejected ();
   test_typed_start_and_wait_handle ();
+  test_mock_start_idempotent_retry ();
   test_mock_start_reuses_closed_workflow_id ();
   test_client_visibility_listing ();
   test_follow_continued_as_new_handle ();
