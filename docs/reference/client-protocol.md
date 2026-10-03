@@ -293,7 +293,9 @@ loss of precision for histories whose event IDs exceed the exact integer range
 of a JavaScript number. `request_id` is the idempotency key for one logical
 reset; if the caller omits it, OCaml derives a deterministic value from the
 exact run and event boundary. Retrying an uncertain transport result with the
-same request ID is therefore safe.
+same request ID is therefore safe. Temporal scopes reset deduplication to the
+workflow: distinct workflow IDs may use the same explicit request ID without
+colliding, while a retry for one workflow must retain the original reset data.
 
 Temporal returns the new run ID. The bridge wraps it in the same execution
 object used by `start`, and OCaml verifies that namespace and workflow ID still
