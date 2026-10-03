@@ -242,9 +242,10 @@ type mock_service = {
   (** Every run, including runs retired by reset, remains addressable by its
       exact workflow/run pair until the service is released. *)
   history : ((string * string), mock_execution) Hashtbl.t;
-  (** Reset request IDs are retained with their input fingerprint so retries
+  (** Reset request IDs are scoped to a workflow, matching server-side
+      deduplication. Each entry retains its input fingerprint so retries
       return the original successor instead of creating another run. *)
-  reset_requests : (string, mock_reset) Hashtbl.t;
+  reset_requests : ((string * string), mock_reset) Hashtbl.t;
 }
 
 (** A client graph contributes one lifecycle bit to a shared mock service.
@@ -683,7 +684,9 @@ let native_client_start (client : native_client) (request : start_request) :
         in
         await_outcome ()
 
-(** Starts a mock execution and preserves the exact request payload. *)
+(** Starts a mock execution under Temporal's default workflow-ID policies:
+    reject a concurrent run, but allow a new run after the current one closes.
+    Exact old runs remain in [history] after the current slot is replaced. *)
 let mock_client_start (client : mock_client) (request : start_request) =
   let service = client.service in
   Mutex.lock service.mutex;
@@ -691,7 +694,11 @@ let mock_client_start (client : mock_client) (request : start_request) =
     ~finally:(fun () -> Mutex.unlock service.mutex)
     (fun () ->
       if client.closed then Error (bridge_error "client is shut down")
-      else if Hashtbl.mem service.executions request.workflow_id then
+      else if
+        (match Hashtbl.find_opt service.executions request.workflow_id with
+        | Some { terminal = Mock_pending; _ } -> true
+        | Some _ | None -> false)
+      then
         Error
           (Error.make ~non_retryable:true ~category:`Workflow
              ~message:"workflow id already exists" ())
@@ -710,7 +717,7 @@ let mock_client_start (client : mock_client) (request : start_request) =
             signal_requests = Hashtbl.create 8;
           }
         in
-        Hashtbl.add service.executions request.workflow_id execution;
+        Hashtbl.replace service.executions request.workflow_id execution;
         Hashtbl.add service.history (request.workflow_id, run_id) execution;
         let response : start_response =
           { workflow_id = request.workflow_id; run_id }
@@ -992,9 +999,9 @@ let equal_reset_request (left : reset_request) (right : reset_request) =
 
 (** Resets a mock execution while retaining the retired run in exact history.
     The mock cannot replay history, so it preserves the original input and
-    marks that run terminated before creating a pending successor. Retaining
-    both the old run and the request fingerprint makes exact waits and retries
-    behave like the native Temporal operation. *)
+    marks a still-running original as terminated before creating a pending
+    successor. A closed original keeps its terminal result. Retaining both the
+    old run and request fingerprint preserves exact waits and reset retries. *)
 let mock_client_reset (client : mock_client) (request : reset_request) =
   let service = client.service in
   Mutex.lock service.mutex;
@@ -1003,7 +1010,10 @@ let mock_client_reset (client : mock_client) (request : reset_request) =
     (fun () ->
       if client.closed then Error (bridge_error "client is shut down")
       else
-        match Hashtbl.find_opt service.reset_requests request.request_id with
+        match
+          Hashtbl.find_opt service.reset_requests
+            (request.workflow_id, request.request_id)
+        with
         | Some previous when equal_reset_request previous.request request ->
             Ok previous.response
         | Some _ ->
@@ -1019,7 +1029,9 @@ let mock_client_reset (client : mock_client) (request : reset_request) =
           when not (String.equal execution.run_id request.run_id) ->
             Error (bridge_error "workflow run id does not match the started run")
         | Some execution ->
-            execution.terminal <- Mock_terminated;
+            (match execution.terminal with
+            | Mock_pending -> execution.terminal <- Mock_terminated
+            | Mock_completed | Mock_cancelled | Mock_terminated -> ());
             service.next_run <- service.next_run + 1;
             let run_id = Printf.sprintf "mock-run-%d" service.next_run in
             let successor =
@@ -1035,7 +1047,8 @@ let mock_client_reset (client : mock_client) (request : reset_request) =
             Hashtbl.replace service.executions request.workflow_id successor;
             Hashtbl.replace service.history (request.workflow_id, run_id) successor;
             let response = { workflow_id = request.workflow_id; run_id } in
-            Hashtbl.add service.reset_requests request.request_id
+            Hashtbl.add service.reset_requests
+              (request.workflow_id, request.request_id)
               { request; response };
             Ok response)
 
@@ -1191,10 +1204,10 @@ let native_client_list_visibility (client : native_client)
             next_page_token = page.next_page_token;
           }
 
-(** Lists every retained mock run, including executions retired by reset.
-    The mock intentionally accepts only an empty query: it is a unit-test
-    ledger, not a second visibility query language. Native HTTP(S) clients
-    send the caller's full Temporal query. *)
+(** Lists every retained mock run in workflow-ID and run-ID order. A page token
+    resumes after the last exact run returned, even when reset created another
+    run with the same workflow ID. The mock accepts only an empty query;
+    native clients use Temporal's query language. *)
 let mock_client_list_visibility (client : mock_client)
     (request : visibility_request) : (visibility_page, Error.t) result =
   if request.page_size < 1 || request.page_size > 1_000 then
@@ -1203,46 +1216,109 @@ let mock_client_list_visibility (client : mock_client)
     Error (defect "visibility query exceeds the protocol safety limit")
   else if String.contains request.query '\000' then
     Error (defect "visibility query must not contain NUL")
-  else if Option.is_some request.next_page_token then
-    Error (defect "the deterministic mock does not support visibility pagination")
   else if not (String.equal request.query "") then
     Error (defect "the deterministic mock only supports an empty visibility query")
   else
-    let service = client.service in
-    Mutex.lock service.mutex;
-    Fun.protect
-      ~finally:(fun () -> Mutex.unlock service.mutex)
-      (fun () ->
-        if client.closed then Error (bridge_error "client is shut down")
-        else
-          let executions : visibility_execution list =
-            Hashtbl.to_seq service.history
-            |> Seq.map (fun ((workflow_id, _run_id), (execution : mock_execution)) ->
-                   let status =
-                     match execution.terminal with
-                     | Mock_pending -> "running"
-                     | Mock_completed -> "completed"
-                     | Mock_cancelled -> "canceled"
-                     | Mock_terminated -> "terminated"
-                   in
-                   ({
-                      workflow_id;
-                      run_id = execution.run_id;
-                      workflow_type = execution.workflow_type;
-                      task_queue = execution.task_queue;
-                      status;
-                    }
-                     : visibility_execution))
-            |> List.of_seq
-            |> List.sort (fun (left : visibility_execution)
-                              (right : visibility_execution) ->
-                    let workflow_order =
-                      String.compare left.workflow_id right.workflow_id
-                    in
-                    if workflow_order <> 0 then workflow_order
-                    else String.compare left.run_id right.run_id)
-          in
-          Ok ({ executions; next_page_token = None } : visibility_page))
+    let token_prefix = "mock-visibility-v2:" in
+    let cursor =
+      match request.next_page_token with
+      | None -> Ok None
+      | Some token ->
+          if String.starts_with ~prefix:token_prefix token
+             && String.length token > String.length token_prefix
+          then
+            let start = String.length token_prefix in
+            (match String.index_from_opt token start ':' with
+            | None -> Error (defect "invalid mock visibility page token")
+            | Some delimiter ->
+                let length =
+                  String.sub token start (delimiter - start) |> int_of_string_opt
+                in
+                let remaining = String.length token - delimiter - 1 in
+                (match length with
+                | Some length when length > 0 && length < remaining ->
+                    Ok
+                      (Some
+                         ( String.sub token (delimiter + 1) length,
+                           String.sub token (delimiter + 1 + length)
+                             (remaining - length) ))
+                | _ -> Error (defect "invalid mock visibility page token")))
+          else Error (defect "invalid mock visibility page token")
+    in
+    Result.bind cursor (fun cursor ->
+      let service = client.service in
+      Mutex.lock service.mutex;
+      Fun.protect
+        ~finally:(fun () -> Mutex.unlock service.mutex)
+        (fun () ->
+          if client.closed then Error (bridge_error "client is shut down")
+          else if
+            (match cursor with
+            | Some key -> not (Hashtbl.mem service.history key)
+            | None -> false)
+          then Error (defect "invalid mock visibility page token")
+          else
+            let executions : visibility_execution list =
+              Hashtbl.to_seq service.history
+              |> Seq.map (fun ((workflow_id, _run_id), (execution : mock_execution)) ->
+                     let status =
+                       match execution.terminal with
+                       | Mock_pending -> "running"
+                       | Mock_completed -> "completed"
+                       | Mock_cancelled -> "canceled"
+                       | Mock_terminated -> "terminated"
+                     in
+                     ({
+                        workflow_id;
+                        run_id = execution.run_id;
+                        workflow_type = execution.workflow_type;
+                        task_queue = execution.task_queue;
+                        status;
+                      }
+                       : visibility_execution))
+              |> List.of_seq
+              |> List.sort (fun (left : visibility_execution)
+                                (right : visibility_execution) ->
+                      let workflow_order =
+                        String.compare left.workflow_id right.workflow_id
+                      in
+                      if workflow_order <> 0 then workflow_order
+                      else String.compare left.run_id right.run_id)
+            in
+            let remaining =
+              match cursor with
+              | None -> executions
+              | Some (workflow_id, run_id) ->
+                  List.filter
+                    (fun (execution : visibility_execution) ->
+                      let workflow_order =
+                        String.compare execution.workflow_id workflow_id
+                      in
+                      workflow_order > 0
+                      || (workflow_order = 0
+                         && String.compare execution.run_id run_id > 0))
+                    executions
+            in
+            (* A token is present exactly when another row follows this page. *)
+            let rec take_page count last acc = function
+              | [] ->
+                  ({ executions = List.rev acc; next_page_token = None }
+                    : visibility_page)
+              | _ :: _ when count = 0 ->
+                  {
+                    executions = List.rev acc;
+                    next_page_token =
+                      Option.map
+                        (fun (execution : visibility_execution) ->
+                          token_prefix
+                          ^ string_of_int (String.length execution.workflow_id)
+                          ^ ":" ^ execution.workflow_id ^ execution.run_id)
+                        last;
+                  }
+              | execution :: rest ->
+                  take_page (count - 1) (Some execution) (execution :: acc) rest
+            in
+            Ok (take_page request.page_size None [] remaining)))
 
 (** Executes visibility through the selected private transport. *)
 let client_list_visibility client request =
