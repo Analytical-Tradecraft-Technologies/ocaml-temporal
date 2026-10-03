@@ -565,9 +565,9 @@ let resolved result =
 let failed_handle error =
   { future = resolved (Error error); cancel = (fun () -> Error error) }
 
-(** Verifies an optional structured-cancellation scope before validating or
-    encoding an activity request. A cancelled or foreign scope therefore
-    cannot cause a new Temporal command or invoke user codec code. *)
+(** Verifies an optional structured-cancellation scope before encoding and
+    again afterward, since application codec code can cancel that scope. A
+    cancelled or foreign scope cannot cause a new Temporal command. *)
 let check_scope = function
   | None -> Ok ()
   | Some scope -> Scope.check scope
@@ -595,6 +595,9 @@ let start_handle_internal ?scope ?activity_id ?task_queue ?schedule_to_close_tim
           match Codec_private.encode_base definition.input input with
           | Error error -> failed_handle (Error_private.of_base error)
           | Ok input -> (
+              match check_scope scope with
+              | Error error -> failed_handle error
+              | Ok () -> (
               match Temporal_sdk_kernel.Workflow_context_store.current () with
               | None -> failed_handle (outside_error ())
               | Some context ->
@@ -664,7 +667,7 @@ let start_handle_internal ?scope ?activity_id ?task_queue ?schedule_to_close_tim
                       {
                         future = Future_private.of_internal future;
                         cancel = request_cancel;
-                      }))))
+                      })))))
 
 (* Public wrapper keeps the implementation-only [local] switch out of the
    published signature; local callers use the dedicated [start_local] helper. *)

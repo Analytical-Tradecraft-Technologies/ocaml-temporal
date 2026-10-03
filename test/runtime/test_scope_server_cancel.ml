@@ -94,7 +94,76 @@ let test_attached_child_cancellation () =
   end;
   Workflow_context_store.shutdown context
 
+(** Cancels the owning scope synchronously while the public input codec runs. *)
+let cancelling_codec scope =
+  Temporal.Codec.make ~encoding:"scope/cancel-during-encoding"
+    ~encode:(fun () ->
+      match Temporal.Scope.cancel scope with
+      | Ok () -> Ok Bytes.empty
+      | Error error -> Error error)
+    ~decode:(fun _ -> Ok ())
+
+(** Requires a ready cancellation result without waiting for Core. *)
+let expect_cancelled future =
+  match Temporal.Future.peek future with
+  | Some (Error error) when Temporal.Error.kind error = "cancelled" -> ()
+  | Some (Error error) ->
+      failwith ("expected cancellation, got " ^ Temporal.Error.kind error)
+  | Some (Ok ()) -> failwith "cancelled start unexpectedly succeeded"
+  | None -> failwith "cancelled start remained pending"
+
+(** A codec-cancelled scope must not schedule an activity or its cancellation. *)
+let test_activity_cancelled_during_encoding () =
+  let scheduler = Scheduler.create () in
+  let context = Workflow_context_store.create scheduler in
+  with_context scheduler context (fun () ->
+      match Temporal.Scope.create () with
+      | Error error -> failwith (Temporal.Error.message error)
+      | Ok scope ->
+          let definition =
+            Temporal.Activity.remote ~name:"cancel-during-activity-encoding"
+              ~input:(cancelling_codec scope) ~output:Temporal.Codec.unit
+          in
+          let handle = Temporal.Activity.start_handle ~scope definition () in
+          expect_cancelled (Temporal.Activity.future handle));
+  begin match Scheduler.run scheduler with
+  | Scheduler.Failed exception_ ->
+      failwith ("activity scheduler failed: " ^ Printexc.to_string exception_)
+  | Scheduler.Complete | Scheduler.Blocked -> ()
+  end;
+  if Workflow_context_store.take_commands context <> [] then
+    failwith "codec-cancelled activity emitted a Temporal command";
+  Workflow_context_store.shutdown context
+
+(** A codec-cancelled scope must not start a child or request its cancellation. *)
+let test_child_cancelled_during_encoding () =
+  let scheduler = Scheduler.create () in
+  let context = Workflow_context_store.create scheduler in
+  with_context scheduler context (fun () ->
+      match Temporal.Scope.create () with
+      | Error error -> failwith (Temporal.Error.message error)
+      | Ok scope ->
+          let definition =
+            Temporal.Workflow.remote ~name:"cancel-during-child-encoding"
+              ~input:(cancelling_codec scope) ~output:Temporal.Codec.unit
+          in
+          let handle =
+            Temporal.Child_workflow.start_handle ~scope ~id:"cancel-during-child"
+              definition ()
+          in
+          expect_cancelled (Temporal.Child_workflow.future handle));
+  begin match Scheduler.run scheduler with
+  | Scheduler.Failed exception_ ->
+      failwith ("child scheduler failed: " ^ Printexc.to_string exception_)
+  | Scheduler.Complete | Scheduler.Blocked -> ()
+  end;
+  if Workflow_context_store.take_commands context <> [] then
+    failwith "codec-cancelled child emitted a Temporal command";
+  Workflow_context_store.shutdown context
+
 (** Runs the focused server-side cancellation assertion. *)
 let () =
   test_attached_activity_cancellation ();
-  test_attached_child_cancellation ()
+  test_attached_child_cancellation ();
+  test_activity_cancelled_during_encoding ();
+  test_child_cancelled_during_encoding ()
