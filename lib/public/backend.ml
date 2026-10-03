@@ -998,9 +998,9 @@ let equal_reset_request (left : reset_request) (right : reset_request) =
 
 (** Resets a mock execution while retaining the retired run in exact history.
     The mock cannot replay history, so it preserves the original input and
-    marks that run terminated before creating a pending successor. Retaining
-    both the old run and the request fingerprint makes exact waits and retries
-    behave like the native Temporal operation. *)
+    marks a still-running original as terminated before creating a pending
+    successor. A closed original keeps its terminal result. Retaining both the
+    old run and request fingerprint preserves exact waits and reset retries. *)
 let mock_client_reset (client : mock_client) (request : reset_request) =
   let service = client.service in
   Mutex.lock service.mutex;
@@ -1025,7 +1025,9 @@ let mock_client_reset (client : mock_client) (request : reset_request) =
           when not (String.equal execution.run_id request.run_id) ->
             Error (bridge_error "workflow run id does not match the started run")
         | Some execution ->
-            execution.terminal <- Mock_terminated;
+            (match execution.terminal with
+            | Mock_pending -> execution.terminal <- Mock_terminated
+            | Mock_completed | Mock_cancelled | Mock_terminated -> ());
             service.next_run <- service.next_run + 1;
             let run_id = Printf.sprintf "mock-run-%d" service.next_run in
             let successor =

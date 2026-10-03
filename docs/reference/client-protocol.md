@@ -267,7 +267,12 @@ exact execution up to a supplied workflow-task finish event. It is an
 operator-facing recovery operation: it does not mutate the existing run and
 it never means “reset whichever run is latest”. The public function requires
 the original run handle and a non-negative `workflow_task_finish_event_id`,
-then returns a new exact-run handle on success.
+then returns the new execution identity on success. Callers use `follow` to
+construct a typed handle for that successor.
+
+The deterministic `mock://` backend terminates an original run that is still
+pending when it is reset. An already closed original keeps its completed,
+canceled, or terminated result while the successor starts as a new run.
 
 The private request is a closed object:
 

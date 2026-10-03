@@ -607,6 +607,43 @@ let test_completed_mock_run_is_immutable () =
   | Error error -> failwith (Temporal.Error.message error));
   unwrap (Temporal.Client.shutdown client)
 
+(** Resetting a completed run creates a successor without rewriting the
+    original exact handle's immutable completed result. *)
+let test_reset_preserves_completed_mock_run () =
+  let client =
+    unwrap
+      (Temporal.Client.create ~target_url:"mock://client"
+         ~namespace:"unit-test" ())
+  in
+  let handle =
+    unwrap
+      (Temporal.Client.start client ~workflow:echo_workflow
+         ~task_queue:"unit-test" ~id:"unit-completed-reset" ~input:"done"
+         ())
+  in
+  (match Temporal.Client.wait handle with
+  | Ok (Temporal.Client.Completed "done") -> ()
+  | Ok _ -> failwith "completed mock run returned the wrong first result"
+  | Error error -> failwith (Temporal.Error.message error));
+  let successor =
+    unwrap
+      (Temporal.Client.reset ~request_id:"reset-completed-1"
+         ~reason:"replay after fix" ~workflow_task_finish_event_id:4L handle)
+  in
+  assert (successor.run_id <> Temporal.Client.run_id handle);
+  (match Temporal.Client.wait handle with
+  | Ok (Temporal.Client.Completed "done") -> ()
+  | Ok _ -> failwith "reset rewrote the completed mock run"
+  | Error error -> failwith (Temporal.Error.message error));
+  let successor_handle =
+    unwrap (Temporal.Client.follow client ~workflow:echo_workflow successor)
+  in
+  (match Temporal.Client.wait successor_handle with
+  | Ok (Temporal.Client.Completed "done") -> ()
+  | Ok _ -> failwith "reset successor returned the wrong result"
+  | Error error -> failwith (Temporal.Error.message error));
+  unwrap (Temporal.Client.shutdown client)
+
 (** A signal is sent to the exact handle run and acknowledged independently of
     waiting. Repeating an explicit request ID remains accepted by the
     deterministic mock, matching Temporal's retry-safe control operation shape.
@@ -910,6 +947,7 @@ let () =
   test_exact_run_reset ();
   test_exact_run_termination ();
   test_completed_mock_run_is_immutable ();
+  test_reset_preserves_completed_mock_run ();
   test_exact_run_signal ();
   test_default_signal_request_ids_are_process_wide ();
   test_client_validation_errors ();
