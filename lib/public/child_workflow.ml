@@ -89,9 +89,9 @@ let runtime_cancellation_type = function
 let failed_handle error =
   { future = resolved (Error error); cancel = (fun ~reason:_ -> Error error) }
 
-(** Verifies an optional structured-cancellation scope before validating or
-    encoding a child request. This keeps a cancelled scope from emitting a
-    new start command or invoking application codecs. *)
+(** Verifies an optional structured-cancellation scope before encoding and
+    again afterward, since application codec code can cancel that scope. This
+    keeps a cancelled scope from emitting a new start command. *)
 let check_scope = function
   | None -> Ok ()
   | Some scope -> Scope.check scope
@@ -109,7 +109,10 @@ let start_handle ?scope ?(cancellation_type = Try_cancel) ?retry_policy ~id
       | Ok () ->
           match Codec_private.encode_base (Workflow.input definition) input with
           | Error error -> failed_handle (Error_private.of_base error)
-          | Ok input ->
+          | Ok input -> (
+              match check_scope scope with
+              | Error error -> failed_handle error
+              | Ok () ->
               match Temporal_sdk_kernel.Workflow_context_store.current () with
               | None -> failed_handle (outside_error ())
               | Some context ->
@@ -143,7 +146,7 @@ let start_handle ?scope ?(cancellation_type = Try_cancel) ?retry_policy ~id
                   {
                     future = Future_private.of_internal future;
                     cancel = request_cancel;
-                  }
+                  })
 
 (** Returns the typed future associated with an operation handle. *)
 let future handle = handle.future
