@@ -677,3 +677,10 @@ let _result_map : ('a, 'error) result -> ('a -> 'b) -> ('b, 'error) result =
 (** Installed consumers can inspect start metadata without private types. *)
 let _workflow_start_metadata : unit -> (T.Workflow.start_metadata, T.Error.t) result =
   T.Workflow.start_metadata
+
+(** Compiles explicit child routing and lifecycle options through the installed
+    public package, so private type leakage cannot hide in source-tree tests. *)
+let _routed_child definition input =
+  T.Child_workflow.start ~id:"cross-sdk-child" ~task_queue:"go-llm-worker"
+    ~parent_close_policy:T.Child_workflow.Parent_close_policy.Abandon
+    definition input

@@ -217,7 +217,7 @@ let test_child_workflow_cancellation () =
   expect "child cancellation commands"
     [
       Activation.Start_child_workflow
-        {
+        { task_queue = None; parent_close_policy = None;
           seq = 1L;
           id = "cancel-me";
           name = "greeting_child";
@@ -309,7 +309,7 @@ let test_default_child_workflow_cancellation_policy () =
   expect "default child cancellation commands"
     [
       Activation.Start_child_workflow
-        {
+        { task_queue = None; parent_close_policy = None;
           seq = 1L;
           id = "default-cancel-me";
           name = "greeting_child";
@@ -696,7 +696,7 @@ let test_child_workflow_completion () =
   expect "child schedule command"
     [
       Activation.Start_child_workflow
-        {
+        { task_queue = None; parent_close_policy = None;
           seq = 1L;
           id = "greeting/Ada";
           name = "greeting_child";
@@ -723,7 +723,7 @@ let test_child_workflow_retry_policy () =
   expect "child retry policy command"
     [
       Activation.Start_child_workflow
-        {
+        { task_queue = None; parent_close_policy = None;
           seq = 1L;
           id = "retrying-child";
           name = "greeting_child";
@@ -762,7 +762,7 @@ let test_child_workflow_concurrency_and_decoding () =
   expect "child and activity command order"
     [
       Activation.Start_child_workflow
-        {
+        { task_queue = None; parent_close_policy = None;
           seq = 1L;
           id = "child-1";
           name = "greeting_child";
@@ -924,7 +924,7 @@ let test_child_workflow_id_boundary () =
   expect "invalid child IDs consume no sequence"
     [
       Activation.Start_child_workflow
-        {
+        { task_queue = None; parent_close_policy = None;
           seq = 1L;
           id = "after-invalid";
           name = "greeting_child";
@@ -1267,7 +1267,7 @@ let test_child_cancel_after_natural_completion_is_noop () =
   expect "natural-completion start command"
     [
       Activation.Start_child_workflow
-        {
+        { task_queue = None; parent_close_policy = None;
           seq = 1L;
           id = "late-cancel-child";
           name = "child-workflow";
@@ -1997,7 +1997,49 @@ let test_workflow_search_attribute_upsert () =
         failwith "search-attribute payload was not retained"
   | _ -> failwith "search-attribute upsert emitted an unexpected command sequence"
 
+(** Verifies public child routing and parent closure remain separate from
+    explicit cancellation, and survive the native protocol translation. *)
+let test_child_routing_and_parent_close () =
+  List.iteri (fun index (public_policy, runtime_policy, protocol_policy) ->
+    let parent = Temporal.Workflow.define ~name:"routed_parent"
+      ~input:Temporal.Codec.unit ~output:Temporal.Codec.string (fun () ->
+        Temporal.Child_workflow.execute ~task_queue:"go-llm-worker"
+          ~parent_close_policy:public_policy ~id:"paid-child" greeting_child "Ada") in
+    let execution = Execution.start ~task_queue:"ocaml-parent" parent () in
+    match Execution.activate execution [Activation.Start_workflow] with
+    | [Activation.Start_child_workflow command as emitted] ->
+        if command.seq <> 1L || command.task_queue <> Some "go-llm-worker"
+           || command.parent_close_policy <> Some runtime_policy
+           || command.cancellation_type <> Activation.Child_try_cancel then
+          failwith ("lost public child options " ^ string_of_int index);
+        (match Temporal_runtime.Native_execution.command_to_protocol emitted with
+         | Ok (Protocol.Start_child_workflow translated) when
+             translated.task_queue = Some "go-llm-worker"
+             && translated.parent_close_policy = Some protocol_policy -> ()
+         | _ -> failwith "lost native child routing or parent-close policy")
+    | _ -> failwith "child options did not emit exactly one start")
+    [Temporal.Child_workflow.Parent_close_policy.Terminate, Activation.Parent_terminate, Protocol.Parent_terminate;
+     Temporal.Child_workflow.Parent_close_policy.Abandon, Activation.Parent_abandon, Protocol.Parent_abandon;
+     Temporal.Child_workflow.Parent_close_policy.Request_cancel, Activation.Parent_request_cancel, Protocol.Parent_request_cancel]
+
+(** Invalid queues return ready typed failures without consuming the next
+    sequence; UTF-8 routing is validated before user codec execution. *)
+let test_invalid_child_queue_is_inert () =
+  let parent = Temporal.Workflow.define ~name:"invalid_child_queue"
+      ~input:Temporal.Codec.unit ~output:Temporal.Codec.string (fun () ->
+    List.iter (fun task_queue ->
+      let future = Temporal.Child_workflow.start ~task_queue ~id:"invalid" greeting_child "Ada" in
+      match Temporal.Future.await future with
+      | Error _ -> () | Ok _ -> failwith "invalid queue accepted")
+      [""; "bad\000queue"; "\255"; String.make 65_537 'q'];
+    Temporal.Child_workflow.execute ~task_queue:"go-worker" ~id:"valid" greeting_child "Ada") in
+  match Execution.activate (Execution.start parent ()) [Activation.Start_workflow] with
+  | [Activation.Start_child_workflow {seq = 1L; task_queue = Some "go-worker"; _}] -> ()
+  | _ -> failwith "invalid queue emitted a command or consumed sequence"
+
 let () =
+  test_child_routing_and_parent_close ();
+  test_invalid_child_queue_is_inert ();
   test_commands_and_completion ();
   test_activity_options_and_queue ();
   test_invalid_activity_options_do_not_schedule ();

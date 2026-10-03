@@ -85,6 +85,13 @@ type activity_cancellation_type =
   | Wait_cancellation_completed
   | Abandon
 
+(** The server action when a parent closes, independent of explicit cancellation.
+    An absent policy preserves the server default. *)
+type child_workflow_parent_close_policy =
+  | Parent_terminate
+  | Parent_abandon
+  | Parent_request_cancel
+
 (** Controls when Core resolves a parent future after a child cancellation
     request.  [Abandon] reports cancellation without asking the child worker;
     [Try_cancel] requests cancellation and resolves immediately; the two wait
@@ -148,6 +155,8 @@ type command =
       cancellation_type : activity_cancellation_type;
     }
   | Start_child_workflow of {
+      task_queue : string option;
+      parent_close_policy : child_workflow_parent_close_policy option;
       seq : int64;
       id : string;
       name : string;

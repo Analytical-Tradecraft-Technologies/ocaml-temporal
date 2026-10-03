@@ -490,6 +490,8 @@ fn converts_start_child_workflow_command() {
         task_failure: None,
         run_id: "parent-run".to_owned(),
         commands: vec![workflow_protocol::CompletionCommand::StartChildWorkflow {
+            task_queue: None,
+            parent_close_policy: None,
             seq: 2,
             workflow_id: "child/1".to_owned(),
             workflow_type: "child".to_owned(),
@@ -537,7 +539,7 @@ fn converts_start_child_workflow_command() {
     else {
         panic!("child command must map to Core's start-child variant");
     };
-    child.task_queue = "child-queue".to_owned();
+    child.workflow_id_reuse_policy = 1;
     assert_eq!(
         workflow_protocol::completion_from_core(&unsupported)
             .unwrap_err()
@@ -708,6 +710,8 @@ fn injects_worker_namespace_into_child_workflow_command() {
         task_failure: None,
         run_id: "parent-run".to_owned(),
         commands: vec![workflow_protocol::CompletionCommand::StartChildWorkflow {
+            task_queue: None,
+            parent_close_policy: None,
             seq: 1,
             workflow_id: "child/1".to_owned(),
             workflow_type: "child".to_owned(),
@@ -784,6 +788,8 @@ fn converts_all_child_cancellation_policies() {
             task_failure: None,
             run_id: "parent-run".to_owned(),
             commands: vec![workflow_protocol::CompletionCommand::StartChildWorkflow {
+                task_queue: None,
+                parent_close_policy: None,
                 seq: 2,
                 workflow_id: "child/1".to_owned(),
                 workflow_type: "child".to_owned(),
@@ -908,6 +914,8 @@ fn rejects_invalid_child_cancellation_commands() {
         task_failure: None,
         run_id: "parent-run".to_owned(),
         commands: vec![workflow_protocol::CompletionCommand::StartChildWorkflow {
+            task_queue: None,
+            parent_close_policy: None,
             seq: 7,
             workflow_id: "child\0".to_owned(),
             workflow_type: "child".to_owned(),
@@ -3444,4 +3452,96 @@ fn task_failure_preserves_the_workflow_execution() {
         ..completion
     };
     assert!(workflow_protocol::completion_to_core(&invalid).is_err());
+}
+
+/// Checks routing and every explicit parent-close policy through JSON and Core.
+/// Cancellation remains TryCancel independently of what parent closure does.
+#[test]
+fn child_routing_and_parent_close_round_trip() {
+    use workflow_protocol::{ChildWorkflowParentClosePolicy as Policy, CompletionCommand};
+    for (policy, expected) in [
+        (None, 0),
+        (Some(Policy::Terminate), 1),
+        (Some(Policy::Abandon), 2),
+        (Some(Policy::RequestCancel), 3),
+    ] {
+        let completion = workflow_protocol::Completion {
+            run_id: "parent-run".into(),
+            task_failure: None,
+            commands: vec![CompletionCommand::StartChildWorkflow {
+                seq: 1,
+                task_queue: Some("go-llm-worker".into()),
+                parent_close_policy: policy,
+                workflow_id: "paid-child".into(),
+                workflow_type: "llm.generate.workflow.v1".into(),
+                input: vec![],
+                retry_policy: None,
+                cancellation_type: workflow_protocol::ChildWorkflowCancellationType::TryCancel,
+            }],
+        };
+        let encoded = workflow_protocol::encode_completion(&completion).unwrap();
+        assert_eq!(
+            workflow_protocol::decode_completion(&encoded).unwrap(),
+            completion
+        );
+        let core = workflow_protocol::completion_to_core(&completion).unwrap();
+        let Some(core_completion::workflow_activation_completion::Status::Successful(success)) =
+            core.status.as_ref()
+        else {
+            panic!("expected successful completion");
+        };
+        let Some(core_commands::workflow_command::Variant::StartChildWorkflowExecution(child)) =
+            success.commands[0].variant.as_ref()
+        else {
+            panic!("expected child start");
+        };
+        assert_eq!(child.task_queue, "go-llm-worker");
+        assert_eq!(child.parent_close_policy, expected);
+        assert_eq!(child.cancellation_type, 1);
+        assert_eq!(
+            workflow_protocol::completion_from_core(&core).unwrap(),
+            completion
+        );
+        let mut unknown = core;
+        let Some(core_completion::workflow_activation_completion::Status::Successful(success)) =
+            unknown.status.as_mut()
+        else {
+            unreachable!()
+        };
+        let Some(core_commands::workflow_command::Variant::StartChildWorkflowExecution(child)) =
+            success.commands[0].variant.as_mut()
+        else {
+            unreachable!()
+        };
+        child.parent_close_policy = 99;
+        assert!(workflow_protocol::completion_from_core(&unknown).is_err());
+    }
+}
+
+/// Rejects malformed explicit options at the semantic boundary while retaining
+/// compatibility with child documents that omit both newly exposed options.
+#[test]
+fn child_options_are_closed_and_validated() {
+    let original = r#"{"run_id":"run","commands":[{"kind":"start_child_workflow","seq":1,"workflow_id":"child","workflow_type":"child","input":[],"retry_policy":null,"cancellation_type":"try_cancel"}]}"#;
+    let decoded = workflow_protocol::decode_completion(original).unwrap();
+    let canonical = workflow_protocol::encode_completion(&decoded).unwrap();
+    assert!(!canonical.contains("task_queue"));
+    assert!(!canonical.contains("parent_close_policy"));
+    for field in [
+        r#""task_queue":"","#,
+        r#""task_queue":"bad\u0000queue","#,
+        r#""task_queue":23,"#,
+        r#""parent_close_policy":"unknown","#,
+        r#""parent_close_policy":1,"#,
+        r#""task_queue":"a","task_queue":"b","#,
+    ] {
+        let malformed = original.replace(
+            r#""kind":"start_child_workflow","#,
+            &format!(r#"{field}"kind":"start_child_workflow","#),
+        );
+        assert!(
+            workflow_protocol::decode_completion(&malformed).is_err(),
+            "accepted {field}"
+        );
+    }
 }

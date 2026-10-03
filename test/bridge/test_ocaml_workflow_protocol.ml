@@ -566,7 +566,7 @@ let test_start_child_workflow_command () =
       commands =
         [
           Start_child_workflow
-            {
+            { task_queue = None; parent_close_policy = None;
               seq = 2L;
               workflow_id = "child/1";
               workflow_type = "child";
@@ -654,7 +654,7 @@ let test_all_child_cancellation_policies () =
           commands =
             [
               Start_child_workflow
-                {
+                { task_queue = None; parent_close_policy = None;
                   seq = 2L;
                   workflow_id = "child/1";
                   workflow_type = "child";
@@ -746,7 +746,7 @@ let test_child_cancellation_validation () =
       commands =
         [
           Start_child_workflow
-            {
+            { task_queue = None; parent_close_policy = None;
               seq = 7L;
               workflow_id = invalid_utf8;
               workflow_type = "child";
@@ -1461,7 +1461,31 @@ let run name test =
     Printf.eprintf "FAIL %s: %s\n%!" name (Printexc.to_string exn);
     exit 1
 
+(** Verifies new options round-trip, malformed values fail closed, and old
+    omitted options retain their canonical representation. *)
+let test_child_routing_options () =
+  let original = {|{"run_id":"run","commands":[{"kind":"start_child_workflow","seq":1,"workflow_id":"child","workflow_type":"child","input":[],"retry_policy":null,"cancellation_type":"try_cancel"}]}|} in
+  let decoded = unwrap (Protocol.decode_completion original) in
+  List.iter (fun policy ->
+    let completion = { decoded with commands = [Protocol.Start_child_workflow {
+      seq = 1L; workflow_id = "child"; workflow_type = "child"; input = [];
+      retry_policy = None; cancellation_type = Protocol.Child_try_cancel;
+      task_queue = Some "go-llm-worker"; parent_close_policy = policy;
+    }] } in
+    if unwrap (Protocol.decode_completion (unwrap (Protocol.encode_completion completion))) <> completion then
+      failwith "child options did not round trip")
+    [None; Some Protocol.Parent_terminate; Some Protocol.Parent_abandon; Some Protocol.Parent_request_cancel];
+  List.iter (fun field ->
+    let malformed = {|{"run_id":"run","commands":[{|} ^ field ^
+      {|"kind":"start_child_workflow","seq":1,"workflow_id":"child","workflow_type":"child","input":[],"retry_policy":null,"cancellation_type":"try_cancel"}]}|} in
+    match Protocol.decode_completion malformed with
+    | Error _ -> () | Ok _ -> failwith "invalid child option accepted")
+    [{|"task_queue":"",|}; {|"task_queue":"bad\u0000queue",|};
+     {|"task_queue":23,|}; {|"parent_close_policy":"unknown",|};
+     {|"parent_close_policy":1,|}; {|"task_queue":"a","task_queue":"b",|}]
+
 let () =
+  test_child_routing_options ();
   run "terminated failure info" test_terminated_failure_info;
   run "workflow activations" test_valid_activations;
   run "invalid reset seeds" test_invalid_reset_seeds;

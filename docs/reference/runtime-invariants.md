@@ -138,6 +138,10 @@ and bridge, read the [documentation guide](../README.md) first.
   payload. A start failure removes and resolves the future immediately. A
   terminal result before start, duplicate acknowledgment, or unknown sequence
   is a non-retryable bridge defect; no event is silently dropped.
+- Child task queues are optional validated identifiers. Explicit routing and
+  parent-close policy survive runtime, JSON, and Core translation unchanged.
+  Omission preserves existing server defaults and default command bytes. Parent
+  closure and explicit child cancellation remain separate policy choices.
 - Activities, child workflows, and timers share one monotonic command sequence.
 - A terminated child resolves its pending future with a typed child-workflow
   error, including the termination cause and identity in its diagnostic. The

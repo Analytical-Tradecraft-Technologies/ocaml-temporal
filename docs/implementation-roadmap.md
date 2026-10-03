@@ -146,3 +146,8 @@ defines classification, cache/acknowledgement ownership, and the focused and
 exact-run live recovery gates. This is a prerequisite for broad fault and
 conformance qualification; passing the bounded recovery fixture does not claim
 those later qualification gates complete.
+
+The child-workflow API now exposes explicit task queues and parent-close policies
+through the public runtime and bilateral Core bridge. Focused deterministic and
+protocol tests qualify these options; live cross-queue routing and parent-close
+acceptance remain part of phase 4.

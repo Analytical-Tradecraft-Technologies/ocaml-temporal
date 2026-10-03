@@ -300,9 +300,12 @@ external workflow, starting and cancelling timers, and completing,
 failing, or cancelling the workflow. A child start includes an explicit
 cancellation policy, and a later cancel command carries a validated reason;
 Core applies that policy while preserving command order for replay. The child
-command deliberately omits namespace, task queue, timeout, retry, header,
-memo, search-attribute, versioning, and priority fields because the current
-OCaml runtime does not expose them. For a live or replay worker, Rust injects
+command carries retry policy and optional `task_queue` and `parent_close_policy`
+fields. Parent-close values are `terminate`, `abandon`, and `request_cancel`;
+omission or null retains the Core/server default. Omitted new fields remain
+omitted on encoding, preserving existing default command bytes. The command
+omits namespace, timeouts, reuse policy, headers, memo, search attributes,
+versioning, and priority because the current OCaml runtime does not expose them. For a live or replay worker, Rust injects
 the worker's already-validated namespace into Core's child-start command before
 submission; this is worker configuration, not workflow input. The remaining
 omitted Core fields receive explicit defaults and non-default values are
