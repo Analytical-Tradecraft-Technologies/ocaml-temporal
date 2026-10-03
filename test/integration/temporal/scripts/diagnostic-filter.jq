@@ -5,7 +5,7 @@
 # the rest of that source is suppressed because unlabeled continuation lines
 # cannot be reliably classified. Filtering precedes the rolling-tail limit.
 def sensitive:
-  test("(?i)(password|passwd|secret|token|authorization|credential|bearer|private.key|payload|(?:input|result|output)[\"'[:space:]]*[=:]|://[^ /]+@|(?:BEGIN|END) .*?(?:KEY|CERTIFICATE))")
+  test("(?i)(password|passwd|secret|token|authorization|credential|bearer|api[._[:space:]-]*key|cookie|private.key|payload|(?:input|result|output)[\"'[:space:]]*[=:]|://[^ /]+@|(?:BEGIN|END) .*?(?:KEY|CERTIFICATE))")
   or test("^\\s*[A-Za-z0-9+/=]{24,}\\s*$");
 def secret_values:
   [env | to_entries[]
