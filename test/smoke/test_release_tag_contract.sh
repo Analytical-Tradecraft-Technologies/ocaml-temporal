@@ -27,6 +27,21 @@ set_fixture_version 1.0.0~beta.1
 sh "$script" "$fixture" v1.0.0-beta.1
 sh "$script" "$fixture" v1.0.0~beta.1
 
+# Git accepts some shell metacharacters in ref names. A release tag must never
+# become shell source when passed through the public Make target.
+injection_marker="$fixture/make-injected"
+injection_tag=$(printf 'v1.0.0";touch>%s;#' "$injection_marker")
+git check-ref-format "refs/tags/$injection_tag"
+if make --no-print-directory -C "$root" release-tag-check \
+    RELEASE_TAG="$injection_tag" >/dev/null 2>&1; then
+  echo "release tag contract accepted a shell metacharacter tag" >&2
+  exit 1
+fi
+if [ -e "$injection_marker" ]; then
+  echo "release tag contract executed untrusted tag content" >&2
+  exit 1
+fi
+
 if sh "$script" "$fixture" 0.1.0 >/dev/null 2>&1; then
   echo "release tag contract accepted a tag without v prefix" >&2
   exit 1
