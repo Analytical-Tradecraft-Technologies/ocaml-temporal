@@ -170,8 +170,7 @@ release-preflight:
 # This is deliberately host-only so a release cannot spend time building an
 # artifact whose version metadata is inconsistent.
 release-tag-check:
-	@test -n "$(RELEASE_TAG)" || { echo "set RELEASE_TAG=vMAJOR.MINOR.PATCH" >&2; exit 2; }
-	sh scripts/check-release-tag.sh . "$(RELEASE_TAG)"
+	@sh scripts/check-release-tag.sh .
 
 # Source-only documentation inventory, shared by the Linux/native test gates.
 .PHONY: check-live-acceptance-inventory update-live-acceptance-inventory test-live-acceptance-inventory-contract
