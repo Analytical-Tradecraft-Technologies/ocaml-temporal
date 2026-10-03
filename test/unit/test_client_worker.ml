@@ -518,6 +518,51 @@ let test_exact_run_reset () =
     ];
   unwrap (Temporal.Client.shutdown client)
 
+(** Reset deduplication belongs to one workflow, even when the mock service
+    ledger is shared. Independent workflows may reuse an explicit request ID;
+    each still returns its own successor on retry and rejects changed data. *)
+let test_reset_request_id_is_scoped_to_workflow () =
+  let client =
+    unwrap
+      (Temporal.Client.create ~target_url:"mock://client"
+         ~namespace:"unit-test" ())
+  in
+  let start id input =
+    unwrap
+      (Temporal.Client.start client ~workflow:echo_workflow
+         ~task_queue:"unit-test" ~id ~input ())
+  in
+  let first = start "unit-reset-scope-a" "first" in
+  let second = start "unit-reset-scope-b" "second" in
+  let reset handle =
+    unwrap
+      (Temporal.Client.reset ~request_id:"shared-reset-id"
+         ~reason:"retryable reset" ~workflow_task_finish_event_id:4L handle)
+  in
+  let first_successor = reset first in
+  let second_successor = reset second in
+  assert (first_successor.workflow_id = "unit-reset-scope-a");
+  assert (second_successor.workflow_id = "unit-reset-scope-b");
+  assert (first_successor.run_id <> second_successor.run_id);
+  assert ((reset first).run_id = first_successor.run_id);
+  assert ((reset second).run_id = second_successor.run_id);
+  expect_error "workflow"
+    (Temporal.Client.reset ~request_id:"shared-reset-id"
+       ~reason:"changed reset" ~workflow_task_finish_event_id:4L first);
+  assert ((reset second).run_id = second_successor.run_id);
+  let expect_success execution expected =
+    let handle =
+      unwrap (Temporal.Client.follow client ~workflow:echo_workflow execution)
+    in
+    match Temporal.Client.wait handle with
+    | Ok (Temporal.Client.Completed actual) when actual = expected -> ()
+    | Ok _ -> failwith "reset successor returned an unexpected result"
+    | Error error -> failwith (Temporal.Error.message error)
+  in
+  expect_success first_successor "first";
+  expect_success second_successor "second";
+  unwrap (Temporal.Client.shutdown client)
+
 (** A late cancellation request cannot rewrite a terminal result that the mock
     has already exposed. This protects the deterministic seam from modelling
     mutable terminal history unlike a real Temporal execution. *)
@@ -846,6 +891,7 @@ let () =
   test_follow_rejects_cross_namespace_execution ();
   test_exact_run_cancellation ();
   test_exact_run_reset ();
+  test_reset_request_id_is_scoped_to_workflow ();
   test_exact_run_termination ();
   test_completed_mock_run_is_immutable ();
   test_exact_run_signal ();

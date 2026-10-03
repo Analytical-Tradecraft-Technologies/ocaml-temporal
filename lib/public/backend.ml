@@ -242,9 +242,10 @@ type mock_service = {
   (** Every run, including runs retired by reset, remains addressable by its
       exact workflow/run pair until the service is released. *)
   history : ((string * string), mock_execution) Hashtbl.t;
-  (** Reset request IDs are retained with their input fingerprint so retries
+  (** Reset request IDs are scoped to a workflow, matching server-side
+      deduplication. Each entry retains its input fingerprint so retries
       return the original successor instead of creating another run. *)
-  reset_requests : (string, mock_reset) Hashtbl.t;
+  reset_requests : ((string * string), mock_reset) Hashtbl.t;
 }
 
 (** A client graph contributes one lifecycle bit to a shared mock service.
@@ -1003,7 +1004,10 @@ let mock_client_reset (client : mock_client) (request : reset_request) =
     (fun () ->
       if client.closed then Error (bridge_error "client is shut down")
       else
-        match Hashtbl.find_opt service.reset_requests request.request_id with
+        match
+          Hashtbl.find_opt service.reset_requests
+            (request.workflow_id, request.request_id)
+        with
         | Some previous when equal_reset_request previous.request request ->
             Ok previous.response
         | Some _ ->
@@ -1035,7 +1039,8 @@ let mock_client_reset (client : mock_client) (request : reset_request) =
             Hashtbl.replace service.executions request.workflow_id successor;
             Hashtbl.replace service.history (request.workflow_id, run_id) successor;
             let response = { workflow_id = request.workflow_id; run_id } in
-            Hashtbl.add service.reset_requests request.request_id
+            Hashtbl.add service.reset_requests
+              (request.workflow_id, request.request_id)
               { request; response };
             Ok response)
 
