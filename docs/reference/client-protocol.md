@@ -770,3 +770,9 @@ and
 [`client-visibility-response.schema.json`](../schemas/bridge/client-visibility-response.schema.json).
 Temporal's protobuf/gRPC communication remains entirely inside Rust; JSON is
 only the ownership-safe OCaml/Rust boundary.
+
+The deterministic `mock://` backend accepts an empty visibility query and
+orders its current executions by workflow ID. It applies `page_size` and
+returns a mock-specific continuation token when more rows remain. The token
+resumes after the last returned workflow ID, so it is only meaningful for the
+same mock service ledger; callers should still treat it as opaque.

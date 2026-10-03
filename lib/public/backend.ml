@@ -1191,9 +1191,10 @@ let native_client_list_visibility (client : native_client)
             next_page_token = page.next_page_token;
           }
 
-(** Lists deterministic mock executions. The mock intentionally accepts only
-    an empty query: it is a unit-test ledger, not a second visibility query
-    language. Native HTTP(S) clients send the caller's full Temporal query. *)
+(** Lists deterministic mock executions in workflow-ID order. A continuation
+    resumes after the last ID returned rather than relying on hash-table order
+    or an offset that shifts when a new execution is inserted. The mock accepts
+    only an empty query; native clients use Temporal's query language. *)
 let mock_client_list_visibility (client : mock_client)
     (request : visibility_request) : (visibility_page, Error.t) result =
   if request.page_size < 1 || request.page_size > 1_000 then
@@ -1202,42 +1203,87 @@ let mock_client_list_visibility (client : mock_client)
     Error (defect "visibility query exceeds the protocol safety limit")
   else if String.contains request.query '\000' then
     Error (defect "visibility query must not contain NUL")
-  else if Option.is_some request.next_page_token then
-    Error (defect "the deterministic mock does not support visibility pagination")
   else if not (String.equal request.query "") then
     Error (defect "the deterministic mock only supports an empty visibility query")
   else
-    let service = client.service in
-    Mutex.lock service.mutex;
-    Fun.protect
-      ~finally:(fun () -> Mutex.unlock service.mutex)
-      (fun () ->
-        if client.closed then Error (bridge_error "client is shut down")
-        else
-          let executions : visibility_execution list =
-            Hashtbl.to_seq service.executions
-            |> Seq.map (fun (workflow_id, (execution : mock_execution)) ->
-                   let status =
-                     match execution.terminal with
-                     | Mock_pending -> "running"
-                     | Mock_completed -> "completed"
-                     | Mock_cancelled -> "canceled"
-                     | Mock_terminated -> "terminated"
-                   in
-                   ({
-                      workflow_id;
-                      run_id = execution.run_id;
-                      workflow_type = execution.workflow_type;
-                      task_queue = execution.task_queue;
-                      status;
-                    }
-                     : visibility_execution))
-            |> List.of_seq
-            |> List.sort (fun (left : visibility_execution)
-                              (right : visibility_execution) ->
-                    String.compare left.workflow_id right.workflow_id)
-          in
-          Ok ({ executions; next_page_token = None } : visibility_page))
+    let token_prefix = "mock-visibility-v1:" in
+    let cursor =
+      match request.next_page_token with
+      | None -> Ok None
+      | Some token ->
+          if String.starts_with ~prefix:token_prefix token
+             && String.length token > String.length token_prefix
+          then
+            Ok
+              (Some
+                 (String.sub token (String.length token_prefix)
+                    (String.length token - String.length token_prefix)))
+          else Error (defect "invalid mock visibility page token")
+    in
+    Result.bind cursor (fun cursor ->
+      let service = client.service in
+      Mutex.lock service.mutex;
+      Fun.protect
+        ~finally:(fun () -> Mutex.unlock service.mutex)
+        (fun () ->
+          if client.closed then Error (bridge_error "client is shut down")
+          else if
+            (match cursor with
+            | Some workflow_id ->
+                not (Hashtbl.mem service.executions workflow_id)
+            | None -> false)
+          then Error (defect "invalid mock visibility page token")
+          else
+            let executions : visibility_execution list =
+              Hashtbl.to_seq service.executions
+              |> Seq.map (fun (workflow_id, (execution : mock_execution)) ->
+                     let status =
+                       match execution.terminal with
+                       | Mock_pending -> "running"
+                       | Mock_completed -> "completed"
+                       | Mock_cancelled -> "canceled"
+                       | Mock_terminated -> "terminated"
+                     in
+                     ({
+                        workflow_id;
+                        run_id = execution.run_id;
+                        workflow_type = execution.workflow_type;
+                        task_queue = execution.task_queue;
+                        status;
+                      }
+                       : visibility_execution))
+              |> List.of_seq
+              |> List.sort (fun (left : visibility_execution)
+                                (right : visibility_execution) ->
+                      String.compare left.workflow_id right.workflow_id)
+            in
+            let remaining =
+              match cursor with
+              | None -> executions
+              | Some workflow_id ->
+                  List.filter
+                    (fun (execution : visibility_execution) ->
+                      String.compare execution.workflow_id workflow_id > 0)
+                    executions
+            in
+            (* A token is present exactly when another row follows this page. *)
+            let rec take_page count last acc = function
+              | [] ->
+                  ({ executions = List.rev acc; next_page_token = None }
+                    : visibility_page)
+              | _ :: _ when count = 0 ->
+                  {
+                    executions = List.rev acc;
+                    next_page_token =
+                      Option.map
+                        (fun (execution : visibility_execution) ->
+                          token_prefix ^ execution.workflow_id)
+                        last;
+                  }
+              | execution :: rest ->
+                  take_page (count - 1) (Some execution) (execution :: acc) rest
+            in
+            Ok (take_page request.page_size None [] remaining)))
 
 (** Executes visibility through the selected private transport. *)
 let client_list_visibility client request =
