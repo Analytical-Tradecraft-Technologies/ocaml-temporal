@@ -312,6 +312,28 @@ let test_client_visibility_listing () =
       assert (first.task_queue = "unit-test");
       assert (first.status = "running")
   | _ -> failwith "visibility listing returned an unexpected row count");
+  let first_page =
+    unwrap (Temporal.Client.list_visibility client ~page_size:1 ~query:"" ())
+  in
+  (match first_page.executions with
+  | [ first ] -> assert (first.workflow_id = "visibility-a")
+  | _ -> failwith "visibility first page was not bounded to one row");
+  let token =
+    match first_page.next_page_token with
+    | Some token -> token
+    | None -> failwith "visibility first page omitted its continuation token"
+  in
+  let second_page =
+    unwrap
+      (Temporal.Client.list_visibility client ~page_size:1 ~page_token:token
+         ~query:"" ())
+  in
+  (match second_page.executions with
+  | [ second ] -> assert (second.workflow_id = "visibility-b")
+  | _ -> failwith "visibility continuation returned the wrong row");
+  assert (second_page.next_page_token = None);
+  expect_error "defect"
+    (Temporal.Client.list_visibility client ~page_token:"invalid" ~query:"" ());
   expect_error "defect"
     (Temporal.Client.list_visibility client ~page_size:0 ~query:"" ());
   unwrap (Temporal.Client.shutdown client)
