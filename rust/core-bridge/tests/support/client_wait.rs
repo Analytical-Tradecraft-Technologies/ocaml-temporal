@@ -24,6 +24,7 @@ use temporalio_common::protos::temporal::api::{
 #[derive(Clone, Copy)]
 enum Reply {
     Completed,
+    Archived,
     Paginated,
     Pending,
     Denied,
@@ -86,6 +87,9 @@ fn connected_runtime(reply: Reply) -> (Runtime, Arc<Probe>) {
                 probe.completed.fetch_add(1, Ordering::SeqCst);
                 if matches!(reply, Reply::Denied) {
                     return Err(RpcStatus::permission_denied("synthetic denial"));
+                }
+                if matches!(reply, Reply::Archived) && request.skip_archival {
+                    return Err(RpcStatus::not_found("synthetic archived history"));
                 }
                 let response = if matches!(reply, Reply::Paginated)
                     && request.next_page_token.is_empty()
@@ -171,6 +175,30 @@ fn delayed_history_survives_owner_windows() {
     terminal(&mut runtime, &request("run-1")).expect("repeated wait after completion");
     assert_eq!(probe.requests.lock().unwrap().len(), 2);
     assert!(runtime.pending_waits.is_empty());
+    assert_eq!(runtime.close(true), STATUS_OK);
+}
+
+/// An exact-run wait must let Temporal read a closed history from archival.
+#[test]
+fn archived_history_remains_waitable() {
+    let (mut runtime, probe) = connected_runtime(Reply::Archived);
+    let response =
+        terminal(&mut runtime, &request("archived-run")).expect("archived terminal result");
+    let response: serde_json::Value = serde_json::from_slice(&response).unwrap();
+    assert_eq!(response["execution"]["run_id"], "archived-run");
+    assert_eq!(response["outcome"]["kind"], "completed");
+    let requests = probe.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert!(!requests[0].skip_archival);
+    assert_eq!(
+        requests[0].execution.as_ref().unwrap().run_id,
+        "archived-run"
+    );
+    assert_eq!(
+        requests[0].history_event_filter_type,
+        HistoryEventFilterType::CloseEvent as i32
+    );
+    drop(requests);
     assert_eq!(runtime.close(true), STATUS_OK);
 }
 

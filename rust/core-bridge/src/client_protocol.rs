@@ -1449,7 +1449,7 @@ pub async fn wait_workflow(
                         run_id: request.run_id.clone(),
                     }),
                     next_page_token: std::mem::take(&mut next_page_token),
-                    skip_archival: true,
+                    skip_archival: false,
                     wait_new_event: true,
                     history_event_filter_type: HistoryEventFilterType::CloseEvent as i32,
                     ..Default::default()
