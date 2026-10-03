@@ -171,8 +171,8 @@ val terminate :
     callers must explicitly use [follow] with the returned execution if they
     want to wait for that new run. An explicitly supplied [request_id] must be
     non-empty, valid UTF-8, NUL-free, and no more than 65,536 bytes.
-    [workflow_task_finish_event_id] must be a non-negative workflow-task event
-    ID accepted by Temporal. *)
+    [workflow_task_finish_event_id] must be greater than 1 and identify a
+    workflow-task finish event accepted by Temporal. *)
 val reset :
   ?request_id:string ->
   ?reason:string ->

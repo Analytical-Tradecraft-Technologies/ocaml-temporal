@@ -261,7 +261,7 @@ the next evidence boundary.
 exact execution up to a supplied workflow-task finish event. It is an
 operator-facing recovery operation: it does not mutate the existing run and
 it never means “reset whichever run is latest”. The public function requires
-the original run handle and a non-negative `workflow_task_finish_event_id`,
+the original run handle and a `workflow_task_finish_event_id` greater than 1,
 then returns a new exact-run handle on success.
 
 The private request is a closed object:
