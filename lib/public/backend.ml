@@ -683,7 +683,9 @@ let native_client_start (client : native_client) (request : start_request) :
         in
         await_outcome ()
 
-(** Starts a mock execution and preserves the exact request payload. *)
+(** Starts a mock execution under Temporal's default workflow-ID policies:
+    reject a concurrent run, but allow a new run after the current one closes.
+    Exact old runs remain in [history] after the current slot is replaced. *)
 let mock_client_start (client : mock_client) (request : start_request) =
   let service = client.service in
   Mutex.lock service.mutex;
@@ -691,7 +693,11 @@ let mock_client_start (client : mock_client) (request : start_request) =
     ~finally:(fun () -> Mutex.unlock service.mutex)
     (fun () ->
       if client.closed then Error (bridge_error "client is shut down")
-      else if Hashtbl.mem service.executions request.workflow_id then
+      else if
+        (match Hashtbl.find_opt service.executions request.workflow_id with
+        | Some { terminal = Mock_pending; _ } -> true
+        | Some _ | None -> false)
+      then
         Error
           (Error.make ~non_retryable:true ~category:`Workflow
              ~message:"workflow id already exists" ())
@@ -710,7 +716,7 @@ let mock_client_start (client : mock_client) (request : start_request) =
             signal_requests = Hashtbl.create 8;
           }
         in
-        Hashtbl.add service.executions request.workflow_id execution;
+        Hashtbl.replace service.executions request.workflow_id execution;
         Hashtbl.add service.history (request.workflow_id, run_id) execution;
         let response : start_response =
           { workflow_id = request.workflow_id; run_id }

@@ -286,6 +286,45 @@ let test_typed_start_and_wait_handle () =
     (Temporal.Client.start client ~workflow:echo_workflow
        ~task_queue:"unit-test" ~id:"after-shutdown" ~input:"ignored" ())
 
+(** A closed mock run releases its workflow ID for a new run, while its exact
+    handle still observes the original result from the retained history. *)
+let test_mock_start_reuses_closed_workflow_id () =
+  let client =
+    unwrap
+      (Temporal.Client.create ~target_url:"mock://client"
+         ~namespace:"unit-test" ())
+  in
+  let first =
+    unwrap
+      (Temporal.Client.start client ~workflow:echo_workflow
+         ~request_id:"reuse-first" ~task_queue:"unit-test" ~id:"reuse-id"
+         ~input:"first" ())
+  in
+  expect_error "workflow"
+    (Temporal.Client.start client ~workflow:echo_workflow
+       ~request_id:"reuse-while-running" ~task_queue:"unit-test"
+       ~id:"reuse-id" ~input:"blocked" ());
+  (match Temporal.Client.wait first with
+  | Ok (Temporal.Client.Completed "first") -> ()
+  | Ok _ -> failwith "first mock run returned an unexpected terminal result"
+  | Error error -> failwith (Temporal.Error.message error));
+  let second =
+    unwrap
+      (Temporal.Client.start client ~workflow:echo_workflow
+         ~request_id:"reuse-second" ~task_queue:"unit-test" ~id:"reuse-id"
+         ~input:"second" ())
+  in
+  assert (Temporal.Client.run_id first <> Temporal.Client.run_id second);
+  (match Temporal.Client.wait first with
+  | Ok (Temporal.Client.Completed "first") -> ()
+  | Ok _ -> failwith "first exact handle lost its original run"
+  | Error error -> failwith (Temporal.Error.message error));
+  (match Temporal.Client.wait second with
+  | Ok (Temporal.Client.Completed "second") -> ()
+  | Ok _ -> failwith "replacement mock run returned the wrong result"
+  | Error error -> failwith (Temporal.Error.message error));
+  unwrap (Temporal.Client.shutdown client)
+
 (** The deterministic client seam exposes the same visibility row shape as the
     native adapter. Starting two workflows proves rows retain type, queue,
     exact run identity, and monotone running status before waits complete. *)
@@ -840,6 +879,7 @@ let () =
   test_mock_worker_rejects_async_activity_without_stopping ();
   test_worker_run_after_shutdown_is_rejected ();
   test_typed_start_and_wait_handle ();
+  test_mock_start_reuses_closed_workflow_id ();
   test_client_visibility_listing ();
   test_follow_continued_as_new_handle ();
   test_follow_rejects_malformed_successor_identity ();
