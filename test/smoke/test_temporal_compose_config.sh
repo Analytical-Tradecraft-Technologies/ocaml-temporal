@@ -29,6 +29,22 @@ require_text 'temporal-postgres-data-v18:'
 require_text 'temporal-network:'
 require_text 'pg_isready'
 require_text 'nc -z localhost 7233'
+# The plaintext development frontend may serve the Compose network, but its
+# sole host publication must be loopback-bound. Check Compose's rendered model
+# so a later interpolation or port-syntax change cannot reopen it externally.
+if ! awk '
+  /^  temporal:$/ { service = 1; next }
+  service && /^  [^ ]/ { service = 0; ports = 0 }
+  service && /^    ports:$/ { ports = 1; next }
+  ports && /^    [^ ]/ { ports = 0 }
+  ports && /^      - / { count++ }
+  ports && /^        target: 7233$/ { target = 1 }
+  ports && /^        host_ip: 127\.0\.0\.1$/ { loopback = 1 }
+  END { exit !(count == 1 && target && loopback) }
+' "$rendered"; then
+  echo 'Temporal frontend must publish only port 7233 on 127.0.0.1' >&2
+  exit 1
+fi
 require_text 'smoke-worker:'
 require_text 'smoke-driver:'
 require_text 'smoke-restart-driver:'

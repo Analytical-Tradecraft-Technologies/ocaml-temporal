@@ -82,6 +82,11 @@ the bounded ticket polls, so polling does not accidentally change the
 idempotency key. A request ID identifies one logical start and must not be
 reused for unrelated workflow starts.
 
+The deterministic `mock://` client follows the default workflow-ID behavior:
+it rejects a new start while that ID has a running execution, then accepts a
+new run after the current execution closes. Old exact-run handles remain
+addressable through the mock's retained run history.
+
 The direct `start_workflow_json` ABI can return the successful response shown
 above, but the public HTTP(S) client uses the asynchronous ticket path. It
 begins the request, waits for the ticket to become terminal, and converts the
@@ -262,7 +267,12 @@ exact execution up to a supplied workflow-task finish event. It is an
 operator-facing recovery operation: it does not mutate the existing run and
 it never means “reset whichever run is latest”. The public function requires
 the original run handle and a `workflow_task_finish_event_id` greater than 1,
-then returns a new exact-run handle on success.
+then returns the new execution identity on success. Callers use `follow` to
+construct a typed handle for that successor.
+
+The deterministic `mock://` backend terminates an original run that is still
+pending when it is reset. An already closed original keeps its completed,
+canceled, or terminated result while the successor starts as a new run.
 
 The private request is a closed object:
 
@@ -283,7 +293,9 @@ loss of precision for histories whose event IDs exceed the exact integer range
 of a JavaScript number. `request_id` is the idempotency key for one logical
 reset; if the caller omits it, OCaml derives a deterministic value from the
 exact run and event boundary. Retrying an uncertain transport result with the
-same request ID is therefore safe.
+same request ID is therefore safe. Temporal scopes reset deduplication to the
+workflow: distinct workflow IDs may use the same explicit request ID without
+colliding, while a retry for one workflow must retain the original reset data.
 
 Temporal returns the new run ID. The bridge wraps it in the same execution
 object used by `start`, and OCaml verifies that namespace and workflow ID still
@@ -300,11 +312,12 @@ match the original handle before exposing it:
 ```
 
 Both sides reject missing, duplicate, or unknown members; empty or NUL-
-containing identifiers; oversized reasons; negative event IDs; and responses
-whose identity does not correlate to the request. A successful response means
-Temporal accepted the reset and supplied a new run identity, not that the new
-run has completed. Call `Temporal.Client.wait` with the returned handle to
-observe it. The request and response schemas are
+containing identifiers; oversized reasons; event IDs at or below 1; and
+responses whose identity does not correlate to the request. A successful
+response means Temporal accepted the reset and supplied a new run identity,
+not that the new run has completed. Call `Temporal.Client.follow` with the
+returned identity,
+then wait on that handle to observe it. The request and response schemas are
 [`client-reset-request.schema.json`](../schemas/bridge/client-reset-request.schema.json)
 and
 [`client-reset-response.schema.json`](../schemas/bridge/client-reset-response.schema.json).
@@ -770,3 +783,9 @@ and
 [`client-visibility-response.schema.json`](../schemas/bridge/client-visibility-response.schema.json).
 Temporal's protobuf/gRPC communication remains entirely inside Rust; JSON is
 only the ownership-safe OCaml/Rust boundary.
+
+The deterministic `mock://` backend accepts an empty visibility query and
+orders its current executions by workflow ID. It applies `page_size` and
+returns a mock-specific continuation token when more rows remain. The token
+resumes after the last returned workflow ID, so it is only meaningful for the
+same mock service ledger; callers should still treat it as opaque.

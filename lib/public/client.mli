@@ -167,9 +167,10 @@ val terminate :
   (unit, Error.t) result
 
 (** Resets the exact run at a workflow-task event boundary and returns the new
-    run identity. The old run is terminated by Temporal and a new run begins;
-    callers must explicitly use [follow] with the returned execution if they
-    want to wait for that new run. An explicitly supplied [request_id] must be
+    run identity. A still-running old run is terminated, while an already
+    closed run keeps its terminal result. Callers must explicitly use [follow]
+    with the returned execution to wait for the new run. An explicitly
+    supplied [request_id] must be
     non-empty, valid UTF-8, NUL-free, and no more than 65,536 bytes.
     [workflow_task_finish_event_id] must be greater than 1 and identify a
     workflow-task finish event accepted by Temporal. *)

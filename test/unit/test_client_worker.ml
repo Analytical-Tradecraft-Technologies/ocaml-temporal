@@ -286,6 +286,45 @@ let test_typed_start_and_wait_handle () =
     (Temporal.Client.start client ~workflow:echo_workflow
        ~task_queue:"unit-test" ~id:"after-shutdown" ~input:"ignored" ())
 
+(** A closed mock run releases its workflow ID for a new run, while its exact
+    handle still observes the original result from the retained history. *)
+let test_mock_start_reuses_closed_workflow_id () =
+  let client =
+    unwrap
+      (Temporal.Client.create ~target_url:"mock://client"
+         ~namespace:"unit-test" ())
+  in
+  let first =
+    unwrap
+      (Temporal.Client.start client ~workflow:echo_workflow
+         ~request_id:"reuse-first" ~task_queue:"unit-test" ~id:"reuse-id"
+         ~input:"first" ())
+  in
+  expect_error "workflow"
+    (Temporal.Client.start client ~workflow:echo_workflow
+       ~request_id:"reuse-while-running" ~task_queue:"unit-test"
+       ~id:"reuse-id" ~input:"blocked" ());
+  (match Temporal.Client.wait first with
+  | Ok (Temporal.Client.Completed "first") -> ()
+  | Ok _ -> failwith "first mock run returned an unexpected terminal result"
+  | Error error -> failwith (Temporal.Error.message error));
+  let second =
+    unwrap
+      (Temporal.Client.start client ~workflow:echo_workflow
+         ~request_id:"reuse-second" ~task_queue:"unit-test" ~id:"reuse-id"
+         ~input:"second" ())
+  in
+  assert (Temporal.Client.run_id first <> Temporal.Client.run_id second);
+  (match Temporal.Client.wait first with
+  | Ok (Temporal.Client.Completed "first") -> ()
+  | Ok _ -> failwith "first exact handle lost its original run"
+  | Error error -> failwith (Temporal.Error.message error));
+  (match Temporal.Client.wait second with
+  | Ok (Temporal.Client.Completed "second") -> ()
+  | Ok _ -> failwith "replacement mock run returned the wrong result"
+  | Error error -> failwith (Temporal.Error.message error));
+  unwrap (Temporal.Client.shutdown client)
+
 (** The deterministic client seam exposes the same visibility row shape as the
     native adapter. Starting two workflows proves rows retain type, queue,
     exact run identity, and monotone running status before waits complete. *)
@@ -312,6 +351,28 @@ let test_client_visibility_listing () =
       assert (first.task_queue = "unit-test");
       assert (first.status = "running")
   | _ -> failwith "visibility listing returned an unexpected row count");
+  let first_page =
+    unwrap (Temporal.Client.list_visibility client ~page_size:1 ~query:"" ())
+  in
+  (match first_page.executions with
+  | [ first ] -> assert (first.workflow_id = "visibility-a")
+  | _ -> failwith "visibility first page was not bounded to one row");
+  let token =
+    match first_page.next_page_token with
+    | Some token -> token
+    | None -> failwith "visibility first page omitted its continuation token"
+  in
+  let second_page =
+    unwrap
+      (Temporal.Client.list_visibility client ~page_size:1 ~page_token:token
+         ~query:"" ())
+  in
+  (match second_page.executions with
+  | [ second ] -> assert (second.workflow_id = "visibility-b")
+  | _ -> failwith "visibility continuation returned the wrong row");
+  assert (second_page.next_page_token = None);
+  expect_error "defect"
+    (Temporal.Client.list_visibility client ~page_token:"invalid" ~query:"" ());
   expect_error "defect"
     (Temporal.Client.list_visibility client ~page_size:0 ~query:"" ());
   unwrap (Temporal.Client.shutdown client)
@@ -551,6 +612,51 @@ let test_reset_rejects_early_event_ids () =
   | Error error -> failwith (Temporal.Error.message error));
   unwrap (Temporal.Client.shutdown client)
 
+(** Reset deduplication belongs to one workflow, even when the mock service
+    ledger is shared. Independent workflows may reuse an explicit request ID;
+    each still returns its own successor on retry and rejects changed data. *)
+let test_reset_request_id_is_scoped_to_workflow () =
+  let client =
+    unwrap
+      (Temporal.Client.create ~target_url:"mock://client"
+         ~namespace:"unit-test" ())
+  in
+  let start id input =
+    unwrap
+      (Temporal.Client.start client ~workflow:echo_workflow
+         ~task_queue:"unit-test" ~id ~input ())
+  in
+  let first = start "unit-reset-scope-a" "first" in
+  let second = start "unit-reset-scope-b" "second" in
+  let reset handle =
+    unwrap
+      (Temporal.Client.reset ~request_id:"shared-reset-id"
+         ~reason:"retryable reset" ~workflow_task_finish_event_id:4L handle)
+  in
+  let first_successor = reset first in
+  let second_successor = reset second in
+  assert (first_successor.workflow_id = "unit-reset-scope-a");
+  assert (second_successor.workflow_id = "unit-reset-scope-b");
+  assert (first_successor.run_id <> second_successor.run_id);
+  assert ((reset first).run_id = first_successor.run_id);
+  assert ((reset second).run_id = second_successor.run_id);
+  expect_error "workflow"
+    (Temporal.Client.reset ~request_id:"shared-reset-id"
+       ~reason:"changed reset" ~workflow_task_finish_event_id:4L first);
+  assert ((reset second).run_id = second_successor.run_id);
+  let expect_success execution expected =
+    let handle =
+      unwrap (Temporal.Client.follow client ~workflow:echo_workflow execution)
+    in
+    match Temporal.Client.wait handle with
+    | Ok (Temporal.Client.Completed actual) when actual = expected -> ()
+    | Ok _ -> failwith "reset successor returned an unexpected result"
+    | Error error -> failwith (Temporal.Error.message error)
+  in
+  expect_success first_successor "first";
+  expect_success second_successor "second";
+  unwrap (Temporal.Client.shutdown client)
+
 (** A late cancellation request cannot rewrite a terminal result that the mock
     has already exposed. This protects the deterministic seam from modelling
     mutable terminal history unlike a real Temporal execution. *)
@@ -576,6 +682,43 @@ let test_completed_mock_run_is_immutable () =
   (match Temporal.Client.wait handle with
   | Ok (Temporal.Client.Completed "done") -> ()
   | Ok _ -> failwith "late cancellation rewrote a completed mock run"
+  | Error error -> failwith (Temporal.Error.message error));
+  unwrap (Temporal.Client.shutdown client)
+
+(** Resetting a completed run creates a successor without rewriting the
+    original exact handle's immutable completed result. *)
+let test_reset_preserves_completed_mock_run () =
+  let client =
+    unwrap
+      (Temporal.Client.create ~target_url:"mock://client"
+         ~namespace:"unit-test" ())
+  in
+  let handle =
+    unwrap
+      (Temporal.Client.start client ~workflow:echo_workflow
+         ~task_queue:"unit-test" ~id:"unit-completed-reset" ~input:"done"
+         ())
+  in
+  (match Temporal.Client.wait handle with
+  | Ok (Temporal.Client.Completed "done") -> ()
+  | Ok _ -> failwith "completed mock run returned the wrong first result"
+  | Error error -> failwith (Temporal.Error.message error));
+  let successor =
+    unwrap
+      (Temporal.Client.reset ~request_id:"reset-completed-1"
+         ~reason:"replay after fix" ~workflow_task_finish_event_id:4L handle)
+  in
+  assert (successor.run_id <> Temporal.Client.run_id handle);
+  (match Temporal.Client.wait handle with
+  | Ok (Temporal.Client.Completed "done") -> ()
+  | Ok _ -> failwith "reset rewrote the completed mock run"
+  | Error error -> failwith (Temporal.Error.message error));
+  let successor_handle =
+    unwrap (Temporal.Client.follow client ~workflow:echo_workflow successor)
+  in
+  (match Temporal.Client.wait successor_handle with
+  | Ok (Temporal.Client.Completed "done") -> ()
+  | Ok _ -> failwith "reset successor returned the wrong result"
   | Error error -> failwith (Temporal.Error.message error));
   unwrap (Temporal.Client.shutdown client)
 
@@ -873,6 +1016,7 @@ let () =
   test_mock_worker_rejects_async_activity_without_stopping ();
   test_worker_run_after_shutdown_is_rejected ();
   test_typed_start_and_wait_handle ();
+  test_mock_start_reuses_closed_workflow_id ();
   test_client_visibility_listing ();
   test_follow_continued_as_new_handle ();
   test_follow_rejects_malformed_successor_identity ();
@@ -880,8 +1024,10 @@ let () =
   test_exact_run_cancellation ();
   test_exact_run_reset ();
   test_reset_rejects_early_event_ids ();
+  test_reset_request_id_is_scoped_to_workflow ();
   test_exact_run_termination ();
   test_completed_mock_run_is_immutable ();
+  test_reset_preserves_completed_mock_run ();
   test_exact_run_signal ();
   test_default_signal_request_ids_are_process_wide ();
   test_client_validation_errors ();
