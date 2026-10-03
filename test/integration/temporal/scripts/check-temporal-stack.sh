@@ -20,17 +20,39 @@ while ! temporal operator cluster health --address "$address"; do
   sleep "$sleep_seconds"
 done
 
-if ! temporal operator namespace describe --namespace "$namespace" --address "$address" >/dev/null 2>&1; then
-  temporal operator namespace create \
-    --namespace "$namespace" \
-    --retention 1d \
-    --address "$address"
-fi
-
-temporal operator namespace describe \
-  --namespace "$namespace" \
-  --address "$address" \
-  >/dev/null
+# A failed describe is not necessarily a missing namespace: the frontend may
+# briefly return Unavailable even after its health check succeeds. Create only
+# on an explicit NotFound response, then wait for describe to observe it.
+attempt=1
+created=0
+while true; do
+  if describe_error=$(temporal operator namespace describe \
+    --namespace "$namespace" --address "$address" 2>&1); then
+    break
+  fi
+  case "$describe_error" in
+    *"Namespace $namespace is not found."*)
+      if [ "$created" -eq 0 ]; then
+        temporal operator namespace create \
+          --namespace "$namespace" \
+          --retention 1d \
+          --address "$address"
+        created=1
+        continue
+      fi
+      ;;
+    *"code = Unavailable"*|*"code = DeadlineExceeded"*) ;;
+    *) printf '%s\n' "$describe_error" >&2; exit 1 ;;
+  esac
+  if [ "$attempt" -ge "$max_attempts" ]; then
+    printf 'Temporal namespace %s describe timed out after %s attempts\n' \
+      "$namespace" "$max_attempts" >&2
+    printf '%s\n' "$describe_error" >&2
+    exit 1
+  fi
+  attempt=$((attempt + 1))
+  sleep "$sleep_seconds"
+done
 
 # Registration can precede the frontend namespace cache becoming usable. Probe
 # the same read-only API used by metadata acceptance; retry only the observed

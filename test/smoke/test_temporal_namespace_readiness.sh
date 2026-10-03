@@ -13,8 +13,35 @@ set -eu
 printf '%s\n' "$*" >> "$FIXTURE/calls"
 case "$*" in
   'operator cluster health '*) exit 0 ;;
-  'operator namespace describe '*) test -f "$FIXTURE/registered"; exit $? ;;
-  'operator namespace create '*) touch "$FIXTURE/registered"; exit 0 ;;
+  'operator namespace describe '*)
+    count=$(cat "$FIXTURE/describe-count")
+    count=$((count + 1))
+    printf '%s\n' "$count" > "$FIXTURE/describe-count"
+    case "$DESCRIBE_SCENARIO" in
+      transient) if [ "$count" -eq 1 ]; then
+        echo 'rpc error: code = Unavailable desc = frontend restarting' >&2
+        exit 1
+      fi ;;
+      pending) if [ "$count" -eq 2 ]; then
+        echo 'Error: Namespace readiness-test is not found.' >&2
+        exit 1
+      fi ;;
+      permanent) echo 'rpc error: code = Unavailable desc = frontend restarting' >&2; exit 1 ;;
+      denied) echo 'rpc error: code = PermissionDenied desc = forbidden' >&2; exit 1 ;;
+      wrong_namespace) echo 'Error: Namespace another-test is not found.' >&2; exit 1 ;;
+    esac
+    if test -f "$FIXTURE/registered"; then exit 0; fi
+    echo 'Error: Namespace readiness-test is not found.' >&2
+    exit 1 ;;
+  'operator namespace create '*)
+    count=$(cat "$FIXTURE/create-count")
+    printf '%s\n' "$((count + 1))" > "$FIXTURE/create-count"
+    if test -f "$FIXTURE/registered"; then
+      echo 'Namespace already exists' >&2
+      exit 1
+    fi
+    touch "$FIXTURE/registered"
+    exit 0 ;;
   'operator search-attribute list '*) ;;
   *) exit 99 ;;
 esac
@@ -33,24 +60,38 @@ exit 1
 CLI
 chmod +x "$fixture/bin/temporal"
 
-# Check success/failure, exact probe counts, and retained diagnostics. Using a
-# nondefault namespace/address also protects argument forwarding to the probe.
+# Check success/failure, exact probe counts, and retained diagnostics. Optional
+# arguments control describe failures and whether the namespace exists
+# before setup. A nondefault namespace/address protects argument forwarding.
 run_case() {
   scenario=$1 expected_status=$2 expected_count=$3
+  describe_scenario=${4:-normal}
+  pre_registered=${5:-no}
+  expected_describes=${6:-2}
+  expected_creates=${7:-1}
   rm -f "$fixture/registered" "$fixture/calls"
+  if [ "$pre_registered" = yes ]; then touch "$fixture/registered"; fi
   echo 0 > "$fixture/count"
+  echo 0 > "$fixture/describe-count"
+  echo 0 > "$fixture/create-count"
   status=0
   PATH="$fixture/bin:$PATH" FIXTURE="$fixture" SCENARIO="$scenario" \
+    DESCRIBE_SCENARIO="$describe_scenario" \
     TEMPORAL_ADDRESS=custom:7233 TEMPORAL_NAMESPACE=readiness-test \
     TEMPORAL_HEALTH_MAX_ATTEMPTS=3 TEMPORAL_HEALTH_SLEEP_SECONDS=0 \
     sh "$root/test/integration/temporal/scripts/check-temporal-stack.sh" \
     > "$fixture/output" 2>&1 || status=$?
-  if [ "$status" -ne "$expected_status" ] || [ "$(cat "$fixture/count")" -ne "$expected_count" ]; then
+  if [ "$status" -ne "$expected_status" ] ||
+     [ "$(cat "$fixture/count")" -ne "$expected_count" ] ||
+     [ "$(cat "$fixture/describe-count")" -ne "$expected_describes" ] ||
+     [ "$(cat "$fixture/create-count")" -ne "$expected_creates" ]; then
     cat "$fixture/output" >&2
-    echo "unexpected readiness result for $scenario: status=$status" >&2
+    echo "unexpected readiness result for $scenario/$describe_scenario: status=$status" >&2
     exit 1
   fi
-  grep -F 'operator search-attribute list --namespace readiness-test --address custom:7233 -o json' "$fixture/calls" >/dev/null
+  if [ "$expected_count" -gt 0 ]; then
+    grep -F 'operator search-attribute list --namespace readiness-test --address custom:7233 -o json' "$fixture/calls" >/dev/null
+  fi
 }
 
 run_case ready 0 1
@@ -61,5 +102,14 @@ grep -F 'Namespace readiness-test is not found.' "$fixture/output" >/dev/null
 run_case denied 1 1
 grep -F 'PermissionDenied: search attributes forbidden' "$fixture/output" >/dev/null
 run_case wrong_namespace 1 1
+grep -F 'Namespace another-test is not found.' "$fixture/output" >/dev/null
+run_case ready 0 1 normal yes 1 0
+run_case ready 0 1 transient yes 2 0
+run_case ready 0 1 pending no 3 1
+run_case ready 1 0 permanent yes 3 0
+grep -F 'describe timed out after 3 attempts' "$fixture/output" >/dev/null
+run_case ready 1 0 denied yes 1 0
+grep -F 'PermissionDenied' "$fixture/output" >/dev/null
+run_case ready 1 0 wrong_namespace yes 1 0
 grep -F 'Namespace another-test is not found.' "$fixture/output" >/dev/null
 printf 'Temporal namespace readiness tests: ok\n'
