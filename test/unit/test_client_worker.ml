@@ -545,6 +545,46 @@ let test_exact_run_reset () =
   in
   assert (execution.workflow_id = "unit-reset");
   assert (execution.run_id <> old_run);
+  let visibility =
+    unwrap (Temporal.Client.list_visibility client ~query:"" ())
+  in
+  assert (List.length visibility.executions = 2);
+  let first_page =
+    unwrap (Temporal.Client.list_visibility client ~page_size:1 ~query:"" ())
+  in
+  let token =
+    match first_page.next_page_token with
+    | Some token -> token
+    | None -> failwith "retired-run page omitted its continuation token"
+  in
+  let second_page =
+    unwrap
+      (Temporal.Client.list_visibility client ~page_size:1 ~page_token:token
+         ~query:"" ())
+  in
+  assert (second_page.next_page_token = None);
+  let paged_run_ids =
+    List.map
+      (fun (row : Temporal.Client.visibility_execution) -> row.run_id)
+      (first_page.executions @ second_page.executions)
+  in
+  assert (List.length paged_run_ids = 2);
+  assert (List.mem old_run paged_run_ids);
+  assert (List.mem execution.run_id paged_run_ids);
+  let old_row =
+    List.find
+      (fun (row : Temporal.Client.visibility_execution) ->
+        String.equal row.run_id old_run)
+      visibility.executions
+  in
+  let successor_row =
+    List.find
+      (fun (row : Temporal.Client.visibility_execution) ->
+        String.equal row.run_id execution.run_id)
+      visibility.executions
+  in
+  assert (old_row.status = "terminated");
+  assert (successor_row.status = "running");
   (match Temporal.Client.wait handle with
   | Ok (Temporal.Client.Terminated error) ->
       assert ((Temporal.Error.view error).category = `Terminated)
