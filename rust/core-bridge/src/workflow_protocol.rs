@@ -3062,12 +3062,12 @@ fn child_cancellation_from_core(
 /// Maps a parent-close policy without merging it with child cancellation semantics.
 fn parent_close_to_core(value: Option<ChildWorkflowParentClosePolicy>) -> i32 {
     use core_child_workflow::ParentClosePolicy as Core;
-    (match value {
+    i32::from(match value {
         None => Core::Unspecified,
         Some(ChildWorkflowParentClosePolicy::Terminate) => Core::Terminate,
         Some(ChildWorkflowParentClosePolicy::Abandon) => Core::Abandon,
         Some(ChildWorkflowParentClosePolicy::RequestCancel) => Core::RequestCancel,
-    }) as i32
+    })
 }
 
 /// Rejects unknown Core policy numbers and preserves an unspecified server default.
