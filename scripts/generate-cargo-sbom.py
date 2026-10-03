@@ -19,6 +19,17 @@ from typing import Any
 NAMESPACE = "https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/sbom/cargo"
 
 
+def document_namespace(document: dict[str, Any]) -> str:
+    """Identify this document's content without depending on its checkout path."""
+
+    content = {key: value for key, value in document.items() if key != "documentNamespace"}
+    canonical = json.dumps(
+        content, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return f"{NAMESPACE}/{digest}"
+
+
 def normalized_manifest_path(
     package: dict[str, Any], workspace_root: str | None = None
 ) -> str:
@@ -95,7 +106,7 @@ def make_document(metadata: dict[str, Any]) -> dict[str, Any]:
     workspace_root = metadata.get("workspace_root")
     if workspace_root is not None and not isinstance(workspace_root, str):
         raise ValueError("Cargo metadata workspace_root must be a string")
-    normalized: list[dict[str, str]] = []
+    normalized: list[dict[str, Any]] = []
     for package in packages:
         if not isinstance(package, dict):
             raise ValueError("Cargo metadata package is not an object")
@@ -111,20 +122,31 @@ def make_document(metadata: dict[str, Any]) -> dict[str, Any]:
                 "versionInfo": version,
                 "licenseConcluded": package.get("license") or "NOASSERTION",
                 "downloadLocation": package.get("source") or "NOASSERTION",
+                "filesAnalyzed": False,
             }
         )
     normalized.sort(key=lambda item: (item["name"], item["versionInfo"], item["SPDXID"]))
-    return {
+    document = {
         "spdxVersion": "SPDX-2.3",
+        "dataLicense": "CC0-1.0",
         "SPDXID": "SPDXRef-DOCUMENT",
         "name": "ocaml-temporal Cargo dependency graph",
-        "documentNamespace": NAMESPACE,
         "creationInfo": {
             "created": "1970-01-01T00:00:00Z",
             "creators": ["Tool: ocaml-temporal-generate-cargo-sbom"],
         },
         "packages": normalized,
+        "relationships": [
+            {
+                "spdxElementId": "SPDXRef-DOCUMENT",
+                "relatedSpdxElement": package["SPDXID"],
+                "relationshipType": "DESCRIBES",
+            }
+            for package in normalized
+        ],
     }
+    document["documentNamespace"] = document_namespace(document)
+    return document
 
 
 def audit_document(document: dict[str, Any]) -> None:
@@ -132,10 +154,10 @@ def audit_document(document: dict[str, Any]) -> None:
 
     if document.get("spdxVersion") != "SPDX-2.3":
         raise ValueError("SBOM is not SPDX-2.3")
+    if document.get("dataLicense") != "CC0-1.0":
+        raise ValueError("SBOM data license is invalid")
     if document.get("SPDXID") != "SPDXRef-DOCUMENT":
         raise ValueError("SBOM document identifier is invalid")
-    if document.get("documentNamespace") != NAMESPACE:
-        raise ValueError("SBOM namespace is invalid")
     packages = document.get("packages")
     if not isinstance(packages, list) or not packages:
         raise ValueError("SBOM contains no packages")
@@ -151,10 +173,24 @@ def audit_document(document: dict[str, Any]) -> None:
             raise ValueError("SBOM package is missing SPDXID, name, or version")
         if identifier in ids:
             raise ValueError(f"duplicate SBOM package identifier: {identifier}")
+        if package.get("filesAnalyzed") is not False:
+            raise ValueError(f"SBOM package {identifier} must set filesAnalyzed to false")
         ids.add(identifier)
         sort_keys.append((name, version, identifier))
     if sort_keys != sorted(sort_keys):
         raise ValueError("SBOM packages are not deterministically sorted")
+    expected_relationships = [
+        {
+            "spdxElementId": "SPDXRef-DOCUMENT",
+            "relatedSpdxElement": identifier,
+            "relationshipType": "DESCRIBES",
+        }
+        for _, _, identifier in sort_keys
+    ]
+    if document.get("relationships") != expected_relationships:
+        raise ValueError("SBOM document DESCRIBES relationships are invalid")
+    if document.get("documentNamespace") != document_namespace(document):
+        raise ValueError("SBOM namespace does not match document content")
 
 
 def main() -> int:
