@@ -74,12 +74,13 @@ services:
       POSTGRES_USER: temporal
       POSTGRES_PWD: temporal
       SQL_PASSWORD: temporal
+      # Listen on the Compose network; only the host publication is loopback.
       BIND_ON_IP: 0.0.0.0
       # Use the mounted absolute path so the server cannot resolve the
       # dynamic-config file relative to an image-specific working directory.
       DYNAMIC_CONFIG_FILE_PATH: /etc/temporal/config/dynamicconfig/development-sql.yaml
     ports:
-      - "${TEMPORAL_FRONTEND_PORT:-7233}:7233"
+      - "127.0.0.1:${TEMPORAL_FRONTEND_PORT:-7233}:7233"
     volumes:
       - ./config/development-sql.yaml:/etc/temporal/config/dynamicconfig/development-sql.yaml:ro
     networks:
