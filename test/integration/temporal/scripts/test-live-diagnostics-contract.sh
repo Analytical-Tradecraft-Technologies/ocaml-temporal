@@ -193,13 +193,17 @@ if grep -q ZZZZZ "$snapshot/restart-replay-driver.log"; then exit 1; fi
 for file in "$snapshot"/*; do check test "$(wc -c <"$file")" -le 65536; done
 rm -f "$fixture"/.restart-replay-*
 
-# Quoted/spaced fields and multiline continuations do not have to repeat a
-# sensitive key. Each case must suppress all subsequent unlabelled content.
-for sensitive in '"input": "QUOTED_CANARY"' 'result = SPACED_CANARY' '"output" : "OUTPUT_CANARY"' '-----BEGIN CERTIFICATE-----'; do
+# Quoted/spaced fields, API keys, cookies and multiline continuations do not
+# have to repeat a sensitive key. Both log modes must suppress all subsequent
+# unlabelled content.
+for sensitive in '"input": "QUOTED_CANARY"' 'result = SPACED_CANARY' '"output" : "OUTPUT_CANARY"' '-----BEGIN CERTIFICATE-----' 'api_key=API_KEY_CANARY' 'X-API-KEY: HEADER_CANARY' 'api.key=DOT_CANARY' 'Cookie: session=COOKIE_CANARY' 'Set-Cookie: session=SET_COOKIE_CANARY'; do
   printf 'safe prefix\n%s\nUNLABELLED_CANARY\n' "$sensitive" >"$temporary/privacy.log"
-  jq -Rnr --arg mode text -f "$scripts/diagnostic-filter.jq" "$temporary/privacy.log" >"$temporary/privacy.filtered"
-  check grep -q 'safe prefix' "$temporary/privacy.filtered"
-  if grep -Eq 'CANARY|CERTIFICATE' "$temporary/privacy.filtered"; then exit 1; fi
+  for mode in text stream; do
+    jq -Rnr --arg mode "$mode" -f "$scripts/diagnostic-filter.jq" "$temporary/privacy.log" >"$temporary/privacy.filtered"
+    check grep -q 'safe prefix' "$temporary/privacy.filtered"
+    check grep -q 'redacted sensitive record' "$temporary/privacy.filtered"
+    if grep -Eq 'CANARY|CERTIFICATE' "$temporary/privacy.filtered"; then exit 1; fi
+  done
 done
 # Projection preserves the existing normalizers' actual correlation fields.
 for normalized in "$root/test/integration/temporal/fixtures/restart-replay/history.terminal.json" "$root/test/integration/temporal/fixtures/parent-child-restart-replay/parent.history.terminal.json" "$root/test/integration/temporal/fixtures/parent-child-restart-replay/child.history.terminal.json"; do
