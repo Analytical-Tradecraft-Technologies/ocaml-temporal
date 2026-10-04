@@ -19,11 +19,18 @@ The concrete `Sdk_supervisor.Native` module instantiates this signature with
 operations on its owner Domain. The public worker loop also uses two private,
 bounded readiness operations (`Wait_workflow` and `Wait_activity`). They do not
 consume a task or return one; they wait for a wake-up from the corresponding
-Rust/Core poll lane. The loop always retries the nonblocking `try_poll_*`
-operation after a wake-up, because readiness is only a hint and another
-consumer may have taken the task first. The C boundary releases the OCaml
-runtime lock during the wait. Its 100 ms bound means a quiet lane returns
-ordinary `Not_ready` and the supervisor can still admit shutdown promptly.
+Rust/Core poll lane. At most one of the two idle execution lanes enters a
+native wait at a time, alternating the preferred lane after each wait. A
+nonpreferred lane may claim the free wait after one local deferral if staggered
+polls keep the preferred lane from observing both lanes idle. If its sibling is
+busy or owns the native wait, a lane yields locally for 10 ms and then retries
+its nonblocking `try_poll_*` operation. This prevents an idle lane
+from repeatedly occupying the sole supervisor owner during work on the other
+lane. Rust poll-lane failures are also reported by `try_poll_*` when no task is
+queued, so local yields cannot conceal a fatal producer error. Native
+readiness remains the both-idle steady-state path. The C boundary releases the
+OCaml runtime lock during its 100 ms native wait, after which the supervisor
+can admit shutdown promptly.
 Keeping waits outside this adapter means `poll` remains nonblocking, the
 registry remains usable with deterministic fake sources, and execution
 translation does not depend on a particular scheduling primitive.
@@ -197,19 +204,23 @@ still owns the final executable: Rust remains a static implementation detail
 behind the private supervisor and no native handle is exposed through the
 public API.
 
-`Temporal.Worker.run` takes the worker mutex and, on each iteration, polls the
-workflow lane once and then the activity lane once. A task-level
-workflow/activity failure is completed through Core and the loop continues; a
-transport, protocol, or lifecycle error returns a typed `Temporal.Error.t`.
-When both nonblocking polls return `Not_ready`, the loop waits on exactly one
-bounded readiness operation and alternates the lane on the next empty
-iteration. A readiness result is only a wake-up, so the next iteration drains
-both lanes again. This keeps an activity-only load from starving behind
-workflow readiness (or the reverse) without making the adapter's `poll`
-operation block.
+`Temporal.Worker.run` holds the worker lifecycle mutex while two OCaml Domains
+run: the calling Domain polls and executes workflow activations, and one
+dedicated Domain polls and executes activity tasks. Both Domains send native
+operations through the same owner-Domain supervisor mailbox. Each lane waits
+on alternating bounded native readiness operations when both are idle, and
+uses a short local yield while its sibling is busy. A slow activity callback
+therefore cannot hold up an unrelated workflow activation; the activity lane
+has capacity one and cannot poll another activity while its callback or exact
+completion retry is pending. A task-level workflow/activity failure is
+completed through Core and the loop continues. A transport, protocol, or
+lifecycle error stops both lanes and returns a typed `Temporal.Error.t` after
+the activity Domain joins. The first fatal result is retained independently of
+the worker's shutdown flag, so an explicit later shutdown still owns cleanup.
 
-`shutdown` first closes admission, then waits for an active loop to leave the
-adapters by taking the same worker mutex. It drains the workflow and activity
+`shutdown` first closes admission, then waits for both execution Domains to
+leave the adapters and for the activity Domain to join before taking the same
+worker lifecycle mutex. It drains the workflow and activity
 pending-completion maps in that order. Only when both maps are empty does the
 supervisor close its readiness signals and native admission, join the Rust
 poll lanes, verify that no native leases remain, and release worker, client,
@@ -231,8 +242,13 @@ complete shutdown. That branch must not write the shared stop flag: a
 concurrent shutdown on another Domain may already have set it to stop the run
 loop, and any write here would race that caller and could strand the loop,
 holding the run mutex forever. It therefore only marks the failure retryable
-and leaves the stop flag exactly as observed. Repeated successful shutdown
-calls are idempotent.
+and leaves the stop flag exactly as observed. Re-entrant shutdown from either
+execution Domain is rejected before the public shutdown mutex is acquired;
+otherwise a callback could deadlock against a concurrent shutdown waiting for
+its Domain to join. Repeated successful shutdown calls are idempotent. A
+callback that never returns still makes the join and shutdown unbounded; the
+overall deadline and escalation policy are tracked in
+[#495](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/495).
 
 The semantic translator accepts child-start commands with the workflow identity,
 input, and optional retry policy represented by the protocol. Core child options

@@ -156,12 +156,16 @@ adapter mutex:
    supervisor returns `Ok ()`.
 
 The adapter mutex covers this whole transaction, including the user
-implementation and the native completion call. The production worker's run
-loop therefore executes one OCaml activity attempt at a time and cannot poll a
-second activity until the first attempt has produced an acknowledged terminal
-completion. This deliberate serialization keeps the token ledger and the
-supervisor mailbox race-free; it is separate from Rust/Core's own network
-concurrency.
+implementation and the native completion call. The production worker's
+dedicated activity Domain therefore executes one OCaml activity callback at a
+time and cannot poll a second activity until that callback has returned and
+its immediate completion or asynchronous handoff has been acknowledged.
+Workflow activations run concurrently on the
+calling Domain; both lanes use the same serialized supervisor mailbox for
+native operations. This preserves the adapter's token-ledger ownership while
+allowing unrelated workflow progress. It does not add parallel OCaml activity
+callbacks, and cancellation tasks behind a blocked callback cannot be polled
+until that callback returns.
 
 The context-aware form is authored with `Temporal.Activity.define_with_context`:
 
@@ -372,13 +376,13 @@ failure, invalid state, configuration error, or worker error remains
 non-retryable.
 
 `Temporal_runtime.Native_worker_loop` converts that explicit transient result
-to `Retry_pending`. The production `Temporal.Worker.run` then waits on the
-bounded native activity-readiness operation before polling again. The wait is
-performed by the blocking worker Domain, while the C bridge releases the OCaml
-runtime lock; it never blocks a workflow effect scheduler or holds the adapter
-mutex. Once the same copied completion is accepted, the next loop iteration is
-free to poll a new activity. Thus a lost completion acknowledgement cannot
-rerun user code, terminate an otherwise healthy worker, or create a busy spin.
+to `Retry_pending`. The production activity Domain then uses the dedicated
+bounded 10 ms native retry backoff before polling again. The C bridge releases
+the OCaml runtime lock during that delay; it never blocks the workflow lane or
+holds the adapter mutex. Once the same copied completion is accepted, the next
+loop iteration is free to poll a new activity. Thus a lost completion
+acknowledgement cannot rerun user code, terminate an otherwise healthy worker,
+or create a busy spin.
 
 The production source currently marks only the explicit bilateral `Retryable`
 status as safe for a completion retry. Generic `Connection` and `Not_ready`

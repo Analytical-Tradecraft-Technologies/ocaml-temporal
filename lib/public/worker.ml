@@ -586,6 +586,16 @@ let run worker =
 
 (** Shuts down the backend once and remembers that no new poll may be admitted. *)
 let shutdown worker =
+  if
+    match worker.backend with
+    | Native_backend backend -> Native_worker.is_execution_domain backend
+    | Mock_backend _ -> false
+  then
+    Error
+      (Error.defect
+         ~message:
+           "cannot shut down a worker from one of its execution Domains")
+  else begin
   Mutex.lock worker.shutdown_mutex;
   Fun.protect
     ~finally:(fun () -> Mutex.unlock worker.shutdown_mutex)
@@ -621,3 +631,4 @@ let shutdown worker =
              open so a later call can attempt shutdown again. *)
           if Atomic.get worker.closed then worker.shutdown_result <- Some result;
           result)
+  end

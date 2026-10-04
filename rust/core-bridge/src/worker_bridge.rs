@@ -312,6 +312,24 @@ impl Readiness {
         &self,
         receiver: &mut mpsc::UnboundedReceiver<ReadyTask<T>>,
     ) -> Option<ReadyTask<T>> {
+        self.take_inner(receiver, false)
+    }
+
+    /// Checks the queue and terminal error under one lock. A separate empty
+    /// receive followed by an error lookup would let a producer enqueue a
+    /// task between those checks, incorrectly reporting the error first.
+    fn take_or_failure<T>(
+        &self,
+        receiver: &mut mpsc::UnboundedReceiver<ReadyTask<T>>,
+    ) -> Option<ReadyTask<T>> {
+        self.take_inner(receiver, true)
+    }
+
+    fn take_inner<T>(
+        &self,
+        receiver: &mut mpsc::UnboundedReceiver<ReadyTask<T>>,
+        report_failure: bool,
+    ) -> Option<ReadyTask<T>> {
         let mut state = self
             .state
             .lock()
@@ -326,11 +344,21 @@ impl Readiness {
                 state.pending = state.pending.saturating_sub(1);
                 Some(message)
             }
-            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Empty) => {
+                if report_failure {
+                    state.error.clone().map(Err)
+                } else {
+                    None
+                }
+            }
             Err(TryRecvError::Disconnected) => {
                 state.closed = true;
                 self.wake.notify_all();
-                None
+                if report_failure {
+                    state.error.clone().map(Err)
+                } else {
+                    None
+                }
             }
         }
     }
@@ -509,7 +537,9 @@ impl PollLanes {
         &mut self,
         handle: &tokio::runtime::Handle,
     ) -> Option<ReadyTask<WorkflowActivation>> {
-        let ready = self.workflow_signal.take(&mut self.workflow_ready)?;
+        let ready = self
+            .workflow_signal
+            .take_or_failure(&mut self.workflow_ready)?;
         match ready {
             Ok(activation) => {
                 let lease = self
@@ -561,7 +591,9 @@ impl PollLanes {
         handle: &tokio::runtime::Handle,
     ) -> Option<ReadyTask<ActivityTask>> {
         loop {
-            let ready = self.activity_signal.take(&mut self.activity_ready)?;
+            let ready = self
+                .activity_signal
+                .take_or_failure(&mut self.activity_ready)?;
             match ready {
                 Err(error) => return Some(Err(error)),
                 Ok(task) => {
@@ -2157,5 +2189,19 @@ mod readiness_tests {
 
         assert_eq!(signal.wait(), ReadinessWait::Error(error.clone()));
         assert_eq!(signal.wait(), ReadinessWait::Error(error));
+    }
+
+    /// A lane that yields locally instead of waiting on its native condition
+    /// still sees the fatal error after all previously queued work is drained.
+    #[test]
+    fn nonblocking_poll_sees_error_after_queued_work() {
+        let signal = Readiness::new();
+        let (sender, mut receiver) = mpsc::unbounded_channel::<ReadyTask<usize>>();
+        let error = PollLaneError::Core("poll failed".to_owned());
+
+        assert!(signal.enqueue(&sender, Ok(7)));
+        signal.fail(error.clone());
+        assert_eq!(signal.take_or_failure(&mut receiver), Some(Ok(7)));
+        assert_eq!(signal.take_or_failure(&mut receiver), Some(Err(error)));
     }
 }
