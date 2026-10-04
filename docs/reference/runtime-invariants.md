@@ -75,6 +75,10 @@ and bridge, read the [documentation guide](../README.md) first.
   weak-reference and live-heap probe in `test/runtime/test_future_retention.ml`
   checks collection while the owner and summary futures remain active.
 - Awaiting a ready future does not perform an effect.
+- A derived future evaluates its outside-owner fallback only when no result was
+  observed after suspension. In particular, `Future.map_error` never invokes
+  an error mapper for a successful result, even when the await resumed from a
+  later activation.
 - External signal/cancellation validation and encoding failures created inside
   a workflow retain its scheduler owner, callback liveness, and suspension gate.
   They emit no command or durable sequence, preserve their original typed error

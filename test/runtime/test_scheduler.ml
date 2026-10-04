@@ -131,6 +131,25 @@ let test_map_error_and_owner_check () =
   expect "mapped error processing" "complete" (Scheduler.run_label first_scheduler);
   expect "mapped error" (Some (Error "FAILURE")) (Temporal.Future.peek mapped)
 
+(** Awaiting a pending mapped future outside its owner still maps the typed
+    ownership error exactly once without trying to suspend the scheduler. *)
+let test_map_error_outside_scheduler () =
+  let scheduler = Scheduler.create () in
+  let source, _resolve =
+    promise scheduler ~outside_error:(fun () -> "outside")
+  in
+  let mapper_calls = ref 0 in
+  let mapped =
+    Temporal.Future.map_error
+      (fun error ->
+        incr mapper_calls;
+        String.uppercase_ascii error)
+      source
+  in
+  expect "mapped outside-owner error" (Error "OUTSIDE")
+    (Temporal.Future.await mapped);
+  expect "outside-owner mapper calls" 1 !mapper_calls
+
 (** An already-resolved future has an inert owner that delivers callbacks
     immediately without being a valid workflow-await owner. Derived futures
     must therefore still run their observer callbacks outside a scheduler. *)
@@ -613,6 +632,7 @@ let () =
   test_outside_scheduler ();
   test_immediate_and_multiple_waiters ();
   test_map_error_and_owner_check ();
+  test_map_error_outside_scheduler ();
   test_resolved_combinator_callback_delivery ();
   test_aggregate_owner_errors_are_typed ();
   test_ready_like_parent_suspends_pending_outer ();

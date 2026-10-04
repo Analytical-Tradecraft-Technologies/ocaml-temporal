@@ -105,7 +105,11 @@ let make_derived ~parent ~outside_error =
                     observed := Some value;
                     signal ())) in
               ());
-          Option.value !observed ~default:(Error (outside_error ()))
+          (* The fallback can invoke a user's [map_error] callback, so it must
+             stay unevaluated after a successful resumption. *)
+          (match !observed with
+          | Some value -> value
+          | None -> Error (outside_error ()))
   in
   let future =
     make_repr ~await ~await_gate ~subscribe

@@ -1043,6 +1043,140 @@ let test_activate_terminal_completion () =
   | [ Protocol.Complete_workflow { result = None } ] -> ()
   | _ -> failwith "unit workflow did not produce nullable protocol completion"
 
+(** Runs a public unit workflow through the production native activation
+    adapter, including a second activation when the workflow starts a timer.
+    A successful case must emit a terminal completion, never a task failure. *)
+let run_map_error_native_case ~label ~expects_timer implementation =
+  let workflow =
+    Temporal.Workflow.define ~name:label ~input:Temporal.Codec.unit
+      ~output:Temporal.Codec.unit implementation
+  in
+  let execution = Execution.start (base_workflow workflow) () in
+  let activate jobs =
+    unwrap label
+      (Native_execution.activate execution (activation ~is_replaying:false jobs))
+  in
+  let initial =
+    activate
+      [ Protocol.Initialize_workflow
+          {
+            workflow_id = label;
+            workflow_type = label;
+            arguments = [];
+            randomness_seed = "1";
+            attempt = 1;
+            context = None;
+          } ]
+  in
+  let completion =
+    if expects_timer then
+      match (initial.commands, initial.task_failure) with
+      | [ Protocol.Start_timer { seq; _ } ], None ->
+          activate [ Protocol.Fire_timer { seq } ]
+      | _, Some failure ->
+          failwith (label ^ " failed before its timer: " ^ failure.message)
+      | _ -> failwith (label ^ " did not start exactly one timer")
+    else initial
+  in
+  (match (completion.commands, completion.task_failure) with
+  | [ Protocol.Complete_workflow { result = None } ], None -> ()
+  | _, Some failure ->
+      failwith (label ^ " failed its workflow task: " ^ failure.message)
+  | _ -> failwith (label ^ " did not complete successfully"));
+  Execution.shutdown execution
+
+(** A mapped successful future must not call an error-only callback, whether
+    it is awaited before the observer runs or after another activation. The
+    callback raises to expose a false invocation as a workflow task failure. *)
+let test_future_map_error_success () =
+  List.iter
+    (fun ready_before_await ->
+      let mapper_calls = ref 0 in
+      let label =
+        if ready_before_await then "map_error_ready_success"
+        else "map_error_pending_success"
+      in
+      run_map_error_native_case ~label ~expects_timer:ready_before_await
+        (fun () ->
+          let mapped =
+            Temporal.Future.map_error
+              (fun _error ->
+                incr mapper_calls;
+                failwith "map_error invoked on a successful future")
+              (Temporal.Future.all [])
+          in
+          let open Temporal.Result_syntax in
+          let* () =
+            if ready_before_await then
+              Temporal.Workflow.sleep (Temporal.Duration.of_ms 1L)
+            else Ok ()
+          in
+          match Temporal.Future.await mapped with
+          | Ok [] -> Ok ()
+          | Ok _ -> failwith "empty aggregate returned a value"
+          | Error error -> Error error);
+      if !mapper_calls <> 0 then
+        failwith (label ^ " invoked its error mapper"))
+    [ false; true ];
+  let run_delayed ~nested =
+    let mapper_calls = ref 0 in
+    let label =
+      if nested then "map_error_nested_delayed_success"
+      else "map_error_delayed_success"
+    in
+    run_map_error_native_case ~label ~expects_timer:true (fun () ->
+        let source =
+          Temporal.Workflow.start_sleep (Temporal.Duration.of_ms 1L)
+        in
+        let source =
+          if nested then Temporal.Future.map Fun.id source else source
+        in
+        let mapped =
+          Temporal.Future.map_error
+            (fun _error ->
+              incr mapper_calls;
+              failwith "map_error invoked on a successful timer")
+            source
+        in
+        let mapped =
+          if nested then Temporal.Future.map Fun.id mapped else mapped
+        in
+        match Temporal.Future.await mapped with
+        | Ok () -> Ok ()
+        | Error error -> Error error);
+    if !mapper_calls <> 0 then
+      failwith (label ^ " invoked its error mapper")
+  in
+  run_delayed ~nested:false;
+  run_delayed ~nested:true
+
+(** A real ready failure still runs the mapper exactly once and propagates its
+    chosen typed error through the native workflow completion. *)
+let test_future_map_error_failure () =
+  let activity =
+    Temporal.Activity.remote ~name:"map_error_invalid_queue"
+      ~input:Temporal.Codec.unit ~output:Temporal.Codec.unit
+  in
+  let mapper_calls = ref 0 in
+  run_map_error_native_case ~label:"map_error_real_failure"
+    ~expects_timer:false (fun () ->
+      let mapped =
+        Temporal.Future.map_error
+          (fun _error ->
+            incr mapper_calls;
+            Temporal.Error.defect ~message:"mapped invalid task queue")
+          (Temporal.Activity.start ~task_queue:"" activity ())
+      in
+      match Temporal.Future.await mapped with
+      | Error error
+        when String.equal (Temporal.Error.message error)
+               "mapped invalid task queue" ->
+          Ok ()
+      | Error _ -> failwith "error mapper returned an unexpected error"
+      | Ok () -> failwith "invalid activity queue unexpectedly succeeded");
+  if !mapper_calls <> 1 then
+    failwith "real failure did not invoke its mapper exactly once"
+
 (** Proves that the native activation adapter installs Core's deterministic
     timestamp before the workflow implementation runs. The implementation
     reads the public [Temporal.Workflow.now] API and compares both integer
@@ -1562,6 +1696,8 @@ let () =
   test_signal_identity_validation ();
   test_cancellation_and_eviction ();
   test_activate_terminal_completion ();
+  test_future_map_error_success ();
+  test_future_map_error_failure ();
   test_activate_installs_workflow_time ();
   test_activate_installs_deployment_metadata ();
   test_activate_installs_workflow_patch_state ();
