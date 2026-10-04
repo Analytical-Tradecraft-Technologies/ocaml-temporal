@@ -2551,7 +2551,7 @@ fn converts_application_failure_options_in_activity_and_child_causes() {
             workflow_protocol::ApplicationFailureCategory::Unspecified,
         ),
     ] {
-        let activation = activity(wrapped_activity(application(category, delay.clone())));
+        let activation = activity(wrapped_activity(application(category, delay)));
         let semantic = workflow_protocol::activation_from_core(&activation).unwrap();
         let workflow_protocol::ActivationJob::ResolveActivity {
             result: workflow_protocol::ActivityResolution::Failed { failure },
