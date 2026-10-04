@@ -19,11 +19,16 @@ The concrete `Sdk_supervisor.Native` module instantiates this signature with
 operations on its owner Domain. The public worker loop also uses two private,
 bounded readiness operations (`Wait_workflow` and `Wait_activity`). They do not
 consume a task or return one; they wait for a wake-up from the corresponding
-Rust/Core poll lane. The loop always retries the nonblocking `try_poll_*`
-operation after a wake-up, because readiness is only a hint and another
-consumer may have taken the task first. The C boundary releases the OCaml
-runtime lock during the wait. Its 100 ms bound means a quiet lane returns
-ordinary `Not_ready` and the supervisor can still admit shutdown promptly.
+Rust/Core poll lane. At most one of the two idle execution lanes enters a
+native wait at a time, alternating the preferred lane after each wait. If its
+sibling is busy or owns the native wait, a lane yields locally for 10 ms and
+then retries its nonblocking `try_poll_*` operation. This prevents an idle lane
+from repeatedly occupying the sole supervisor owner during work on the other
+lane. Rust poll-lane failures are also reported by `try_poll_*` when no task is
+queued, so local yields cannot conceal a fatal producer error. Native
+readiness remains the both-idle steady-state path. The C boundary releases the
+OCaml runtime lock during its 100 ms native wait, after which the supervisor
+can admit shutdown promptly.
 Keeping waits outside this adapter means `poll` remains nonblocking, the
 registry remains usable with deterministic fake sources, and execution
 translation does not depend on a particular scheduling primitive.
@@ -201,7 +206,8 @@ public API.
 run: the calling Domain polls and executes workflow activations, and one
 dedicated Domain polls and executes activity tasks. Both Domains send native
 operations through the same owner-Domain supervisor mailbox. Each lane waits
-on its own bounded readiness operation when idle. A slow activity callback
+on alternating bounded native readiness operations when both are idle, and
+uses a short local yield while its sibling is busy. A slow activity callback
 therefore cannot hold up an unrelated workflow activation; the activity lane
 has capacity one and cannot poll another activity while its callback or exact
 completion retry is pending. A task-level workflow/activity failure is

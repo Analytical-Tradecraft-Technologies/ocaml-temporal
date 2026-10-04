@@ -18,13 +18,15 @@ type progress =
     and release the native graph. An error in either lane stops the other through
     a separate per-run signal; it never changes the worker shutdown flag.
 
-    Both [wait_for_lane] and [retry_pending] must be bounded. The latter must
-    apply a real backoff even if unrelated work is ready, so an uncertain
-    completion cannot spin or trigger a second callback invocation. *)
+    [wait_for_lane] receives [native_wait = true] only when both lanes are idle
+    and this lane holds the single native-wait token. Otherwise it must perform
+    a short bounded local yield without entering the supervisor mailbox.
+    [retry_pending] must apply a real bounded backoff even if unrelated work is
+    ready, so an uncertain completion cannot spin or rerun its callback. *)
 val run :
   closed:(unit -> bool) ->
   poll_workflow:(unit -> (progress, 'error) result) ->
   poll_activity:(unit -> (progress, 'error) result) ->
-  wait_for_lane:(workflow_lane:bool -> (unit, 'error) result) ->
+  wait_for_lane:(workflow_lane:bool -> native_wait:bool -> (unit, 'error) result) ->
   retry_pending:(workflow_lane:bool -> (unit, 'error) result) ->
   (unit, 'error) result

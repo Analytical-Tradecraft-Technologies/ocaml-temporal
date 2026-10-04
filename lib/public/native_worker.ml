@@ -387,17 +387,24 @@ let poll_activity worker =
       Ok Retry_pending
   | Error error -> Error (public_activity_error "activity task poll" error)
 
-(** Waits on one bounded native readiness lane. The C bridge releases the OCaml
-    runtime lock during this operation, and the bounded result lets [shutdown]
-    regain the supervisor mailbox without waiting forever. *)
-let wait_for_lane worker ~workflow_lane =
-  let operation : unit Native.operation =
-    if workflow_lane then Native.Wait_workflow else Native.Wait_activity
-  in
-  match Native.perform worker.supervisor operation with
-  | Ok () -> Ok ()
-  | Error error when is_not_ready error -> Ok ()
-  | Error error -> Error (public_native_error "worker readiness wait" error)
+(** Uses native event readiness only for the one idle lane holding the wait
+    token. When its sibling is busy or already waiting, a 10 ms local yield
+    avoids occupying the sole supervisor owner with a wait for the wrong lane.
+    The next poll checks the Rust queue; when both lanes become idle, they
+    alternate native waits with the OCaml runtime lock released. *)
+let wait_for_lane worker ~workflow_lane ~native_wait =
+  if not native_wait then begin
+    Thread.delay 0.01;
+    Ok ()
+  end
+  else
+    let operation : unit Native.operation =
+      if workflow_lane then Native.Wait_workflow else Native.Wait_activity
+    in
+    match Native.perform worker.supervisor operation with
+    | Ok () -> Ok ()
+    | Error error when is_not_ready error -> Ok ()
+    | Error error -> Error (public_native_error "worker readiness wait" error)
 
 (** Applies the bounded delay used after a retained activity completion. The
     native supervisor owns the timer operation and its C stub releases the OCaml
@@ -407,7 +414,7 @@ let wait_for_lane worker ~workflow_lane =
     the ordinary readiness path preserves a safe fallback if a future adapter
     adds one without also adding a workflow-specific native timer. *)
 let retry_pending worker ~workflow_lane =
-  if workflow_lane then wait_for_lane worker ~workflow_lane
+  if workflow_lane then wait_for_lane worker ~workflow_lane ~native_wait:false
   else
     match
       Native.perform worker.supervisor
@@ -455,8 +462,8 @@ let run worker =
                 ~poll_activity:(fun () ->
                   Atomic.set worker.activity_domain (Some (Domain.self ()));
                   poll_activity worker)
-                ~wait_for_lane:(fun ~workflow_lane ->
-                  wait_for_lane worker ~workflow_lane)
+                ~wait_for_lane:(fun ~workflow_lane ~native_wait ->
+                  wait_for_lane worker ~workflow_lane ~native_wait)
                 ~retry_pending:(fun ~workflow_lane ->
                   retry_pending worker ~workflow_lane)
             with _ ->

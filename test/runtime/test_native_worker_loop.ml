@@ -49,8 +49,12 @@ let test_blocked_activity_does_not_block_workflow_or_overadmit () =
         Ok Loop.Progress
     | _ -> failwith "capacity-one lane polled beyond the queued activities"
   in
-  let wait_for_lane ~workflow_lane =
+  let wait_for_lane ~workflow_lane ~native_wait =
     if workflow_lane then begin
+      if Atomic.get first_entered then begin
+        if native_wait then
+          failwith "idle workflow used the owner while an activity was busy";
+      end;
       if Atomic.get workflow_progressed then
         await "second activity completion" (fun () -> Atomic.get closed)
       else
@@ -94,6 +98,90 @@ let test_blocked_activity_does_not_block_workflow_or_overadmit () =
   if Atomic.get activity_polls <> 2 then
     failwith "capacity-one lane did not process both queued activities"
 
+(** A busy workflow poll keeps the idle activity lane off the sole supervisor
+    owner, rather than allowing repeated unrelated 100 ms native waits. *)
+let test_busy_workflow_keeps_idle_activity_off_owner () =
+  let closed = Atomic.make false in
+  let workflow_entered = Atomic.make false in
+  let release_workflow = Atomic.make false in
+  let activity_local_yields = Atomic.make 0 in
+  let activity_native_waits = Atomic.make 0 in
+  let runner =
+    Domain.spawn (fun () ->
+      Loop.run ~closed:(fun () -> Atomic.get closed)
+        ~poll_workflow:(fun () ->
+          Atomic.set workflow_entered true;
+          await "workflow release" (fun () -> Atomic.get release_workflow);
+          Atomic.set closed true;
+          Ok Loop.Progress)
+        ~poll_activity:(fun () ->
+          await "busy workflow poll" (fun () -> Atomic.get workflow_entered);
+          Ok Loop.Not_ready)
+        ~wait_for_lane:(fun ~workflow_lane ~native_wait ->
+          if workflow_lane then failwith "busy workflow entered readiness wait";
+          if native_wait then
+            ignore (Atomic.fetch_and_add activity_native_waits 1)
+          else
+            ignore (Atomic.fetch_and_add activity_local_yields 1);
+          Thread.delay 0.001;
+          Ok ())
+        ~retry_pending:(fun ~workflow_lane:_ ->
+          failwith "busy workflow fixture entered completion retry"))
+  in
+  let observation =
+    try
+      await "activity local yields" (fun () -> Atomic.get activity_local_yields >= 3);
+      if Atomic.get activity_native_waits <> 0 then
+        failwith "idle activity repeatedly blocked the owner during workflow work";
+      Ok ()
+    with exception_ -> Error exception_
+  in
+  Atomic.set release_workflow true;
+  Atomic.set closed true;
+  let run_result = Domain.join runner in
+  (match observation with Ok () -> () | Error exception_ -> raise exception_);
+  (match run_result with
+  | Ok () -> ()
+  | Error _ -> failwith "busy workflow fixture returned an unexpected error")
+
+(** When both lanes are idle, one native event wait at a time alternates
+    between their readiness signals. The sibling takes bounded local yields. *)
+let test_idle_native_waits_alternate () =
+  let closed = Atomic.make false in
+  let waits = Atomic.make [] in
+  let runner =
+    Domain.spawn (fun () ->
+      Loop.run ~closed:(fun () -> Atomic.get closed)
+        ~poll_workflow:idle_workflow
+        ~poll_activity:(fun () -> Ok Loop.Not_ready)
+        ~wait_for_lane:(fun ~workflow_lane ~native_wait ->
+          if native_wait then begin
+            let observed = Atomic.get waits in
+            Atomic.set waits (workflow_lane :: observed);
+            if List.length observed >= 3 then Atomic.set closed true
+          end;
+          Thread.delay 0.001;
+          Ok ())
+        ~retry_pending:(fun ~workflow_lane:_ ->
+          failwith "idle lanes entered completion retry"))
+  in
+  let observation =
+    try
+      await "four alternating native waits" (fun () ->
+        List.length (Atomic.get waits) >= 4);
+      let sequence = List.rev (Atomic.get waits) in
+      if sequence <> [true; false; true; false] then
+        failwith "idle native readiness waits did not alternate lanes";
+      Ok ()
+    with exception_ -> Error exception_
+  in
+  Atomic.set closed true;
+  let run_result = Domain.join runner in
+  (match observation with Ok () -> () | Error exception_ -> raise exception_);
+  (match run_result with
+  | Ok () -> ()
+  | Error _ -> failwith "idle readiness fixture returned an unexpected error")
+
 (** One retained completion receives a backoff and does not rerun its callback.
     The third poll is a distinct task, proving the lane stays live afterward. *)
 let test_transient_completion_retries_and_progresses () =
@@ -119,7 +207,7 @@ let test_transient_completion_retries_and_progresses () =
   begin match
     Loop.run ~closed:(fun () -> Atomic.get closed)
       ~poll_workflow:idle_workflow ~poll_activity
-      ~wait_for_lane:(fun ~workflow_lane ->
+      ~wait_for_lane:(fun ~workflow_lane ~native_wait:_ ->
         if not workflow_lane then
           failwith "retained completion used ordinary activity readiness";
         await "activity completion retry" (fun () -> Atomic.get closed);
@@ -156,7 +244,7 @@ let test_permanent_activity_error_stops_sibling_without_shutdown () =
         await "workflow lane startup" (fun () -> Atomic.get workflow_started);
         Atomic.set activity_failed true;
         Error error)
-      ~wait_for_lane:(fun ~workflow_lane ->
+      ~wait_for_lane:(fun ~workflow_lane ~native_wait:_ ->
         if not workflow_lane then
           failwith "fatal activity error entered activity readiness wait";
         await "fatal activity result" (fun () -> Atomic.get activity_failed);
@@ -191,7 +279,7 @@ let test_rejected_delivery_keeps_workflow_lane_live () =
   begin match
     Loop.run ~closed:(fun () -> Atomic.get closed) ~poll_workflow
       ~poll_activity:(fun () -> Ok Loop.Not_ready)
-      ~wait_for_lane:(fun ~workflow_lane ->
+      ~wait_for_lane:(fun ~workflow_lane ~native_wait:_ ->
         if workflow_lane then ignore (Atomic.fetch_and_add workflow_waits 1)
         else await "workflow completion" (fun () -> Atomic.get closed);
         Ok ())
@@ -211,14 +299,17 @@ let test_closed_loop_does_not_poll () =
     ignore (Atomic.fetch_and_add calls 1);
     failwith "closed worker loop polled a backend lane"
   in
-  let unexpected_wait ~workflow_lane:_ =
+  let unexpected_wait ~workflow_lane:_ ~native_wait:_ =
     ignore (Atomic.fetch_and_add calls 1);
     failwith "closed worker loop waited on a backend lane"
   in
   match
     Loop.run ~closed:(fun () -> true)
       ~poll_workflow:unexpected_poll ~poll_activity:unexpected_poll
-      ~wait_for_lane:unexpected_wait ~retry_pending:unexpected_wait
+      ~wait_for_lane:unexpected_wait
+      ~retry_pending:(fun ~workflow_lane:_ ->
+        ignore (Atomic.fetch_and_add calls 1);
+        failwith "closed worker loop retried a completion")
   with
   | Ok () when Atomic.get calls = 0 -> ()
   | Ok () -> failwith "closed worker loop invoked a backend callback"
@@ -227,6 +318,8 @@ let test_closed_loop_does_not_poll () =
 (** Runs the focused scheduler regressions. *)
 let () =
   test_blocked_activity_does_not_block_workflow_or_overadmit ();
+  test_busy_workflow_keeps_idle_activity_off_owner ();
+  test_idle_native_waits_alternate ();
   test_transient_completion_retries_and_progresses ();
   test_permanent_activity_error_stops_sibling_without_shutdown ();
   test_rejected_delivery_keeps_workflow_lane_live ();

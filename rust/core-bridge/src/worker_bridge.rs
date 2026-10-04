@@ -335,6 +335,19 @@ impl Readiness {
         }
     }
 
+    /// Lets a nonblocking owner poll observe a fatal producer failure even
+    /// when no queue message remains. The OCaml lanes sometimes yield outside
+    /// the supervisor while their sibling is busy; they cannot rely on a
+    /// native readiness wait to surface this terminal condition. Queued tasks
+    /// are drained first, so the caller checks this only after [take] is empty.
+    fn failure(&self) -> Option<PollLaneError> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .error
+            .clone()
+    }
+
     /// Awaits one queue message while preserving the same pending-count
     /// invariant as [`Self::take`].  Replay disposal uses this owner-side
     /// variant while a poll lane is being joined: the lane may publish an
@@ -509,7 +522,10 @@ impl PollLanes {
         &mut self,
         handle: &tokio::runtime::Handle,
     ) -> Option<ReadyTask<WorkflowActivation>> {
-        let ready = self.workflow_signal.take(&mut self.workflow_ready)?;
+        let ready = match self.workflow_signal.take(&mut self.workflow_ready) {
+            Some(ready) => ready,
+            None => return self.workflow_signal.failure().map(Err),
+        };
         match ready {
             Ok(activation) => {
                 let lease = self
@@ -561,7 +577,10 @@ impl PollLanes {
         handle: &tokio::runtime::Handle,
     ) -> Option<ReadyTask<ActivityTask>> {
         loop {
-            let ready = self.activity_signal.take(&mut self.activity_ready)?;
+            let ready = match self.activity_signal.take(&mut self.activity_ready) {
+                Some(ready) => ready,
+                None => return self.activity_signal.failure().map(Err),
+            };
             match ready {
                 Err(error) => return Some(Err(error)),
                 Ok(task) => {
@@ -2157,5 +2176,20 @@ mod readiness_tests {
 
         assert_eq!(signal.wait(), ReadinessWait::Error(error.clone()));
         assert_eq!(signal.wait(), ReadinessWait::Error(error));
+    }
+
+    /// A lane that yields locally instead of waiting on its native condition
+    /// still sees the fatal error after all previously queued work is drained.
+    #[test]
+    fn nonblocking_poll_sees_error_after_queued_work() {
+        let signal = Readiness::new();
+        let (sender, mut receiver) = mpsc::unbounded_channel::<ReadyTask<usize>>();
+        let error = PollLaneError::Core("poll failed".to_owned());
+
+        assert!(signal.enqueue(&sender, Ok(7)));
+        signal.fail(error.clone());
+        assert_eq!(signal.take(&mut receiver), Some(Ok(7)));
+        assert_eq!(signal.take(&mut receiver), None);
+        assert_eq!(signal.failure(), Some(error));
     }
 }

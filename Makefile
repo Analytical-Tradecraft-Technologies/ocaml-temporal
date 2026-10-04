@@ -375,6 +375,7 @@ test-temporal-integration: test-temporal-config
 	trap 'exit 143' TERM; \
 	$(MAKE) temporal-start; \
 	$(MAKE) temporal-health; \
+	$(MAKE) test-worker-poll-isolation-live TEMPORAL_CLIENT_TEST_URL=http://temporal:7233; \
 	$(MAKE) test-core-lifecycle-integration; \
 	$(MAKE) temporal-start-worker; \
 	$(MAKE) temporal-run-driver; \
@@ -694,6 +695,13 @@ test-runtime:
 .PHONY: test-client-request-ids-live
 test-client-request-ids-live:
 	$(RUN) dune exec test/integration/client_request_ids/regression.exe -- check $(TEMPORAL_CLIENT_TEST_URL)
+
+# Requires a disposable running Temporal server. One worker runs both lanes;
+# a fresh client reads the exact timer-workflow result while its activity gate
+# remains closed, then the fixture releases and shuts down its worker.
+.PHONY: test-worker-poll-isolation-live
+test-worker-poll-isolation-live:
+	$(RUN) dune exec test/integration/worker_poll_isolation/regression.exe -- check $(TEMPORAL_CLIENT_TEST_URL)
 
 lint:
 	$(RUN) dune build @install $(DUNE_BUILD_ARGS)

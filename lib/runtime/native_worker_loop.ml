@@ -17,13 +17,17 @@ type progress =
     teardown even if [run] returned an error. *)
 type 'error lane_failure = Source_error of 'error | Raised of exn
 
-(** Runs one lane until shutdown or a sibling-lane failure. Polling and callback
-    execution remain sequential within a lane. Every wait is bounded by its
-    native implementation, so the sibling can observe a published stop. *)
-let run_lane ~stopped ~poll ~wait ~retry_pending =
+(** Runs one lane until shutdown or a sibling-lane failure. A lane is busy from
+    the start of its poll through callback/completion and any retained-completion
+    backoff. Only a [Not_ready] result makes it idle. The shared wait token lets
+    at most one idle lane occupy the native supervisor with a readiness wait;
+    the other lane yields locally and keeps checking for its own work. *)
+let run_lane ~stopped ~poll ~wait ~retry_pending ~busy ~sibling_busy
+    ~wait_token ~prefer_workflow ~workflow_lane =
   let rec loop () =
     if stopped () then Ok ()
-    else
+    else begin
+      Atomic.set busy true;
       match poll () with
       | Error _ when stopped () -> Ok ()
       | Error error -> Error error
@@ -33,13 +37,27 @@ let run_lane ~stopped ~poll ~wait ~retry_pending =
             let wait_result =
               match progress with
               | Progress -> Ok ()
-              | Not_ready -> wait ()
+              | Not_ready ->
+                  Atomic.set busy false;
+                  let native_wait =
+                    not (Atomic.get sibling_busy)
+                    && Atomic.get prefer_workflow = workflow_lane
+                    && Atomic.compare_and_set wait_token false true
+                  in
+                  if native_wait then
+                    Fun.protect
+                      ~finally:(fun () ->
+                        Atomic.set prefer_workflow (not workflow_lane);
+                        Atomic.set wait_token false)
+                      (fun () -> wait ~native_wait:true)
+                  else wait ~native_wait:false
               | Retry_pending -> retry_pending ()
             in
             match wait_result with
             | Error _ when stopped () -> Ok ()
             | Error error -> Error error
             | Ok () -> loop ()
+    end
   in
   loop ()
 
@@ -51,16 +69,21 @@ let run_lane ~stopped ~poll ~wait ~retry_pending =
 let run ~closed ~poll_workflow ~poll_activity ~wait_for_lane ~retry_pending =
   let stop = Atomic.make false in
   let first_failure = Atomic.make None in
+  let workflow_busy = Atomic.make false in
+  let activity_busy = Atomic.make false in
+  let wait_token = Atomic.make false in
+  let prefer_workflow = Atomic.make true in
   let stopped () = Atomic.get stop || closed () in
   let publish failure =
     ignore (Atomic.compare_and_set first_failure None (Some failure));
     Atomic.set stop true
   in
-  let guarded ~poll ~workflow_lane =
+  let guarded ~poll ~workflow_lane ~busy ~sibling_busy =
     try
       match
-        run_lane ~stopped ~poll
-          ~wait:(fun () -> wait_for_lane ~workflow_lane)
+        run_lane ~stopped ~poll ~busy ~sibling_busy ~wait_token
+          ~prefer_workflow ~workflow_lane
+          ~wait:(fun ~native_wait -> wait_for_lane ~workflow_lane ~native_wait)
           ~retry_pending:(fun () -> retry_pending ~workflow_lane)
       with
       | Ok () -> ()
@@ -68,9 +91,12 @@ let run ~closed ~poll_workflow ~poll_activity ~wait_for_lane ~retry_pending =
     with exception_ -> publish (Raised exception_)
   in
   let activity_domain =
-    Domain.spawn (fun () -> guarded ~poll:poll_activity ~workflow_lane:false)
+    Domain.spawn (fun () ->
+      guarded ~poll:poll_activity ~workflow_lane:false ~busy:activity_busy
+        ~sibling_busy:workflow_busy)
   in
-  guarded ~poll:poll_workflow ~workflow_lane:true;
+  guarded ~poll:poll_workflow ~workflow_lane:true ~busy:workflow_busy
+    ~sibling_busy:activity_busy;
   Domain.join activity_domain;
   match Atomic.get first_failure with
   | None -> Ok ()

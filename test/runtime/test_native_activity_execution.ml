@@ -715,7 +715,7 @@ let test_unrepresentable_context_retires_lease () =
               in
               (match Loop.run ~closed:(fun () -> Atomic.get good_calls = 1)
                  ~poll_workflow:(fun () -> Ok Loop.Not_ready) ~poll_activity
-                 ~wait_for_lane:(fun ~workflow_lane ->
+                 ~wait_for_lane:(fun ~workflow_lane ~native_wait:_ ->
                    if not workflow_lane then failwith "unexpected activity wait";
                    (* The independent workflow lane may wait before the queued
                       activity has completed. Keep that fixture wait bounded. *)
