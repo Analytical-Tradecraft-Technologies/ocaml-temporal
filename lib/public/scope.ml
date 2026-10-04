@@ -164,11 +164,16 @@ let on_cancel ?until scope hook =
         Ok ()
 
 (** Reports the scope state without scheduling work or touching the resolver.
-    Status is an owner-domain operation just like [cancel]: returning a typed
-    defect for a foreign or stale handle prevents a cross-Domain read of the
-    mutable state and makes post-shutdown use explicit. *)
+    A synchronous query may read its own live scope while the scheduler is
+    paused; the query marker grants no permission to cancel it. Foreign or
+    stale handles still return a typed defect before reading mutable state. *)
 let is_cancelled scope =
-  if not (owns_scheduler scope) then Error (ownership_error "is_cancelled")
+  if
+    not
+      (owns_scheduler scope
+      || Temporal_sdk_kernel.Workflow_context_store.query_read_owner_matches
+           scope.owner_id)
+  then Error (ownership_error "is_cancelled")
   else Ok (match scope.state with Cancelled -> true | Active -> false)
 
 (** Returns the scope's current cancellation result. The owner check is kept

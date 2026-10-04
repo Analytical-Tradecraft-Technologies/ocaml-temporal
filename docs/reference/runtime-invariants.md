@@ -17,6 +17,9 @@ and bridge, read the [documentation guide](../README.md) first.
   its synchronous handler, letting it inspect workflow-local state without
   running scheduler fibers. Query dispatch disables deterministic randomness,
   and the dynamic context binding is restored before its response is emitted.
+  The query may read its own live `Temporal.Scope.is_cancelled` status through
+  a separate Domain-local read marker. It cannot cancel the scope, await a
+  future, read another execution's scope, or use a scope after shutdown.
 - Futures from different schedulers cannot be combined.
 - Terminal completion, failure, cancellation, eviction, and shutdown dispose
   all pending callbacks and captured continuations.
@@ -109,9 +112,10 @@ and bridge, read the [documentation guide](../README.md) first.
   futures it observes. Cancellation resolves that private signal and invokes
   each registered activity or child-workflow cancellation hook at most once;
   timers and unscoped operations remain observation-only. Every scope
-  operation, including `is_cancelled` and `check`, is owner-checked (including
-  while the scheduler is paused between runs), so a foreign or stale handle
-  returns a typed defect rather than racing mutable state. Normal workflow
+  operation is owner-checked. While the scheduler is paused between runs,
+  only `is_cancelled` may also be called by a synchronous query for the same
+  live execution; a foreign or stale handle returns a typed defect rather than
+  racing mutable state. Normal workflow
   teardown closes any still-pending signal and its callbacks. Repeating
   cancellation is idempotent; hook errors are aggregated as a typed first
   error after all hooks have been attempted. The owner check compares the
