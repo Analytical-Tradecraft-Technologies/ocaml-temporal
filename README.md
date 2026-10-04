@@ -105,45 +105,13 @@ make test-temporal-parent-child-restart # bilateral exact-run recovery target
 ```
 
 The default development image uses OCaml 5.2. To try another supported image,
-pass `OCAML_VERSION`, for example `make verify OCAML_VERSION=5.5`. CI has a
-fast representative pull-request gate and an exhaustive compatibility gate. A
-code PR verifies Linux amd64 with OCaml 5.2 and 5.5, Linux arm64 with OCaml
-5.5, macOS ARM64 with OCaml 5.5, the pinned quality and dependency-license
-checks, the OCaml 5.5 Temporal/PostgreSQL smoke, and Windows x64 with OCaml
-5.5. PRs and merge groups use one all-or-nothing code gate: documentation-only
-changes skip all these jobs, while code, tests, build inputs, GitHub workflows,
-and composite actions run them all. JSON protocol schemas under `docs/schemas/`
-are code. Unknown file types also trigger the build. The separate release
-metadata/SBOM check still runs without compiling the SDK.
-
-Scheduled runs retain the exhaustive Linux matrix (OCaml 5.2–5.5 on amd64 and
-arm64) plus both OCaml 5.5 native desktop jobs. Pushes to `master` do not start
-builds. The standalone license audit runs once per code workflow, not per
-matrix cell. These entries describe configured jobs, not evidence that a
-particular Actions run has completed. Superseded runs are cancelled for the
-same PR or merge-group ref; job timeouts start after runner allocation.
-
-CI builds the Rust bridge once per operating system and architecture, sharing
-the Linux libraries across OCaml versions and the live smoke. Exact-input
-caches populated by `master` also serve PR, merge-queue, and scheduled runs.
-The C stubs, OCaml libraries, installed consumers, and their tests still build
-in every compatibility lane. Each lane also publishes a tested
+pass `OCAML_VERSION`, for example `make verify OCAML_VERSION=5.5`. The
+[quality and security gates](docs/reference/quality-gates.md) are the
+authoritative reference for CI triggers, required PR and merge-group checks,
+the `master` matrix, Rust artifact sharing, and local checks while Actions is
+queued. Each compatibility lane publishes a tested
 [compiled OCaml SDK bundle](docs/reference/prebuilt-ocaml.md) for compatible
 downstream applications to link without rebuilding the SDK.
-See [Rust artifact sharing](docs/reference/quality-gates.md#rust-artifact-sharing)
-for the cache boundaries and local producer/consumer commands.
-
-When Actions is queued, use `make check OCAML_VERSION=5.2` as the representative
-Docker-backed local baseline. It combines `make verify` with the package/OCaml
-license audit. Run `make quality` separately when the pinned native
-`cargo-deny`, `cargo-machete`, and `typos` binaries are installed; CI installs
-the checksum-verified versions. On Windows or macOS, `make native-verify`
-exercises the corresponding OCaml 5.5/Rust native compatibility path. The
-locked Cargo license scanner runs once in its isolated CI job and is not
-claimed by `make license-check`; `make test-temporal-integration` is the
-optional, expensive live Temporal Server/PostgreSQL check. Local results are
-interim evidence only and do not turn an unexecuted matrix, platform, or live
-server job green.
 
 On a memory-constrained Docker VM, bound Dune's native build concurrency with
 `make build DUNE_JOBS=1`; leaving `DUNE_JOBS` unset preserves the default
