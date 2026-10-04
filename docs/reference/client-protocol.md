@@ -783,8 +783,10 @@ and
 Temporal's protobuf/gRPC communication remains entirely inside Rust; JSON is
 only the ownership-safe OCaml/Rust boundary.
 
-The deterministic `mock://` backend accepts an empty visibility query and
-orders its current executions by workflow ID. It applies `page_size` and
-returns a mock-specific continuation token when more rows remain. The token
-resumes after the last returned workflow ID, so it is only meaningful for the
-same mock service ledger; callers should still treat it as opaque.
+The deterministic `mock://` backend lists every retained run, including an
+old run retired by reset and its running successor. It accepts an empty
+visibility query, orders rows by workflow ID and run ID, and applies
+`page_size`. When more rows remain, the mock-specific continuation token
+resumes after the exact workflow and run pair returned on the previous page.
+The token is meaningful only for the same mock service ledger; callers should
+still treat it as opaque.

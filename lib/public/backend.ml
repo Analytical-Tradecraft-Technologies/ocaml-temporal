@@ -1204,10 +1204,10 @@ let native_client_list_visibility (client : native_client)
             next_page_token = page.next_page_token;
           }
 
-(** Lists deterministic mock executions in workflow-ID order. A continuation
-    resumes after the last ID returned rather than relying on hash-table order
-    or an offset that shifts when a new execution is inserted. The mock accepts
-    only an empty query; native clients use Temporal's query language. *)
+(** Lists every retained mock run in workflow-ID and run-ID order. A page token
+    resumes after the last exact run returned, even when reset created another
+    run with the same workflow ID. The mock accepts only an empty query;
+    native clients use Temporal's query language. *)
 let mock_client_list_visibility (client : mock_client)
     (request : visibility_request) : (visibility_page, Error.t) result =
   if request.page_size < 1 || request.page_size > 1_000 then
@@ -1219,7 +1219,7 @@ let mock_client_list_visibility (client : mock_client)
   else if not (String.equal request.query "") then
     Error (defect "the deterministic mock only supports an empty visibility query")
   else
-    let token_prefix = "mock-visibility-v1:" in
+    let token_prefix = "mock-visibility-v2:" in
     let cursor =
       match request.next_page_token with
       | None -> Ok None
@@ -1227,10 +1227,22 @@ let mock_client_list_visibility (client : mock_client)
           if String.starts_with ~prefix:token_prefix token
              && String.length token > String.length token_prefix
           then
-            Ok
-              (Some
-                 (String.sub token (String.length token_prefix)
-                    (String.length token - String.length token_prefix)))
+            let start = String.length token_prefix in
+            (match String.index_from_opt token start ':' with
+            | None -> Error (defect "invalid mock visibility page token")
+            | Some delimiter ->
+                let length =
+                  String.sub token start (delimiter - start) |> int_of_string_opt
+                in
+                let remaining = String.length token - delimiter - 1 in
+                (match length with
+                | Some length when length > 0 && length < remaining ->
+                    Ok
+                      (Some
+                         ( String.sub token (delimiter + 1) length,
+                           String.sub token (delimiter + 1 + length)
+                             (remaining - length) ))
+                | _ -> Error (defect "invalid mock visibility page token")))
           else Error (defect "invalid mock visibility page token")
     in
     Result.bind cursor (fun cursor ->
@@ -1242,14 +1254,13 @@ let mock_client_list_visibility (client : mock_client)
           if client.closed then Error (bridge_error "client is shut down")
           else if
             (match cursor with
-            | Some workflow_id ->
-                not (Hashtbl.mem service.executions workflow_id)
+            | Some key -> not (Hashtbl.mem service.history key)
             | None -> false)
           then Error (defect "invalid mock visibility page token")
           else
             let executions : visibility_execution list =
-              Hashtbl.to_seq service.executions
-              |> Seq.map (fun (workflow_id, (execution : mock_execution)) ->
+              Hashtbl.to_seq service.history
+              |> Seq.map (fun ((workflow_id, _run_id), (execution : mock_execution)) ->
                      let status =
                        match execution.terminal with
                        | Mock_pending -> "running"
@@ -1268,15 +1279,24 @@ let mock_client_list_visibility (client : mock_client)
               |> List.of_seq
               |> List.sort (fun (left : visibility_execution)
                                 (right : visibility_execution) ->
-                      String.compare left.workflow_id right.workflow_id)
+                      let workflow_order =
+                        String.compare left.workflow_id right.workflow_id
+                      in
+                      if workflow_order <> 0 then workflow_order
+                      else String.compare left.run_id right.run_id)
             in
             let remaining =
               match cursor with
               | None -> executions
-              | Some workflow_id ->
+              | Some (workflow_id, run_id) ->
                   List.filter
                     (fun (execution : visibility_execution) ->
-                      String.compare execution.workflow_id workflow_id > 0)
+                      let workflow_order =
+                        String.compare execution.workflow_id workflow_id
+                      in
+                      workflow_order > 0
+                      || (workflow_order = 0
+                         && String.compare execution.run_id run_id > 0))
                     executions
             in
             (* A token is present exactly when another row follows this page. *)
@@ -1290,7 +1310,9 @@ let mock_client_list_visibility (client : mock_client)
                     next_page_token =
                       Option.map
                         (fun (execution : visibility_execution) ->
-                          token_prefix ^ execution.workflow_id)
+                          token_prefix
+                          ^ string_of_int (String.length execution.workflow_id)
+                          ^ ":" ^ execution.workflow_id ^ execution.run_id)
                         last;
                   }
               | execution :: rest ->
