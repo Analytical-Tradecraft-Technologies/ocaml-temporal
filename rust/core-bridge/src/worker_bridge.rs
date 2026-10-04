@@ -34,6 +34,10 @@ const MAX_TASK_TOKEN_BYTES: usize = 128 * 1024 * 1024;
 /// admission latency while still preventing a ready activity lane from
 /// turning a transient completion failure into a tight loop.
 pub const ACTIVITY_COMPLETION_RETRY_BACKOFF: Duration = Duration::from_millis(10);
+/// Minimum delay after a successfully rejected workflow delivery. Core may
+/// immediately redeliver an activation containing unsupported future fields;
+/// this bound keeps one such run from monopolizing the supervisor poll loop.
+pub const WORKFLOW_DELIVERY_REJECTION_BACKOFF: Duration = Duration::from_millis(100);
 
 /// Builds the bounded failure text sent to Core when a workflow activation
 /// cannot cross the private semantic boundary.
@@ -673,6 +677,13 @@ impl PollLanes {
     /// other Domains remain schedulable.
     pub fn wait_activity_completion_retry_backoff(&self) {
         std::thread::sleep(ACTIVITY_COMPLETION_RETRY_BACKOFF);
+    }
+
+    /// Prevents immediate Core redelivery of an unrepresentable activation
+    /// from spinning through the supervisor loop. The C binding releases the
+    /// OCaml runtime lock while the caller is inside this bounded timer.
+    pub fn wait_workflow_delivery_rejection_backoff(&self) {
+        std::thread::sleep(WORKFLOW_DELIVERY_REJECTION_BACKOFF);
     }
 
     /// Waits until both guarded poll futures have observed Core shutdown.
@@ -2056,6 +2067,7 @@ impl Default for TaskLedger {
 mod readiness_tests {
     use super::{
         ACTIVITY_COMPLETION_RETRY_BACKOFF, PollLaneError, Readiness, ReadinessWait, ReadyTask,
+        WORKFLOW_DELIVERY_REJECTION_BACKOFF,
     };
     use std::sync::Arc;
     use std::thread;
@@ -2069,6 +2081,8 @@ mod readiness_tests {
     fn completion_retry_backoff_is_positive_and_bounded() {
         assert!(ACTIVITY_COMPLETION_RETRY_BACKOFF > Duration::ZERO);
         assert!(ACTIVITY_COMPLETION_RETRY_BACKOFF <= Duration::from_secs(1));
+        assert!(WORKFLOW_DELIVERY_REJECTION_BACKOFF > Duration::ZERO);
+        assert!(WORKFLOW_DELIVERY_REJECTION_BACKOFF <= Duration::from_secs(1));
     }
 
     /// Confirms a notification committed before waiting is observed immediately.

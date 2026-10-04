@@ -468,7 +468,19 @@ Core's exact `timeout_type` (`unspecified`, `start_to_close`,
 `{"kind":"terminated","identity":"..."}`; its identity is bounded text and
 may be empty, as in Core's child-termination result. Termination is preserved
 through nested child failures so the parent receives a typed child-workflow
-error instead of a bridge rejection. Unknown
+error instead of a bridge rejection. Application failures retain Core's
+`category` (`unspecified` or `benign`) and exact nonnegative
+`next_retry_delay` seconds/nanoseconds in nested activity, child, continuation,
+and client outcomes. The default category and absent delay are omitted from
+the canonical JSON to preserve existing documents. These Core-only options
+are included in the bounded public error diagnostic.
+
+An activation with a future unsupported category or invalid delay is failed
+to Core and its lease retired. After Core accepts that rejection, the native
+poll returns `not_ready` so `Worker.run` can process other tasks; a fixed,
+internal 100 ms delay bounds immediate redelivery churn and warning volume.
+A failed Core rejection remains a fatal worker error. The rejection reason is
+static and contains no run ID or payload. Unknown
 protobuf oneofs, enum values, external payload references, unsupported failure
 variants, or omitted Core fields with non-default values fail conversion.
 

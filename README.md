@@ -381,6 +381,7 @@ AI models used to help build this project:
 
 ### OpenAI
 - GPT-6
+- GPT-6.1 Sol
 - GPT-5
 - GPT-5.5
 - GPT 5.6 Sol

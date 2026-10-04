@@ -2687,6 +2687,67 @@ mod tests {
         assert!(outcome_from_event(continued, "default", "id").is_err());
     }
 
+    /// The exact-run client shares the same Core application conversion as
+    /// workflow activations, including benign severity and exact retry delay.
+    #[test]
+    fn terminal_client_failure_retains_application_options() {
+        use temporalio_common::protos::temporal::api::{
+            enums::v1::ApplicationErrorCategory,
+            failure::v1::{ApplicationFailureInfo, Failure, failure::FailureInfo},
+            history::v1::WorkflowExecutionFailedEventAttributes,
+        };
+        let failure = Failure {
+            message: "expected failure".into(),
+            failure_info: Some(FailureInfo::ApplicationFailureInfo(
+                ApplicationFailureInfo {
+                    r#type: "ExpectedError".into(),
+                    category: i32::from(ApplicationErrorCategory::Benign),
+                    next_retry_delay: Some(prost_wkt_types::Duration {
+                        seconds: 3,
+                        nanos: 7,
+                    }),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        };
+        let event = HistoryEvent {
+            attributes: Some(Attributes::WorkflowExecutionFailedEventAttributes(
+                WorkflowExecutionFailedEventAttributes {
+                    failure: Some(failure),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        };
+        let outcome = outcome_from_event(event, "default", "id").unwrap();
+        let WorkflowOutcome::Failed { failure, .. } = &outcome else {
+            panic!("expected failed client outcome");
+        };
+        assert!(matches!(
+            &failure.info,
+            workflow_protocol::FailureInfo::Application {
+                category: workflow_protocol::ApplicationFailureCategory::Benign,
+                next_retry_delay: Some(workflow_protocol::Duration {
+                    seconds: 3,
+                    nanoseconds: 7,
+                }),
+                ..
+            }
+        ));
+        let response = WaitWorkflowResponse {
+            execution: ExecutionRef {
+                namespace: "default".into(),
+                workflow_id: "id".into(),
+                run_id: "run".into(),
+            },
+            outcome,
+        };
+        let encoded = encode_wait_response(&response).unwrap();
+        assert!(encoded.contains("\"category\":\"benign\""));
+        assert!(encoded.contains("\"next_retry_delay\""));
+    }
+
     #[test]
     /// Confirms continued-as-new output retains the successor run identity.
     fn continued_as_new_response_preserves_successor_metadata() {
@@ -2731,6 +2792,8 @@ mod tests {
                         type_name: "application".to_owned(),
                         non_retryable: false,
                         details: Vec::new(),
+                        category: workflow_protocol::ApplicationFailureCategory::Unspecified,
+                        next_retry_delay: None,
                     },
                 }),
                 successor: None,
@@ -3023,6 +3086,8 @@ mod tests {
                         type_name: "Failure".to_owned(),
                         non_retryable: true,
                         details: Vec::new(),
+                        category: workflow_protocol::ApplicationFailureCategory::Unspecified,
+                        next_retry_delay: None,
                     },
                 }),
             }),

@@ -6,6 +6,15 @@
   "$ref": "#/$defs/failure",
   "$defs": {
     "payload": {"$ref": "temporal-payload.schema.json"},
+    "nonnegativeDuration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["seconds", "nanoseconds"],
+      "properties": {
+        "seconds": {"type": "integer", "minimum": 0, "maximum": 9223372036854775807},
+        "nanoseconds": {"type": "integer", "minimum": 0, "maximum": 999999999}
+      }
+    },
     "failure": {
       "type": "object",
       "additionalProperties": false,
@@ -29,7 +38,9 @@
             "kind": {"const": "application"},
             "type": {"type": "string", "maxLength": 65536},
             "non_retryable": {"type": "boolean"},
-            "details": {"type": "array", "maxItems": 201326592, "items": {"$ref": "#/$defs/payload"}}
+            "details": {"type": "array", "maxItems": 201326592, "items": {"$ref": "#/$defs/payload"}},
+            "category": {"enum": ["unspecified", "benign"]},
+            "next_retry_delay": {"oneOf": [{"$ref": "#/$defs/nonnegativeDuration"}, {"type": "null"}]}
           }
         },
         {

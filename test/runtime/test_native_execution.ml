@@ -205,6 +205,8 @@ let test_retained_payloads_are_copied () =
             type_name = "continued";
             non_retryable = false;
             details = [ continuation_detail ];
+            category = Protocol.Application_category_unspecified;
+            next_retry_delay = None;
           };
     }
   in
@@ -389,6 +391,8 @@ let test_activity_failure_details_are_preserved () =
                   type_name = "mock_failure";
                   non_retryable = false;
                   details = [ protocol_payload "failure-details" ];
+                  category = Protocol.Application_category_unspecified;
+                  next_retry_delay = None;
                 };
           };
       info =

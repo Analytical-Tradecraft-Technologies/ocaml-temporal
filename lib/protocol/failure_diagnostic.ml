@@ -21,9 +21,19 @@ let bounded_text ~limit value =
 (** Describes one semantic info variant while leaving binary payload details in
     the typed [Error.view] list. *)
 let failure_info_summary = function
-  | Application { type_name; non_retryable; details } ->
-      Printf.sprintf "application type=%s non_retryable=%b details=%d" type_name
-        non_retryable (List.length details)
+  | Application
+      { type_name; non_retryable; details; category; next_retry_delay } ->
+      let options =
+        (match category with
+        | Application_category_unspecified -> ""
+        | Application_category_benign -> " category=benign")
+        ^ (match next_retry_delay with
+          | None -> ""
+          | Some { seconds; nanoseconds } ->
+              Printf.sprintf " next_retry_delay=%Ld.%09ds" seconds nanoseconds)
+      in
+      Printf.sprintf "application type=%s non_retryable=%b details=%d%s"
+        type_name non_retryable (List.length details) options
   | Canceled { details; identity } ->
       Printf.sprintf "canceled identity=%s details=%d" identity
         (List.length details)

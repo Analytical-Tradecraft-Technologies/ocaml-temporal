@@ -75,6 +75,11 @@ type timeout_type =
   | Timeout_schedule_to_close
   | Timeout_heartbeat
 
+(** Core's application-failure severity, separate from [Error.category]. *)
+type application_failure_category =
+  | Application_category_unspecified
+  | Application_category_benign
+
 (** Stable JSON spelling of a timeout policy, used by diagnostics as well as
     the private protocol encoder. *)
 val timeout_type_string : timeout_type -> string
@@ -85,6 +90,8 @@ type failure_info =
       type_name : string;
       non_retryable : bool;
       details : payload list;
+      category : application_failure_category;
+      next_retry_delay : duration option;
     }
   | Canceled of { details : payload list; identity : string }
   | Terminated of { identity : string }

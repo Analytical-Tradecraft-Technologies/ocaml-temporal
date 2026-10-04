@@ -123,6 +123,35 @@ let test_permanent_protocol_error_remains_fatal () =
   if !waits <> [] then
     failwith "permanent protocol error incorrectly entered retry wait"
 
+(** A successful Core rejection is surfaced as [Not_ready] after the native
+    bounded backoff. Repeated unsupported deliveries must leave this scheduler
+    free to observe the next healthy workflow, rather than ending Worker.run. *)
+let test_rejected_delivery_keeps_workflow_lane_live () =
+  let workflow_polls = ref 0 in
+  let waits = ref 0 in
+  let closed = ref false in
+  let poll_workflow () =
+    incr workflow_polls;
+    if !workflow_polls <= 2 then Ok Loop.Not_ready
+    else begin
+      closed := true;
+      Ok Loop.Progress
+    end
+  in
+  begin match
+    Loop.run ~closed:(fun () -> !closed)
+      ~poll_workflow
+      ~poll_activity:(fun () -> Ok Loop.Not_ready)
+      ~wait_for_lane:(fun ~workflow_lane:_ -> incr waits; Ok ())
+      ~retry_pending:(fun ~workflow_lane:_ ->
+        failwith "rejected workflow delivery entered activity retry path")
+  with
+  | Ok () -> ()
+  | Error _ -> failwith "rejected workflow delivery stopped the worker loop"
+  end;
+  if !workflow_polls <> 3 || !waits <> 2 then
+    failwith "worker did not advance beyond rejected workflow deliveries"
+
 (** A native stop request must short-circuit before either readiness lane or
     retry callback is touched. This protects shutdown liveness from a future
     loop refactor that accidentally polls a retired supervisor once more. *)
@@ -149,4 +178,5 @@ let test_closed_loop_does_not_poll () =
 let () =
   test_transient_completion_retries_and_progresses ();
   test_permanent_protocol_error_remains_fatal ();
+  test_rejected_delivery_keeps_workflow_lane_live ();
   test_closed_loop_does_not_poll ()

@@ -253,6 +253,8 @@ let failure_of_error (error : error_view) : Protocol.failure =
             type_name = "ocaml_temporal_native_worker";
             non_retryable = true;
             details = [];
+            category = Application_category_unspecified;
+            next_retry_delay = None;
           };
     }
 
@@ -554,12 +556,15 @@ module Make (Supervisor : SUPERVISOR) = struct
   let rec copy_failure (failure : Protocol.failure) : Protocol.failure =
     let info =
       match failure.info with
-      | Protocol.Application { type_name; non_retryable; details } ->
+      | Protocol.Application
+          { type_name; non_retryable; details; category; next_retry_delay } ->
           Protocol.Application
             {
               type_name;
               non_retryable;
               details = List.map copy_payload details;
+              category;
+              next_retry_delay;
             }
       | Protocol.Canceled { details; identity } ->
           Protocol.Canceled

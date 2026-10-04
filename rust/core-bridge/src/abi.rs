@@ -7,6 +7,7 @@ use crate::{activity_protocol, client_protocol, workflow_protocol};
 use serde::Deserialize;
 use std::collections::{HashMap, hash_map::Entry};
 use std::future::Future;
+use std::io::Write;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
 use std::ptr;
@@ -1192,18 +1193,17 @@ impl Runtime {
         let semantic = match workflow_protocol::activation_from_core(&activation) {
             Ok(semantic) => semantic,
             Err(error) => {
-                self.reject_workflow_delivery_with_reason(&activation.run_id, error.message)?;
-                return Err(core_conversion_failure(error));
+                return self
+                    .reject_unrepresentable_workflow_delivery(&activation.run_id, error.message);
             }
         };
         let encoded = match workflow_protocol::encode_activation(&semantic) {
             Ok(encoded) => encoded,
-            Err(error) => {
-                self.reject_workflow_delivery_with_reason(
+            Err(_error) => {
+                return self.reject_unrepresentable_workflow_delivery(
                     &activation.run_id,
                     "semantic activation JSON encoding failed",
-                )?;
-                return Err(protocol_failure(error));
+                );
             }
         };
         // Retain must not leave a leased ledger entry without a handoff
@@ -1663,6 +1663,24 @@ impl Runtime {
         handle
             .block_on(worker.reject_workflow_delivery_with_reason(run_id, reason))
             .map_err(worker_bridge_failure)
+    }
+
+    /// A successfully rejected unsupported activation is local task progress,
+    /// so the public worker keeps polling its other leases. An actual Core
+    /// rejection error remains fatal through the `?` below. The static reason
+    /// is also the bounded diagnostic sent to Core; no payload is logged.
+    fn reject_unrepresentable_workflow_delivery(
+        &self,
+        run_id: &str,
+        reason: &'static str,
+    ) -> Operation {
+        self.reject_workflow_delivery_with_reason(run_id, reason)?;
+        write_rejected_workflow_diagnostic(std::io::stderr().lock(), reason);
+        self.worker
+            .as_ref()
+            .expect("rejected workflow delivery retains worker")
+            .wait_workflow_delivery_rejection_backoff();
+        Err(not_ready())
     }
 
     /// Fails and retires an activity task that was never exposed to OCaml.
@@ -2149,6 +2167,15 @@ fn not_ready() -> Failure {
         status: STATUS_NOT_READY,
         message: "no Temporal task is ready".to_owned(),
     }
+}
+
+/// Logging is best effort after Core has accepted the task rejection: a
+/// closed stderr must not turn local task progress into an ABI panic.
+fn write_rejected_workflow_diagnostic(mut output: impl Write, reason: &'static str) {
+    let _ = writeln!(
+        output,
+        "ocaml-temporal: rejected workflow delivery: {reason}"
+    );
 }
 
 /// Reports an exact-run wait that must be retried without exposing a fake
@@ -4056,6 +4083,34 @@ pub fn test_worker_bridge_status(error: WorkerBridgeError) -> Status {
 #[cfg(test)]
 #[path = "../tests/support/abi_rejection.rs"]
 mod rejection_tests;
+
+#[cfg(test)]
+mod rejection_diagnostic_tests {
+    use super::write_rejected_workflow_diagnostic;
+    use std::io::{self, Write};
+
+    /// Models a closed stderr stream without changing process-wide descriptors.
+    struct BrokenStderr(usize);
+
+    impl Write for BrokenStderr {
+        fn write(&mut self, _bytes: &[u8]) -> io::Result<usize> {
+            self.0 += 1;
+            Err(io::ErrorKind::BrokenPipe.into())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A diagnostic write error must be observed without unwinding the worker.
+    #[test]
+    fn closed_stderr_does_not_panic_after_workflow_rejection() {
+        let mut stderr = BrokenStderr(0);
+        write_rejected_workflow_diagnostic(&mut stderr, "unsupported Core failure category");
+        assert_eq!(stderr.0, 1);
+    }
+}
 
 #[cfg(test)]
 #[path = "../tests/support/client_wait.rs"]

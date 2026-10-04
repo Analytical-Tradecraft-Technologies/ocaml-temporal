@@ -50,11 +50,18 @@ type timeout_type =
   | Timeout_schedule_to_close
   | Timeout_heartbeat
 
+(** Core's application-failure severity, separate from [Error.category]. *)
+type application_failure_category =
+  | Application_category_unspecified
+  | Application_category_benign
+
 type failure_info =
   | Application of {
       type_name : string;
       non_retryable : bool;
       details : payload list;
+      category : application_failure_category;
+      next_retry_delay : duration option;
     }
   | Canceled of { details : payload list; identity : string }
   | Terminated of { identity : string }
@@ -720,6 +727,17 @@ let retry_state_string = function
   | Internal_server_error -> "internal_server_error"
   | Cancel_requested -> "cancel_requested"
 
+(** Decodes only the application-failure categories in the pinned Core schema. *)
+let application_failure_category path = function
+  | "unspecified" -> Ok Application_category_unspecified
+  | "benign" -> Ok Application_category_benign
+  | _ -> Error (invalid path "unknown application failure category")
+
+(** Uses the same lowercase spelling as Core's enum mapping. *)
+let application_failure_category_string = function
+  | Application_category_unspecified -> "unspecified"
+  | Application_category_benign -> "benign"
+
 (** Decodes Core's exact timeout-policy spelling and rejects future values. *)
 let timeout_type path = function
   | "unspecified" -> Ok Timeout_unspecified
@@ -748,8 +766,17 @@ let failure_info path json =
   let* kind = string (path ^ ".kind") kind_json in
   match kind with
   | "application" ->
+      let optional_fields =
+        match json with
+        | `Assoc entries ->
+            List.filter (fun name -> List.mem_assoc name entries)
+              [ "category"; "next_retry_delay" ]
+        | _ -> []
+      in
       let* entries =
-        exact_object path [ "kind"; "type"; "non_retryable"; "details" ] json
+        exact_object path
+          ([ "kind"; "type"; "non_retryable"; "details" ] @ optional_fields)
+          json
       in
       let* type_json = field path "type" entries in
       let* type_name = string (path ^ ".type") type_json in
@@ -757,7 +784,22 @@ let failure_info path json =
       let* non_retryable = bool (path ^ ".non_retryable") non_retryable_json in
       let* details_json = field path "details" entries in
       let* details = list (path ^ ".details") payload details_json in
-      Ok (Application { type_name; non_retryable; details })
+      let* category =
+        match List.assoc_opt "category" entries with
+        | None -> Ok Application_category_unspecified
+        | Some value ->
+            let* name = string (path ^ ".category") value in
+            application_failure_category (path ^ ".category") name
+      in
+      let* next_retry_delay =
+        match List.assoc_opt "next_retry_delay" entries with
+        | None -> Ok None
+        | Some value ->
+            nullable (path ^ ".next_retry_delay") duration value
+      in
+      Ok
+        (Application
+           { type_name; non_retryable; details; category; next_retry_delay })
   | "canceled" ->
       let* entries = exact_object path [ "kind"; "details"; "identity" ] json in
       let* details_json = field path "details" entries in
@@ -944,16 +986,29 @@ let continuation path json =
 
 (** Encodes the supported failure-info union. *)
 let rec failure_info_json = function
-  | Application { type_name; non_retryable; details } ->
+  | Application
+      { type_name; non_retryable; details; category; next_retry_delay } ->
       let* details = payloads_json details in
+      let category_field =
+        match category with
+        | Application_category_unspecified -> []
+        | Application_category_benign ->
+            [ ("category", `String (application_failure_category_string category)) ]
+      in
+      let retry_delay_field =
+        match next_retry_delay with
+        | None -> []
+        | Some value ->
+            [ ("next_retry_delay", time_json value.seconds value.nanoseconds) ]
+      in
       Ok
         (`Assoc
-          [
+          ([
             ("kind", `String "application");
             ("type", `String type_name);
             ("non_retryable", `Bool non_retryable);
             ("details", details);
-          ])
+          ] @ category_field @ retry_delay_field))
   | Canceled { details; identity } ->
       let* details = payloads_json details in
       Ok

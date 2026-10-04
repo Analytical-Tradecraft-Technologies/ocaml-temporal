@@ -51,12 +51,19 @@ type timeout_type = Workflow_protocol.timeout_type =
   | Timeout_schedule_to_close
   | Timeout_heartbeat
 
+(** Severity of an application failure in the pinned Core schema. *)
+type application_failure_category = Workflow_protocol.application_failure_category =
+  | Application_category_unspecified
+  | Application_category_benign
+
 (** Supported closed set of structured Temporal failure details. *)
 type failure_info = Workflow_protocol.failure_info =
   | Application of {
       type_name : string;
       non_retryable : bool;
       details : payload list;
+      category : application_failure_category;
+      next_retry_delay : duration option;
     }
   | Canceled of { details : payload list; identity : string }
   | Terminated of { identity : string }

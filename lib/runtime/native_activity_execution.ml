@@ -237,6 +237,8 @@ let failure_of_error (error : error_view) : Protocol.failure =
             type_name = "ocaml_temporal_native_activity";
             non_retryable = true;
             details = [];
+            category = Application_category_unspecified;
+            next_retry_delay = None;
           };
     }
 
@@ -408,6 +410,8 @@ let failure_of_application_error (diagnostic : error_view)
               type_name = Base_error.kind error;
               non_retryable = view.non_retryable;
               details;
+              category = Application_category_unspecified;
+              next_retry_delay = None;
             };
       }
 
