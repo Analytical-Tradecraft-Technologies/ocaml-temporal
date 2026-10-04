@@ -17,14 +17,15 @@ changing a type, changing a labelled argument, changing a result/error
 contract, or exposing an implementation module is a breaking change even when
 the compiler can still build the repository itself.
 
-The [v1 support policy](v1-support-policy.md) describes a narrower production
-feature/deployment contract, compatibility commitments and release
+The [MVP v1 prerelease scope](v1-support-policy.md) describes the core
+workflow/client/worker candidate, its experimental gaps, and release
 qualification gates. Its matrix becomes the approved target only after a
 maintainer approves it on [PR #557](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/pull/557)
 and that PR merges; [#489](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/489)
-tracks the decision. Approval does not claim that the experimental package
-already satisfies the release gates. Public export visibility and compile-time
-compatibility remain separate from stable behavioral support.
+tracks the decision. The candidate `v0.1.0-rc.1` remains experimental and
+does not establish a stable 1.x source or behavior promise. Approval does not
+claim that the package satisfies the release gates. Public export visibility
+and compile-time checks remain separate from runtime qualification.
 
 The policy is intentionally conservative at the application boundary. It
 protects the source API that a downstream OCaml program sees, not the private
@@ -72,7 +73,8 @@ When a public API change is intentional:
 
 Do not weaken an annotation merely to make a changed signature compile. If a
 new capability requires a new public module, add it to the explicit root
-allow-list and document why it belongs in the supported surface. Before the
-first stable release, maintainers must approve the v1 policy and complete its
-qualification checklist. The installed witness and private-module negative
-checks remain required even for exported capabilities labelled experimental.
+allow-list and document why it belongs in the exported surface. Before the
+MVP prerelease is published, maintainers must approve its scope and complete
+its candidate qualification checklist. The installed witness and
+private-module negative checks remain required even for exported capabilities
+labelled experimental.
