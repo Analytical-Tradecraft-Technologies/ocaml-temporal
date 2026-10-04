@@ -19,10 +19,12 @@
 #include <string.h>
 
 /* OCaml custom block that is the sole owner of one initialized Rust result.
- * `live` makes explicit free and finalization idempotent with respect to the
- * same OCaml value. Copying this C structure remains forbidden. */
+ * A reader increments active_reads before checking live; explicit free closes
+ * the gate and waits for admitted readers before Rust releases either buffer.
+ * Copying this C structure remains forbidden. */
 typedef struct owned_response {
   ocaml_temporal_core_result result;
+  atomic_uint active_reads;
   /* Atomic so explicit free and GC finalization cannot race a double free if
    * the same response value is observed from more than one Domain. */
   atomic_int live;
@@ -149,12 +151,35 @@ static void release_runtime(owned_runtime *owned) {
   atomic_fetch_sub_explicit(&owned->active_calls, 1, memory_order_seq_cst);
 }
 
+/* Admit a short, allocation-free read of an initialized Rust result. The
+ * increment precedes the liveness check so free cannot release a buffer that
+ * an admitted reader is copying. Callers must release the borrow before any
+ * OCaml allocation or exception. */
+static int acquire_response(owned_response *response) {
+  atomic_fetch_add_explicit(&response->active_reads, 1, memory_order_seq_cst);
+  if (atomic_load_explicit(&response->live, memory_order_seq_cst) == 0) {
+    atomic_fetch_sub_explicit(&response->active_reads, 1,
+                              memory_order_seq_cst);
+    return 0;
+  }
+  return 1;
+}
+
+/* End one result read before its owner can release Rust allocations. */
+static void release_response_read(owned_response *response) {
+  atomic_fetch_sub_explicit(&response->active_reads, 1, memory_order_seq_cst);
+}
+
 /* Release Rust allocations exactly once and poison further field access. */
 static void release_response(owned_response *response) {
   int expected = 1;
   if (atomic_compare_exchange_strong_explicit(
-          &response->live, &expected, 0, memory_order_acq_rel,
-          memory_order_acquire)) {
+          &response->live, &expected, 0, memory_order_seq_cst,
+          memory_order_seq_cst)) {
+    while (atomic_load_explicit(&response->active_reads,
+                                memory_order_seq_cst) != 0) {
+      runtime_thread_yield();
+    }
     (void)ocaml_temporal_core_v2_result_free(&response->result);
   }
 }
@@ -229,6 +254,7 @@ static value alloc_response(void) {
   response = caml_alloc_custom(&response_operations, sizeof(owned_response), 0, 1);
   owned = Response_val(response);
   memset(owned, 0, sizeof(*owned));
+  atomic_init(&owned->active_reads, 0);
   atomic_init(&owned->live, 1);
   CAMLreturn(response);
 }
@@ -331,30 +357,50 @@ static value invoke_runtime(value runtime, runtime_operation operation) {
   CAMLreturn(response);
 }
 
-/* Reject use-after-free deterministically at the private binding boundary. */
+/* Start a protected read or reject a response already freed on any Domain. */
 static owned_response *require_live(value response) {
   owned_response *owned = Response_val(response);
-  if (atomic_load_explicit(&owned->live, memory_order_acquire) == 0) {
+  if (!acquire_response(owned)) {
     caml_invalid_argument("Temporal native response has already been freed");
   }
   return owned;
 }
 
-/* Copy one Rust-owned byte span without passing its canonical null pointer to
- * the OCaml initialized-string primitive.  The Rust ABI deliberately uses
- * `{ NULL, 0 }` for an empty allocation; allocating an empty OCaml string
- * directly avoids making a zero-length `memcpy` depend on whether a particular
- * OCaml runtime build tolerates a null source pointer.  A nonempty null span
- * is an ABI defect, so fail before dereferencing it rather than crashing. */
-static value copy_owned_buffer(const ocaml_temporal_core_buffer *buffer) {
-  if (buffer->len == 0) {
-    return caml_alloc_string(0);
+/* Allocate GC-owned output between two short result borrows. An OCaml
+ * allocation can move the response custom block or raise, so no interior
+ * pointer or active borrow may survive that call. If another Domain frees the
+ * result between the length read and the copy, the second borrow raises a
+ * deterministic use-after-free error instead of touching released bytes. */
+static value copy_response_buffer(value response, int want_success) {
+  CAMLparam1(response);
+  CAMLlocal1(copy);
+  owned_response *owned = require_live(response);
+  int status = owned->result.status;
+  const ocaml_temporal_core_buffer *buffer =
+      want_success ? &owned->result.value : &owned->result.error;
+  size_t length = buffer->len;
+  int invalid_span = length > 0 && buffer->ptr == NULL;
+  release_response_read(owned);
+
+  if ((status == OCAML_TEMPORAL_CORE_STATUS_OK) != want_success) {
+    caml_invalid_argument(want_success
+                              ? "Temporal native response does not contain a value"
+                              : "Temporal native response does not contain an error");
   }
-  if (buffer->ptr == NULL) {
+  if (invalid_span) {
     caml_invalid_argument("Temporal native response has a null nonempty buffer");
   }
-  return caml_alloc_initialized_string((mlsize_t)buffer->len,
-                                        (const char *)buffer->ptr);
+
+  copy = caml_alloc_string((mlsize_t)length);
+  owned = require_live(response);
+  buffer = want_success ? &owned->result.value : &owned->result.error;
+  /* While live, Rust never mutates a result buffer. The only transition is
+   * free, which cannot pass the second borrow until this copy is done. */
+  if (length > 0) {
+    memcpy(Bytes_val(copy), buffer->ptr, length);
+  }
+  release_response_read(owned);
+  CAMLreturn(copy);
 }
 
 /* Negotiate ABI compatibility without blocking; the returned custom block owns
@@ -790,29 +836,19 @@ CAMLprim value ocaml_temporal_runtime_close(value runtime) {
 CAMLprim value ocaml_temporal_response_status(value response) {
   CAMLparam1(response);
   owned_response *owned = require_live(response);
-  CAMLreturn(Val_int(owned->result.status));
+  int status = owned->result.status;
+  release_response_read(owned);
+  CAMLreturn(Val_int(status));
 }
 
 /* Copy successful Rust bytes into GC-owned OCaml storage before cleanup. */
 CAMLprim value ocaml_temporal_response_value(value response) {
-  CAMLparam1(response);
-  owned_response *owned = require_live(response);
-
-  if (owned->result.status != OCAML_TEMPORAL_CORE_STATUS_OK) {
-    caml_invalid_argument("Temporal native response does not contain a value");
-  }
-  CAMLreturn(copy_owned_buffer(&owned->result.value));
+  return copy_response_buffer(response, 1);
 }
 
 /* Copy failure diagnostics into GC-owned OCaml storage before cleanup. */
 CAMLprim value ocaml_temporal_response_error(value response) {
-  CAMLparam1(response);
-  owned_response *owned = require_live(response);
-
-  if (owned->result.status == OCAML_TEMPORAL_CORE_STATUS_OK) {
-    caml_invalid_argument("Temporal native response does not contain an error");
-  }
-  CAMLreturn(copy_owned_buffer(&owned->result.error));
+  return copy_response_buffer(response, 0);
 }
 
 /* Explicit cleanup used by [Fun.protect]; finalization remains a fallback. */
