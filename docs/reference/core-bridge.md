@@ -270,13 +270,41 @@ rooted/finalizable owner rather than orphaning Rust memory. Disposal is
 idempotent, so a later finalizer after deterministic disposal is harmless.
 
 Returned bytes are copied once, directly from the live Rust buffer into the
-OCaml string/bytes allocation. For the canonical empty `{ NULL, 0 }` case, the
-C binding allocates an empty OCaml value without passing the null pointer to
-the runtime's initialized-string primitive. A nonempty null span is rejected
-before dereference as an ABI defect. Inputs that must survive a blocking call are
-copied to temporary C storage before the runtime lock is released, then freed
-immediately after the lock is reacquired. Neither side directly frees an
-allocation made by the other side.
+OCaml string/bytes allocation. The C binding first reads the buffer length
+under a counted borrow, releases that borrow before allocating OCaml storage,
+then borrows the result again for the allocation-free byte copy. Explicit free
+closes the borrow gate and waits for admitted copies before calling Rust's
+`result_free`. If another Domain frees the result between allocation and the
+second borrow, the copy raises a closed-owner error without dereferencing
+released bytes. No pointer into the movable OCaml custom block is retained
+across the OCaml allocation. For the canonical empty `{ NULL, 0 }` case, the
+C binding allocates an empty OCaml value without passing the null pointer to a
+copy operation. A nonempty null span is rejected before dereference as an ABI
+defect. Inputs that must survive a blocking call are copied to temporary C
+storage before the runtime lock is released, then freed immediately after the
+lock is reacquired. Neither side directly frees an allocation made by the
+other side.
+
+### Bounded replay ownership audit (#523)
+
+This table traces one replay activation from a client-free runtime through
+handoff, completion, and abandonment. The references name the owning path and
+the test that observes it; they do not qualify every Core or FFI lifecycle.
+
+| Stage | Owner and cleanup contract | Instrumentation |
+| --- | --- | --- |
+| Start and feed | `Runtime::replay_worker` owns the Core worker and one-slot feeder; `Runtime::dispose_replay` or runtime close releases the graph. C's `owned_runtime.active_calls` keeps the runtime alive during a released-lock call. | `rust/core-bridge/src/abi.rs` (`start_replay_worker`, `dispose_replay`, `drop_runtime_graph`), `lib/core_bridge/native_stubs.c` (`acquire_runtime`, `release_runtime`), `rust/core-bridge/tests/replay_abi.rs` (`new_replay_runtime`). |
+| Poll and handoff | The Rust workflow ledger retains the activation lease. The ABI result owns its encoded bytes until C's `owned_response` copies and frees them; the copy/free gate permits either a complete copy or a closed-owner error when Domains race. In the OCaml binding, explicit free and finalization converge on `release_response`, which alone calls Rust's `result_free`; raw ABI callers call `result_free` directly. | `rust/core-bridge/src/abi.rs` (`try_poll_replay_workflow`, `invoke`, `result_free`), `lib/core_bridge/native_stubs.c` (`copy_response_buffer`, `release_response`), `lib/core_bridge/response_borrow_gate.h` (shared gate), `test/bridge/test_response_borrow_gate.ml` (admitted-read interleaving), `test/bridge/test_ocaml_response_buffers.ml` (success/error Domain races). |
+| Malformed activation handoff | An OCaml decode failure sends the original bytes to native rejection. A mismatched or malformed rejection does not consume the lease; a semantically matching rejection reports the failure to Core and retires the lease. Each ABI response owns its diagnostic until the OCaml binding copies and frees it. | `rust/core-bridge/src/abi.rs` (`reject_replay_workflow_delivery`), `rust/core-bridge/tests/replay_abi.rs` (`replay_abi_rejects_only_semantically_matching_lease`), `test/sdk_supervisor/test_native_worker_operations.ml` (`test_decode_failure_retires_native_lease`). |
+| Malformed completion or panic | Strict decoding rejects malformed completion before consuming the lease. `invoke` catches a Rust panic in its operation closure and returns an owned `STATUS_PANIC` error; the synthetic probe does not inject a panic into Core or after replay-worker ownership is taken. | `rust/core-bridge/src/abi.rs` (`complete_replay_workflow`, `invoke`, `test_invoke_panic`), `rust/core-bridge/tests/replay_abi.rs` (`replay_abi_retains_lease_after_malformed_completion`), `rust/core-bridge/tests/abi.rs` (`contains_rust_panics_as_owned_errors`). |
+| Accepted completion and natural finalization | Core acceptance retires the semantic lease; a duplicate completion fails. Natural finalization requires closed input, observed shutdown, and no outstanding native debt, then clears the runtime's replay worker. | `rust/core-bridge/src/abi.rs` (`complete_replay_workflow`, `finalize_replay`), `rust/core-bridge/src/replay_bridge.rs` (`finalize`), `rust/core-bridge/tests/replay_abi.rs` (`replay_abi_retains_lease_after_malformed_completion`). |
+| Abandonment | Explicit replay disposal acknowledges leased work with Core's replay-safe empty completion. Runtime disposal transfers the graph to its cleanup thread; the process-local created/cleaned counters observe eventual destructor completion with a leased activation. | `rust/core-bridge/src/replay_bridge.rs` (`dispose`), `rust/core-bridge/src/abi.rs` (`drop_runtime_graph`), `rust/core-bridge/tests/replay_abi.rs` (`replay_abi_disposes_a_leased_activation_without_core_failure`), `rust/core-bridge/tests/runtime_cleanup.rs`. |
+
+The panic probe proves containment and result-buffer release at the common ABI
+wrapper. It does not prove recovery from an arbitrary panic inside Temporal
+Core or after `finalize_replay`/`dispose_replay` takes the worker. Those cases
+remain outside this finite audit and must not be treated as production
+qualification of the full FFI.
 
 ### Private OCaml worker operations
 
