@@ -17,6 +17,16 @@ let activity_completion_retryable = function
   | Temporal_core_bridge.Native_bridge.Retryable -> true
   | _ -> false
 
+(** Returns whether an async-client heartbeat failure leaves its nonterminal
+    capability available. Unlike a Core worker completion, a heartbeat cannot
+    consume the completion lease: an uncertain RPC result may be retried with
+    the same details. [Invalid_state] is the bridge's confirmed NotFound result
+    and remains terminal. *)
+let async_heartbeat_retryable = function
+  | Temporal_core_bridge.Native_bridge.Connection
+  | Temporal_core_bridge.Native_bridge.Retryable -> true
+  | _ -> false
+
 (** Returns whether a failed adapter drain can safely reopen worker admission.
     A same-Domain shutdown admission defect is handled before a drain and is
     intentionally separate from this predicate. *)

@@ -95,18 +95,20 @@ shutdown still reports the outstanding lease until a terminal operation complete
 If an earlier submission is still uncertain, a local rejection of its retry
 cannot clear the original operation key or allow a conflicting request.
 
-On the native worker path, an operation key is retained after a failed
-submission only when the supervisor explicitly classifies the failure as
-retryable; the current bilateral policy
-uses the dedicated `Retryable` bridge status for that classification. Generic
-`Connection` failures, `NotFound`, and other non-retryable bridge failures
-close the handle and remove the pending operation because they do not prove
-that replay is safe. Callers may retry only the same byte-identical operation
-after an explicitly retryable result; they must not retry a generic async RPC
-failure or issue a different operation for the same handle. The activity
-callback is never rerun for a completion-submission retry. The handle is not a
-retained activity context: ordinary `Activity.Context` values are still
-invalidated when their callback returns.
+On the native worker path, a failed operation keeps its key only when its
+operation-specific supervisor classifier reports uncertainty. Core worker
+completions and late async terminal completions retain the conservative
+bilateral policy: only the dedicated `Retryable` bridge status authorizes an
+exact-request retry. A namespace-bound async heartbeat is nonterminal and
+does not consume the worker completion lease. Its `Connection` result leaves
+the handle and adapter lease tracked so the caller may retry the same
+byte-identical heartbeat after connectivity returns, then complete the
+activity once. A different heartbeat or terminal operation stays blocked until
+that request is resolved. `NotFound` maps to `Invalid_state` and closes the
+handle because the server has discarded the token. Other permanent bridge
+failures also close it. The activity callback is never rerun for a submission
+retry. The handle is not a retained activity context: ordinary
+`Activity.Context` values are still invalidated when their callback returns.
 
 ## Registration and dispatch
 
@@ -208,8 +210,9 @@ adapter exposes it but does not start a timer or synthesize timeout/retry
 behavior; Temporal Core owns timeout decisions and subsequent task delivery.
 If Core has already timed out an attempt, the synchronous adapter has no stale
 completion recovery. An asynchronous handle remains owned by the SDK until a
-terminal client operation is accepted or a non-retryable bridge failure closes
-it. A shutdown attempt that finds an admitted asynchronous lease returns a
+terminal client operation is accepted or a confirmed terminal bridge failure
+closes it. An uncertain async heartbeat connection error cannot retire that
+lease. A shutdown attempt that finds an admitted asynchronous lease returns a
 retryable outstanding-lease error and leaves the worker graph and handle
 usable; the caller must finish the handle and retry shutdown. Only terminal
 cleanup after a non-retryable failure closes an admitted handle.

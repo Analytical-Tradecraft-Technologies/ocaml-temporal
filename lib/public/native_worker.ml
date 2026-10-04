@@ -178,6 +178,14 @@ module Activity_source = struct
         Worker_policy.activity_completion_retryable status
     | _ -> false
 
+  (** The namespace-bound async heartbeat is nonterminal, so its connection
+      error does not prove that the client completion capability is gone. This
+      classification is intentionally separate from Core worker completions. *)
+  let async_heartbeat_error_is_retryable = function
+    | Native.Backend { Bridge.status; _ } ->
+        Worker_policy.async_heartbeat_retryable status
+    | _ -> false
+
   (** Unexpected supervisor exceptions are defects, not evidence of a safe
       transient transport failure. The adapter therefore retains them but the
       worker loop treats them as fatal unless a private test/source explicitly

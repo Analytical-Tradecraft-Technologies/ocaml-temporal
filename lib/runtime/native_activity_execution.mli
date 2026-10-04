@@ -60,6 +60,12 @@ module type SUPERVISOR = sig
       may retry the same completion after a bounded wait. Permanent, protocol,
       configuration, and lifecycle failures must return [false]. *)
 
+  val async_heartbeat_error_is_retryable : error -> bool
+  (** Classifies a failed namespace-bound async heartbeat separately from a
+      Core worker completion. [true] retains the nonterminal handle and lease
+      for an exact-request retry after uncertain transport failure; a confirmed
+      terminal token response such as NotFound must return [false]. *)
+
   val exception_is_retryable : exn -> bool
   (** Classifies an exception raised by the completion call. Production
       supervisors should return [false] unless they define a private,

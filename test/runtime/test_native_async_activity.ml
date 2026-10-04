@@ -11,6 +11,8 @@
 module Protocol = Temporal_protocol.Activity_protocol
 module Raw_adapter = Temporal_runtime.Native_activity_execution
 module Base_async = Temporal_base.Async_activity
+module Bridge = Temporal_core_bridge.Native_bridge
+module Worker_policy = Temporal_runtime.Native_worker_policy
 
 (** Copies a public payload into the private representation used by the base
     adapter. The test intentionally performs the same ownership conversion as
@@ -90,7 +92,12 @@ let copy_heartbeat heartbeat =
       | Ok value -> value
       | Error _ -> failwith "async fake could not reparse its heartbeat")
 
-type source_error = { code : string; message : string; retryable : bool }
+type source_error = {
+  code : string;
+  message : string;
+  retryable : bool;
+  native_status : Bridge.status option;
+}
 (** Bounded source diagnostics returned by the deterministic supervisor. *)
 
 type fake_supervisor = {
@@ -108,6 +115,8 @@ type fake_supervisor = {
   reject_next_async_completion : bool ref;
   reject_next_async_completion_terminal : bool ref;
   reject_next_async_heartbeat : bool ref;
+  reject_next_async_heartbeat_connection : bool ref;
+  reject_next_async_heartbeat_terminal : bool ref;
 }
 (** Fake native state. [leased] and [async_leased] intentionally model
     different Temporal APIs and are never allowed to substitute for one another.
@@ -129,6 +138,8 @@ let fake_supervisor () =
     reject_next_async_completion = ref false;
     reject_next_async_completion_terminal = ref false;
     reject_next_async_heartbeat = ref false;
+    reject_next_async_heartbeat_connection = ref false;
+    reject_next_async_heartbeat_terminal = ref false;
   }
 
 (** Removes the first byte-identical token from a lease ledger. Tokens are
@@ -147,8 +158,8 @@ let has_token token tokens =
   List.exists (fun current -> Bytes.equal current token) tokens
 
 (** Creates a stable fake error for stale or unavailable leases. *)
-let source_error ?(retryable = false) code message =
-  { code; message; retryable }
+let source_error ?(retryable = false) ?native_status code message =
+  { code; message; retryable; native_status }
 
 (** Implements the complete supervisor contract needed by the adapter. All
     methods copy values before retaining them, and late operations consult only
@@ -257,7 +268,23 @@ module Fake_supervisor = struct
   (** Records heartbeat details against the namespace-bound async lease. *)
   let record_async_activity_heartbeat supervisor (heartbeat : Protocol.heartbeat) =
     incr supervisor.async_heartbeat_calls;
-    if !(supervisor.reject_next_async_heartbeat) then begin
+    if !(supervisor.reject_next_async_heartbeat_terminal) then begin
+      supervisor.reject_next_async_heartbeat_terminal := false;
+      let _, remaining =
+        remove_token heartbeat.Protocol.task_token !(supervisor.async_leased)
+      in
+      supervisor.async_leased := remaining;
+      Error
+        (source_error ~native_status:Bridge.Invalid_state "not_found"
+           "async activity no longer exists")
+    end
+    else if !(supervisor.reject_next_async_heartbeat_connection) then begin
+      supervisor.reject_next_async_heartbeat_connection := false;
+      Error
+        (source_error ~native_status:Bridge.Connection "connection"
+           "async heartbeat transport unavailable")
+    end
+    else if !(supervisor.reject_next_async_heartbeat) then begin
       supervisor.reject_next_async_heartbeat := false;
       Error
         (source_error ~retryable:true "temporarily_unavailable"
@@ -273,7 +300,18 @@ module Fake_supervisor = struct
   (** Exposes stable source classifications to the adapter. *)
   let error_code error = error.code
   let error_message error = error.message
-  let error_is_retryable error = error.retryable
+  let error_is_retryable error =
+    match error.native_status with
+    | Some status -> Worker_policy.activity_completion_retryable status
+    | None -> error.retryable
+
+  (** Exercise the production heartbeat classifier on statuses that the Rust
+      async client actually returns, rather than on a premarked retryable fake. *)
+  let async_heartbeat_error_is_retryable error =
+    match error.native_status with
+    | Some status -> Worker_policy.async_heartbeat_retryable status
+    | None -> error.retryable
+
   let exception_is_retryable _ = false
 end
 
@@ -787,6 +825,110 @@ let test_async_terminal_rejection_closes_lease () =
         failwith ("terminal async rejection blocked drain: " ^ error.message)
   end
 
+(** Admits one deferred activity for native-status heartbeat failure tests.
+    The callback count proves a retry never re-executes user activity code. *)
+let heartbeat_status_fixture ~name ~token =
+  let supervisor = fake_supervisor () in
+  let calls = ref 0 and retained = ref None in
+  let activity =
+    Temporal.Activity.define_async ~name ~input:Temporal.Codec.unit
+      ~output:Temporal.Codec.string
+      (fun context () ->
+        incr calls;
+        let handle = Temporal.Activity.Async_context.handle context in
+        retained := Some handle;
+        Temporal.Activity.Will_complete_async handle)
+  in
+  enqueue supervisor
+    (start_task ~token ~activity_type:name
+       ~input:[ encode_input Temporal.Codec.unit () ]);
+  let worker = worker supervisor [ Adapter.register_async activity ] in
+  expect_deferred (Worker.poll worker);
+  (supervisor, worker, Option.get !retained, calls)
+
+(** A native [Connection] heartbeat result is uncertain, not terminal: the
+    client did not consume the worker completion lease, and the server activity
+    can still be live. Keep both OCaml registries until the exact heartbeat is
+    retried, then accept one terminal completion. *)
+let test_async_connection_heartbeat_keeps_handle () =
+  let token = Bytes.of_string "async-connection-token" in
+  let supervisor, worker, handle, calls =
+    heartbeat_status_fixture ~name:"async_connection_heartbeat" ~token
+  in
+  let detail : Temporal.Payload.t =
+    { metadata = [ ("encoding", "binary/plain") ];
+      data = Bytes.of_string "progress" }
+  in
+  supervisor.reject_next_async_heartbeat_connection := true;
+  (match Temporal.Activity.Async_handle.heartbeat handle [ detail ] with
+  | Error error ->
+      let view = Temporal.Error.view error in
+      if view.category <> `Bridge || view.non_retryable then
+        failwith "uncertain heartbeat was classified as terminal"
+  | Ok () -> failwith "connection failure was reported as an accepted heartbeat");
+  if !calls <> 1 || !(supervisor.async_leased) <> [ token ] then
+    failwith "connection failure reran callback or retired server activity";
+  (match Worker.drain worker with
+  | Error { code = "outstanding_async_leases"; retryable = true; _ } -> ()
+  | _ -> failwith "connection failure let worker drain an active async lease");
+  let changed_detail : Temporal.Payload.t =
+    { detail with data = Bytes.of_string "changed" }
+  in
+  (match Temporal.Activity.Async_handle.heartbeat handle [ changed_detail ] with
+  | Error _ -> ()
+  | Ok () -> failwith "uncertain heartbeat allowed changed retry details");
+  (match Temporal.Activity.Async_handle.complete handle "premature" with
+  | Error _ -> ()
+  | Ok () -> failwith "uncertain heartbeat allowed a terminal operation");
+  if !(supervisor.async_heartbeat_calls) <> 1
+     || !(supervisor.async_completion_calls) <> 0 then
+    failwith "conflicting async request reached the native client";
+  (match Temporal.Activity.Async_handle.heartbeat handle [ detail ] with
+  | Ok () -> ()
+  | Error error ->
+      failwith ("identical heartbeat retry failed: " ^ Temporal.Error.message error));
+  (match Temporal.Activity.Async_handle.complete handle "done" with
+  | Ok () -> ()
+  | Error error ->
+      failwith ("completion after heartbeat recovery failed: "
+        ^ Temporal.Error.message error));
+  if !calls <> 1 || !(supervisor.async_heartbeat_calls) <> 2
+     || List.length !(supervisor.async_heartbeats) <> 1
+     || !(supervisor.async_completion_calls) <> 1
+     || List.length !(supervisor.async_completions) <> 1
+     || !(supervisor.async_leased) <> [] then
+    failwith "heartbeat recovery did not retire exactly one async lease";
+  (match Worker.drain worker with
+  | Ok () -> ()
+  | Error _ -> failwith "completed async handle still blocked drain")
+
+(** A native [Invalid_state] heartbeat means Temporal has discarded the token.
+    The fake retires its server ledger before returning that terminal response,
+    and the adapter must close the public handle and stop tracking the lease. *)
+let test_async_not_found_heartbeat_closes_handle () =
+  let token = Bytes.of_string "async-not-found-token" in
+  let supervisor, worker, handle, _ =
+    heartbeat_status_fixture ~name:"async_not_found_heartbeat" ~token
+  in
+  supervisor.reject_next_async_heartbeat_terminal := true;
+  (match Temporal.Activity.Async_handle.heartbeat handle [] with
+  | Error error when (Temporal.Error.view error).non_retryable -> ()
+  | Error _ -> failwith "not-found heartbeat was treated as uncertain"
+  | Ok () -> failwith "not-found heartbeat was reported as accepted");
+  (match Temporal.Activity.Async_handle.heartbeat handle [] with
+  | Error _ -> ()
+  | Ok () -> failwith "terminal heartbeat left its handle active");
+  (match Temporal.Activity.Async_handle.complete handle "late" with
+  | Error _ -> ()
+  | Ok () -> failwith "terminal heartbeat allowed a late completion");
+  if !(supervisor.async_heartbeat_calls) <> 1
+     || !(supervisor.async_completion_calls) <> 0
+     || !(supervisor.async_leased) <> [] then
+    failwith "terminal heartbeat did not retire its client capability";
+  match Worker.drain worker with
+  | Ok () -> ()
+  | Error _ -> failwith "terminal heartbeat left an adapter lease outstanding"
+
 (** Heartbeat retries retain the request while terminal cancellation preserves
     its detail payloads. This checks the non-terminal and terminal state paths
     independently on one admitted handle. *)
@@ -1097,6 +1239,8 @@ let () =
   test_async_invalid_encoding_preserves_handle ();
   test_async_completion_retry ();
   test_async_terminal_rejection_closes_lease ();
+  test_async_connection_heartbeat_keeps_handle ();
+  test_async_not_found_heartbeat_closes_handle ();
   test_async_heartbeat_and_cancel ();
   test_async_failure ();
   test_async_drain_and_discard ();

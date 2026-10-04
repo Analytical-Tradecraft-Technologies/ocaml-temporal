@@ -33,6 +33,27 @@ let test_activity_completion_policy () =
       ("unknown status", Bridge.Unknown 13);
     ]
 
+(** Async client heartbeats do not consume a completion lease. A connection
+    result is uncertain and retains the handle for an identical retry, while
+    the bridge's NotFound/invalid-state response closes it. This must not
+    weaken the ordinary Core completion policy tested above. *)
+let test_async_heartbeat_policy () =
+  expect_bool "uncertain heartbeat connection" true
+    (Policy.async_heartbeat_retryable Bridge.Connection);
+  expect_bool "explicit retryable heartbeat" true
+    (Policy.async_heartbeat_retryable Bridge.Retryable);
+  List.iter
+    (fun (label, status) ->
+      expect_bool label false (Policy.async_heartbeat_retryable status))
+    [
+      ("not-found heartbeat", Bridge.Invalid_state);
+      ("not-ready heartbeat", Bridge.Not_ready);
+      ("worker heartbeat", Bridge.Worker);
+      ("protocol heartbeat", Bridge.Protocol);
+      ("configuration heartbeat", Bridge.Configuration);
+      ("unknown heartbeat status", Bridge.Unknown 13);
+    ]
+
 (** Shutdown can reopen admission only when an activity drain retained a
     completion after an explicitly transient native failure. Workflow drains
     and permanent activity failures must remain terminal. *)
@@ -153,6 +174,7 @@ let test_reentrant_same_domain_shutdown_preserves_closed () =
 (** Runs all pure policy regressions. *)
 let () =
   test_activity_completion_policy ();
+  test_async_heartbeat_policy ();
   test_shutdown_policy ();
   test_terminal_cleanup_preserves_original_error ();
   test_reentrant_same_domain_shutdown_preserves_closed ()

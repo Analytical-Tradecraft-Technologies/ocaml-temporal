@@ -15,6 +15,13 @@ val activity_completion_retryable :
 (** Returns [true] only for the bilateral retryable-completion status. Generic
     connection, readiness, worker, protocol, and closed states are false. *)
 
+val async_heartbeat_retryable :
+  Temporal_core_bridge.Native_bridge.status -> bool
+(** Returns [true] for an uncertain async-client heartbeat connection result
+    or explicit retryable result. A heartbeat is nonterminal and does not
+    consume a Core completion lease; [Invalid_state] (server NotFound) and all
+    other bridge failures remain terminal. *)
+
 val shutdown_retryable : drain_failure -> bool
 (** Returns [true] only when an activity adapter retained a completion after an
     explicitly transient native failure. Workflow drains and all permanent

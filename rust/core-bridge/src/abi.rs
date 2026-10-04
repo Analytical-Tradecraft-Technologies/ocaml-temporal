@@ -126,9 +126,10 @@ const START_WAIT_TIMEOUT: Duration = Duration::from_millis(100);
 /// already completed, cancelled, timed out, or otherwise discarded that
 /// activity, so retrying the same request could never make it valid. Other RPC
 /// failures do not prove whether the server consumed the request. They remain
-/// a generic connection failure and are therefore fail-closed rather than
-/// guessed to be retryable. The remote diagnostic is intentionally discarded
-/// at this boundary so server-controlled text cannot enter the stable ABI.
+/// a generic connection failure; the OCaml adapter decides whether the
+/// particular operation can be retried. A heartbeat is nonterminal, unlike a
+/// completion. The remote diagnostic is intentionally discarded at this
+/// boundary so server-controlled text cannot enter the stable ABI.
 fn async_activity_failure(operation: &str, error: AsyncActivityError) -> Failure {
     match error {
         AsyncActivityError::NotFound(_) => Failure {
@@ -4141,11 +4142,11 @@ mod async_activity_error_tests {
         );
     }
 
-    /// A generic RPC failure does not prove whether Temporal consumed the
-    /// request, so the bridge must fail closed instead of inventing a retryable
-    /// classification from the remote status text.
+    /// A generic RPC failure stays Connection. The OCaml heartbeat policy may
+    /// retain its nonterminal handle, while the completion policy remains
+    /// fail-closed; Rust must not claim a bilateral completion retry lease.
     #[test]
-    fn rpc_failure_is_fail_closed_connection() {
+    fn heartbeat_rpc_failure_is_connection() {
         let failure = async_activity_failure(
             "heartbeat",
             AsyncActivityError::Rpc(Status::unavailable("ignored")),
@@ -4155,6 +4156,22 @@ mod async_activity_error_tests {
         assert_eq!(
             failure.message,
             "Temporal asynchronous activity heartbeat failed"
+        );
+    }
+
+    /// A confirmed missing heartbeat token is terminal just like a missing
+    /// completion token, even though a connection failure is uncertain.
+    #[test]
+    fn heartbeat_not_found_is_terminal_invalid_state() {
+        let failure = async_activity_failure(
+            "heartbeat",
+            AsyncActivityError::NotFound(Status::not_found("ignored")),
+        );
+
+        assert_eq!(failure.status, STATUS_INVALID_STATE);
+        assert_eq!(
+            failure.message,
+            "Temporal asynchronous activity heartbeat is no longer active"
         );
     }
 }

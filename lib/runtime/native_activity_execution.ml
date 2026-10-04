@@ -41,6 +41,7 @@ module type SUPERVISOR = sig
   val error_code : error -> string
   val error_message : error -> string
   val error_is_retryable : error -> bool
+  val async_heartbeat_error_is_retryable : error -> bool
   val exception_is_retryable : exn -> bool
 end
 
@@ -571,6 +572,12 @@ module Make (Supervisor : SUPERVISOR) = struct
   let source_error_is_retryable source_error =
     try Supervisor.error_is_retryable source_error with _ -> false
 
+  (** Heartbeat uncertainty is distinct from a Core worker completion lease.
+      A faulty source classifier still fails closed instead of hiding a defect. *)
+  let async_heartbeat_error_is_retryable source_error =
+    try Supervisor.async_heartbeat_error_is_retryable source_error
+    with _ -> false
+
   (** Exception classification is equally conservative: arbitrary exceptions
       are owner-domain defects unless the supervisor explicitly marks one as a
       transient completion transport failure. *)
@@ -711,8 +718,10 @@ module Make (Supervisor : SUPERVISOR) = struct
     Ok request
 
   (** Maps a native outcome to one lifecycle decision shared by the adapter
-      registry and handle state machine. Local preflight errors never enter
-      this classifier, even when their public category is [Bridge]. *)
+      registry and handle state machine. A heartbeat connection error keeps
+      its nonterminal lease, while terminal client operations retain their
+      existing conservative completion policy. Local preflight errors never
+      enter this classifier, even when their public category is [Bridge]. *)
   let async_submission_error operation (error : error_view) =
     let diagnostic = base_operation_error operation error in
     if error.retryable then Async_activity.Retryable_submission diagnostic
@@ -770,7 +779,11 @@ module Make (Supervisor : SUPERVISOR) = struct
                         | Error source_error ->
                             Error (async_submission_error name
                               (supervisor_error ~path
-                                ~retryable:(source_error_is_retryable source_error)
+                                ~retryable:(match request with
+                                  | Async_completion _ ->
+                                      source_error_is_retryable source_error
+                                  | Async_heartbeat _ ->
+                                      async_heartbeat_error_is_retryable source_error)
                                 ~error_code:Supervisor.error_code
                                 ~error_message:Supervisor.error_message source_error))
                       with exception_ ->
