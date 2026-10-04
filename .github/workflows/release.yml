@@ -34,13 +34,7 @@ jobs:
           git check-ref-format "refs/tags/$RELEASE_TAG"
           sh scripts/check-release-tag.sh . "$RELEASE_TAG"
           make release-preflight
-          # Exit 2 means no matching remote tag; network errors must fail.
-          status=0
-          git ls-remote --exit-code --tags origin "refs/tags/$RELEASE_TAG" || status=$?
-          if [ "$status" -ne 2 ]; then
-            echo 'Release tag already exists, or its availability could not be verified.' >&2
-            exit 1
-          fi
+          sh scripts/check-release-tag-commit.sh "$RELEASE_TAG" "$GITHUB_SHA"
 
   build:
     needs: validate
@@ -112,22 +106,20 @@ jobs:
           The SPDX document covers the Rust dependency graph; it is not a full
           application or OCaml dependency SBOM.
           EOF
-      - name: Create the tag and publish the complete release
+      - name: Publish the complete release from the approved tag
         run: |
           set -euo pipefail
-          flags=(--latest)
+          flags=()
           case "$RELEASE_TAG" in
-            *-*|*~*) flags=(--prerelease --latest=false) ;;
+            *-*|*~*) flags=(--prerelease) ;;
           esac
-          # Creating the ref is atomic: an existing tag fails rather than
-          # publishing assets against an unrelated or concurrently created tag.
-          gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
-            -f ref="refs/tags/$RELEASE_TAG" -f sha="$GITHUB_SHA"
+          sh scripts/check-release-tag-commit.sh "$RELEASE_TAG" "$GITHUB_SHA"
           # Assets are uploaded to a draft before anything is published.
           gh release create "$RELEASE_TAG" _build/release-assets/* \
             --repo "$GITHUB_REPOSITORY" --verify-tag \
             --draft --title "$RELEASE_TAG" --notes-file "$RUNNER_TEMP/release-notes.md" \
             "${flags[@]}"
+          sh scripts/check-release-tag-commit.sh "$RELEASE_TAG" "$GITHUB_SHA"
           gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false
           gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
             --json url --jq '.url' >> "$GITHUB_STEP_SUMMARY"

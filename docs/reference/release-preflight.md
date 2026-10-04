@@ -53,20 +53,31 @@ downloads require GitHub authentication; published public release assets do not.
 
 ## Publish a prerelease
 
-After merging the workflow, open **Actions → Release → Run workflow**, select
-`master`, and enter **Version tag**, initially `v0.1.0-rc.1`. Everything after
-that manual dispatch is automated:
+The release tag is a maintainer approval boundary. First review the candidate
+commit, the support decision, and the required qualification evidence. An
+authorized maintainer then creates `v0.1.0-rc.1` at that exact `master` commit
+and pushes the protected tag over HTTPS. For example, from a clean checkout:
 
-1. Require master, matching version metadata, a clean source checkout, and an
-   unused tag.
+```sh
+git fetch origin master
+git tag -a v0.1.0-rc.1 <approved-master-sha> -m 'OCaml Temporal SDK v0.1.0-rc.1'
+git push origin refs/tags/v0.1.0-rc.1
+```
+
+Open **Actions → Release → Run workflow**, select `master`, and enter the same
+**Version tag**. Dispatch must still resolve to the approved SHA. The workflow:
+
+1. Require master, matching version metadata, a clean source checkout, and a
+   remote tag that peels to the exact dispatch commit. A missing, retargeted,
+   or unreachable tag fails before the release build.
 2. Build/test all four Rust platforms and all sixteen OCaml combinations, plus
    the single live smoke job, quality/security scans, and dependency audits.
 3. Validate all bridge and OCaml SDK bundles, archive the exact source commit, audit the Cargo
    SPDX SBOM, and generate the release manifest and asset checksums.
-4. Atomically create the Git tag at the exact tested commit. A concurrent or
-   existing tag fails publication instead of moving or reusing that tag.
+4. Fetch and verify the remote tag again before creating the draft and before
+   publishing it. The workflow never creates or moves the protected tag.
 5. Upload assets to a draft release and publish it as a prerelease when the tag
-   has a prerelease suffix. No manual tagging or asset upload is required.
+   has a prerelease suffix. No manual asset upload is required.
 
 The release contains four compiler-independent Rust bridge archives, sixteen
 compiled OCaml SDK archives, source, `manifest.json`, the Cargo SBOM, and
@@ -75,10 +86,17 @@ directly without rebuilding them. Each SDK records its exact compiler and compil
 dependency identities; incompatible environments must use matching dependencies
 or build from source. Linux assets target Debian 12/glibc, not musl/Alpine.
 
-For the next version, first update the three version files in a PR and then
-enter the matching new tag at dispatch. Published tags are immutable. If an
-upload fails after tag creation, leave the draft unpublished and inspect it;
-a rerun deliberately fails on the existing tag rather than replacing assets.
+For the next version, first update the three version files in a PR and obtain
+maintainer approval of the candidate and its evidence. Create the matching
+protected tag at the approved master commit, then dispatch the workflow. The
+tag must be protected against updates and deletion as well as unauthorized
+creation before dispatch: the workflow detects a mismatched commit at each
+check, but cannot prevent a ref change between the final check and publication,
+or after publication. If an upload fails, leave the draft unpublished and
+inspect it. A rerun may finish if no draft release exists yet; it will not
+silently replace an existing draft or release. If a published release is found
+defective, preserve its tag and assets for audit,
+mark it superseded in its notes, and issue a corrected version under a new tag.
 The source SHA and checksums in the manifest identify what was built, but are
 not a signed provenance attestation.
 
