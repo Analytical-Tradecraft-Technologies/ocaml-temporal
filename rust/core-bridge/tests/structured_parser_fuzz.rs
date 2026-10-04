@@ -251,7 +251,15 @@ fn mutate(target: Target, seed: &[u8], case: usize, state: &mut u64) -> Vec<u8> 
     match case % 11 {
         0 => seed.to_vec(),
         1 => seed[..seed.len() / 2].to_vec(),
-        2 => seed[..seed.len().saturating_sub(1)].to_vec(),
+        2 => {
+            // Fixtures may end in a newline. Remove the closing JSON
+            // delimiter itself so this case always reaches the reject path.
+            let trimmed = seed
+                .iter()
+                .rposition(|byte| !byte.is_ascii_whitespace())
+                .expect("nonempty JSON seed");
+            seed[..trimmed].to_vec()
+        }
         3 => {
             let mut output = seed.to_vec();
             let start = random % output.len();
@@ -449,9 +457,9 @@ fn run_target(target: Target) {
             _ => case % valid.len(),
         };
         let input = mutate(target, &valid[fixture_index], case, &mut state);
-        // Excessive nesting and overlong control fields must always reject;
-        // other mutations may remain valid after a benign change.
-        let expected = matches!(case % 11, 7..=9).then_some(false);
+        // An incomplete document, excessive nesting, and corrupt control
+        // fields must reject; other mutations may remain valid.
+        let expected = matches!(case % 11, 2 | 7..=9).then_some(false);
         if run_case(target, &input, seed, case, expected) {
             accepted += 1;
             generated_accepted += 1;
