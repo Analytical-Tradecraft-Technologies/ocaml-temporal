@@ -1450,16 +1450,10 @@ let worker_restart_replay =
           in
           Ok ("SMOKE:" ^ transformed))
 
-(** Keeps a workflow run in Core's sticky cache while a second run is admitted.
-    The long deterministic timer gives Core an explicit pending history
-    boundary, so the first workflow task is fully acknowledged before cache
-    pressure is introduced. It is deliberately longer than the driver's
-    eviction budget: if this run reached its terminal timer completion first,
-    Core would remove it for normal completion and there would be no
-    cache-full transition to observe. The live fixture configures one cache slot; when
-    the second workflow is admitted Core must therefore deliver a
-    [RemoveFromCache(CacheFull)] activation for the older run. The driver
-    observes that marker and cancels both exact executions. *)
+(** Keeps the second cache-pressure run outstanding with a durable timer.
+    The timer exceeds the driver's eviction budget, so B cannot complete
+    normally before the driver resumes evicted run A. The driver cancels B
+    only after A has completed. *)
 let cache_eviction =
   Temporal.Workflow.define ~name:"smoke.cache_eviction"
     ~input:Temporal.Codec.string ~output:Temporal.Codec.string (fun seed ->
@@ -1469,13 +1463,37 @@ let cache_eviction =
       in
       Ok ("SMOKE:CACHE:" ^ String.uppercase_ascii seed))
 
-(** A read-only cache-settling probe used only by the live eviction fixture.
-    The driver invokes it after A has completed its initial timer-scheduling
-    activation and before it starts B. Receiving this typed response proves
-    that Core has processed a follow-up activation for A, providing a settled
-    native-stream boundary after the OCaml initial-completion marker. It does
-    not itself claim which cache route Core took. The handler has no mutable
-    state and emits no workflow command, so it is replay-safe. *)
+(** Parks the first cache-pressure run without a durable timer. After Core has
+    acknowledged its cache-full removal, the driver signals this exact run.
+    Replaying the parked condition and handling the signal must then produce a
+    normal completion while the second run still occupies the one-slot cache.
+    The existing execution-local signal slot keeps the release decision
+    deterministic across eviction and replay. *)
+let cache_eviction_resumable =
+  Temporal.Workflow.define ~name:"smoke.cache_eviction_resumable"
+    ~input:Temporal.Codec.string ~output:Temporal.Codec.string (fun seed ->
+      let open Temporal.Result_syntax in
+      let* () =
+        Temporal.Condition.wait_until_result (fun () ->
+            match Temporal.Workflow_context.Local.get signal_value_state with
+            | Ok value -> Ok (Option.is_some value)
+            | Error error -> Error error)
+      in
+      match Temporal.Workflow_context.Local.get signal_value_state with
+      | Ok (Some value) ->
+          Ok
+            ("SMOKE:CACHE:" ^ String.uppercase_ascii seed ^ ":"
+           ^ String.uppercase_ascii value)
+      | Ok None ->
+          Error
+            (Temporal.Error.defect
+               ~message:"cache eviction resumed without its release signal")
+      | Error error -> Error error)
+
+(** A read-only residency probe retained for the isolated eviction fixture.
+    The current driver uses an acknowledged initial activation marker as its
+    admission barrier and does not issue this query. The handler has no mutable
+    state and emits no workflow command, so it remains replay-safe. *)
 let cache_eviction_residency_query =
   Temporal.Query.define ~name:"smoke.cache_eviction_residency"
     ~output:Temporal.Codec.string
