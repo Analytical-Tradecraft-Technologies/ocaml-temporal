@@ -827,6 +827,39 @@ let test_reset_preserves_completed_mock_run () =
   | Error error -> failwith (Temporal.Error.message error));
   unwrap (Temporal.Client.shutdown client)
 
+(** Temporal rejects reset boundaries at or before the first history event.
+    Invalid attempts must leave the original mock run pending and visible. *)
+let test_reset_rejects_early_event_ids () =
+  let client =
+    unwrap
+      (Temporal.Client.create ~target_url:"mock://client"
+         ~namespace:"unit-test" ())
+  in
+  let handle =
+    unwrap
+      (Temporal.Client.start client ~workflow:echo_workflow
+         ~task_queue:"unit-test" ~id:"unit-reset-early-event"
+         ~input:"still-running" ())
+  in
+  List.iter
+    (fun event_id ->
+      expect_error_message_contains "defect" "greater than 1"
+        (Temporal.Client.reset ~workflow_task_finish_event_id:event_id
+           handle))
+    [ -1L; 0L; 1L ];
+  let page = unwrap (Temporal.Client.list_visibility client ~query:"" ()) in
+  (match page.executions with
+  | [ execution ] ->
+      assert (execution.workflow_id = "unit-reset-early-event");
+      assert (execution.run_id = Temporal.Client.run_id handle);
+      assert (execution.status = "running")
+  | _ -> failwith "invalid resets changed mock visibility");
+  (match Temporal.Client.wait handle with
+  | Ok (Temporal.Client.Completed "still-running") -> ()
+  | Ok _ -> failwith "invalid reset changed the original mock run"
+  | Error error -> failwith (Temporal.Error.message error));
+  unwrap (Temporal.Client.shutdown client)
+
 (** A signal is sent to the exact handle run and acknowledged independently of
     waiting. Repeating an explicit request ID remains accepted by the
     deterministic mock, matching Temporal's retry-safe control operation shape.
@@ -1186,6 +1219,7 @@ let () =
   test_exact_run_termination ();
   test_completed_mock_run_is_immutable ();
   test_reset_preserves_completed_mock_run ();
+  test_reset_rejects_early_event_ids ();
   test_exact_run_signal ();
   test_default_signal_request_ids_are_process_wide ();
   test_client_validation_errors ();

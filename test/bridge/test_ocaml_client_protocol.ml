@@ -245,6 +245,8 @@ let test_reset_protocol () =
     (fun request -> require_error (Protocol.encode_reset_request request))
     [
       { reset_request with workflow_task_finish_event_id = -1L };
+      { reset_request with workflow_task_finish_event_id = 0L };
+      { reset_request with workflow_task_finish_event_id = 1L };
       { reset_request with request_id = "" };
       { reset_request with reason = "contains\000nul" };
     ];

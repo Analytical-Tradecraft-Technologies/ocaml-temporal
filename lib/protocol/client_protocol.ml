@@ -426,8 +426,10 @@ let encode_reset_request (value : reset_request) =
   let* () = validate_identifier "$.workflow_id" value.execution.workflow_id in
   let* () = validate_identifier "$.run_id" value.execution.run_id in
   let* () = validate_identifier "$.request_id" value.request_id in
-  if value.workflow_task_finish_event_id < 0L then
-    Error (invalid ~path:"$.workflow_task_finish_event_id" "event ID must be non-negative")
+  if value.workflow_task_finish_event_id <= 1L then
+    Error
+      (invalid ~path:"$.workflow_task_finish_event_id"
+         "event ID must be greater than 1")
   else if String.length value.reason > 65_536 then
     Error (invalid ~path:"$.reason" "reason exceeds the protocol string safety limit")
   else if String.contains value.reason '\000' then

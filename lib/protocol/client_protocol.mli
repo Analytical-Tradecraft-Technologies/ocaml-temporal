@@ -219,8 +219,8 @@ val decode_cancel_response : string -> (cancel_response, error) result
 (** Strictly decodes the positive native cancellation acknowledgement. *)
 
 val encode_reset_request : reset_request -> (string, error) result
-(** Validates and serializes one exact-run reset request and non-negative
-    workflow-task finish event ID. *)
+(** Validates and serializes one exact-run reset request whose workflow-task
+    finish event ID is greater than 1. *)
 
 val decode_reset_response : request:reset_request -> string -> (reset_response, error) result
 (** Strictly decodes and correlates the new run returned after reset. *)

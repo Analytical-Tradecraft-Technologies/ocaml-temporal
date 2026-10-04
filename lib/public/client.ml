@@ -419,10 +419,10 @@ let validate_reset_fields ~request_id ~reason ~workflow_task_finish_event_id =
   in
   match request_result with
   | Error _ as error -> error
-  | Ok () when workflow_task_finish_event_id < 0L ->
+  | Ok () when workflow_task_finish_event_id <= 1L ->
       Error
         (Error.defect
-           ~message:"reset workflow-task finish event ID must be non-negative")
+           ~message:"reset workflow-task finish event ID must be greater than 1")
   | Ok () when String.length reason > 65_536 ->
       Error
         (Error.defect ~message:"reset reason exceeds the protocol safety limit")
