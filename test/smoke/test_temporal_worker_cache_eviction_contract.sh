@@ -12,7 +12,9 @@ cache_worker="$root/test/integration/temporal/worker/cache_eviction_worker.ml"
 driver="$root/test/integration/temporal/driver/cache_eviction_driver.ml"
 driver_dune="$root/test/integration/temporal/driver/dune"
 fixture="$root/test/integration/temporal/fixtures/cache-eviction/marker.json"
-temporary_directory=$(mktemp -d "${TMPDIR:-/tmp}/ocaml-temporal-cache-eviction.XXXXXX")
+# Keep synthetic paths relative to Dune's writable action directory. On
+# Windows, the Cygwin shell and a native jq binary disagree about /tmp paths.
+temporary_directory=$(mktemp -d "./ocaml-temporal-cache-eviction.XXXXXX")
 trap 'rm -rf "$temporary_directory"' EXIT HUP INT TERM
 
 require_source() {
