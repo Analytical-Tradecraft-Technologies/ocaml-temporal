@@ -139,18 +139,20 @@ type update_response = {
 (** Bounded completion poll response; [None] means still pending. *)
 type poll_update_response = { outcome : update_outcome option }
 
+(** Successor identity from an exact-run close event. The protocol already
+    checks its namespace against the waited execution. *)
+type successor = { workflow_id : string; run_id : string }
+
 (** Terminal outcomes are kept separate from bridge transport errors so a
-    completed Temporal failure remains an ordinary typed value. *)
+    completed Temporal failure remains an ordinary typed value. Failure and
+    timeout outcomes retain any server-supplied successor for explicit follow. *)
 type terminal_result =
   | Completed of Payload.t
-  | Failed of Error.t
+  | Failed of { error : Error.t; successor : successor option }
   | Cancelled of Error.t
   | Terminated of Error.t
-  | Timed_out of Error.t
-  | Continued_as_new of {
-      workflow_id : string;
-      run_id : string;
-    }
+  | Timed_out of { error : Error.t; successor : successor option }
+  | Continued_as_new of successor
 
 (** A synthetic workflow task used only by the deterministic unit-test seam.
     Native Core activations carry replay metadata, jobs, and history context;
@@ -218,6 +220,19 @@ val client_start : client -> start_request -> (start_response, Error.t) result
 
 (** Waits for the exact workflow/run pair and returns its terminal outcome. *)
 val client_wait : client -> wait_request -> (terminal_result, Error.t) result
+
+(** Scripts a failed or timed-out exact run in the deterministic mock for the
+    public [Client.wait] to [Client.follow] regression. This private test seam
+    rejects native clients and does not create successor runs. *)
+val mock_set_wait_outcome_for_test :
+  client -> wait_request -> terminal_result -> (unit, Error.t) result
+
+(** Converts a protocol-validated native wait response to the private semantic
+    terminal result. Kept in this private interface so bridge tests can verify
+    that close-event successor identities survive the conversion. *)
+val native_terminal_result :
+  Temporal_sdk_kernel.Client_protocol.wait_response ->
+  (terminal_result, Error.t) result
 
 (** Requests cancellation of one exact workflow run. Success acknowledges the
     server RPC; a later [client_wait] observes the terminal cancellation. *)

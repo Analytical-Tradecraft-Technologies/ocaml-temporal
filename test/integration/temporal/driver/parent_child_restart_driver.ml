@@ -102,10 +102,10 @@ let require_completed expected_label expected_result :
     Error
       (Error.defect
            ~message:(expected_label ^ " workflow returned an unexpected result"))
-  | Client.Failed error
+  | Client.Failed { error; _ }
   | Client.Cancelled error
   | Client.Terminated error
-  | Client.Timed_out error ->
+  | Client.Timed_out { error; _ } ->
       Error
         (Error.defect
            ~message:

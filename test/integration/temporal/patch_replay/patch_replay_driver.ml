@@ -92,10 +92,10 @@ let require_expected_completion expected = function
       Error
         (Error.defect
            ~message:"patch replay workflow completed with an unexpected branch marker")
-  | Client.Failed error
+  | Client.Failed { error; _ }
   | Client.Cancelled error
   | Client.Terminated error
-  | Client.Timed_out error ->
+  | Client.Timed_out { error; _ } ->
       Error
         (Error.defect
            ~message:

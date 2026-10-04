@@ -224,10 +224,10 @@ let require_completed operation expected = function
         (Error.defect
            ~message:
              (Printf.sprintf "%s returned unexpected result %S" operation actual))
-  | Ok (Client.Failed error)
+  | Ok (Client.Failed { error; _ })
   | Ok (Client.Cancelled error)
   | Ok (Client.Terminated error)
-  | Ok (Client.Timed_out error) ->
+  | Ok (Client.Timed_out { error; _ }) ->
       Error
         (Error.defect
            ~message:
@@ -259,7 +259,7 @@ let terminal_kind = function
     stable message prefix identifies this fixture's intentional failure without
     depending on extra source or Core failure-info text. *)
 let require_non_retryable_failure operation expected_message = function
-  | Ok (Client.Failed error) ->
+  | Ok (Client.Failed { error; successor = None }) ->
       let view = Error.view error in
       if
         view.category = `Workflow
@@ -289,7 +289,7 @@ let require_non_retryable_failure operation expected_message = function
     [Child_workflow] category is asserted inside the parent workflow when its
     child future resolves. *)
 let require_non_retryable_child_failure operation = function
-  | Ok (Client.Failed error) ->
+  | Ok (Client.Failed { error; _ }) ->
       let view = Error.view error in
       if view.category = `Workflow && view.non_retryable then Ok ()
       else

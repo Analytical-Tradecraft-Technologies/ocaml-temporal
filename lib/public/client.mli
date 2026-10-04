@@ -16,10 +16,11 @@ type ('input, 'output) handle
     await it or inspect its update ID. *)
 type ('input, 'output) update_handle
 
-(** An exact workflow/run identity returned when a workflow continues as new.
+(** An exact successor workflow/run identity returned after a failed, timed-out,
+    or continued-as-new run.
     It contains no codec or client ownership; use [follow] with the original
     client and typed workflow definition to construct a handle for this run.
-    The namespace is retained so a continuation cannot accidentally be used
+    The namespace is retained so a successor cannot accidentally be used
     with a client connected to a different Temporal namespace. *)
 type execution = {
   (* Namespace that owns the successor execution. *)
@@ -36,14 +37,14 @@ type execution = {
 type 'output terminal_result =
   (* The terminal payload decoded using the workflow definition's output codec. *)
   | Completed of 'output
-  (* Temporal reported a workflow failure as a terminal value. *)
-  | Failed of Error.t
+  (* Failure and optional retry successor. Following it is the caller's choice. *)
+  | Failed of { error : Error.t; successor : execution option }
   (* The exact run reached the cancellation state. *)
   | Cancelled of Error.t
   (* The exact run was terminated by an operator or another client. *)
   | Terminated of Error.t
-  (* The exact run reached a Temporal timeout state. *)
-  | Timed_out of Error.t
+  (* Timeout and optional successor. Following it is the caller's choice. *)
+  | Timed_out of { error : Error.t; successor : execution option }
   (* The run continued as new; the caller decides whether to wait on the
      returned successor identity. *)
   | Continued_as_new of execution
@@ -118,10 +119,10 @@ val start :
   unit ->
   (('input, 'output) handle, Error.t) result
 
-(** Rebuilds a typed exact-run handle for a continuation returned by [wait].
+(** Rebuilds a typed exact-run handle for a successor returned by [wait].
     This does not start a workflow or follow a run implicitly: it only combines
     the caller's existing client, the supplied workflow definition's codecs,
-    and the successor identity. The continuation namespace must equal the
+    and the successor identity. The successor namespace must equal the
     namespace used to create [client]. All identity fields must be non-empty,
     valid UTF-8, NUL-free, and no more than 65,536 bytes; malformed or
     cross-namespace values are returned as typed defects before any backend
@@ -132,9 +133,9 @@ val follow :
   execution ->
   (('input, 'output) handle, Error.t) result
 
-(** Waits for the exact workflow ID and run ID returned by [start]. A
-    continued-as-new result is returned as a value rather than followed
-    implicitly, preserving the caller's run identity choice. The native client
+(** Waits for the exact workflow ID and run ID returned by [start]. Failed,
+    timed-out, and continued-as-new outcomes may carry a typed successor;
+    the wait never follows one implicitly. The native client
     retains at most 64 distinct pending runs; waiting on another run at capacity
     returns an error. Terminal results and errors free their slots, and client
     shutdown interrupts pending waits. *)

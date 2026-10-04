@@ -49,11 +49,10 @@ type ('input, 'output) update_handle = {
   outcome : Backend.update_outcome option;
 }
 
-(** Identifies a successor execution returned by Temporal after a workflow
-    continues as new. The pair is intentionally kept separate from a typed
-    [handle]: callers must supply the original workflow definition when they
-    turn this wire-level identity back into a handle, so the output codec is
-    never guessed from an untyped run ID. *)
+(** Identifies a successor execution returned after a failed, timed-out, or
+    continued-as-new run. The identity is intentionally kept separate from a
+    typed [handle]: callers must supply the workflow definition when they turn
+    it back into a handle, so the output codec is never guessed from a run ID. *)
 type execution = {
   (* Namespace that owns the successor execution. *)
   namespace : string;
@@ -68,14 +67,14 @@ type execution = {
 type 'output terminal_result =
   (* The terminal payload decoded with the workflow definition's output codec. *)
   | Completed of 'output
-  (* Temporal reported a workflow failure as a typed terminal value. *)
-  | Failed of Error.t
+  (* Failure and its optional successor run, which callers may follow explicitly. *)
+  | Failed of { error : Error.t; successor : execution option }
   (* The exact run accepted a cancellation request and reached cancellation. *)
   | Cancelled of Error.t
   (* The exact run was terminated by an operator or another Temporal client. *)
   | Terminated of Error.t
-  (* The exact run reached a Temporal timeout terminal state. *)
-  | Timed_out of Error.t
+  (* Timeout and its optional successor run, which callers may follow explicitly. *)
+  | Timed_out of { error : Error.t; successor : execution option }
   (* The run continued as a new execution; callers choose whether to follow it. *)
   | Continued_as_new of execution
 
@@ -262,8 +261,8 @@ let start client ?request_id ?(memo = []) ?(search_attributes = []) ~workflow
                     })))
 
 (** Rebuilds a typed handle for a successor run without starting another
-    execution. Temporal returns a continuation's workflow/run identity in the
-    terminal result for the original run; this operation validates that
+    execution. Temporal may return a successor identity in the original run's
+    failed, timed-out, or continued-as-new outcome; this operation validates that
     identity at the same boundary as [start], retains the caller's client and
     supplied workflow codecs, and leaves the exact-run choice explicit to the
     caller. Namespace equality is checked before constructing a handle so an
@@ -290,7 +289,8 @@ let follow client ~workflow ({ namespace; workflow_id; run_id } : execution) =
               | Ok () -> Ok { client; workflow; workflow_id; run_id }))
 
 (** Decodes a completed payload and maps terminal failures without exposing the
-    private backend constructors. *)
+    private backend constructors. Each successor gains this client's namespace
+    only after the protocol has checked it belongs to the waited execution. *)
 let wait (handle : ('input, 'output) handle) =
   if Atomic.get handle.client.closed then
     Error
@@ -299,15 +299,27 @@ let wait (handle : ('input, 'output) handle) =
     let request : Backend.wait_request =
       { workflow_id = handle.workflow_id; run_id = handle.run_id }
     in
+    (* The backend keeps the validated run pair; the owning client supplies
+       the namespace needed by [follow]. *)
+    let public_successor =
+      Option.map (fun (value : Backend.successor) ->
+          {
+            namespace = handle.client.namespace;
+            workflow_id = value.workflow_id;
+            run_id = value.run_id;
+          })
+    in
     Result.bind (Backend.client_wait handle.client.backend request) (function
       | Backend.Completed payload ->
           Result.map
             (fun output -> Completed output)
             (Codec.decode (Workflow.output handle.workflow) payload)
-      | Backend.Failed error -> Ok (Failed error)
+      | Backend.Failed { error; successor } ->
+          Ok (Failed { error; successor = public_successor successor })
       | Backend.Cancelled error -> Ok (Cancelled error)
       | Backend.Terminated error -> Ok (Terminated error)
-      | Backend.Timed_out error -> Ok (Timed_out error)
+      | Backend.Timed_out { error; successor } ->
+          Ok (Timed_out { error; successor = public_successor successor })
       | Backend.Continued_as_new { workflow_id; run_id } ->
           Ok
             (Continued_as_new

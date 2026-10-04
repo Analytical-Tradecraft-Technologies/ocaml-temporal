@@ -137,17 +137,19 @@ type update_response = {
 
 type poll_update_response = { outcome : update_outcome option }
 
+(** A successor returned by a close event. Its namespace was validated against
+    the waited execution by the client protocol and is supplied by the owning
+    public client when constructing a typed execution. *)
+type successor = { workflow_id : string; run_id : string }
+
 (** Terminal workflow outcome represented independently from transport errors. *)
 type terminal_result =
   | Completed of Payload.t
-  | Failed of Error.t
+  | Failed of { error : Error.t; successor : successor option }
   | Cancelled of Error.t
   | Terminated of Error.t
-  | Timed_out of Error.t
-  | Continued_as_new of {
-      workflow_id : string;
-      run_id : string;
-    }
+  | Timed_out of { error : Error.t; successor : successor option }
+  | Continued_as_new of successor
 
 (** New run identity returned by a successful reset. *)
 type reset_response = { workflow_id : string; run_id : string }
@@ -197,7 +199,13 @@ type activity_completion =
 (** Terminal state for one mock execution. The state is monotone: once a wait
     observes completion, a later cancellation cannot rewrite that terminal
     result, which mirrors Temporal's immutable execution history. *)
-type mock_terminal = Mock_pending | Mock_completed | Mock_cancelled | Mock_terminated
+type mock_terminal =
+  | Mock_pending
+  | Mock_completed
+  | Mock_cancelled
+  | Mock_terminated
+  | Mock_failed of { error : Error.t; successor : successor option }
+  | Mock_timed_out of { error : Error.t; successor : successor option }
 
 (** A mock signal delivery records the request identity and payload. Retaining
     this small value lets the deterministic transport model Temporal's
@@ -488,10 +496,19 @@ let terminal_details_error ~category ~message details =
 let unit_null_payload : Payload.t =
   { Payload.metadata = [ ("encoding", "binary/null") ]; data = Bytes.empty }
 
-(** Converts one native wait response into the existing public terminal-result
-    algebra. A single payload is the normal case; zero payloads are the unit
-    completion marker; multiple payloads remain a codec error. *)
+(** Converts one native wait response into the backend terminal-result algebra.
+    A single payload is the normal case; zero payloads are the unit completion
+    marker; multiple payloads remain a codec error. A close event's validated
+    successor identity is retained for the public client's explicit choice. *)
 let native_terminal_result (response : Client_protocol.wait_response) =
+  (* The protocol has already checked the successor against the exact run;
+     retain its identity until the public client can attach its namespace. *)
+  let successor_ref (value : Client_protocol.execution option) : successor option =
+    Option.map
+      (fun (value : Client_protocol.execution) ->
+        ({ workflow_id = value.workflow_id; run_id = value.run_id } : successor))
+      value
+  in
   match response.outcome with
   | Client_protocol.Completed { result; successor = _ } -> (
       match result with
@@ -503,8 +520,13 @@ let native_terminal_result (response : Client_protocol.wait_response) =
                ~message:
                  "Temporal completed with multiple output payloads; the public client expects one"
                ()))
-  | Client_protocol.Failed { failure; successor = _ } ->
-      Ok (Failed (workflow_failure_error failure))
+  | Client_protocol.Failed { failure; successor } ->
+      Ok
+        (Failed
+           {
+             error = workflow_failure_error failure;
+             successor = successor_ref successor;
+           })
   | Client_protocol.Cancelled { details } ->
       Ok
         (Cancelled
@@ -517,15 +539,14 @@ let native_terminal_result (response : Client_protocol.wait_response) =
               ~details:(List.map public_payload details)
               ~message:"workflow execution was terminated" ()))
   | Client_protocol.Timed_out { successor } ->
-      let successor =
-        match successor with
-        | None -> ""
-        | Some successor -> "; successor_run_id=" ^ successor.run_id
-      in
       Ok
         (Timed_out
-           (Error.make ~category:`Timeout
-              ~message:("workflow execution timed out" ^ successor) ()))
+           {
+             error =
+               Error.make ~category:`Timeout
+                 ~message:"workflow execution timed out" ();
+             successor = successor_ref successor;
+           })
   | Client_protocol.Continued_as_new { successor } ->
       Ok
         (Continued_as_new
@@ -853,13 +874,46 @@ let mock_client_wait (client : mock_client) (request : wait_request) =
                 Ok
                   (Terminated
                      (Error.make ~non_retryable:true ~category:`Terminated
-                        ~message:"workflow execution was terminated" ()))))
+                        ~message:"workflow execution was terminated" ()))
+            | Mock_failed { error; successor } ->
+                Ok (Failed { error; successor })
+            | Mock_timed_out { error; successor } ->
+                Ok (Timed_out { error; successor })))
 
 (** Waits for a terminal result on the selected private transport. *)
 let client_wait client (request : wait_request) =
   match client with
   | Mock_client client -> mock_client_wait client request
   | Native_client client -> native_client_wait client request
+
+(** Scripts one exact mock close event for the public wait/follow regression.
+    This private test seam cannot alter a native client or allocate a run. *)
+let mock_set_wait_outcome_for_test client (request : wait_request) outcome =
+  match client with
+  | Native_client _ -> Error (defect "mock wait outcomes require a mock client")
+  | Mock_client client ->
+      let service = client.service in
+      Mutex.lock service.mutex;
+      Fun.protect
+        ~finally:(fun () -> Mutex.unlock service.mutex)
+        (fun () ->
+          if client.closed then Error (bridge_error "client is shut down")
+          else
+            match
+              Hashtbl.find_opt service.history
+                (request.workflow_id, request.run_id)
+            with
+            | None -> Error (bridge_error "workflow run id does not match the started run")
+            | Some execution -> (
+                match outcome with
+                | Failed { error; successor } ->
+                    execution.terminal <- Mock_failed { error; successor };
+                    Ok ()
+                | Timed_out { error; successor } ->
+                    execution.terminal <- Mock_timed_out { error; successor };
+                    Ok ()
+                | Completed _ | Cancelled _ | Terminated _ | Continued_as_new _ ->
+                    Error (defect "mock wait outcome must be failed or timed out")))
 
 (** Converts one public cancellation request to the closed native protocol
     representation. The namespace is supplied by the connected client rather
@@ -1037,7 +1091,9 @@ let mock_client_cancel (client : mock_client) (request : cancel_request) =
         | Some execution ->
             (match execution.terminal with
             | Mock_pending -> execution.terminal <- Mock_cancelled
-            | Mock_completed | Mock_cancelled | Mock_terminated -> ());
+            | Mock_completed | Mock_cancelled | Mock_terminated
+            | Mock_failed _ | Mock_timed_out _ ->
+                ());
             Ok ())
 
 (** Requests cancellation on the selected private transport. *)
@@ -1144,7 +1200,9 @@ let mock_client_terminate (client : mock_client) (request : terminate_request) =
         | Some execution ->
             (match execution.terminal with
             | Mock_pending -> execution.terminal <- Mock_terminated
-            | Mock_completed | Mock_cancelled | Mock_terminated -> ());
+            | Mock_completed | Mock_cancelled | Mock_terminated
+            | Mock_failed _ | Mock_timed_out _ ->
+                ());
             Ok ())
 
 (** Requests immediate termination on the selected private transport. *)
@@ -1335,6 +1393,8 @@ let mock_client_list_visibility (client : mock_client)
                        | Mock_completed -> "completed"
                        | Mock_cancelled -> "canceled"
                        | Mock_terminated -> "terminated"
+                       | Mock_failed _ -> "failed"
+                       | Mock_timed_out _ -> "timed_out"
                      in
                      ({
                         workflow_id;
