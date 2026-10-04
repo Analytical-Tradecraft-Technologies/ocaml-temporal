@@ -128,6 +128,8 @@
   ../integration/temporal/cache_wait/cache_eviction_wait.ml
   ../integration/temporal/driver/dune
   ../integration/temporal/worker/smoke_worker.ml
+  ../integration/temporal/worker/cache_eviction_worker.ml
+  ../integration/temporal/scripts/validate-cache-eviction-progress.sh
   ../integration/temporal/fixtures/cache-eviction/marker.json)
  (action
   (run sh %{dep:test_temporal_worker_cache_eviction_contract.sh} %{workspace_root})))
