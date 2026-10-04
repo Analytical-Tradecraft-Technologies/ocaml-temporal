@@ -221,6 +221,13 @@ val client_start : client -> start_request -> (start_response, Error.t) result
 (** Waits for the exact workflow/run pair and returns its terminal outcome. *)
 val client_wait : client -> wait_request -> (terminal_result, Error.t) result
 
+(** Converts a protocol-validated native wait response to the private semantic
+    terminal result. Kept in this private interface so bridge tests can verify
+    that close-event successor identities survive the conversion. *)
+val native_terminal_result :
+  Temporal_sdk_kernel.Client_protocol.wait_response ->
+  (terminal_result, Error.t) result
+
 (** Requests cancellation of one exact workflow run. Success acknowledges the
     server RPC; a later [client_wait] observes the terminal cancellation. *)
 val client_cancel : client -> cancel_request -> (unit, Error.t) result
