@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run the workflow's classifier against real Git histories without any builds.
+# Run the workflow's required-check gate against real Git histories without builds.
 set -euo pipefail
 source_root=$(cd "${1:-.}" && pwd)
 fixture=$(mktemp -d)
@@ -8,7 +8,7 @@ awk '
   /^        run: \|$/ { copying = 1; next }
   copying && (/^  [a-zA-Z0-9_-]+:/ || /^      - name:/) { exit }
   copying { sub(/^          /, ""); print }
-' "$source_root/.github/workflows/build-pr.yml" > "$fixture/classify.sh"
+' "$source_root/.github/workflows/build-pr.yml" > "$fixture/gate.sh"
 mkdir "$fixture/repo"
 cd "$fixture/repo"
 git init -q
@@ -21,17 +21,16 @@ git add .
 git commit -qm base
 base=$(git rev-parse HEAD)
 
-# Run the extracted step and require the expected single output.
+# Run the extracted step and require the enabled output.
 check() {
-  local expected=$1
-  export BASE_SHA=$2 HEAD_SHA=$3
-  export RUNNER_TEMP=$fixture GITHUB_OUTPUT=$fixture/output
+  export BASE_SHA=$1 HEAD_SHA=$2 GITHUB_OUTPUT=$fixture/output
   : > "$GITHUB_OUTPUT"
-  bash "$fixture/classify.sh"
-  test "$(cat "$GITHUB_OUTPUT")" = "code=$expected"
+  bash "$fixture/gate.sh"
+  test "$(cat "$GITHUB_OUTPUT")" = 'code=true'
 }
 
-# Isolate each path to prove both exclusions and the fail-closed default.
+# Every changed path, including documentation, must enable concrete required
+# matrix checks. Exercise unusual filenames and former exclusions as well.
 for path in README.md docs/guide.md LICENSE NOTICE.md \
   lib/public/workflow.ml test/integration/temporal/driver/main.ml \
   docs/schemas/protocol.json docs/schemas/fixture.md \
@@ -43,14 +42,10 @@ for path in README.md docs/guide.md LICENSE NOTICE.md \
   printf 'changed\n' > "$path"
   git add .
   git commit -qm path
-  case "$path" in
-    README.md|docs/guide.md|LICENSE|NOTICE.md) expected=false ;;
-    *) expected=true ;;
-  esac
-  check "$expected" "$base" "$(git rev-parse HEAD)"
+  check "$base" "$(git rev-parse HEAD)"
 done
 
-# A code change on the base branch after the PR fork must not count as a PR edit.
+# The PR comparison accepts a docs-only change even when master also changed.
 git checkout -q --detach "$base"
 printf 'docs\n' > README.md
 git commit -qam docs
@@ -60,24 +55,26 @@ printf 'code\n' > source.ml
 git add .
 git commit -qm code
 code_head=$(git rev-parse HEAD)
-check false "$code_head" "$docs_head"
+check "$code_head" "$docs_head"
 
 # A merge-group comparison covers all changes relative to its supplied base.
 git merge -q --no-edit "$docs_head"
-check true "$base" "$(git rev-parse HEAD)"
-check false "$code_head" "$(git rev-parse HEAD)"
+check "$base" "$(git rev-parse HEAD)"
+check "$code_head" "$(git rev-parse HEAD)"
 
-# Disabling rename detection exposes the removed code path even when its new
-# name is documentation. Deletion alone must also keep the code gate enabled.
+# Renames, deletions, and even an empty comparison still run required checks.
 git mv source.ml archived.md
 git commit -qm rename
-check true "$code_head" "$(git rev-parse HEAD)"
+check "$code_head" "$(git rev-parse HEAD)"
 git checkout -q --detach "$code_head"
 git rm -q source.ml
 git commit -qm deletion
-check true "$code_head" "$(git rev-parse HEAD)"
-check false "$base" "$base"
-if check false invalid-ref "$base" 2>/dev/null; then
+check "$code_head" "$(git rev-parse HEAD)"
+check "$base" "$base"
+# Master and release calls have no PR comparison and must run the same graph.
+check '' ''
+export BASE_SHA=invalid-ref HEAD_SHA=$base
+if bash "$fixture/gate.sh" 2>/dev/null; then
   echo 'invalid comparisons must fail' >&2
   exit 1
 fi
