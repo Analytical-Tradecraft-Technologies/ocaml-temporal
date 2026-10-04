@@ -45,10 +45,10 @@ val on_cancel :
   ?until:('value, 'error) Future.t ->
   t -> (unit -> (unit, Error.t) result) -> (unit, Error.t) result
 
-(** Reports whether cancellation has been requested for [scope]. The query is
-    owner-checked just like [cancel], so a foreign Domain or a retained scope
-    queried after scheduler shutdown receives a typed defect instead of racing
-    the workflow's mutable state. *)
+(** Reports whether cancellation has been requested for [scope]. A synchronous
+    query handler may read its own live scope while workflow fibers are paused;
+    this does not allow cancellation or waiting from the query. Foreign Domains,
+    other executions, and stale scopes still receive a typed ownership defect. *)
 val is_cancelled : t -> (bool, Error.t) result
 
 (** Checks the scope without waiting. An active scope returns [Ok ()]; a

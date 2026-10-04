@@ -34,6 +34,11 @@ val validate_task_queue : string -> (unit, string) result
 (** Returns the context installed on the current OCaml Domain, if any. *)
 val current : unit -> t option
 
+(** True only while a synchronous read-only query on this Domain inspects the
+    live execution whose scheduler has [owner_id]. Does not grant scheduler
+    ownership or permission to mutate workflow state. *)
+val query_read_owner_matches : int -> bool
+
 (** Allocates a key for execution-local workflow state. The key itself may be
     retained by a workflow definition and its registered interaction handlers;
     values written through it never cross execution-context boundaries. *)
@@ -121,6 +126,11 @@ val upsert_search_attributes :
 (** Runs [action] with [t] dynamically installed and restores the previous
     context even if [action] raises. Nested calls are supported. *)
 val with_context : t -> (unit -> 'value) -> 'value
+
+(** Installs [t] for one synchronous query callback and permits owner-checked
+    scope status reads while disabling deterministic randomness. Restores the
+    previous Domain-local bindings even if the callback raises. *)
+val with_read_only_query : t -> (unit -> 'value) -> 'value
 
 (** Runs [action] with no workflow context installed and restores the previous
     context afterward. Infrastructure callbacks that must not re-enter

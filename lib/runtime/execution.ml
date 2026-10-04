@@ -455,9 +455,8 @@ let process_job execution = function
                    deterministic random stream also prevents this synchronous,
                    non-replayed callback from advancing that replay-visible
                    state. *)
-                Workflow_context_store.with_context execution.context (fun () ->
-                    Workflow_context_store.with_randomness_disabled execution.context
-                      (fun () -> handler.dispatch query))
+                Workflow_context_store.with_read_only_query execution.context
+                  (fun () -> handler.dispatch query)
               with
               | exn ->
                   Error

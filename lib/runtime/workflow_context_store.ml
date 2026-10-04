@@ -238,6 +238,23 @@ let start_metadata context = Option.map copy_start_metadata context.start_metada
 let current_key = Domain.DLS.new_key (fun () -> None)
 let current () = Domain.DLS.get current_key
 
+(** Marks the synchronous query callback allowed to read immutable observations
+    of its own live execution. This is separate from the scheduler owner marker:
+    queries must never gain permission to mutate scopes or resume fibers. *)
+let query_read_key = Domain.DLS.new_key (fun () -> None)
+
+(** Accepts a scope status read only in the marked query for its owning live
+    execution. Both dynamic bindings are Domain-local, and the sealed check
+    rejects a scope retained after terminal workflow completion. *)
+let query_read_owner_matches owner_id =
+  match (Domain.DLS.get query_read_key, current ()) with
+  | Some query_context, Some current_context
+    when query_context == current_context
+         && not query_context.sealed
+         && Scheduler.is_active query_context.scheduler ->
+      Scheduler.id query_context.scheduler = owner_id
+  | _ -> false
+
 (** Creates a key whose value, when set, is retained only in each execution's
     private context. Key creation is allowed outside workflow code so one
     definition can share the key between its workflow body and registered
@@ -424,6 +441,17 @@ let with_context context action =
   let previous = current () in
   Domain.DLS.set current_key (Some context);
   Fun.protect ~finally:(fun () -> Domain.DLS.set current_key previous) action
+
+(** Runs a query with its execution context and a Domain-local status-read
+    marker. The marker is restored even when the handler raises; unlike a
+    scheduler owner turn it grants no cancellation or future permissions. *)
+let with_read_only_query context action =
+  with_context context (fun () ->
+      let previous = Domain.DLS.get query_read_key in
+      Domain.DLS.set query_read_key (Some context);
+      Fun.protect
+        ~finally:(fun () -> Domain.DLS.set query_read_key previous)
+        (fun () -> with_randomness_disabled context action))
 
 (** Runs infrastructure code with no workflow installed, then restores the
     previous context. This prevents re-entrant callbacks such as application
