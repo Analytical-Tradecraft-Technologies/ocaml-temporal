@@ -286,6 +286,53 @@ let test_typed_start_and_wait_handle () =
     (Temporal.Client.start client ~workflow:echo_workflow
        ~task_queue:"unit-test" ~id:"after-shutdown" ~input:"ignored" ())
 
+(** A custom encoder failure must stop before the backend accepts a start; a
+    custom decoder failure leaves the exact mock result available for retry. *)
+let test_client_custom_codec_failures () =
+  let client =
+    unwrap
+      (Temporal.Client.create ~target_url:"mock://client"
+         ~namespace:"unit-test" ())
+  in
+  let raising_input =
+    Temporal.Codec.make ~encoding:"binary/null"
+      ~encode:(fun () -> failwith "encoder-boom") ~decode:(fun _ -> Ok ())
+  in
+  let invalid_start =
+    Temporal.Workflow.remote ~name:"unit.codec-input-failure"
+      ~input:raising_input ~output:Temporal.Codec.unit
+  in
+  expect_error "codec"
+    (Temporal.Client.start client ~workflow:invalid_start
+       ~task_queue:"unit-test" ~id:"codec-input-failure" ~input:() ());
+  let visibility = unwrap (Temporal.Client.list_visibility client ~query:"" ()) in
+  assert (visibility.executions = []);
+  let fail_next_decode = ref true in
+  let output =
+    Temporal.Codec.make ~encoding:"binary/null"
+      ~encode:(fun () -> Ok Bytes.empty)
+      ~decode:(fun _ ->
+        if !fail_next_decode then (
+          fail_next_decode := false;
+          failwith "decoder-boom")
+        else Ok ())
+  in
+  let workflow =
+    Temporal.Workflow.remote ~name:"unit.codec-output-failure"
+      ~input:Temporal.Codec.unit ~output
+  in
+  let handle =
+    unwrap
+      (Temporal.Client.start client ~workflow ~task_queue:"unit-test"
+         ~id:"codec-output-failure" ~input:() ())
+  in
+  expect_error "codec" (Temporal.Client.wait handle);
+  (match Temporal.Client.wait handle with
+  | Ok (Temporal.Client.Completed ()) -> ()
+  | Ok _ -> failwith "retried wait returned an unexpected terminal result"
+  | Error error -> failwith (Temporal.Error.message error));
+  unwrap (Temporal.Client.shutdown client)
+
 (** Retrying the same accepted explicit start ID returns its first run, while
     changing request data under that ID is rejected before a second run starts. *)
 let test_mock_start_idempotent_retry () =
@@ -1206,6 +1253,7 @@ let () =
   test_mock_worker_rejects_async_activity_without_stopping ();
   test_worker_run_after_shutdown_is_rejected ();
   test_typed_start_and_wait_handle ();
+  test_client_custom_codec_failures ();
   test_mock_start_idempotent_retry ();
   test_mock_start_reuses_closed_workflow_id ();
   test_client_visibility_listing ();

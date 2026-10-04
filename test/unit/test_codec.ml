@@ -4,6 +4,46 @@ let fail_error error = failwith (Temporal.Error.message error)
 (** Extracts a successful test result or fails with its SDK diagnostic. *)
 let unwrap = function Ok value -> value | Error error -> fail_error error
 
+(** Checks that user callback exceptions become typed codec failures while
+    callbacks that deliberately return an error retain that exact error. *)
+let test_custom_callback_failures () =
+  let payload : Temporal.Payload.t =
+    { metadata = [ ("encoding", "test/callback") ]; data = Bytes.empty }
+  in
+  let raising_encoder =
+    Temporal.Codec.make ~encoding:"test/callback"
+      ~encode:(fun () -> failwith "encoder-boom") ~decode:(fun _ -> Ok ())
+  in
+  (match Temporal.Codec.encode raising_encoder () with
+  | Error error ->
+      assert (Temporal.Error.kind error = "codec");
+      assert
+        (Temporal.Error.message error
+        = "codec \"test/callback\" encode callback raised an exception")
+  | Ok _ -> failwith "raising encoder unexpectedly succeeded");
+  let raising_decoder =
+    Temporal.Codec.make ~encoding:"test/callback" ~encode:(fun () -> Ok Bytes.empty)
+      ~decode:(fun _ -> failwith "decoder-boom")
+  in
+  (match Temporal.Codec.decode raising_decoder payload with
+  | Error error ->
+      assert (Temporal.Error.kind error = "codec");
+      assert
+        (Temporal.Error.message error
+        = "codec \"test/callback\" decode callback raised an exception")
+  | Ok _ -> failwith "raising decoder unexpectedly succeeded");
+  let original = Temporal.Error.defect ~message:"preserve custom error" in
+  let returned_errors =
+    Temporal.Codec.make ~encoding:"test/callback"
+      ~encode:(fun () -> Error original) ~decode:(fun _ -> Error original)
+  in
+  (match Temporal.Codec.encode returned_errors () with
+  | Error error -> assert (error == original)
+  | Ok _ -> failwith "encoder error unexpectedly succeeded");
+  match Temporal.Codec.decode returned_errors payload with
+  | Error error -> assert (error == original)
+  | Ok _ -> failwith "decoder error unexpectedly succeeded"
+
 let () =
   let value = "agent \"one\"\n\t\001" in
   let payload = unwrap (Temporal.Codec.encode Temporal.Codec.string value) in
@@ -172,3 +212,5 @@ let () =
    with
   | exception Invalid_argument _ -> ()
   | _ -> failwith "reserved option encoding accepted by Codec.make")
+
+let () = test_custom_callback_failures ()

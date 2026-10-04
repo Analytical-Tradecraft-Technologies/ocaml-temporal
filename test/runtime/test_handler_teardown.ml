@@ -36,7 +36,7 @@ let unit_payload =
   | Error error -> failwith (T.Error.message error)
 
 (** Builds a runtime execution with real public signal or update dispatch. *)
-let execution kind ~root ~handler =
+let execution ?(input_codec = T.Codec.unit) kind ~root ~handler =
   let definition =
     Temporal_base.Definition.make ~name:"handler_teardown"
       ~input:Temporal_base.Codec.unit ~output:Temporal_base.Codec.unit
@@ -44,7 +44,7 @@ let execution kind ~root ~handler =
   in
   match kind with
   | Signal ->
-      let signal = T.Signal.define ~name:"handler" ~input:T.Codec.unit in
+      let signal = T.Signal.define ~name:"handler" ~input:input_codec in
       let public_handler = T.Signal.Handler.make signal handler in
       let runtime_handler =
         Execution.make_signal_handler ~name:"handler"
@@ -61,7 +61,7 @@ let execution kind ~root ~handler =
            identity = "test"; headers = [] })
   | Update ->
       let update =
-        T.Update.define ~name:"handler" ~input:T.Codec.unit ~output:T.Codec.unit
+        T.Update.define ~name:"handler" ~input:input_codec ~output:T.Codec.unit
       in
       let public_handler = T.Update.Handler.make update handler in
       let runtime_handler =
@@ -179,6 +179,28 @@ let test_handler_continue kind =
   expect "continued run is sealed" []
     (Execution.activate execution [ Activation.Cancel_workflow ])
 
+(** A signal or update decoder that invokes a terminal workflow operation must
+    pass its private control exception through the public handler's codec
+    boundary, so the implementation never runs after the run is sealed. *)
+let test_handler_codec_continue kind =
+  let handler_ran = ref false in
+  let input_codec =
+    T.Codec.make ~encoding:"binary/null"
+      ~encode:(fun () -> Ok Bytes.empty)
+      ~decode:(fun _ -> T.Workflow.continue_as_new successor ())
+  in
+  let execution, job =
+    execution ~input_codec kind ~root:sleep
+      ~handler:(fun () -> handler_ran := true; Ok ())
+  in
+  ignore (Execution.activate execution [ Activation.Start_workflow ]);
+  let commands = Execution.activate execution [ job ] in
+  expect "codec handler continue command" true
+    (List.exists (function Activation.Continue_as_new _ -> true | _ -> false) commands);
+  expect "codec handler abort is not a task failure" None
+    (Execution.task_failure execution);
+  expect "codec handler was not invoked after termination" false !handler_ran
+
 (** The control-flow exception exemption must not hide real callback defects. *)
 let test_handler_defect kind =
   let execution, job =
@@ -199,5 +221,6 @@ let () =
       test_teardown kind Complete ~queued:true ~finished:false;
       test_teardown kind Complete ~queued:false ~finished:true;
       test_handler_continue kind;
+      test_handler_codec_continue kind;
       test_handler_defect kind)
     [ Signal; Update ]

@@ -128,6 +128,12 @@ and bridge, read the [documentation guide](../README.md) first.
 
 ## Commands and terminal state
 
+- Custom `Codec.make` encode/decode callbacks are invoked inside a codec
+  exception boundary. An ordinary raised exception becomes a typed codec error
+  without its potentially sensitive message; a returned error is preserved.
+  Private terminal/shutdown control exceptions still unwind workflow fibers.
+  Client start encoding failures submit no request, and a failed terminal
+  decode does not discard the exact-run result needed for a later wait.
 - Input payloads are encoded before scheduling a command.
 - Activity outputs are decoded before resolving the typed public future.
 - Child-workflow IDs are explicit, non-empty, valid UTF-8, and at most 65,536

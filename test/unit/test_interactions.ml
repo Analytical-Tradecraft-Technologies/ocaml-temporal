@@ -155,11 +155,9 @@ let test_exception_containment () =
   let dispatcher = unwrap (Temporal.Interaction.create ~queries:[ handler ] ()) in
   expect_error_kind "defect" (Temporal.Interaction.query dispatcher query)
 
-(** A codec whose [encode] raises instead of returning [Error] is a contract
-    violation, but the dispatcher must still contain it as a non-retryable
-    defect rather than let the exception unwind the caller's workflow fiber
-    uncaught. [decode] is never expected to run in these tests, so it returns
-    a harmless [Ok ()]. *)
+(** A codec whose [encode] raises instead of returning [Error] must produce a
+    typed codec error at the [Codec.make] boundary. [decode] is never expected
+    to run in these tests, so it returns a harmless [Ok ()]. *)
 let raising_encode_codec () =
   Temporal.Codec.make ~encoding:"application/x-raising-test-codec-encode"
     ~encode:(fun () -> failwith "codec encode bug")
@@ -174,8 +172,8 @@ let raising_decode_codec () =
     ~encode:(fun () -> Ok Bytes.empty)
     ~decode:(fun _ -> failwith "codec decode bug")
 
-(** [Interaction.signal] must contain an input codec that raises on encode:
-    the exception is reported as a defect instead of escaping the call. *)
+(** [Interaction.signal] propagates a typed codec error when its input encoder
+    raises instead of letting the exception escape the call. *)
 let test_signal_input_codec_exception_containment () =
   let signal =
     Temporal.Signal.define ~name:"raising-input" ~input:(raising_encode_codec ())
@@ -184,7 +182,7 @@ let test_signal_input_codec_exception_containment () =
   let dispatcher =
     unwrap (Temporal.Interaction.create ~signals:[ handler ] ())
   in
-  expect_error_kind "defect" (Temporal.Interaction.signal dispatcher signal ())
+  expect_error_kind "codec" (Temporal.Interaction.signal dispatcher signal ())
 
 (** [Signal.Handler.dispatch] must contain an input codec that raises on
     decode, matching the same boundary as a raising handler callback. The
@@ -195,7 +193,7 @@ let test_signal_handler_decode_exception_containment () =
   let signal = Temporal.Signal.define ~name:"raising-decode" ~input:codec in
   let handler = Temporal.Signal.Handler.make signal (fun _ -> Ok ()) in
   let payload = unwrap (Temporal.Codec.encode codec ()) in
-  expect_error_kind "defect" (Temporal.Signal.Handler.dispatch handler payload)
+  expect_error_kind "codec" (Temporal.Signal.Handler.dispatch handler payload)
 
 (** [Interaction.query] must contain an output codec that raises on decode
     after a successful handler dispatch: [Query.Handler.dispatch] encodes the
@@ -207,7 +205,7 @@ let test_query_output_codec_exception_containment () =
   in
   let handler = Temporal.Query.Handler.make query (fun () -> Ok ()) in
   let dispatcher = unwrap (Temporal.Interaction.create ~queries:[ handler ] ()) in
-  expect_error_kind "defect" (Temporal.Interaction.query dispatcher query)
+  expect_error_kind "codec" (Temporal.Interaction.query dispatcher query)
 
 (** [Query.Handler.dispatch] must contain an output codec that raises on
     encode, not just the handler callback itself. *)
@@ -216,7 +214,7 @@ let test_query_handler_encode_exception_containment () =
     Temporal.Query.define ~name:"raising-encode" ~output:(raising_encode_codec ())
   in
   let handler = Temporal.Query.Handler.make query (fun () -> Ok ()) in
-  expect_error_kind "defect" (Temporal.Query.Handler.dispatch handler)
+  expect_error_kind "codec" (Temporal.Query.Handler.dispatch handler)
 
 (** [Query.Handler.dispatch_payloads] must contain a raising typed-input
     decoder before invoking the user callback.  This protects the worker
@@ -230,7 +228,7 @@ let test_typed_query_handler_decode_exception_containment () =
   in
   let handler = Temporal.Query.Handler.make_with_input query (fun () -> Ok ()) in
   let payload = unwrap (Temporal.Codec.encode input_codec ()) in
-  expect_error_kind "defect"
+  expect_error_kind "codec"
     (Temporal.Query.Handler.dispatch_payloads handler [ payload ])
 
 (** [Interaction.update] must contain both a raising input encode and a
@@ -245,7 +243,7 @@ let test_update_codec_exception_containment () =
   let dispatcher =
     unwrap (Temporal.Interaction.create ~updates:[ handler ] ())
   in
-  expect_error_kind "defect" (Temporal.Interaction.update dispatcher update ());
+  expect_error_kind "codec" (Temporal.Interaction.update dispatcher update ());
   let update_raising_output =
     Temporal.Update.define ~name:"raising-update-output" ~input:Temporal.Codec.unit
       ~output:(raising_decode_codec ())
@@ -256,7 +254,7 @@ let test_update_codec_exception_containment () =
   let output_dispatcher =
     unwrap (Temporal.Interaction.create ~updates:[ output_handler ] ())
   in
-  expect_error_kind "defect"
+  expect_error_kind "codec"
     (Temporal.Interaction.update output_dispatcher update_raising_output ())
 
 (** [Update.Handler.dispatch] must contain a raising input decode and a
@@ -269,7 +267,7 @@ let test_update_handler_codec_exception_containment () =
   in
   let handler = Temporal.Update.Handler.make update (fun _ -> Ok ()) in
   let payload = unwrap (Temporal.Codec.encode input_codec ()) in
-  expect_error_kind "defect" (Temporal.Update.Handler.dispatch handler payload);
+  expect_error_kind "codec" (Temporal.Update.Handler.dispatch handler payload);
   let update_raising_output =
     Temporal.Update.define ~name:"raising-update-encode" ~input:Temporal.Codec.unit
       ~output:(raising_encode_codec ())
@@ -278,7 +276,7 @@ let test_update_handler_codec_exception_containment () =
     Temporal.Update.Handler.make update_raising_output (fun () -> Ok ())
   in
   let unit_payload = unwrap (Temporal.Codec.encode Temporal.Codec.unit ()) in
-  expect_error_kind "defect"
+  expect_error_kind "codec"
     (Temporal.Update.Handler.dispatch output_handler unit_payload)
 
 (** Runs all interaction assertions. *)

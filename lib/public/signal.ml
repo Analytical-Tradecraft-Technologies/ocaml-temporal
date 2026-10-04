@@ -57,11 +57,10 @@ module Handler = struct
   (** Returns the name used by the interaction dispatcher. *)
   let name (Handler { definition; _ }) = definition.name
 
-  (** Decodes and invokes one signal payload, converting callback exceptions to
-      non-retryable defects at the same boundary as workflow dispatch. A
-      raising codec is contained the same way: user/codec decoders must not
-      escape dispatch half-applied. Private terminal/shutdown exceptions must
-      reach the scheduler unchanged so teardown cannot invalidate completion. *)
+  (** Decodes and invokes one signal payload. [Codec.make] reports ordinary
+      decoder exceptions as typed codec errors; unexpected codec exceptions and
+      handler exceptions become non-retryable defects. Private terminal and
+      shutdown exceptions from the handler reach the scheduler unchanged. *)
   let dispatch (Handler { definition; implementation }) payload =
     match Codec.decode definition.input payload with
     | result -> (
@@ -79,6 +78,10 @@ module Handler = struct
                      ~message:
                        (Printf.sprintf "signal handler raised: %s"
                           (Printexc.to_string exception_)))))
+    | exception (Temporal_sdk_kernel.Scheduler.Workflow_aborted as exception_) ->
+        raise exception_
+    | exception (Temporal_sdk_kernel.Future_store.Scheduler_shutdown as exception_) ->
+        raise exception_
     | exception exception_ ->
         Error
           (Error.defect
