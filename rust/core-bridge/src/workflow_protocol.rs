@@ -2223,10 +2223,10 @@ fn application_category_from_core(
 /// Converts one represented application category to its exact Core number.
 fn application_category_to_core(value: ApplicationFailureCategory) -> i32 {
     use api_enums::ApplicationErrorCategory as Core;
-    (match value {
+    i32::from(match value {
         ApplicationFailureCategory::Unspecified => Core::Unspecified,
         ApplicationFailureCategory::Benign => Core::Benign,
-    }) as i32
+    })
 }
 
 /// Converts the supported recursive official failure subset.

@@ -2701,7 +2701,7 @@ mod tests {
             failure_info: Some(FailureInfo::ApplicationFailureInfo(
                 ApplicationFailureInfo {
                     r#type: "ExpectedError".into(),
-                    category: ApplicationErrorCategory::Benign as i32,
+                    category: i32::from(ApplicationErrorCategory::Benign),
                     next_retry_delay: Some(prost_wkt_types::Duration {
                         seconds: 3,
                         nanos: 7,
