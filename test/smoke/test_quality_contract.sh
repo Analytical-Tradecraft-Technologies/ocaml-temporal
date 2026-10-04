@@ -229,7 +229,7 @@ grep -Fqx '      tier: release' "$source_root/.github/workflows/release.yml"
 for workflow in "$source_root"/.github/workflows/*.yml "$source_root"/.github/actions/*/action.yml; do
   assert_third_party_actions_pinned "$workflow" "$(cat "$workflow")"
 done
-# Source-only histories preserve fail-closed docs skipping for PR/merge queue.
+# Every PR and merge group runs required jobs, including documentation changes.
 bash "$source_root/test/smoke/test_ci_changed_paths.sh" "$source_root"
 pr_quality=$(printf '%s\n' "$pr_workflow_text" | sed -n '/^  quality:/,/^  license-audit:/p')
 printf '%s\n' "$pr_quality" | grep -Fqx "    if: needs.changes.outputs.code == 'true'"
