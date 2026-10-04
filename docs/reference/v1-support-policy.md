@@ -1,14 +1,15 @@
-# Proposed v1 support and compatibility policy
+# V1 support and compatibility policy
 
-**Status: proposed for maintainer approval in [#489].** This document selects
-a finite target for the first stable release; it does not declare today's
-experimental `~dev` package production-ready. The existing
-[pre-release API policy](api-stability.md) remains in force until maintainers
-approve this policy and publish a qualified stable release. Approval must be
-recorded on the implementing pull request before #489 is closed. Qualification
-issues remain separate gates after that policy decision.
+**Approval gate:** This document is a proposal until a repository maintainer
+explicitly approves its matrix in a review on [PR #557] and that PR merges.
+After both events, it is the approved target for the first stable release,
+not evidence that today's experimental `~dev` package is production-ready.
+The existing [pre-release API policy](api-stability.md) remains in force until
+a qualified stable release is published. [#489] tracks the policy decision and
+must remain open until the PR review records approval. Qualification issues
+remain separate gates after that decision.
 
-The source baseline for this proposal is
+The source baseline for this policy is
 [`beae10d0a58e`](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/commit/beae10d0a58e58fb8e076734cd38113d7a2b4466).
 [Feature coverage](feature-coverage.md) and [live acceptance coverage](live-acceptance-coverage.md)
 describe implementation evidence. The decisions below describe what a future
@@ -26,7 +27,7 @@ describe implementation evidence. The decisions below describe what a future
 
 The package's `ocaml >= 5.2` dependency is a solver constraint, not proof of
 support for every future compiler. Preserve the 5.2 compiler baseline; this
-proposal does not request a compiler upgrade. For every release, record exact
+policy does not request a compiler upgrade. For every release, record exact
 compiler patch versions, Dune, Rust, protoc, OPAM/Cargo locks and container
 digests from the jobs, rather than treating floating image tags as evidence.
 The [dependency inventory](../dependencies.md) describes the licensing gate.
@@ -116,7 +117,7 @@ When validating an unsupported option combination, fail with a typed error
 before starting work or sending a request whenever local validation can decide
 it. Do not silently ignore a requested policy, downgrade authentication, or
 substitute different execution semantics. A known experimental option may
-remain usable and labelled experimental; this proposal does not claim the
+remain usable and labelled experimental; this policy does not claim the
 current SDK rejects every out-of-scope feature. Unknown/future server inputs
 must produce a bounded diagnostic and recoverable task failure where required
 by [#511], rather than a success claim or an unintended terminal workflow
@@ -135,12 +136,12 @@ not automatic.
 For each candidate, the release owner records named people for the roles
 below in the release PR. A person may hold multiple roles; no external
 contributor, security mailbox or service-level promise is assigned implicitly.
-Maintainer approval of this proposal is the scope gate. Release approval is a
+Maintainer approval of this matrix is the scope gate. Release approval is a
 later decision based on evidence for the exact candidate commit and tag.
 
 | Gate | Responsible role | Required retained evidence |
 | --- | --- | --- |
-| Scope and status | Repository maintainer / release owner | Approval of this matrix in [#489]; exact inclusions/exclusions in release notes and examples; [#491] documentation reconciliation; no unsupported capability described as stable. A scope amendment repeats review and updates linked qualification issues. |
+| Scope and status | Repository maintainer / release owner | Explicit approval of this matrix in a review on [PR #557] before merge, recorded for [#489]; exact inclusions/exclusions in release notes and examples; [#491] documentation reconciliation; no unsupported capability described as stable. A scope amendment repeats review and updates linked qualification issues. |
 | Public package | API maintainer | `make test-api` (same installed-consumer gate as `make test-install`), the public witness and every private-module negative fixture on the candidate; compiler/OS/architecture build results from the exhaustive workflow. Source review alone is not a passing install result. |
 | Build and supply chain | Release owner | `make check OCAML_VERSION=5.2`, `make quality`, the exhaustive Linux/native matrix, and the independent Cargo license audit. Record exact resolved tools, locks and source inputs. `make release-preflight` must pass on the clean release commit; `make release-tag-check RELEASE_TAG=v1.0.0` runs only after matching manifests are prepared. [#510] supplies complete release-artifact provenance/SBOM and an installation rehearsal. |
 | Authenticated live behavior | SDK qualification maintainer | [#496]/[#505] results for the chosen Server/Core and both production architectures, including rejection and recovery cases. Retain exact run IDs, histories, logs and controller outputs through [#490]; a build or mock pass is insufficient. |
@@ -195,3 +196,4 @@ candidate does not satisfy release qualification.
 [#512]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/512
 [#513]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/513
 [#514]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/514
+[PR #557]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/pull/557

@@ -94,10 +94,10 @@ The remaining reference documents are useful when changing one subsystem:
   pre-`0.1.0` compatibility policy and the installed-consumer type witness.
 - [Precompiled OCaml SDK](reference/prebuilt-ocaml.md) describes compatible binary
   installations and downstream linking without recompiling the SDK.
-- [Proposed v1 support policy](reference/v1-support-policy.md) selects the
+- [MVP v1 support policy](reference/v1-support-policy.md) selects the
   experimental core SDK prerelease scope, tested platform, compatibility
-  boundary, and qualification responsibilities pending maintainer approval in
-  #489.
+  boundary, and qualification responsibilities. Maintainer approval must be
+  recorded on PR #557 before the policy takes effect; #489 tracks the decision.
 - [Release preflight](reference/release-preflight.md) documents the clean-tree
   metadata and source-input gate, deterministic CI-only Cargo
   SBOM audit, and stable/prerelease tag-to-manifest consistency check.
