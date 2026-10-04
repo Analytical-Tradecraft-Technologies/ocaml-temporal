@@ -97,8 +97,17 @@ NATIVE_ENV := CARGO_TARGET_DIR="$(NATIVE_CARGO_TARGET_DIR)"
 QUALITY_CARGO_DENY_VERSION ?= 0.20.2
 QUALITY_CARGO_MACHETE_VERSION ?= 0.9.2
 QUALITY_TYPOS_VERSION ?= 1.48.0
+# Exploratory, no-server benchmark. The report stays under ignored _build by
+# default; callers can retain it elsewhere with BENCH_REPORT.
+BENCH_WARMUP ?= 100
+BENCH_SAMPLES ?= 1000
+BENCH_REPETITIONS ?= 3
+BENCH_SEED ?= 1
+BENCH_HOST_LABEL ?= unspecified
+BENCH_REPORT ?= _build/benchmarks/local-minimal-activation.json
 
 .PHONY: test-temporal-live-ci test-temporal-diagnostics-contract
+.PHONY: bench
 .PHONY: version-check build build-examples cargo-metadata test test-unit test-runtime test-rust test-bridge test-install test-api release-preflight release-tag-check test-quality-contract test-temporal-config test-temporal-worker-readiness-contract test-temporal-worker-stop-contract test-temporal-worker-crash-recovery-contract test-temporal-worker-cache-eviction-contract test-core-lifecycle-integration temporal-start temporal-start-worker temporal-run-driver temporal-inspect-smoke temporal-stop-worker test-temporal-two-binary test-temporal-integration test-temporal-worker-restart test-temporal-worker-restart-contract test-temporal-worker-restart-live test-temporal-worker-crash-recovery test-temporal-worker-cache-eviction test-temporal-worker-cache-eviction-live test-temporal-workflow-patching test-temporal-workflow-patching-contract test-temporal-workflow-patching-live test-temporal-parent-child-restart test-temporal-parent-child-restart-contract test-temporal-parent-child-restart-live test-temporal-parent-child-failure-replay test-temporal-parent-child-failure-replay-contract test-temporal-parent-child-failure-replay-live temporal-health temporal-status temporal-logs temporal-stop temporal-clean lint lint-rust fmt quality quality-tool-version-check quality-rust quality-spelling license-check audit clean verify check native-version-check native-build native-test native-test-rust native-test-install native-lint native-lint-rust native-verify
 version-check:
 	@output="$$( $(RUN) ocamlc -version )" || exit $$?; \
@@ -123,6 +132,43 @@ build-examples:
 # it into the isolated license scanner without knowing the Compose fixture path.
 cargo-metadata:
 	@$(CARGO) metadata --manifest-path $(CARGO_MANIFEST) --locked --format-version 1
+
+# Runs only the local OCaml activation workload in the development container.
+# It deliberately does not start Temporal Server or apply a performance gate.
+bench:
+	@set -eu; \
+	source_commit=$$(git rev-parse HEAD); \
+	if test -z "$$(git status --porcelain)"; then source_dirty=false; else source_dirty=true; fi; \
+	core_revision=$$(awk -F '"' '/^temporalio-sdk-core =/ { print $$4; exit }' rust/Cargo.toml); \
+	test -n "$$core_revision"; \
+	mkdir -p "$(dir $(BENCH_REPORT))"; \
+	report="$(BENCH_REPORT)"; \
+	tmp=$$(mktemp "$$report.tmp.XXXXXX"); \
+	trap 'rm -f "$$tmp"' EXIT HUP INT TERM; \
+	OCAML_IMAGE=$(OCAML_IMAGE) $(COMPOSE) --progress plain build $(SERVICE) >&2; \
+	image_id=$$(docker image inspect --format '{{.Id}}' "$(TEMPORAL_COMPOSE_PROJECT)-$(SERVICE)" 2>/dev/null || true); \
+	if test -z "$$image_id"; then image_id=unavailable; fi; \
+	status=0; \
+	OCAML_IMAGE=$(OCAML_IMAGE) $(COMPOSE) --progress quiet run --rm --user $(HOST_UID):$(HOST_GID) $(SERVICE) env \
+		BENCH_SOURCE_COMMIT="$$source_commit" \
+		BENCH_SOURCE_DIRTY="$$source_dirty" \
+		BENCH_SDK_VERSION="$$(cat .release-version)" \
+		BENCH_CORE_REVISION="$$core_revision" \
+		BENCH_DUNE_PROFILE=release \
+		BENCH_BASE_IMAGE_REFERENCE="$(OCAML_IMAGE)" \
+		BENCH_DEVELOPMENT_IMAGE_ID="$$image_id" \
+		BENCH_HOST_LABEL="$(BENCH_HOST_LABEL)" \
+		opam exec -- dune exec --profile release test/benchmark/bench_local_activation.exe -- \
+		--warmup "$(BENCH_WARMUP)" --samples "$(BENCH_SAMPLES)" \
+		--repetitions "$(BENCH_REPETITIONS)" --seed "$(BENCH_SEED)" \
+		>"$$tmp" || status=$$?; \
+	if test -s "$$tmp" && python3 -m json.tool "$$tmp" >/dev/null 2>&1; then \
+		mv "$$tmp" "$$report"; \
+		printf 'benchmark report: %s\n' "$$report"; \
+	else \
+		status=1; \
+	fi; \
+	exit "$$status"
 
 test:
 	$(MAKE) test-temporal-config
