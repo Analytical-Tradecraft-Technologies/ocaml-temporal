@@ -21,8 +21,9 @@ while ! temporal operator cluster health --address "$address"; do
 done
 
 # A failed describe is not necessarily a missing namespace: the frontend may
-# briefly return Unavailable even after its health check succeeds. Create only
-# on an explicit NotFound response, then wait for describe to observe it.
+# briefly return Unavailable or a CLI connection deadline even after its health
+# check succeeds. Create only on an explicit NotFound response, then wait for
+# describe to observe it.
 attempt=1
 created=0
 while true; do
@@ -42,6 +43,7 @@ while true; do
       fi
       ;;
     *"code = Unavailable"*|*"code = DeadlineExceeded"*) ;;
+    "Error: failed connecting to Temporal server at $address: context deadline exceeded") ;;
     *) printf '%s\n' "$describe_error" >&2; exit 1 ;;
   esac
   if [ "$attempt" -ge "$max_attempts" ]; then

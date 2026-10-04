@@ -22,6 +22,15 @@ case "$*" in
         echo 'rpc error: code = Unavailable desc = frontend restarting' >&2
         exit 1
       fi ;;
+      cli_deadline_once) if [ "$count" -eq 1 ]; then
+        echo "Error: failed connecting to Temporal server at $TEMPORAL_ADDRESS: context deadline exceeded" >&2
+        exit 1
+      fi ;;
+      cli_deadline_permanent)
+        echo "Error: failed connecting to Temporal server at $TEMPORAL_ADDRESS: context deadline exceeded" >&2
+        exit 1 ;;
+      cli_auth) echo 'Error: authentication failed: invalid API key' >&2; exit 1 ;;
+      cli_bad_config) echo 'Error: invalid Temporal server configuration' >&2; exit 1 ;;
       pending) if [ "$count" -eq 2 ]; then
         echo 'Error: Namespace readiness-test is not found.' >&2
         exit 1
@@ -105,6 +114,15 @@ run_case wrong_namespace 1 1
 grep -F 'Namespace another-test is not found.' "$fixture/output" >/dev/null
 run_case ready 0 1 normal yes 1 0
 run_case ready 0 1 transient yes 2 0
+run_case ready 0 1 cli_deadline_once yes 2 0
+run_case ready 0 1 cli_deadline_once no 3 1
+run_case ready 1 0 cli_deadline_permanent yes 3 0
+grep -F 'describe timed out after 3 attempts' "$fixture/output" >/dev/null
+grep -F 'failed connecting to Temporal server at custom:7233: context deadline exceeded' "$fixture/output" >/dev/null
+run_case ready 1 0 cli_auth yes 1 0
+grep -F 'authentication failed: invalid API key' "$fixture/output" >/dev/null
+run_case ready 1 0 cli_bad_config yes 1 0
+grep -F 'invalid Temporal server configuration' "$fixture/output" >/dev/null
 run_case ready 0 1 pending no 3 1
 run_case ready 1 0 permanent yes 3 0
 grep -F 'describe timed out after 3 attempts' "$fixture/output" >/dev/null
