@@ -79,6 +79,7 @@ type retry_policy = {
 }
 
 type activity_start = {
+  is_local : bool;
   workflow_namespace : string;
   workflow_type : string;
   workflow_execution : workflow_execution;
@@ -292,6 +293,7 @@ let activity_start path json =
   let fields =
     [
       "kind";
+      "is_local";
       "workflow_namespace";
       "workflow_type";
       "workflow_execution";
@@ -314,6 +316,8 @@ let activity_start path json =
   in
   let* entries = Shared.exact_object path fields json in
   let get name = required path name entries in
+  let* is_local_json = get "is_local" in
+  let* is_local = Shared.bool (path ^ ".is_local") is_local_json in
   let* workflow_namespace_json = get "workflow_namespace" in
   let* workflow_namespace = Shared.identifier (path ^ ".workflow_namespace") workflow_namespace_json in
   let* workflow_type_json = get "workflow_type" in
@@ -350,6 +354,7 @@ let activity_start path json =
   let* standalone_run_id = Shared.string (path ^ ".standalone_run_id") standalone_json in
   Ok
     {
+      is_local;
       workflow_namespace;
       workflow_type;
       workflow_execution;
@@ -397,6 +402,7 @@ let activity_start_json value =
     (`Assoc
       [
         ("kind", `String "start");
+        ("is_local", `Bool value.is_local);
         ("workflow_namespace", `String value.workflow_namespace);
         ("workflow_type", `String value.workflow_type);
         ("workflow_execution", workflow_execution_json value.workflow_execution);

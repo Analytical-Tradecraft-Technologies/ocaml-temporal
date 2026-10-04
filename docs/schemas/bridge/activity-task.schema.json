@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/mfow/ocaml-temporal/docs/schemas/bridge/activity-task.schema.json",
-  "title": "Remote activity task",
-  "description": "A closed semantic remote-activity task sent from the Rust Temporal Core bridge to the private OCaml activity runner.",
+  "title": "Activity task",
+  "description": "A closed semantic remote or local activity task sent from the Rust Temporal Core bridge to the private OCaml activity runner.",
   "type": "object",
   "additionalProperties": false,
   "required": ["task_token", "variant"],
@@ -80,9 +80,10 @@
     "activity_start": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["kind", "workflow_namespace", "workflow_type", "workflow_execution", "activity_id", "activity_type", "header_fields", "input", "heartbeat_details", "scheduled_time", "current_attempt_scheduled_time", "started_time", "attempt", "schedule_to_close_timeout", "start_to_close_timeout", "heartbeat_timeout", "retry_policy", "priority", "standalone_run_id"],
+      "required": ["kind", "is_local", "workflow_namespace", "workflow_type", "workflow_execution", "activity_id", "activity_type", "header_fields", "input", "heartbeat_details", "scheduled_time", "current_attempt_scheduled_time", "started_time", "attempt", "schedule_to_close_timeout", "start_to_close_timeout", "heartbeat_timeout", "retry_policy", "priority", "standalone_run_id"],
       "properties": {
         "kind": {"const": "start"},
+        "is_local": {"type": "boolean"},
         "workflow_namespace": {"$ref": "#/$defs/identifier"},
         "workflow_type": {"$ref": "#/$defs/identifier"},
         "workflow_execution": {"$ref": "#/$defs/workflow_execution"},

@@ -96,6 +96,7 @@ type source_error = { code : string; message : string; retryable : bool }
 type fake_supervisor = {
   queue : Protocol.task Queue.t;
   leased : bytes list ref;
+  local_leased : bytes list ref;
   async_leased : bytes list ref;
   completions : Protocol.completion list ref;
   async_completions : Protocol.completion list ref;
@@ -103,6 +104,7 @@ type fake_supervisor = {
   async_heartbeats : Protocol.heartbeat list ref;
   async_completion_calls : int ref;
   async_heartbeat_calls : int ref;
+  reject_next_worker_completion : bool ref;
   reject_next_async_completion : bool ref;
   reject_next_async_completion_terminal : bool ref;
   reject_next_async_heartbeat : bool ref;
@@ -115,6 +117,7 @@ let fake_supervisor () =
   {
     queue = Queue.create ();
     leased = ref [];
+    local_leased = ref [];
     async_leased = ref [];
     completions = ref [];
     async_completions = ref [];
@@ -122,6 +125,7 @@ let fake_supervisor () =
     async_heartbeats = ref [];
     async_completion_calls = ref 0;
     async_heartbeat_calls = ref 0;
+    reject_next_worker_completion = ref false;
     reject_next_async_completion = ref false;
     reject_next_async_completion_terminal = ref false;
     reject_next_async_heartbeat = ref false;
@@ -159,17 +163,39 @@ module Fake_supervisor = struct
     else
       let task = Queue.take supervisor.queue in
       supervisor.leased := Bytes.copy task.task_token :: !(supervisor.leased);
+      (match task.variant with
+      | Protocol.Start { is_local = true; _ } ->
+          supervisor.local_leased :=
+            Bytes.copy task.task_token :: !(supervisor.local_leased)
+      | Protocol.Start _ | Protocol.Cancel _ -> ());
       Ok (Some task)
 
-  (** Accepts the worker-side completion. A [Will_complete_async] result moves
-      the token from the worker ledger to the separate client ledger. *)
+  (** Accepts a worker completion only for a leased token. Core rejects a
+      deferred local result before retiring its token; the optional one-shot
+      transport failure checks that an ordinary local failure is retried
+      without rerunning the callback. *)
   let complete_activity supervisor (completion : Protocol.completion) =
-    let found, remaining =
-      remove_token completion.Protocol.task_token !(supervisor.leased)
-    in
-    if not found then Error (source_error "stale_lease" "worker lease is not active")
+    let token = completion.Protocol.task_token in
+    if not (has_token token !(supervisor.leased)) then
+      Error (source_error "stale_lease" "worker lease is not active")
+    else if
+      has_token token !(supervisor.local_leased)
+      && completion.Protocol.result = Protocol.Will_complete_async
+    then
+      Error
+        (source_error "malformed_activity_completion"
+           "local activities cannot be completed asynchronously")
+    else if !(supervisor.reject_next_worker_completion) then begin
+      supervisor.reject_next_worker_completion := false;
+      Error
+        (source_error ~retryable:true "temporarily_unavailable"
+           "worker completion transport unavailable")
+    end
     else begin
+      let _, remaining = remove_token token !(supervisor.leased) in
       supervisor.leased := remaining;
+      let _, remaining_local = remove_token token !(supervisor.local_leased) in
+      supervisor.local_leased := remaining_local;
       supervisor.completions := copy_completion completion :: !(supervisor.completions);
       begin
         match completion.Protocol.result with
@@ -291,11 +317,12 @@ let decode_output codec (payload : Protocol.payload) =
   | Ok value -> value
   | Error error -> failwith (Temporal.Error.message error)
 
-(** Builds the complete start-task context while leaving timing fields absent;
-    async lifecycle tests focus on token ownership and payload operations. *)
-let start_task ~token ~activity_type ~input : Protocol.task =
+(** Builds a start task with explicit Core locality while leaving timing fields
+    absent; async lifecycle tests focus on token ownership and payloads. *)
+let start_task_with_locality ~is_local ~token ~activity_type ~input : Protocol.task =
   let start : Protocol.activity_start =
     {
+      is_local;
       workflow_namespace = "default";
       workflow_type = "async_test_workflow";
       workflow_execution =
@@ -318,6 +345,10 @@ let start_task ~token ~activity_type ~input : Protocol.task =
     }
   in
   { Protocol.task_token = Bytes.copy token; variant = Start start }
+
+(** Builds a remote task for the existing deferred-completion controls. *)
+let start_task ~token ~activity_type ~input =
+  start_task_with_locality ~is_local:false ~token ~activity_type ~input
 
 (** Adds a task to the deterministic source queue. *)
 let enqueue supervisor task = Queue.add task supervisor.queue
@@ -365,6 +396,76 @@ let expect_rejected code
   | Error error ->
       failwith
         (Printf.sprintf "stale async handle escaped as adapter error: %s" error.code)
+
+(** A local callback may choose the public deferred result, but Core cannot
+    accept that handoff. The adapter submits one ordinary failure, keeps it on
+    an uncertain first submission, and then processes the next local task
+    without activating the retained handle. *)
+let test_local_deferred_failure_keeps_worker_progress () =
+  let supervisor = fake_supervisor () in
+  let calls = ref 0 and retained = ref None in
+  let activity =
+    Temporal.Activity.define_async ~name:"local_async_rejection"
+      ~input:Temporal.Codec.unit ~output:Temporal.Codec.string
+      (fun context () ->
+        incr calls;
+        if !calls = 1 then begin
+          let handle = Temporal.Activity.Async_context.handle context in
+          retained := Some handle;
+          Temporal.Activity.Will_complete_async handle
+        end
+        else Temporal.Activity.Completed "next")
+  in
+  let first_token = Bytes.of_string "local-async-first" in
+  let second_token = Bytes.of_string "local-async-second" in
+  let input = [ encode_input Temporal.Codec.unit () ] in
+  enqueue supervisor
+    (start_task_with_locality ~is_local:true ~token:first_token
+       ~activity_type:"local_async_rejection" ~input);
+  enqueue supervisor
+    (start_task_with_locality ~is_local:true ~token:second_token
+       ~activity_type:"local_async_rejection" ~input);
+  let worker = worker supervisor [ Adapter.register_async activity ] in
+  supervisor.reject_next_worker_completion := true;
+  begin
+    match Worker.poll worker with
+    | Error { retryable = true; code = "completion_failed"; _ } -> ()
+    | _ -> failwith "uncertain local failure did not retain its completion"
+  end;
+  if !calls <> 1 || Queue.length supervisor.queue <> 1 then
+    failwith "uncertain local completion reran the callback or consumed the next task";
+  if not (has_token first_token !(supervisor.leased)) then
+    failwith "uncertain local failure lost the worker lease";
+  expect_rejected "local_async_unsupported" (Worker.poll worker);
+  if !calls <> 1 then failwith "local failure retry reran the callback";
+  begin
+    match Temporal.Activity.Async_handle.complete (Option.get !retained) "late" with
+    | Error error when (Temporal.Error.view error).non_retryable -> ()
+    | Error _ -> failwith "rejected local handle remained retryable"
+    | Ok () -> failwith "rejected local handle became active"
+  end;
+  begin
+    match Worker.poll worker with
+    | Ok (Raw_adapter.Completed { kind = Raw_adapter.Succeeded; _ }) -> ()
+    | _ -> failwith "local deferred failure blocked the next activity"
+  end;
+  if !calls <> 2 || not (Queue.is_empty supervisor.queue) then
+    failwith "next local callback did not run exactly once";
+  if !(supervisor.leased) <> [] || !(supervisor.local_leased) <> []
+     || !(supervisor.async_leased) <> [] then
+    failwith "local completion left a worker or async lease outstanding";
+  begin
+    match !(supervisor.completions) with
+    | [ { Protocol.task_token = second; result = Protocol.Completed _ };
+        { Protocol.task_token = first;
+          result = Protocol.Failed
+            { info = Protocol.Application { non_retryable = true; _ }; _ } } ]
+      when Bytes.equal second second_token && Bytes.equal first first_token -> ()
+    | _ -> failwith "local failure and following success were not acknowledged"
+  end;
+  match Worker.drain worker with
+  | Ok () -> ()
+  | Error error -> failwith ("local failure blocked drain: " ^ error.message)
 
 (** Deferred completion admits a handle only after the worker-side handoff,
     then routes heartbeat and terminal operations through the async ledger. *)
@@ -989,6 +1090,7 @@ let () =
   test_base_state_machine ();
   test_operation_key_boundaries ();
   test_local_rejection_preserves_earlier_uncertainty ();
+  test_local_deferred_failure_keeps_worker_progress ();
   test_deferred_lifecycle ();
   test_invalid_async_payload_preserves_handle ();
   test_async_codec_error_preserves_handle ();

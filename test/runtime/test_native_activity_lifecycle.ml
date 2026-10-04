@@ -134,6 +134,7 @@ module Worker = Adapter.Make (Fake_supervisor)
 let start_task token : Protocol.task =
   let start : Protocol.activity_start =
     {
+      is_local = false;
       workflow_namespace = "default";
       workflow_type = "lifecycle_workflow";
       workflow_execution = { Protocol.workflow_id = "workflow-1"; run_id = "run-1" };

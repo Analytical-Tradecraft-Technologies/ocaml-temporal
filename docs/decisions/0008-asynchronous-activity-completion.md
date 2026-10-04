@@ -69,14 +69,16 @@ context flag, or implicit defer caused by dropping an output value. The
 existing `define` and `define_with_context` wrappers remain ordinary
 result-returning functions.
 
-The defer handoff is linearized only after the activity callback has returned.
+The defer handoff is linearized only after a remote activity callback has returned.
 At that point the adapter submits exactly one `WillCompleteAsync` completion
 to Core. If Core accepts it, the adapter publishes the opaque handle and moves
 the token into a separate asynchronous-lease registry. If Core rejects it,
 the original worker lease remains in the ordinary retry map and the activity
 is not silently abandoned. A handle is never usable before this handoff is
 accepted, so a callback cannot synchronously call back through the mutex it is
-already holding.
+already holding. If a local activity callback returns `Will_complete_async`,
+the adapter instead closes its dormant handle and submits a non-retryable
+failure for the same worker token; Core cannot accept a deferred local result.
 
 ## Native boundary
 
