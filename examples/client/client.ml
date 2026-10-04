@@ -31,7 +31,7 @@ let display_terminal = function
   | Temporal.Client.Completed message ->
       Printf.printf "Workflow completed:\n%s\n%!" message;
       Ok ()
-  | Temporal.Client.Failed error ->
+  | Temporal.Client.Failed { error; _ } ->
       Printf.eprintf "Workflow failed: %s\n%!" (Temporal.Error.message error);
       Error error
   | Temporal.Client.Cancelled error ->
@@ -40,7 +40,7 @@ let display_terminal = function
   | Temporal.Client.Terminated error ->
       Printf.eprintf "Workflow was terminated: %s\n%!" (Temporal.Error.message error);
       Error error
-  | Temporal.Client.Timed_out error ->
+  | Temporal.Client.Timed_out { error; _ } ->
       Printf.eprintf "Workflow timed out: %s\n%!" (Temporal.Error.message error);
       Error error
   | Temporal.Client.Continued_as_new { workflow_id; run_id; _ } ->

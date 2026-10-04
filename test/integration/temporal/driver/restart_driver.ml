@@ -54,10 +54,10 @@ let require_completed = function
       Error
         (Error.defect
            ~message:(Printf.sprintf "restart workflow returned %S" value))
-  | Client.Failed error
+  | Client.Failed { error; _ }
   | Client.Cancelled error
   | Client.Terminated error
-  | Client.Timed_out error ->
+  | Client.Timed_out { error; _ } ->
       Error
         (Error.defect
            ~message:

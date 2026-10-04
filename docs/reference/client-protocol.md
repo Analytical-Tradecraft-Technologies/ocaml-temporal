@@ -622,12 +622,15 @@ Whenever a successor is present, both sides enforce the same three invariants:
 3. successor run ID differs from the waited run ID.
 
 This prevents a malformed response from changing which execution a caller is
-observing. OCaml returns `continued_as_new` to the caller; it never follows the
-successor implicitly. See
+observing. The public OCaml terminal result retains an optional
+`Temporal.Client.execution` successor in `Failed { error; successor }` and
+`Timed_out { error; successor }`, and a required one in `Continued_as_new`.
+`Client.wait` still returns the outcome of the requested exact run; it never
+follows a successor implicitly. See
 [`client-wait-request.schema.json`](../schemas/bridge/client-wait-request.schema.json)
 and [`client-wait-response.schema.json`](../schemas/bridge/client-wait-response.schema.json).
 
-The public client exposes the successor as an opaque-to-codec
+The public client exposes these successors as opaque-to-codec
 `Temporal.Client.execution` value containing the validated workflow and run
 identity and its namespace. `Temporal.Client.follow client ~workflow successor`
 combines that identity with the caller's existing client and workflow
@@ -724,7 +727,9 @@ codec does not decide whether a workflow failure is retryable.
 At the public boundary, a bridge or codec problem is the outer `Error.t` from
 `Client.start`, `Client.wait`, or `Client.cancel`. A workflow that reached a
 Temporal terminal state instead remains inside the successful result: for
-example, `Client.wait` returns `Ok (Failed error)` or `Ok (Cancelled error)`.
+example, `Client.wait` returns `Ok (Failed { error; successor })` or
+`Ok (Cancelled error)`. The optional successor is a typed execution identity,
+not part of the error message.
 
 ## Validation and ownership checklist
 

@@ -8,7 +8,8 @@ let identity name handle = Printf.sprintf "%s\t%s\t%s\n" name
 (** Verifies typed public results, including deliberate application retryability. *)
 let assert_outcome name = function
   | Temporal.Client.Completed "recovered" when List.mem name [ "body"; "encoder"; "missing" ] -> ()
-  | Temporal.Client.Failed error when List.mem name [ "business-retryable"; "business-permanent" ] ->
+  | Temporal.Client.Failed { error; _ }
+    when List.mem name [ "business-retryable"; "business-permanent" ] ->
       let view = Temporal.Error.view error in
       (* Native client diagnostics retain structured metadata after the original
          message; raw server history separately asserts the exact message. *)

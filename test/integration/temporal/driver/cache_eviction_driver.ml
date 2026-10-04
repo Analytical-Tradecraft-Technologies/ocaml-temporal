@@ -105,9 +105,9 @@ let require_cancelled label = function
                   label))
   | Client.Completed _ ->
       Error (Error.defect ~message:(label ^ " completed instead of cancelling"))
-  | Client.Failed error
+  | Client.Failed { error; _ }
   | Client.Terminated error
-  | Client.Timed_out error ->
+  | Client.Timed_out { error; _ } ->
       Error
         (Error.defect
            ~message:

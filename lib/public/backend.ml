@@ -137,17 +137,19 @@ type update_response = {
 
 type poll_update_response = { outcome : update_outcome option }
 
+(** A successor returned by a close event. Its namespace was validated against
+    the waited execution by the client protocol and is supplied by the owning
+    public client when constructing a typed execution. *)
+type successor = { workflow_id : string; run_id : string }
+
 (** Terminal workflow outcome represented independently from transport errors. *)
 type terminal_result =
   | Completed of Payload.t
-  | Failed of Error.t
+  | Failed of { error : Error.t; successor : successor option }
   | Cancelled of Error.t
   | Terminated of Error.t
-  | Timed_out of Error.t
-  | Continued_as_new of {
-      workflow_id : string;
-      run_id : string;
-    }
+  | Timed_out of { error : Error.t; successor : successor option }
+  | Continued_as_new of successor
 
 (** New run identity returned by a successful reset. *)
 type reset_response = { workflow_id : string; run_id : string }
@@ -488,10 +490,19 @@ let terminal_details_error ~category ~message details =
 let unit_null_payload : Payload.t =
   { Payload.metadata = [ ("encoding", "binary/null") ]; data = Bytes.empty }
 
-(** Converts one native wait response into the existing public terminal-result
-    algebra. A single payload is the normal case; zero payloads are the unit
-    completion marker; multiple payloads remain a codec error. *)
+(** Converts one native wait response into the backend terminal-result algebra.
+    A single payload is the normal case; zero payloads are the unit completion
+    marker; multiple payloads remain a codec error. A close event's validated
+    successor identity is retained for the public client's explicit choice. *)
 let native_terminal_result (response : Client_protocol.wait_response) =
+  (* The protocol has already checked the successor against the exact run;
+     retain its identity until the public client can attach its namespace. *)
+  let successor_ref (value : Client_protocol.execution option) : successor option =
+    Option.map
+      (fun (value : Client_protocol.execution) ->
+        ({ workflow_id = value.workflow_id; run_id = value.run_id } : successor))
+      value
+  in
   match response.outcome with
   | Client_protocol.Completed { result; successor = _ } -> (
       match result with
@@ -503,8 +514,13 @@ let native_terminal_result (response : Client_protocol.wait_response) =
                ~message:
                  "Temporal completed with multiple output payloads; the public client expects one"
                ()))
-  | Client_protocol.Failed { failure; successor = _ } ->
-      Ok (Failed (workflow_failure_error failure))
+  | Client_protocol.Failed { failure; successor } ->
+      Ok
+        (Failed
+           {
+             error = workflow_failure_error failure;
+             successor = successor_ref successor;
+           })
   | Client_protocol.Cancelled { details } ->
       Ok
         (Cancelled
@@ -517,15 +533,14 @@ let native_terminal_result (response : Client_protocol.wait_response) =
               ~details:(List.map public_payload details)
               ~message:"workflow execution was terminated" ()))
   | Client_protocol.Timed_out { successor } ->
-      let successor =
-        match successor with
-        | None -> ""
-        | Some successor -> "; successor_run_id=" ^ successor.run_id
-      in
       Ok
         (Timed_out
-           (Error.make ~category:`Timeout
-              ~message:("workflow execution timed out" ^ successor) ()))
+           {
+             error =
+               Error.make ~category:`Timeout
+                 ~message:"workflow execution timed out" ();
+             successor = successor_ref successor;
+           })
   | Client_protocol.Continued_as_new { successor } ->
       Ok
         (Continued_as_new

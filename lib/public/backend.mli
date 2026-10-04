@@ -139,18 +139,20 @@ type update_response = {
 (** Bounded completion poll response; [None] means still pending. *)
 type poll_update_response = { outcome : update_outcome option }
 
+(** Successor identity from an exact-run close event. The protocol already
+    checks its namespace against the waited execution. *)
+type successor = { workflow_id : string; run_id : string }
+
 (** Terminal outcomes are kept separate from bridge transport errors so a
-    completed Temporal failure remains an ordinary typed value. *)
+    completed Temporal failure remains an ordinary typed value. Failure and
+    timeout outcomes retain any server-supplied successor for explicit follow. *)
 type terminal_result =
   | Completed of Payload.t
-  | Failed of Error.t
+  | Failed of { error : Error.t; successor : successor option }
   | Cancelled of Error.t
   | Terminated of Error.t
-  | Timed_out of Error.t
-  | Continued_as_new of {
-      workflow_id : string;
-      run_id : string;
-    }
+  | Timed_out of { error : Error.t; successor : successor option }
+  | Continued_as_new of successor
 
 (** A synthetic workflow task used only by the deterministic unit-test seam.
     Native Core activations carry replay metadata, jobs, and history context;

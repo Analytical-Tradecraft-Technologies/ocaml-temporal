@@ -133,6 +133,57 @@ let test_terminal_outcomes () =
         failwith "completed result payload changed"
   | _ -> failwith "completed response did not retain its result shape"
 
+(** Failed and timed-out exact runs retain an optional validated successor in
+    the OCaml half of the native protocol. Both outcomes keep the original run
+    in [response.execution], leaving a later follow call to the public client. *)
+let test_failure_and_timeout_successors () =
+  let prefix =
+    {|{"execution":{"namespace":"default","workflow_id":"workflow-1","run_id":"run-1"},"outcome":|}
+  in
+  let successor =
+    {|{"namespace":"default","workflow_id":"workflow-1","run_id":"run-2"}|}
+  in
+  let failure =
+    {|"failure":{"message":"failed","source":"worker","stack_trace":"","encoded_attributes":null,"cause":null,"info":{"kind":"application","type":"Failure","non_retryable":true,"details":[]}}|}
+  in
+  (* All four fixtures use the same exact-run response envelope. *)
+  let decode kind extra successor =
+    unwrap
+      (Protocol.decode_wait_response ~request:execution
+         (prefix ^ {|{"kind":"|} ^ kind ^ {|",|} ^ extra ^ {|"successor":|}
+        ^ successor ^ "}}"))
+  in
+  (* A successor belongs to the same workflow chain but has a different run. *)
+  let require_same_chain = function
+    | Some (value : Protocol.execution)
+      when value.namespace = execution.namespace
+           && value.workflow_id = execution.workflow_id
+           && value.run_id = "run-2" ->
+        ()
+    | _ -> failwith "close outcome dropped its typed successor identity"
+  in
+  let failed_without = decode "failed" (failure ^ ",") "null" in
+  let failed_with = decode "failed" (failure ^ ",") successor in
+  let timeout_without = decode "timed_out" "" "null" in
+  let timeout_with = decode "timed_out" "" successor in
+  List.iter
+    (fun (response : Protocol.wait_response) ->
+      if response.execution <> execution then
+        failwith "exact-run response switched to a successor")
+    [ failed_without; failed_with; timeout_without; timeout_with ];
+  (match failed_without.outcome with
+  | Protocol.Failed { successor = None; _ } -> ()
+  | _ -> failwith "failed run without successor changed shape");
+  (match failed_with.outcome with
+  | Protocol.Failed { successor; _ } -> require_same_chain successor
+  | _ -> failwith "failed run lost successor");
+  (match timeout_without.outcome with
+  | Protocol.Timed_out { successor = None } -> ()
+  | _ -> failwith "timed-out run without successor changed shape");
+  match timeout_with.outcome with
+  | Protocol.Timed_out { successor } -> require_same_chain successor
+  | _ -> failwith "timed-out run lost successor"
+
 (** Rejects successor identities that would silently leave or repeat the exact
     run selected by the wait request. *)
 let test_successor_identity_validation () =
@@ -532,6 +583,7 @@ let run name test =
 (** Runs every client-protocol encoder/decoder assertion as one bridge test. *)
 let () =
   run "client terminal outcomes" test_terminal_outcomes;
+  run "client retry successors" test_failure_and_timeout_successors;
   run "client successor identity" test_successor_identity_validation;
   run "client request validation" test_request_validation;
   run "client cancellation protocol" test_cancellation_protocol;
