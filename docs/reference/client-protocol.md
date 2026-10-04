@@ -297,6 +297,12 @@ same request ID is therefore safe. Temporal scopes reset deduplication to the
 workflow: distinct workflow IDs may use the same explicit request ID without
 colliding, while a retry for one workflow must retain the original reset data.
 
+The deterministic `mock://` backend keeps closed runs addressable by their
+exact run IDs. A new request ID may reset the same retained source run again;
+if its previous successor is still running, that successor is terminated
+before the new one starts. Reusing a prior request ID returns its original
+successor instead of creating another run.
+
 Temporal returns the new run ID. The bridge wraps it in the same execution
 object used by `start`, and OCaml verifies that namespace and workflow ID still
 match the original handle before exposing it:

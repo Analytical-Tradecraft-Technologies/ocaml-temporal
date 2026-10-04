@@ -619,6 +619,61 @@ let test_exact_run_reset () =
     ];
   unwrap (Temporal.Client.shutdown client)
 
+(** A second distinct reset may target a retained closed source run. It
+    terminates the first pending successor, while retrying the first request
+    ID still returns its original successor identity. *)
+let test_reset_retired_exact_run_again () =
+  let client =
+    unwrap
+      (Temporal.Client.create ~target_url:"mock://client"
+         ~namespace:"unit-test" ())
+  in
+  let original =
+    unwrap
+      (Temporal.Client.start client ~workflow:echo_workflow
+         ~task_queue:"unit-test" ~id:"unit-reset-again" ~input:"again" ())
+  in
+  (match Temporal.Client.wait original with
+  | Ok (Temporal.Client.Completed "again") -> ()
+  | Ok _ -> failwith "original run did not complete before reset"
+  | Error error -> failwith (Temporal.Error.message error));
+  let first =
+    unwrap
+      (Temporal.Client.reset ~request_id:"reset-again-1"
+         ~workflow_task_finish_event_id:4L original)
+  in
+  let first_handle =
+    unwrap (Temporal.Client.follow client ~workflow:echo_workflow first)
+  in
+  let second =
+    unwrap
+      (Temporal.Client.reset ~request_id:"reset-again-2"
+         ~workflow_task_finish_event_id:4L original)
+  in
+  assert (first.run_id <> second.run_id);
+  let retried =
+    unwrap
+      (Temporal.Client.reset ~request_id:"reset-again-1"
+         ~workflow_task_finish_event_id:4L original)
+  in
+  assert (retried.run_id = first.run_id);
+  (match Temporal.Client.wait original with
+  | Ok (Temporal.Client.Completed "again") -> ()
+  | Ok _ -> failwith "reset rewrote the closed source run"
+  | Error error -> failwith (Temporal.Error.message error));
+  (match Temporal.Client.wait first_handle with
+  | Ok (Temporal.Client.Terminated _) -> ()
+  | Ok _ -> failwith "second reset did not terminate the first successor"
+  | Error error -> failwith (Temporal.Error.message error));
+  let second_handle =
+    unwrap (Temporal.Client.follow client ~workflow:echo_workflow second)
+  in
+  (match Temporal.Client.wait second_handle with
+  | Ok (Temporal.Client.Completed "again") -> ()
+  | Ok _ -> failwith "second reset successor returned the wrong result"
+  | Error error -> failwith (Temporal.Error.message error));
+  unwrap (Temporal.Client.shutdown client)
+
 (** Reset deduplication belongs to one workflow, even when the mock service
     ledger is shared. Independent workflows may reuse an explicit request ID;
     each still returns its own successor on retry and rejects changed data. *)
@@ -1030,6 +1085,7 @@ let () =
   test_follow_rejects_cross_namespace_execution ();
   test_exact_run_cancellation ();
   test_exact_run_reset ();
+  test_reset_retired_exact_run_again ();
   test_reset_request_id_is_scoped_to_workflow ();
   test_exact_run_termination ();
   test_completed_mock_run_is_immutable ();
