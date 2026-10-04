@@ -70,6 +70,15 @@ require_source "$cache_worker" 'Definitions.cache_eviction_resumable'
 require_source "$cache_worker" 'Definitions.signal_value_handler'
 require_source "$makefile" 'validate-cache-eviction-progress.sh'
 require_source "$makefile" 'capture_history "$$workflow_id" "$$run_id" "$$destination"'
+require_source "$makefile" 'command -v jq >/dev/null 2>&1'
+validator="$root/test/integration/temporal/scripts/validate-cache-eviction-progress.sh"
+sh -n "$validator"
+require_source "$validator" '.reason == "cache_full"'
+require_source "$validator" '$types[-1] == "WorkflowExecutionCompleted"'
+require_source "$validator" 'index("WorkflowExecutionSignaled")'
+require_source "$validator" '$types[-1] == "WorkflowExecutionCanceled"'
+require_source "$validator" 'index("TimerStarted")'
+require_source "$validator" 'index("WorkflowExecutionCancelRequested")'
 require_source "$root/lib/public/worker.mli" '?max_cached_workflows:int'
 require_source "$root/test/integration/temporal/observer/acceptance_observer.ml" '| Some "" -> Ok None'
 require_source "$root/test/integration/temporal/observer/acceptance_observer.ml" 'SMOKE_WORKER_CACHE_EVICTION_READY_FILE'
@@ -105,14 +114,16 @@ fi
 # The live controller retains only identity/event projections, so exercise
 # their exact-run terminal validator without a Temporal service. Mutation
 # cases prove that a cancelled A or a B with no cancellation request cannot
-# be mistaken for successful post-eviction progress.
+# be mistaken for successful post-eviction progress. The native OCaml matrix
+# does not install the live gate's jq dependency on every platform, so run
+# these JSON assertions only where jq is available; the live gate requires it.
+if command -v jq >/dev/null 2>&1; then
 cat >"$temporary_directory/a.json" <<'JSON'
 {"workflow_id":"two-binary-cache-eviction-a","run_id":"22222222-2222-4222-8222-222222222222","events":[{"event_id":"1","type":"WorkflowExecutionStarted"},{"event_id":"2","type":"WorkflowTaskScheduled"},{"event_id":"3","type":"WorkflowTaskStarted"},{"event_id":"4","type":"WorkflowTaskCompleted"},{"event_id":"5","type":"WorkflowExecutionSignaled"},{"event_id":"6","type":"WorkflowTaskScheduled"},{"event_id":"7","type":"WorkflowTaskStarted"},{"event_id":"8","type":"WorkflowTaskCompleted"},{"event_id":"9","type":"WorkflowExecutionCompleted"}]}
 JSON
 cat >"$temporary_directory/b.json" <<'JSON'
 {"workflow_id":"two-binary-cache-eviction-b","run_id":"33333333-3333-4333-8333-333333333333","events":[{"event_id":"1","type":"WorkflowExecutionStarted"},{"event_id":"2","type":"WorkflowTaskScheduled"},{"event_id":"3","type":"WorkflowTaskStarted"},{"event_id":"4","type":"WorkflowTaskCompleted"},{"event_id":"5","type":"TimerStarted"},{"event_id":"6","type":"WorkflowExecutionCancelRequested"},{"event_id":"7","type":"WorkflowTaskScheduled"},{"event_id":"8","type":"WorkflowTaskStarted"},{"event_id":"9","type":"WorkflowTaskCompleted"},{"event_id":"10","type":"WorkflowExecutionCanceled"}]}
 JSON
-validator="$root/test/integration/temporal/scripts/validate-cache-eviction-progress.sh"
 sh "$validator" "$fixture" "$temporary_directory/a.json" "$temporary_directory/b.json" \
   33333333-3333-4333-8333-333333333333 >/dev/null
 jq '.events[-1].type = "WorkflowExecutionCanceled"' "$temporary_directory/a.json" \
@@ -128,6 +139,9 @@ if sh "$validator" "$fixture" "$temporary_directory/a.json" \
   "$temporary_directory/b-invalid.json" 33333333-3333-4333-8333-333333333333 >/dev/null 2>&1; then
   echo 'cache eviction progress validator accepted B without a cancellation request' >&2
   exit 1
+fi
+else
+  echo 'cache eviction JSON validator contract skipped: jq is unavailable' >&2
 fi
 
 echo "temporal worker cache eviction contract: ok"
