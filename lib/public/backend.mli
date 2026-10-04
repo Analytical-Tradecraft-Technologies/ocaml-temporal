@@ -221,6 +221,12 @@ val client_start : client -> start_request -> (start_response, Error.t) result
 (** Waits for the exact workflow/run pair and returns its terminal outcome. *)
 val client_wait : client -> wait_request -> (terminal_result, Error.t) result
 
+(** Scripts a failed or timed-out exact run in the deterministic mock for the
+    public [Client.wait] to [Client.follow] regression. This private test seam
+    rejects native clients and does not create successor runs. *)
+val mock_set_wait_outcome_for_test :
+  client -> wait_request -> terminal_result -> (unit, Error.t) result
+
 (** Converts a protocol-validated native wait response to the private semantic
     terminal result. Kept in this private interface so bridge tests can verify
     that close-event successor identities survive the conversion. *)

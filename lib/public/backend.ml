@@ -199,7 +199,13 @@ type activity_completion =
 (** Terminal state for one mock execution. The state is monotone: once a wait
     observes completion, a later cancellation cannot rewrite that terminal
     result, which mirrors Temporal's immutable execution history. *)
-type mock_terminal = Mock_pending | Mock_completed | Mock_cancelled | Mock_terminated
+type mock_terminal =
+  | Mock_pending
+  | Mock_completed
+  | Mock_cancelled
+  | Mock_terminated
+  | Mock_failed of { error : Error.t; successor : successor option }
+  | Mock_timed_out of { error : Error.t; successor : successor option }
 
 (** A mock signal delivery records the request identity and payload. Retaining
     this small value lets the deterministic transport model Temporal's
@@ -868,13 +874,46 @@ let mock_client_wait (client : mock_client) (request : wait_request) =
                 Ok
                   (Terminated
                      (Error.make ~non_retryable:true ~category:`Terminated
-                        ~message:"workflow execution was terminated" ()))))
+                        ~message:"workflow execution was terminated" ()))
+            | Mock_failed { error; successor } ->
+                Ok (Failed { error; successor })
+            | Mock_timed_out { error; successor } ->
+                Ok (Timed_out { error; successor })))
 
 (** Waits for a terminal result on the selected private transport. *)
 let client_wait client (request : wait_request) =
   match client with
   | Mock_client client -> mock_client_wait client request
   | Native_client client -> native_client_wait client request
+
+(** Scripts one exact mock close event for the public wait/follow regression.
+    This private test seam cannot alter a native client or allocate a run. *)
+let mock_set_wait_outcome_for_test client (request : wait_request) outcome =
+  match client with
+  | Native_client _ -> Error (defect "mock wait outcomes require a mock client")
+  | Mock_client client ->
+      let service = client.service in
+      Mutex.lock service.mutex;
+      Fun.protect
+        ~finally:(fun () -> Mutex.unlock service.mutex)
+        (fun () ->
+          if client.closed then Error (bridge_error "client is shut down")
+          else
+            match
+              Hashtbl.find_opt service.history
+                (request.workflow_id, request.run_id)
+            with
+            | None -> Error (bridge_error "workflow run id does not match the started run")
+            | Some execution -> (
+                match outcome with
+                | Failed { error; successor } ->
+                    execution.terminal <- Mock_failed { error; successor };
+                    Ok ()
+                | Timed_out { error; successor } ->
+                    execution.terminal <- Mock_timed_out { error; successor };
+                    Ok ()
+                | Completed _ | Cancelled _ | Terminated _ | Continued_as_new _ ->
+                    Error (defect "mock wait outcome must be failed or timed out")))
 
 (** Converts one public cancellation request to the closed native protocol
     representation. The namespace is supplied by the connected client rather
@@ -1052,7 +1091,9 @@ let mock_client_cancel (client : mock_client) (request : cancel_request) =
         | Some execution ->
             (match execution.terminal with
             | Mock_pending -> execution.terminal <- Mock_cancelled
-            | Mock_completed | Mock_cancelled | Mock_terminated -> ());
+            | Mock_completed | Mock_cancelled | Mock_terminated
+            | Mock_failed _ | Mock_timed_out _ ->
+                ());
             Ok ())
 
 (** Requests cancellation on the selected private transport. *)
@@ -1159,7 +1200,9 @@ let mock_client_terminate (client : mock_client) (request : terminate_request) =
         | Some execution ->
             (match execution.terminal with
             | Mock_pending -> execution.terminal <- Mock_terminated
-            | Mock_completed | Mock_cancelled | Mock_terminated -> ());
+            | Mock_completed | Mock_cancelled | Mock_terminated
+            | Mock_failed _ | Mock_timed_out _ ->
+                ());
             Ok ())
 
 (** Requests immediate termination on the selected private transport. *)
@@ -1350,6 +1393,8 @@ let mock_client_list_visibility (client : mock_client)
                        | Mock_completed -> "completed"
                        | Mock_cancelled -> "canceled"
                        | Mock_terminated -> "terminated"
+                       | Mock_failed _ -> "failed"
+                       | Mock_timed_out _ -> "timed_out"
                      in
                      ({
                         workflow_id;
