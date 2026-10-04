@@ -25,8 +25,18 @@ type timeout_type = Workflow.timeout_type =
   | Timeout_schedule_to_close
   | Timeout_heartbeat
 
+type application_failure_category = Workflow.application_failure_category =
+  | Application_category_unspecified
+  | Application_category_benign
+
 type failure_info = Workflow.failure_info =
-  | Application of { type_name : string; non_retryable : bool; details : payload list }
+  | Application of {
+      type_name : string;
+      non_retryable : bool;
+      details : payload list;
+      category : application_failure_category;
+      next_retry_delay : duration option;
+    }
   | Canceled of { details : payload list; identity : string }
   | Terminated of { identity : string }
   | Activity of {

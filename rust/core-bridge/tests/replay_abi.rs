@@ -152,12 +152,15 @@ fn finalize_after_natural_shutdown(runtime: *mut Runtime) {
 /// remains blocked by Core's completion debt.
 fn complete_follow_up_eviction(runtime: *mut Runtime) {
     let activation = poll_replay_activation(runtime);
-    let semantic: serde_json::Value =
-        serde_json::from_slice(&activation).expect("eviction activation should be JSON");
-    let run_id = semantic
-        .get("run_id")
-        .and_then(serde_json::Value::as_str)
-        .expect("eviction activation should retain its run ID");
+    let semantic = ocaml_temporal_core_bridge::workflow_protocol::decode_activation(
+        std::str::from_utf8(&activation).expect("eviction activation should be UTF-8"),
+    )
+    .expect("eviction activation should decode");
+    assert!(semantic.jobs.iter().any(|job| matches!(
+        job,
+        ocaml_temporal_core_bridge::workflow_protocol::ActivationJob::RemoveFromCache { .. }
+    )));
+    let run_id = semantic.run_id;
     let completion = serde_json::json!({"run_id": run_id, "commands": []}).to_string();
     let mut result = empty_result();
     assert_eq!(
@@ -522,9 +525,16 @@ fn replay_abi_disposes_a_leased_activation_without_core_failure() {
 
 #[test]
 /// A replay rejection must retain its lease when the semantic activation is
-/// changed, but accept equivalent JSON with different formatting. This tests
-/// the ownership boundary without claiming that JSON bytes are identity.
+/// changed, but accept equivalent JSON with different formatting. After Core
+/// retires the rejected task, a distinct queued workflow must still complete.
+/// This tests the ownership boundary without claiming that JSON bytes are
+/// identity.
 fn replay_abi_rejects_only_semantically_matching_lease() {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use ocaml_temporal_core_bridge::workflow_protocol::{self, ActivationJob, CompletionCommand};
+    use prost::Message;
+    use temporalio_protos::temporal::api::history::v1::{History, history_event::Attributes};
+
     let mut runtime = new_replay_runtime();
     let mut result = empty_result();
     let document = replay_fixture::open_workflow_task_document("workflow-replay-test");
@@ -546,6 +556,47 @@ fn replay_abi_rejects_only_semantically_matching_lease() {
         serde_json::from_slice(&activation).expect("replay poll should return JSON");
     let pretty = serde_json::to_string_pretty(&semantic).expect("activation should pretty-print");
     assert_ne!(pretty.as_bytes(), activation.as_slice());
+
+    // Queue an unrelated terminal history while the first activation is
+    // leased. Its distinct run ID prevents Core from treating the next
+    // history as another task for the rejected execution.
+    let second_workflow_id = "workflow-after-rejection";
+    let second_run_id = "run-after-rejection";
+    let second: serde_json::Value = serde_json::from_str(
+        &replay_fixture::complete_history_document(second_workflow_id),
+    )
+    .unwrap();
+    let mut history = History::decode(
+        STANDARD
+            .decode(second["history"]["data"].as_str().unwrap())
+            .unwrap()
+            .as_slice(),
+    )
+    .unwrap();
+    let Some(Attributes::WorkflowExecutionStartedEventAttributes(started)) =
+        history.events[0].attributes.as_mut()
+    else {
+        panic!("replay fixture must begin with a workflow start event");
+    };
+    started.original_execution_run_id = second_run_id.to_owned();
+    started.first_execution_run_id = second_run_id.to_owned();
+    let second_document = serde_json::json!({
+        "workflow_id": second_workflow_id,
+        "history": {"encoding": "base64", "data": STANDARD.encode(history.encode_to_vec())},
+    })
+    .to_string();
+    assert_eq!(
+        unsafe {
+            ocaml_temporal_core_v2_replay_worker_feed_history_json(
+                runtime,
+                second_document.as_ptr(),
+                second_document.len(),
+                &mut result,
+            )
+        },
+        STATUS_OK
+    );
+    assert_status(&mut result, STATUS_OK);
 
     let mut mismatched = semantic.clone();
     mismatched
@@ -583,6 +634,38 @@ fn replay_abi_rejects_only_semantically_matching_lease() {
     );
     assert_status(&mut result, STATUS_OK);
     complete_follow_up_eviction(runtime);
+
+    let second_activation = poll_replay_activation(runtime);
+    let second = workflow_protocol::decode_activation(
+        std::str::from_utf8(&second_activation).expect("replay activation should be UTF-8"),
+    )
+    .expect("unrelated workflow activation should decode");
+    assert_eq!(second.run_id, second_run_id);
+    assert!(second.jobs.iter().any(|job| matches!(
+        job,
+        ActivationJob::InitializeWorkflow { workflow_id, .. }
+            if workflow_id == second_workflow_id
+    )));
+    let completion = workflow_protocol::encode_completion(&workflow_protocol::Completion {
+        run_id: second.run_id,
+        commands: vec![CompletionCommand::CompleteWorkflow { result: None }],
+        task_failure: None,
+    })
+    .expect("unrelated workflow completion should encode");
+    assert_eq!(
+        unsafe {
+            ocaml_temporal_core_v2_replay_worker_complete_workflow_json(
+                runtime,
+                completion.as_ptr(),
+                completion.len(),
+                &mut result,
+            )
+        },
+        STATUS_OK
+    );
+    assert_status(&mut result, STATUS_OK);
+    complete_follow_up_eviction(runtime);
+
     assert_eq!(
         unsafe { ocaml_temporal_core_v2_replay_worker_finish_input(runtime, &mut result) },
         STATUS_OK
@@ -737,6 +820,8 @@ fn replay_live_workflow_task_failure_histories() {
                                         type_name: "workflow".into(),
                                         non_retryable: name == "business-permanent",
                                         details: vec![],
+                                        category: workflow_protocol::ApplicationFailureCategory::Unspecified,
+                                        next_retry_delay: None,
                                     },
                                 },
                             });

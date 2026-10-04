@@ -785,6 +785,8 @@ let protocol_failure path (error : Temporal_base.Error.t) =
             type_name = Temporal_base.Error.kind error;
             non_retryable = view.non_retryable;
             details;
+            category = Protocol.Application_category_unspecified;
+            next_retry_delay = None;
           }
   in
   Ok

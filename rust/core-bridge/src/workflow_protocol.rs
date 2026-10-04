@@ -348,6 +348,23 @@ pub enum TimeoutType {
     Heartbeat,
 }
 
+/// Severity reported by Core for an application failure. This is distinct
+/// from the public OCaml error category, which identifies the failing operation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApplicationFailureCategory {
+    /// Core supplied no severity classification.
+    #[default]
+    Unspecified,
+    /// The application expects this failure and does not treat it as severe.
+    Benign,
+}
+
+/// Omits the default category from existing private protocol documents.
+fn is_unspecified_application_category(value: &ApplicationFailureCategory) -> bool {
+    *value == ApplicationFailureCategory::Unspecified
+}
+
 /// Supported closed subset of Temporal failure information.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -357,6 +374,10 @@ pub enum FailureInfo {
         type_name: String,
         non_retryable: bool,
         details: Vec<Payload>,
+        #[serde(default, skip_serializing_if = "is_unspecified_application_category")]
+        category: ApplicationFailureCategory,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        next_retry_delay: Option<Duration>,
     },
     Canceled {
         details: Vec<Payload>,
@@ -1097,10 +1118,21 @@ pub(crate) fn validate_failure(value: &Failure, path: &str) -> Result<(), Protoc
     bounded_text(&value.stack_trace, path)?;
     match &value.info {
         FailureInfo::Application {
-            type_name, details, ..
+            type_name,
+            details,
+            next_retry_delay,
+            ..
         } => {
             bounded_text(type_name, path)?;
             validate_failure_payloads(details, &format!("{path}.details"))?;
+            if let Some(delay) = next_retry_delay {
+                validate_time(
+                    delay.seconds,
+                    delay.nanoseconds,
+                    true,
+                    &format!("{path}.next_retry_delay"),
+                )?;
+            }
         }
         FailureInfo::Canceled { identity, details } => {
             bounded_text(identity, path)?;
@@ -2175,6 +2207,28 @@ fn timeout_type_to_core(value: TimeoutType) -> i32 {
     }) as i32
 }
 
+/// Maps only the categories supported by the pinned Core protobuf schema.
+fn application_category_from_core(
+    value: i32,
+) -> Result<ApplicationFailureCategory, CoreConversionError> {
+    use api_enums::ApplicationErrorCategory as Core;
+    match Core::try_from(value)
+        .map_err(|_| invalid_core("unknown Core application failure category"))?
+    {
+        Core::Unspecified => Ok(ApplicationFailureCategory::Unspecified),
+        Core::Benign => Ok(ApplicationFailureCategory::Benign),
+    }
+}
+
+/// Converts one represented application category to its exact Core number.
+fn application_category_to_core(value: ApplicationFailureCategory) -> i32 {
+    use api_enums::ApplicationErrorCategory as Core;
+    (match value {
+        ApplicationFailureCategory::Unspecified => Core::Unspecified,
+        ApplicationFailureCategory::Benign => Core::Benign,
+    }) as i32
+}
+
 /// Converts the supported recursive official failure subset.
 pub(crate) fn failure_from_core(
     value: &api_failure::Failure,
@@ -2185,16 +2239,17 @@ pub(crate) fn failure_from_core(
         .as_ref()
         .ok_or_else(|| invalid_core("Core failure info is absent"))?
     {
-        Core::ApplicationFailureInfo(info) => {
-            if info.next_retry_delay.is_some() || info.category != 0 {
-                return Err(unsupported("application failure options are not supported"));
-            }
-            FailureInfo::Application {
-                type_name: info.r#type.clone(),
-                non_retryable: info.non_retryable,
-                details: payloads_from_core(info.details.as_ref())?,
-            }
-        }
+        Core::ApplicationFailureInfo(info) => FailureInfo::Application {
+            type_name: info.r#type.clone(),
+            non_retryable: info.non_retryable,
+            details: payloads_from_core(info.details.as_ref())?,
+            category: application_category_from_core(info.category)?,
+            next_retry_delay: info
+                .next_retry_delay
+                .as_ref()
+                .map(duration_from_core)
+                .transpose()?,
+        },
         Core::CanceledFailureInfo(info) => FailureInfo::Canceled {
             details: payloads_from_core(info.details.as_ref())?,
             identity: info.identity.clone(),
@@ -2269,12 +2324,14 @@ pub(crate) fn failure_to_core(
             type_name,
             non_retryable,
             details,
+            category,
+            next_retry_delay,
         } => Core::ApplicationFailureInfo(api_failure::ApplicationFailureInfo {
             r#type: type_name.clone(),
             non_retryable: *non_retryable,
             details: Some(payloads_to_core(details)?),
-            next_retry_delay: None,
-            category: 0,
+            next_retry_delay: next_retry_delay.map(duration_to_core),
+            category: application_category_to_core(*category),
         }),
         FailureInfo::Canceled { details, identity } => {
             Core::CanceledFailureInfo(api_failure::CanceledFailureInfo {

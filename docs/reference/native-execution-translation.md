@@ -69,11 +69,11 @@ flag does not close the execution or prevent a workflow-task retry.
 | `Initialize_workflow` | `Start_workflow` | Workflow ID, type, arguments, randomness seed, attempt, and initialization context are retained in `translated_activation.initialization`. |
 | `Resolve_activity` with `Completed None` | `Resolve_activity` with the canonical null payload | The absence of a result remains distinguishable from an ordinary payload. |
 | `Resolve_activity` with `Completed (Some payload)` | `Resolve_activity` with a copied runtime payload | Metadata and body bytes are copied before workflow code can observe them. |
-| `Resolve_activity` with `Failed` or `Cancelled` | `Resolve_activity` with a typed `Temporal_base.Error.t` | Application/cancellation category, retryability, details, and a bounded diagnostic of structured failure information are retained. Timeout failures retain the exact timeout policy and last heartbeat payloads. |
+| `Resolve_activity` with `Failed` or `Cancelled` | `Resolve_activity` with a typed `Temporal_base.Error.t` | Application/cancellation category, retryability, details, and a bounded diagnostic of structured failure information are retained. Application failure severity and exact next retry delay appear in that diagnostic, including through a cause chain. Timeout failures retain the exact timeout policy and last heartbeat payloads. |
 | `Resolve_child_workflow_start` with `Succeeded` | `Resolve_child_workflow_start` with `Ok run_id` | The translation preserves the run ID; `Workflow_context_store` records it and deliberately does not resolve the child's future yet. |
 | `Resolve_child_workflow_start` with `Failed` or `Cancelled` | `Resolve_child_workflow_start` with `Error` | The translation produces a typed child-workflow or cancellation error; `Workflow_context_store` removes the pending child so a rejected start cannot remain suspended forever. |
 | `Resolve_child_workflow` with `Completed` | `Resolve_child_workflow` with `Ok payload` | The translation preserves the terminal payload (including canonical null); `Workflow_context_store` resolves the child only after a successful start acknowledgment. |
-| `Resolve_child_workflow` with `Failed` or `Cancelled` | `Resolve_child_workflow` with `Error` | Child failure identity, retry state, details, cancellation category, and the bounded recursive diagnostic are retained. |
+| `Resolve_child_workflow` with `Failed` or `Cancelled` | `Resolve_child_workflow` with `Error` | Child failure identity, retry state, details, cancellation category, and the bounded recursive diagnostic are retained, including nested application severity and next retry delay. |
 | `Notify_has_patch` | `Notify_has_patch` | The validated patch ID is copied into execution-local patch state before workflow fibers run. Query-only activations cannot contain this or any other non-query job. |
 | `Update_random_seed` | `Update_random_seed` | The full canonical uint64 seed is retained as decimal text. The ordered job pass replaces the execution's random stream before resumed fibers run. |
 | `Fire_timer` | `Fire_timer` | The exact sequence is retained. |
@@ -122,6 +122,14 @@ terminal result received before its start acknowledgment is a bridge defect.
 This two-stage lifecycle mirrors Core's event order and prevents a started
 child from being mistaken for a completed child or a failed start from being
 left suspended indefinitely.
+
+Application severity and retry delay describe the received Core failure. The
+public `Error.t` exposes them in its bounded diagnostic, not as fields used to
+construct a new failure. If workflow code catches that error and deliberately
+fails the workflow with it, the new OCaml application failure has Core's
+default severity and no next retry delay; its diagnostic still describes the
+original failure. This follows the existing behavior for other Core-only
+recursive failure fields.
 
 ### Activity command defaults and options
 

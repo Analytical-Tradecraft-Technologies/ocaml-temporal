@@ -44,6 +44,8 @@ let test_nested_timeout_is_visible () =
                  type_name = "LlmUnavailable";
                  non_retryable = false;
                  details = [ detail ];
+                 category = Protocol.Application_category_unspecified;
+                 next_retry_delay = None;
                })
       ~cause:None
   in
@@ -82,13 +84,41 @@ let test_depth_is_bounded () =
     let cause = if depth = 0 then None else Some (make (depth - 1)) in
     layer ~message:"nested" ~source:"test"
       ~info:(Protocol.Application
-               { type_name = "Nested"; non_retryable = false; details = [] })
+               { type_name = "Nested"; non_retryable = false; details = [];
+                 category = Protocol.Application_category_unspecified;
+                 next_retry_delay = None })
       ~cause
   in
   let diagnostic = Diagnostic.failure_diagnostic (make 130) in
   assert (contains diagnostic "cause_depth_limit_reached")
 
+(** Public errors keep Core-only application options in a bounded diagnostic
+    even when an activity wrapper is the visible failure layer. *)
+let test_application_options_survive_cause_diagnostic () =
+  let application =
+    layer ~message:"expected rejection" ~source:"activity-worker"
+      ~info:(Protocol.Application
+        { type_name = "ExpectedError"; non_retryable = false; details = [];
+          category = Protocol.Application_category_benign;
+          next_retry_delay = Some { seconds = 3L; nanoseconds = 7 } })
+      ~cause:None
+  in
+  let outer =
+    layer ~message:"activity failed" ~source:"server"
+      ~info:(Protocol.Activity
+        { scheduled_event_id = 1L; started_event_id = 2L;
+          identity = "worker"; activity_type = "lookup";
+          activity_id = "lookup-1";
+          retry_state = Protocol.Maximum_attempts_reached })
+      ~cause:(Some application)
+  in
+  let diagnostic = Diagnostic.failure_diagnostic outer in
+  assert (contains diagnostic "category=benign");
+  assert (contains diagnostic "next_retry_delay=3.000000007s");
+  assert (contains diagnostic "activity id=lookup-1")
+
 (** Runs the pure diagnostic regression cases. *)
 let () =
   test_nested_timeout_is_visible ();
-  test_depth_is_bounded ()
+  test_depth_is_bounded ();
+  test_application_options_survive_cause_diagnostic ()

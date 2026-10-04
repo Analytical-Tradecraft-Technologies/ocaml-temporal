@@ -1630,6 +1630,8 @@ fn converts_query_results_and_matches_activation_ids() {
             type_name: "QueryError".to_owned(),
             non_retryable: true,
             details: Vec::new(),
+            category: workflow_protocol::ApplicationFailureCategory::Unspecified,
+            next_retry_delay: None,
         },
     };
     let failed = workflow_protocol::Completion {
@@ -1990,6 +1992,8 @@ fn converts_update_responses_and_enforces_phases() {
                             type_name: "UpdateError".to_owned(),
                             non_retryable: true,
                             details: Vec::new(),
+                            category: workflow_protocol::ApplicationFailureCategory::Unspecified,
+                            next_retry_delay: None,
                         },
                     }),
                 },
@@ -2462,6 +2466,236 @@ fn converts_child_workflow_resolution_lifecycle() {
         },
         job => panic!("unexpected failed child job: {job:?}"),
     }
+}
+
+/// Core application options must survive the complete failure tree and the
+/// private JSON boundary for both activity and child resolutions. Default
+/// values retain the historical JSON shape; future category numbers fail the
+/// individual activation instead of being silently reclassified.
+#[test]
+fn converts_application_failure_options_in_activity_and_child_causes() {
+    use core_activation::workflow_activation_job::Variant;
+    use temporalio_protos::coresdk::{activity_result, child_workflow, workflow_activation};
+    use temporalio_protos::temporal::api::{
+        common::v1 as api_common, enums::v1 as api_enums, failure::v1 as api_failure,
+    };
+
+    let application = |category, next_retry_delay| api_failure::Failure {
+        message: "application failed".into(),
+        failure_info: Some(api_failure::failure::FailureInfo::ApplicationFailureInfo(
+            api_failure::ApplicationFailureInfo {
+                r#type: "ExpectedError".into(),
+                category,
+                next_retry_delay,
+                ..Default::default()
+            },
+        )),
+        ..Default::default()
+    };
+    let wrapped_activity = |cause| api_failure::Failure {
+        message: "activity failed".into(),
+        cause: Some(Box::new(cause)),
+        failure_info: Some(api_failure::failure::FailureInfo::ActivityFailureInfo(
+            api_failure::ActivityFailureInfo {
+                activity_type: Some(api_common::ActivityType {
+                    name: "lookup".into(),
+                }),
+                activity_id: "lookup-1".into(),
+                ..Default::default()
+            },
+        )),
+        ..Default::default()
+    };
+    let activity = |failure| workflow_activation::WorkflowActivation {
+        run_id: "activity-run".into(),
+        timestamp: Some(prost_wkt_types::Timestamp::default()),
+        jobs: vec![workflow_activation::WorkflowActivationJob {
+            variant: Some(Variant::ResolveActivity(
+                workflow_activation::ResolveActivity {
+                    seq: 1,
+                    result: Some(activity_result::ActivityResolution {
+                        status: Some(activity_result::activity_resolution::Status::Failed(
+                            activity_result::Failure {
+                                failure: Some(failure),
+                            },
+                        )),
+                    }),
+                    is_local: false,
+                },
+            )),
+        }],
+        ..Default::default()
+    };
+    for (category, delay, expected_category) in [
+        (
+            api_enums::ApplicationErrorCategory::Unspecified as i32,
+            None,
+            workflow_protocol::ApplicationFailureCategory::Unspecified,
+        ),
+        (
+            api_enums::ApplicationErrorCategory::Benign as i32,
+            None,
+            workflow_protocol::ApplicationFailureCategory::Benign,
+        ),
+        (
+            api_enums::ApplicationErrorCategory::Benign as i32,
+            Some(prost_wkt_types::Duration {
+                seconds: 3,
+                nanos: 7,
+            }),
+            workflow_protocol::ApplicationFailureCategory::Benign,
+        ),
+        (
+            api_enums::ApplicationErrorCategory::Unspecified as i32,
+            Some(prost_wkt_types::Duration::default()),
+            workflow_protocol::ApplicationFailureCategory::Unspecified,
+        ),
+    ] {
+        let activation = activity(wrapped_activity(application(category, delay.clone())));
+        let semantic = workflow_protocol::activation_from_core(&activation).unwrap();
+        let workflow_protocol::ActivationJob::ResolveActivity {
+            result: workflow_protocol::ActivityResolution::Failed { failure },
+            ..
+        } = &semantic.jobs[0]
+        else {
+            panic!("expected failed activity");
+        };
+        let cause = failure.cause.as_ref().expect("application cause retained");
+        let workflow_protocol::FailureInfo::Application {
+            category,
+            next_retry_delay,
+            ..
+        } = &cause.info
+        else {
+            panic!("expected application cause");
+        };
+        assert_eq!(*category, expected_category);
+        assert_eq!(
+            next_retry_delay.map(|value| (value.seconds, value.nanoseconds)),
+            delay.map(|value| (value.seconds, value.nanos))
+        );
+        let encoded = workflow_protocol::encode_activation(&semantic).unwrap();
+        if delay.is_none()
+            && expected_category == workflow_protocol::ApplicationFailureCategory::Unspecified
+        {
+            assert!(!encoded.contains("next_retry_delay"));
+            assert!(!encoded.contains("category"));
+        }
+        assert_eq!(
+            workflow_protocol::decode_activation(&encoded).unwrap(),
+            semantic
+        );
+    }
+
+    let child_failure = api_failure::Failure {
+        message: "child failed".into(),
+        cause: Some(Box::new(application(
+            api_enums::ApplicationErrorCategory::Benign as i32,
+            Some(prost_wkt_types::Duration {
+                seconds: 9,
+                nanos: 999_999_999,
+            }),
+        ))),
+        failure_info: Some(
+            api_failure::failure::FailureInfo::ChildWorkflowExecutionFailureInfo(
+                api_failure::ChildWorkflowExecutionFailureInfo {
+                    namespace: "default".into(),
+                    workflow_execution: Some(api_common::WorkflowExecution {
+                        workflow_id: "child".into(),
+                        run_id: "child-run".into(),
+                    }),
+                    workflow_type: Some(api_common::WorkflowType {
+                        name: "child-type".into(),
+                    }),
+                    initiated_event_id: 4,
+                    started_event_id: 5,
+                    retry_state: api_enums::RetryState::MaximumAttemptsReached as i32,
+                },
+            ),
+        ),
+        ..Default::default()
+    };
+    let child = workflow_activation::WorkflowActivation {
+        run_id: "parent-run".into(),
+        timestamp: Some(prost_wkt_types::Timestamp::default()),
+        jobs: vec![workflow_activation::WorkflowActivationJob {
+            variant: Some(Variant::ResolveChildWorkflowExecution(
+                workflow_activation::ResolveChildWorkflowExecution {
+                    seq: 2,
+                    result: Some(child_workflow::ChildWorkflowResult {
+                        status: Some(child_workflow::child_workflow_result::Status::Failed(
+                            child_workflow::Failure {
+                                failure: Some(child_failure),
+                            },
+                        )),
+                    }),
+                },
+            )),
+        }],
+        ..Default::default()
+    };
+    let semantic = workflow_protocol::activation_from_core(&child).unwrap();
+    let workflow_protocol::ActivationJob::ResolveChildWorkflow {
+        result: workflow_protocol::ChildWorkflowResolution::Failed { failure },
+        ..
+    } = &semantic.jobs[0]
+    else {
+        panic!("expected failed child");
+    };
+    let cause = failure
+        .cause
+        .as_ref()
+        .expect("child application cause retained");
+    assert!(matches!(
+        &cause.info,
+        workflow_protocol::FailureInfo::Application {
+            category: workflow_protocol::ApplicationFailureCategory::Benign,
+            next_retry_delay: Some(workflow_protocol::Duration {
+                seconds: 9,
+                nanoseconds: 999_999_999
+            }),
+            ..
+        }
+    ));
+    let encoded = workflow_protocol::encode_activation(&semantic).unwrap();
+    assert_eq!(
+        workflow_protocol::decode_activation(&encoded).unwrap(),
+        semantic
+    );
+
+    let outbound = workflow_protocol::Completion {
+        run_id: "parent-run".into(),
+        task_failure: None,
+        commands: vec![workflow_protocol::CompletionCommand::FailWorkflow {
+            failure: cause.as_ref().clone(),
+        }],
+    };
+    let core_outbound = workflow_protocol::completion_to_core(&outbound).unwrap();
+    assert_eq!(
+        workflow_protocol::completion_from_core(&core_outbound).unwrap(),
+        outbound
+    );
+
+    let unsupported = activity(wrapped_activity(application(99, None)));
+    assert_eq!(
+        workflow_protocol::activation_from_core(&unsupported)
+            .unwrap_err()
+            .code,
+        workflow_protocol::CoreConversionErrorCode::InvalidCore
+    );
+    let invalid_delay = activity(wrapped_activity(application(
+        api_enums::ApplicationErrorCategory::Benign as i32,
+        Some(prost_wkt_types::Duration {
+            seconds: -1,
+            nanos: 0,
+        }),
+    )));
+    assert_eq!(
+        workflow_protocol::activation_from_core(&invalid_delay)
+            .unwrap_err()
+            .code,
+        workflow_protocol::CoreConversionErrorCode::InvalidCore
+    );
 }
 
 /// Proves Core timeout failure metadata survives activation conversion and
@@ -3184,6 +3418,8 @@ fn nested_application_failure(cause_count: usize) -> workflow_protocol::Failure 
             type_name: String::new(),
             non_retryable: false,
             details: Vec::new(),
+            category: workflow_protocol::ApplicationFailureCategory::Unspecified,
+            next_retry_delay: None,
         }),
         |cause, _| workflow_protocol::Failure {
             cause: Some(Box::new(cause)),
@@ -3191,6 +3427,8 @@ fn nested_application_failure(cause_count: usize) -> workflow_protocol::Failure 
                 type_name: String::new(),
                 non_retryable: false,
                 details: Vec::new(),
+                category: workflow_protocol::ApplicationFailureCategory::Unspecified,
+                next_retry_delay: None,
             })
         },
     )
@@ -3224,6 +3462,8 @@ fn accepts_application_failure_type_as_bounded_text() {
                 type_name: String::new(),
                 non_retryable: false,
                 details: Vec::new(),
+                category: workflow_protocol::ApplicationFailureCategory::Unspecified,
+                next_retry_delay: None,
             }),
         }],
     };

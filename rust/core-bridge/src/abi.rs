@@ -1192,18 +1192,17 @@ impl Runtime {
         let semantic = match workflow_protocol::activation_from_core(&activation) {
             Ok(semantic) => semantic,
             Err(error) => {
-                self.reject_workflow_delivery_with_reason(&activation.run_id, error.message)?;
-                return Err(core_conversion_failure(error));
+                return self
+                    .reject_unrepresentable_workflow_delivery(&activation.run_id, error.message);
             }
         };
         let encoded = match workflow_protocol::encode_activation(&semantic) {
             Ok(encoded) => encoded,
-            Err(error) => {
-                self.reject_workflow_delivery_with_reason(
+            Err(_error) => {
+                return self.reject_unrepresentable_workflow_delivery(
                     &activation.run_id,
                     "semantic activation JSON encoding failed",
-                )?;
-                return Err(protocol_failure(error));
+                );
             }
         };
         // Retain must not leave a leased ledger entry without a handoff
@@ -1663,6 +1662,24 @@ impl Runtime {
         handle
             .block_on(worker.reject_workflow_delivery_with_reason(run_id, reason))
             .map_err(worker_bridge_failure)
+    }
+
+    /// A successfully rejected unsupported activation is local task progress,
+    /// so the public worker keeps polling its other leases. An actual Core
+    /// rejection error remains fatal through the `?` below. The static reason
+    /// is also the bounded diagnostic sent to Core; no payload is logged.
+    fn reject_unrepresentable_workflow_delivery(
+        &self,
+        run_id: &str,
+        reason: &'static str,
+    ) -> Operation {
+        self.reject_workflow_delivery_with_reason(run_id, reason)?;
+        eprintln!("ocaml-temporal: rejected workflow delivery: {reason}");
+        self.worker
+            .as_ref()
+            .expect("rejected workflow delivery retains worker")
+            .wait_workflow_delivery_rejection_backoff();
+        Err(not_ready())
     }
 
     /// Fails and retires an activity task that was never exposed to OCaml.

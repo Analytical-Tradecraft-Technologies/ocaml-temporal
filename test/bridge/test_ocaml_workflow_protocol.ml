@@ -124,7 +124,8 @@ let test_continuation_initialize_metadata () =
       cause = None;
       info =
         Application
-          { type_name = "example"; non_retryable = false; details = [] };
+          { type_name = "example"; non_retryable = false; details = [];
+            category = Application_category_unspecified; next_retry_delay = None };
     }
   in
   let continuation : Protocol.continuation =
@@ -403,7 +404,8 @@ let test_query_protocol_slice () =
                            stack_trace = "";
                            encoded_attributes = None;
                            cause = None;
-                           info = Application { type_name = "QueryFailure"; non_retryable = true; details = [] };
+                           info = Application { type_name = "QueryFailure"; non_retryable = true; details = [];
+                                                category = Application_category_unspecified; next_retry_delay = None };
                          };
             };
         ];
@@ -1032,14 +1034,16 @@ let nested_application_failure cause_count =
         {
           (failure_with_info
              (Application
-                { type_name = ""; non_retryable = false; details = [] }))
+                { type_name = ""; non_retryable = false; details = [];
+                  category = Application_category_unspecified; next_retry_delay = None }))
           with
           cause = Some cause;
         }
   in
   loop cause_count
     (failure_with_info
-       (Application { type_name = ""; non_retryable = false; details = [] }))
+       (Application { type_name = ""; non_retryable = false; details = [];
+                      category = Application_category_unspecified; next_retry_delay = None }))
 
 (** Proves recursive failures can exceed the former 16-level limit while the
     serde_json-aligned stack-safety boundary still rejects hostile depth. *)
@@ -1055,6 +1059,54 @@ let test_recursive_failure_depth () =
   ignore (unwrap (Protocol.encode_completion (completion 32)));
   require_error (Protocol.encode_completion (completion 130))
 
+(** Checks the exact retry duration and severity through the OCaml side of the
+    private JSON contract. The default case keeps existing fixture spelling. *)
+let test_application_failure_options () =
+  let completion category next_retry_delay : Protocol.completion =
+    { run_id = "options-run"; task_failure = None;
+      commands = [ Fail_workflow { failure = failure_with_info
+        (Application { type_name = "ExpectedError"; non_retryable = false;
+                       details = []; category; next_retry_delay }) } ] }
+  in
+  let default = completion Application_category_unspecified None in
+  let default_json = unwrap (Protocol.encode_completion default) in
+  if contains_substring ~needle:"next_retry_delay" default_json
+     || contains_substring ~needle:"category" default_json then
+    failwith "default application options changed canonical JSON";
+  if unwrap (Protocol.decode_completion default_json) <> default then
+    failwith "default application options did not round trip";
+  let delay : Protocol.duration = { seconds = 3L; nanoseconds = 7 } in
+  let benign_only = completion Application_category_benign None in
+  let benign_json = unwrap (Protocol.encode_completion benign_only) in
+  if not (contains_substring ~needle:{|"category":"benign"|} benign_json)
+     || contains_substring ~needle:"next_retry_delay" benign_json
+     || unwrap (Protocol.decode_completion benign_json) <> benign_only then
+    failwith "benign-only application option did not round trip";
+  let delay_only = completion Application_category_unspecified (Some delay) in
+  let delay_json = unwrap (Protocol.encode_completion delay_only) in
+  if contains_substring ~needle:"category" delay_json
+     || unwrap (Protocol.decode_completion delay_json) <> delay_only then
+    failwith "delay-only application option did not round trip";
+  let with_options = completion Application_category_benign (Some delay) in
+  let encoded = unwrap (Protocol.encode_completion with_options) in
+  if not (contains_substring ~needle:{|"category":"benign"|} encoded)
+     || not (contains_substring ~needle:{|"next_retry_delay":{"nanoseconds":7,"seconds":3}|} encoded) then
+    failwith "application options lost their exact JSON values";
+  if unwrap (Protocol.decode_completion encoded) <> with_options then
+    failwith "application options did not round trip";
+  let invalid_info field =
+    {|{"run_id":"options-run","commands":[{"kind":"fail_workflow","failure":{"message":"","source":"","stack_trace":"","encoded_attributes":null,"cause":null,"info":{"kind":"application","type":"ExpectedError","non_retryable":false,"details":[],|}
+    ^ field ^ {|}}}]}|}
+  in
+  List.iter (fun field ->
+    check_error_path "invalid application category" "$.commands[0].failure.info.category"
+      (Protocol.decode_completion (invalid_info field)))
+    [{|"category":"future"|}; {|"category":9|}];
+  List.iter (fun field ->
+    require_error (Protocol.decode_completion (invalid_info field)))
+    [{|"next_retry_delay":{"seconds":-1,"nanoseconds":0}|};
+     {|"next_retry_delay":{"seconds":3,"nanoseconds":1000000000}|}]
+
 (** Proves application types are bounded text and activity failures reject
     negative event IDs and oversized identities on outgoing validation. *)
 let test_failure_field_semantics () =
@@ -1069,7 +1121,8 @@ let test_failure_field_semantics () =
               failure =
                 failure_with_info
                   (Application
-                     { type_name = ""; non_retryable = false; details = [] });
+                     { type_name = ""; non_retryable = false; details = [];
+                       category = Application_category_unspecified; next_retry_delay = None });
             };
         ];
     }
@@ -1168,7 +1221,8 @@ let test_timeout_failure_info () =
 let test_failure_retryability_inheritance () =
   let application non_retryable =
     failure_with_info
-      (Application { type_name = "child_failure"; non_retryable; details = [] })
+      (Application { type_name = "child_failure"; non_retryable; details = [];
+                     category = Application_category_unspecified; next_retry_delay = None })
   in
   let child retry_state cause =
     {
@@ -1511,6 +1565,7 @@ let () =
   run "activation cross-field invariants" test_activation_cross_field_invariants;
   run "large activation job batch" test_large_activation_job_batch;
   run "failure field semantics" test_failure_field_semantics;
+  run "application failure options" test_application_failure_options;
   run "timeout failure info" test_timeout_failure_info;
   run "failure retryability inheritance" test_failure_retryability_inheritance;
   run "recursive failure depth" test_recursive_failure_depth;

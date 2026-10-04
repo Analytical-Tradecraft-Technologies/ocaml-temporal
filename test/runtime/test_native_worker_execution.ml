@@ -2393,6 +2393,8 @@ let child_terminal_failure : Protocol.failure =
                       data = Bytes.of_string "child-details";
                     };
                   ];
+                category = Protocol.Application_category_unspecified;
+                next_retry_delay = None;
               };
         };
     info =
