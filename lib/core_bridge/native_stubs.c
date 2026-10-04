@@ -1,4 +1,5 @@
 #include "ocaml_temporal_core.h"
+#include "response_borrow_gate.h"
 
 #include <caml/alloc.h>
 #include <caml/custom.h>
@@ -14,20 +15,14 @@
 #endif
 
 #include <stdint.h>
-#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 
 /* OCaml custom block that is the sole owner of one initialized Rust result.
- * A reader increments active_reads before checking live; explicit free closes
- * the gate and waits for admitted readers before Rust releases either buffer.
- * Copying this C structure remains forbidden. */
+ * Copying this structure remains forbidden. */
 typedef struct owned_response {
   ocaml_temporal_core_result result;
-  atomic_uint active_reads;
-  /* Atomic so explicit free and GC finalization cannot race a double free if
-   * the same response value is observed from more than one Domain. */
-  atomic_int live;
+  response_borrow_gate gate;
 } owned_response;
 
 /* Owner of the sole native runtime pointer for one SDK instance. Future
@@ -156,30 +151,18 @@ static void release_runtime(owned_runtime *owned) {
  * an admitted reader is copying. Callers must release the borrow before any
  * OCaml allocation or exception. */
 static int acquire_response(owned_response *response) {
-  atomic_fetch_add_explicit(&response->active_reads, 1, memory_order_seq_cst);
-  if (atomic_load_explicit(&response->live, memory_order_seq_cst) == 0) {
-    atomic_fetch_sub_explicit(&response->active_reads, 1,
-                              memory_order_seq_cst);
-    return 0;
-  }
-  return 1;
+  return response_borrow_gate_acquire(&response->gate);
 }
 
 /* End one result read before its owner can release Rust allocations. */
 static void release_response_read(owned_response *response) {
-  atomic_fetch_sub_explicit(&response->active_reads, 1, memory_order_seq_cst);
+  response_borrow_gate_release(&response->gate);
 }
 
 /* Release Rust allocations exactly once and poison further field access. */
 static void release_response(owned_response *response) {
-  int expected = 1;
-  if (atomic_compare_exchange_strong_explicit(
-          &response->live, &expected, 0, memory_order_seq_cst,
-          memory_order_seq_cst)) {
-    while (atomic_load_explicit(&response->active_reads,
-                                memory_order_seq_cst) != 0) {
-      runtime_thread_yield();
-    }
+  if (response_borrow_gate_close_and_wait(&response->gate,
+                                          runtime_thread_yield)) {
     (void)ocaml_temporal_core_v2_result_free(&response->result);
   }
 }
@@ -254,8 +237,7 @@ static value alloc_response(void) {
   response = caml_alloc_custom(&response_operations, sizeof(owned_response), 0, 1);
   owned = Response_val(response);
   memset(owned, 0, sizeof(*owned));
-  atomic_init(&owned->active_reads, 0);
-  atomic_init(&owned->live, 1);
+  response_borrow_gate_init(&owned->gate);
   CAMLreturn(response);
 }
 
