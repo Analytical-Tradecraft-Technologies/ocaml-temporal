@@ -5,7 +5,10 @@ set -eu
 # tag whose object ID differs from the source commit and a network failure.
 root=$(cd "${1:-.}" && pwd)
 script="$root/scripts/check-release-tag-commit.sh"
-fixture=$(mktemp -d "${TMPDIR:-/tmp}/temporal-release-ref.XXXXXX")
+# OPAM's Cygwin shell and Git for Windows interpret absolute /tmp differently.
+# Keep paths passed to both tools relative to the same working directory.
+cd "$root"
+fixture=$(mktemp -d './.temporal-release-ref.XXXXXX')
 trap 'rm -rf "$fixture"' EXIT HUP INT TERM
 git init --bare "$fixture/origin.git" >/dev/null
 git init -b master "$fixture/checkout" >/dev/null
@@ -16,7 +19,7 @@ git -C "$fixture/checkout" config tag.gpgsign false
 printf 'first\n' > "$fixture/checkout/source.txt"
 git -C "$fixture/checkout" add source.txt
 git -C "$fixture/checkout" commit -m first >/dev/null
-git -C "$fixture/checkout" remote add origin "$fixture/origin.git"
+git -C "$fixture/checkout" remote add origin ../origin.git
 git -C "$fixture/checkout" push origin HEAD:master >/dev/null
 first=$(git -C "$fixture/checkout" rev-parse HEAD)
 
@@ -52,7 +55,7 @@ if (cd "$fixture/checkout" && sh "$script" v1.0.0-light "$first" >/dev/null 2>&1
 fi
 
 # A cached local tag cannot substitute for a reachable remote.
-git -C "$fixture/checkout" remote set-url origin "$fixture/unreachable.git"
+git -C "$fixture/checkout" remote set-url origin ../unreachable.git
 if (cd "$fixture/checkout" && sh "$script" v1.0.0-light "$first" >/dev/null 2>&1); then
   echo 'release accepted an unreachable remote tag' >&2
   exit 1
