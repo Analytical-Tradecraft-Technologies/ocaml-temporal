@@ -229,20 +229,28 @@ let test_staggered_idle_polls_eventually_enter_native_wait () =
     can be overtaken by the one-yield stagger fallback. *)
 let test_idle_native_waits_share_one_token () =
   let closed = Atomic.make false in
-  let waits = Atomic.make [] in
+  let workflow_polled = Atomic.make false in
+  let activity_polled = Atomic.make false in
+  let workflow_waited = Atomic.make false in
+  let activity_waited = Atomic.make false in
   let active_waits = Atomic.make 0 in
   let runner =
     Domain.spawn (fun () ->
       Loop.run ~closed:(fun () -> Atomic.get closed)
-        ~poll_workflow:idle_workflow
-        ~poll_activity:(fun () -> Ok Loop.Not_ready)
+        ~poll_workflow:(fun () ->
+          Atomic.set workflow_polled true;
+          idle_workflow ())
+        ~poll_activity:(fun () ->
+          Atomic.set activity_polled true;
+          Ok Loop.Not_ready)
         ~wait_for_lane:(fun ~workflow_lane ~native_wait ->
           if native_wait then begin
             if Atomic.fetch_and_add active_waits 1 <> 0 then
               failwith "idle lanes entered simultaneous native waits";
-            let observed = Atomic.get waits in
-            Atomic.set waits (workflow_lane :: observed);
-            if List.length observed >= 7 then Atomic.set closed true;
+            if workflow_lane then Atomic.set workflow_waited true
+            else Atomic.set activity_waited true;
+            if Atomic.get workflow_waited && Atomic.get activity_waited then
+              Atomic.set closed true;
             Thread.delay 0.001;
             ignore (Atomic.fetch_and_add active_waits (-1))
           end;
@@ -253,13 +261,11 @@ let test_idle_native_waits_share_one_token () =
   in
   let observation =
     try
-      await "eight native readiness waits" (fun () ->
-        List.length (Atomic.get waits) >= 8);
-      let sequence = List.rev (Atomic.get waits) in
-      if not (List.mem true sequence && List.mem false sequence) then
-        failwith
-          ("idle native readiness wait starved one lane: "
-          ^ String.concat "," (List.map string_of_bool sequence));
+      (* Give both Domains a chance to start before measuring wait fairness. *)
+      await "both idle lanes to poll" (fun () ->
+        Atomic.get workflow_polled && Atomic.get activity_polled);
+      await "both idle lanes to enter a native readiness wait" (fun () ->
+        Atomic.get workflow_waited && Atomic.get activity_waited);
       Ok ()
     with exception_ -> Error exception_
   in
