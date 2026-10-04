@@ -61,6 +61,9 @@ DUNE_BUILD_ARGS := $(if $(strip $(DUNE_JOBS)),-j $(DUNE_JOBS),)
 # changing the test set or the production build profile.
 CARGO_BUILD_JOBS ?= 1
 CARGO_TEST_ENV := CARGO_BUILD_JOBS=$(CARGO_BUILD_JOBS) CARGO_INCREMENTAL=0
+STRUCTURED_FUZZ_CASES ?= 128
+STRUCTURED_FUZZ_SEED ?= 0x521506a1
+STRUCTURED_FUZZ_TARGET ?= fuzz_
 # CI supplies a verified, immutable bridge bundle. Each OCaml consumer still
 # builds its C stubs and runs its own tests; Rust-only checks belong to the
 # producer. Explicit test-rust/lint-rust targets always remain available.
@@ -135,6 +138,16 @@ test:
 test-rust:
 	$(COMPOSE_RUN) sh test/smoke/test_rust_toolchain.sh
 	$(COMPOSE_RUN) env $(CARGO_TEST_ENV) cargo test --manifest-path $(CARGO_MANIFEST) --locked
+
+# The ordinary Rust suite already includes this bounded smoke. This named
+# target lets contributors increase its deterministic case budget, reuse the
+# exact committed corpus, or replay a retained input without changing code.
+.PHONY: test-parser-fuzz native-test-parser-fuzz
+test-parser-fuzz:
+	$(COMPOSE_RUN) env $(CARGO_TEST_ENV) STRUCTURED_FUZZ_CASES="$(STRUCTURED_FUZZ_CASES)" STRUCTURED_FUZZ_SEED="$(STRUCTURED_FUZZ_SEED)" STRUCTURED_FUZZ_REPLAY="$(STRUCTURED_FUZZ_REPLAY)" cargo test --manifest-path $(CARGO_MANIFEST) --locked --test structured_parser_fuzz "$(STRUCTURED_FUZZ_TARGET)" -- --nocapture
+
+native-test-parser-fuzz:
+	$(NATIVE_ENV) $(CARGO_TEST_ENV) STRUCTURED_FUZZ_CASES="$(STRUCTURED_FUZZ_CASES)" STRUCTURED_FUZZ_SEED="$(STRUCTURED_FUZZ_SEED)" STRUCTURED_FUZZ_REPLAY="$(STRUCTURED_FUZZ_REPLAY)" cargo test --manifest-path $(CARGO_MANIFEST) --locked --test structured_parser_fuzz "$(STRUCTURED_FUZZ_TARGET)" -- --nocapture
 
 test-bridge:
 	$(COMPOSE_RUN) sh test/bridge/test_abi.sh

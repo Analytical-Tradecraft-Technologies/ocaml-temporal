@@ -83,6 +83,14 @@ runs:
         else
           make native-rust-bridge
         fi
+    - name: Retain parser fuzz input after a Rust failure
+      if: failure()
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      with:
+        name: structured-parser-fuzz-${{ inputs.platform }}-${{ github.run_id }}-${{ github.run_attempt }}
+        path: _build/structured-fuzz/
+        if-no-files-found: ignore
+        retention-days: 14
     - name: Validate the complete bundle
       shell: ${{ inputs.shell }}
       env:

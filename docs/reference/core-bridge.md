@@ -56,6 +56,11 @@ accepted only at their documented default; a non-default value returns a typed
 [protocol reference](core-protocol.md), machine-readable schemas, and
 [ADR 0006](../decisions/0006-first-workflow-semantic-protocol.md).
 
+The [structured parser fuzz smoke](bridge-parser-fuzz.md) mutates committed
+valid and rejected fixtures against the independently callable Rust envelope,
+payload, activation, and completion decoders. Its limits and instrumentation
+scope are stated separately from the fixed-fixture and C ABI sanitizer tests.
+
 There is one normal-start compatibility default in the initializer: Temporal
 Core maps the server's `first_workflow_task_backoff` to
 `cron_schedule_to_schedule_interval`, and Temporal Server sends an explicit
