@@ -39,21 +39,26 @@ means no MVP capability claim, even if private machinery or partial APIs exist.
 | Capability | Decision and application boundary | Evidence or qualification |
 | --- | --- | --- |
 | Workflow authoring | **Core candidate:** typed direct-style workflows, deterministic futures/conditions/time, durable timers, child workflows, and continue-as-new. Workflow code must yield and avoid nondeterministic I/O. | [Runtime tests](../../test/runtime/) and named [live scenarios](live-acceptance-coverage.md). Non-yielding code can block its process; process supervision remains necessary ([#493]). |
-| Remote activities | **Core candidate:** typed remote callbacks, retry/timeout policy, heartbeats, and result/failure handling. Activity delivery may repeat; callers must make external side effects idempotent. | [Native activity contract](native-activity-execution.md) and [live scenarios](live-acceptance-coverage.md). Callbacks currently execute serially and can delay polling ([#492]); shutdown may wait for a running callback ([#495]). No concurrent callback or hard shutdown deadline is promised. |
+| Remote activities | **Core candidate for bounded callbacks:** typed remote callbacks, retry/timeout policy, heartbeats, and result/failure handling. Application code must put finite deadlines on callback I/O and return within an application-defined budget. Activity delivery may repeat; callers must make external side effects idempotent. | [Native activity contract](native-activity-execution.md) and [live scenarios](live-acceptance-coverage.md). Callbacks currently execute serially under the polling lock: a blocked callback can indefinitely stop unrelated workflow progress ([#492]). Temporal activity timeouts do not interrupt the OCaml callback. |
 | Client control | **Core candidate:** start, exact-run wait/follow, typed signals, and exact-run cancellation requests with typed outcomes. A request acknowledgement does not prove handler execution or terminal completion; a transport timeout can leave an outcome uncertain. | [Client interface](../../lib/public/client.mli), [client tests](../../test/unit/test_client_worker.ml), and [live driver](../../test/integration/temporal/driver/smoke_driver.ml). Workflow-level cooperative cancellation/cleanup is excluded ([#514]). |
-| Worker and recovery | **Core candidate:** application-owned worker, same-version restart/replay, and selected crash/cache-eviction recovery for the tested workload. | [Worker interface](../../lib/public/worker.mli) and the [live controller matrix](live-acceptance-coverage.md). A passed fixture is not arbitrary failure recovery; cache and shutdown limits remain tracked in [#501] and [#495]. |
+| Worker and recovery | **Core candidate for supervised processes:** application-owned worker, same-version restart/replay, and selected crash recovery for the tested workload. The application operator must enforce a process-level deadline and force termination/replacement if callback execution or graceful shutdown stalls; outstanding work then depends on Temporal redelivery. | [Worker interface](../../lib/public/worker.mli) and the [live controller matrix](live-acceptance-coverage.md). The SDK has no end-to-end shutdown bound when a callback holds the run mutex ([#495]). Intermittent cache-eviction stalls at the same source SHA remain unqualified until root cause and repeated live runs satisfy [#501]; a single green controller is insufficient. |
 | Payloads and errors | **Core candidate:** built-in typed codecs, typed results/errors, and preservation of supported failure details. Application codecs own their schema and migration policy. | [Codec tests](../../test/unit/test_codec.ml), [error tests](../../test/unit/test_error.ml), installed-consumer tests, and selected live payload paths. Cross-SDK codec interoperability is not generally qualified. |
 | Queries and updates | **Experimental:** output/typed-input queries and immediate/suspended updates. | Existing [interaction tests](../../test/unit/test_interactions.ml) and named live cases do not prove read-only enforcement, validator safety, replay/eviction recovery, or all deadline cases ([#513], [#505]). |
 | Local and asynchronous activities | **Experimental:** local activity start/execution, retained asynchronous completion, and task-token completion/heartbeat. | Focused and limited live cases exist; retry/replay and lease ownership remain under investigation ([#691], [#692]). Do not depend on a process-local completion handle surviving replacement. |
-| Advanced client options | **Experimental:** memo/search attributes, workflow execution/run/task timeouts, ID reuse/conflict policies, per-call deadlines, reset, visibility, and termination. | Presence in public signatures does not establish end-to-end semantics. [#499] and [#512] track option and start-metadata alignment. |
+| Additional exported client operations | **Experimental:** start memo/search attributes, exact-run reset and termination, and bounded visibility listing. | These appear in the [public client interface](../../lib/public/client.mli), but presence does not establish complete end-to-end semantics. [#512] tracks start-metadata alignment. |
+| Unavailable client options | **Deferred:** public workflow execution/run/task timeout options, workflow ID reuse/conflict policies, per-call deadlines, cron schedules, and delayed starts. | These are not exposed by `Client.start` or the public client operations. [#499] tracks policies and deadlines; applications must not infer support from server-side metadata or private protocol fields. |
 | Worker upgrades and replay tools | **Deferred:** cross-version workflow-history compatibility, deployment/build-ID routing, an application-facing offline replay runner, and an automated upgrade/rollback path. Patching APIs may be evaluated experimentally. | The [patching reference](workflow-patching.md) and private [replay bridge](replay-bridge.md) do not create a cross-version or public replay promise ([#497], [#503], [#508]). |
 | Wider Temporal surface | **Deferred:** schedules, Nexus, interceptors, broad observability/load commitments, and other upstream SDK parity work. | [Feature coverage](feature-coverage.md) is the inventory; adding support requires a separate decision and qualification. |
 
 Known defects that affect a core row must be fixed and retested before that
 row is claimed on a candidate. A documented limit can narrow the workload;
 it cannot turn a failing core test into a pass. The release notes must name
-all residual limits, especially serialized callbacks, non-yielding workflows,
-shutdown behavior, repeat activity delivery, and cancellation semantics.
+all residual limits, especially callbacks with application-owned deadlines,
+external process supervision, non-yielding workflows, shutdown behavior,
+repeat activity delivery, and cancellation semantics. Without bounded callback
+I/O and a supervisor willing to force-terminate a stuck process, the core
+worker liveness and shutdown paths are outside this candidate. [#492] and
+[#495] must be fixed and qualified before widening that boundary.
 Signals admitted before workflow completion need an application-defined drain
 pattern; the SDK does not automatically wait for every handler. See the
 [interaction reference](interactive-workflows.md).
@@ -102,11 +107,16 @@ For the **exact candidate commit**, retain:
    restart, crash recovery, cache eviction, parent/child replay, child failure
    after replay, and patching controllers. Retain run URL, logs, exact run IDs,
    histories, and residual limitations. Contract-only tests are not live
-   evidence. [#505] tracks broader conformance rather than silently making
-   it a prerequisite for every excluded capability.
-3. An explicit review of unresolved core-path defects and the release notes'
-   workload limits. Release approval cannot rely on a test from an older
-   commit or on the presence of a fixture that did not finish successfully.
+   evidence. Because [#501] records repeated same-SHA cache-eviction stalls,
+   resolve its root cause and complete its predeclared repeated-live-run plan
+   before claiming worker recovery for the candidate. One green run does not
+   satisfy that gate. [#505] tracks broader conformance rather than silently
+   making it a prerequisite for every excluded capability.
+3. An explicit review of unresolved core-path defects and release notes that
+   require bounded callback I/O and an external supervisor with a forced-exit
+   deadline. A process kill is not graceful shutdown; document how Temporal
+   retries outstanding tasks. Release approval cannot rely on a test from an
+   older commit or on the presence of a fixture that did not finish.
 4. A successful publish and retrieval of the immutable tag, source and binary
    assets, manifest, checksums, and Cargo SBOM for the tested commit. The
    current [release workflow](release-preflight.md#publish-a-prerelease)
