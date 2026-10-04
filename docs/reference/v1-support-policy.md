@@ -44,7 +44,7 @@ means no MVP capability claim, even if private machinery or partial APIs exist.
 | Worker and recovery | **Core candidate for supervised processes:** application-owned worker, same-version restart/replay, and selected crash recovery for the tested workload. The application operator must enforce a process-level deadline and force termination/replacement if callback execution or graceful shutdown stalls; outstanding work then depends on Temporal redelivery. | [Worker interface](../../lib/public/worker.mli) and the [live controller matrix](live-acceptance-coverage.md). The SDK has no end-to-end shutdown bound when a callback holds the run mutex ([#495]). [#501] closed after [PR #555] fixed a polling-capacity mismatch and repeated live checks passed. The sole cause of the earlier 900-second timeout remains unproven; cache eviction must pass again on the exact candidate. |
 | Payloads and errors | **Core candidate:** built-in typed codecs, typed results/errors, and preservation of supported failure details. Application codecs own their schema and migration policy. | [Codec tests](../../test/unit/test_codec.ml), [error tests](../../test/unit/test_error.ml), installed-consumer tests, and selected live payload paths. Cross-SDK codec interoperability is not generally qualified. |
 | Queries and updates | **Experimental:** output/typed-input queries and immediate/suspended updates. | Existing [interaction tests](../../test/unit/test_interactions.ml) and named live cases do not prove read-only enforcement, validator safety, replay/eviction recovery, or all deadline cases ([#513], [#505]). |
-| Local and asynchronous activities | **Experimental:** local activity start/execution, retained asynchronous completion, and task-token completion/heartbeat. | Focused and limited live cases exist; retry/replay and lease ownership remain under investigation ([#691], [#692]). Do not depend on a process-local completion handle surviving replacement. |
+| Local and asynchronous activities | **Experimental:** local activity start/execution and retained asynchronous completion with task-token completion/heartbeat for remote activities. Deferred completion is unavailable for local activities: a local callback returning `Will_complete_async` fails that attempt. | Focused and limited live cases exist. [#691] closed after [PR #749] made the unsupported local/deferred combination an ordinary activity failure. [#692] still tracks uncertain heartbeat failures and lease ownership; retry/replay combinations remain unqualified. Do not depend on a process-local completion handle surviving replacement. |
 | Additional exported client operations | **Experimental:** start memo/search attributes, exact-run reset and termination, and bounded visibility listing. | These appear in the [public client interface](../../lib/public/client.mli), but presence does not establish complete end-to-end semantics. [#512] tracks start-metadata alignment. |
 | Unavailable client options | **Deferred:** public workflow execution/run/task timeout options, workflow ID reuse/conflict policies, per-call deadlines, cron schedules, and delayed starts. | These are not exposed by `Client.start` or the public client operations. [#499] tracks policies and deadlines; applications must not infer support from server-side metadata or private protocol fields. |
 | Worker upgrades and replay tools | **Deferred:** cross-version workflow-history compatibility, deployment/build-ID routing, an application-facing offline replay runner, and an automated upgrade/rollback path. Patching APIs may be evaluated experimentally. | The [patching reference](workflow-patching.md) and private [replay bridge](replay-bridge.md) do not create a cross-version or public replay promise ([#497], [#503], [#508]). |
@@ -122,8 +122,9 @@ For the **exact candidate commit**, retain:
    older commit or on the presence of a fixture that did not finish.
 4. A successful publish and retrieval of the immutable tag, source and binary
    assets, manifest, checksums, and Cargo SBOM for the tested commit. The
-   current [release workflow](release-preflight.md#publish-a-prerelease)
-   needs an authorized tag-creation path before this gate can pass ([#510]).
+   [release procedure](release-preflight.md#publish-a-prerelease) documents a
+   protected maintainer-created tag path. [#510] remains open until the exact
+   candidate's publication and asset retrieval are rehearsed and evidenced.
 
 The maintainer's policy approval closes [#489] only after this PR merges.
 Release publication, secure endpoints, cross-version replay, and production
@@ -150,4 +151,5 @@ deployment remain separate decisions with their own evidence.
 [October 2]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/37073688475
 [October 3]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/37156563875
 [PR #555]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/pull/555
+[PR #749]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/pull/749
 [PR #557]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/pull/557
