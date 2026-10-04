@@ -8,6 +8,10 @@ open Temporal
 (** Converts the public result boundary into a short fixture failure. *)
 let get = function Ok value -> value | Error error -> failwith (Error.message error)
 
+let namespace =
+  Sys.getenv_opt "TEMPORAL_NAMESPACE"
+  |> Option.value ~default:"temporal-sdk-test"
+
 (** The live controller's console filter suppresses a Docker build command's
     remaining output after a sensitive line. Keep only fixed, payload-free
     phase markers in an allowlisted file so a timed-out fixture identifies the
@@ -70,10 +74,10 @@ let await label seconds predicate =
     shutdown interrupts it after the test deadline. *)
 let wait_exact label address workflow handle =
   record_phase (label ^ "_client_create") "begin";
-  let client = get (Client.create ~target_url:address ~namespace:"default" ()) in
+  let client = get (Client.create ~target_url:address ~namespace ()) in
   record_phase (label ^ "_client_create") "ok";
   let execution : Client.execution =
-    { namespace = "default"; workflow_id = Client.workflow_id handle;
+    { namespace; workflow_id = Client.workflow_id handle;
       run_id = Client.run_id handle }
   in
   let outcome = Atomic.make None in
@@ -124,7 +128,8 @@ let check address =
     failwith "poll isolation fixture requires an HTTP development server";
   let queue = Printf.sprintf "poll-isolation-%d-%d" (Unix.getpid ())
     (Random.State.bits (Random.State.make_self_init ())) in
-  let worker = get (Worker.create ~target_url:address ~namespace:"default"
+  record_phase "worker_create" "begin";
+  let worker = get (Worker.create ~target_url:address ~namespace
     ~task_queue:queue
     ~workflows:[Worker.workflow activity_workflow; Worker.workflow timer_workflow]
     ~activities:[Worker.activity blocked_activity] ()) in
@@ -137,7 +142,7 @@ let check address =
   let run_result = ref None in
   let body =
     try
-      let connected = get (Client.create ~target_url:address ~namespace:"default" ()) in
+      let connected = get (Client.create ~target_url:address ~namespace ()) in
       client := Some connected;
       record_phase "client_create" "ok";
       let start workflow suffix =

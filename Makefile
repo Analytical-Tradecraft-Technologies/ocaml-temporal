@@ -731,7 +731,7 @@ test-worker-poll-isolation-live-build:
 
 .PHONY: test-worker-poll-isolation-live-run
 test-worker-poll-isolation-live-run:
-	OCAML_IMAGE=$(OCAML_IMAGE) $(COMPOSE) --progress quiet run --rm --user $(HOST_UID):$(HOST_GID) $(SERVICE) env TEMPORAL_POLL_ISOLATION_LOG_FILE=/workspace/test/integration/temporal/.smoke-poll-isolation.log sh scripts/run-temporal-executable.sh --build-dir=/workspace/_build/worker-poll-isolation test/integration/worker_poll_isolation/regression.exe check $(TEMPORAL_CLIENT_TEST_URL)
+	OCAML_IMAGE=$(OCAML_IMAGE) $(COMPOSE) --progress quiet run --rm --user $(HOST_UID):$(HOST_GID) $(SERVICE) env TEMPORAL_NAMESPACE=temporal-sdk-test TEMPORAL_POLL_ISOLATION_LOG_FILE=/workspace/test/integration/temporal/.smoke-poll-isolation.log sh scripts/run-temporal-executable.sh --build-dir=/workspace/_build/worker-poll-isolation test/integration/worker_poll_isolation/regression.exe check $(TEMPORAL_CLIENT_TEST_URL)
 
 lint:
 	$(RUN) dune build @install $(DUNE_BUILD_ARGS)
