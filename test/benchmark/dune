@@ -1,0 +1,19 @@
+(library
+ (name benchmark_harness)
+ (modules benchmark_harness)
+ (libraries yojson unix))
+
+(test
+ (name bench_local_activation)
+ (modules bench_local_activation)
+ (libraries benchmark_harness temporal_base temporal_runtime yojson)
+ ; Keep the executable and its smallest report-producing path in every Dune
+ ; test matrix, without gating on a noisy benchmark measurement.
+ (action
+  (setenv BENCH_SOURCE_COMMIT test-commit
+   (setenv BENCH_SOURCE_DIRTY false
+    (setenv BENCH_SDK_VERSION test-version
+     (setenv BENCH_CORE_REVISION test-core
+      (setenv BENCH_DUNE_PROFILE dev
+       (run %{test} --warmup 1 --samples 3
+        --repetitions 1 --seed 1))))))))

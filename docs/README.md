@@ -57,6 +57,9 @@ The remaining reference documents are useful when changing one subsystem:
   are recorded in the live two-binary evidence.
 - [OCaml SDK logging](reference/observability.md) documents log sources, tags,
   levels, privacy, and Domain behavior.
+- [Benchmark harness](reference/benchmark-harness.md) documents the first
+  no-server workload, reproducible command, versioned report, and measurement
+  boundary.
 - [Local Temporal stack](reference/local-temporal-stack.md) documents the
   PostgreSQL/Temporal Server Compose fixture and Make targets.
 - [Two-OCaml-binary acceptance design](reference/two-ocaml-binary-e2e-acceptance.md)
