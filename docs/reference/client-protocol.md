@@ -82,10 +82,13 @@ the bounded ticket polls, so polling does not accidentally change the
 idempotency key. A request ID identifies one logical start and must not be
 reused for unrelated workflow starts.
 
-The deterministic `mock://` client follows the default workflow-ID behavior:
-it rejects a new start while that ID has a running execution, then accepts a
-new run after the current execution closes. Old exact-run handles remain
-addressable through the mock's retained run history.
+The deterministic `mock://` backend retains successful explicit start IDs
+with their request fields and original run identity. An identical retry
+returns that run before workflow-ID conflict checks; changed request data
+under the same ID is rejected. For a new request ID, the mock rejects a start
+while that workflow ID has a running execution and accepts a new run after the
+current execution closes. Old exact-run handles remain addressable through
+the mock's retained run history.
 
 The direct `start_workflow_json` ABI can return the successful response shown
 above, but the public HTTP(S) client uses the asynchronous ticket path. It

@@ -221,6 +221,13 @@ type mock_execution = {
   signal_requests : (string, mock_signal) Hashtbl.t;
 }
 
+(** One accepted start keyed by workflow ID and explicit request ID. Its
+    copied request distinguishes an idempotent retry from accidental key reuse. *)
+type mock_start = {
+  request : start_request;
+  response : start_response;
+}
+
 (** One accepted reset request and the successor identity it created. Keeping
     the original request fields lets the mock enforce the same idempotency
     contract as Temporal when a caller retries an uncertain reset response. *)
@@ -242,6 +249,8 @@ type mock_service = {
   (** Every run, including runs retired by reset, remains addressable by its
       exact workflow/run pair until the service is released. *)
   history : ((string * string), mock_execution) Hashtbl.t;
+  (** Explicit start IDs are scoped to a workflow and retain the first run. *)
+  start_requests : ((string * string), mock_start) Hashtbl.t;
   (** Reset request IDs are scoped to a workflow, matching server-side
       deduplication. Each entry retains its input fingerprint so retries
       return the original successor instead of creating another run. *)
@@ -305,6 +314,36 @@ type worker = Mock_worker of mock_worker
 (** Copies payload bytes before retaining them in a backend-owned ledger. *)
 let copy_payload (payload : Payload.t) : Payload.t =
   { payload with data = Bytes.copy payload.data }
+
+(** Copies all mutable payload bytes in an accepted start before retaining its
+    idempotency fingerprint in the process-local mock ledger. *)
+let copy_start_request (request : start_request) : start_request =
+  let copy_fields fields =
+    List.map (fun (key, payload) -> (key, copy_payload payload)) fields
+  in
+  {
+    request with
+    input = copy_payload request.input;
+    memo = copy_fields request.memo;
+    search_attributes = copy_fields request.search_attributes;
+  }
+
+(** Compares every caller-controlled start field, including payload bytes, so
+    reusing one explicit ID with changed data cannot return the wrong run. *)
+let equal_start_request (left : start_request) (right : start_request) =
+  let equal_payload (left : Payload.t) (right : Payload.t) =
+    left.metadata = right.metadata && Bytes.equal left.data right.data
+  in
+  let equal_field (left_key, left_payload) (right_key, right_payload) =
+    String.equal left_key right_key && equal_payload left_payload right_payload
+  in
+  left.request_id = right.request_id
+  && String.equal left.workflow_name right.workflow_name
+  && String.equal left.workflow_id right.workflow_id
+  && String.equal left.task_queue right.task_queue
+  && equal_payload left.input right.input
+  && List.equal equal_field left.memo right.memo
+  && List.equal equal_field left.search_attributes right.search_attributes
 
 (** Creates a structured bridge error without exposing a backend exception. *)
 let bridge_error message = Error.make ~category:`Bridge ~message ()
@@ -548,6 +587,7 @@ let acquire_mock_service ~target_url ~namespace =
               mutex = Mutex.create ();
               executions = Hashtbl.create 16;
               history = Hashtbl.create 32;
+              start_requests = Hashtbl.create 16;
               reset_requests = Hashtbl.create 16;
             }
           in
@@ -684,8 +724,9 @@ let native_client_start (client : native_client) (request : start_request) :
         in
         await_outcome ()
 
-(** Starts a mock execution under Temporal's default workflow-ID policies:
-    reject a concurrent run, but allow a new run after the current one closes.
+(** Starts a mock execution or returns the first run for an identical retry of
+    an accepted explicit request ID. Retry lookup precedes workflow-ID checks;
+    a new request rejects a pending current run but can replace a closed one.
     Exact old runs remain in [history] after the current slot is replaced. *)
 let mock_client_start (client : mock_client) (request : start_request) =
   let service = client.service in
@@ -694,35 +735,54 @@ let mock_client_start (client : mock_client) (request : start_request) =
     ~finally:(fun () -> Mutex.unlock service.mutex)
     (fun () ->
       if client.closed then Error (bridge_error "client is shut down")
-      else if
-        (match Hashtbl.find_opt service.executions request.workflow_id with
-        | Some { terminal = Mock_pending; _ } -> true
-        | Some _ | None -> false)
-      then
-        Error
-          (Error.make ~non_retryable:true ~category:`Workflow
-             ~message:"workflow id already exists" ())
       else
-        let run_id =
-          service.next_run <- service.next_run + 1;
-          Printf.sprintf "mock-run-%d" service.next_run
+        let previous =
+          match request.request_id with
+          | None -> None
+          | Some request_id ->
+              Hashtbl.find_opt service.start_requests
+                (request.workflow_id, request_id)
         in
-        let execution =
-          {
-            run_id;
-            workflow_type = request.workflow_name;
-            task_queue = request.task_queue;
-            input = copy_payload request.input;
-            terminal = Mock_pending;
-            signal_requests = Hashtbl.create 8;
-          }
-        in
-        Hashtbl.replace service.executions request.workflow_id execution;
-        Hashtbl.add service.history (request.workflow_id, run_id) execution;
-        let response : start_response =
-          { workflow_id = request.workflow_id; run_id }
-        in
-        Ok response)
+        match previous with
+        | Some previous when equal_start_request previous.request request ->
+            Ok previous.response
+        | Some _ ->
+            Error
+              (Error.make ~non_retryable:true ~category:`Workflow
+                 ~message:"start request ID was already used for different start data"
+                 ())
+        | None
+          when (match Hashtbl.find_opt service.executions request.workflow_id with
+               | Some { terminal = Mock_pending; _ } -> true
+               | Some _ | None -> false) ->
+            Error
+              (Error.make ~non_retryable:true ~category:`Workflow
+                 ~message:"workflow id already exists" ())
+        | None ->
+            service.next_run <- service.next_run + 1;
+            let run_id = Printf.sprintf "mock-run-%d" service.next_run in
+            let execution =
+              {
+                run_id;
+                workflow_type = request.workflow_name;
+                task_queue = request.task_queue;
+                input = copy_payload request.input;
+                terminal = Mock_pending;
+                signal_requests = Hashtbl.create 8;
+              }
+            in
+            Hashtbl.replace service.executions request.workflow_id execution;
+            Hashtbl.add service.history (request.workflow_id, run_id) execution;
+            let response : start_response =
+              { workflow_id = request.workflow_id; run_id }
+            in
+            (match request.request_id with
+            | None -> ()
+            | Some request_id ->
+                Hashtbl.add service.start_requests
+                  (request.workflow_id, request_id)
+                  { request = copy_start_request request; response });
+            Ok response)
 
 (** Starts a workflow on the selected private transport. *)
 let client_start client request =
