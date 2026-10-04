@@ -33,6 +33,39 @@ let test_activity_completion_policy () =
       ("unknown status", Bridge.Unknown 13);
     ]
 
+(** Async client heartbeats do not consume a completion lease. A connection
+    result is uncertain and retains the handle for an identical retry, while
+    the bridge's NotFound/invalid-state response closes it. This must not
+    weaken the ordinary Core completion policy tested above. *)
+let test_async_heartbeat_policy () =
+  let expect_disposition label expected actual =
+    if actual <> expected then failwith label
+  in
+  expect_disposition "uncertain heartbeat connection" Policy.Retry_exact
+    (Policy.async_heartbeat_disposition Bridge.Connection);
+  expect_disposition "explicit retryable heartbeat" Policy.Retry_exact
+    (Policy.async_heartbeat_disposition Bridge.Retryable);
+  List.iter
+    (fun (label, status) ->
+      expect_disposition label Policy.Rejected_live
+        (Policy.async_heartbeat_disposition status))
+    [
+      ("definitive RPC rejection", Bridge.Async_heartbeat_rejected);
+      ("local invalid argument", Bridge.Invalid_argument);
+      ("local protocol rejection", Bridge.Protocol);
+      ("local configuration rejection", Bridge.Configuration);
+    ];
+  List.iter
+    (fun (label, status) ->
+      expect_disposition label Policy.Retired
+        (Policy.async_heartbeat_disposition status))
+    [
+      ("not-found heartbeat", Bridge.Invalid_state);
+      ("not-ready heartbeat", Bridge.Not_ready);
+      ("worker heartbeat", Bridge.Worker);
+      ("unknown heartbeat status", Bridge.Unknown 13);
+    ]
+
 (** Shutdown can reopen admission only when an activity drain retained a
     completion after an explicitly transient native failure. Workflow drains
     and permanent activity failures must remain terminal. *)
@@ -153,6 +186,7 @@ let test_reentrant_same_domain_shutdown_preserves_closed () =
 (** Runs all pure policy regressions. *)
 let () =
   test_activity_completion_policy ();
+  test_async_heartbeat_policy ();
   test_shutdown_policy ();
   test_terminal_cleanup_preserves_original_error ();
   test_reentrant_same_domain_shutdown_preserves_closed ()

@@ -124,6 +124,11 @@ module Fake_supervisor = struct
       category; stale-token errors remain fatal protocol failures. *)
   let error_is_retryable error = error.retryable
 
+  (** This lifecycle fake does not submit async heartbeats. *)
+  let async_heartbeat_error_disposition error =
+    if error.retryable then Temporal_runtime.Native_worker_policy.Retry_exact
+    else Temporal_runtime.Native_worker_policy.Retired
+
   (** This fake does not inject completion exceptions. *)
   let exception_is_retryable _exception = false
 end

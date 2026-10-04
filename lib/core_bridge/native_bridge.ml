@@ -14,6 +14,7 @@ type status =
   | Protocol
   | Already_started
   | Retryable
+  | Async_heartbeat_rejected
   | Unknown of int
 
 (** Error data copied into OCaml. It never owns Rust memory. *)
@@ -244,6 +245,7 @@ let status = function
   | 11 -> Protocol
   | 12 -> Already_started
   | 13 -> Retryable
+  | 14 -> Async_heartbeat_rejected
   | code -> Unknown code
 
 (** Converts a bridge status to a bounded stable tag value without exposing the
@@ -262,6 +264,7 @@ let status_name = function
   | Protocol -> "protocol"
   | Already_started -> "already_started"
   | Retryable -> "retryable"
+  | Async_heartbeat_rejected -> "async_heartbeat_rejected"
   | Unknown _ -> "unknown"
 
 (** Constructs a local configuration failure without entering native code. *)

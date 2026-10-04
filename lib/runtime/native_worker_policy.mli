@@ -15,6 +15,17 @@ val activity_completion_retryable :
 (** Returns [true] only for the bilateral retryable-completion status. Generic
     connection, readiness, worker, protocol, and closed states are false. *)
 
+type async_heartbeat_disposition = Retry_exact | Rejected_live | Retired
+(** Whether a failed heartbeat must retry the identical request, can replace a
+    definitively rejected request while retaining its live activity lease, or
+    must retire the handle after token loss or unusable native state. *)
+
+val async_heartbeat_disposition :
+  Temporal_core_bridge.Native_bridge.status -> async_heartbeat_disposition
+(** Classifies typed bridge statuses without reading diagnostic text.
+    [Connection] is uncertain; [Async_heartbeat_rejected] and local preflight
+    failures leave the handle live; [Invalid_state] closes a lost token. *)
+
 val shutdown_retryable : drain_failure -> bool
 (** Returns [true] only when an activity adapter retained a completion after an
     explicitly transient native failure. Workflow drains and all permanent

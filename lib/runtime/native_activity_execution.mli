@@ -60,6 +60,13 @@ module type SUPERVISOR = sig
       may retry the same completion after a bounded wait. Permanent, protocol,
       configuration, and lifecycle failures must return [false]. *)
 
+  val async_heartbeat_error_disposition :
+    error -> Native_worker_policy.async_heartbeat_disposition
+  (** Classifies a failed namespace-bound async heartbeat separately from a
+      Core worker completion. An uncertain RPC retains the exact request;
+      definitive rejection clears a fresh request while retaining the live
+      handle and lease; confirmed token loss retires both. *)
+
   val exception_is_retryable : exn -> bool
   (** Classifies an exception raised by the completion call. Production
       supervisors should return [false] unless they define a private,

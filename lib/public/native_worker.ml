@@ -44,6 +44,7 @@ let bridge_status = function
   | Protocol -> "protocol"
   | Already_started -> "already_started"
   | Retryable -> "retryable"
+  | Async_heartbeat_rejected -> "async_heartbeat_rejected"
   | Unknown code -> Printf.sprintf "unknown(%d)" code
 
 (** Converts the supervisor's opaque error into a bounded worker diagnostic.
@@ -177,6 +178,14 @@ module Activity_source = struct
     | Native.Backend { Bridge.status; _ } ->
         Worker_policy.activity_completion_retryable status
     | _ -> false
+
+  (** The namespace-bound async heartbeat is nonterminal. A rejected request
+      leaves its activity live, while an uncertain RPC retains the exact
+      request; this differs from Core worker completion ownership. *)
+  let async_heartbeat_error_disposition = function
+    | Native.Backend { Bridge.status; _ } ->
+        Worker_policy.async_heartbeat_disposition status
+    | _ -> Worker_policy.Retired
 
   (** Unexpected supervisor exceptions are defects, not evidence of a safe
       transient transport failure. The adapter therefore retains them but the

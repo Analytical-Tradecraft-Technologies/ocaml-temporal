@@ -22,10 +22,12 @@ type submit_result = (unit, Error.t) result
 
 (** The adapter explicitly distinguishes preflight rejection from native
     outcomes. [Not_submitted] releases a new operation key while preserving
-    the handle; unresolved earlier submissions retain it, and terminal native
-    outcomes close the handle. *)
+    the handle; a definitive native heartbeat rejection has the same key effect
+    without claiming that no call occurred. Unresolved earlier submissions
+    retain the exact key, and terminal native outcomes close the handle. *)
 type submission_error =
   | Not_submitted of Error.t
+  | Rejected_submission of Error.t
   | Retryable_submission of Error.t
   | Terminal_submission of Error.t
 
@@ -232,7 +234,8 @@ let operation_key operation =
     result under the mutex. A successful terminal operation clears the pending
     key and closes the handle; a retryable failure clears only [in_flight], so a
     later call can repeat the exact operation without rerunning user code.
-    Local rejection releases the invalid key so a corrected operation can run. *)
+    Local or definitive native rejection releases a fresh key so a corrected
+    operation can run. Neither can erase an earlier uncertain submission. *)
 let submit_operation handle ~terminal operation =
   let key = operation_key operation in
   match begin_operation handle ~key operation with
@@ -251,7 +254,7 @@ let submit_operation handle ~terminal operation =
       with_mutex handle.mutex (fun () ->
           pending.in_flight <- false;
           match result with
-          | Error (Not_submitted error) ->
+          | Error (Not_submitted error | Rejected_submission error) ->
               if not pending.retry_pending then handle.pending <- None;
               Error error
           | Error (Retryable_submission error) ->

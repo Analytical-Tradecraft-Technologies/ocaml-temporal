@@ -337,6 +337,7 @@ module Protocol_adapter = struct
       | Protocol -> "protocol"
       | Already_started -> "already_started"
       | Retryable -> "retryable"
+      | Async_heartbeat_rejected -> "async_heartbeat_rejected"
       | Unknown code -> Printf.sprintf "unknown(%d)" code
     in
     {

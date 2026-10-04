@@ -14,6 +14,7 @@ module Base_error = Temporal_base.Error
 module Observability = Temporal_base.Observability
 module Activity_context = Temporal_base.Activity_context
 module Async_activity = Temporal_base.Async_activity
+module Worker_policy = Native_worker_policy
 
 (** Result-bind notation keeps expected protocol and codec failures on typed
     paths rather than using exceptions as ordinary activity control flow. *)
@@ -41,6 +42,8 @@ module type SUPERVISOR = sig
   val error_code : error -> string
   val error_message : error -> string
   val error_is_retryable : error -> bool
+  val async_heartbeat_error_disposition :
+    error -> Worker_policy.async_heartbeat_disposition
   val exception_is_retryable : exn -> bool
 end
 
@@ -571,6 +574,13 @@ module Make (Supervisor : SUPERVISOR) = struct
   let source_error_is_retryable source_error =
     try Supervisor.error_is_retryable source_error with _ -> false
 
+  (** Heartbeat classification distinguishes an uncertain RPC from a rejected
+      request that leaves its activity live. A faulty source classifier still
+      fails closed instead of hiding a defect. *)
+  let async_heartbeat_error_disposition source_error =
+    try Supervisor.async_heartbeat_error_disposition source_error
+    with _ -> Worker_policy.Retired
+
   (** Exception classification is equally conservative: arbitrary exceptions
       are owner-domain defects unless the supervisor explicitly marks one as a
       transient completion transport failure. *)
@@ -711,8 +721,10 @@ module Make (Supervisor : SUPERVISOR) = struct
     Ok request
 
   (** Maps a native outcome to one lifecycle decision shared by the adapter
-      registry and handle state machine. Local preflight errors never enter
-      this classifier, even when their public category is [Bridge]. *)
+      registry and handle state machine. Terminal client operations retain
+      their conservative completion policy; heartbeat errors may retain an
+      exact request or reject it while leaving the live lease available.
+      Local preflight errors never enter this classifier. *)
   let async_submission_error operation (error : error_view) =
     let diagnostic = base_operation_error operation error in
     if error.retryable then Async_activity.Retryable_submission diagnostic
@@ -768,11 +780,33 @@ module Make (Supervisor : SUPERVISOR) = struct
                         match submitted with
                         | Ok () -> Ok ()
                         | Error source_error ->
-                            Error (async_submission_error name
-                              (supervisor_error ~path
-                                ~retryable:(source_error_is_retryable source_error)
-                                ~error_code:Supervisor.error_code
-                                ~error_message:Supervisor.error_message source_error))
+                            (match request with
+                            | Async_completion _ ->
+                                Error (async_submission_error name
+                                  (supervisor_error ~path
+                                    ~retryable:(source_error_is_retryable source_error)
+                                    ~error_code:Supervisor.error_code
+                                    ~error_message:Supervisor.error_message source_error))
+                            | Async_heartbeat _ ->
+                                let disposition =
+                                  async_heartbeat_error_disposition source_error
+                                in
+                                let retryable =
+                                  disposition = Worker_policy.Retry_exact
+                                in
+                                let diagnostic =
+                                  base_operation_error name
+                                    (supervisor_error ~path ~retryable
+                                      ~error_code:Supervisor.error_code
+                                      ~error_message:Supervisor.error_message source_error)
+                                in
+                                Error (match disposition with
+                                  | Worker_policy.Retry_exact ->
+                                      Async_activity.Retryable_submission diagnostic
+                                  | Worker_policy.Rejected_live ->
+                                      Async_activity.Rejected_submission diagnostic
+                                  | Worker_policy.Retired ->
+                                      Async_activity.Terminal_submission diagnostic))
                       with exception_ ->
                         Error (async_submission_error name (exception_error ~path exception_))
                     in
@@ -782,6 +816,7 @@ module Make (Supervisor : SUPERVISOR) = struct
                     | Error (Async_activity.Terminal_submission _) ->
                         adapter.async_leases <- Token_map.remove token adapter.async_leases
                     | Ok () | Error (Async_activity.Not_submitted _
+                        | Async_activity.Rejected_submission _
                         | Async_activity.Retryable_submission _) -> ());
                     result))
 

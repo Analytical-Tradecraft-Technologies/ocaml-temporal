@@ -275,6 +275,15 @@ and bridge, read the [documentation guide](../README.md) first.
   failures, so `Connection`, `Not_ready`, and `Worker` never authorize a
   second completion attempt. The dedicated retry backoff is a 10 ms native
   timer with the OCaml runtime lock released; it is not a readiness signal.
+- A namespace-bound async heartbeat is nonterminal and does not consume that
+  Core completion lease. An uncertain RPC `Connection` keeps the public handle
+  and adapter async lease tracked for an identical heartbeat retry. A definite
+  non-`NotFound` RPC rejection clears a fresh heartbeat request so corrected
+  details or completion may proceed, but keeps both the handle and lease live;
+  it cannot erase an earlier uncertain request. Worker drain must still report
+  the outstanding obligation. Confirmed `NotFound` maps to `Invalid_state` and
+  closes the handle. This decision does not change worker or async terminal
+  completion retry policy.
 - Adapter shutdown reopens admission only for an explicitly retryable activity
   drain. Workflow-drain errors and permanent activity errors invoke the
   supervisor's `Native.shutdown`/`runtime_close` path before leaving the private
