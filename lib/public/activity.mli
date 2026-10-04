@@ -94,10 +94,12 @@ val define_with_context :
   ('input, 'output) contextual_implementation ->
   ('input, 'output) t
 
-(** Creates a local activity whose callback may return a retained completion
+(** Creates an activity whose callback may return a retained completion
     handle. The callback must return exactly one of [Completed], [Failed], or
-    [Will_complete_async]; the handle becomes usable only after the worker has
-    accepted the handoff. *)
+    [Will_complete_async]. Deferred completion is supported for remote
+    activities only; a local activity returning [Will_complete_async] fails
+    that attempt. A remote handle becomes usable only after the worker accepts
+    the handoff. *)
 val define_async :
   name:string ->
   input:'input Codec.t ->

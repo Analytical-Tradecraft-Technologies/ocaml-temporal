@@ -3,8 +3,9 @@
 `Temporal_protocol.Activity_protocol` is the private OCaml representation of
 activity-task and completion JSON exchanged with the Rust Temporal Core bridge.
 The same document shape carries remote server activities and local-activity
-lane tasks; Core's internal local bit does not alter callback or completion
-semantics. It is an internal worker building block, not an API that workflow or
+lane tasks; the required `is_local` start field preserves Core's locality bit
+because local activities cannot hand off completion asynchronously. It is an
+internal worker building block, not an API that workflow or
 activity authors construct directly. Rust remains the only protobuf boundary;
 this module sees ordinary OCaml records, variants, byte strings, and typed
 validation failures.
@@ -21,7 +22,8 @@ value and the user-side execution aligned while Rust's outstanding-task ledger
 decides whether the lease can be retired. The adapter never interprets token
 bytes.
 
-Start context retains the scheduling workflow identity, activity identity,
+Start context retains whether Core leased a local activity, the scheduling
+workflow identity, activity identity,
 headers, ordered arguments, heartbeat details, timestamps, timeouts, one-based
 attempt supplied by Core, normalized retry policy, task priority, and optional
 standalone activity run ID. Cancellation context retains both Core's primary
@@ -29,10 +31,13 @@ reason and its independent detail flags. The completion result is a closed
 variant: completed with an optional payload, failed, cancelled, or
 will-complete-asynchronously.
 
-The `will-complete-asynchronously` variant is the worker-to-client handoff for
-`Temporal.Activity.define_async`. The adapter sends it through the ordinary
-worker completion path exactly once, then activates the opaque handle only
-after Core accepts it. Later completion, failure, cancellation, and heartbeat
+The `will-complete-asynchronously` variant is the remote worker-to-client
+handoff for `Temporal.Activity.define_async`. The adapter sends it through the
+ordinary worker completion path exactly once, then activates the opaque handle
+only after Core accepts it. For a local task, the adapter instead closes the
+dormant handle and submits a non-retryable activity failure for the same token;
+Core cannot accept a deferred local completion. Later remote completion,
+failure, cancellation, and heartbeat
 operations use separate namespace-bound client endpoints. Activity authors
 cannot construct a task token or retain the ordinary attempt context; they can
 only retain the typed handle returned by `Async_context.handle`.
@@ -73,6 +78,7 @@ Semantic validation then enforces:
 - nonempty canonical task tokens within the opaque-byte ceiling;
 - nonempty workflow, run, namespace, activity, and activity-type identifiers;
 - nonempty unique header keys, with maps normalized lexicographically;
+- a required boolean `is_local` on start tasks, retained from Core;
 - signed timestamp seconds and nonnegative duration seconds, both with
   nanoseconds from 0 through 999,999,999;
 - unsigned 32-bit attempts and priority-weight bits, signed 32-bit priority and

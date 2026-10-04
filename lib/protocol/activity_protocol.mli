@@ -110,9 +110,12 @@ type retry_policy = {
   non_retryable_error_types : string list;
 }
 
-(** Complete execution context needed to invoke one remote activity attempt.
-    Association lists are normalized by key when encoded. *)
+(** Complete execution context needed to invoke one activity attempt.
+    [is_local] identifies Core's local-activity lane, whose completions cannot
+    hand off to the asynchronous client endpoint. Association lists are
+    normalized by key when encoded. *)
 type activity_start = {
+  is_local : bool;
   workflow_namespace : string;
   workflow_type : string;
   workflow_execution : workflow_execution;

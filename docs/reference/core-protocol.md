@@ -22,11 +22,12 @@ ledger validates the run ID or opaque task token before Core sees a completion.
 
 ## Startup compatibility
 
-Compatibility number `1` covers the C layout and JSON contract. The bridge
-checks it once before creating an SDK runtime. It is absent from messages
-because OCaml and Rust are compiled and shipped together. A different number
-means a stale or partial build and fails startup; per-message negotiation and
-mixed versions are unsupported.
+ABI version `2` guards the C layout and operations. The bridge checks it once
+before creating an SDK runtime. It is absent from messages because OCaml and
+Rust are compiled and shipped together. Direct JSON documents are strictly
+validated and evolve with those paired sources; CI identifies prebuilt Rust
+artifacts by an exact source key. A different ABI version fails startup, while
+mixed source revisions are unsupported even when their ABI number matches.
 
 ## Two JSON layers
 
@@ -51,7 +52,7 @@ The operation-specific documents therefore start at their own schema root:
 | Client exact-run wait/cancel | wait or cancellation request and response | [client protocol](client-protocol.md) |
 | Client asynchronous activity completion/heartbeat | async completion or heartbeat request | [client protocol](client-protocol.md) |
 | Workflow worker poll/complete/reject | activation or completion | This document's workflow sections |
-| Remote activity worker poll/complete/heartbeat | task, completion, or heartbeat | [activity protocol](activity-protocol.md) |
+| Activity worker poll/complete/heartbeat | task, completion, or heartbeat | [activity protocol](activity-protocol.md) |
 
 Use the envelope shape only when an operation explicitly declares an envelope;
 do not put an activation, completion, task, or client request inside a second
@@ -486,21 +487,23 @@ variants, or omitted Core fields with non-default values fail conversion.
 
 The Rust conversion functions are the only protobuf boundary. They convert
 official pinned Core activations to semantic values and semantic completions
-back to official Core values. Core's `is_local` activity-resolution flag is not
-represented because the pinned Core contract explicitly says language SDKs do
-not need to distinguish it; every other omitted value is checked before
-conversion.
+back to official Core values. The workflow activation's `is_local`
+activity-resolution flag is not represented because the pinned Core contract
+explicitly says language SDKs do not need to distinguish it. The separate
+activity-task start message does preserve `is_local` so the worker can enforce
+local completion rules; every other omitted value is checked before conversion.
 
-## Remote activity task and completion semantics
+## Activity task and completion semantics
 
-Remote activity tasks use a separate closed document. The opaque Core task
-token is canonical padded base64 and must be nonempty. A start task preserves
-workflow and activity identity, headers, inputs, heartbeat details, exact
-timestamps and timeouts, attempt, effective retry policy, priority, and the
-standalone activity run ID. Retry backoff uses its unsigned IEEE-754 bit pattern
-as a decimal string. A cancellation preserves its reason and independent detail
-flags. Local activity tasks are rejected because this worker does not enable
-their distinct lifecycle.
+Remote and local activity tasks use a separate closed document. The opaque
+Core task token is canonical padded base64 and must be nonempty. A start task
+preserves Core's `is_local` flag, workflow and activity identity, headers,
+inputs, heartbeat details, exact timestamps and timeouts, attempt, effective
+retry policy, priority, and the standalone activity run ID. Retry backoff uses
+its unsigned IEEE-754 bit pattern as a decimal string. A cancellation preserves
+its reason and independent detail flags. Local activities can complete or fail
+through the ordinary worker completion path, but cannot hand off completion
+asynchronously.
 
 Completions contain the same task token and exactly one result: completed with
 an optional payload, failed, cancelled, or will-complete-asynchronously.
@@ -515,7 +518,7 @@ Shared positive and malformed fixtures under `test/bridge/fixtures/protocol`
 drive the envelope tests. Bilateral activation/completion fixtures live under
 `test/bridge/fixtures/workflow-protocol`; their schemas are
 `workflow-activation.schema.json` and `workflow-completion.schema.json`.
-Remote activity documents are described by `activity-task.schema.json` and
+Activity documents are described by `activity-task.schema.json` and
 `activity-completion.schema.json`. Both protocol families reference
 `temporal-payload.schema.json` and `temporal-failure.schema.json`. The OCaml
 adapter's ownership, typed representation, and validation behavior are described

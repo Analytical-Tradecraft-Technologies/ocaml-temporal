@@ -36,6 +36,7 @@ fn start_activity_task() -> ActivityTask {
             },
             activity_id: "activity-1".to_owned(),
             activity_type: "example.activity".to_owned(),
+            is_local: false,
             header_fields: std::collections::BTreeMap::new(),
             input: Vec::new(),
             heartbeat_details: Vec::new(),

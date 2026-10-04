@@ -18,7 +18,7 @@ remain synchronous, while `define_async` provides an explicit capability for
 work that finishes after the worker callback returns.
 
 The private activity protocol has a closed `will_complete_async` result. The
-OCaml adapter now emits it only for `define_async` callbacks that return
+OCaml adapter now emits it only for remote `define_async` callbacks that return
 `Will_complete_async`, and the Rust bridge exposes separate namespace-bound
 client operations for the later terminal completion or heartbeat. The worker
 lease and the retained asynchronous lease are deliberately different state
@@ -69,14 +69,16 @@ context flag, or implicit defer caused by dropping an output value. The
 existing `define` and `define_with_context` wrappers remain ordinary
 result-returning functions.
 
-The defer handoff is linearized only after the activity callback has returned.
+The defer handoff is linearized only after a remote activity callback has returned.
 At that point the adapter submits exactly one `WillCompleteAsync` completion
 to Core. If Core accepts it, the adapter publishes the opaque handle and moves
 the token into a separate asynchronous-lease registry. If Core rejects it,
 the original worker lease remains in the ordinary retry map and the activity
 is not silently abandoned. A handle is never usable before this handoff is
 accepted, so a callback cannot synchronously call back through the mutex it is
-already holding.
+already holding. If a local activity callback returns `Will_complete_async`,
+the adapter instead closes its dormant handle and submits a non-retryable
+failure for the same worker token; Core cannot accept a deferred local result.
 
 ## Native boundary
 

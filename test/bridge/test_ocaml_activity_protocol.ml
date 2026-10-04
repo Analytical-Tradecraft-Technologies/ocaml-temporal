@@ -42,7 +42,7 @@ let find_substring source needle =
 (** A complete start task exercises every nullable field and shared semantic
     codec without requiring an official protobuf on the OCaml side. *)
 let valid_start_json =
-  {|{"task_token":"AAEC/v8=","variant":{"kind":"start","workflow_namespace":"default","workflow_type":"example.workflow","workflow_execution":{"workflow_id":"workflow-1","run_id":"run-1"},"activity_id":"activity-1","activity_type":"example.activity","header_fields":{"trace":{"metadata":{},"data":{"encoding":"base64","data":"aGVhZGVy"}}},"input":[{"metadata":{"encoding":{"encoding":"base64","data":"anNvbi9wbGFpbg=="}},"data":{"encoding":"base64","data":"eyJ2YWx1ZSI6MX0="}}],"heartbeat_details":[],"scheduled_time":{"seconds":10,"nanoseconds":20},"current_attempt_scheduled_time":null,"started_time":{"seconds":11,"nanoseconds":0},"attempt":1,"schedule_to_close_timeout":{"seconds":60,"nanoseconds":0},"start_to_close_timeout":{"seconds":30,"nanoseconds":0},"heartbeat_timeout":null,"retry_policy":{"initial_interval":{"seconds":1,"nanoseconds":0},"backoff_coefficient_bits":"4611686018427387904","maximum_interval":null,"maximum_attempts":3,"non_retryable_error_types":["InvalidInput"]},"priority":{"priority_key":2,"fairness_key":"tenant","fairness_weight_bits":1065353216},"standalone_run_id":""}}|}
+  {|{"task_token":"AAEC/v8=","variant":{"kind":"start","is_local":false,"workflow_namespace":"default","workflow_type":"example.workflow","workflow_execution":{"workflow_id":"workflow-1","run_id":"run-1"},"activity_id":"activity-1","activity_type":"example.activity","header_fields":{"trace":{"metadata":{},"data":{"encoding":"base64","data":"aGVhZGVy"}}},"input":[{"metadata":{"encoding":{"encoding":"base64","data":"anNvbi9wbGFpbg=="}},"data":{"encoding":"base64","data":"eyJ2YWx1ZSI6MX0="}}],"heartbeat_details":[],"scheduled_time":{"seconds":10,"nanoseconds":20},"current_attempt_scheduled_time":null,"started_time":{"seconds":11,"nanoseconds":0},"attempt":1,"schedule_to_close_timeout":{"seconds":60,"nanoseconds":0},"start_to_close_timeout":{"seconds":30,"nanoseconds":0},"heartbeat_timeout":null,"retry_policy":{"initial_interval":{"seconds":1,"nanoseconds":0},"backoff_coefficient_bits":"4611686018427387904","maximum_interval":null,"maximum_attempts":3,"non_retryable_error_types":["InvalidInput"]},"priority":{"priority_key":2,"fairness_key":"tenant","fairness_weight_bits":1065353216},"standalone_run_id":""}}|}
 
 (** Decoding a start task produces binary tokens and typed execution context,
     while encoding returns the Rust contract's deterministic field order. *)
@@ -50,6 +50,7 @@ let test_start_round_trip () =
   let task = unwrap (Protocol.decode_task valid_start_json) in
   (match task.variant with
   | Start start ->
+      if start.is_local then failwith "remote activity became local";
       if not (Bytes.equal task.task_token (Bytes.of_string "\000\001\002\254\255")) then
         failwith "task token bytes changed";
       if start.attempt <> 1L then failwith "attempt changed";
@@ -58,7 +59,16 @@ let test_start_round_trip () =
       if start.retry_policy = None then failwith "retry policy was lost"
   | Cancel _ -> failwith "start task decoded as cancellation");
   let encoded = unwrap (Protocol.encode_task task) in
-  ignore (unwrap (Protocol.decode_task encoded))
+  ignore (unwrap (Protocol.decode_task encoded));
+  let local =
+    match task.variant with
+    | Start start -> { task with variant = Start { start with is_local = true } }
+    | Cancel _ -> failwith "start fixture became cancellation"
+  in
+  let local = unwrap (Protocol.decode_task (unwrap (Protocol.encode_task local))) in
+  match local.variant with
+  | Start { is_local = true; _ } -> ()
+  | Start _ | Cancel _ -> failwith "local activity bit was lost"
 
 (** Cancellation tasks preserve both the stable primary reason and every
     independent cancellation fact supplied by newer Core versions. *)
@@ -167,6 +177,8 @@ let test_semantic_validation () =
     (fun json -> require_error (Protocol.decode_task json))
     [
       replace_once valid_start_json "AAEC/v8=" "AAEC/v8";
+      replace_once valid_start_json "\"is_local\":false," "";
+      replace_once valid_start_json "\"is_local\":false" "\"is_local\":\"false\"";
       replace_once valid_start_json "\"workflow_namespace\":\"default\"" "\"workflow_namespace\":\"\"";
       replace_once valid_start_json "\"nanoseconds\":20" "\"nanoseconds\":1000000000";
       replace_once valid_start_json "\"seconds\":60" "\"seconds\":-1";

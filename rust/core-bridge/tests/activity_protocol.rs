@@ -10,7 +10,7 @@ use temporalio_protos::coresdk::activity_task as core_activity_task;
 
 /// A complete start-task fixture exercises every nullable field, the retry
 /// policy, priority, headers, and both payload collection shapes.
-const VALID_START_TASK: &str = r#"{"task_token":"AAEC/v8=","variant":{"kind":"start","workflow_namespace":"default","workflow_type":"example.workflow","workflow_execution":{"workflow_id":"workflow-1","run_id":"run-1"},"activity_id":"activity-1","activity_type":"example.activity","header_fields":{"trace":{"metadata":{},"data":{"encoding":"base64","data":"aGVhZGVy"}}},"input":[{"metadata":{"encoding":{"encoding":"base64","data":"anNvbi9wbGFpbg=="}},"data":{"encoding":"base64","data":"eyJ2YWx1ZSI6MX0="}}],"heartbeat_details":[],"scheduled_time":{"seconds":10,"nanoseconds":20},"current_attempt_scheduled_time":null,"started_time":{"seconds":11,"nanoseconds":0},"attempt":1,"schedule_to_close_timeout":{"seconds":60,"nanoseconds":0},"start_to_close_timeout":{"seconds":30,"nanoseconds":0},"heartbeat_timeout":null,"retry_policy":{"initial_interval":{"seconds":1,"nanoseconds":0},"backoff_coefficient_bits":"4611686018427387904","maximum_interval":{"seconds":60,"nanoseconds":0},"maximum_attempts":3,"non_retryable_error_types":["InvalidInput"]},"priority":{"priority_key":2,"fairness_key":"tenant","fairness_weight_bits":1065353216},"standalone_run_id":""}}"#;
+const VALID_START_TASK: &str = r#"{"task_token":"AAEC/v8=","variant":{"kind":"start","workflow_namespace":"default","workflow_type":"example.workflow","workflow_execution":{"workflow_id":"workflow-1","run_id":"run-1"},"activity_id":"activity-1","activity_type":"example.activity","is_local":false,"header_fields":{"trace":{"metadata":{},"data":{"encoding":"base64","data":"aGVhZGVy"}}},"input":[{"metadata":{"encoding":{"encoding":"base64","data":"anNvbi9wbGFpbg=="}},"data":{"encoding":"base64","data":"eyJ2YWx1ZSI6MX0="}}],"heartbeat_details":[],"scheduled_time":{"seconds":10,"nanoseconds":20},"current_attempt_scheduled_time":null,"started_time":{"seconds":11,"nanoseconds":0},"attempt":1,"schedule_to_close_timeout":{"seconds":60,"nanoseconds":0},"start_to_close_timeout":{"seconds":30,"nanoseconds":0},"heartbeat_timeout":null,"retry_policy":{"initial_interval":{"seconds":1,"nanoseconds":0},"backoff_coefficient_bits":"4611686018427387904","maximum_interval":{"seconds":60,"nanoseconds":0},"maximum_attempts":3,"non_retryable_error_types":["InvalidInput"]},"priority":{"priority_key":2,"fairness_key":"tenant","fairness_weight_bits":1065353216},"standalone_run_id":""}}"#;
 
 /// Replaces exactly one fixture fragment so each malformed document targets a
 /// single semantic rule and fails loudly if the fixture is later reshaped.
@@ -249,6 +249,58 @@ fn activity_start_task_round_trips() {
     let task = decode_task(VALID_START_TASK).expect("valid start task should decode");
     let encoded = encode_task(&task).expect("valid start task should encode");
     assert_eq!(decode_task(&encoded), Ok(task));
+}
+
+/// Core's locality bit must survive the complete task handoff so the OCaml
+/// adapter can reject a deferred local result before it reaches Core.
+#[test]
+fn activity_start_preserves_core_locality_through_json() {
+    for is_local in [false, true] {
+        let core = core_activity_task::ActivityTask {
+            task_token: vec![0, 1, 2, 254, 255],
+            variant: Some(core_activity_task::activity_task::Variant::Start(
+                core_activity_task::Start {
+                    workflow_namespace: "default".to_owned(),
+                    workflow_type: "example.workflow".to_owned(),
+                    workflow_execution: Some(
+                        temporalio_common::protos::temporal::api::common::v1::WorkflowExecution {
+                            workflow_id: "workflow-1".to_owned(),
+                            run_id: "run-1".to_owned(),
+                        },
+                    ),
+                    activity_id: "activity-1".to_owned(),
+                    activity_type: "example.activity".to_owned(),
+                    is_local,
+                    ..Default::default()
+                },
+            )),
+        };
+
+        let semantic = task_from_core(&core).expect("Core start should convert");
+        let ActivityTaskVariant::Start(start) = &semantic.variant else {
+            panic!("Core start must remain a start task");
+        };
+        assert_eq!(start.is_local, is_local);
+
+        let encoded = encode_task(&semantic).expect("start should encode");
+        assert!(encoded.contains(&format!("\"is_local\":{is_local}")));
+        assert_eq!(decode_task(&encoded), Ok(semantic));
+    }
+}
+
+/// Locality is required, not an optional hint that could silently turn a
+/// local activity into a remote one when a task document is malformed.
+#[test]
+fn activity_start_requires_boolean_locality() {
+    let missing = replace_once(VALID_START_TASK, "\"is_local\":false,", "");
+    assert!(decode_task(&missing).is_err());
+
+    let non_boolean = replace_once(
+        VALID_START_TASK,
+        "\"is_local\":false",
+        "\"is_local\":\"false\"",
+    );
+    assert!(decode_task(&non_boolean).is_err());
 }
 
 /// Rust rejects the same nested values that the OCaml adapter rejects before

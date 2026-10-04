@@ -16,9 +16,8 @@ use crate::workflow_protocol::{
 };
 
 /// One activity task delivered by Core. The same representation is used for
-/// remote server activities and the local-activity lane; Core's internal
-/// `is_local` bit does not change how the registered OCaml implementation is
-/// invoked or how its result is completed.
+/// remote server activities and the local-activity lane; the start variant
+/// retains Core's locality bit because local activities cannot defer completion.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ActivityTask {
@@ -32,7 +31,7 @@ pub struct ActivityTask {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ActivityTaskVariant {
-    /// Begin one remote activity attempt.
+    /// Begin one remote or local activity attempt.
     Start(Box<ActivityStart>),
     /// Request cancellation of an already running attempt.
     Cancel(ActivityCancel),
@@ -52,6 +51,9 @@ pub struct ActivityStart {
     pub activity_id: String,
     /// Registered activity type to invoke.
     pub activity_type: String,
+    /// Whether Core delivered this through the local-activity lane. Local
+    /// activities must complete synchronously rather than hand off a token.
+    pub is_local: bool,
     /// User headers delivered to activity interceptors.
     pub header_fields: BTreeMap<String, Payload>,
     /// Ordered activity arguments.
@@ -442,7 +444,8 @@ use temporalio_protos::{
     temporal::api::common::v1 as api_common,
 };
 
-/// Converts an official remote activity task without exposing protobuf.
+/// Converts an official activity task without exposing protobuf or losing
+/// the local-only completion restriction.
 pub fn task_from_core(
     value: &core_task::ActivityTask,
 ) -> Result<ActivityTask, CoreConversionError> {
@@ -465,6 +468,7 @@ pub fn task_from_core(
                 },
                 activity_id: start.activity_id.clone(),
                 activity_type: start.activity_type.clone(),
+                is_local: start.is_local,
                 header_fields: start
                     .header_fields
                     .iter()

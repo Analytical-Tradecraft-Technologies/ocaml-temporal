@@ -968,8 +968,10 @@ module Make (Supervisor : SUPERVISOR) = struct
       ~failure:(failure_of_error error) error
 
   (** Executes an asynchronous activity callback. The handle is dormant while
-      the callback runs; only an accepted [Will_complete_async] completion
-      causes [finish_lease] to publish and activate it. *)
+      the callback runs; only an accepted remote [Will_complete_async]
+      completion causes [finish_lease] to publish and activate it. Core cannot
+      accept this handoff for a local activity, so that outcome is converted to
+      an ordinary failure before a completion is queued. *)
   let process_async_start adapter token definition
       (start : Protocol.activity_start) =
     let activity_type = Some start.activity_type in
@@ -1037,24 +1039,37 @@ module Make (Supervisor : SUPERVISOR) = struct
                          reject_task_with_failure adapter ~token ~activity_type
                            ~failure diagnostic)
                  | Async_activity.Will_complete_async handle ->
-                     (match
-                        Async_activity.prepare_handoff ~expected:context_handle
-                          handle
-                      with
-                     | Error error ->
-                         reject_task adapter ~token ~activity_type
-                           (application_error ~path:"$.implementation.async_handle"
-                              error)
-                     | Ok () ->
-                         let completion =
-                           Protocol.
-                             {
-                               task_token = Bytes.copy token;
-                               result = Will_complete_async;
-                             }
-                         in
-                         enqueue_and_finish adapter ~token ~activity_type
-                           ~completion ~accepted_result:(Async_handoff handle))
+                     if start.is_local then begin
+                       (* The callback may retain the dormant handle. Close its
+                          current-attempt capability before acknowledging a
+                          failure, so no later operation can target this token.
+                          The failure lease remains retryable if native
+                          submission is genuinely uncertain. *)
+                       ignore (Async_activity.close context_handle);
+                       reject_task adapter ~token ~activity_type
+                         (make_error ~path:"$.implementation.async_handle"
+                            "local_async_unsupported"
+                            "local activities cannot be completed asynchronously")
+                     end
+                     else
+                       (match
+                          Async_activity.prepare_handoff ~expected:context_handle
+                            handle
+                        with
+                       | Error error ->
+                           reject_task adapter ~token ~activity_type
+                             (application_error ~path:"$.implementation.async_handle"
+                                error)
+                       | Ok () ->
+                           let completion =
+                             Protocol.
+                               {
+                                 task_token = Bytes.copy token;
+                                 result = Will_complete_async;
+                               }
+                           in
+                           enqueue_and_finish adapter ~token ~activity_type
+                             ~completion ~accepted_result:(Async_handoff handle))
                with exception_ ->
                  reject_task adapter ~token ~activity_type
                    (exception_error ~path:"$.implementation" exception_)))

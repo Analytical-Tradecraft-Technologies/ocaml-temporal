@@ -331,6 +331,7 @@ let start_task_fields ~heartbeat_details ~heartbeat_timeout ~token ~activity_typ
     ~input : Protocol.task =
   let start : Protocol.activity_start =
     {
+      is_local = false;
       workflow_namespace = "default";
       workflow_type = "test_workflow";
       workflow_execution =
