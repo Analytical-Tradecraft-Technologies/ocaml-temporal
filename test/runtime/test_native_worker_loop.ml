@@ -144,11 +144,93 @@ let test_busy_workflow_keeps_idle_activity_off_owner () =
   | Ok () -> ()
   | Error _ -> failwith "busy workflow fixture returned an unexpected error")
 
-(** When both lanes are idle, one native event wait at a time alternates
-    between their readiness signals. The sibling takes bounded local yields. *)
-let test_idle_native_waits_alternate () =
+(** A strict wait preference can strand both lanes in local yields when polls
+    are staggered: the preferred workflow lane always observes activity busy,
+    and the activity lane sees workflow idle but declines the wait token. After
+    one deferral in the same wait epoch, the activity lane must claim it. *)
+let test_staggered_idle_polls_eventually_enter_native_wait () =
+  let closed = Atomic.make false in
+  let workflow_polls = Atomic.make 0 in
+  let activity_polls = Atomic.make 0 in
+  let workflow_first_yield = Atomic.make false in
+  let activity_first_yield = Atomic.make false in
+  let workflow_second_yield = Atomic.make false in
+  let activity_native_wait = Atomic.make false in
+  let runner =
+    Domain.spawn (fun () ->
+      Loop.run ~closed:(fun () -> Atomic.get closed)
+        ~poll_workflow:(fun () ->
+          match Atomic.fetch_and_add workflow_polls 1 with
+          | 0 ->
+              await "first activity poll" (fun () ->
+                Atomic.get activity_polls >= 1);
+              Ok Loop.Not_ready
+          | 1 ->
+              await "second activity poll" (fun () ->
+                Atomic.get activity_polls >= 2);
+              Ok Loop.Not_ready
+          | _ ->
+              await "staggered fixture close" (fun () -> Atomic.get closed);
+              Ok Loop.Not_ready)
+        ~poll_activity:(fun () ->
+          match Atomic.fetch_and_add activity_polls 1 with
+          | 0 ->
+              await "first workflow local yield" (fun () ->
+                Atomic.get workflow_first_yield);
+              Ok Loop.Not_ready
+          | 1 ->
+              await "second workflow local yield" (fun () ->
+                Atomic.get workflow_second_yield);
+              Ok Loop.Not_ready
+          | _ -> Ok Loop.Not_ready)
+        ~wait_for_lane:(fun ~workflow_lane ~native_wait ->
+          if workflow_lane then begin
+            if native_wait then
+              failwith "preferred workflow waited while activity polled";
+            if not (Atomic.get workflow_first_yield) then begin
+              Atomic.set workflow_first_yield true;
+              await "first activity local yield" (fun () ->
+                Atomic.get activity_first_yield)
+            end
+            else begin
+              Atomic.set workflow_second_yield true;
+              await "activity native wait" (fun () -> Atomic.get closed)
+            end
+          end
+          else if native_wait then begin
+            Atomic.set activity_native_wait true;
+            Atomic.set closed true
+          end
+          else if not (Atomic.get activity_first_yield) then begin
+            Atomic.set activity_first_yield true;
+            await "second workflow poll" (fun () ->
+              Atomic.get workflow_polls >= 2)
+          end;
+          Ok ())
+        ~retry_pending:(fun ~workflow_lane:_ ->
+          failwith "staggered idle fixture entered completion retry"))
+  in
+  let observation =
+    try
+      await "native event wait after staggered idle polls" (fun () ->
+        Atomic.get activity_native_wait);
+      Ok ()
+    with exception_ -> Error exception_
+  in
+  Atomic.set closed true;
+  let run_result = Domain.join runner in
+  (match observation with Ok () -> () | Error exception_ -> raise exception_);
+  (match run_result with
+  | Ok () -> ()
+  | Error _ -> failwith "staggered idle fixture returned an unexpected error")
+
+(** When both lanes are idle, each eventually receives a native event wait and
+    the single token never admits two waits concurrently. Advisory preference
+    can be overtaken by the one-yield stagger fallback. *)
+let test_idle_native_waits_share_one_token () =
   let closed = Atomic.make false in
   let waits = Atomic.make [] in
+  let active_waits = Atomic.make 0 in
   let runner =
     Domain.spawn (fun () ->
       Loop.run ~closed:(fun () -> Atomic.get closed)
@@ -156,22 +238,28 @@ let test_idle_native_waits_alternate () =
         ~poll_activity:(fun () -> Ok Loop.Not_ready)
         ~wait_for_lane:(fun ~workflow_lane ~native_wait ->
           if native_wait then begin
+            if Atomic.fetch_and_add active_waits 1 <> 0 then
+              failwith "idle lanes entered simultaneous native waits";
             let observed = Atomic.get waits in
             Atomic.set waits (workflow_lane :: observed);
-            if List.length observed >= 3 then Atomic.set closed true
+            if List.length observed >= 7 then Atomic.set closed true;
+            Thread.delay 0.001;
+            ignore (Atomic.fetch_and_add active_waits (-1))
           end;
-          Thread.delay 0.001;
+          if not native_wait then Thread.delay 0.001;
           Ok ())
         ~retry_pending:(fun ~workflow_lane:_ ->
           failwith "idle lanes entered completion retry"))
   in
   let observation =
     try
-      await "four alternating native waits" (fun () ->
-        List.length (Atomic.get waits) >= 4);
+      await "eight native readiness waits" (fun () ->
+        List.length (Atomic.get waits) >= 8);
       let sequence = List.rev (Atomic.get waits) in
-      if sequence <> [true; false; true; false] then
-        failwith "idle native readiness waits did not alternate lanes";
+      if not (List.mem true sequence && List.mem false sequence) then
+        failwith
+          ("idle native readiness wait starved one lane: "
+          ^ String.concat "," (List.map string_of_bool sequence));
       Ok ()
     with exception_ -> Error exception_
   in
@@ -319,7 +407,8 @@ let test_closed_loop_does_not_poll () =
 let () =
   test_blocked_activity_does_not_block_workflow_or_overadmit ();
   test_busy_workflow_keeps_idle_activity_off_owner ();
-  test_idle_native_waits_alternate ();
+  test_staggered_idle_polls_eventually_enter_native_wait ();
+  test_idle_native_waits_share_one_token ();
   test_transient_completion_retries_and_progresses ();
   test_permanent_activity_error_stops_sibling_without_shutdown ();
   test_rejected_delivery_keeps_workflow_lane_live ();

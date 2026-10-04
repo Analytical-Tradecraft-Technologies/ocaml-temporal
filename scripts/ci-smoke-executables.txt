@@ -15,3 +15,4 @@ test/integration/temporal/worker/cache_eviction_worker.exe
 test/integration/temporal/worker/parent_child_restart_worker.exe
 test/integration/temporal/worker/smoke_worker.exe
 test/integration/test_core_lifecycle.exe
+test/integration/worker_poll_isolation/regression.exe

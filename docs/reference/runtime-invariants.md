@@ -270,9 +270,10 @@ and bridge, read the [documentation guide](../README.md) first.
 - Worker readiness waits are bounded to 100 ms and return `Not_ready` on a
   quiet lane, so a supervisor handler cannot strand a queued shutdown request.
   Only one idle execution lane enters a native wait at a time; the preferred
-  lane alternates after each wait. While its sibling is busy or already owns
-  the wait, a lane yields locally for 10 ms, then retries its nonblocking
-  poll. The poll reports a fatal Rust lane error even with no queued task.
+  lane alternates after each wait, with a one-yield fallback for staggered idle
+  polls. While its sibling is busy or already owns the wait, a lane yields
+  locally for 10 ms, then retries its nonblocking poll. The poll reports a
+  fatal Rust lane error even with no queued task.
 - The workflow execution Domain and capacity-one activity execution Domain
   share the same serialized supervisor mailbox. The activity adapter retains
   exclusive ownership of an attempt and its completion retry. Worker shutdown

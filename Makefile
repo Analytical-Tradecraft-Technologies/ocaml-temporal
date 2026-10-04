@@ -701,7 +701,7 @@ test-client-request-ids-live:
 # remains closed, then the fixture releases and shuts down its worker.
 .PHONY: test-worker-poll-isolation-live
 test-worker-poll-isolation-live:
-	$(RUN) dune exec test/integration/worker_poll_isolation/regression.exe -- check $(TEMPORAL_CLIENT_TEST_URL)
+	$(COMPOSE_RUN) sh scripts/run-temporal-executable.sh --build-dir=/workspace/_build/worker-poll-isolation test/integration/worker_poll_isolation/regression.exe check $(TEMPORAL_CLIENT_TEST_URL)
 
 lint:
 	$(RUN) dune build @install $(DUNE_BUILD_ARGS)

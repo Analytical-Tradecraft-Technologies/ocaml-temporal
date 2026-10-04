@@ -20,9 +20,11 @@ operations on its owner Domain. The public worker loop also uses two private,
 bounded readiness operations (`Wait_workflow` and `Wait_activity`). They do not
 consume a task or return one; they wait for a wake-up from the corresponding
 Rust/Core poll lane. At most one of the two idle execution lanes enters a
-native wait at a time, alternating the preferred lane after each wait. If its
-sibling is busy or owns the native wait, a lane yields locally for 10 ms and
-then retries its nonblocking `try_poll_*` operation. This prevents an idle lane
+native wait at a time, alternating the preferred lane after each wait. A
+nonpreferred lane may claim the free wait after one local deferral if staggered
+polls keep the preferred lane from observing both lanes idle. If its sibling is
+busy or owns the native wait, a lane yields locally for 10 ms and then retries
+its nonblocking `try_poll_*` operation. This prevents an idle lane
 from repeatedly occupying the sole supervisor owner during work on the other
 lane. Rust poll-lane failures are also reported by `try_poll_*` when no task is
 queued, so local yields cannot conceal a fatal producer error. Native

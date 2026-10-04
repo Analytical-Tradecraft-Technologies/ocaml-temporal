@@ -23,7 +23,8 @@ type 'error lane_failure = Source_error of 'error | Raised of exn
     at most one idle lane occupy the native supervisor with a readiness wait;
     the other lane yields locally and keeps checking for its own work. *)
 let run_lane ~stopped ~poll ~wait ~retry_pending ~busy ~sibling_busy
-    ~wait_token ~prefer_workflow ~workflow_lane =
+    ~wait_token ~prefer_workflow ~wait_epoch ~workflow_lane =
+  let deferred_epoch = ref (-1) in
   let rec loop () =
     if stopped () then Ok ()
     else begin
@@ -39,18 +40,31 @@ let run_lane ~stopped ~poll ~wait ~retry_pending ~busy ~sibling_busy
               | Progress -> Ok ()
               | Not_ready ->
                   Atomic.set busy false;
+                  let epoch = Atomic.get wait_epoch in
+                  let sibling_is_busy = Atomic.get sibling_busy in
+                  let preferred = Atomic.get prefer_workflow = workflow_lane in
                   let native_wait =
-                    not (Atomic.get sibling_busy)
-                    && Atomic.get prefer_workflow = workflow_lane
+                    (not sibling_is_busy)
+                    && (preferred || !deferred_epoch = epoch)
+                    && Atomic.get wait_epoch = epoch
+                    && not (Atomic.get sibling_busy)
                     && Atomic.compare_and_set wait_token false true
                   in
                   if native_wait then
                     Fun.protect
                       ~finally:(fun () ->
                         Atomic.set prefer_workflow (not workflow_lane);
+                        ignore (Atomic.fetch_and_add wait_epoch 1);
                         Atomic.set wait_token false)
                       (fun () -> wait ~native_wait:true)
-                  else wait ~native_wait:false
+                  else begin
+                    (* Preference is advisory: if the favored lane keeps
+                       seeing its sibling busy, this lane may claim the next
+                       free token after one local yield in the same epoch. *)
+                    if not sibling_is_busy && not preferred then
+                      deferred_epoch := epoch;
+                    wait ~native_wait:false
+                  end
               | Retry_pending -> retry_pending ()
             in
             match wait_result with
@@ -73,6 +87,7 @@ let run ~closed ~poll_workflow ~poll_activity ~wait_for_lane ~retry_pending =
   let activity_busy = Atomic.make false in
   let wait_token = Atomic.make false in
   let prefer_workflow = Atomic.make true in
+  let wait_epoch = Atomic.make 0 in
   let stopped () = Atomic.get stop || closed () in
   let publish failure =
     ignore (Atomic.compare_and_set first_failure None (Some failure));
@@ -82,7 +97,7 @@ let run ~closed ~poll_workflow ~poll_activity ~wait_for_lane ~retry_pending =
     try
       match
         run_lane ~stopped ~poll ~busy ~sibling_busy ~wait_token
-          ~prefer_workflow ~workflow_lane
+          ~prefer_workflow ~wait_epoch ~workflow_lane
           ~wait:(fun ~native_wait -> wait_for_lane ~workflow_lane ~native_wait)
           ~retry_pending:(fun () -> retry_pending ~workflow_lane)
       with
