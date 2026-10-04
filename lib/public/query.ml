@@ -97,6 +97,10 @@ module Handler = struct
               | Error _ as error -> error
               | Ok value -> (
                   try Codec.encode query.output value with
+                  | Temporal_sdk_kernel.Scheduler.Workflow_aborted as exception_ ->
+                      raise exception_
+                  | Temporal_sdk_kernel.Future_store.Scheduler_shutdown as exception_ ->
+                      raise exception_
                   | exception_ ->
                       Error
                         (Error.defect
@@ -119,12 +123,14 @@ module Handler = struct
         dispatch_payloads = (fun payloads ->
           match payloads with
           | [ payload ] -> (
-              (* A codec is supplied by the application, so it may raise even
-                 though the normal codec contract is result-based.  Keep that
-                 exception inside the existential worker boundary and report
-                 it as a typed defect, just like callback and output codec
-                 failures below. *)
+              (* [Codec.make] reports ordinary callback exceptions as typed
+                 codec errors. Keep any unexpected codec exception inside the
+                 existential worker boundary as a defect. *)
               match Codec.decode query.input payload with
+              | exception (Temporal_sdk_kernel.Scheduler.Workflow_aborted as exception_) ->
+                  raise exception_
+              | exception (Temporal_sdk_kernel.Future_store.Scheduler_shutdown as exception_) ->
+                  raise exception_
               | exception exception_ ->
                   Error
                     (Error.defect
@@ -146,6 +152,10 @@ module Handler = struct
                   | Error _ as error -> error
                   | Ok output -> (
                       try Codec.encode query.output output with
+                      | Temporal_sdk_kernel.Scheduler.Workflow_aborted as exception_ ->
+                          raise exception_
+                      | Temporal_sdk_kernel.Future_store.Scheduler_shutdown as exception_ ->
+                          raise exception_
                       | exception_ ->
                           Error
                             (Error.defect
@@ -172,10 +182,10 @@ module Handler = struct
   (** Returns the name used by the dispatcher. *)
   let name (Handler { name; _ }) = name
 
-  (** Runs the query callback and encodes its output. Callback exceptions are
-      converted to defects so they cannot tear down the dispatcher; a raising
-      output codec is contained the same way so it cannot escape dispatch
-      half-applied. *)
+  (** Runs the query callback and encodes its output. Ordinary callback
+      exceptions become defects, and [Codec.make] reports ordinary codec
+      callback exceptions as typed codec errors. Scheduler control exceptions
+      from codecs still unwind the workflow fiber. *)
   let dispatch_payloads (Handler { dispatch_payloads; _ }) =
     dispatch_payloads
 

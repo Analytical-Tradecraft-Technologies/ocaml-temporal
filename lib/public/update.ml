@@ -63,11 +63,16 @@ module Handler = struct
       encode sequence. [on_validated] runs exactly once after input and
       validator checks succeed and immediately before the implementation. The
       runtime uses that boundary to acknowledge a handler before it parks on a
-      workflow future. Callback exceptions are converted to defects, except
+      workflow future. [Codec.make] reports ordinary codec callback exceptions
+      as typed codec errors. Handler callback exceptions become defects, except
       private terminal/shutdown control flow which belongs to the scheduler. *)
   let dispatch ?(run_validator = true) ?on_validated
       (Handler { definition; validator; implementation }) payload =
     match Codec.decode definition.input payload with
+    | exception (Temporal_sdk_kernel.Scheduler.Workflow_aborted as exception_) ->
+        raise exception_
+    | exception (Temporal_sdk_kernel.Future_store.Scheduler_shutdown as exception_) ->
+        raise exception_
     | exception exception_ ->
         Error
           (Error.defect
@@ -143,6 +148,10 @@ module Handler = struct
                 | Ok output -> (
                     match Codec.encode definition.output output with
                     | result -> result
+                    | exception (Temporal_sdk_kernel.Scheduler.Workflow_aborted as exception_) ->
+                        raise exception_
+                    | exception (Temporal_sdk_kernel.Future_store.Scheduler_shutdown as exception_) ->
+                        raise exception_
                     | exception exception_ ->
                         Error
                           (Error.defect

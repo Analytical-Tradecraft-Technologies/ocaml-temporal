@@ -36,9 +36,11 @@ let encoding_metadata metadata =
 let optional_wrapper_encoding = "binary/x-ocaml-optional"
 
 (** Builds a codec that writes one exact encoding name and validates that name
-    before invoking the decoder. User conversion failures remain typed errors,
-    so malformed data never escapes as an exception. Duplicate metadata names
-    are rejected before the callback runs, matching the strict bridge protocol.
+    before invoking the decoder. A callback's returned error is preserved, and
+    an ordinary callback exception becomes a typed codec error without exposing
+    its possibly sensitive exception message. Private scheduler control
+    exceptions still unwind the workflow fiber. Duplicate metadata names are
+    rejected before the callback runs, matching the strict bridge protocol.
 
     Claiming {!optional_wrapper_encoding} is a programmer error: that name is
     reserved for the [option] combinator, so [make] raises [Invalid_argument]
@@ -48,15 +50,33 @@ let make ~encoding ~encode ~decode =
     invalid_arg
       (Printf.sprintf "Codec.make: encoding %S is reserved for Codec.option"
          optional_wrapper_encoding);
+  (* Catch only the application callback. A returned [Error] keeps its identity,
+     and no payload or exception text enters an SDK diagnostic. Terminal and
+     shutdown control exceptions must still unwind their workflow fiber. *)
+  let protect_callback operation callback input =
+    match callback input with
+    | exception (Temporal_sdk_kernel.Scheduler.Workflow_aborted as exception_) ->
+        raise exception_
+    | exception (Temporal_sdk_kernel.Future_store.Scheduler_shutdown as exception_) ->
+        raise exception_
+    | exception _ ->
+        Error
+          (Error.codec
+             ~message:
+               (Printf.sprintf "codec %S %s callback raised an exception"
+                  encoding operation))
+    | result -> result
+  in
   let encode_payload value =
     Result.map
       (fun data -> { metadata = [ ("encoding", encoding) ]; data })
-      (encode value)
+      (protect_callback "encode" encode value)
   in
   let decode_payload payload =
     match encoding_metadata payload.metadata with
     | Error error -> Error error
-    | Ok (Some actual) when String.equal actual encoding -> decode payload.data
+    | Ok (Some actual) when String.equal actual encoding ->
+        protect_callback "decode" decode payload.data
     | Ok (Some actual) ->
         Error
           (Error.codec

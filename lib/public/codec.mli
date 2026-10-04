@@ -10,7 +10,11 @@ type 'a t
     [encode] function converts a value to bytes, and [decode] converts those
     bytes back to a value. The SDK writes [encoding] into the payload metadata
     and checks it before decoding, preventing the wrong codec from reading a
-    payload.
+    payload. Errors returned by either callback are preserved. If a callback
+    raises an ordinary exception, [Codec.encode] or [Codec.decode] returns a
+    typed codec error without including the exception text, which might contain
+    payload data. Internal terminal and shutdown control exceptions still
+    unwind their workflow fiber.
 
     @raise Invalid_argument
       if [encoding] is ["binary/x-ocaml-optional"], which the SDK reserves for

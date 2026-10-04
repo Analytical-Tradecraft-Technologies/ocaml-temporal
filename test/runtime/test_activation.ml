@@ -1479,6 +1479,87 @@ let test_continue_as_new_terminal () =
   expect "continue-as-new ignores cancellation" []
     (Execution.activate execution [ Activation.Cancel_workflow ])
 
+(** A custom codec can run inside a workflow while encoding a command. A
+    terminal operation inside that callback must unwind the fiber instead of
+    becoming a codec error and resuming the caller after termination. *)
+let test_codec_callback_preserves_terminal_control () =
+  let successor =
+    Temporal.Workflow.remote ~name:"codec_continuation_target"
+      ~input:Temporal.Codec.unit ~output:Temporal.Codec.unit
+  in
+  let input =
+    Temporal.Codec.make ~encoding:"test/terminal-control"
+      ~encode:(fun () -> Temporal.Workflow.continue_as_new successor ())
+      ~decode:(fun _ -> Ok ())
+  in
+  let activity =
+    Temporal.Activity.remote ~name:"codec_terminal_activity" ~input
+      ~output:Temporal.Codec.unit
+  in
+  let resumed_after_terminal = ref false in
+  let source =
+    Temporal.Workflow.define ~name:"codec_terminal_source"
+      ~input:Temporal.Codec.unit ~output:Temporal.Codec.unit (fun () ->
+        ignore (Temporal.Activity.start_handle activity ());
+        resumed_after_terminal := true;
+        Ok ())
+  in
+  let expected =
+    let successor_input =
+      match Temporal.Codec.encode Temporal.Codec.unit () with
+      | Ok payload -> base_payload payload
+      | Error error -> failwith (Temporal.Error.message error)
+    in
+    [ Activation.Continue_as_new
+        { workflow_type = "codec_continuation_target";
+          input = successor_input } ]
+  in
+  expect "activity codec callback terminal command" expected
+    (Execution.activate (Execution.start source ()) [ Activation.Start_workflow ]);
+  expect "activity codec callback did not resume after termination" false
+    !resumed_after_terminal;
+  let signal = Temporal.Signal.define ~name:"codec_terminal_signal" ~input in
+  let handler = Temporal.Signal.Handler.make signal (fun () -> Ok ()) in
+  let dispatcher =
+    match Temporal.Interaction.create ~signals:[ handler ] () with
+    | Ok dispatcher -> dispatcher
+    | Error error -> failwith (Temporal.Error.message error)
+  in
+  let resumed_after_interaction = ref false in
+  let interaction_source =
+    Temporal.Workflow.define ~name:"codec_terminal_interaction_source"
+      ~input:Temporal.Codec.unit ~output:Temporal.Codec.unit (fun () ->
+        ignore (Temporal.Interaction.signal dispatcher signal ());
+        resumed_after_interaction := true;
+        Ok ())
+  in
+  expect "interaction codec callback terminal command" expected
+    (Execution.activate
+       (Execution.start interaction_source ())
+       [ Activation.Start_workflow ]);
+  expect "interaction codec callback did not resume after termination" false
+    !resumed_after_interaction
+
+(** Releasing a codec callback parked on a future must unwind its continuation
+    without converting scheduler shutdown into a codec result. *)
+let test_codec_callback_preserves_shutdown_control () =
+  let scheduler = Scheduler.create () in
+  let pending, _ = Scheduler.promise scheduler ~outside_error:(fun () -> ()) in
+  let codec =
+    Temporal.Codec.make ~encoding:"test/shutdown-control"
+      ~encode:(fun () ->
+        ignore (Future_store.await pending);
+        Ok Bytes.empty)
+      ~decode:(fun _ -> Ok ())
+  in
+  let resumed_after_shutdown = ref false in
+  Scheduler.spawn scheduler (fun () ->
+      ignore (Temporal.Codec.encode codec ());
+      resumed_after_shutdown := true);
+  expect "codec callback parked" "blocked" (Scheduler.run_label scheduler);
+  Scheduler.shutdown scheduler;
+  expect "codec callback did not resume after shutdown" false
+    !resumed_after_shutdown
 
 (** A continue-as-new whose successor input cannot be encoded must still seal
     the execution: the failure command is terminal, and a later cancellation
@@ -2069,6 +2150,8 @@ let () =
   test_child_resolution_rejections_preserve_lifecycle_state ();
   test_cancel_and_evict ();
   test_continue_as_new_terminal ();
+  test_codec_callback_preserves_terminal_control ();
+  test_codec_callback_preserves_shutdown_control ();
   test_continue_as_new_encode_failure_is_terminal ();
   test_terminal_finally_cannot_emit_cancel ();
   test_continue_as_new_finally_cannot_emit_cancel ();
