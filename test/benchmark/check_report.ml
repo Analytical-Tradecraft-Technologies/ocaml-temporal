@@ -39,8 +39,7 @@ let check_phase ~attempts ~latencies phase =
 
 (** Checks the JSON emitted by the actual minimal activation workload. *)
 let () =
-  if Array.length Sys.argv <> 2 then failwith "expected report path";
-  let report = Yojson.Basic.from_file Sys.argv.(1) in
+  let report = Yojson.Basic.from_channel stdin in
   expect (integer report "schema_version" = 1) "unexpected report schema";
   expect
     (Json.(report |> member "suite" |> to_string) = "local-minimal-activation")

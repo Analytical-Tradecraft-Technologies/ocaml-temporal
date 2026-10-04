@@ -17,10 +17,9 @@
       (setenv BENCH_DUNE_PROFILE dev
        (setenv BENCH_BASE_IMAGE_REFERENCE test-image
         (setenv BENCH_DEVELOPMENT_IMAGE_ID unavailable
-         (progn
-          (with-stdout-to benchmark-report.json
-           (run %{test} --warmup 1 --samples 3 --repetitions 1 --seed 1))
-          (run %{exe:check_report.exe} benchmark-report.json)))))))))))
+         (pipe-stdout
+          (run %{test} --warmup 1 --samples 3 --repetitions 1 --seed 1)
+          (run %{exe:check_report.exe})))))))))))
 
 (executable
  (name check_report)
