@@ -19,7 +19,42 @@
         (setenv BENCH_DEVELOPMENT_IMAGE_ID unavailable
          (pipe-stdout
           (run %{test} --warmup 1 --samples 3 --repetitions 1 --seed 1)
-          (run %{exe:check_report.exe})))))))))))
+          (run %{exe:check_report.exe} local-minimal-activation 3)))))))))))
+
+(test
+ (name bench_warm_activation)
+ (modules bench_warm_activation)
+ (libraries benchmark_harness temporal_base temporal_runtime)
+ (action
+  (setenv BENCH_SOURCE_COMMIT test-commit
+   (setenv BENCH_SOURCE_DIRTY false
+    (setenv BENCH_SDK_VERSION test-version
+     (setenv BENCH_CORE_REVISION test-core
+      (setenv BENCH_DUNE_PROFILE dev
+       (setenv BENCH_BASE_IMAGE_REFERENCE test-image
+        (setenv BENCH_DEVELOPMENT_IMAGE_ID unavailable
+         (pipe-stdout
+          (run %{test} --warmup 1 --samples 3 --repetitions 1 --seed 1)
+          (run %{exe:check_report.exe} ocaml-warm-cache-activation 3)))))))))))
+
+(test
+ (name bench_cold_replay)
+ (modules bench_cold_replay)
+ (deps ../integration/temporal/initial_signals/history.replay.json)
+ (libraries benchmark_harness temporal-sdk temporal_runtime temporal_sdk_supervisor unix)
+ (action
+  (setenv BENCH_SOURCE_COMMIT test-commit
+   (setenv BENCH_SOURCE_DIRTY false
+    (setenv BENCH_SDK_VERSION test-version
+     (setenv BENCH_CORE_REVISION test-core
+      (setenv BENCH_DUNE_PROFILE dev
+       (setenv BENCH_BASE_IMAGE_REFERENCE test-image
+        (setenv BENCH_DEVELOPMENT_IMAGE_ID unavailable
+         (setenv BENCH_REPLAY_HISTORY
+          %{dep:../integration/temporal/initial_signals/history.replay.json}
+          (pipe-stdout
+           (run %{test} --warmup 1 --samples 2 --repetitions 1 --seed 1)
+           (run %{exe:check_report.exe} core-cold-replay 2))))))))))))
 
 (executable
  (name check_report)

@@ -5,6 +5,10 @@
 type config = { warmup : int; samples : int; repetitions : int; seed : string }
 (** Bounded command-line inputs for one reproducible benchmark invocation. *)
 
+type workload = { sample : string -> unit; close : unit -> unit }
+(** One repetition's independently owned workload. [sample] runs inside the
+    timed phase; [close] releases its state after both phases, even on error. *)
+
 type phase = {
   elapsed_seconds : float;
   latencies_us : float list;
@@ -164,11 +168,13 @@ let runtime_uname () =
     value
   with _ -> "unavailable"
 
-(** Runs a supplied workload across repetitions and prints one versioned report.
-    Extra configuration describes suite-specific workload dimensions; each key
-    must be unique and must not shadow the shared configuration keys. The
-    process exits nonzero after writing the report if any sample failed. *)
-let run ~suite ~boundary ~server_version ~workload_config ~workload () =
+(** Runs independently prepared workloads across repetitions and prints one
+    versioned report. Preparation and cleanup are outside each timed phase; each
+    sample, including its validation, is inside. Extra configuration describes
+    suite-specific dimensions and must not shadow shared keys. The process exits
+    nonzero after writing the report if any sample failed. *)
+let run_repetitions ~suite ~boundary ~server_version ~workload_config
+    ~make_workload () =
   let config = parse_config () in
   let source_commit = required_env "BENCH_SOURCE_COMMIT" in
   let source_dirty = required_env "BENCH_SOURCE_DIRTY" in
@@ -182,21 +188,23 @@ let run ~suite ~boundary ~server_version ~workload_config ~workload () =
   let total_errors = ref 0 in
   let repetitions =
     List.init config.repetitions (fun index ->
-        let warmup =
-          run_phase ~workload ~record_latencies:false ~count:config.warmup
-            ~seed:config.seed
-        in
-        let measured =
-          run_phase ~workload ~record_latencies:true ~count:config.samples
-            ~seed:config.seed
-        in
-        total_errors := !total_errors + warmup.errors + measured.errors;
-        `Assoc
-          [
-            ("index", `Int (index + 1));
-            ("warmup", phase_json ~count:config.warmup warmup);
-            ("measurement", phase_json ~count:config.samples measured);
-          ])
+        let workload = make_workload config in
+        Fun.protect ~finally:workload.close (fun () ->
+            let warmup =
+              run_phase ~workload:workload.sample ~record_latencies:false
+                ~count:config.warmup ~seed:config.seed
+            in
+            let measured =
+              run_phase ~workload:workload.sample ~record_latencies:true
+                ~count:config.samples ~seed:config.seed
+            in
+            total_errors := !total_errors + warmup.errors + measured.errors;
+            `Assoc
+              [
+                ("index", `Int (index + 1));
+                ("warmup", phase_json ~count:config.warmup warmup);
+                ("measurement", phase_json ~count:config.samples measured);
+              ]))
   in
   let report =
     `Assoc
@@ -251,3 +259,10 @@ let run ~suite ~boundary ~server_version ~workload_config ~workload () =
   Yojson.Basic.pretty_to_channel stdout report;
   output_char stdout '\n';
   if !total_errors <> 0 then exit 1
+
+(** Keeps the original stateless-workload entry point for suites that create and
+    release all of their state within each timed sample. *)
+let run ~suite ~boundary ~server_version ~workload_config ~workload () =
+  run_repetitions ~suite ~boundary ~server_version ~workload_config
+    ~make_workload:(fun _ -> { sample = workload; close = (fun () -> ()) })
+    ()
