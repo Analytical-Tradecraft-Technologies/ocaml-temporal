@@ -105,9 +105,17 @@ BENCH_REPETITIONS ?= 3
 BENCH_SEED ?= 1
 BENCH_HOST_LABEL ?= unspecified
 BENCH_REPORT ?= _build/benchmarks/local-minimal-activation.json
+BENCH_EXECUTABLE ?= bench_local_activation
+BENCH_REPLAY_HISTORY ?= test/integration/temporal/initial_signals/history.replay.json
+BENCH_WARM_REPORT ?= _build/benchmarks/ocaml-warm-cache-activation.json
+BENCH_COLD_REPORT ?= _build/benchmarks/core-cold-replay.json
+BENCH_COLD_WARMUP ?= 1
+BENCH_COLD_SAMPLES ?= 10
+BENCH_COLD_REPETITIONS ?= 3
 
 .PHONY: test-temporal-live-ci test-temporal-diagnostics-contract
-.PHONY: bench
+.PHONY: bench bench-activation bench-activation-warm bench-activation-cold
+.NOTPARALLEL: bench-activation
 .PHONY: version-check build build-examples cargo-metadata test test-unit test-runtime test-rust test-bridge test-install test-api release-preflight release-tag-check test-quality-contract test-temporal-config test-temporal-worker-readiness-contract test-temporal-worker-stop-contract test-temporal-worker-crash-recovery-contract test-temporal-worker-cache-eviction-contract test-core-lifecycle-integration temporal-start temporal-start-worker temporal-run-driver temporal-inspect-smoke temporal-stop-worker test-temporal-two-binary test-temporal-integration test-temporal-worker-restart test-temporal-worker-restart-contract test-temporal-worker-restart-live test-temporal-worker-crash-recovery test-temporal-worker-cache-eviction test-temporal-worker-cache-eviction-live test-temporal-workflow-patching test-temporal-workflow-patching-contract test-temporal-workflow-patching-live test-temporal-parent-child-restart test-temporal-parent-child-restart-contract test-temporal-parent-child-restart-live test-temporal-parent-child-failure-replay test-temporal-parent-child-failure-replay-contract test-temporal-parent-child-failure-replay-live temporal-health temporal-status temporal-logs temporal-stop temporal-clean lint lint-rust fmt quality quality-tool-version-check quality-rust quality-spelling license-check audit clean verify check native-version-check native-build native-test native-test-rust native-test-install native-lint native-lint-rust native-verify
 version-check:
 	@output="$$( $(RUN) ocamlc -version )" || exit $$?; \
@@ -133,7 +141,7 @@ build-examples:
 cargo-metadata:
 	@$(CARGO) metadata --manifest-path $(CARGO_MANIFEST) --locked --format-version 1
 
-# Runs only the local OCaml activation workload in the development container.
+# Runs one selected no-server activation workload in the development container.
 # It deliberately does not start Temporal Server or apply a performance gate.
 bench:
 	@set -eu; \
@@ -158,7 +166,8 @@ bench:
 		BENCH_BASE_IMAGE_REFERENCE="$(OCAML_IMAGE)" \
 		BENCH_DEVELOPMENT_IMAGE_ID="$$image_id" \
 		BENCH_HOST_LABEL="$(BENCH_HOST_LABEL)" \
-		opam exec -- dune exec --profile release test/benchmark/bench_local_activation.exe -- \
+		BENCH_REPLAY_HISTORY="$(BENCH_REPLAY_HISTORY)" \
+		opam exec -- dune exec --profile release test/benchmark/$(BENCH_EXECUTABLE).exe -- \
 		--warmup "$(BENCH_WARMUP)" --samples "$(BENCH_SAMPLES)" \
 		--repetitions "$(BENCH_REPETITIONS)" --seed "$(BENCH_SEED)" \
 		>"$$tmp" || status=$$?; \
@@ -169,6 +178,18 @@ bench:
 		status=1; \
 	fi; \
 	exit "$$status"
+
+# Run the two bounded activation scenarios independently; their timing
+# boundaries and throughput denominators differ and must not be combined.
+bench-activation: bench-activation-warm bench-activation-cold
+
+bench-activation-warm:
+	$(MAKE) bench BENCH_EXECUTABLE=bench_warm_activation BENCH_REPORT="$(BENCH_WARM_REPORT)"
+
+bench-activation-cold:
+	$(MAKE) bench BENCH_EXECUTABLE=bench_cold_replay BENCH_REPORT="$(BENCH_COLD_REPORT)" \
+		BENCH_WARMUP="$(BENCH_COLD_WARMUP)" BENCH_SAMPLES="$(BENCH_COLD_SAMPLES)" \
+		BENCH_REPETITIONS="$(BENCH_COLD_REPETITIONS)"
 
 test:
 	$(MAKE) test-temporal-config

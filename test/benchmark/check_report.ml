@@ -1,4 +1,4 @@
-(** Validates the tiny Dune smoke report's schema and bounded sample counts. *)
+(** Validates the tiny Dune smoke reports' schema and bounded sample counts. *)
 
 module Json = Yojson.Basic.Util
 
@@ -37,15 +37,34 @@ let check_phase ~attempts ~latencies phase =
   nonnegative_number phase "elapsed_seconds";
   nonnegative_number phase "throughput_successes_per_second"
 
-(** Checks the JSON emitted by the actual minimal activation workload. *)
+(** Checks a report emitted by one of the actual activation workloads. *)
 let () =
+  if Array.length Sys.argv <> 3 then
+    failwith "check_report expects suite and measured sample count";
+  let expected_suite = Sys.argv.(1) in
+  let samples = int_of_string Sys.argv.(2) in
   let report = Yojson.Basic.from_channel stdin in
   expect (integer report "schema_version" = 1) "unexpected report schema";
   expect
-    (Json.(report |> member "suite" |> to_string) = "local-minimal-activation")
+    (Json.(report |> member "suite" |> to_string) = expected_suite)
     "unexpected benchmark suite";
   ignore (object_field report "machine");
+  let config = Json.member "config" report in
   ignore (object_field report "config");
+  if expected_suite <> "local-minimal-activation" then (
+    expect
+      (integer config "admitted_concurrency" = 1)
+      "unexpected admitted concurrency";
+    expect
+      (Json.(config |> member "admission_model" |> to_string) = "closed_loop")
+      "unexpected admission model";
+    expect
+      (integer config "pending_attempt_backlog_peak" = 0)
+      "unexpected closed-loop backlog";
+    expect
+      (Json.(config |> member "saturation_observation" |> to_string)
+      = "not_exercised")
+      "unexpected saturation observation");
   let provenance = Json.member "provenance" report in
   expect
     (Json.(provenance |> member "dune_profile" |> to_string) = "dev")
@@ -57,12 +76,13 @@ let () =
   let totals = Json.member "totals" report in
   expect (integer totals "warmup_attempts" = 1) "unexpected warmup count";
   expect
-    (integer totals "measurement_attempts" = 3)
+    (integer totals "measurement_attempts" = samples)
     "unexpected measurement count";
   expect (integer totals "errors" = 0) "unexpected total errors";
   match list report "repetitions" with
   | [ repetition ] ->
       check_phase ~attempts:1 ~latencies:0 (Json.member "warmup" repetition);
-      check_phase ~attempts:3 ~latencies:3
-        (Json.member "measurement" repetition)
+      let measured = Json.member "measurement" repetition in
+      check_phase ~attempts:samples ~latencies:samples measured;
+      List.iter (nonnegative_number measured) [ "p50_us"; "p95_us"; "p99_us" ]
   | _ -> failwith "expected one benchmark repetition"
