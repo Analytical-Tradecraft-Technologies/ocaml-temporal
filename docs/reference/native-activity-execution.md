@@ -375,14 +375,14 @@ separate private exception classifier. An unexpected exception, protocol
 failure, invalid state, configuration error, or worker error remains
 non-retryable.
 
-`Temporal_runtime.Native_worker_loop` converts that explicit transient result
-to `Retry_pending`. The production activity Domain then uses the dedicated
-bounded 10 ms native retry backoff before polling again. The C bridge releases
-the OCaml runtime lock during that delay; it never blocks the workflow lane or
-holds the adapter mutex. Once the same copied completion is accepted, the next
-loop iteration is free to poll a new activity. Thus a lost completion
-acknowledgement cannot rerun user code, terminate an otherwise healthy worker,
-or create a busy spin.
+`Native_worker.poll_activity` converts that explicit transient result to
+`Retry_pending`. `Temporal_runtime.Native_worker_loop` then invokes the public
+worker's retry callback, which uses the dedicated bounded 10 ms native retry
+backoff before polling again. The C bridge releases the OCaml runtime lock
+during that delay; it never blocks the workflow lane or holds the adapter
+mutex. Once the same copied completion is accepted, the next loop iteration
+is free to poll a new activity. Thus a lost completion acknowledgement cannot
+rerun user code, terminate an otherwise healthy worker, or create a busy spin.
 
 The production source currently marks only the explicit bilateral `Retryable`
 status as safe for a completion retry. Generic `Connection` and `Not_ready`
