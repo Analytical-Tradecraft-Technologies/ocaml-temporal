@@ -622,7 +622,7 @@ let test_unrepresentable_context_retires_lease () =
             (fun retry ->
               let supervisor = fake_supervisor () in
               let bad_calls = ref 0 in
-              let good_calls = ref 0 in
+              let good_calls = Atomic.make 0 in
               let bad =
                 if async then
                   Adapter.register_async
@@ -640,7 +640,9 @@ let test_unrepresentable_context_retires_lease () =
               let good =
                 Temporal.Activity.define ~name:"after-bad-context"
                   ~input:Temporal.Codec.unit ~output:Temporal.Codec.unit
-                  (fun () -> incr good_calls; Ok ())
+                  (fun () ->
+                    ignore (Atomic.fetch_and_add good_calls 1);
+                    Ok ())
               in
               let heartbeat_details, heartbeat_timeout, path =
                 if binary_metadata then
@@ -711,15 +713,25 @@ let test_unrepresentable_context_retires_lease () =
                 | Error error -> Error error
                 | _ -> failwith "queued activity did not make progress"
               in
-              (match Loop.run ~closed:(fun () -> !good_calls = 1)
+              (match Loop.run ~closed:(fun () -> Atomic.get good_calls = 1)
                  ~poll_workflow:(fun () -> Ok Loop.Not_ready) ~poll_activity
-                 ~wait_for_lane:(fun ~workflow_lane:_ -> failwith "unexpected idle wait")
+                 ~wait_for_lane:(fun ~workflow_lane ->
+                   if not workflow_lane then failwith "unexpected activity wait";
+                   (* The independent workflow lane may wait before the queued
+                      activity has completed. Keep that fixture wait bounded. *)
+                   let deadline = Unix.gettimeofday () +. 5. in
+                   while Atomic.get good_calls = 0 do
+                     if Unix.gettimeofday () >= deadline then
+                       failwith "timed out waiting for queued activity";
+                     Domain.cpu_relax ()
+                   done;
+                   Ok ())
                  ~retry_pending:(fun ~workflow_lane:_ -> failwith "unexpected retry wait")
                with
               | Ok () -> ()
               | Error _ -> failwith "context rejection stopped the worker loop");
               match Worker.drain adapter with
-              | Ok () when !(supervisor.leased) = [] && !good_calls = 1 -> ()
+              | Ok () when !(supervisor.leased) = [] && Atomic.get good_calls = 1 -> ()
               | _ -> failwith "context rejection left unaccounted completion debt")
             [ false; true ])
         [ true; false ])

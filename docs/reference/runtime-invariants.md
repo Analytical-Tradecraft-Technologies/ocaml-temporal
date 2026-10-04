@@ -269,6 +269,12 @@ and bridge, read the [documentation guide](../README.md) first.
 - Blocking FFI calls occur only while the OCaml runtime lock is released.
 - Worker readiness waits are bounded to 100 ms and return `Not_ready` on a
   quiet lane, so a supervisor handler cannot strand a queued shutdown request.
+- The workflow execution Domain and capacity-one activity execution Domain
+  share the same serialized supervisor mailbox. The activity adapter retains
+  exclusive ownership of an attempt and its completion retry. Worker shutdown
+  joins that Domain before draining either adapter or releasing native handles;
+  a callback that never returns therefore leaves shutdown waiting without an
+  overall deadline (tracked by #495).
 - A retained activity completion may be retried only after the OCaml source
   receives the explicit bridge `Retryable` status. The pinned Core completion
   implementation removes the activity lease before suppressing generic network
@@ -293,9 +299,10 @@ and bridge, read the [documentation guide](../README.md) first.
   after the result is observed. If native shutdown raises before returning, the
   maps remain retained, a terminal-cleanup-pending flag schedules a detached
   retry, and the worker finalizer remains a last-resort path. A same-Domain
-  shutdown defect is different: it cannot acquire its own run mutex, but no
-  teardown has started, so it remains retryable for a later call from another
-  Domain.
+  shutdown defect from either execution Domain is different: it cannot wait
+  for its own lane to finish, but no teardown has started, so it remains
+  retryable for a later call from another Domain. The public wrapper checks
+  this before acquiring its shutdown mutex to avoid a cross-Domain deadlock.
 - Each Rust poll lane owns one mutex-protected pending count. Producers hold
   that mutex while publishing a queue message and its wake notification;
   the supervisor holds it while receiving and decrementing. A wake is never

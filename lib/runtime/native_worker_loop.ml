@@ -1,53 +1,78 @@
 (** The private native worker lane scheduler.
 
-    It deliberately does not know about Temporal protocol values or native
-    handles. The two typed adapters report only scheduling summaries, while
-    this module enforces the important liveness rule: a retained completion is
-    retried after a bounded wait instead of terminating the worker or spinning
-    on a permanently ready event. *)
+    Workflow activations stay on the calling Domain. One dedicated activity
+    Domain polls and executes activity callbacks, so a slow activity cannot
+    prevent an unrelated workflow activation from reaching Core. Both lanes
+    still enter the same owner-Domain supervisor mailbox for native operations.
+    The activity lane admits only one task at a time; a retained completion is
+    retried after a bounded backoff before another activity is polled. *)
 
 type progress =
   | Progress
   | Not_ready
   | Retry_pending
 
-(** Result-bind notation keeps bounded wait failures on the typed path. *)
-let ( let* ) = Result.bind
+(** The first fatal lane outcome is published across Domains without changing
+    the worker's shutdown flag. A later explicit shutdown must still own native
+    teardown even if [run] returned an error. *)
+type 'error lane_failure = Source_error of 'error | Raised of exn
 
-(** Returns the next lane to use when the worker has to wait for ordinary
-    readiness. Alternation prevents a workload with only one kind of task from
-    being delayed by repeatedly waiting on the other lane. *)
-let next_wait_lane workflow_lane = not workflow_lane
-
-(** Runs both serialized lanes until shutdown or a fatal error. The activity
-    lane is polled after the workflow lane, preserving the existing ordering;
-    retry-pending results are handled before ordinary progress so a retained
-    completion always receives its dedicated bounded backoff. *)
-let run ~closed ~poll_workflow ~poll_activity ~wait_for_lane ~retry_pending =
-  let rec loop wait_workflow_lane =
-    if closed () then Ok ()
+(** Runs one lane until shutdown or a sibling-lane failure. Polling and callback
+    execution remain sequential within a lane. Every wait is bounded by its
+    native implementation, so the sibling can observe a published stop. *)
+let run_lane ~stopped ~poll ~wait ~retry_pending =
+  let rec loop () =
+    if stopped () then Ok ()
     else
-      let workflow_result = poll_workflow () in
-      let activity_result =
-        match workflow_result with
-        | Error _ as error -> error
-        | Ok _ -> poll_activity ()
-      in
-      match (workflow_result, activity_result) with
-      | Error _, _ when closed () -> Ok ()
-      | _, Error _ when closed () -> Ok ()
-      | Error error, _ -> Error error
-      | _, Error error -> Error error
-      | Ok Retry_pending, _ ->
-          let* () = retry_pending ~workflow_lane:true in
-          loop (next_wait_lane wait_workflow_lane)
-      | _, Ok Retry_pending ->
-          let* () = retry_pending ~workflow_lane:false in
-          loop (next_wait_lane wait_workflow_lane)
-      | Ok Progress, _ | _, Ok Progress ->
-          loop (next_wait_lane wait_workflow_lane)
-      | Ok Not_ready, Ok Not_ready ->
-          let* () = wait_for_lane ~workflow_lane:wait_workflow_lane in
-          loop (next_wait_lane wait_workflow_lane)
+      match poll () with
+      | Error _ when stopped () -> Ok ()
+      | Error error -> Error error
+      | Ok progress ->
+          if stopped () then Ok ()
+          else
+            let wait_result =
+              match progress with
+              | Progress -> Ok ()
+              | Not_ready -> wait ()
+              | Retry_pending -> retry_pending ()
+            in
+            match wait_result with
+            | Error _ when stopped () -> Ok ()
+            | Error error -> Error error
+            | Ok () -> loop ()
   in
-  loop true
+  loop ()
+
+(** Runs the workflow and capacity-one activity lanes concurrently. The caller
+    joins the activity Domain on every ordinary result before returning; its
+    owner can therefore hold the worker lifecycle mutex until neither lane can
+    use an adapter or the native supervisor. An activity callback that never
+    returns also prevents this join and remains a bounded-shutdown limitation. *)
+let run ~closed ~poll_workflow ~poll_activity ~wait_for_lane ~retry_pending =
+  let stop = Atomic.make false in
+  let first_failure = Atomic.make None in
+  let stopped () = Atomic.get stop || closed () in
+  let publish failure =
+    ignore (Atomic.compare_and_set first_failure None (Some failure));
+    Atomic.set stop true
+  in
+  let guarded ~poll ~workflow_lane =
+    try
+      match
+        run_lane ~stopped ~poll
+          ~wait:(fun () -> wait_for_lane ~workflow_lane)
+          ~retry_pending:(fun () -> retry_pending ~workflow_lane)
+      with
+      | Ok () -> ()
+      | Error error -> publish (Source_error error)
+    with exception_ -> publish (Raised exception_)
+  in
+  let activity_domain =
+    Domain.spawn (fun () -> guarded ~poll:poll_activity ~workflow_lane:false)
+  in
+  guarded ~poll:poll_workflow ~workflow_lane:true;
+  Domain.join activity_domain;
+  match Atomic.get first_failure with
+  | None -> Ok ()
+  | Some (Source_error error) -> Error error
+  | Some (Raised exception_) -> raise exception_

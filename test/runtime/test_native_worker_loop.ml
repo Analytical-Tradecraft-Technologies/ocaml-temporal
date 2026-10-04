@@ -1,168 +1,218 @@
 (** Regression tests for the private native worker lane scheduler.
 
-    These tests use callbacks instead of a native worker so they can make the
-    liveness boundary deterministic: one activity completion rejection is
-    followed by a dedicated bounded retry backoff, then the exact same completion is
-    accepted and the loop can observe a subsequent task. A permanent protocol
-    error is kept fatal, proving that retry support cannot hide malformed or
-    unsafe boundary data. *)
+    Fake callbacks retain the scheduling contract without a Temporal server.
+    Atomic gates hold one activity callback while the workflow lane continues,
+    and every test wait has a deadline so a lost wake fails promptly. *)
 
 module Loop = Temporal_runtime.Native_worker_loop
 
-(** A small diagnostic type is enough for the scheduler because it does not
-    inspect error contents. The [retryable] bit is produced by the adapter's
-    explicit source classification, never inferred from message text. *)
+(** A diagnostic the scheduler must return without inspecting its contents. *)
 type source_error = { code : string; retryable : bool }
 
-(** A fake source records lane calls and exposes a single transient completion
-    rejection. [closed] is set only after the retry succeeds so the test proves
-    that the loop actually performed the retry before stopping. *)
-type fake_source = {
-  mutable activity_polls : int;
-  mutable activity_rejections : int;
-  mutable waits : bool list;
-  mutable retry_waits : bool list;
-  mutable closed : bool;
-}
+(** Waits for a cross-Domain observation with a test-only deadline. *)
+let await label predicate =
+  let deadline = Unix.gettimeofday () +. 5. in
+  while not (predicate ()) do
+    if Unix.gettimeofday () >= deadline then
+      failwith ("timed out waiting for " ^ label);
+    Domain.cpu_relax ()
+  done
 
-(** Creates the deterministic source used by the success-after-retry test. *)
-let fake_source () =
-  {
-    activity_polls = 0;
-    activity_rejections = 1;
-    waits = [];
-    retry_waits = [];
-    closed = false;
-  }
-
-(** The workflow lane has no work in this focused test. *)
+(** Returns no workflow work until the activity test closes its source. *)
 let idle_workflow () = Ok Loop.Not_ready
 
-(** The first activity poll reports a retained completion rejection. The second
-    poll accepts that exact completion, and the third poll represents a
-    subsequent activity task. Only after that subsequent task does the fixture
-    close, proving that retry does not strand the worker loop. *)
-let activity_after_one_rejection source () =
-  source.activity_polls <- source.activity_polls + 1;
-  if source.activity_rejections > 0 then begin
-    source.activity_rejections <- source.activity_rejections - 1;
-    (* The adapter has already classified and retained the exact completion;
-       the scheduler receives a scheduling outcome rather than a fatal error. *)
-    Ok Loop.Retry_pending
-  end
-  else if source.activity_polls = 2 then
-    Ok Loop.Progress
-  else begin
-    source.closed <- true;
-    Ok Loop.Progress
-  end
+(** A blocked activity must not prevent unrelated workflow progress. A second
+    activity is queued but cannot enter while the first holds the sole slot. *)
+let test_blocked_activity_does_not_block_workflow_or_overadmit () =
+  let closed = Atomic.make false in
+  let first_entered = Atomic.make false in
+  let release_first = Atomic.make false in
+  let workflow_progressed = Atomic.make false in
+  let second_entered = Atomic.make false in
+  let activity_polls = Atomic.make 0 in
+  let poll_workflow () =
+    if Atomic.get first_entered && not (Atomic.get workflow_progressed) then begin
+      Atomic.set workflow_progressed true;
+      Ok Loop.Progress
+    end
+    else Ok Loop.Not_ready
+  in
+  let poll_activity () =
+    match Atomic.fetch_and_add activity_polls 1 with
+    | 0 ->
+        Atomic.set first_entered true;
+        await "release of first activity" (fun () -> Atomic.get release_first);
+        Ok Loop.Progress
+    | 1 ->
+        Atomic.set second_entered true;
+        Atomic.set closed true;
+        Ok Loop.Progress
+    | _ -> failwith "capacity-one lane polled beyond the queued activities"
+  in
+  let wait_for_lane ~workflow_lane =
+    if workflow_lane then begin
+      if Atomic.get workflow_progressed then
+        await "second activity completion" (fun () -> Atomic.get closed)
+      else
+        await "first activity admission" (fun () -> Atomic.get first_entered);
+      Ok ()
+    end
+    else failwith "activity lane waited despite a queued task"
+  in
+  let runner =
+    Domain.spawn (fun () ->
+        Loop.run ~closed:(fun () -> Atomic.get closed) ~poll_workflow
+          ~poll_activity ~wait_for_lane
+          ~retry_pending:(fun ~workflow_lane:_ ->
+            failwith "queued activities entered completion retry"))
+  in
+  let observation =
+    try
+      await "first activity callback" (fun () -> Atomic.get first_entered);
+      await "workflow progress during blocked activity" (fun () ->
+          Atomic.get workflow_progressed);
+      if Atomic.get second_entered || Atomic.get activity_polls <> 1 then
+        failwith "second activity ran before the first callback completed";
+      Atomic.set release_first true;
+      await "second queued activity" (fun () -> Atomic.get second_entered);
+      Ok ()
+    with exception_ -> Error exception_
+  in
+  (* Release the fixture even if an assertion fails so the activity Domain can
+     leave its callback before the test reports that failure. *)
+  Atomic.set release_first true;
+  Atomic.set closed true;
+  let run_result = Domain.join runner in
+  begin match observation with
+  | Ok () -> ()
+  | Error exception_ -> raise exception_
+  end;
+  begin match run_result with
+  | Ok () -> ()
+  | Error _ -> failwith "concurrent worker lanes returned an unexpected error"
+  end;
+  if Atomic.get activity_polls <> 2 then
+    failwith "capacity-one lane did not process both queued activities"
 
-(** Records the requested lane without sleeping. Production supplies a native
-    bounded readiness wait; the fake only proves that the retry selects the
-    activity lane rather than spinning or waiting on workflow readiness. *)
-let record_wait source ~workflow_lane =
-  source.waits <- workflow_lane :: source.waits;
-  Ok ()
-
-(** Records the dedicated backoff callback separately from ordinary readiness.
-    Production supplies a native timer for this callback; keeping the two
-    traces distinct proves a retained completion does not accidentally use an
-    idle-lane wait or spin through the polling loop. *)
-let record_retry_wait source ~workflow_lane =
-  source.retry_waits <- workflow_lane :: source.retry_waits;
-  Ok ()
-
-(** Proves one transient completion rejection is retried after exactly one
-    dedicated bounded backoff and then allows the worker loop to finish
-    normally. *)
+(** One retained completion receives a backoff and does not rerun its callback.
+    The third poll is a distinct task, proving the lane stays live afterward. *)
 let test_transient_completion_retries_and_progresses () =
-  let source = fake_source () in
+  let closed = Atomic.make false in
+  let activity_polls = Atomic.make 0 in
+  let callback_calls = Atomic.make 0 in
+  let retry_waits = Atomic.make 0 in
+  let poll_activity () =
+    match Atomic.fetch_and_add activity_polls 1 with
+    | 0 ->
+        ignore (Atomic.fetch_and_add callback_calls 1);
+        Ok Loop.Retry_pending
+    | 1 ->
+        if Atomic.get retry_waits <> 1 then
+          failwith "retained completion was retried before its backoff";
+        Ok Loop.Progress
+    | 2 ->
+        ignore (Atomic.fetch_and_add callback_calls 1);
+        Atomic.set closed true;
+        Ok Loop.Progress
+    | _ -> failwith "activity lane polled after fixture completion"
+  in
   begin match
-    Loop.run ~closed:(fun () -> source.closed)
-      ~poll_workflow:idle_workflow
-      ~poll_activity:(activity_after_one_rejection source)
-      ~wait_for_lane:(record_wait source)
-      ~retry_pending:(record_retry_wait source)
+    Loop.run ~closed:(fun () -> Atomic.get closed)
+      ~poll_workflow:idle_workflow ~poll_activity
+      ~wait_for_lane:(fun ~workflow_lane ->
+        if not workflow_lane then
+          failwith "retained completion used ordinary activity readiness";
+        await "activity completion retry" (fun () -> Atomic.get closed);
+        Ok ())
+      ~retry_pending:(fun ~workflow_lane ->
+        if workflow_lane then
+          failwith "activity completion used workflow retry backoff";
+        ignore (Atomic.fetch_and_add retry_waits 1);
+        Ok ())
   with
   | Ok () -> ()
   | Error _ -> failwith "transient completion rejection stopped worker loop"
   end;
-  if source.activity_polls <> 3 then
-    failwith
-      "worker loop did not retry the retained completion and then process a subsequent task";
-  begin match source.retry_waits with
-  | [ false ] -> ()
-  | _ -> failwith "worker loop did not apply dedicated activity-lane backoff"
-  end;
-  if source.waits <> [] then
-    failwith "retry-pending completion used ordinary readiness wait"
+  if Atomic.get activity_polls <> 3 || Atomic.get callback_calls <> 2 then
+    failwith "retained completion retry redispatched a callback or lost a task";
+  if Atomic.get retry_waits <> 1 then
+    failwith "retained completion did not receive one activity backoff"
 
-(** A permanent/protocol failure must stop the loop immediately. In
-    particular, the scheduler must not reinterpret a protocol error as a
-    transport retry merely because both errors use the same result channel. *)
-let test_permanent_protocol_error_remains_fatal () =
-  let waits = ref [] in
+(** A fatal activity error stops the sibling and preserves the error without
+    setting the external shutdown flag; explicit teardown still owns that flag. *)
+let test_permanent_activity_error_stops_sibling_without_shutdown () =
+  let closed = Atomic.make false in
+  let workflow_started = Atomic.make false in
+  let activity_failed = Atomic.make false in
+  let activity_polls = Atomic.make 0 in
   let error = { code = "protocol"; retryable = false } in
   begin match
-    Loop.run ~closed:(fun () -> false)
-      ~poll_workflow:idle_workflow
-      ~poll_activity:(fun () -> Error error)
+    Loop.run ~closed:(fun () -> Atomic.get closed)
+      ~poll_workflow:(fun () ->
+        Atomic.set workflow_started true;
+        Ok Loop.Not_ready)
+      ~poll_activity:(fun () ->
+        ignore (Atomic.fetch_and_add activity_polls 1);
+        await "workflow lane startup" (fun () -> Atomic.get workflow_started);
+        Atomic.set activity_failed true;
+        Error error)
       ~wait_for_lane:(fun ~workflow_lane ->
-        waits := workflow_lane :: !waits;
+        if not workflow_lane then
+          failwith "fatal activity error entered activity readiness wait";
+        await "fatal activity result" (fun () -> Atomic.get activity_failed);
         Ok ())
-      ~retry_pending:(fun ~workflow_lane ->
-        waits := workflow_lane :: !waits;
-        Ok ())
+      ~retry_pending:(fun ~workflow_lane:_ ->
+        failwith "permanent activity error entered retry backoff")
   with
   | Error returned
     when returned.code = error.code && returned.retryable = error.retryable ->
       ()
-  | Error _ -> failwith "permanent protocol error was rewritten"
-  | Ok () -> failwith "permanent protocol error did not stop worker loop"
+  | Error _ -> failwith "permanent activity error was rewritten"
+  | Ok () -> failwith "permanent activity error did not stop worker loop"
   end;
-  if !waits <> [] then
-    failwith "permanent protocol error incorrectly entered retry wait"
+  if Atomic.get closed then
+    failwith "lane failure changed the worker shutdown admission flag";
+  if Atomic.get activity_polls <> 1 then
+    failwith "fatal activity error caused another activity poll"
 
-(** A successful Core rejection is surfaced as [Not_ready] after the native
-    bounded backoff. Repeated unsupported deliveries must leave this scheduler
-    free to observe the next healthy workflow, rather than ending Worker.run. *)
+(** Rejected workflow deliveries leave the lane free to observe a later healthy
+    task while the idle activity Domain waits for completion. *)
 let test_rejected_delivery_keeps_workflow_lane_live () =
-  let workflow_polls = ref 0 in
-  let waits = ref 0 in
-  let closed = ref false in
+  let workflow_polls = Atomic.make 0 in
+  let workflow_waits = Atomic.make 0 in
+  let closed = Atomic.make false in
   let poll_workflow () =
-    incr workflow_polls;
-    if !workflow_polls <= 2 then Ok Loop.Not_ready
+    if Atomic.fetch_and_add workflow_polls 1 < 2 then Ok Loop.Not_ready
     else begin
-      closed := true;
+      Atomic.set closed true;
       Ok Loop.Progress
     end
   in
   begin match
-    Loop.run ~closed:(fun () -> !closed)
-      ~poll_workflow
+    Loop.run ~closed:(fun () -> Atomic.get closed) ~poll_workflow
       ~poll_activity:(fun () -> Ok Loop.Not_ready)
-      ~wait_for_lane:(fun ~workflow_lane:_ -> incr waits; Ok ())
+      ~wait_for_lane:(fun ~workflow_lane ->
+        if workflow_lane then ignore (Atomic.fetch_and_add workflow_waits 1)
+        else await "workflow completion" (fun () -> Atomic.get closed);
+        Ok ())
       ~retry_pending:(fun ~workflow_lane:_ ->
         failwith "rejected workflow delivery entered activity retry path")
   with
   | Ok () -> ()
   | Error _ -> failwith "rejected workflow delivery stopped the worker loop"
   end;
-  if !workflow_polls <> 3 || !waits <> 2 then
-    failwith "worker did not advance beyond rejected workflow deliveries"
+  if Atomic.get workflow_polls <> 3 || Atomic.get workflow_waits <> 2 then
+    failwith "workflow lane did not advance beyond rejected deliveries"
 
-(** A native stop request must short-circuit before either readiness lane or
-    retry callback is touched. This protects shutdown liveness from a future
-    loop refactor that accidentally polls a retired supervisor once more. *)
+(** A native stop request short-circuits before either lane is touched. *)
 let test_closed_loop_does_not_poll () =
-  let calls = ref 0 in
+  let calls = Atomic.make 0 in
   let unexpected_poll () =
-    incr calls;
+    ignore (Atomic.fetch_and_add calls 1);
     failwith "closed worker loop polled a backend lane"
   in
   let unexpected_wait ~workflow_lane:_ =
-    incr calls;
+    ignore (Atomic.fetch_and_add calls 1);
     failwith "closed worker loop waited on a backend lane"
   in
   match
@@ -170,13 +220,14 @@ let test_closed_loop_does_not_poll () =
       ~poll_workflow:unexpected_poll ~poll_activity:unexpected_poll
       ~wait_for_lane:unexpected_wait ~retry_pending:unexpected_wait
   with
-  | Ok () when !calls = 0 -> ()
+  | Ok () when Atomic.get calls = 0 -> ()
   | Ok () -> failwith "closed worker loop invoked a backend callback"
   | Error _ -> failwith "closed worker loop returned an unexpected error"
 
 (** Runs the focused scheduler regressions. *)
 let () =
+  test_blocked_activity_does_not_block_workflow_or_overadmit ();
   test_transient_completion_retries_and_progresses ();
-  test_permanent_protocol_error_remains_fatal ();
+  test_permanent_activity_error_stops_sibling_without_shutdown ();
   test_rejected_delivery_keeps_workflow_lane_live ();
   test_closed_loop_does_not_poll ()
