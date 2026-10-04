@@ -114,11 +114,19 @@ let failed_handle error =
   { future = resolved (Error error); cancel = (fun ~reason:_ -> Error error) }
 
 (** Verifies an optional structured-cancellation scope before encoding and
-    again afterward, since application codec code can cancel that scope. This
-    keeps a cancelled scope from emitting a new start command. *)
+    again afterward, since application codec code can cancel that scope. A
+    query can read [Scope.check], but may never schedule a scoped command. *)
 let check_scope = function
   | None -> Ok ()
-  | Some scope -> Scope.check scope
+  | Some scope -> (
+      match Temporal_sdk_kernel.Workflow_context_store.current () with
+      | Some context
+        when Temporal_sdk_kernel.Workflow_context_store.in_owner_turn context ->
+          Scope.check scope
+      | _ ->
+          Error
+            (Error.defect
+               ~message:"scoped child start used outside a workflow scheduler turn"))
 
 (** Validates durable identity and encodes input before allocating a private
     sequence number. Consequently invalid requests cannot change command order

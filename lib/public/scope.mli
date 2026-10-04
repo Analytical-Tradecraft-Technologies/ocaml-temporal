@@ -52,8 +52,10 @@ val on_cancel :
 val is_cancelled : t -> (bool, Error.t) result
 
 (** Checks the scope without waiting. An active scope returns [Ok ()]; a
-    cancelled scope returns a typed [`Cancelled] error; and a foreign Domain
-    or stale handle returns a typed ownership defect. *)
+    cancelled scope returns a typed [`Cancelled] error. A synchronous query
+    handler may check its own live scope while workflow fibers are paused,
+    but cannot cancel or await it. A foreign Domain, other execution, or stale
+    handle returns a typed ownership defect. *)
 val check : t -> (unit, Error.t) result
 
 (** Awaits [future] while observing [scope]. A cancellation requested before

@@ -112,15 +112,19 @@ eviction. This establishes language-layer retention, not live server behavior.
 - `Temporal.Scope.create ()` succeeds only while a workflow execution is active
   on the current Domain. Outside workflow execution it returns a typed defect.
 - `Temporal.Scope.cancel`, `is_cancelled`, `check`, and `await` are all
-  owner-checked. They must run on the scheduler that created the scope while
-  that scheduler is processing workflow callbacks.
-- Calling a scope operation from another Domain, between scheduler runs, or
-  after workflow teardown returns a typed ownership defect. A retained scope
-  is not a cross-Domain synchronization primitive.
+  owner-checked. Cancellation and awaiting must run while the scheduler that
+  created the scope is processing workflow callbacks. The pure `is_cancelled`
+  and `check` reads may also run in a synchronous query for the same live
+  execution while its scheduler is paused.
+- Calling a scope operation from another Domain, outside an owning scheduler
+  turn or same-execution query, or after workflow teardown returns a typed
+  ownership defect. A retained scope is not a cross-Domain synchronization
+  primitive.
 - `Temporal.Scope.check` is a non-waiting guard: it returns `Ok ()` for an
   active scope and a typed `Cancelled` error after cancellation.
-- `Temporal.Scope.is_cancelled` reports the state without scheduling work, but
-  it has the same ownership checks as cancellation and awaiting.
+- `Temporal.Scope.is_cancelled` reports the state without scheduling work.
+  Like `check`, it may read through the query marker but cannot mutate or
+  resume workflow fibers.
 - Scope cancellation itself is a private deterministic signal. Only activity
   and child operations started with `~scope` register hooks that enqueue the
   corresponding server-cancellation command. Timer futures and unscoped

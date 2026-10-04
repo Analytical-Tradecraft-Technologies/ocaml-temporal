@@ -554,11 +554,13 @@ let run_with_deadline input =
 `Scope.check` is a non-blocking cancellation check, and `Scope.await` returns
 an `Error.t` with category `Cancelled` when the scope has been cancelled before
 the observed future completes. `Scope.is_cancelled` is also typed because
-status reads must be serialized with the owning workflow Domain. Every scope
-operation called between scheduler runs, from another OCaml Domain, or after
-shutdown returns a typed ownership defect. This keeps signal delivery
-deterministic and prevents a cancellation request or status read from racing
-the queue that owns the scope.
+status reads must be serialized with the owning workflow Domain. A synchronous
+query for the same live execution may call `Scope.is_cancelled` or `Scope.check`
+while the scheduler is paused; cancellation and awaiting still require an owner
+scheduler turn. Other calls between scheduler runs, calls from another OCaml
+Domain, and calls after shutdown return a typed ownership defect. This keeps
+signal delivery deterministic and prevents a cancellation request or status
+read from racing the queue that owns the scope.
 
 Scope cancellation is cooperative for local observation and structured for
 selected durable operations. Starting an activity or child workflow with

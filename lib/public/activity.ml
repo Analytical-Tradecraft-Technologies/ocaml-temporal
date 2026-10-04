@@ -567,10 +567,18 @@ let failed_handle error =
 
 (** Verifies an optional structured-cancellation scope before encoding and
     again afterward, since application codec code can cancel that scope. A
-    cancelled or foreign scope cannot cause a new Temporal command. *)
+    query can read [Scope.check], but may never schedule a scoped command. *)
 let check_scope = function
   | None -> Ok ()
-  | Some scope -> Scope.check scope
+  | Some scope -> (
+      match Temporal_sdk_kernel.Workflow_context_store.current () with
+      | Some context
+        when Temporal_sdk_kernel.Workflow_context_store.in_owner_turn context ->
+          Scope.check scope
+      | _ ->
+          Error
+            (Error.defect
+               ~message:"scoped activity start used outside a workflow scheduler turn"))
 
 (** Schedules an activity after validating command options and encoding input.
     Option validation deliberately happens first: a malformed activity ID or

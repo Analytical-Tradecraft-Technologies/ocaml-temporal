@@ -163,24 +163,25 @@ let on_cancel ?until scope hook =
           until;
         Ok ()
 
+(** Pure scope reads may run during an owner scheduler turn or from that
+    execution's synchronous query while its scheduler is paused. The query
+    marker grants no permission to mutate the scope or await its signal. *)
+let may_read_state scope =
+  owns_scheduler scope
+  || Temporal_sdk_kernel.Workflow_context_store.query_read_owner_matches
+       scope.owner_id
+
 (** Reports the scope state without scheduling work or touching the resolver.
-    A synchronous query may read its own live scope while the scheduler is
-    paused; the query marker grants no permission to cancel it. Foreign or
-    stale handles still return a typed defect before reading mutable state. *)
+    Foreign or stale handles return a typed defect before reading state. *)
 let is_cancelled scope =
-  if
-    not
-      (owns_scheduler scope
-      || Temporal_sdk_kernel.Workflow_context_store.query_read_owner_matches
-           scope.owner_id)
-  then Error (ownership_error "is_cancelled")
+  if not (may_read_state scope) then Error (ownership_error "is_cancelled")
   else Ok (match scope.state with Cancelled -> true | Active -> false)
 
 (** Returns the scope's current cancellation result. The owner check is kept
-    here rather than delegated to [is_cancelled] so the operation has one
-    clear typed failure for a foreign or already-shutdown execution. *)
+    here rather than delegated to [is_cancelled] so the operation has its own
+    typed failure for a foreign or already-shutdown execution. *)
 let check scope =
-  if not (owns_scheduler scope) then Error (ownership_error "check")
+  if not (may_read_state scope) then Error (ownership_error "check")
   else
     match scope.state with
     | Cancelled -> Error (cancellation_error ())
