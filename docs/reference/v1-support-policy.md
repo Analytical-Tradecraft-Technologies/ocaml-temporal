@@ -41,7 +41,7 @@ means no MVP capability claim, even if private machinery or partial APIs exist.
 | Workflow authoring | **Core candidate:** typed direct-style workflows, deterministic futures/conditions/time, durable timers, child workflows, and continue-as-new. Workflow code must yield and avoid nondeterministic I/O. | [Runtime tests](../../test/runtime/) and named [live scenarios](live-acceptance-coverage.md). Non-yielding code can block its process; process supervision remains necessary ([#493]). |
 | Remote activities | **Core candidate for bounded callbacks:** typed remote callbacks, retry/timeout policy, heartbeats, and result/failure handling. Application code must put finite deadlines on callback I/O and return within an application-defined budget. Activity delivery may repeat; callers must make external side effects idempotent. | [Native activity contract](native-activity-execution.md) and [live scenarios](live-acceptance-coverage.md). Callbacks currently execute serially under the polling lock: a blocked callback can indefinitely stop unrelated workflow progress ([#492]). Temporal activity timeouts do not interrupt the OCaml callback. |
 | Client control | **Core candidate:** start, exact-run wait/follow, typed signals, and exact-run cancellation requests with typed outcomes. A request acknowledgement does not prove handler execution or terminal completion; a transport timeout can leave an outcome uncertain. | [Client interface](../../lib/public/client.mli), [client tests](../../test/unit/test_client_worker.ml), and [live driver](../../test/integration/temporal/driver/smoke_driver.ml). Workflow-level cooperative cancellation/cleanup is excluded ([#514]). |
-| Worker and recovery | **Core candidate for supervised processes:** application-owned worker, same-version restart/replay, and selected crash recovery for the tested workload. The application operator must enforce a process-level deadline and force termination/replacement if callback execution or graceful shutdown stalls; outstanding work then depends on Temporal redelivery. | [Worker interface](../../lib/public/worker.mli) and the [live controller matrix](live-acceptance-coverage.md). The SDK has no end-to-end shutdown bound when a callback holds the run mutex ([#495]). Intermittent cache-eviction stalls at the same source SHA remain unqualified until root cause and repeated live runs satisfy [#501]; a single green controller is insufficient. |
+| Worker and recovery | **Core candidate for supervised processes:** application-owned worker, same-version restart/replay, and selected crash recovery for the tested workload. The application operator must enforce a process-level deadline and force termination/replacement if callback execution or graceful shutdown stalls; outstanding work then depends on Temporal redelivery. | [Worker interface](../../lib/public/worker.mli) and the [live controller matrix](live-acceptance-coverage.md). The SDK has no end-to-end shutdown bound when a callback holds the run mutex ([#495]). [#501] closed after [PR #555] fixed a polling-capacity mismatch and repeated live checks passed. The sole cause of the earlier 900-second timeout remains unproven; cache eviction must pass again on the exact candidate. |
 | Payloads and errors | **Core candidate:** built-in typed codecs, typed results/errors, and preservation of supported failure details. Application codecs own their schema and migration policy. | [Codec tests](../../test/unit/test_codec.ml), [error tests](../../test/unit/test_error.ml), installed-consumer tests, and selected live payload paths. Cross-SDK codec interoperability is not generally qualified. |
 | Queries and updates | **Experimental:** output/typed-input queries and immediate/suspended updates. | Existing [interaction tests](../../test/unit/test_interactions.ml) and named live cases do not prove read-only enforcement, validator safety, replay/eviction recovery, or all deadline cases ([#513], [#505]). |
 | Local and asynchronous activities | **Experimental:** local activity start/execution, retained asynchronous completion, and task-token completion/heartbeat. | Focused and limited live cases exist; retry/replay and lease ownership remain under investigation ([#691], [#692]). Do not depend on a process-local completion handle surviving replacement. |
@@ -107,11 +107,14 @@ For the **exact candidate commit**, retain:
    restart, crash recovery, cache eviction, parent/child replay, child failure
    after replay, and patching controllers. Retain run URL, logs, exact run IDs,
    histories, and residual limitations. Contract-only tests are not live
-   evidence. Because [#501] records repeated same-SHA cache-eviction stalls,
-   resolve its root cause and complete its predeclared repeated-live-run plan
-   before claiming worker recovery for the candidate. One green run does not
-   satisfy that gate. [#505] tracks broader conformance rather than silently
-   making it a prerequisite for every excluded capability.
+   evidence. The [#501 closeout] records ten fresh-stack local passes and
+   scheduled [October 2] and [October 3] master diagnostics with accepted A/B
+   runs and typed cancellation after [PR #555]. These runs support the
+   polling-capacity explanation but do not prove it was the sole cause of the
+   earlier 900-second timeout. They are prior-revision evidence: the exact
+   candidate must pass its own cache-eviction controller, and any new timeout
+   requires investigation. [#505] tracks broader conformance rather than
+   silently making it a prerequisite for every excluded capability.
 3. An explicit review of unresolved core-path defects and release notes that
    require bounded callback I/O and an external supervisor with a forced-exit
    deadline. A process kill is not graceful shutdown; document how Temporal
@@ -143,4 +146,8 @@ deployment remain separate decisions with their own evidence.
 [#514]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/514
 [#691]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/691
 [#692]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/692
+[#501 closeout]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/501#issuecomment-5978294089
+[October 2]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/37073688475
+[October 3]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/37156563875
+[PR #555]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/pull/555
 [PR #557]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/pull/557
