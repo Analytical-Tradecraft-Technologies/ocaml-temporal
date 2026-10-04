@@ -18,7 +18,7 @@ remain synchronous, while `define_async` provides an explicit capability for
 work that finishes after the worker callback returns.
 
 The private activity protocol has a closed `will_complete_async` result. The
-OCaml adapter now emits it only for `define_async` callbacks that return
+OCaml adapter now emits it only for remote `define_async` callbacks that return
 `Will_complete_async`, and the Rust bridge exposes separate namespace-bound
 client operations for the later terminal completion or heartbeat. The worker
 lease and the retained asynchronous lease are deliberately different state

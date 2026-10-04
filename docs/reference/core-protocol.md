@@ -22,11 +22,12 @@ ledger validates the run ID or opaque task token before Core sees a completion.
 
 ## Startup compatibility
 
-Compatibility number `1` covers the C layout and JSON contract. The bridge
-checks it once before creating an SDK runtime. It is absent from messages
-because OCaml and Rust are compiled and shipped together. A different number
-means a stale or partial build and fails startup; per-message negotiation and
-mixed versions are unsupported.
+ABI version `2` guards the C layout and operations. The bridge checks it once
+before creating an SDK runtime. It is absent from messages because OCaml and
+Rust are compiled and shipped together. Direct JSON documents are strictly
+validated and evolve with those paired sources; CI identifies prebuilt Rust
+artifacts by an exact source key. A different ABI version fails startup, while
+mixed source revisions are unsupported even when their ABI number matches.
 
 ## Two JSON layers
 
@@ -51,7 +52,7 @@ The operation-specific documents therefore start at their own schema root:
 | Client exact-run wait/cancel | wait or cancellation request and response | [client protocol](client-protocol.md) |
 | Client asynchronous activity completion/heartbeat | async completion or heartbeat request | [client protocol](client-protocol.md) |
 | Workflow worker poll/complete/reject | activation or completion | This document's workflow sections |
-| Remote activity worker poll/complete/heartbeat | task, completion, or heartbeat | [activity protocol](activity-protocol.md) |
+| Activity worker poll/complete/heartbeat | task, completion, or heartbeat | [activity protocol](activity-protocol.md) |
 
 Use the envelope shape only when an operation explicitly declares an envelope;
 do not put an activation, completion, task, or client request inside a second
