@@ -19,6 +19,7 @@ SMOKE_CACHE_EVICTION_TIMEOUT_SECONDS ?= 900
 # child timer a process-level budget independent of the ordinary smoke driver.
 SMOKE_PARENT_CHILD_RESTART_TIMEOUT_SECONDS ?= 900
 SMOKE_DRIVER_LOG_FILE := $(TEMPORAL_FIXTURE_DIR)/.smoke-driver.log
+SMOKE_POLL_ISOLATION_LOG_FILE := $(TEMPORAL_FIXTURE_DIR)/.smoke-poll-isolation.log
 SMOKE_CANCELLATION_READY_FILE := $(TEMPORAL_FIXTURE_DIR)/.cancellation-ready
 SMOKE_WORKER_STOPPED_FILE := $(TEMPORAL_FIXTURE_DIR)/.worker-stopped
 SMOKE_REPLAY_DIAGNOSTICS_FILE := $(TEMPORAL_FIXTURE_DIR)/.restart-replay-diagnostics.json
@@ -325,7 +326,8 @@ temporal-stop:
 		"$(SMOKE_RESTART_TERMINAL_HISTORY).describe.json" \
 		"$(SMOKE_RESTART_CONTROLLER_FILE)" "$(SMOKE_CACHE_EVICTION_FILE)" \
 		"$(SMOKE_CACHE_EVICTION_READY_FILE)" "$(SMOKE_CACHE_EVICTION_SECOND_READY_FILE)" \
-		"$(SMOKE_CACHE_EVICTION_DRIVER_LOG_FILE)"
+		"$(SMOKE_CACHE_EVICTION_DRIVER_LOG_FILE)" \
+		"$(SMOKE_POLL_ISOLATION_LOG_FILE)"
 
 temporal-clean:
 	$(TEMPORAL_COMPOSE) down --volumes --remove-orphans
@@ -338,7 +340,8 @@ temporal-clean:
 		"$(SMOKE_RESTART_TERMINAL_HISTORY).describe.json" \
 		"$(SMOKE_RESTART_CONTROLLER_FILE)" "$(SMOKE_CACHE_EVICTION_FILE)" \
 		"$(SMOKE_CACHE_EVICTION_READY_FILE)" "$(SMOKE_CACHE_EVICTION_SECOND_READY_FILE)" \
-		"$(SMOKE_CACHE_EVICTION_DRIVER_LOG_FILE)"
+		"$(SMOKE_CACHE_EVICTION_DRIVER_LOG_FILE)" \
+		"$(SMOKE_POLL_ISOLATION_LOG_FILE)"
 
 # CI uses the same controllers as local acceptance, each with a bounded log
 # wrapper. A failed scenario stops the suite; workflow finalizers upload all
@@ -358,14 +361,19 @@ test-temporal-diagnostics-contract:
 
 test-temporal-integration: test-temporal-config
 	@set -eu; \
+	cleanup_command() { \
+		if [ "$${TEMPORAL_PREBUILT_SMOKE:-0}" = 1 ]; then \
+			timeout --signal=TERM --kill-after=10s 60s "$$@"; \
+		else "$$@"; fi; \
+	}; \
 	cleanup() { \
 		status=$$?; \
 		trap - EXIT HUP INT TERM; \
 		sh test/integration/temporal/scripts/collect-live-diagnostics.sh cleanup || echo "live diagnostic snapshot failed" >&2; \
 		if [ "$$status" -ne 0 ]; then \
-			$(MAKE) temporal-logs || true; \
+			cleanup_command $(MAKE) temporal-logs || true; \
 		fi; \
-		$(MAKE) temporal-clean || true; \
+		cleanup_command $(MAKE) temporal-clean || true; \
 		exit "$$status"; \
 	}; \
 	$(MAKE) temporal-clean; \
@@ -701,7 +709,29 @@ test-client-request-ids-live:
 # remains closed, then the fixture releases and shuts down its worker.
 .PHONY: test-worker-poll-isolation-live
 test-worker-poll-isolation-live:
-	$(COMPOSE_RUN) sh scripts/run-temporal-executable.sh --build-dir=/workspace/_build/worker-poll-isolation test/integration/worker_poll_isolation/regression.exe check $(TEMPORAL_CLIENT_TEST_URL)
+	@printf 'poll isolation phase=compose_build status=begin\n' >"$(SMOKE_POLL_ISOLATION_LOG_FILE)"
+	@run_bounded() { \
+		if [ "$${TEMPORAL_PREBUILT_SMOKE:-0}" = 1 ]; then \
+			timeout --signal=TERM --kill-after=10s "$$1" $(MAKE) "$$2"; \
+		else $(MAKE) "$$2"; fi; \
+	}; \
+	status=0; run_bounded 600 test-worker-poll-isolation-live-build || status=$$?; \
+	case "$$status" in 0) outcome=ok ;; 124|137) outcome=timeout ;; *) outcome=failed ;; esac; \
+	printf 'poll isolation phase=compose_build status=%s\n' "$$outcome" >>"$(SMOKE_POLL_ISOLATION_LOG_FILE)"; \
+	[ "$$status" -eq 0 ] || exit "$$status"; \
+	printf 'poll isolation phase=fixture_run status=begin\n' >>"$(SMOKE_POLL_ISOLATION_LOG_FILE)"; \
+	status=0; run_bounded 180 test-worker-poll-isolation-live-run || status=$$?; \
+	case "$$status" in 0) outcome=ok ;; 124|137) outcome=timeout ;; *) outcome=failed ;; esac; \
+	printf 'poll isolation phase=fixture_run status=%s\n' "$$outcome" >>"$(SMOKE_POLL_ISOLATION_LOG_FILE)"; \
+	exit "$$status"
+
+.PHONY: test-worker-poll-isolation-live-build
+test-worker-poll-isolation-live-build:
+	OCAML_IMAGE=$(OCAML_IMAGE) $(COMPOSE) --progress plain build $(SERVICE) >&2
+
+.PHONY: test-worker-poll-isolation-live-run
+test-worker-poll-isolation-live-run:
+	OCAML_IMAGE=$(OCAML_IMAGE) $(COMPOSE) --progress quiet run --rm --user $(HOST_UID):$(HOST_GID) $(SERVICE) env TEMPORAL_POLL_ISOLATION_LOG_FILE=/workspace/test/integration/temporal/.smoke-poll-isolation.log sh scripts/run-temporal-executable.sh --build-dir=/workspace/_build/worker-poll-isolation test/integration/worker_poll_isolation/regression.exe check $(TEMPORAL_CLIENT_TEST_URL)
 
 lint:
 	$(RUN) dune build @install $(DUNE_BUILD_ARGS)

@@ -41,7 +41,11 @@ elif $mode == "phases" then
   # Exact machine phase lines are a separate closed projection, so conservative
   # suppression of a preceding free-text log cannot erase durable outcomes.
   reduce inputs as $line ({events:[],truncated:false};
-    ($line | [capture("^(?:two-binary|cache eviction) phase=(?<phase>[a-z0-9_:-]+) status=(?<status>[a-z0-9_:-]+) workflow_id=(?<workflow_id>two-binary-[a-z0-9-]+) run_id=(?<run_id>[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})(?: duration_ms=[0-9.]+)?$")]) as $records
+    ($line | if startswith("poll isolation phase=") then
+      [capture("^poll isolation phase=(?<phase>[a-z0-9_:-]+) status=(?<status>[a-z0-9_:-]+)$")]
+    else
+      [capture("^(?:two-binary|cache eviction) phase=(?<phase>[a-z0-9_:-]+) status=(?<status>[a-z0-9_:-]+) workflow_id=(?<workflow_id>two-binary-[a-z0-9-]+) run_id=(?<run_id>[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})(?: duration_ms=[0-9.]+)?$")]
+    end) as $records
     | if (.events | length) + ($records | length) > 256 then .truncated = true
       else .events += $records end)
   | diagnostic

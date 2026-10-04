@@ -234,6 +234,21 @@ check test ! -e "$TEMPORAL_DIAGNOSTICS_DIR/restart/snapshot-02-record-limit/rest
 check grep -q omitted-invalid-or-oversize-json "$TEMPORAL_DIAGNOSTICS_DIR/restart/snapshot-02-record-limit/collection.tsv"
 rm -f "$fixture"/.restart-replay-*
 
+# The poll-isolation fixture writes only fixed phase/status records outside the
+# console stream, which can be suppressed after Docker prints sensitive data.
+# Preserve that last completed phase even when the fixture process times out.
+export TEMPORAL_DIAGNOSTICS_SCENARIO=integration
+export TEMPORAL_DIAGNOSTICS_DIR="$temporary/poll-isolation"
+printf 'poll isolation phase=timer_wait status=begin\n' >"$fixture/.smoke-poll-isolation.log"
+sh "$scripts/collect-live-diagnostics.sh" poll-timeout
+check grep -q '^poll isolation phase=timer_wait status=begin$' \
+  "$TEMPORAL_DIAGNOSTICS_DIR/integration/snapshot-00-poll-timeout/smoke-poll-isolation.log"
+check jq -e '(.events | length) == 1 and .events[0].phase == "timer_wait" and .events[0].status == "begin" and (.truncated | not)' \
+  "$TEMPORAL_DIAGNOSTICS_DIR/integration/snapshot-00-poll-timeout/smoke-poll-isolation.log.executions.json"
+rm -f "$fixture/.smoke-poll-isolation.log"
+export TEMPORAL_DIAGNOSTICS_SCENARIO=restart
+export TEMPORAL_DIAGNOSTICS_DIR="$temporary/limits"
+
 # A Docker command failure is diagnostic metadata, not a scenario failure.
 export DIAGNOSTIC_TEST_DOCKER_FAILURE=yes
 sh "$scripts/collect-live-diagnostics.sh" docker-failure

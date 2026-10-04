@@ -123,7 +123,7 @@ for source_file in "$fixture"/.*; do
   case "$name" in $pattern|.worker-stopped) ;; *) continue ;; esac
   case "$name" in *.raw*|*.describe*|*-describe*|*.tmp*) continue ;; esac
   # Filenames are an allowlist too; a neighbouring custom file is not evidence.
-  if ! printf '%s\n' "$name" | LC_ALL=C grep -Eq '^\.(smoke-driver\.log|worker-stopped|cache-eviction(\.json|-ready|-second-ready|-driver\.log)|restart-replay-(accepted|result|driver\.log|controller\.json|diagnostics\.json|history\.(initial|terminal)\.json)|patch-replay-(controller\.json|(legacy|new|removal)-(accepted|result|driver\.log|worker-stopped|diagnostics\.json|history\.(initial|terminal)\.json))|(parent-child-restart|child-failure-replay)-(accepted|result|driver\.log|controller\.json|diagnostics\.json|worker-(one|two)-stopped|(parent|child)\.(initial|post-removal|terminal)\.json))$'; then
+  if ! printf '%s\n' "$name" | LC_ALL=C grep -Eq '^\.(smoke-(driver|poll-isolation)\.log|worker-stopped|cache-eviction(\.json|-ready|-second-ready|-driver\.log)|restart-replay-(accepted|result|driver\.log|controller\.json|diagnostics\.json|history\.(initial|terminal)\.json)|patch-replay-(controller\.json|(legacy|new|removal)-(accepted|result|driver\.log|worker-stopped|diagnostics\.json|history\.(initial|terminal)\.json))|(parent-child-restart|child-failure-replay)-(accepted|result|driver\.log|controller\.json|diagnostics\.json|worker-(one|two)-stopped|(parent|child)\.(initial|post-removal|terminal)\.json))$'; then
     continue
   fi
   case "$name" in
