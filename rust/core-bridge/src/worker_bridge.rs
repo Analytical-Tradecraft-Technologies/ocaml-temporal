@@ -312,6 +312,24 @@ impl Readiness {
         &self,
         receiver: &mut mpsc::UnboundedReceiver<ReadyTask<T>>,
     ) -> Option<ReadyTask<T>> {
+        self.take_inner(receiver, false)
+    }
+
+    /// Checks the queue and terminal error under one lock. A separate empty
+    /// receive followed by an error lookup would let a producer enqueue a
+    /// task between those checks, incorrectly reporting the error first.
+    fn take_or_failure<T>(
+        &self,
+        receiver: &mut mpsc::UnboundedReceiver<ReadyTask<T>>,
+    ) -> Option<ReadyTask<T>> {
+        self.take_inner(receiver, true)
+    }
+
+    fn take_inner<T>(
+        &self,
+        receiver: &mut mpsc::UnboundedReceiver<ReadyTask<T>>,
+        report_failure: bool,
+    ) -> Option<ReadyTask<T>> {
         let mut state = self
             .state
             .lock()
@@ -326,26 +344,23 @@ impl Readiness {
                 state.pending = state.pending.saturating_sub(1);
                 Some(message)
             }
-            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Empty) => {
+                if report_failure {
+                    state.error.clone().map(Err)
+                } else {
+                    None
+                }
+            }
             Err(TryRecvError::Disconnected) => {
                 state.closed = true;
                 self.wake.notify_all();
-                None
+                if report_failure {
+                    state.error.clone().map(Err)
+                } else {
+                    None
+                }
             }
         }
-    }
-
-    /// Lets a nonblocking owner poll observe a fatal producer failure even
-    /// when no queue message remains. The OCaml lanes sometimes yield outside
-    /// the supervisor while their sibling is busy; they cannot rely on a
-    /// native readiness wait to surface this terminal condition. Queued tasks
-    /// are drained first, so the caller checks this only after [take] is empty.
-    fn failure(&self) -> Option<PollLaneError> {
-        self.state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .error
-            .clone()
     }
 
     /// Awaits one queue message while preserving the same pending-count
@@ -522,10 +537,9 @@ impl PollLanes {
         &mut self,
         handle: &tokio::runtime::Handle,
     ) -> Option<ReadyTask<WorkflowActivation>> {
-        let ready = match self.workflow_signal.take(&mut self.workflow_ready) {
-            Some(ready) => ready,
-            None => return self.workflow_signal.failure().map(Err),
-        };
+        let ready = self
+            .workflow_signal
+            .take_or_failure(&mut self.workflow_ready)?;
         match ready {
             Ok(activation) => {
                 let lease = self
@@ -577,10 +591,9 @@ impl PollLanes {
         handle: &tokio::runtime::Handle,
     ) -> Option<ReadyTask<ActivityTask>> {
         loop {
-            let ready = match self.activity_signal.take(&mut self.activity_ready) {
-                Some(ready) => ready,
-                None => return self.activity_signal.failure().map(Err),
-            };
+            let ready = self
+                .activity_signal
+                .take_or_failure(&mut self.activity_ready)?;
             match ready {
                 Err(error) => return Some(Err(error)),
                 Ok(task) => {
@@ -2188,8 +2201,7 @@ mod readiness_tests {
 
         assert!(signal.enqueue(&sender, Ok(7)));
         signal.fail(error.clone());
-        assert_eq!(signal.take(&mut receiver), Some(Ok(7)));
-        assert_eq!(signal.take(&mut receiver), None);
-        assert_eq!(signal.failure(), Some(error));
+        assert_eq!(signal.take_or_failure(&mut receiver), Some(Ok(7)));
+        assert_eq!(signal.take_or_failure(&mut receiver), Some(Err(error)));
     }
 }

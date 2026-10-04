@@ -410,9 +410,8 @@ let wait_for_lane worker ~workflow_lane ~native_wait =
     native supervisor owns the timer operation and its C stub releases the OCaml
     runtime lock while sleeping, so this callback cannot block a workflow
     scheduler or let a ready-but-unrelated activity lane spin. A workflow retry
-    is not currently produced by the workflow adapter; keeping that branch on
-    the ordinary readiness path preserves a safe fallback if a future adapter
-    adds one without also adding a workflow-specific native timer. *)
+    is not currently produced by the workflow adapter; its bounded local yield
+    remains a fallback if a future adapter adds one without a dedicated timer. *)
 let retry_pending worker ~workflow_lane =
   if workflow_lane then wait_for_lane worker ~workflow_lane ~native_wait:false
   else
