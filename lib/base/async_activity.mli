@@ -21,11 +21,14 @@ type submit_result = (unit, Error.t) result
 (** Private submission disposition, independent of the public diagnostic's
     error category. [Not_submitted] proves local validation prevented any
     native call, permitting a corrected or different operation unless an
-    earlier submission is still unresolved. An explicitly retryable submission
-    retains the exact request key; a terminal native rejection or closed
-    capability retires the handle. *)
+    earlier submission is still unresolved. [Rejected_submission] is a
+    definitive native heartbeat rejection that also permits a corrected
+    request while retaining the live handle and lease. An explicitly retryable
+    submission retains the exact request key; a terminal native rejection or
+    closed capability retires the handle. *)
 type submission_error =
   | Not_submitted of Error.t
+  | Rejected_submission of Error.t
   | Retryable_submission of Error.t
   | Terminal_submission of Error.t
 

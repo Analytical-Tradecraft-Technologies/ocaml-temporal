@@ -100,13 +100,17 @@ operation-specific supervisor classifier reports uncertainty. Core worker
 completions and late async terminal completions retain the conservative
 bilateral policy: only the dedicated `Retryable` bridge status authorizes an
 exact-request retry. A namespace-bound async heartbeat is nonterminal and
-does not consume the worker completion lease. Its `Connection` result leaves
-the handle and adapter lease tracked so the caller may retry the same
-byte-identical heartbeat after connectivity returns, then complete the
-activity once. A different heartbeat or terminal operation stays blocked until
-that request is resolved. `NotFound` maps to `Invalid_state` and closes the
-handle because the server has discarded the token. Other permanent bridge
-failures also close it. The activity callback is never rerun for a submission
+does not consume the worker completion lease. An uncertain RPC status such as
+`Unavailable` or `DeadlineExceeded` maps to `Connection`: the handle and
+adapter lease stay tracked, and only the same byte-identical heartbeat may
+retry until its outcome is known. A definitive non-`NotFound` RPC rejection
+such as `InvalidArgument`, `PermissionDenied`, or `FailedPrecondition` maps to
+`Async_heartbeat_rejected`. It clears a fresh pending request but keeps the
+activity handle and adapter lease live, permitting corrected heartbeat details
+or a terminal completion. If an earlier attempt was already uncertain, the
+rejection of its exact retry does not erase that earlier request key.
+`NotFound` maps to `Invalid_state` and closes the handle because the server has
+discarded the token. The activity callback is never rerun for a submission
 retry. The handle is not a retained activity context: ordinary
 `Activity.Context` values are still invalidated when their callback returns.
 
@@ -211,8 +215,9 @@ behavior; Temporal Core owns timeout decisions and subsequent task delivery.
 If Core has already timed out an attempt, the synchronous adapter has no stale
 completion recovery. An asynchronous handle remains owned by the SDK until a
 terminal client operation is accepted or a confirmed terminal bridge failure
-closes it. An uncertain async heartbeat connection error cannot retire that
-lease. A shutdown attempt that finds an admitted asynchronous lease returns a
+closes it. Neither an uncertain heartbeat RPC outcome nor a definitive
+non-`NotFound` heartbeat rejection can retire that lease. A shutdown attempt
+that finds an admitted asynchronous lease returns a
 retryable outstanding-lease error and leaves the worker graph and handle
 usable; the caller must finish the handle and retry shutdown. Only terminal
 cleanup after a non-retryable failure closes an admitted handle.

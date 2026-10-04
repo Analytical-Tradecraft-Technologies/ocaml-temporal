@@ -224,7 +224,10 @@ close/dispose and result disposal have no result document and return their
 status directly. Status zero is success. Nonzero statuses cover invalid
 arguments, ABI mismatch, a contained Rust panic, internal bridge failure,
 invalid lifecycle state, configuration, connection, worker, outstanding-task,
-not-ready, protocol, and already-started failures. Worker polling and exact-run
+not-ready, protocol, already-started, explicit retryable-completion, and
+async-heartbeat-rejected failures. The last status is a definitive rejection of
+one nonterminal heartbeat request; it does not say the activity token is gone.
+Worker polling and exact-run
 client waits use the expected `NOT_READY` status. For a worker lane it means no
 task is queued; for a client wait it means the 100 ms owner interval elapsed
 without a terminal result. In both cases the caller or a later orchestration

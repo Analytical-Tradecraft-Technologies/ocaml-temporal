@@ -60,11 +60,12 @@ module type SUPERVISOR = sig
       may retry the same completion after a bounded wait. Permanent, protocol,
       configuration, and lifecycle failures must return [false]. *)
 
-  val async_heartbeat_error_is_retryable : error -> bool
+  val async_heartbeat_error_disposition :
+    error -> Native_worker_policy.async_heartbeat_disposition
   (** Classifies a failed namespace-bound async heartbeat separately from a
-      Core worker completion. [true] retains the nonterminal handle and lease
-      for an exact-request retry after uncertain transport failure; a confirmed
-      terminal token response such as NotFound must return [false]. *)
+      Core worker completion. An uncertain RPC retains the exact request;
+      definitive rejection clears a fresh request while retaining the live
+      handle and lease; confirmed token loss retires both. *)
 
   val exception_is_retryable : exn -> bool
   (** Classifies an exception raised by the completion call. Production

@@ -38,19 +38,31 @@ let test_activity_completion_policy () =
     the bridge's NotFound/invalid-state response closes it. This must not
     weaken the ordinary Core completion policy tested above. *)
 let test_async_heartbeat_policy () =
-  expect_bool "uncertain heartbeat connection" true
-    (Policy.async_heartbeat_retryable Bridge.Connection);
-  expect_bool "explicit retryable heartbeat" true
-    (Policy.async_heartbeat_retryable Bridge.Retryable);
+  let expect_disposition label expected actual =
+    if actual <> expected then failwith label
+  in
+  expect_disposition "uncertain heartbeat connection" Policy.Retry_exact
+    (Policy.async_heartbeat_disposition Bridge.Connection);
+  expect_disposition "explicit retryable heartbeat" Policy.Retry_exact
+    (Policy.async_heartbeat_disposition Bridge.Retryable);
   List.iter
     (fun (label, status) ->
-      expect_bool label false (Policy.async_heartbeat_retryable status))
+      expect_disposition label Policy.Rejected_live
+        (Policy.async_heartbeat_disposition status))
+    [
+      ("definitive RPC rejection", Bridge.Async_heartbeat_rejected);
+      ("local invalid argument", Bridge.Invalid_argument);
+      ("local protocol rejection", Bridge.Protocol);
+      ("local configuration rejection", Bridge.Configuration);
+    ];
+  List.iter
+    (fun (label, status) ->
+      expect_disposition label Policy.Retired
+        (Policy.async_heartbeat_disposition status))
     [
       ("not-found heartbeat", Bridge.Invalid_state);
       ("not-ready heartbeat", Bridge.Not_ready);
       ("worker heartbeat", Bridge.Worker);
-      ("protocol heartbeat", Bridge.Protocol);
-      ("configuration heartbeat", Bridge.Configuration);
       ("unknown heartbeat status", Bridge.Unknown 13);
     ]
 

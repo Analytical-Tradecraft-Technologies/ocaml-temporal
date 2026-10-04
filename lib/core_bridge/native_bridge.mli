@@ -14,6 +14,7 @@ type status =
   | Protocol
   | Already_started
   | Retryable
+  | Async_heartbeat_rejected
   | Unknown of int
 
 (** Error copied into the OCaml heap. Once returned, it contains no pointer to

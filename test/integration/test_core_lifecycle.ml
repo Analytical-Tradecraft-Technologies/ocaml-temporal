@@ -19,6 +19,7 @@ let bridge_status = function
   | Protocol -> "protocol"
   | Already_started -> "already_started"
   | Retryable -> "retryable"
+  | Async_heartbeat_rejected -> "async_heartbeat_rejected"
   | Unknown code -> Printf.sprintf "unknown(%d)" code
 
 (** Raises a test failure while preserving structured bridge diagnostics. *)

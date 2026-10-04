@@ -279,7 +279,9 @@ module Fake_supervisor = struct
 
   (** This fake does not submit async heartbeats; preserve its explicit source
       classification to satisfy the operation-specific adapter contract. *)
-  let async_heartbeat_error_is_retryable error = error.retryable
+  let async_heartbeat_error_disposition error =
+    if error.retryable then Temporal_runtime.Native_worker_policy.Retry_exact
+    else Temporal_runtime.Native_worker_policy.Retired
 
   (** The fake uses a private marker exception to model a transient owner-side
       completion raise without treating arbitrary implementation exceptions as

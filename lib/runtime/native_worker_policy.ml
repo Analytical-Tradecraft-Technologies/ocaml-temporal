@@ -17,15 +17,23 @@ let activity_completion_retryable = function
   | Temporal_core_bridge.Native_bridge.Retryable -> true
   | _ -> false
 
-(** Returns whether an async-client heartbeat failure leaves its nonterminal
-    capability available. Unlike a Core worker completion, a heartbeat cannot
-    consume the completion lease: an uncertain RPC result may be retried with
-    the same details. [Invalid_state] is the bridge's confirmed NotFound result
-    and remains terminal. *)
-let async_heartbeat_retryable = function
+(** The three ownership outcomes of a failed namespace-bound async heartbeat.
+    A rejected request may be replaced, while an uncertain request retains its
+    exact key and a lost token or unusable native graph retires the handle. *)
+type async_heartbeat_disposition = Retry_exact | Rejected_live | Retired
+
+(** Classifies a typed heartbeat result without inspecting server diagnostic
+    text. The explicit rejected status means the request was not applied but
+    does not prove that the activity token is gone. Local argument, protocol,
+    and configuration failures likewise have not crossed the RPC boundary. *)
+let async_heartbeat_disposition = function
   | Temporal_core_bridge.Native_bridge.Connection
-  | Temporal_core_bridge.Native_bridge.Retryable -> true
-  | _ -> false
+  | Temporal_core_bridge.Native_bridge.Retryable -> Retry_exact
+  | Temporal_core_bridge.Native_bridge.Async_heartbeat_rejected
+  | Temporal_core_bridge.Native_bridge.Invalid_argument
+  | Temporal_core_bridge.Native_bridge.Protocol
+  | Temporal_core_bridge.Native_bridge.Configuration -> Rejected_live
+  | _ -> Retired
 
 (** Returns whether a failed adapter drain can safely reopen worker admission.
     A same-Domain shutdown admission defect is handled before a drain and is
