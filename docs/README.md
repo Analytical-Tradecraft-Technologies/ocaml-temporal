@@ -45,6 +45,9 @@ The remaining reference documents are useful when changing one subsystem:
   build-ID and deployment-based routing options, task-local selected deployment
   metadata, the closed OCaml/Rust JSON contract, and the current evidence
   boundary.
+- [Worker upgrade and rollback rehearsal](reference/worker-upgrade-rollback.md)
+  records the proposed separate-queue cutover, operator stop points, and the
+  live evidence still required before any upgrade claim.
 - [Interactive workflows](reference/interactive-workflows.md) documents the
   experimental typed signal, query, and update definitions, deterministic
   handler dispatcher, and the remaining native-delivery boundary.
