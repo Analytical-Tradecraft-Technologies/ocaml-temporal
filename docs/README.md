@@ -199,30 +199,8 @@ Compose file from the repository root.
 
 ### CI lanes
 
-A code pull request runs representative compatibility lanes: Linux amd64 on
-OCaml 5.2 and 5.5, Linux arm64 on OCaml 5.5, macOS ARM64 on OCaml 5.5, the
-quality and dependency-license audits, and the OCaml 5.5 Temporal/PostgreSQL
-smoke. The Windows x64 OCaml 5.5 native lane is enabled when native bridge,
-build/toolchain, workflow, or composite-action configuration changes.
-Documentation-only pull requests still run the standalone license audit; JSON
-protocol schemas under `docs/schemas/` are instead treated as code. A pull
-request that changes only the live acceptance fixture under
-`test/integration/temporal/` runs the license audit and its live smoke rather
-than the representative matrix. A push to `master` and the scheduled run are
-the exhaustive gate: OCaml 5.2–5.5 on both Linux architectures, both OCaml 5.5
-native desktop jobs, quality, license audit, and the live smoke.
-
-When a GitHub Actions run is still `queued`, it has not produced verification
-evidence. The representative local baseline is `make check OCAML_VERSION=5.2`,
-which combines `make verify` with the package/OCaml license audit. Run
-`make quality` separately for the pinned host scanners, and run
-`make native-verify` on a matching Windows or macOS host for the native
-compatibility path. The locked Cargo license scanner is intentionally a single
-CI-only job; `make license-check` does not claim to replace that scanner. Use
-`make test-temporal-integration` only when a real Temporal Server/PostgreSQL
-result is required. These local results are useful interim evidence, but they
-do not turn an unexecuted matrix, platform, or live-server job green; queued
-required checks still need to finish when Actions becomes available.
+See [quality and security gates](reference/quality-gates.md) for the current
+event triggers, CI matrix, required checks, cache policy, and local equivalents.
 
 `make test-temporal-worker-restart-contract` is the Docker-free contract gate:
 it validates the normalized history/replay diagnostic contract, the ordered
