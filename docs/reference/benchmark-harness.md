@@ -27,14 +27,18 @@ fails, with attempted sample counts, errors, and the first three error messages.
 
 Report `schema_version: 1` contains the source commit and dirty-tree flag, SDK
 version, OCaml compiler version, Dune profile, pinned Core revision, server version (`none`),
-machine/container identity, host label, exact warmup and measurement counts,
+base image reference, built development image ID, machine/container identity,
+host label, exact warmup and measurement counts,
 repetitions, seed, workload configuration, phase duration, per-attempt latency
 in microseconds, p50/p95/p99 (nearest-rank), successful operations per second,
 and error count. The seed is recorded for the shared harness interface; the
 minimal workload does not use randomness. Each repetition warms up separately.
-Latency and throughput use the process wall clock and include local execution
+Latency and throughput use a monotonic elapsed clock and include local execution
 creation, activation, validation, and shutdown. The per-attempt array supports
 later analysis; the overall phase duration is authoritative for throughput.
+The UTC timestamp is wall-clock metadata only. If Docker cannot resolve the
+built image ID, the report explicitly records `unavailable`; the base image
+reference alone may be a mutable tag and is not a substitute for a digest.
 
 Compare reports only when their source/configuration, compiler, machine, and
 measurement boundary are compatible. No threshold is inferred from one local

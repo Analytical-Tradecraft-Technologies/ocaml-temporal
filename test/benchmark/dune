@@ -1,7 +1,7 @@
 (library
  (name benchmark_harness)
  (modules benchmark_harness)
- (libraries yojson unix))
+ (libraries mtime.clock yojson unix))
 
 (test
  (name bench_local_activation)
@@ -15,5 +15,14 @@
     (setenv BENCH_SDK_VERSION test-version
      (setenv BENCH_CORE_REVISION test-core
       (setenv BENCH_DUNE_PROFILE dev
-       (run %{test} --warmup 1 --samples 3
-        --repetitions 1 --seed 1))))))))
+       (setenv BENCH_BASE_IMAGE_REFERENCE test-image
+        (setenv BENCH_DEVELOPMENT_IMAGE_ID unavailable
+         (progn
+          (with-stdout-to benchmark-report.json
+           (run %{test} --warmup 1 --samples 3 --repetitions 1 --seed 1))
+          (run %{exe:check_report.exe} benchmark-report.json)))))))))))
+
+(executable
+ (name check_report)
+ (modules check_report)
+ (libraries yojson))

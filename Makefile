@@ -134,21 +134,26 @@ cargo-metadata:
 # It deliberately does not start Temporal Server or apply a performance gate.
 bench:
 	@set -eu; \
-	mkdir -p "$(dir $(BENCH_REPORT))"; \
-	report="$(BENCH_REPORT)"; \
-	tmp=$$(mktemp "$$report.tmp.XXXXXX"); \
-	trap 'rm -f "$$tmp"' EXIT HUP INT TERM; \
 	source_commit=$$(git rev-parse HEAD); \
 	if test -z "$$(git status --porcelain)"; then source_dirty=false; else source_dirty=true; fi; \
 	core_revision=$$(awk -F '"' '/^temporalio-sdk-core =/ { print $$4; exit }' rust/Cargo.toml); \
 	test -n "$$core_revision"; \
+	mkdir -p "$(dir $(BENCH_REPORT))"; \
+	report="$(BENCH_REPORT)"; \
+	tmp=$$(mktemp "$$report.tmp.XXXXXX"); \
+	trap 'rm -f "$$tmp"' EXIT HUP INT TERM; \
+	OCAML_IMAGE=$(OCAML_IMAGE) $(COMPOSE) --progress plain build $(SERVICE) >&2; \
+	image_id=$$(docker image inspect --format '{{.Id}}' "$(TEMPORAL_COMPOSE_PROJECT)-$(SERVICE)" 2>/dev/null || true); \
+	if test -z "$$image_id"; then image_id=unavailable; fi; \
 	status=0; \
-	$(COMPOSE_RUN) env \
+	OCAML_IMAGE=$(OCAML_IMAGE) $(COMPOSE) --progress quiet run --rm --user $(HOST_UID):$(HOST_GID) $(SERVICE) env \
 		BENCH_SOURCE_COMMIT="$$source_commit" \
 		BENCH_SOURCE_DIRTY="$$source_dirty" \
 		BENCH_SDK_VERSION="$$(cat .release-version)" \
 		BENCH_CORE_REVISION="$$core_revision" \
 		BENCH_DUNE_PROFILE=release \
+		BENCH_BASE_IMAGE_REFERENCE="$(OCAML_IMAGE)" \
+		BENCH_DEVELOPMENT_IMAGE_ID="$$image_id" \
 		BENCH_HOST_LABEL="$(BENCH_HOST_LABEL)" \
 		opam exec -- dune exec --profile release test/benchmark/bench_local_activation.exe -- \
 		--warmup "$(BENCH_WARMUP)" --samples "$(BENCH_SAMPLES)" \

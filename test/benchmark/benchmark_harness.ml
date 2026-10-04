@@ -84,24 +84,24 @@ let run_phase ~workload ~record_latencies ~count ~seed =
   let latencies = ref [] in
   let errors = ref 0 in
   let examples = ref [] in
-  let started = Unix.gettimeofday () in
+  let started = Mtime_clock.counter () in
   for _ = 1 to count do
-    let before = Unix.gettimeofday () in
+    let before = Mtime_clock.counter () in
     let error = ref None in
     (try workload seed with exn -> error := Some (Printexc.to_string exn));
-    let elapsed = Unix.gettimeofday () -. before in
-    if elapsed < 0. then error := Some "wall clock moved backwards";
+    let elapsed_us =
+      Mtime.Span.to_float_ns (Mtime_clock.count before) /. 1_000.
+    in
     (match !error with
     | Some message ->
         incr errors;
         if List.length !examples < 3 then examples := message :: !examples
     | None -> ());
-    if record_latencies then
-      latencies := (max 0. elapsed *. 1_000_000.) :: !latencies
+    if record_latencies then latencies := elapsed_us :: !latencies
   done;
-  let elapsed_seconds = Unix.gettimeofday () -. started in
-  if elapsed_seconds < 0. then
-    failwith "wall clock moved backwards during phase";
+  let elapsed_seconds =
+    Mtime.Span.to_float_ns (Mtime_clock.count started) /. 1_000_000_000.
+  in
   {
     elapsed_seconds;
     latencies_us = List.rev !latencies;
@@ -177,6 +177,8 @@ let run ~suite ~boundary ~server_version ~workload_config ~workload () =
   let sdk_version = required_env "BENCH_SDK_VERSION" in
   let core_revision = required_env "BENCH_CORE_REVISION" in
   let dune_profile = required_env "BENCH_DUNE_PROFILE" in
+  let base_image_reference = required_env "BENCH_BASE_IMAGE_REFERENCE" in
+  let development_image_id = required_env "BENCH_DEVELOPMENT_IMAGE_ID" in
   let total_errors = ref 0 in
   let repetitions =
     List.init config.repetitions (fun index ->
@@ -213,6 +215,8 @@ let run ~suite ~boundary ~server_version ~workload_config ~workload () =
               ("dune_profile", `String dune_profile);
               ("core_revision", `String core_revision);
               ("server_version", `String server_version);
+              ("base_image_reference", `String base_image_reference);
+              ("development_image_id", `String development_image_id);
             ] );
         ( "machine",
           `Assoc
