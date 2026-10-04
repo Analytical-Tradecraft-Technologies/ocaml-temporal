@@ -51,7 +51,13 @@ qualification. Do not treat a green fixture job as that qualification.
    application release that chooses `Client.start`'s queue. Record the rollback
    decision-maker and a finite observation window. Preserve the old executable
    and its configuration until every old-queue run can finish or has an approved
-   migration plan.
+   migration plan. For each logical start, persist a unique workflow ID, an
+   explicit caller-owned `Client.start ~request_id`, and the intended workflow
+   type, input, and task queue **before** sending the request. Omitting
+   `request_id` makes the SDK allocate a fresh key for that call, which the
+   caller cannot reuse after an uncertain result. Never reuse one key for a
+   different logical start. Keep the retryable input in an application-owned,
+   protected request ledger rather than in diagnostic logs.
 2. Replay retained histories with the old and candidate code using the
    compatibility corpus required by [#503]. Review any changed command order,
    patch marker, payload codec/schema, error type, activity name, child type,
@@ -90,10 +96,16 @@ and retrieved artifacts; do not cite the presence of a test target as a pass.
    Confirm the runs are still open before cutover.
 2. **Introduce the new worker:** Start the new executable on the new queue
    without stopping the old worker. Prove both workers are polling their
-   intended queues. Switch only *new starts* to the new queue; retain their
-   returned run IDs. Observe one exact new run through completion and query
-   its server history and queue. Abort the start switch if routing, health, or
-   an expected outcome differs.
+   intended queues. Pause admission and drain in-flight `Client.start` calls
+   before changing the starter's route. Switch only *new starts* to the new
+   queue, tracking every attempt even if no run handle returns. A timeout or
+   transport error may follow server acceptance. For an uncertain result,
+   keep the original logical request's workflow type, ID, input, and queue;
+   retry only with its persisted `request_id`, never with a fresh key or the
+   newly selected queue. Reconcile the request against the server and record
+   the actual run ID and queue before another routing change. Observe one
+   exact new run through completion and query its server history and queue.
+   Abort the start switch if routing, health, or an expected outcome differs.
 3. **Mixed window:** Keep the old and new runs open together. Exercise timer
    firing, activity retry, and the supported interactions. Capture per-run
    histories and generation-labelled worker diagnostics. Confirm old runs
@@ -119,11 +131,20 @@ agreed process bound, an external side effect has an uncertain outcome, or a
 replay/determinism error appears. Do not delete queues, histories, or old
 workers as a diagnostic shortcut.
 
+Before taking any rollback branch or stopping either worker, pause new starts,
+drain in-flight start calls, and reconcile **every** attempted start in the
+caller's ledger as an accepted exact run with its server-recorded task queue or
+a definitively rejected request. A `Client.start` error, missing returned run
+ID, or temporarily absent server row is not proof that no run was accepted. If
+an attempt remains uncertain, keep both relevant workers available and do not
+take the “no new-queue run” branch. See the public
+[`Client.start` contract] for the stable request-ID rule.
+
 ## Rollback decision by stage
 
 | Stage and evidence | Safe operator action | Action requiring separate proof |
 | --- | --- | --- |
-| Before any new-queue run is accepted | Keep the old worker and revert the application starter and its *new starts* to the old queue, after checking that the old worker accepts their workflow type and input. Stop the unused new worker after checking it owns no task. | None of this proves a future mixed-version downgrade. |
+| After all start attempts are reconciled and no new-queue run was accepted | Keep the old worker and revert the application starter and its *new starts* to the old queue, after checking that the old worker accepts their workflow type and input. Stop the unused new worker only after server evidence confirms its queue has no open run or pending task. | An uncertain start prevents this branch; absence of a client handle is not negative server evidence. |
 | New-queue runs exist, but no incompatible history is known | Route **future** starts back to the old queue only after checking that the old worker accepts their workflow type and input; keep the new worker for its existing runs. Inspect exact histories and payloads before any attempted migration. | Sending an existing new-queue run to old code, or stopping its worker, requires a proved compatible replay/migration path. |
 | New code has written a history, patch marker, or payload that old code cannot replay | Stop further new starts, retain the new worker for affected runs, and deploy a forward fix or a separately validated history-compatible replacement. | Never point those runs at the old worker simply because the old application binary is still available. |
 | Worker is unavailable or a completion outcome is uncertain | Preserve server histories and both workers' diagnostics, restore the same history-compatible worker if possible, and reconcile the exact run plus the external idempotency record before any side-effect retry. | Server/database restore or rollback follows the server operator's separate recovery plan; it is not an SDK rollback operation. |
@@ -135,8 +156,11 @@ commit and image digest; SDK/Core/server versions; namespace and queue names;
 start-routing change and rollback timestamps; exact workflow/run IDs; parent,
 child, activity, timer and interaction observations; normalized initial and
 terminal histories; worker logs and process exit status; replay-corpus result;
-backup reference; metrics/alerts; stop-condition decisions; and the operator's
-signed acceptance or rejection. Link the CI run and downloadable artifacts.
+backup reference; the caller's per-start workflow and request IDs, workflow
+type, input schema/fingerprint and actual queue, in-flight/uncertain
+resolution; metrics/alerts; stop-condition decisions; and the operator's signed
+acceptance or rejection.
+Link the CI run and downloadable artifacts.
 Redact payloads and credentials from diagnostics.
 
 The runbook only supplies a reviewable procedure. [#508] is complete after a
@@ -156,3 +180,4 @@ rollback as unqualified in the support policy and release notes.
 [legacy build-ID or deployment-based options]: worker-versioning.md
 [current live fixture]: local-temporal-stack.md
 [live acceptance]: live-acceptance-coverage.md
+[`Client.start` contract]: ../../lib/public/client.mli
