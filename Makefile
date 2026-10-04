@@ -186,6 +186,7 @@ test-live-acceptance-inventory-contract:
 test-quality-contract: check-live-acceptance-inventory test-live-acceptance-inventory-contract test-temporal-namespace-readiness
 	sh test/smoke/test_quality_contract.sh .
 	sh test/smoke/test_release_tag_contract.sh .
+	sh test/smoke/test_release_tag_commit_contract.sh .
 	sh test/smoke/test_make_docker_commands.sh .
 	sh test/smoke/test_rust_bridge_artifact.sh .
 
