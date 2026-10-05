@@ -138,6 +138,18 @@ still enforces the package's more specific Rust 1.94 minimum from
 and use the wrapped `Temporal` module; the native build tools are prerequisites,
 not part of the public OCaml API.
 
+Two process constraints apply to applications that link the SDK (see
+[Process and linking constraints](docs/guides/workflows.md#process-and-linking-constraints)):
+
+- Fork or daemonise before creating any native `Client` or `Worker`. Each one
+  spawns an OCaml Domain, and OCaml 5 rejects `Unix.fork` for the rest of the
+  process once any Domain has been spawned. Starting subprocesses with
+  `Unix.create_process` or `Unix.open_process*` still works.
+- Build native executables, `-custom` bytecode executables, or Dune
+  `(modes byte)` executables. The Rust bridge is installed only as a static
+  archive, so dynamically loaded bytecode (`ocamlc -linkpkg` without
+  `-custom`) and the toplevel (`#require "temporal-sdk"`) are not supported.
+
 ### The real Temporal smoke
 
 `make test-temporal-integration` starts the pinned Temporal Server and
