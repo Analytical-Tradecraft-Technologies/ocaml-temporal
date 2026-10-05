@@ -13,10 +13,22 @@ let max_cause_depth = 128
 
 (** Limits server-supplied text before it is copied into an OCaml error. The
     protocol already bounds each field, but this local cap keeps diagnostics
-    safe if a value bypasses decoding. *)
+    safe if a value bypasses decoding.
+
+    The cut backs off to a UTF-8 code-point boundary so that truncating valid
+    text never yields invalid UTF-8: a split character would otherwise make the
+    whole message unusable later, when [bounded_protocol_message] replaces
+    invalid text with a generic diagnostic. Continuation bytes have the form
+    [0b10xxxxxx]; at most three are skipped for well-formed input. *)
 let bounded_text ~limit value =
   if String.length value <= limit then value
-  else String.sub value 0 limit ^ "..."
+  else
+    let is_continuation index = Char.code value.[index] land 0xC0 = 0x80 in
+    let rec boundary length =
+      if length > 0 && is_continuation length then boundary (length - 1)
+      else length
+    in
+    String.sub value 0 (boundary limit) ^ "..."
 
 (** Describes one semantic info variant while leaving binary payload details in
     the typed [Error.view] list. *)
