@@ -221,29 +221,29 @@ their own adapter coverage in `test/runtime/test_native_activity_execution.ml`.
 The public native worker invokes this adapter through the owner-Domain
 supervisor. The live Compose gate exercises timer and activity success paths
 and includes parent/child result paths against Temporal Server. The complete
-[PR #289 Compose run](https://github.com/mfow/ocaml-temporal/actions/runs/29339077368)
+[PR #289 Compose run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29339077368)
 also live-verifies propagated child failure, child-handle cancellation, child
 retry, and duplicate-ID child-start failure. The [PR #298 Compose
-run](https://github.com/mfow/ocaml-temporal/actions/runs/29346853291) live-verifies
+run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29346853291) live-verifies
 the current two-generation worker restart/replay path, including the
-replacement-worker retry to attempt two; the earlier [PR #253 run](https://github.com/mfow/ocaml-temporal/actions/runs/29286560471)
+replacement-worker retry to attempt two; the earlier [PR #253 run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29286560471)
 remains historical evidence for the original path. Sticky-cache eviction is
-now live-verified by the complete [PR #438 Compose run](https://github.com/mfow/ocaml-temporal/actions/runs/29805397413).
+now live-verified by the complete [PR #438 Compose run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29805397413).
 That repaired gate uses an isolated worker configured with one Core cache slot;
 the one-slot scenario observes a `RemoveFromCache(CacheFull)` activation,
 acknowledges it with an empty completion, and checks the exact workflow runs.
-The earlier [PR #322 run](https://github.com/mfow/ocaml-temporal/actions/runs/29402103748)
+The earlier [PR #322 run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29402103748)
 remains historical evidence for the original gate.
 Other untested child recovery cases remain deferred live acceptance scenarios
 even though several of their local worker paths are already tested. The later
-[PR #306 Build run](https://github.com/mfow/ocaml-temporal/actions/runs/29356904816)
+[PR #306 Build run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29356904816)
 adds a separate forced-crash proof: generation one must exit with code 137 and
 without a graceful-stop marker before generation two is allowed to replay and
 complete. That run verifies worker-process recovery; it does not establish
 broader child-workflow recovery coverage. Exact bilateral parent/child replacement
 recovery is separately live-verified in the complete [PR #351
-run](https://github.com/mfow/ocaml-temporal/actions/runs/29434016013). The
+run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29434016013). The
 [child-failure-after-replay acceptance](child-failure-replay-acceptance.md) is
-also live-verified by the complete [PR #361 CI run](https://github.com/mfow/ocaml-temporal/actions/runs/29475615866),
+also live-verified by the complete [PR #361 CI run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29475615866),
 which requires replay before the typed child failure and the recovered parent
 result. Additional child-failure and cache-recovery scenarios remain deferred.

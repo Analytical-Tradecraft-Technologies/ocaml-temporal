@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/mfow/ocaml-temporal/docs/schemas/acceptance/patch-replay-diagnostics.schema.json",
+  "$id": "https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/docs/schemas/acceptance/patch-replay-diagnostics.schema.json",
   "title": "Workflow-patch replay worker diagnostics",
   "description": "The existing Native_worker test observer's payload-free activation records. An initial-stage snapshot contains the generation-one initial record; a terminal-stage snapshot contains that record followed by the generation-two replay record. Patch branch selection is deliberately not duplicated here because it is proven by durable history events.",
   "type": "object",

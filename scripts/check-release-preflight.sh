@@ -77,6 +77,14 @@ grep -F 'Apache License' LICENSE >/dev/null || fail "LICENSE is not Apache-2.0"
 sdk_version=$(printf '%s\n' "$version" | sed 's/~/-/')
 grep -F "const SDK_VERSION: &str = \"$sdk_version\";" rust/core-bridge/src/abi.rs >/dev/null ||
   fail "bridge SDK_VERSION does not match .release-version"
+# The repository moved from its original owner. GitHub's transfer redirect
+# breaks if that name is reused, and published schema $id values are permanent
+# identifiers, so no tracked file may use the pre-transfer URL. The pattern is
+# assembled at runtime so this script does not match itself.
+former_owner=mfow
+stale_references=$(git grep -l -F "github.com/$former_owner/ocaml-temporal" -- . || true)
+[ -z "$stale_references" ] ||
+  fail "tracked files reference the pre-transfer repository URL: $(printf '%s' "$stale_references" | tr '\n' ' ')"
 grep -F "repository = \"$repository_url\"" rust/Cargo.toml >/dev/null ||
   fail "Cargo repository metadata differs"
 grep -F "NAMESPACE = \"$repository_url/sbom/cargo\"" scripts/generate-cargo-sbom.py >/dev/null ||

@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/mfow/ocaml-temporal/docs/schemas/bridge/client-cancel-response.schema.json",
+  "$id": "https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/docs/schemas/bridge/client-cancel-response.schema.json",
   "title": "OCaml Temporal native client cancellation acknowledgement",
   "description": "The Rust bridge emits this closed document only after Temporal accepts the cancellation RPC. It is an acknowledgement, not proof that the workflow has reached its cancelled terminal state; callers must use the exact-run wait operation.",
   "type": "object",

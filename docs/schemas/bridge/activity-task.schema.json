@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/mfow/ocaml-temporal/docs/schemas/bridge/activity-task.schema.json",
+  "$id": "https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/docs/schemas/bridge/activity-task.schema.json",
   "title": "Activity task",
   "description": "A closed semantic remote or local activity task sent from the Rust Temporal Core bridge to the private OCaml activity runner.",
   "type": "object",

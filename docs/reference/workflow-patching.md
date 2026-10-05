@@ -132,9 +132,9 @@ cases. It does not run a JSON Schema validator against those fixtures, build
 workers, start containers, contact Temporal Server, or establish that a replay
 occurred.
 The complete [PR #348 CI
-run](https://github.com/mfow/ocaml-temporal/actions/runs/29411260374) records the
+run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29411260374) records the
 successful real-server invocation of the two original patch-in scenarios. The
-complete [PR #356 run](https://github.com/mfow/ocaml-temporal/actions/runs/29469232271)
+complete [PR #356 run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29469232271)
 also verifies the active-to-deprecated and deprecated-to-removed transitions.
 
 ## Focused evidence and remaining boundary

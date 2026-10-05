@@ -222,9 +222,9 @@ fixtures plus fail-closed normalization and validation cases. The umbrella
 `make test-temporal-workflow-patching` runs that contract before the real
 two-scenario Compose controller. A green contract-only run is not evidence of
 Temporal Server replay. The complete [PR #348 CI
-run](https://github.com/mfow/ocaml-temporal/actions/runs/29411260374) is the
+run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29411260374) is the
 corresponding real-server evidence for the original patch-in cases; the
-complete [PR #356 CI run](https://github.com/mfow/ocaml-temporal/actions/runs/29469232271)
+complete [PR #356 CI run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29469232271)
 verifies the expanded lifecycle cases.
 
 ## Terms used in this project

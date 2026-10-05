@@ -143,7 +143,7 @@ lease retirement. The live Compose fixture now also covers one parent calling
 child's durable timer. The live Compose fixture also covers propagated child
 failure, child cancellation, child retry, and duplicate-ID child-start failure;
 the complete [PR #351
-run](https://github.com/mfow/ocaml-temporal/actions/runs/29434016013) additionally
+run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29434016013) additionally
 verifies exact parent and child replay through worker replacement. Broader
 child failure recovery remains a separate acceptance scenario.
 
@@ -659,12 +659,12 @@ cover the complete lifecycle. The live Compose fixture covers the parent/child
 success path, propagated failure, child cancellation, and child retry: the
 parent calls `Child_workflow.execute`, the registered child waits on a durable
 timer, and the driver asserts the parent's exact result. The complete [PR #289
-CI run](https://github.com/mfow/ocaml-temporal/actions/runs/29333761719) also
+CI run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29333761719) also
 live-verifies duplicate-ID child-start failure. The complete [PR #351
-run](https://github.com/mfow/ocaml-temporal/actions/runs/29434016013) verifies
+run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29434016013) verifies
 the exact parent and child replay path. The separate
 [child-failure-after-replay acceptance](../reference/child-failure-replay-acceptance.md)
-is live-verified by the complete [PR #361 CI run](https://github.com/mfow/ocaml-temporal/actions/runs/29475615866):
+is live-verified by the complete [PR #361 CI run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29475615866):
 it requires both replay observations before the typed child failure and the
 parent's `SMOKE:PARENT:CHILD:FAILURE_RECOVERED` result. Additional child
 failure and recovery permutations remain separate acceptance work.
@@ -725,7 +725,7 @@ and rejects unsupported non-default options instead of silently dropping them.
 
 `Temporal.Client.wait` treats the current run as terminal and returns its
 typed continued-as-new outcome with the successor execution reference; it does
-not follow the successor automatically. The complete [PR #253 CI run](https://github.com/mfow/ocaml-temporal/actions/runs/29286560471)
+not follow the successor automatically. The complete [PR #253 CI run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29286560471)
 live-verified the successor-following path in Compose; longer continuation
 chains and other advanced history-management features remain separate work.
 
@@ -897,13 +897,13 @@ the workflow definition; the [interactive workflow reference](../reference/inter
 describes the typed definition and deterministic handler boundary. The client
 signal bridge and mock lifecycle are focused-tested at this baseline. The
 complete [PR #266 CI
-run](https://github.com/mfow/ocaml-temporal/actions/runs/29311239247) live-verifies
+run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29311239247) live-verifies
 typed signal delivery and signal-dependent completion, and the expanded [PR #289 CI
-run](https://github.com/mfow/ocaml-temporal/actions/runs/29333761719) retains those
+run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29333761719) retains those
 assertions in the historical seventeen-result baseline. The [PR #302 CI
-run](https://github.com/mfow/ocaml-temporal/actions/runs/29351689638) first
+run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29351689638) first
 verified the long-backoff retry extension, and the complete [PR #439 CI
-run](https://github.com/mfow/ocaml-temporal/actions/runs/29824441578) retains
+run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29824441578) retains
 the signal and retry paths in its historical baseline. See the
 [current evidence audit](../reference/live-acceptance-coverage.md) for the
 later successful source snapshot and remaining condition/recovery limits. A successful
@@ -934,16 +934,16 @@ workflow failure, direct cancellation and termination, queries, updates,
 direct and workflow-to-workflow signals, and external cancellation. Readiness
 markers guard control operations, and the start-to-close and heartbeat-timeout
 retries remain serialized after the shorter heartbeat path. The complete [PR
-#439 CI run](https://github.com/mfow/ocaml-temporal/actions/runs/29824441578)
+#439 CI run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29824441578)
 passed all current terminal assertions against Temporal Server 1.31 and
 PostgreSQL. The historical [PR #289 CI
-run](https://github.com/mfow/ocaml-temporal/actions/runs/29333761719) verifies
-the earlier seventeen-result baseline, and [PR #302](https://github.com/mfow/ocaml-temporal/actions/runs/29351689638)
+run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29333761719) verifies
+the earlier seventeen-result baseline, and [PR #302](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29351689638)
 first verifies its long-backoff extension. The
 [PR #266 CI
-run](https://github.com/mfow/ocaml-temporal/actions/runs/29311239247) remains focused
+run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29311239247) remains focused
 evidence for typed signal delivery and condition wake-up, while the historical
-[PR #210 CI run](https://github.com/mfow/ocaml-temporal/actions/runs/29221151859)
+[PR #210 CI run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29221151859)
 remains evidence for the earlier nine-scenario slice. The implementation scope
 and evidence boundary are described in the [acceptance design](../reference/two-ocaml-binary-e2e-acceptance.md)
 and [live acceptance coverage](../reference/live-acceptance-coverage.md).

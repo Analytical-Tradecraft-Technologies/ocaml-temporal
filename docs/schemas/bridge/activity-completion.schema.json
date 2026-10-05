@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/mfow/ocaml-temporal/docs/schemas/bridge/activity-completion.schema.json",
+  "$id": "https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/docs/schemas/bridge/activity-completion.schema.json",
   "title": "Remote activity completion",
   "description": "A closed terminal remote-activity completion sent from the private OCaml activity runner to the Rust Temporal Core bridge.",
   "type": "object",

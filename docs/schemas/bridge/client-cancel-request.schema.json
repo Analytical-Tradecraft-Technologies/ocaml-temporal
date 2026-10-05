@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/mfow/ocaml-temporal/docs/schemas/bridge/client-cancel-request.schema.json",
+  "$id": "https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/docs/schemas/bridge/client-cancel-request.schema.json",
   "title": "OCaml Temporal native client exact-run cancellation request",
   "description": "Closed JSON document used only by the private Rust client bridge. The request names one exact run and carries a stable Temporal cancellation request ID. Runtime validators also reject duplicate keys, NUL bytes, and strings over the 65,536-byte safety limit; maxLength is the character-count bound expressible in standard JSON Schema.",
   "type": "object",

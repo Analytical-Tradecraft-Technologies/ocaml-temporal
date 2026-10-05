@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/mfow/ocaml-temporal/docs/schemas/acceptance/restart-replay-diagnostics.schema.json",
+  "$id": "https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/docs/schemas/acceptance/restart-replay-diagnostics.schema.json",
   "title": "Worker restart/replay diagnostics",
   "description": "Payload-free, machine-readable diagnostics emitted by the two worker generations during the restart/replay acceptance scenario.",
   "type": "object",

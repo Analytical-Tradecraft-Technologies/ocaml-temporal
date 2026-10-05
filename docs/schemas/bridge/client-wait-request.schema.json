@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/mfow/ocaml-temporal/docs/schemas/bridge/client-wait-request.schema.json",
+  "$id": "https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/docs/schemas/bridge/client-wait-request.schema.json",
   "title": "OCaml Temporal native client exact-run wait request",
   "description": "The absence of a follow_runs option is intentional: this operation always waits for the named run and never follows continued-as-new. Runtime validators also reject NUL-containing identifiers and enforce a 65,536-byte UTF-8 safety limit; maxLength is the corresponding character-count bound expressible in standard JSON Schema.",
   "type": "object",

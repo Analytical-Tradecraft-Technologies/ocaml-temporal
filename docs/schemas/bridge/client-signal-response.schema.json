@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/mfow/ocaml-temporal/docs/schemas/bridge/client-signal-response.schema.json",
+  "$id": "https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/docs/schemas/bridge/client-signal-response.schema.json",
   "title": "OCaml Temporal native client signal acknowledgement",
   "description": "The Rust bridge emits this closed document only after Temporal accepts the signal RPC. It is an acknowledgement, not proof that workflow code has processed the signal.",
   "type": "object",

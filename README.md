@@ -185,9 +185,9 @@ The Docker-free companion checks the checked-in normalized-history,
 diagnostics, and controller fixtures and their rejection paths. It does not
 build workers, start containers, contact Temporal Server, or establish that a
 replay occurred. The complete [PR #348 CI
-run](https://github.com/mfow/ocaml-temporal/actions/runs/29411260374) is the
+run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29411260374) is the
 corresponding real-server evidence for the original cases; the complete [PR
-#356 run](https://github.com/mfow/ocaml-temporal/actions/runs/29469232271)
+#356 run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29469232271)
 verifies the expanded lifecycle cases. Deployment-based routing, arbitrary
 historical compatibility, and migration tooling remain separate; legacy
 build-ID worker routing is covered by bilateral bridge tests but still needs a

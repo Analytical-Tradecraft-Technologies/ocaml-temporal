@@ -240,13 +240,13 @@ cleanup paths have focused tests. The separate live restart design is in
 [`worker-restart-replay-acceptance.md`](worker-restart-replay-acceptance.md),
 and its two-generation Compose test now observes the exact run, replay marker,
 retrying activity's attempt-two result, terminal result, and volume cleanup in
-the [PR #298 Actions run](https://github.com/mfow/ocaml-temporal/actions/runs/29346853291).
-The [PR #306 CI run](https://github.com/mfow/ocaml-temporal/actions/runs/29356904816)
+the [PR #298 Actions run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29346853291).
+The [PR #306 CI run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29356904816)
 reuses that replay path in a forced-crash companion gate: generation one must
 exit with status 137 and leave no graceful-shutdown marker before generation
 two is accepted. This proves worker-process recovery through the replay bridge,
 not a public replay API or a separate child-workflow recovery guarantee.
-The earlier [PR #253 run](https://github.com/mfow/ocaml-temporal/actions/runs/29286560471)
+The earlier [PR #253 run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29286560471)
 is historical evidence for the original path. These runs are evidence for the
 integrated worker/replay scenario, not for exposing this private bridge
 directly.

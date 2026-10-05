@@ -8,21 +8,21 @@ It includes local/remote activities, typed queries, direct/external signals,
 updates, termination, external cancellation and completed-target signal
 rejection. The PR runs below are historical milestones, not suite inventories.
 The historical [PR #289 Actions
-run](https://github.com/mfow/ocaml-temporal/actions/runs/29333761719) verifies
+run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29333761719) verifies
 the earlier seventeen-result baseline; the [PR #302 Actions
-run](https://github.com/mfow/ocaml-temporal/actions/runs/29351689638) first
+run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29351689638) first
 verifies the eighteenth result: a non-immediate retry under a policy configured
 with a two-second backoff. Its timing guard rejects retries delivered in under
 one second and therefore does not prove that the full configured delay elapsed.
 The complete
-[PR #253 Actions run](https://github.com/mfow/ocaml-temporal/actions/runs/29286560471) verified the separate two-generation worker restart/replay acceptance against real Temporal Server and PostgreSQL.
+[PR #253 Actions run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29286560471) verified the separate two-generation worker restart/replay acceptance against real Temporal Server and PostgreSQL.
 The PR #253 run passed the supported Linux and native platform matrix. The
-earlier [PR #229 Actions run](https://github.com/mfow/ocaml-temporal/actions/runs/29235144016)
+earlier [PR #229 Actions run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29235144016)
 verified all ten scenarios against real Temporal Server and PostgreSQL for
 PR head `c244733`, including the timeout-ordering guard; PR #229 was then
-squash-merged as `bfbd568`. The earlier [PR #226 Actions run](https://github.com/mfow/ocaml-temporal/actions/runs/29224854182)
+squash-merged as `bfbd568`. The earlier [PR #226 Actions run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29224854182)
 verified the same ten scenarios with the shorter timeout-fixture delay, and
-the [PR #210 Actions run](https://github.com/mfow/ocaml-temporal/actions/runs/29221151859)
+the [PR #210 Actions run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29221151859)
 verified the previous nine scenarios; that PR used head `47c9a93` and was
 squash-merged as `f877fbf`. The tenth `smoke.activity_timeout_retry` scenario
 has a first activity callback that sleeps beyond its 500 ms start-to-close
@@ -49,7 +49,7 @@ separate [`make test-temporal-workflow-patching`](workflow-patching.md#live-repl
 target uses the same client-only-driver/worker role split but replaces workers
 around both a marker-free legacy history and a marker-bearing new history. Its
 real-server result is independently verified by the complete [PR #348 CI
-run](https://github.com/mfow/ocaml-temporal/actions/runs/29411260374); it must
+run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29411260374); it must
 not be inferred from the baseline's green historical runs.
 
 The current implementation stages the workflows in the generated inventory.
@@ -74,7 +74,7 @@ assertion target requires the exact success payloads, one propagated child
 failure, one child-cancellation marker, one typed non-retryable failure, one
 delayed asynchronous result, one continue-as-new successor result, one timeout
 retry result, and one exact-run cancellation. The separate restart/replay
-acceptance now passes in [PR #253](https://github.com/mfow/ocaml-temporal/actions/runs/29286560471);
+acceptance now passes in [PR #253](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29286560471);
 the child-start-failure parent returns `SMOKE:CHILD:START_FAILED`; cache
 eviction and broader recovery remain separate work.
 
@@ -172,24 +172,24 @@ the 500ms server lease; the six-second delay gives Core time to classify the
 expired token before the callback returns. A dedicated two-attempt policy uses
 7-second initial and maximum intervals, leaving the serialized activity adapter
 free before the retry is polled. Its source contract is Docker-free. The
-current ordering and retry policy passed in the [PR #229 live CI run](https://github.com/mfow/ocaml-temporal/actions/runs/29235144016);
-the earlier [PR #226 live CI run](https://github.com/mfow/ocaml-temporal/actions/runs/29224854182)
+current ordering and retry policy passed in the [PR #229 live CI run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29235144016);
+the earlier [PR #226 live CI run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29224854182)
 used the shorter delay. The driver also starts
 `smoke.non_retryable_failure` and requires its
 stable typed error metadata. It starts `smoke.long_running_cancellation`, waits
 for its `smoke.cancellation_ready` marker activity (with eager execution
 disabled), sends an exact-run cancellation request, and requires the same
 handle to return a typed `Cancelled` error. Those historical ten-run paths,
-including the updated timeout ordering, passed in the [PR #229 live CI run](https://github.com/mfow/ocaml-temporal/actions/runs/29235144016)
-and the [PR #226 live CI run](https://github.com/mfow/ocaml-temporal/actions/runs/29224854182);
-the historical nine-run path passed in [PR #210](https://github.com/mfow/ocaml-temporal/actions/runs/29221151859).
+including the updated timeout ordering, passed in the [PR #229 live CI run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29235144016)
+and the [PR #226 live CI run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29224854182);
+the historical nine-run path passed in [PR #210](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29221151859).
 The historical seventeen-result run additionally verifies asynchronous completion,
 typed signal delivery, continue-as-new successor following, activity-level
 non-retryable classification, heartbeat-timeout retry, and child-workflow
-retry and duplicate-ID child-start failure. The [PR #289 run](https://github.com/mfow/ocaml-temporal/actions/runs/29333761719)
+retry and duplicate-ID child-start failure. The [PR #289 run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29333761719)
 also carries the child retry policy and typed child-start failure through the
 private Rust/OCaml
-activation bridge. The [PR #253 run](https://github.com/mfow/ocaml-temporal/actions/runs/29286560471)
+activation bridge. The [PR #253 run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29286560471)
 also verifies the separate worker restart/replay controller. Child start
 replay and recovery, sticky-cache eviction, and crash recovery remain separate
 scenarios. The
@@ -636,7 +636,7 @@ thread.
 ## Required assertions and failure evidence
 
 The prior driver's successful exit established all of the following against
-the live stack. These assertions passed in the complete [PR #210 Actions run](https://github.com/mfow/ocaml-temporal/actions/runs/29221151859)
+the live stack. These assertions passed in the complete [PR #210 Actions run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29221151859)
 for PR head `47c9a93`, later squash-merged as `f877fbf`:
 
 1. each top-level workflow start returned a nonempty run ID that the driver
@@ -703,7 +703,7 @@ payload-free if added.
 
 The first live test was intentionally small. The parent/child replay and
 recovery item from this historical expansion list is now covered by the
-complete [PR #351 CI run](https://github.com/mfow/ocaml-temporal/actions/runs/29434016013).
+complete [PR #351 CI run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29434016013).
 The separate
 [child-failure-after-replay acceptance](child-failure-replay-acceptance.md)
 has its own reference and [coverage status](live-acceptance-coverage.md). The
@@ -718,7 +718,7 @@ remaining expansion of the same two-binary topology is:
 Child-start commands and both child-resolution jobs have a closed bilateral
 schema, Core conversion, pure-OCaml lifecycle tests, and the PR #210
 real-server assertions for parent/child success, propagated child failure, and
-child cancellation. The [PR #289 run](https://github.com/mfow/ocaml-temporal/actions/runs/29333761719)
+child cancellation. The [PR #289 run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29333761719)
 adds live child retry and duplicate-ID child-start failure. The activity retry
 policy has the same separation:
 bilateral policy validation is synthetic, while the PR #210 run makes both the
@@ -726,11 +726,11 @@ ordinary attempt-2 result and heartbeat-detail retry live evidence; the PR #226
 run adds start-to-close timeout-triggered retry for the earlier delay. The PR
 #229 run verifies the delayed retry policy and ordering guard against the live
 server. PR #289 adds heartbeat-timeout, non-retryable activity, and child retry
-plus duplicate-ID child-start-failure evidence; the [PR #253 run](https://github.com/mfow/ocaml-temporal/actions/runs/29286560471)
+plus duplicate-ID child-start-failure evidence; the [PR #253 run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29286560471)
 adds live worker restart/replay evidence. These baseline assertions do not
 claim sticky-cache eviction or crash-recovery coverage. The bilateral
 parent/child replay gate is a separate live scenario, verified by
-[PR #351](https://github.com/mfow/ocaml-temporal/actions/runs/29434016013).
+[PR #351](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29434016013).
 The child-failure-after-replay gate, sticky-cache eviction, and crash recovery
 have their own live acceptance references and [coverage boundaries](live-acceptance-coverage.md).
 
@@ -739,7 +739,7 @@ have their own live acceptance references and [coverage boundaries](live-accepta
 The current baseline is verified by the [audited CI job](live-acceptance-coverage.md#verified-ci-boundary).
 PR #439 remains historical evidence for its earlier interaction/control slice. The
 separate two-generation restart/replay acceptance was verified by the complete
-[PR #253 CI run](https://github.com/mfow/ocaml-temporal/actions/runs/29286560471).
+[PR #253 CI run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29286560471).
 The baseline driver assertions and the restart controller are separate gates:
 the former waits for every exact terminal outcome, while the latter replaces
 generation 1, validates replay on generation 2, and removes the PostgreSQL
@@ -748,10 +748,10 @@ eighteen-result milestones; the older entries below retain the earlier nine-
 and ten-workflow milestones.
 
 The previous nine-workflow acceptance contract was verified by the complete
-[PR #210 CI run](https://github.com/mfow/ocaml-temporal/actions/runs/29221151859)
+[PR #210 CI run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29221151859)
 for PR head `47c9a93` before the squash merge as `f877fbf`. The historical
 ten-workflow contract, including the updated timeout ordering, was verified by
-the complete [PR #229 CI run](https://github.com/mfow/ocaml-temporal/actions/runs/29235144016)
+the complete [PR #229 CI run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29235144016)
 for PR head `c244733` before the squash merge as `bfbd568`. PR #226's complete
 run for PR head `ca112b8` remains historical evidence for the earlier shorter
 delay.

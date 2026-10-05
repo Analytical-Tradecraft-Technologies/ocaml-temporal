@@ -72,7 +72,7 @@ forces reconstruction by replacing the entire process.
 
 ## 2026-07-21: Stable and prerelease tag consistency gate (#444)
 
-The complete [PR #444 Actions run](https://github.com/mfow/ocaml-temporal/actions/runs/29827725596)
+The complete [PR #444 Actions run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29827725596)
 passed the release-preflight job and every applicable compatibility job. The
 host-only `make release-tag-check RELEASE_TAG=...` gate accepts a stable
 `vMAJOR.MINOR.PATCH` tag or an optional prerelease suffix. A SemVer-style tag
@@ -88,19 +88,19 @@ audit that remain roadmap work.
 
 ## 2026-07-21: Repaired live sticky-cache eviction acceptance (#438)
 
-The complete [PR #438 Actions run](https://github.com/mfow/ocaml-temporal/actions/runs/29805397413)
+The complete [PR #438 Actions run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29805397413)
 passes the real Temporal/PostgreSQL integration smoke after isolating the
 cache-eviction worker and configuring it with one Core cache slot. The current
 `make test-temporal-worker-cache-eviction` gate uses a typed read-only query as
 its synchronization barrier, requires the payload-free `cache_full` marker,
 acknowledges Core's `RemoveFromCache` activation with an empty completion, and
-then checks exact-run cancellation and teardown. The earlier [PR #322 run](https://github.com/mfow/ocaml-temporal/actions/runs/29402103748)
+then checks exact-run cancellation and teardown. The earlier [PR #322 run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29402103748)
 remains historical evidence for the original gate; broader cache/recovery and
 child-failure scenarios remain planned.
 
 ## 2026-07-19: Live external workflow cancellation acceptance (#431)
 
-The complete [PR #431 Build run](https://github.com/mfow/ocaml-temporal/actions/runs/29679213525)
+The complete [PR #431 Build run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29679213525)
 passes the real Temporal/PostgreSQL integration smoke and all compatibility
 jobs. Its two-binary scenario delivers an external signal, rejects a
 mismatched run ID before acknowledging the exact-run request, then cancels the
@@ -111,7 +111,7 @@ remain separate live scenarios.
 
 ## 2026-07-21: Stable mismatched-run external cancellation diagnostic (#439)
 
-The complete [PR #439 Build run](https://github.com/mfow/ocaml-temporal/actions/runs/29824441578)
+The complete [PR #439 Build run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29824441578)
 keeps the live external-cancellation scenario green while tightening its
 wrong-run assertion. A mismatched exact-run cancellation now has documented
 bridge evidence as a retryable workflow error (`non_retryable=false`) whose
@@ -122,15 +122,15 @@ diagnostic.
 
 ## 2026-07-19: Live typed queries, workflow updates, and termination
 
-The complete [PR #434 Actions run](https://github.com/mfow/ocaml-temporal/actions/runs/29684113836)
+The complete [PR #434 Actions run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29684113836)
 extends the parked-workflow query acceptance from output-only queries to
 `Temporal.Client.query_with_input`. It also requires the exact missing-handler
 rejection and preserves the local typed-input validation boundary. The [PR #428
-Actions run](https://github.com/mfow/ocaml-temporal/actions/runs/29676120429)
+Actions run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29676120429)
 verifies typed workflow-update admission, polling, handler state mutation, and
-completion against the real Temporal/PostgreSQL stack; [PR #432](https://github.com/mfow/ocaml-temporal/actions/runs/29681119024)
+completion against the real Temporal/PostgreSQL stack; [PR #432](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29681119024)
 adds the unregistered-handler rejection and proves the parked workflow remains
-usable afterward. The [PR #433 Actions run](https://github.com/mfow/ocaml-temporal/actions/runs/29683521094)
+usable afterward. The [PR #433 Actions run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29683521094)
 verifies exact-run termination and reconciliation of the uncertain
 acknowledgement before observing the stable `Terminated` result.
 
@@ -148,7 +148,7 @@ signal and checks the ordinary terminal result. This ordering proves that the
 query response came from a live workflow execution rather than a local
 dispatcher or a completed final state.
 
-The complete [PR #406 Actions run](https://github.com/mfow/ocaml-temporal/actions/runs/29557704643)
+The complete [PR #406 Actions run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29557704643)
 passed the live integration smoke and all compatibility jobs. It established
 the output-only query slice; the newer 2026-07-19 entry above supersedes its
 typed-input query, update, and termination status.
@@ -179,7 +179,7 @@ then replaced by code containing no patch API. Strict normalized histories
 preserve the exact initial prefix and observed marker deprecation state, while
 controller evidence requires distinct containers and generation-two replay.
 
-The Docker-free contract passes, and the complete [PR #356 GitHub Actions run](https://github.com/mfow/ocaml-temporal/actions/runs/29469232271) verifies the
+The Docker-free contract passes, and the complete [PR #356 GitHub Actions run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29469232271) verifies the
 expanded cases against Temporal Server and PostgreSQL. It covers all three
 transitions with separately compiled workers, exact normalized history and
 marker assertions, worker handoff evidence, and cleanup.
@@ -225,7 +225,7 @@ removal against that deprecated history.
 ## 2026-07-15: Bilateral parent/child restart-replay gate
 
 Status: the complete [PR #351 CI
-run](https://github.com/mfow/ocaml-temporal/actions/runs/29434016013) passed all
+run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29434016013) passed all
 nine jobs, including the real Temporal/PostgreSQL acceptance in 23m11s.
 
 The dedicated gate starts a fixed parent execution from an independent OCaml
@@ -246,7 +246,7 @@ crash timing, and child-failure recovery remain separate scenarios.
 ## 2026-07-15: Live old/new-history workflow patch replay (#348)
 
 Status: the complete [PR #348 CI
-run](https://github.com/mfow/ocaml-temporal/actions/runs/29411260374) passed all
+run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29411260374) passed all
 nine jobs, including the real Temporal/PostgreSQL acceptance in 18m15s.
 
 The live controller created a marker-free history under a legacy OCaml worker
@@ -293,7 +293,7 @@ claim that the real-server target has already passed.
 ## 2026-07-14: Live non-immediate activity retry (#302)
 
 The complete [PR #302 Actions
-run](https://github.com/mfow/ocaml-temporal/actions/runs/29351689638) passed the
+run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29351689638) passed the
 Temporal/PostgreSQL integration job. Its public driver started
 `smoke.activity_long_backoff_retry`, retained the exact workflow/run handle,
 observed the run complete, required
@@ -304,14 +304,14 @@ under a policy configured with a two-second initial and maximum backoff. It does
 not measure or prove that the full configured delay elapsed.
 
 This was the first live evidence for the eighteenth baseline result. The
-complete [PR #439 run](https://github.com/mfow/ocaml-temporal/actions/runs/29824441578)
+complete [PR #439 run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29824441578)
 retains the scenario in the later 26-start baseline; PR #289 remains historical
 evidence for the preceding seventeen-result slice.
 
 ## 2026-07-14: Retry-after-restart acceptance extension
 
 Status: verified in the Temporal/PostgreSQL integration job of the complete
-[PR #298 GitHub Actions run](https://github.com/mfow/ocaml-temporal/actions/runs/29346853291).
+[PR #298 GitHub Actions run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29346853291).
 
 The two-generation restart/replay fixture now uses the existing bounded
 two-attempt activity policy after generation 2 replays the pending timer. The
@@ -330,7 +330,7 @@ attempt-two result, terminal result, normalized history, and cleanup record.
 
 ## 2026-07-14: Live child-workflow retry acceptance (#279)
 
-Status: verified in the complete [PR #279 GitHub Actions run](https://github.com/mfow/ocaml-temporal/actions/runs/29329420364).
+Status: verified in the complete [PR #279 GitHub Actions run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29329420364).
 
 The two-binary Compose smoke now starts a parent whose child has an explicit
 two-attempt retry policy. The child deliberately returns a retryable workflow
@@ -397,7 +397,7 @@ the source contracts pass locally.
 
 ## 2026-07-14: Live worker restart/replay acceptance (#253)
 
-Status: verified in the complete [PR #253 GitHub Actions run](https://github.com/mfow/ocaml-temporal/actions/runs/29286560471)
+Status: verified in the complete [PR #253 GitHub Actions run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29286560471)
 for head `017c58e00ad64458f0ce2b41a7d29bad3404ded5`.
 
 The real Temporal/PostgreSQL integration job passed the twelve-result baseline
@@ -644,7 +644,7 @@ made for those fields.
 
 ## 2026-07-13: Complete nine-scenario Temporal smoke evidence (#210)
 
-Status: historical CI evidence from the full [PR #210 Actions run](https://github.com/mfow/ocaml-temporal/actions/runs/29221151859),
+Status: historical CI evidence from the full [PR #210 Actions run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29221151859),
 then squash-merged to `master` as `f877fbf`. The newer local twelve-result
 acceptance entry above supersedes this as the current fixture description.
 
@@ -740,7 +740,7 @@ workflow-authoring tests. No live Temporal acceptance is claimed. GitHub
 Actions checks for this milestone may remain pending because of the repository
 quota.
 
-The squash-merged [PR #191](https://github.com/mfow/ocaml-temporal/pull/191),
+The squash-merged [PR #191](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/pull/191),
 commit `cb07df2`, adds an opaque `Activity.start_handle` API alongside the
 existing future-only `Activity.start` and `Activity.execute` helpers. The
 handle keeps the typed result future with an owner-checked, parameterless
@@ -754,7 +754,7 @@ ownership checks, and natural or failed terminal races.
 
 ## 2026-07-13: Two-binary child failure and cancellation acceptance coverage
 
-Status: locally contract-checked after the squash-merged [PR #193](https://github.com/mfow/ocaml-temporal/pull/193), commit `48ed97f`. No live Temporal Server or GitHub Actions success claim is made here. The expanded Actions run was cancelled, and subsequent checks may remain queued while the repository quota is exhausted.
+Status: locally contract-checked after the squash-merged [PR #193](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/pull/193), commit `48ed97f`. No live Temporal Server or GitHub Actions success claim is made here. The expanded Actions run was cancelled, and subsequent checks may remain queued while the repository quota is exhausted.
 
 The two-binary fixture now starts nine top-level workflows before awaiting any
 result. In addition to the historical success and retry scenarios, the driver
@@ -873,9 +873,9 @@ as a result.
 
 ## 2026-07-13: Acceptance validator and client-boundary hardening (#164–#165)
 
-The merged tip is `1fa679c`: [#164](https://github.com/mfow/ocaml-temporal/pull/164)
+The merged tip is `1fa679c`: [#164](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/pull/164)
 (`4724830`) preserves configurable `JQ_BIN` paths containing spaces and adds
-a regression invocation; [#165](https://github.com/mfow/ocaml-temporal/pull/165)
+a regression invocation; [#165](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/pull/165)
 (`1fa679c`) validates client protocol identifier sizes consistently and adds
 boundary tests.
 
@@ -887,15 +887,15 @@ Focused local verification includes
 queued while the repository quota is exhausted, so this entry makes no
 CI-success claim and adds no new live Temporal evidence. The historical
 five-execution live result in run
-[`29191260073`](https://github.com/mfow/ocaml-temporal/actions/runs/29191260073)
+[`29191260073`](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29191260073)
 remains the latest successful two-binary acceptance evidence.
 
 ## 2026-07-13: Public client state, protocol evidence, and scheduler teardown (#159–#161)
 
-The merged tip is `02f4627`: [#159](https://github.com/mfow/ocaml-temporal/pull/159)
-(`980855f`) clarifies public client state and adds protocol coverage; [#160](https://github.com/mfow/ocaml-temporal/pull/160)
+The merged tip is `02f4627`: [#159](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/pull/159)
+(`980855f`) clarifies public client state and adds protocol coverage; [#160](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/pull/160)
 (`d5606ad`) separates local protocol evidence from live Temporal evidence; and
-[#161](https://github.com/mfow/ocaml-temporal/pull/161) (`02f4627`) releases
+[#161](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/pull/161) (`02f4627`) releases
 settled futures during scheduler teardown with a weak-reference regression test.
 
 PR #161 recorded this local verification: `DUNE_BUILD_DIR=/tmp/ocaml-temporal-dune-audit
@@ -905,29 +905,29 @@ test/runtime`, `sh scripts/check-format.sh`,
 repository's GitHub Actions checks remain queued while the Actions quota is
 exhausted, so this entry makes no CI-success claim. The historical
 five-execution live result in run
-[`29191260073`](https://github.com/mfow/ocaml-temporal/actions/runs/29191260073)
+[`29191260073`](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29191260073)
 remains the latest successful two-binary acceptance evidence.
 
 ## 2026-07-13: Protocol, lifecycle, and two-binary acceptance contracts (#141–#152)
 
 Status: the merged documentation and acceptance-contract milestones are now
 present on `origin/master` at `c008c52`. The activity-protocol lifecycle and
-evidence records are [#141](https://github.com/mfow/ocaml-temporal/pull/141)
-(`cb2892c`), [#142](https://github.com/mfow/ocaml-temporal/pull/142)
-(`d1d45c2`), and [#143](https://github.com/mfow/ocaml-temporal/pull/143)
+evidence records are [#141](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/pull/141)
+(`cb2892c`), [#142](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/pull/142)
+(`d1d45c2`), and [#143](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/pull/143)
 (`ef3e171`); asynchronous completion, native worker ownership, and installed
-package boundaries are [#144](https://github.com/mfow/ocaml-temporal/pull/144)
-(`cfb760a`), [#145](https://github.com/mfow/ocaml-temporal/pull/145)
-(`9a6992a`), and [#146](https://github.com/mfow/ocaml-temporal/pull/146)
+package boundaries are [#144](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/pull/144)
+(`cfb760a`), [#145](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/pull/145)
+(`9a6992a`), and [#146](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/pull/146)
 (`127f3f6`). Native execution translation, dependency licensing, restart and
 replay evidence, and the separation of control from operation JSON are
-recorded by [#147](https://github.com/mfow/ocaml-temporal/pull/147)
-(`6e860b2`), [#148](https://github.com/mfow/ocaml-temporal/pull/148)
-(`b30f85f`), [#149](https://github.com/mfow/ocaml-temporal/pull/149)
-(`54cf1a9`), and [#150](https://github.com/mfow/ocaml-temporal/pull/150)
-(`3466ae9`). [#151](https://github.com/mfow/ocaml-temporal/pull/151)
+recorded by [#147](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/pull/147)
+(`6e860b2`), [#148](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/pull/148)
+(`b30f85f`), [#149](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/pull/149)
+(`54cf1a9`), and [#150](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/pull/150)
+(`3466ae9`). [#151](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/pull/151)
 (`ef0ed69`) adds assertions that the acceptance harness has separate
-`smoke_driver` and `smoke_worker` OCaml binaries with distinct roles. [#152](https://github.com/mfow/ocaml-temporal/pull/152)
+`smoke_driver` and `smoke_worker` OCaml binaries with distinct roles. [#152](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/pull/152)
 (`c008c52`) documents the native worker execution-state invariants and adds
 regression coverage for them.
 
@@ -944,27 +944,27 @@ repository was affected by its Actions quota, so this entry does not treat
 those checks as passing evidence. The Docker Compose acceptance against a
 live Temporal Server and PostgreSQL was not run for this milestone, and no
 new live result is claimed at that milestone. The historical five-execution live result in run
-[`29191260073`](https://github.com/mfow/ocaml-temporal/actions/runs/29191260073)
+[`29191260073`](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29191260073)
 was the latest successful two-binary acceptance evidence at that time; the
 later PR #210 entry above supersedes it.
 
 ## 2026-07-13: Documentation evidence and navigation refresh (#129–#140)
 
-Status: documentation-only updates were merged in PRs [#129](https://github.com/mfow/ocaml-temporal/pull/129)
-(`d37f863`), [#130](https://github.com/mfow/ocaml-temporal/pull/130)
-(`857862b`), and [#131](https://github.com/mfow/ocaml-temporal/pull/131)
+Status: documentation-only updates were merged in PRs [#129](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/pull/129)
+(`d37f863`), [#130](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/pull/130)
+(`857862b`), and [#131](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/pull/131)
 (`404a7c5`) for runtime invariants, merged lifecycle evidence, and feature
-coverage; [#132](https://github.com/mfow/ocaml-temporal/pull/132)
-(`1dfc13e`), [#133](https://github.com/mfow/ocaml-temporal/pull/133)
-(`515f723`), and [#135](https://github.com/mfow/ocaml-temporal/pull/135)
+coverage; [#132](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/pull/132)
+(`1dfc13e`), [#133](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/pull/133)
+(`515f723`), and [#135](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/pull/135)
 (`a656f92`) for the two-binary acceptance boundary, queued-CI fallback, and
-live-acceptance evidence; [#134](https://github.com/mfow/ocaml-temporal/pull/134)
-(`229b548`), [#137](https://github.com/mfow/ocaml-temporal/pull/137)
-(`97924c7`), and [#138](https://github.com/mfow/ocaml-temporal/pull/138)
+live-acceptance evidence; [#134](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/pull/134)
+(`229b548`), [#137](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/pull/137)
+(`97924c7`), and [#138](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/pull/138)
 (`65b6441`) for native activity, client protocol, and Core-bridge contracts;
-and [#136](https://github.com/mfow/ocaml-temporal/pull/136)
-(`b487eaf`), [#139](https://github.com/mfow/ocaml-temporal/pull/139)
-(`6709fce`), and [#140](https://github.com/mfow/ocaml-temporal/pull/140)
+and [#136](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/pull/136)
+(`b487eaf`), [#139](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/pull/139)
+(`6709fce`), and [#140](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/pull/140)
 (`9104f3d`) for observability, workflow guidance, and documentation
 navigation.
 
@@ -975,7 +975,7 @@ used for the documentation PRs; host-only `make quality` remains dependent on
 the pinned scanner binaries being installed. GitHub Actions checks may remain
 queued because of the repository quota and are not treated as passing evidence.
 The historical five-execution live result in run
-[`29191260073`](https://github.com/mfow/ocaml-temporal/actions/runs/29191260073)
+[`29191260073`](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29191260073)
 was the latest successful two-binary acceptance evidence for this historical
 entry. The expanded assertions were later live-verified by PR #210, as recorded
 in the current entry above.
@@ -983,9 +983,9 @@ in the current entry above.
 ## 2026-07-13: Scope, child-lifecycle, and ABI cancellation-validation coverage
 
 Status: locally verified on the merged `origin/master` tip with focused OCaml,
-Rust, and ABI tests. The work was merged in [PR #125](https://github.com/mfow/ocaml-temporal/pull/125)
-as `8e56c24`, [PR #126](https://github.com/mfow/ocaml-temporal/pull/126) as
-`43beafb`, and [PR #127](https://github.com/mfow/ocaml-temporal/pull/127) as
+Rust, and ABI tests. The work was merged in [PR #125](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/pull/125)
+as `8e56c24`, [PR #126](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/pull/126) as
+`43beafb`, and [PR #127](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/pull/127) as
 `55d758c`. This entry makes no claim about a live Temporal Server run or
 GitHub Actions success.
 
@@ -1003,7 +1003,7 @@ an unrelated connection or state error.
 
 Status: locally verified in the native activity execution tests; no live
 Temporal Server claim is made by this test-only milestone. The change was
-merged in [PR #120](https://github.com/mfow/ocaml-temporal/pull/120) as commit
+merged in [PR #120](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/pull/120) as commit
 `04a6bab`.
 
 The activity-context tests now prove that previous-attempt details, heartbeat
@@ -1019,8 +1019,8 @@ live heartbeat-timeout behavior.
 
 Status: locally verified in the focused OCaml and Rust tests; no live Temporal
 Server or GitHub Actions success claim is made by these test-only milestones.
-The lifecycle tests were merged in [PR #118](https://github.com/mfow/ocaml-temporal/pull/118)
-as commit `8b62593`, and the bridge ownership tests were merged in [PR #119](https://github.com/mfow/ocaml-temporal/pull/119)
+The lifecycle tests were merged in [PR #118](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/pull/118)
+as commit `8b62593`, and the bridge ownership tests were merged in [PR #119](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/pull/119)
 as commit `25eb755`.
 
 The lifecycle corpus now checks that continue-as-new remains terminal when
@@ -1108,7 +1108,7 @@ and Core command conversion.
 
 Status: locally verified in the focused runtime and package checks; this
 milestone has no live Temporal or GitHub Actions success claim. The change was
-merged in [PR #99](https://github.com/mfow/ocaml-temporal/pull/99) as commit
+merged in [PR #99](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/pull/99) as commit
 `efb02dd`.
 
 Shutdown now makes queued public-future observers, derived-future mappers, and
@@ -1123,15 +1123,15 @@ and `git diff --check` as passing locally.
 ## 2026-07-12: Correction to live cancellation evidence
 
 Status: documentation correction merged in
-[PR #100](https://github.com/mfow/ocaml-temporal/pull/100) as commit `9baa00a`;
+[PR #100](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/pull/100) as commit `9baa00a`;
 no new live acceptance result was produced by that documentation change.
 
 The acceptance references now distinguish the historical five-execution green
-run [`29191260073`](https://github.com/mfow/ocaml-temporal/actions/runs/29191260073)
+run [`29191260073`](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29191260073)
 from the current-at-that-time seven-run cancellation/heartbeat implementation and its local protocol,
 client, worker, and supervisor checks. The one-shot OCaml assertion driver and
 the long-lived worker are described separately. GitHub Actions run
-[`29193818312`](https://github.com/mfow/ocaml-temporal/actions/runs/29193818312)
+[`29193818312`](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29193818312)
 was cancelled, so the seven-run cancellation and heartbeat scenarios were
 unverified against a live Temporal Server at the time. PR #210 later supplied
 the green nine-scenario run recorded in the current entry above.
@@ -1140,10 +1140,10 @@ the green nine-scenario run recorded in the current entry above.
 
 Status: historical observation for PR #100; this entry does not claim a
 completed CI result. The PR #100 Actions attempt
-[`29194514765`](https://github.com/mfow/ocaml-temporal/actions/runs/29194514765)
+[`29194514765`](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29194514765)
 did not produce a completed result in the observed window, and its push run for
 merge commit `9baa00a`
-[`29194534789`](https://github.com/mfow/ocaml-temporal/actions/runs/29194534789)
+[`29194534789`](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29194534789)
 was later cancelled by workflow concurrency. Neither run is live acceptance
 evidence. Repeated updates can cancel superseded runs because
 `.github/workflows/build.yml` enables `cancel-in-progress`; the last successful
@@ -1184,7 +1184,7 @@ server's cancelled terminal result, and then verify clean shutdown.
 ## 2026-07-12: Typed non-retryable workflow failure acceptance
 
 Status: verified in GitHub Actions run
-[`29191260073`](https://github.com/mfow/ocaml-temporal/actions/runs/29191260073)
+[`29191260073`](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29191260073)
 for merge commit `a4eaccc8`. The real Compose acceptance passed with
 PostgreSQL and Temporal Server, the separate OCaml worker, and the one-shot
 OCaml assertion driver.
@@ -1210,7 +1210,7 @@ Compose project were removed by the target's cleanup trap.
 ## 2026-07-12: Live activity retry acceptance scenario
 
 Status: verified in Linux CI run
-[`29187733405`](https://github.com/mfow/ocaml-temporal/actions/runs/29187733405)
+[`29187733405`](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29187733405)
 for commit `b895d3c` by the `Temporal/PostgreSQL integration smoke (OCaml
 5.5)` job. The existing retry-policy constructor, JSON protocol, and Temporal
 Core conversion tests remain synthetic evidence; they prove that the policy is
@@ -2147,10 +2147,10 @@ Evidence:
   `amd64` and `arm64` manifests.
 - Local `make verify OCAML_VERSION=<version>` passed for all four versions.
 - Local `make license-check OCAML_VERSION=5.2` passed independently.
-- [GitHub Actions run 29139710646](https://github.com/mfow/ocaml-temporal/actions/runs/29139710646)
+- [GitHub Actions run 29139710646](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29139710646)
   completed all eight compiler/architecture cells and the license job
   successfully.
-- [GitHub Actions run 29139792049](https://github.com/mfow/ocaml-temporal/actions/runs/29139792049)
+- [GitHub Actions run 29139792049](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29139792049)
   repeated all nine jobs successfully after updating to the current official
   `actions/checkout` major version.
 
@@ -2231,7 +2231,7 @@ Local evidence:
 - A strict C11 harness compiles against the canonical header, links the actual
   Rust static archive, and passes under AddressSanitizer and
   UndefinedBehaviorSanitizer.
-- [GitHub Actions run 29141377953](https://github.com/mfow/ocaml-temporal/actions/runs/29141377953)
+- [GitHub Actions run 29141377953](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29141377953)
   passed the standalone license audit and all eight OCaml/compiler and native
   architecture jobs.
 
@@ -2282,7 +2282,7 @@ Local evidence:
   `Temporal.Runtime_info` API without the Rust source or C header.
 - The install smoke test builds and runs a new native OCaml executable against
   that staged package.
-- [GitHub Actions run 29142248581](https://github.com/mfow/ocaml-temporal/actions/runs/29142248581)
+- [GitHub Actions run 29142248581](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29142248581)
   passed the standalone dependency audit and all eight Linux OCaml 5.2 through
   5.5 amd64/arm64 jobs with the linked Rust bridge.
 
@@ -2293,7 +2293,7 @@ Native desktop evidence:
   tests, and the fresh installed-package consumer.
 - macOS ARM64 performs the same native verification with OCaml 5.5 and the
   pinned Apple ARM Rust toolchain.
-- [GitHub Actions run 29143621807](https://github.com/mfow/ocaml-temporal/actions/runs/29143621807)
+- [GitHub Actions run 29143621807](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29143621807)
   passed both native desktop jobs, all eight Linux OCaml 5.2 through 5.5
   amd64/arm64 jobs, and the standalone dependency audit.
 
