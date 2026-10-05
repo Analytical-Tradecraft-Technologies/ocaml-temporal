@@ -102,6 +102,51 @@ child workflows, or from public combinators over those values. An application
 cannot fabricate an arbitrary scheduler-owned future or access its callbacks
 or continuations.
 
+## Vendored source builds
+
+An application may build the SDK from source inside its own Dune workspace
+instead of installing it, for example as a Git submodule, in a monorepo, or
+through `opam monorepo`:
+
+```lisp
+; consumer/dune
+(vendored_dirs vendor)
+```
+
+with this repository at `vendor/temporal/` and executables depending on
+`(libraries temporal-sdk)`. In that layout Dune's workspace root is the
+consumer's project, which contains neither the bridge scripts nor the Rust
+workspace. The bridge rule in `lib/core_bridge/dune` therefore resolves every
+path relative to its own directory (`../..` is always the SDK root), and its
+writable Cargo fallback is `../../rust-target`, inside the SDK's own build
+directory rather than the consumer's build root. An explicit `CARGO_TARGET_DIR`
+remains authoritative exactly as in the in-repository build, and
+`TEMPORAL_RUST_BRIDGE_DIR`/`TEMPORAL_RUST_BRIDGE_KEY` still select a verified
+prebuilt bundle. Building from source requires the same Rust toolchain and
+`protoc` as any other source build.
+
+A vendored SDK's `dune-workspace` is ignored, so the consumer does not inherit
+its `(disable_dynamically_linked_foreign_archives true)` context setting. On
+Linux and macOS the default is harmless: the bridge rule also produces the
+dynamic archive Dune expects, and every Temporal executable links the bridge
+statically. On Windows, FlexDLL cannot consume Rust's GNU-style native linker
+flags while building that unneeded DLL stub, so Windows consumers must add the
+setting to their own `dune-workspace`:
+
+```lisp
+(lang dune 3.18)
+(context
+ (default
+  (disable_dynamically_linked_foreign_archives true)))
+```
+
+`make test-vendored` (or `make native-test-vendored` on the host) builds and
+runs a scratch consumer that vendors a copy of the current checkout this way,
+calls the linked bridge through `Temporal.Runtime_info`, and checks that the
+fallback Cargo directory did not escape into the consumer's build root. It
+compiles the Rust bridge in a fresh workspace, so it is an opt-in check rather
+than part of `make test` or the per-commit CI matrix.
+
 ## Regression evidence
 
 The installed-package smoke test is deliberately run against a fresh consumer
