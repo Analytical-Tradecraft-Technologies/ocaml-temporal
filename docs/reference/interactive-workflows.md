@@ -82,8 +82,14 @@ exactly one input payload. It runs the validator when Core requests it, skips
 validation on replay, and emits accepted before invoking the handler. A handler
 that awaits a workflow future retains its continuation in the execution-owned
 pending map; a later activation emits completed or rejected and removes that
-entry. Codec failures, missing handlers, unsupported input arity, duplicate
-pending protocol IDs, and callback errors become typed rejections. Focused
+entry. Before acceptance, missing handlers, unsupported input arity, input
+codec failures, duplicate pending protocol IDs, and every validator error
+become typed rejections, including an `Error.defect` returned by the validator
+or an exception it raises: only the read-only validator has run, so nothing
+needs to be discarded. After acceptance, a typed non-defect handler error is a
+rejection, while a handler exception or defect fails the workflow task and
+discards the speculative acceptance and buffered commands (see
+[workflow failures](workflow-failures.md)). Focused
 native tests prove this behavior; live typed admission/completion and the
 missing-handler rejection are verified by PRs #428 and #432.
 

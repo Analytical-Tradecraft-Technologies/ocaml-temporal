@@ -34,8 +34,10 @@ module Handler : sig
   type t
 
   (** Builds an update handler. [validator] runs first when supplied. A
-      validator may reject with a typed [Error.t]; in that case [run] is not
-      called and no update-side state change can occur. *)
+      validator may reject with a typed [Error.t] of any category, including
+      [Error.defect]; an exception it raises also rejects the update. In both
+      cases [run] is not called, no update-side state change can occur, and
+      the workflow task is unaffected. *)
   val make :
     ?validator:('input -> (unit, Error.t) result) ->
     ('input, 'output) definition ->

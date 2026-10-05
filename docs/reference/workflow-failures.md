@@ -14,8 +14,8 @@ complete the same workflow ID and run ID. Applications must no longer use
 | Workflow result encoder returns an error or raises | Failed workflow task, regardless of the encoder's error category |
 | Missing workflow registration, malformed activation, invalid resolver state, adapter exception before submission | Failed workflow task, no commands |
 | Query lookup, handler, or codec failure | Failed query answer for the original query ID; does not fail the workflow |
-| Missing update handler, input rejection, validation rejection, or deliberate typed handler failure | Rejected update response; does not fail the workflow |
-| Unexpected update exception/invariant failure, or codec failure after acceptance | Failed workflow task; discard speculative acceptance and commands |
+| Missing update handler, input rejection, any validator error (returned in any category, or raised), or deliberate typed handler failure | Rejected update response; does not fail the workflow |
+| Unexpected update handler exception/invariant failure after acceptance, or codec failure after acceptance | Failed workflow task; discard speculative acceptance and commands |
 | Eviction | Successful empty acknowledgement |
 
 For example, a business rule that should close the execution returns:

@@ -558,12 +558,20 @@ let process_job execution = function
               in
                 begin match dispatched with
                 | Error error ->
-                    (* Typed validation/input rejection remains local to the
-                       update. After acceptance, codec failures invalidate any
-                       commands/mutable state produced by its handler. *)
-                    if (is_task_failure error && (!accepted ||
-                        (Temporal_base.Error.view error).category <> `Codec))
-                    then fail_task execution error
+                    (* Before acceptance only the read-only validator and input
+                       decoding have run, so their errors, including defects
+                       and validator exceptions, reject the update without
+                       touching the workflow task (#790); only an SDK bridge
+                       failure is unsafe. After acceptance, a defect or bridge
+                       failure may have left commands or mutable state from the
+                       handler, so it fails the task; codec failures there
+                       remain rejections. *)
+                    let category = (Temporal_base.Error.view error).category in
+                    let fails_task =
+                      if !accepted then is_task_failure error && category <> `Codec
+                      else category = `Bridge
+                    in
+                    if fails_task then fail_task execution error
                     else reject error
                 | Ok payload ->
                     if not !accepted then
