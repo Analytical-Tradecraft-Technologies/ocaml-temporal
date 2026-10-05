@@ -1,7 +1,8 @@
 use crate::replay_bridge::{ReplayWorker, ReplayWorkerError};
 use crate::worker_bridge::{
-    PollLaneError, PollLanes, ReadinessWait, WorkerBridgeError, public_poll_lane_error_message,
-    public_worker_error_message,
+    BoundedFinalize, PollLaneError, PollLanes, ReadinessWait, ShutdownDrainError,
+    WORKER_FINALIZE_TIMEOUT, WORKER_SHUTDOWN_DRAIN_TIMEOUT, WorkerBridgeError,
+    public_poll_lane_error_message, public_worker_error_message,
 };
 use crate::{activity_protocol, client_protocol, workflow_protocol};
 use serde::Deserialize;
@@ -60,7 +61,9 @@ pub const STATUS_CONFIGURATION: Status = 6;
 pub const STATUS_CONNECTION: Status = 7;
 /// Official Core worker construction or namespace validation failed.
 pub const STATUS_WORKER: Status = 8;
-/// Worker shutdown is draining tasks that still require language completion.
+/// Shutdown found tasks that still required language completion. For a live
+/// worker those tasks were force-completed and the worker was still released;
+/// for replay, recorded input was not fully drained.
 pub const STATUS_OUTSTANDING_TASKS: Status = 9;
 /// A bounded readiness operation has no result ready for handoff yet.
 pub const STATUS_NOT_READY: Status = 10;
@@ -1227,7 +1230,30 @@ impl Runtime {
         Ok(Vec::new())
     }
 
-    /// Gracefully finalizes the child worker once; absence is already closed.
+    /// Shuts down and finalizes the child worker in bounded time; absence is
+    /// already closed.
+    ///
+    /// By the time OCaml sends this request its run loop has stopped and its
+    /// retained completions are drained, and the supervisor Domain cannot
+    /// deliver another completion while it is inside this call. Every task
+    /// Core still counts as outstanding can therefore only be completed by the
+    /// bridge, and Core's polls do not report `ShutDown` until that happens
+    /// (issue #769). The worker is shut down in three bounded steps:
+    ///
+    /// 1. initiate Core shutdown;
+    /// 2. retire every outstanding task while joining both poll lanes, for at
+    ///    most [`WORKER_SHUTDOWN_DRAIN_TIMEOUT`];
+    /// 3. run Core's finalizer in a task that owns the worker, waiting for at
+    ///    most [`WORKER_FINALIZE_TIMEOUT`].
+    ///
+    /// Contract: tasks that never reached OCaml (queued handoffs, polls in
+    /// flight at shutdown, Core's own cache evictions) are retired silently,
+    /// because OCaml never owned them. When a task *leased* to OCaml had to be
+    /// force-completed, the worker is still finalized and released, but the
+    /// call reports `STATUS_OUTSTANDING_TASKS` so the caller learns that
+    /// language-side work was abandoned. A drain timeout, lane failure, or
+    /// refused finalization keeps the worker in the graph and reports a
+    /// worker failure; runtime close then disposes it.
     fn shutdown_worker(&mut self) -> Operation {
         let Some(worker) = self.worker.as_mut() else {
             return Ok(Vec::new());
@@ -1243,37 +1269,46 @@ impl Runtime {
             let _runtime_guard = handle.enter();
             worker.initiate_shutdown();
         }
-        handle
-            .block_on(worker.join_poll_lanes())
-            .map_err(poll_lane_failure)?;
-        if !worker.can_finalize() {
-            return Err(Failure {
-                status: STATUS_OUTSTANDING_TASKS,
-                message: "Temporal worker is draining outstanding workflow or activity tasks"
-                    .to_owned(),
-            });
-        }
+        let retirement = handle
+            .block_on(worker.drain_and_join_for_shutdown(WORKER_SHUTDOWN_DRAIN_TIMEOUT))
+            .map_err(shutdown_drain_failure)?;
         let worker = self
             .worker
             .take()
-            .expect("checked worker remains owned until terminal finalization");
-        match handle.block_on(worker.finalize()) {
-            Ok(()) => {
-                self.worker_namespace = None;
-                // Semantic handoffs belong to the worker that created them.
-                // Drop them with the worker so a later start on this runtime
-                // cannot treat a recycled run ID or task token as a duplicate.
-                self.workflow_activations.clear();
-                self.activity_tasks.clear();
-                Ok(Vec::new())
+            .expect("drained worker remains owned until terminal finalization");
+        let result = match handle.block_on(worker.finalize_bounded(WORKER_FINALIZE_TIMEOUT)) {
+            BoundedFinalize::Refused(worker, error) => {
+                // The bridge would not consume the worker (for example after a
+                // lost poll lease). Keep it owned by the graph so runtime close
+                // performs its last-resort disposal instead of losing it here.
+                self.worker = Some(*worker);
+                return Err(worker_bridge_failure(error));
             }
-            Err((worker, error)) => {
-                // Put the worker back so the language side can finish outstanding
-                // tasks and retry graceful shutdown instead of losing the graph.
-                self.worker = Some(worker);
-                Err(worker_bridge_failure(error))
-            }
-        }
+            BoundedFinalize::Finalized if retirement.abandoned_leases == 0 => Ok(Vec::new()),
+            BoundedFinalize::Finalized => Err(Failure {
+                status: STATUS_OUTSTANDING_TASKS,
+                message: "Temporal worker shutdown force-completed tasks that were never completed by the worker".to_owned(),
+            }),
+            BoundedFinalize::Panicked => Err(Failure {
+                status: STATUS_WORKER,
+                message: "Temporal worker finalization failed".to_owned(),
+            }),
+            BoundedFinalize::Detached => Err(Failure {
+                status: STATUS_WORKER,
+                message: "Temporal worker finalization did not finish within the shutdown bound"
+                    .to_owned(),
+            }),
+        };
+        // In every remaining outcome the graph no longer owns the worker: it
+        // was finalized, released while unwinding, or is still being finalized
+        // by a task that owns it.
+        self.worker_namespace = None;
+        // Semantic handoffs belong to the worker that created them. Drop them
+        // with the worker so a later start on this runtime cannot treat a
+        // recycled run ID or task token as a duplicate.
+        self.workflow_activations.clear();
+        self.activity_tasks.clear();
+        result
     }
 
     /// Takes one workflow activation from the Rust lane without waiting.
@@ -2197,20 +2232,26 @@ fn drop_runtime_graph(
         // outstanding. Force-fail every still-owned debt before joining the
         // lanes so dispose cannot block forever waiting for OCaml.
         handle.block_on(worker.force_complete_outstanding_for_dispose());
-        let _ = handle.block_on(worker.join_poll_lanes());
+        // The join keeps completing tasks that polls already in flight publish
+        // while the lanes stop, and is bounded so dispose cannot hang on a
+        // debt Core keeps outstanding (issue #769). A timeout leaves the
+        // worker unfinalizable, which the match below handles.
+        let _ = handle.block_on(worker.drain_and_join_for_shutdown(WORKER_SHUTDOWN_DRAIN_TIMEOUT));
         // A poll that was already inside Core can return after the first drain
         // and publish a new ready task before its lane exits.  The joins above
         // establish that no producer remains; a final pass therefore closes
         // the only window in which a late task could otherwise be dropped with
         // an outstanding Core completion debt.
         handle.block_on(worker.force_complete_outstanding_for_dispose());
-        match handle.block_on(worker.finalize()) {
-            Ok(()) => {}
-            Err((worker, _)) => {
+        match handle.block_on(worker.finalize_bounded(WORKER_FINALIZE_TIMEOUT)) {
+            BoundedFinalize::Refused(worker, _) => {
                 // Dispose cannot wait for OCaml. Dropping after force-complete
                 // is the last-resort reclaim path.
                 drop(worker);
             }
+            // A detached finalizer still owns the worker; dropping Core below
+            // shuts down its Tokio runtime, which ends that task.
+            BoundedFinalize::Finalized | BoundedFinalize::Panicked | BoundedFinalize::Detached => {}
         }
     }
     if let Some(worker) = replay_worker {
@@ -2298,6 +2339,18 @@ fn poll_lane_failure(error: PollLaneError) -> Failure {
     Failure {
         status: STATUS_WORKER,
         message: public_poll_lane_error_message(&error).to_owned(),
+    }
+}
+
+/// Maps a failed bounded shutdown drain to a closed worker failure. The worker
+/// stays in the runtime graph in both cases, so runtime close disposes it.
+fn shutdown_drain_failure(error: ShutdownDrainError) -> Failure {
+    match error {
+        ShutdownDrainError::Lane(error) => poll_lane_failure(error),
+        ShutdownDrainError::TimedOut => Failure {
+            status: STATUS_WORKER,
+            message: "Temporal worker poll lanes did not stop within the shutdown bound".to_owned(),
+        },
     }
 }
 

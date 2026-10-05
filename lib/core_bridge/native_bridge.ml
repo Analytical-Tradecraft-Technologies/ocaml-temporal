@@ -538,8 +538,9 @@ let bridge_error_log_level = function
          operator. *)
       (Logs.Debug, "bridge operation not ready")
   | Outstanding_tasks ->
-      (* Shutdown can be retried after the language side finishes its leased
-         work. Keep this visible without classifying it as a bridge failure. *)
+      (* Live worker shutdown force-completed a lease the language side never
+         completed and still released the worker; replay reports undrained
+         input. Keep this visible without classifying it as a bridge failure. *)
       (Logs.Warning, "bridge operation waiting for outstanding tasks")
   | _ ->
       (* Protocol, lifecycle, configuration, and native failures all indicate
