@@ -43,7 +43,16 @@
  (language c)
  (names native_stubs)
  (include_dirs ../../rust/core-bridge/include)
- (flags :standard -Wall -Wextra -Werror))
+ (flags :standard -Wall -Wextra))
+
+;; Warnings are fatal only in the development profile used by CI and local
+;; builds. [opam install] builds with [-p], which selects the release profile,
+;; so a new warning from a user's newer or different C compiler cannot turn
+;; installation into a hard failure.
+(env
+ (dev
+  (c_flags
+   (:standard -Werror))))
 
 (library
  (name temporal_core_bridge)
