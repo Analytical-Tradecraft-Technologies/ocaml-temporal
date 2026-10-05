@@ -695,6 +695,8 @@ dynamically linked foreign archives. The internal OCaml library uses
 `no_dynlink`, because a native plugin (`.cmxs`) would be another dynamic bridge
 artifact and is neither supported nor needed by the final executable.
 
+### Supported link modes
+
 The supported deployment artifact is an OCaml-owned native executable; the
 project does not need a separately loadable bridge DLL. This distinction is
 important on Windows: Rust correctly reports GNU linker tokens for the final
@@ -702,3 +704,9 @@ native link, but FlexDLL cannot reinterpret all of those tokens while
 constructing an intermediate OCaml stub DLL. Keeping the C and Rust inputs as
 static foreign archives removes that unnecessary link step without changing
 the installed OCaml API or final executable.
+
+Because only the static archives are installed, bytecode consumers must link
+with `-custom` (or as a Dune `(modes byte)` executable); dynamically loaded
+bytecode and the toplevel cannot load the bridge. The user-facing statement of
+this constraint, together with the related `Unix.fork` restriction, is in the
+[workflow guide](../guides/workflows.md#process-and-linking-constraints).

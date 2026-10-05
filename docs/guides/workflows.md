@@ -969,6 +969,45 @@ later successful source snapshot and remaining condition/recovery limits. A succ
 signal call still acknowledges Temporal's RPC
 rather than the later execution of the worker-side handler.
 
+## Process and linking constraints
+
+Two properties of the hosting process are fixed by OCaml 5 and by how the
+native bridge is packaged. Neither is reported as a typed `Temporal.Error.t`;
+violating them fails at fork time or at link/load time.
+
+**Fork before creating a native client or worker.** Every `Client` or `Worker`
+with an `http://` or `https://` target owns an SDK supervisor that runs on its
+own OCaml Domain. OCaml 5 forbids `Unix.fork` once any Domain has ever been
+spawned in the process, even after that Domain has been joined, so a fork after
+`Client.create` or `Worker.create` raises
+`Failure "Unix.fork may not be called after any domain has been spawned"`.
+This holds after `Client.shutdown` as well. Daemonise, use a pre-fork server
+model, or fork test processes before the first native SDK value is created, and
+create the client or worker in the child. Starting a separate program with
+`Unix.create_process`, `Unix.open_process_in`, or a similar spawn API remains
+available at any time, because those calls do not duplicate the OCaml runtime.
+This applies to Unix platforms such as Linux and macOS. On Windows,
+`Unix.fork` is not implemented at all and raises `Invalid_argument` whether or
+not the SDK has started; use `Unix.create_process` or `Unix.open_process*` to
+run other processes there.
+
+**Link a native or `-custom` bytecode executable.** The private Rust bridge and
+its C stubs are installed only as static archives; no shared library is
+installed for the bytecode runtime to load. These link modes are supported:
+
+- native executables (`ocamlfind ocamlopt ... -linkpkg`, or Dune executables
+  in the default native mode);
+- bytecode executables linked with `-custom`, which embed the static archives
+  in a custom runtime;
+- Dune `(modes byte)` executables.
+
+Plain dynamically loaded bytecode (`ocamlfind ocamlc -package temporal-sdk
+-linkpkg` without `-custom`) fails at startup because the runtime cannot find
+`dllocaml_temporal_core_bridge`, and the toplevel or utop
+(`#require "temporal-sdk";;`) fails with a shared-library loading error. Native
+plugins (`.cmxs`) are also unsupported. The design reasons are recorded in the
+[Core bridge reference](../reference/core-bridge.md#supported-link-modes).
+
 ## 10. Validate locally
 
 From the repository root, the focused Make targets are:
