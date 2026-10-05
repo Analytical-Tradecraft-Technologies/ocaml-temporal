@@ -674,11 +674,20 @@ let test_query_workflow_translation_and_activation () =
        })
 
 (** A query can inspect the owning live scope without draining a paused fiber.
-    Mutation and cross-Domain reads remain disallowed, and the retained handle
-    becomes stale after workflow completion. *)
+    Both state reads work before and after cancellation; mutation, scoped
+    command starts, and cross-Domain reads remain disallowed, and the retained
+    handle becomes stale after workflow completion. *)
 let test_query_reads_live_scope_status () =
   let scope_ref = ref None in
   let resumes = ref 0 in
+  let activity =
+    Temporal.Activity.remote ~name:"query-scope-activity"
+      ~input:Temporal.Codec.unit ~output:Temporal.Codec.unit
+  in
+  let child =
+    Temporal.Workflow.remote ~name:"query-scope-child"
+      ~input:Temporal.Codec.unit ~output:Temporal.Codec.unit
+  in
   let workflow =
     Temporal.Workflow.define ~name:"query_scope_status"
       ~input:Temporal.Codec.unit ~output:Temporal.Codec.unit (fun () ->
@@ -706,18 +715,47 @@ let test_query_reads_live_scope_status () =
         | Ok cancelled -> Ok (runtime_payload (string_of_bool cancelled))
         | Error error -> Error (base_error error))
   in
+  let check_handler =
+    Execution.make_query_handler ~name:"scope-check" ~dispatch:(fun _ ->
+        match Temporal.Scope.check (scope ()) with
+        | Ok () -> Ok (runtime_payload "active")
+        | Error error when (Temporal.Error.view error).category = `Cancelled ->
+            Ok (runtime_payload "cancelled")
+        | Error error -> Error (base_error error))
+  in
   let read_only_handler =
     Execution.make_query_handler ~name:"scope-read-only" ~dispatch:(fun _ ->
         let scope = scope () in
         let mutation_rejected =
           match Temporal.Scope.cancel scope with Error _ -> true | Ok () -> false
         in
+        let scoped_activity_rejected =
+          match Temporal.Future.peek (Temporal.Activity.start ~scope activity ()) with
+          | Some (Error error) ->
+              (Temporal.Error.view error).category = `Defect
+          | Some (Ok ()) | None -> false
+        in
+        let scoped_child_rejected =
+          match
+            Temporal.Future.peek
+              (Temporal.Child_workflow.start ~scope ~id:"query-scope-child" child ())
+          with
+          | Some (Error error) ->
+              (Temporal.Error.view error).category = `Defect
+          | Some (Ok ()) | None -> false
+        in
         let foreign_read_rejected =
           match Domain.join (Domain.spawn (fun () -> Temporal.Scope.is_cancelled scope)) with
           | Error _ -> true
           | Ok _ -> false
         in
-        if mutation_rejected && foreign_read_rejected then
+        let foreign_check_rejected =
+          match Domain.join (Domain.spawn (fun () -> Temporal.Scope.check scope)) with
+          | Error _ -> true
+          | Ok () -> false
+        in
+        if mutation_rejected && scoped_activity_rejected && scoped_child_rejected
+           && foreign_read_rejected && foreign_check_rejected then
           Ok (runtime_payload "rejected")
         else
           Error
@@ -725,7 +763,7 @@ let test_query_reads_live_scope_status () =
                ~message:"query bypassed scope ownership"))
   in
   let execution =
-    Execution.start ~query_handlers:[ status_handler; read_only_handler ]
+    Execution.start ~query_handlers:[ status_handler; check_handler; read_only_handler ]
       (base_workflow workflow) ()
   in
   let activate jobs =
@@ -764,6 +802,7 @@ let test_query_reads_live_scope_status () =
              } ])
   in
   expect_query "scope-before-cancel" "false" "scope-status";
+  expect_query "scope-check-before-cancel" "active" "scope-check";
   expect_query "scope-ownership" "rejected" "scope-read-only";
   if !resumes <> 0 then failwith "query resumed the paused workflow fiber";
   let second_timer =
@@ -772,6 +811,7 @@ let test_query_reads_live_scope_status () =
   in
   if !resumes <> 1 then failwith "timer did not resume the workflow once";
   expect_query "scope-after-cancel" "true" "scope-status";
+  expect_query "scope-check-after-cancel" "cancelled" "scope-check";
   if !resumes <> 1 then failwith "query resumed the cancelled workflow fiber";
   let finished = activate [ Protocol.Fire_timer { seq = second_timer } ] in
   (match (finished.commands, finished.task_failure) with
@@ -787,6 +827,16 @@ let test_query_reads_live_scope_status () =
   | [ Protocol.Query_result
         { query_id = "scope-stale"; result = Query_failed _ } ], None -> ()
   | _ -> failwith "query accepted a stale scope after workflow completion");
+  let stale_check =
+    activate
+      [ Protocol.Query_workflow
+          { query_id = "scope-check-stale"; query_type = "scope-check";
+            arguments = []; headers = [] } ]
+  in
+  (match (stale_check.commands, stale_check.task_failure) with
+  | [ Protocol.Query_result
+        { query_id = "scope-check-stale"; result = Query_failed _ } ], None -> ()
+  | _ -> failwith "query accepted a stale scope check after workflow completion");
   Execution.shutdown execution
 
 (** Proves a native update is translated with its Core correlation fields and

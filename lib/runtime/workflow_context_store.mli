@@ -39,6 +39,10 @@ val current : unit -> t option
     ownership or permission to mutate workflow state. *)
 val query_read_owner_matches : int -> bool
 
+(** True only in the current execution's scheduler turn, outside a read-only
+    query. Scoped command starts use this before allocating durable state. *)
+val in_owner_turn : t -> bool
+
 (** Allocates a key for execution-local workflow state. The key itself may be
     retained by a workflow definition and its registered interaction handlers;
     values written through it never cross execution-context boundaries. *)

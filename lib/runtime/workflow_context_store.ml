@@ -255,6 +255,17 @@ let query_read_owner_matches owner_id =
       Scheduler.id query_context.scheduler = owner_id
   | _ -> false
 
+(** Commands attached to a scope must originate in a scheduler turn, even
+    though a synchronous query may read that scope's status. Reject a nested
+    query marker as well as a paused or sealed scheduler before allocation. *)
+let in_owner_turn context =
+  match (Domain.DLS.get query_read_key, current ()) with
+  | None, Some current_context when current_context == context ->
+      not context.sealed
+      && Scheduler.is_active context.scheduler
+      && Future_store.current_owner_matches (Scheduler.id context.scheduler)
+  | _ -> false
+
 (** Creates a key whose value, when set, is retained only in each execution's
     private context. Key creation is allowed outside workflow code so one
     definition can share the key between its workflow body and registered
