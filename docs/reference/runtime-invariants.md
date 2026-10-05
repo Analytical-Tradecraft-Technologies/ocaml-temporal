@@ -263,7 +263,7 @@ and bridge, read the [documentation guide](../README.md) first.
   rejection is accepted only for the exact activation lease that was polled.
 - The private supervisor validates native poll bytes before returning typed
   workflow or activity values to another Domain. It canonically encodes and
-  reparses typed completions before entering C.
+  semantically validates typed completions before entering C.
 - An activity `Start` (remote or local) creates one Core completion debt. A `Cancel` poll
   is an update to that same token: it is handed to the OCaml activity adapter
   while the token remains tracked, but it never acquires a second completion

@@ -120,6 +120,214 @@ let test_payloads () =
     (Protocol.decode_payload
        (fixture [ "invalid"; "payload-unknown-field.json" ]))
 
+(** Extracts the base64 text from a canonical wrapper built by the codec. *)
+let wrapper_data bytes =
+  match unwrap (Protocol.payload_json bytes) with
+  | `Assoc [ ("encoding", `String "base64"); ("data", `String data) ] -> data
+  | _ -> failwith "payload wrapper did not have its canonical shape"
+
+(** Builds an in-memory wrapper around arbitrary candidate base64 text. *)
+let wrapper data =
+  `Assoc [ ("encoding", `String "base64"); ("data", `String data) ]
+
+(** A deliberately simple reference for canonical base64, independent of the
+    codec's table-driven decoder: decode leniently (ignoring unused low bits),
+    then accept only if re-encoding reproduces the input exactly. This is the
+    rule the codec enforced by re-encoding before #846. *)
+let reference_decode data =
+  let alphabet =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+  in
+  let length = String.length data in
+  let padding =
+    if length >= 2 && data.[length - 1] = '=' && data.[length - 2] = '=' then 2
+    else if length >= 1 && data.[length - 1] = '=' then 1
+    else 0
+  in
+  if length mod 4 <> 0 then None
+  else
+    let values =
+      List.init (length - padding) (fun index ->
+          String.index_opt alphabet data.[index])
+    in
+    if List.mem None values then None
+    else
+      let values = Array.of_list (List.map Option.get values) in
+      let decoded_length = (length / 4 * 3) - padding in
+      let output = Buffer.create decoded_length in
+      let symbol index =
+        if index < Array.length values then values.(index) else 0
+      in
+      for group = 0 to (length / 4) - 1 do
+        let bits =
+          (symbol (group * 4) lsl 18)
+          lor (symbol ((group * 4) + 1) lsl 12)
+          lor (symbol ((group * 4) + 2) lsl 6)
+          lor symbol ((group * 4) + 3)
+        in
+        List.iter
+          (fun shift ->
+            if Buffer.length output < decoded_length then
+              Buffer.add_char output (Char.chr ((bits lsr shift) land 0xff)))
+          [ 16; 8; 0 ]
+      done;
+      let bytes = Buffer.to_bytes output in
+      if String.equal (wrapper_data bytes) data then Some bytes else None
+
+(** Requires the in-memory decoder, the serialized-document decoder, and the
+    reference to agree on acceptance and on decoded bytes. *)
+let check_decoders_agree data =
+  let direct = Protocol.decode_payload_json (wrapper data) in
+  let serialized =
+    Protocol.decode_payload (Yojson.Safe.to_string (wrapper data))
+  in
+  match (reference_decode data, direct, serialized) with
+  | Some expected, Ok direct, Ok serialized ->
+      check_true "direct decode matches reference" (Bytes.equal expected direct);
+      check_true "serialized decode matches reference"
+        (Bytes.equal expected serialized)
+  | None, Error direct, Error _ ->
+      let direct = Protocol.error_view direct in
+      check_string "rejection path" "$.data" direct.path
+  | _ -> failwith "payload decoders disagreed on canonical base64 acceptance"
+
+(** Pins the single-pass base64 codec and in-memory wrapper decoder to the
+    previous encode-and-compare behavior, including every padding shape,
+    noncanonical spelling, alphabet violation, and wrapper-shape error. *)
+let test_payload_codec_edges () =
+  (* RFC 4648 section 10 vectors fix the exact wire spelling. *)
+  List.iter
+    (fun (plain, encoded) ->
+      check_string ("encode " ^ plain) encoded
+        (wrapper_data (Bytes.of_string plain));
+      check_true ("decode " ^ plain)
+        (Bytes.equal (Bytes.of_string plain)
+           (unwrap (Protocol.decode_payload_json (wrapper encoded)))))
+    [
+      ("", "");
+      ("f", "Zg==");
+      ("fo", "Zm8=");
+      ("foo", "Zm9v");
+      ("foob", "Zm9vYg==");
+      ("fooba", "Zm9vYmE=");
+      ("foobar", "Zm9vYmFy");
+    ];
+  check_string "empty payload document" {|{"encoding":"base64","data":""}|}
+    (unwrap (Protocol.encode_payload Bytes.empty));
+  (* Every length across many group boundaries round-trips through both the
+     document and the in-memory paths, for arbitrary byte values. *)
+  let random = Random.State.make [| 846 |] in
+  for length = 0 to 300 do
+    let bytes =
+      Bytes.init length (fun _ -> Char.chr (Random.State.int random 256))
+    in
+    check_decoders_agree (wrapper_data bytes);
+    check_true "document round trip"
+      (Bytes.equal bytes
+         (unwrap
+            (Protocol.decode_payload (unwrap (Protocol.encode_payload bytes)))))
+  done;
+  List.iter check_decoders_agree
+    [
+      (* nonzero unused bits with two and with one padding byte *)
+      "Zh==";
+      "Zm9=";
+      "Zg=";
+      "Zg";
+      "Z===";
+      "====";
+      "=AAA";
+      (* padding before the last group *)
+      "Zg==Zg==";
+      "Zm9v====";
+      "Zm9v\n";
+      "Zm9v Zm9v";
+      "Zm-v";
+      "Zm_v";
+      "Zm9\x80";
+      "\xc3\xa9AA";
+      "Zm9vYmFy\000AAA";
+    ];
+  (* Exhaustively compare all four-symbol groups over a small alphabet that
+     covers both ends of each six-bit range, padding, and invalid bytes, both
+     alone and after a valid group. *)
+  let symbols = "AQgw/+=-\x80z" in
+  String.iter
+    (fun first ->
+      String.iter
+        (fun second ->
+          String.iter
+            (fun third ->
+              String.iter
+                (fun fourth ->
+                  let group =
+                    String.init 4 (function
+                      | 0 -> first
+                      | 1 -> second
+                      | 2 -> third
+                      | _ -> fourth)
+                  in
+                  check_decoders_agree group;
+                  check_decoders_agree ("Zm9v" ^ group))
+                symbols)
+            symbols)
+        symbols)
+    symbols;
+  (* Wrapper shape errors are detected without serializing the wrapper, and
+     a repeated member name cannot stand in for a missing one. *)
+  List.iter
+    (fun json -> require_error (Protocol.decode_payload_json json))
+    [
+      `Assoc [ ("encoding", `String "base64"); ("encoding", `String "base64") ];
+      `Assoc [ ("data", `String ""); ("data", `String "") ];
+      `Assoc [ ("encoding", `String "base64") ];
+      `Assoc
+        [ ("encoding", `String "base64"); ("data", `String ""); ("extra", `Null) ];
+      `Assoc [ ("encoding", `String "base32"); ("data", `String "") ];
+      `Assoc [ ("encoding", `Int 64); ("data", `String "") ];
+      `Assoc [ ("encoding", `String "base64"); ("data", `Null) ];
+      `List [];
+      `String "";
+    ];
+  check_error_path "unsupported encoding path" "$.encoding"
+    (Protocol.decode_payload_json
+       (`Assoc [ ("data", `String ""); ("encoding", `String "hex") ]));
+  ignore
+    (unwrap
+       (Protocol.decode_payload_json
+          (`Assoc [ ("data", `String "Zg=="); ("encoding", `String "base64") ])))
+
+(** Outgoing payload objects keep every receiver check without a reparse: tree
+    rules come from tree validation and raw-text rules from the preflight scan
+    of the serialized bytes. *)
+let test_outgoing_payload_object () =
+  let input =
+    {| {"z":{"encoding":"base64","data":"Zg=="},"a":[1,-2,9223372036854775807]} |}
+  in
+  let value = unwrap (Protocol.decode_payload_object input) in
+  let output = unwrap (Protocol.encode_payload_object value) in
+  check_string "normalized payload object"
+    {|{"a":[1,-2,9223372036854775807],"z":{"data":"Zg==","encoding":"base64"}}|}
+    output;
+  check_string "stable re-encoding" output
+    (unwrap
+       (Protocol.encode_payload_object
+          (unwrap (Protocol.decode_payload_object output))));
+  require_error (Protocol.encode_payload_object (`List []));
+  require_error
+    (Protocol.encode_payload_object (`Assoc [ ("a", `Null); ("a", `Null) ]));
+  require_error
+    (Protocol.encode_payload_object (`Assoc [ ("a", `String "\xff") ]));
+  require_error (Protocol.encode_payload_object (`Assoc [ ("a", `Float 1.5) ]));
+  require_error
+    (Protocol.encode_payload_object
+       (`Assoc [ ("a", `Intlit "9223372036854775808") ]));
+  let rec nested depth =
+    if depth = 0 then `Null else `Assoc [ ("a", nested (depth - 1)) ]
+  in
+  require_error (Protocol.encode_payload_object (nested 128));
+  ignore (unwrap (Protocol.encode_payload_object (nested 127)))
+
 (** Generates resource-limit attacks locally so the repository does not carry
     megabyte-sized fixtures. *)
 let test_resource_limits () =
@@ -207,6 +415,8 @@ let () =
   run "valid envelopes" test_valid_envelopes;
   run "invalid envelopes" test_invalid_envelopes;
   run "payloads" test_payloads;
+  run "payload codec edges" test_payload_codec_edges;
+  run "outgoing payload object" test_outgoing_payload_object;
   run "resource limits" test_resource_limits;
   run "compatibility and outgoing validation"
     test_compatibility_and_outgoing_validation;
