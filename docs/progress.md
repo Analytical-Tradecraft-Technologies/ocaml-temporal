@@ -15,6 +15,18 @@ implementation when a later entry documents that work as complete. The
 records the current tested source, named assertions and successful CI job for
 the Temporal acceptance controllers.
 
+## 2026-10-05: Activity timeout and duration bounds (#812)
+
+`Activity.start`, `start_local`, and `start_handle` reject an explicit zero
+schedule-to-close or start-to-close timeout with a ready typed defect before any
+codec runs or command is emitted; Temporal treats zero as unset, which would
+otherwise wedge the workflow on server-rejected tasks. `Duration.of_ms` raises
+above the protobuf `Duration` maximum (315,576,000,000,999 ms), and the OCaml
+decoder and Rust validator both reject zero close timeouts and durations past
+protobuf's maximum second count. Shared invalid fixtures prove the bilateral
+rejection; focused OCaml unit/bridge/runtime suites and the Rust test suite
+passed locally on OCaml 5.4.1.
+
 ## 2026-09-20: Current start metadata and worker replacement (#512)
 
 `Client.start` memo and registered search attributes now reach root and

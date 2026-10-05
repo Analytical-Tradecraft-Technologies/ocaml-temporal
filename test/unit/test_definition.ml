@@ -70,12 +70,13 @@ let () =
     (Temporal.Activity.start ~start_to_close_timeout:zero greeting "Ada");
   expect_zero_rejected "local start-to-close"
     (Temporal.Activity.start_local ~start_to_close_timeout:zero greeting "Ada");
-  (match Temporal.Duration.of_ms 315_576_000_000_001L with
+  (* protobuf allows the maximum second count plus a fractional second. *)
+  (match Temporal.Duration.of_ms 315_576_000_001_000L with
   | _ -> failwith "duration above the protobuf maximum was accepted"
   | exception Invalid_argument _ -> ());
   assert (
-    Temporal.Duration.to_ms (Temporal.Duration.of_ms 315_576_000_000_000L)
-    = 315_576_000_000_000L);
+    Temporal.Duration.to_ms (Temporal.Duration.of_ms 315_576_000_000_999L)
+    = 315_576_000_000_999L);
   match Temporal.Workflow.sleep (Temporal.Duration.of_ms 1L) with
   | Error error -> assert (Temporal.Error.kind error = "defect")
   | Ok () -> failwith "workflow slept outside an execution"

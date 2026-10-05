@@ -4,10 +4,12 @@
 type t = int64
 
 (** protobuf [Duration] accepts at most 315,576,000,000 seconds (10,000
-    years). Every SDK duration eventually becomes a protobuf duration in a
-    Temporal command, and the server rejects larger values on every workflow
-    task retry, so the bound is enforced at construction. *)
-let max_ms = 315_576_000_000_000L
+    years) plus up to 999,999,999 nanoseconds, so the largest whole-millisecond
+    value is 315,576,000,000,999 ms. Every SDK duration eventually becomes a
+    protobuf duration in a Temporal command, and the server rejects larger
+    values on every workflow task retry, so the bound is enforced at
+    construction. *)
+let max_ms = 315_576_000_000_999L
 
 let of_ms milliseconds =
   if Int64.compare milliseconds 0L < 0 then
