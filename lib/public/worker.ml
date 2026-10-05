@@ -346,7 +346,26 @@ let create ?(identity = default_identity) ?options ?max_cached_workflows
                       let activity_names =
                         Name_map.bindings activities |> List.map fst
                       in
-                      if String.starts_with ~prefix:"mock://" target_url then
+                      let async_activity =
+                        Name_map.bindings activities
+                        |> List.find_map
+                             (fun (name, Activity_entry { async_implementation; _ }) ->
+                               Option.map (fun _ -> name) async_implementation)
+                      in
+                      (* The mock backend has no Temporal task token to retain
+                         for a later asynchronous completion, so reject such a
+                         registration at construction rather than failing each
+                         task during [run]. *)
+                      if String.starts_with ~prefix:"mock://" target_url
+                         && Option.is_some async_activity
+                      then
+                        Error
+                          (Error.defect
+                             ~message:
+                               ("asynchronous activity "
+                               ^ Option.get async_activity
+                               ^ " requires the native worker backend"))
+                      else if String.starts_with ~prefix:"mock://" target_url then
                         Result.map
                           (fun backend ->
                             {
@@ -457,6 +476,9 @@ let dispatch_activity worker task =
           let result =
             match async_implementation with
             | Some _ ->
+                (* Unreachable through [create], which rejects asynchronous
+                   registrations for the mock backend; kept so dispatch never
+                   invokes a callback without a native completion lease. *)
                 Error
                   (Error.make ~non_retryable:true ~category:`Activity
                      ~message:
