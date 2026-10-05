@@ -81,6 +81,12 @@ type worker_config = {
   max_outstanding_workflow_tasks : int;
   max_concurrent_workflow_task_polls : int;
   graceful_shutdown_timeout_ms : int64;
+  workflow_tasks : bool;
+      (** Poll workflow tasks. False only when no workflow is registered. *)
+  activity_tasks : bool;
+      (** Poll remote activity tasks. False only when no activity is
+          registered, so the worker never takes an activity that a sibling
+          worker on the same task queue could execute (#805). *)
 }
 
 (** Private transport-safety ceiling mirrored and revalidated by Rust. This is
@@ -330,9 +336,13 @@ let client_config ~target_url ~identity =
 let worker_config ~namespace ~task_queue ~build_id ?(versioning = No_versioning)
     ~max_cached_workflows
     ~max_outstanding_workflow_tasks ~max_concurrent_workflow_task_polls
-    ~graceful_shutdown_timeout_ms () =
+    ~graceful_shutdown_timeout_ms ?(workflow_tasks = true)
+    ?(activity_tasks = true) () =
   let validations =
     [
+      (if workflow_tasks || activity_tasks then Ok ()
+       else
+         configuration_error "task_types must enable workflows or activities");
       validate_identifier "namespace" namespace;
       validate_identifier "task_queue" task_queue;
       validate_identifier "build_id" build_id;
@@ -405,6 +415,8 @@ let worker_config ~namespace ~task_queue ~build_id ?(versioning = No_versioning)
           max_outstanding_workflow_tasks;
           max_concurrent_workflow_task_polls;
           graceful_shutdown_timeout_ms;
+          workflow_tasks;
+          activity_tasks;
         }
 
 (** Encodes the exact strict client document accepted by the Rust adapter. *)
@@ -454,6 +466,12 @@ let encode_worker_config config =
         `Int config.max_concurrent_workflow_task_polls );
       ( "graceful_shutdown_timeout_ms",
         `Intlit (Int64.to_string config.graceful_shutdown_timeout_ms) );
+      ( "task_types",
+        `Assoc
+          [
+            ("workflows", `Bool config.workflow_tasks);
+            ("activities", `Bool config.activity_tasks);
+          ] );
     ]
   |> Yojson.Safe.to_string |> Bytes.of_string
 

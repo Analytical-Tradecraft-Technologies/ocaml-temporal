@@ -53,7 +53,11 @@ acceptance evidence.
 
 The activity worker turns two requested message styles into text. The workflow
 worker concurrently schedules those activities, records a short durable timer,
-and returns the combined message. The client starts one execution, waits for
+and returns the combined message. Both workers share one task queue, which is
+safe because a worker polls only the task kinds it registers: the workflow
+worker (`~activities:[]`) never takes activity tasks, and the activity worker
+(`~workflows:[]`) never takes workflow tasks. A worker must register at least
+one workflow or activity. The client starts one execution, waits for
 its exact run, and prints the completed value.
 
 All three programs read the same optional environment variables:

@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/mfow/ocaml-temporal/blob/master/docs/schemas/bridge/worker-config.schema.json",
   "title": "OCaml Temporal Core bridge workflow worker configuration",
-  "description": "Private, strict workflow-only worker configuration sent from the OCaml supervisor to Rust.",
+  "description": "Private, strict worker configuration sent from the OCaml supervisor to Rust.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -63,7 +63,23 @@
     "max_cached_workflows": { "type": "integer", "minimum": 0, "maximum": 1000000 },
     "max_outstanding_workflow_tasks": { "type": "integer", "minimum": 1, "maximum": 1000000 },
     "max_concurrent_workflow_task_polls": { "type": "integer", "minimum": 1, "maximum": 1000000 },
-    "graceful_shutdown_timeout_ms": { "type": "integer", "minimum": 0, "maximum": 86400000 }
+    "graceful_shutdown_timeout_ms": { "type": "integer", "minimum": 0, "maximum": 86400000 },
+    "task_types": {
+      "description": "Task kinds the worker polls, derived from its registrations (#805). workflows enables workflow polling and in-process local activities; activities enables remote activity polling. At least one must be true. When omitted, both are polled; the OCaml encoder always sends it.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["workflows", "activities"],
+      "properties": {
+        "workflows": { "type": "boolean" },
+        "activities": { "type": "boolean" }
+      },
+      "not": {
+        "properties": {
+          "workflows": { "const": false },
+          "activities": { "const": false }
+        }
+      }
+    }
   },
   "allOf": [
     {

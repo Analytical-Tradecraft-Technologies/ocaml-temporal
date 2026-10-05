@@ -1197,6 +1197,18 @@ let test_native_worker_configuration_boundary () =
        ~namespace:"unit-test" ~task_queue:"unit-test" ~workflows:[]
        ~activities:[] ())
 
+(** A native worker polls only the task kinds it registered (#805), so a
+    worker that registers neither workflows nor activities could never make
+    progress. It is rejected as a defect after address validation and before
+    any runtime, connection, or Core poller is created; the unreachable port
+    would otherwise surface as a connection error. *)
+let test_native_worker_requires_a_task_type () =
+  expect_error_message_contains "defect"
+    "worker must register at least one workflow or activity"
+    (Temporal.Worker.create ~target_url:"http://127.0.0.1:1"
+       ~namespace:"unit-test" ~task_queue:"unit-test" ~workflows:[]
+       ~activities:[] ())
+
 (** Public worker options validate legacy routing metadata before any native
     graph is allocated, retain an immutable cache override, and expose the
     selected mode through an explicit variant. *)
@@ -1305,5 +1317,6 @@ let () =
   test_native_client_configuration_boundary ();
   test_worker_validation_errors ();
   test_native_worker_configuration_boundary ();
+  test_native_worker_requires_a_task_type ();
   test_worker_options_versioning ();
   test_worker_options_deployment_versioning ()

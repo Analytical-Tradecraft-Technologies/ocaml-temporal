@@ -592,12 +592,11 @@ fn restore_after_rejection_does_not_clobber_a_legitimately_readmitted_run() {
     );
 }
 
-/// The acceptance worker polls workflows, remote activities, and the local
-/// activity lane now that local-task completion and Core-directed retry
-/// backoff are implemented; Nexus remains outside this bridge's scope.
+/// A worker registering both kinds polls workflows, remote activities, and
+/// the local activity lane; Nexus remains outside this bridge's scope.
 #[test]
 fn bridge_enables_only_supported_core_task_types() {
-    let task_types = bridge_task_types();
+    let task_types = bridge_task_types(true, true).expect("both kinds are valid");
 
     assert!(task_types.enable_workflows);
     assert!(task_types.enable_remote_activities);
