@@ -1,4 +1,7 @@
+# Must equal the exact compiler every gate uses (Makefile NATIVE_RUST_VERSION,
+# CI workflows, and the rust:1.98 Docker images). test/smoke/test_rust_toolchain.sh
+# fails if this file drifts, so a toolchain bump updates all pins together.
 [toolchain]
-channel = "1.99"
+channel = "1.98.1"
 components = ["clippy", "rustfmt"]
 profile = "minimal"
