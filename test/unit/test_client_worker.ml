@@ -80,7 +80,7 @@ let unit_activity calls =
       Ok ())
 
 (** An asynchronous activity definition used to prove that the deterministic
-    mock reports its native-only mode as an activity failure instead of
+    mock rejects its native-only mode at worker construction instead of
     invoking a callback without a real completion lease. *)
 let unsupported_async_activity =
   Temporal.Activity.define_async ~name:"unit.aaa-async-activity"
@@ -230,21 +230,26 @@ let test_worker_continues_after_task_failure () =
   unwrap (Temporal.Worker.shutdown worker)
 
 (** The mock backend cannot provide the native lease required by an
-    asynchronous activity, so it acknowledges that task as a typed activity
-    failure and continues to the next ordinary activity task. *)
-let test_mock_worker_rejects_async_activity_without_stopping () =
+    asynchronous activity, so [Worker.create] rejects the registration with a
+    typed defect, as documented, instead of returning [Ok] and failing each
+    task during [run] (#844). *)
+let test_mock_worker_rejects_async_activity_at_create () =
   let activity_calls = Atomic.make 0 in
-  let worker =
-    unwrap
-      (Temporal.Worker.create ~target_url:"mock://dispatch"
-         ~namespace:"unit-test" ~task_queue:"unit-test" ~workflows:[]
-         ~activities:
-           [ Temporal.Worker.activity unsupported_async_activity;
-             Temporal.Worker.activity (unit_activity activity_calls) ] ())
-  in
-  unwrap (Temporal.Worker.run worker);
-  assert (Atomic.get activity_calls = 1);
-  unwrap (Temporal.Worker.shutdown worker)
+  match
+    Temporal.Worker.create ~target_url:"mock://dispatch"
+      ~namespace:"unit-test" ~task_queue:"unit-test" ~workflows:[]
+      ~activities:
+        [ Temporal.Worker.activity unsupported_async_activity;
+          Temporal.Worker.activity (unit_activity activity_calls) ] ()
+  with
+  | Ok _ -> failwith "mock worker accepted an asynchronous activity"
+  | Error error ->
+      assert (Temporal.Error.kind error = "defect");
+      assert (
+        Temporal.Error.message error
+        = "asynchronous activity unit.aaa-async-activity requires the native \
+           worker backend");
+      assert (Atomic.get activity_calls = 0)
 
 (** The public run admission gate is shared by mock and native workers. After
     shutdown, attempting to run again must return a typed lifecycle error
@@ -1272,7 +1277,7 @@ let () =
   test_remote_registration_is_rejected ();
   test_worker_registration_and_dispatch ();
   test_worker_continues_after_task_failure ();
-  test_mock_worker_rejects_async_activity_without_stopping ();
+  test_mock_worker_rejects_async_activity_at_create ();
   test_worker_run_after_shutdown_is_rejected ();
   test_typed_start_and_wait_handle ();
   test_client_custom_codec_failures ();
