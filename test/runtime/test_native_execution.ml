@@ -46,6 +46,7 @@ let public_payload (payload : Temporal_base.Codec.payload) : Temporal.Payload.t 
 let base_error (error : Temporal.Error.t) : Temporal_base.Error.t =
   let view = Temporal.Error.view error in
   Temporal_base.Error.make ~non_retryable:view.non_retryable
+    ?error_type:view.error_type
     ~details:(List.map base_payload view.details) ~category:view.category
     ~message:view.message ()
 
@@ -419,8 +420,132 @@ let test_activity_failure_details_are_preserved () =
       begin match view.details with
       | [ payload ] when Bytes.to_string payload.data = "failure-details" -> ()
       | _ -> failwith "wrapped activity failure details were discarded"
-      end
+      end;
+      (* The application type nested under the activity wrapper is the one
+         workflow code can branch on, not the wrapper's activity type. *)
+      if view.error_type <> Some "mock_failure" then
+        failwith "wrapped activity application type was not preserved"
   | _ -> failwith "activity failure did not become a typed runtime error"
+
+(** Confirms a child-workflow failure exposes the type of the application
+    failure nested under Core's child-workflow wrapper, and that a failure with
+    no application layer leaves the type absent instead of inventing one. *)
+let test_child_failure_application_type () =
+  let application_failure : Protocol.failure =
+    {
+      message = "child business failure";
+      source = "GoSDK";
+      stack_trace = "";
+      encoded_attributes = None;
+      cause = None;
+      info =
+        Protocol.Application
+          {
+            type_name = "OrderRejected";
+            non_retryable = true;
+            details = [];
+            category = Protocol.Application_category_unspecified;
+            next_retry_delay = None;
+          };
+    }
+  in
+  let child_wrapper cause : Protocol.failure =
+    {
+      message = "child workflow failed";
+      source = "core";
+      stack_trace = "";
+      encoded_attributes = None;
+      cause;
+      info =
+        Protocol.Child_workflow
+          {
+            namespace = "default";
+            workflow_id = "child";
+            run_id = "child-run";
+            workflow_type = "child_type";
+            initiated_event_id = 1L;
+            started_event_id = 2L;
+            retry_state = Protocol.Non_retryable_failure;
+          };
+    }
+  in
+  let resolve seq failure =
+    let translated =
+      unwrap "child failure translation"
+        (Native_execution.translate_activation
+           (activation
+              [
+                Protocol.Resolve_child_workflow
+                  { seq; result = Protocol.Child_failed failure };
+              ]))
+    in
+    match translated.jobs with
+    | [ Activation.Resolve_child_workflow { result = Error error; _ } ] ->
+        Temporal_base.Error.view error
+    | _ -> failwith "child failure did not become a typed runtime error"
+  in
+  let typed = resolve 9L (child_wrapper (Some application_failure)) in
+  if typed.category <> `Child_workflow then
+    failwith "child failure category changed";
+  if typed.error_type <> Some "OrderRejected" then
+    failwith "nested child application type was not preserved";
+  let untyped = resolve 10L (child_wrapper None) in
+  if untyped.error_type <> None then
+    failwith "child failure without an application layer invented a type"
+
+(** Runs a workflow that returns [error] and returns the single
+    [Fail_workflow] failure it produces. *)
+let fail_workflow_failure ~label error =
+  let workflow =
+    Temporal_base.Definition.make ~name:label ~input:Temporal_base.Codec.unit
+      ~output:Temporal_base.Codec.unit
+      ~implementation:(Some (fun () -> Error error))
+  in
+  let execution = Execution.start workflow () in
+  let completion =
+    unwrap label
+      (Native_execution.activate execution
+         (activation
+            [
+              Protocol.Initialize_workflow
+                {
+                  workflow_id = label;
+                  workflow_type = label;
+                  arguments = [];
+                  randomness_seed = "1";
+                  attempt = 1;
+                  context = None;
+                };
+            ]))
+  in
+  Execution.shutdown execution;
+  match completion.commands with
+  | [ Protocol.Fail_workflow { failure } ] -> failure
+  | _ -> failwith (label ^ " did not fail the workflow")
+
+(** Confirms a workflow failure carries the error's explicit application type
+    as [ApplicationFailureInfo.type], falls back to the category label when the
+    error is untyped, and uses the SDK-wide failure source. *)
+let test_workflow_failure_application_type () =
+  let typed =
+    fail_workflow_failure ~label:"typed_failure"
+      (Temporal_base.Error.make ~error_type:"InvalidInput" ~non_retryable:true
+         ~category:`Workflow ~message:"bad input" ())
+  in
+  (match typed.info with
+  | Protocol.Application { type_name = "InvalidInput"; non_retryable = true; _ }
+    ->
+      ()
+  | _ -> failwith "workflow failure did not carry its explicit type");
+  if typed.source <> "ocaml-temporal" then
+    failwith "workflow failure used an unexpected source";
+  let untyped =
+    fail_workflow_failure ~label:"untyped_failure"
+      (Temporal_base.Error.make ~category:`Workflow ~message:"failed" ())
+  in
+  match untyped.info with
+  | Protocol.Application { type_name = "workflow"; _ } -> ()
+  | _ -> failwith "untyped workflow failure did not fall back to its category"
 
 (** Confirms child start and terminal resolutions remain distinct jobs while
     sharing one Core sequence number. A repeated start or repeated terminal
@@ -1885,6 +2010,8 @@ let () =
   test_activation_metadata_and_order ();
   test_retained_payloads_are_copied ();
   test_activity_failure_details_are_preserved ();
+  test_child_failure_application_type ();
+  test_workflow_failure_application_type ();
   test_child_resolution_translation ();
   test_local_activity_backoff_translation ();
   test_signal_workflow_translation_and_activation ();

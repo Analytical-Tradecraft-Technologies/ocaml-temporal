@@ -7,7 +7,7 @@
     through a result returned by the public API. *)
 let of_base (error : Temporal_base.Error.t) : Error.t =
   let view = Temporal_base.Error.view error in
-  Error.make ~non_retryable:view.non_retryable
+  Error.make ~non_retryable:view.non_retryable ?error_type:view.error_type
     ~details:(List.map Payload_private.of_base view.details)
     ~category:view.category ~message:view.message ()
 
@@ -17,5 +17,5 @@ let of_base (error : Temporal_base.Error.t) : Error.t =
 let to_base (error : Error.t) : Temporal_base.Error.t =
   let view = Error.view error in
   Temporal_base.Error.make ~non_retryable:view.non_retryable
-    ~details:(List.map Payload_private.to_base view.details)
+    ?error_type:view.error_type ~details:(List.map Payload_private.to_base view.details)
     ~category:view.category ~message:view.message ()

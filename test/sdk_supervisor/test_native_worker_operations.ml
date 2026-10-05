@@ -43,6 +43,7 @@ let require_bridge = function
         | Already_started -> "already_started"
         | Retryable -> "retryable"
         | Async_heartbeat_rejected -> "async_heartbeat_rejected"
+        | Resource_exhausted -> "resource_exhausted"
         | Unknown code -> Printf.sprintf "unknown(%d)" code
       in
       failwith (Printf.sprintf "%s: %s" status message)
@@ -92,9 +93,12 @@ let test_nonblocking_readiness_results () =
   | _ -> failwith "hostile activity worker error changed status")
 
 (** If OCaml rejects bytes that Rust already leased, the adapter returns those
-    exact bytes to the native rejection path before exposing the protocol
-    error. A rejection failure is appended without losing the original
-    [Protocol] classification or copying source JSON into the diagnostic. *)
+    exact bytes to the native rejection path. On a live worker a successful
+    rejection is local task progress and reads as an empty poll, so one
+    undecodable task cannot end [Worker.run] (issue #801). A replay keeps the
+    [Protocol] error instead of silently skipping history. A rejection failure
+    is appended without losing the original [Protocol] classification or
+    copying source JSON into the diagnostic. *)
 let test_decode_failure_retires_native_lease () =
   let malformed = Bytes.of_string {|{"run_id":"private-run"}|} in
   let rejected = ref None in
@@ -102,14 +106,25 @@ let test_decode_failure_retires_native_lease () =
     rejected := Some input;
     Ok ()
   in
+  expect "live workflow rejection keeps polling" (Ok None)
+    (Supervisor.Protocol_adapter.workflow_poll_result ~reject (Ok malformed));
+  expect "workflow rejection input" (Some malformed) !rejected;
+  rejected := None;
   (match
-     Supervisor.Protocol_adapter.workflow_poll_result ~reject (Ok malformed)
+     Supervisor.Protocol_adapter.replay_workflow_poll_result ~reject
+       (Ok malformed)
    with
   | Error { Bridge.status = Protocol; message } ->
       if contains_substring message "private-run"
-      then failwith "workflow rejection error exposed source JSON"
-  | _ -> failwith "workflow decode failure did not remain Protocol");
-  expect "workflow rejection input" (Some malformed) !rejected;
+      then failwith "replay rejection error exposed source JSON"
+  | _ -> failwith "replay decode failure did not remain Protocol");
+  expect "replay rejection input" (Some malformed) !rejected;
+  let malformed_task = Bytes.of_string {|{"task_token":"c2VjcmV0"}|} in
+  rejected := None;
+  expect "live activity rejection keeps polling" (Ok None)
+    (Supervisor.Protocol_adapter.activity_poll_result ~reject
+       (Ok malformed_task));
+  expect "activity rejection input" (Some malformed_task) !rejected;
   let rejection_failure =
     { Bridge.status = Worker; message = "native rejection failed safely" }
   in
@@ -453,6 +468,9 @@ let test_native_lifecycle_guards () =
   (match Supervisor.perform supervisor Supervisor.Wait_activity with
   | Error (Supervisor.Backend { Bridge.status = Invalid_state; _ }) -> ()
   | _ -> failwith "activity readiness wait without worker was accepted");
+  (match Supervisor.perform supervisor Supervisor.Wait_any with
+  | Error (Supervisor.Backend { Bridge.status = Invalid_state; _ }) -> ()
+  | _ -> failwith "combined readiness wait without worker was accepted");
   let invalid_completion : Workflow.completion =
     { run_id = ""; task_failure = None; commands = [] }
   in

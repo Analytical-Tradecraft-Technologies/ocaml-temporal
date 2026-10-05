@@ -1316,14 +1316,25 @@ fn validates_start_metadata_without_continuation_bypass() {
                 workflow_protocol::CoreConversionErrorCode::Unsupported
             );
         }
-        for field in ["memo", "search_attributes", "expiration"] {
+        // A memo key the protocol cannot carry is client-supplied and
+        // server-valid, so it is dropped rather than rejected (#802); the
+        // entry must not survive, and the memo itself stays present.
+        let mut init = baseline.clone();
+        init.memo = Some(Memo {
+            fields: [(String::new(), Default::default())].into(),
+        });
+        let semantic =
+            workflow_protocol::activation_from_core(&start_metadata_activation(init)).unwrap();
+        assert!(matches!(
+            semantic.jobs.as_slice(),
+            [workflow_protocol::ActivationJob::InitializeWorkflow {
+                context: Some(context),
+                ..
+            }] if context.memo.as_ref().is_some_and(|memo| memo.is_empty())
+        ));
+        for field in ["search_attributes", "expiration"] {
             let mut init = baseline.clone();
             match field {
-                "memo" => {
-                    init.memo = Some(Memo {
-                        fields: [(String::new(), Default::default())].into(),
-                    })
-                }
                 "search_attributes" => {
                     init.search_attributes = Some(SearchAttributes {
                         indexed_fields: [(String::new(), Default::default())].into(),
@@ -1447,8 +1458,11 @@ fn converts_signal_workflow_activation_losslessly() {
 /// Proves a sender identity cannot smuggle an embedded NUL through the
 /// semantic encoder. Rust strings are UTF-8 by construction, so the bilateral
 /// UTF-8 invariant is represented by accepting a non-ASCII identity in the
-/// normal round-trip above while this test covers the byte-level rejection
-/// that Rust can observe directly.
+/// normal round-trip above while this test covers the byte-level rule that
+/// Rust can observe directly. A server-valid Core identity containing NUL is
+/// not rejected (that would wedge the workflow on every replay); conversion
+/// replaces the NUL with U+FFFD instead, while a semantic document carrying
+/// NUL is still rejected by the strict encoder.
 #[test]
 fn rejects_signal_identity_with_nul() {
     use core_activation::workflow_activation_job::Variant;
@@ -1467,12 +1481,13 @@ fn rejects_signal_identity_with_nul() {
         ..Default::default()
     };
 
-    let error = workflow_protocol::activation_from_core(&activation)
-        .expect_err("NUL-containing signal identity was accepted");
-    assert_eq!(
-        error.code,
-        workflow_protocol::CoreConversionErrorCode::InvalidCore
-    );
+    let converted = workflow_protocol::activation_from_core(&activation)
+        .expect("server-valid NUL identity must not reject the activation");
+    assert!(matches!(
+        converted.jobs.as_slice(),
+        [workflow_protocol::ActivationJob::SignalWorkflow { identity, .. }]
+            if identity == "sender\u{FFFD}"
+    ));
 
     let semantic = workflow_protocol::Activation {
         run_id: "run-signal-invalid".to_owned(),

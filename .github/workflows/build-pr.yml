@@ -138,7 +138,7 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          OCAML_IMAGE=ocaml/opam:debian-12-ocaml-5.2 \
+          OCAML_VERSION=5.2 \
             make --silent cargo-metadata \
             | docker run --rm --interactive --network none \
                 --volume "$PWD:/workspace:ro" \
@@ -214,7 +214,7 @@ jobs:
         run: make test-temporal-task-failure-live
       - name: Retain exact-run task failure recovery evidence
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: workflow-task-failure-${{ github.run_id }}-${{ github.run_attempt }}
           path: _build/task-failure-live/
@@ -360,8 +360,11 @@ jobs:
           --component clippy --component rustfmt
       - name: Install Protocol Buffers compiler on macOS
         run: brew install protobuf
-      - name: Install OCaml dependencies
-        run: opam install . --deps-only --with-test --assume-depexts --yes
+      - name: Install and verify locked OCaml dependencies
+        # Exact temporal-sdk.opam.locked versions (compiler packages excepted);
+        # fails if the switch drifts from the audited lock.
+        shell: bash
+        run: sh scripts/opam-locked-deps.sh install --assume-depexts
       - name: Download the verified platform bridge
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
@@ -438,8 +441,11 @@ jobs:
           cygpath -w "$(dirname "$protoc_unix_path")" >> "$GITHUB_PATH"
           echo "PROTOC=$protoc_windows_path" >> "$GITHUB_ENV"
           "$protoc_unix_path" --version
-      - name: Install OCaml dependencies
-        run: opam install . --deps-only --with-test --assume-depexts --yes
+      - name: Install and verify locked OCaml dependencies
+        # Exact temporal-sdk.opam.locked versions (compiler packages excepted);
+        # fails if the switch drifts from the audited lock.
+        shell: bash
+        run: sh scripts/opam-locked-deps.sh install --assume-depexts
       - name: Download the verified platform bridge
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:

@@ -164,6 +164,10 @@ let () =
   | Error { status = Invalid_state; message } ->
       assert (String.length message > 0)
   | _ -> failwith "activity readiness wait without a worker was accepted");
+  (match Bridge.worker_wait_any runtime with
+  | Error { status = Invalid_state; message } ->
+      assert (String.length message > 0)
+  | _ -> failwith "combined readiness wait without a worker was accepted");
   (match Bridge.worker_complete_workflow_json runtime Bytes.empty with
   | Error { status = Protocol; message } ->
       assert (String.length message > 0)

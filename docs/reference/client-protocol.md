@@ -134,6 +134,13 @@ messages while Temporal performs the RPC. Rust returns an opaque ticket:
 {"ticket":"4a7c3e0e-3e3d-4b9f-9df2-6e55d3b2b4b7"}
 ```
 
+At most 64 tickets may be outstanding per runtime. A begin request whose
+`request_id` is already pending with identical fields returns the existing
+ticket without using another slot; any other request at capacity is rejected
+with status `15` (`RESOURCE_EXHAUSTED`) before a Tokio task or RPC is created.
+The client remains connected, and the public adapter reports this as a
+retryable `bridge` error recognized by `Client.is_at_capacity`.
+
 The supervisor supplies that object to either `poll_start_workflow_json` or
 `wait_start_workflow_json`. Poll returns immediately; wait blocks for at most
 the bridge's short bounded interval and then returns `STATUS_NOT_READY`, so a

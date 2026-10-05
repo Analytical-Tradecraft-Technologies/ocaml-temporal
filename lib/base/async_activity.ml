@@ -2,8 +2,11 @@
     completion capability.
 
     The handle starts dormant because the callback may return a handle before
-    the worker has accepted the [WillCompleteAsync] handoff. Every operation
-    reserves a request key under [mutex], releases the lock while entering the
+    the worker has accepted the [WillCompleteAsync] handoff. An operation on a
+    handle that is not yet active is rejected with a retryable error rather
+    than buffered: buffering would have to report a later native outcome to a
+    caller that has already returned, while blocking could deadlock when the
+    caller is the dispatch thread itself. Every operation reserves a request key under [mutex], releases the lock while entering the
     supervisor, and commits the result under the lock. Consequently a second
     Domain cannot submit a conflicting terminal operation, while a transport
     failure of a terminal operation leaves the exact operation available for a
@@ -39,7 +42,12 @@ type submission_error =
 (** The handle lifecycle is protected by [handle.mutex]. [Handoff_pending]
     closes the gap between a callback returning [Will_complete_async] and the
     worker accepting that handoff; [Terminal] prevents duplicate completion,
-    while [Closed] permanently rejects operations after teardown. *)
+    while [Closed] permanently rejects operations after teardown.
+
+    Operations in [Dormant] and [Handoff_pending] are rejected with a
+    retryable error, because external code may race the handoff (#766). The
+    owning adapter must therefore move every handle that will never be
+    activated to [Closed] so that retry loops terminate. *)
 type lifecycle = Dormant | Handoff_pending | Active | Terminal | Closed
 
 (** The one operation currently reserved by this handle. [in_flight] is set
@@ -145,25 +153,40 @@ let prepare_handoff ~expected handle =
             lifecycle_error
               "asynchronous activity handle cannot be reserved for a handoff")
 
+(** Closes a handle that was never reserved for a handoff. The adapter calls
+    this after every callback outcome other than an accepted
+    [prepare_handoff], so a handle retained by external code cannot stay
+    [Dormant] forever and keep returning the retryable "not active yet" error.
+    A handle in any other lifecycle state is left unchanged. *)
+let close_if_dormant handle =
+  with_mutex handle.mutex (fun () ->
+      match handle.lifecycle with
+      | Dormant ->
+          handle.lifecycle <- Closed;
+          handle.pending <- None
+      | Handoff_pending | Active | Terminal | Closed -> ())
+
 (** Reserves one operation key under the lock. The key is installed before the
     supervisor call so another Domain cannot submit a conflicting operation or
     duplicate the same request while the first submission is in flight. *)
 let begin_operation handle ~key operation =
   with_mutex handle.mutex (fun () ->
       match handle.lifecycle with
-      | Dormant ->
+      | Dormant | Handoff_pending ->
+          (* The handle has not been activated yet, but it may still become
+             active: the callback has not returned, or the worker has not yet
+             had [WillCompleteAsync] accepted. A completer on another Domain
+             can legitimately reach this state first (#766), so the error is
+             retryable and nothing is reserved; the caller retries the same
+             operation. Every path on which activation can no longer happen
+             moves the handle to [Closed], which turns a retry loop into a
+             non-retryable error instead of spinning forever. *)
           Error
-            (Error.make ~non_retryable:true ~category:`Activity
+            (Error.make ~non_retryable:false ~category:`Activity
                ~message:
-                 "asynchronous activity handle is not active; return Will_complete_async first"
+                 "asynchronous activity handle is not active yet; retry after the worker accepts the Will_complete_async handoff"
                ())
       | Closed -> lifecycle_error "asynchronous activity handle is closed"
-      | Handoff_pending ->
-          Error
-            (Error.make ~non_retryable:true ~category:`Activity
-               ~message:
-                 "asynchronous activity handle is waiting for the worker handoff"
-               ())
       | Terminal -> lifecycle_error "asynchronous activity handle is terminal"
       | Active -> (
           match handle.pending with
@@ -217,8 +240,9 @@ let add_payloads buffer payloads =
   List.iter (add_payload buffer) payloads
 
 (** Derives the stable equality key used to permit only byte-identical retries
-    after an uncertain supervisor submission. Error category, retryability, and
-    detail payloads are included because they affect the completion request. *)
+    after an uncertain supervisor submission. Error category, application
+    failure type, retryability, and detail payloads are included because they
+    affect the completion request. *)
 let operation_key operation =
   let buffer = Buffer.create 64 in
   (match operation with
@@ -231,6 +255,7 @@ let operation_key operation =
         Error.view error
       in
       add_field buffer (Error.kind error);
+      add_field buffer (Error.application_failure_type error);
       add_field buffer message;
       add_field buffer (if non_retryable then "1" else "0");
       add_payloads buffer details

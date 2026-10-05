@@ -1,7 +1,8 @@
 use crate::replay_bridge::{ReplayWorker, ReplayWorkerError};
 use crate::worker_bridge::{
-    PollLaneError, PollLanes, ReadinessWait, WorkerBridgeError, public_poll_lane_error_message,
-    public_worker_error_message,
+    BoundedFinalize, PollLaneError, PollLanes, ReadinessWait, ShutdownDrainError,
+    WORKER_FINALIZE_TIMEOUT, WORKER_SHUTDOWN_DRAIN_TIMEOUT, WorkerBridgeError,
+    public_poll_lane_error_message, public_worker_error_message,
 };
 use crate::{activity_protocol, client_protocol, workflow_protocol};
 use serde::Deserialize;
@@ -60,7 +61,9 @@ pub const STATUS_CONFIGURATION: Status = 6;
 pub const STATUS_CONNECTION: Status = 7;
 /// Official Core worker construction or namespace validation failed.
 pub const STATUS_WORKER: Status = 8;
-/// Worker shutdown is draining tasks that still require language completion.
+/// Shutdown found tasks that still required language completion. For a live
+/// worker those tasks were force-completed and the worker was still released;
+/// for replay, recorded input was not fully drained.
 pub const STATUS_OUTSTANDING_TASKS: Status = 9;
 /// A bounded readiness operation has no result ready for handoff yet.
 pub const STATUS_NOT_READY: Status = 10;
@@ -81,6 +84,13 @@ pub const STATUS_RETRYABLE: Status = 13;
 /// is gone. The caller may correct the request or submit a different one. The
 /// name predates terminal operations and is kept for ABI stability.
 pub const STATUS_ASYNC_HEARTBEAT_REJECTED: Status = 14;
+/// A bounded bridge-owned registry for client operations is full, so this
+/// request was not admitted and nothing was sent to Temporal.
+///
+/// Unlike `STATUS_INVALID_STATE`, the client remains connected and usable: the
+/// caller may retry once another of its in-flight operations finishes. The
+/// bounds are `MAX_PENDING_WAITS` and `MAX_PENDING_STARTS`.
+pub const STATUS_RESOURCE_EXHAUSTED: Status = 15;
 
 /// Maximum accepted lifecycle configuration document size.
 const MAX_LIFECYCLE_CONFIG_BYTES: usize = 64 * 1024;
@@ -130,6 +140,9 @@ const MAX_GRACEFUL_SHUTDOWN_MS: u64 = 24 * 60 * 60 * 1_000;
 const CLIENT_WAIT_TIMEOUT: Duration = Duration::from_millis(100);
 /// Bounds retained exact-run observations, including their RPC and page state.
 /// Completed or failed waits release their slot; disconnect cancels all waits.
+/// Waiting on another distinct run at capacity returns
+/// `STATUS_RESOURCE_EXHAUSTED`; concurrent waits on an already retained run
+/// share its slot. The public `Client.wait` documentation repeats this value.
 const MAX_PENDING_WAITS: usize = 64;
 /// Bounds the number of in-flight client starts retained by one supervisor.
 ///
@@ -137,7 +150,9 @@ const MAX_PENDING_WAITS: usize = 64;
 /// request payload until the RPC completes. A finite ceiling prevents a caller
 /// that forgets tickets from turning the supervisor into an unbounded task
 /// registry; the caller can submit more work after polling or closing
-/// completed tickets.
+/// completed tickets. Admission at capacity returns
+/// `STATUS_RESOURCE_EXHAUSTED` before any RPC is issued; the public
+/// `Client.start` documentation repeats this value.
 const MAX_PENDING_STARTS: usize = 64;
 /// Maximum time spent in one wait-ticket ABI call before the owner regains
 /// control of its mailbox and can service lifecycle messages.
@@ -882,8 +897,10 @@ impl Runtime {
         }
         if self.pending_starts.len() >= MAX_PENDING_STARTS {
             return Err(Failure {
-                status: STATUS_INVALID_STATE,
-                message: "too many Temporal workflow starts are pending".to_owned(),
+                status: STATUS_RESOURCE_EXHAUSTED,
+                message: format!(
+                    "too many Temporal workflow starts are pending (limit {MAX_PENDING_STARTS})"
+                ),
             });
         }
 
@@ -1100,8 +1117,10 @@ impl Runtime {
         if !self.pending_waits.contains_key(&request) {
             if self.pending_waits.len() >= MAX_PENDING_WAITS {
                 return Err(Failure {
-                    status: STATUS_INVALID_STATE,
-                    message: "too many Temporal workflow waits are pending".to_owned(),
+                    status: STATUS_RESOURCE_EXHAUSTED,
+                    message: format!(
+                        "too many Temporal workflow waits are pending (limit {MAX_PENDING_WAITS})"
+                    ),
                 });
             }
             self.pending_waits.try_reserve(1).map_err(|_| Failure {
@@ -1227,7 +1246,30 @@ impl Runtime {
         Ok(Vec::new())
     }
 
-    /// Gracefully finalizes the child worker once; absence is already closed.
+    /// Shuts down and finalizes the child worker in bounded time; absence is
+    /// already closed.
+    ///
+    /// By the time OCaml sends this request its run loop has stopped and its
+    /// retained completions are drained, and the supervisor Domain cannot
+    /// deliver another completion while it is inside this call. Every task
+    /// Core still counts as outstanding can therefore only be completed by the
+    /// bridge, and Core's polls do not report `ShutDown` until that happens
+    /// (issue #769). The worker is shut down in three bounded steps:
+    ///
+    /// 1. initiate Core shutdown;
+    /// 2. retire every outstanding task while joining both poll lanes, for at
+    ///    most [`WORKER_SHUTDOWN_DRAIN_TIMEOUT`];
+    /// 3. run Core's finalizer in a task that owns the worker, waiting for at
+    ///    most [`WORKER_FINALIZE_TIMEOUT`].
+    ///
+    /// Contract: tasks that never reached OCaml (queued handoffs, polls in
+    /// flight at shutdown, Core's own cache evictions) are retired silently,
+    /// because OCaml never owned them. When a task *leased* to OCaml had to be
+    /// force-completed, the worker is still finalized and released, but the
+    /// call reports `STATUS_OUTSTANDING_TASKS` so the caller learns that
+    /// language-side work was abandoned. A drain timeout, lane failure, or
+    /// refused finalization keeps the worker in the graph and reports a
+    /// worker failure; runtime close then disposes it.
     fn shutdown_worker(&mut self) -> Operation {
         let Some(worker) = self.worker.as_mut() else {
             return Ok(Vec::new());
@@ -1243,37 +1285,46 @@ impl Runtime {
             let _runtime_guard = handle.enter();
             worker.initiate_shutdown();
         }
-        handle
-            .block_on(worker.join_poll_lanes())
-            .map_err(poll_lane_failure)?;
-        if !worker.can_finalize() {
-            return Err(Failure {
-                status: STATUS_OUTSTANDING_TASKS,
-                message: "Temporal worker is draining outstanding workflow or activity tasks"
-                    .to_owned(),
-            });
-        }
+        let retirement = handle
+            .block_on(worker.drain_and_join_for_shutdown(WORKER_SHUTDOWN_DRAIN_TIMEOUT))
+            .map_err(shutdown_drain_failure)?;
         let worker = self
             .worker
             .take()
-            .expect("checked worker remains owned until terminal finalization");
-        match handle.block_on(worker.finalize()) {
-            Ok(()) => {
-                self.worker_namespace = None;
-                // Semantic handoffs belong to the worker that created them.
-                // Drop them with the worker so a later start on this runtime
-                // cannot treat a recycled run ID or task token as a duplicate.
-                self.workflow_activations.clear();
-                self.activity_tasks.clear();
-                Ok(Vec::new())
+            .expect("drained worker remains owned until terminal finalization");
+        let result = match handle.block_on(worker.finalize_bounded(WORKER_FINALIZE_TIMEOUT)) {
+            BoundedFinalize::Refused(worker, error) => {
+                // The bridge would not consume the worker (for example after a
+                // lost poll lease). Keep it owned by the graph so runtime close
+                // performs its last-resort disposal instead of losing it here.
+                self.worker = Some(*worker);
+                return Err(worker_bridge_failure(error));
             }
-            Err((worker, error)) => {
-                // Put the worker back so the language side can finish outstanding
-                // tasks and retry graceful shutdown instead of losing the graph.
-                self.worker = Some(worker);
-                Err(worker_bridge_failure(error))
-            }
-        }
+            BoundedFinalize::Finalized if retirement.abandoned_leases == 0 => Ok(Vec::new()),
+            BoundedFinalize::Finalized => Err(Failure {
+                status: STATUS_OUTSTANDING_TASKS,
+                message: "Temporal worker shutdown force-completed tasks that were never completed by the worker".to_owned(),
+            }),
+            BoundedFinalize::Panicked => Err(Failure {
+                status: STATUS_WORKER,
+                message: "Temporal worker finalization failed".to_owned(),
+            }),
+            BoundedFinalize::Detached => Err(Failure {
+                status: STATUS_WORKER,
+                message: "Temporal worker finalization did not finish within the shutdown bound"
+                    .to_owned(),
+            }),
+        };
+        // In every remaining outcome the graph no longer owns the worker: it
+        // was finalized, released while unwinding, or is still being finalized
+        // by a task that owns it.
+        self.worker_namespace = None;
+        // Semantic handoffs belong to the worker that created them. Drop them
+        // with the worker so a later start on this runtime cannot treat a
+        // recycled run ID or task token as a duplicate.
+        self.workflow_activations.clear();
+        self.activity_tasks.clear();
+        result
     }
 
     /// Takes one workflow activation from the Rust lane without waiting.
@@ -1633,14 +1684,26 @@ impl Runtime {
 
     /// Revalidates and retires the exact workflow activation whose OCaml
     /// semantic decode failed after Rust handed off its lease.
+    ///
+    /// Success is local task progress, as for a Rust conversion failure: the
+    /// OCaml supervisor reports an empty poll and keeps polling (issue #801).
+    /// The static diagnostic and the redelivery backoff of
+    /// [`Self::reject_unrepresentable_workflow_delivery`] apply here too,
+    /// because Core may redeliver the failed workflow task at once.
     fn reject_polled_workflow(&mut self, input: &[u8]) -> Operation {
+        const REASON: &str = "OCaml semantic workflow activation decoding failed";
         let run_id = workflow_rejection_run_id(&self.workflow_activations, input)?;
         // reject_workflow_delivery retires the ledger even when Core rejects
         // the generated failure. Remove the semantic handoff on the same path
         // so a Core error cannot leave a stale run_id that blocks later work.
-        let rejection = self.reject_workflow_delivery(&run_id);
+        let rejection = self.reject_workflow_delivery_with_reason(&run_id, REASON);
         self.workflow_activations.remove(&run_id);
         rejection?;
+        write_rejected_workflow_diagnostic(std::io::stderr().lock(), REASON);
+        self.worker
+            .as_ref()
+            .expect("rejected workflow delivery retains worker")
+            .wait_workflow_delivery_rejection_backoff();
         Ok(Vec::new())
     }
 
@@ -1665,20 +1728,17 @@ impl Runtime {
             .map_err(poll_lane_failure)?;
         let semantic = match activity_protocol::task_from_core(&task) {
             Ok(semantic) => semantic,
-            Err(error) => {
-                self.reject_unrepresentable_activity(&task)?;
-                return Err(core_conversion_failure(error));
-            }
+            Err(error) => return self.reject_unrepresentable_activity(&task, error.message),
         };
         match activity_protocol::encode_task(&semantic) {
             Ok(encoded) => {
                 retain_activity_task(&mut self.activity_tasks, task.task_token.clone(), semantic);
                 Ok(encoded.into_bytes())
             }
-            Err(error) => {
-                self.reject_unrepresentable_activity(&task)?;
-                Err(protocol_failure(error))
-            }
+            Err(_error) => self.reject_unrepresentable_activity(
+                &task,
+                "semantic activity task JSON encoding failed",
+            ),
         }
     }
 
@@ -1689,15 +1749,26 @@ impl Runtime {
     /// Cancel variant is only an update to that Start; it has no independent
     /// completion to fail, so dropping a malformed update preserves the
     /// in-flight Start lease for the activity implementation.
+    ///
+    /// A handled rejection is local task progress, not a worker failure: one
+    /// task the bridge cannot represent (for example a standalone activity
+    /// with no workflow, or a header key another SDK allowed) must not end
+    /// `Worker.run` for every task on the queue (issue #801). After Core
+    /// accepts the generated non-retryable failure, the bounded static
+    /// `reason` is written to stderr and the poll returns `STATUS_NOT_READY`
+    /// so the worker keeps polling. A Core rejection error remains fatal
+    /// through the `?` below. No backoff is needed, unlike the workflow lane:
+    /// the failure is non-retryable, so the server does not redeliver it.
     fn reject_unrepresentable_activity(
         &self,
         task: &CoreActivityTask,
-    ) -> std::result::Result<(), Failure> {
+        reason: &'static str,
+    ) -> Operation {
         if activity_task_owns_completion_debt(task) {
-            self.reject_activity_delivery(&task.task_token)
-        } else {
-            Ok(())
+            self.reject_activity_delivery(&task.task_token, reason)?;
         }
+        write_rejected_activity_diagnostic(std::io::stderr().lock(), reason);
+        Err(not_ready())
     }
 
     /// Waits for remote-activity-lane readiness without consuming its task.
@@ -1723,6 +1794,32 @@ impl Runtime {
         }
     }
 
+    /// Waits for readiness on either live-worker lane without consuming a task.
+    ///
+    /// The worker loop uses this for its single idle native wait so a task on
+    /// the lane it did not expect wakes the supervisor at once rather than
+    /// after the bounded timeout (#806). Statuses match the lane-specific
+    /// waits: `STATUS_NOT_READY` on timeout and `STATUS_INVALID_STATE` once a
+    /// lane has closed without queued work.
+    fn wait_any(&self) -> Operation {
+        let worker = self.worker.as_ref().ok_or_else(|| Failure {
+            status: STATUS_INVALID_STATE,
+            message: "Temporal worker is not running".to_owned(),
+        })?;
+        match worker.wait_any() {
+            ReadinessWait::Ready => Ok(Vec::new()),
+            ReadinessWait::TimedOut => Err(Failure {
+                status: STATUS_NOT_READY,
+                message: "Temporal worker readiness wait timed out; retry".to_owned(),
+            }),
+            ReadinessWait::Shutdown => Err(Failure {
+                status: STATUS_INVALID_STATE,
+                message: "Temporal worker readiness wait ended during worker shutdown".to_owned(),
+            }),
+            ReadinessWait::Error(error) => Err(poll_lane_failure(error)),
+        }
+    }
+
     /// Applies the fixed native backoff used only after an explicitly
     /// retryable activity-completion outcome.
     ///
@@ -1739,14 +1836,6 @@ impl Runtime {
         };
         worker.wait_activity_completion_retry_backoff();
         Ok(Vec::new())
-    }
-
-    /// Fails and retires a workflow activation that was never exposed to OCaml.
-    fn reject_workflow_delivery(&self, run_id: &str) -> std::result::Result<(), Failure> {
-        self.reject_workflow_delivery_with_reason(
-            run_id,
-            "semantic workflow activation conversion failed",
-        )
     }
 
     /// Fails and retires a workflow activation with a static diagnostic
@@ -1788,8 +1877,13 @@ impl Runtime {
         Err(not_ready())
     }
 
-    /// Fails and retires an activity task that was never exposed to OCaml.
-    fn reject_activity_delivery(&self, task_token: &[u8]) -> std::result::Result<(), Failure> {
+    /// Fails and retires an activity task that was never exposed to OCaml,
+    /// reporting the static `reason` in the non-retryable Core failure.
+    fn reject_activity_delivery(
+        &self,
+        task_token: &[u8],
+        reason: &'static str,
+    ) -> std::result::Result<(), Failure> {
         let worker = self.worker.as_ref().ok_or_else(|| Failure {
             status: STATUS_INVALID_STATE,
             message: "Temporal worker is not running".to_owned(),
@@ -1800,7 +1894,7 @@ impl Runtime {
             .expect("worker retains parent runtime")
             .tokio_handle();
         handle
-            .block_on(worker.reject_activity_delivery(task_token))
+            .block_on(worker.reject_activity_delivery(task_token, reason))
             .map_err(worker_bridge_failure)
     }
 
@@ -1997,7 +2091,12 @@ impl Runtime {
     /// native lease. A cancellation is only an update attached to the same
     /// token. If its JSON cannot be decoded, dropping that one update must not
     /// retire the start lease that another OCaml call still has to complete.
+    ///
+    /// Success means the task was handled locally (issue #801): the OCaml
+    /// supervisor then reports an empty poll and keeps polling. The static
+    /// diagnostic is written only after the rejection succeeded.
     fn reject_polled_activity(&mut self, input: &[u8]) -> Operation {
+        const REASON: &str = "OCaml semantic activity task decoding failed";
         let rejection = activity_rejection_task(&self.activity_tasks, input)?;
         let owns_completion_debt = matches!(
             &rejection.task.variant,
@@ -2007,7 +2106,7 @@ impl Runtime {
         // Cancel has no independent completion to reject; removing just its
         // retained document preserves the shared Start debt.
         let native_rejection = if owns_completion_debt {
-            self.reject_activity_delivery(&rejection.task_token)
+            self.reject_activity_delivery(&rejection.task_token, REASON)
         } else {
             Ok(())
         };
@@ -2017,6 +2116,7 @@ impl Runtime {
             &rejection.task,
         );
         native_rejection?;
+        write_rejected_activity_diagnostic(std::io::stderr().lock(), REASON);
         Ok(Vec::new())
     }
 
@@ -2171,20 +2271,26 @@ fn drop_runtime_graph(
         // outstanding. Force-fail every still-owned debt before joining the
         // lanes so dispose cannot block forever waiting for OCaml.
         handle.block_on(worker.force_complete_outstanding_for_dispose());
-        let _ = handle.block_on(worker.join_poll_lanes());
+        // The join keeps completing tasks that polls already in flight publish
+        // while the lanes stop, and is bounded so dispose cannot hang on a
+        // debt Core keeps outstanding (issue #769). A timeout leaves the
+        // worker unfinalizable, which the match below handles.
+        let _ = handle.block_on(worker.drain_and_join_for_shutdown(WORKER_SHUTDOWN_DRAIN_TIMEOUT));
         // A poll that was already inside Core can return after the first drain
         // and publish a new ready task before its lane exits.  The joins above
         // establish that no producer remains; a final pass therefore closes
         // the only window in which a late task could otherwise be dropped with
         // an outstanding Core completion debt.
         handle.block_on(worker.force_complete_outstanding_for_dispose());
-        match handle.block_on(worker.finalize()) {
-            Ok(()) => {}
-            Err((worker, _)) => {
+        match handle.block_on(worker.finalize_bounded(WORKER_FINALIZE_TIMEOUT)) {
+            BoundedFinalize::Refused(worker, _) => {
                 // Dispose cannot wait for OCaml. Dropping after force-complete
                 // is the last-resort reclaim path.
                 drop(worker);
             }
+            // A detached finalizer still owns the worker; dropping Core below
+            // shuts down its Tokio runtime, which ends that task.
+            BoundedFinalize::Finalized | BoundedFinalize::Panicked | BoundedFinalize::Detached => {}
         }
     }
     if let Some(worker) = replay_worker {
@@ -2275,6 +2381,18 @@ fn poll_lane_failure(error: PollLaneError) -> Failure {
     }
 }
 
+/// Maps a failed bounded shutdown drain to a closed worker failure. The worker
+/// stays in the runtime graph in both cases, so runtime close disposes it.
+fn shutdown_drain_failure(error: ShutdownDrainError) -> Failure {
+    match error {
+        ShutdownDrainError::Lane(error) => poll_lane_failure(error),
+        ShutdownDrainError::TimedOut => Failure {
+            status: STATUS_WORKER,
+            message: "Temporal worker poll lanes did not stop within the shutdown bound".to_owned(),
+        },
+    }
+}
+
 /// Constructs the stable result used by empty non-blocking poll lanes.
 fn not_ready() -> Failure {
     Failure {
@@ -2290,6 +2408,14 @@ fn write_rejected_workflow_diagnostic(mut output: impl Write, reason: &'static s
         output,
         "ocaml-temporal: rejected workflow delivery: {reason}"
     );
+}
+
+/// Best-effort stderr diagnostic after an unrepresentable activity task was
+/// handled locally. As for workflows, only the static category is written;
+/// no task token, identifier, header, or payload reaches the log, and a closed
+/// stderr cannot turn the handled task into an ABI panic.
+fn write_rejected_activity_diagnostic(mut output: impl Write, reason: &'static str) {
+    let _ = writeln!(output, "ocaml-temporal: rejected activity task: {reason}");
 }
 
 /// Reports an exact-run wait that must be retried without exposing a fake
@@ -3840,6 +3966,34 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_worker_wait_activity(
     }
 }
 
+/// Wait for readiness on either worker lane without consuming a queued task.
+///
+/// The caller must release the OCaml runtime lock around this operation. It
+/// has the same bounded timeout and status contract as the lane-specific
+/// waits, but any queued workflow activation or activity task ends it.
+///
+/// # Safety
+///
+/// `runtime` must be a live exclusively owned runtime handle and `output` must
+/// satisfy the standard initialized-result contract.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ocaml_temporal_core_v2_worker_wait_any(
+    runtime: *mut Runtime,
+    output: *mut Result,
+) -> Status {
+    unsafe {
+        invoke(output, || {
+            runtime
+                .as_ref()
+                .ok_or_else(|| Failure {
+                    status: STATUS_INVALID_ARGUMENT,
+                    message: "runtime pointer is null".to_owned(),
+                })?
+                .wait_any()
+        })
+    }
+}
+
 /// Apply the bounded native delay used before retrying an explicitly
 /// retryable activity completion.
 ///
@@ -4224,7 +4378,7 @@ mod rejection_tests;
 
 #[cfg(test)]
 mod rejection_diagnostic_tests {
-    use super::write_rejected_workflow_diagnostic;
+    use super::{write_rejected_activity_diagnostic, write_rejected_workflow_diagnostic};
     use std::io::{self, Write};
 
     /// Models a closed stderr stream without changing process-wide descriptors.
@@ -4246,6 +4400,14 @@ mod rejection_diagnostic_tests {
     fn closed_stderr_does_not_panic_after_workflow_rejection() {
         let mut stderr = BrokenStderr(0);
         write_rejected_workflow_diagnostic(&mut stderr, "unsupported Core failure category");
+        assert_eq!(stderr.0, 1);
+    }
+
+    /// The activity rejection diagnostic is equally best effort (issue #801).
+    #[test]
+    fn closed_stderr_does_not_panic_after_activity_rejection() {
+        let mut stderr = BrokenStderr(0);
+        write_rejected_activity_diagnostic(&mut stderr, "activity task header key is empty");
         assert_eq!(stderr.0, 1);
     }
 }

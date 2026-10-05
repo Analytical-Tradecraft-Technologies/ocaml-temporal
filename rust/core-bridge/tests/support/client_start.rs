@@ -203,3 +203,72 @@ fn disconnect_aborts_an_in_flight_start_and_releases_its_request() {
     assert!(runtime.disconnect_client().is_ok());
     assert_eq!(runtime.close(true), STATUS_OK);
 }
+
+/// Builds a distinct start document so each admission occupies its own slot.
+fn start_request(index: usize) -> Vec<u8> {
+    format!(
+        r#"{{"request_id":"capacity-request-{index}","namespace":"default","workflow_id":"workflow-{index}","workflow_type":"Workflow","task_queue":"queue","input":[]}}"#
+    )
+    .into_bytes()
+}
+
+/// A full start registry rejects only new logical starts, with the dedicated
+/// retryable capacity status rather than the closed-client invalid-state
+/// status. The client stays connected, an identical retry of an admitted
+/// request still returns its original ticket, and freeing one slot admits the
+/// previously rejected start.
+#[test]
+fn pending_start_capacity_rejects_only_new_requests() {
+    let (mut runtime, _probe) = connected_runtime(Reply::Hung);
+    let mut tickets = Vec::with_capacity(MAX_PENDING_STARTS);
+    for index in 0..MAX_PENDING_STARTS {
+        tickets.push(
+            runtime
+                .begin_start_workflow_json(&start_request(index))
+                .expect("start admitted below capacity"),
+        );
+    }
+
+    let excess = runtime
+        .begin_start_workflow_json(&start_request(MAX_PENDING_STARTS))
+        .expect_err("start beyond capacity must be rejected");
+    assert_eq!(excess.status, STATUS_RESOURCE_EXHAUSTED);
+    assert!(
+        excess
+            .message
+            .contains(&format!("limit {MAX_PENDING_STARTS}")),
+        "{}",
+        excess.message
+    );
+    assert_eq!(runtime.pending_starts.len(), MAX_PENDING_STARTS);
+    assert!(runtime.client.is_some());
+
+    let retry = runtime
+        .begin_start_workflow_json(&start_request(0))
+        .expect("identical retry at capacity reuses its ticket");
+    assert_eq!(retry, tickets[0]);
+
+    // Retire one ticket as the owner would after a terminal result, joining
+    // its aborted task so no transport future outlives the slot. The freed
+    // slot must admit the start that was rejected above.
+    let ticket: serde_json::Value = serde_json::from_slice(&tickets[0]).unwrap();
+    let pending = runtime
+        .pending_starts
+        .remove(ticket["ticket"].as_str().expect("ticket field"))
+        .expect("first start is pending");
+    pending.task.abort();
+    let _ = runtime
+        .core
+        .as_ref()
+        .unwrap()
+        .tokio_handle()
+        .block_on(pending.task);
+    runtime
+        .begin_start_workflow_json(&start_request(MAX_PENDING_STARTS))
+        .expect("start admitted after a slot is released");
+    assert_eq!(runtime.pending_starts.len(), MAX_PENDING_STARTS);
+
+    assert!(runtime.disconnect_client().is_ok());
+    assert!(runtime.pending_starts.is_empty());
+    assert_eq!(runtime.close(true), STATUS_OK);
+}

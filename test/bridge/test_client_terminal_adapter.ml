@@ -74,6 +74,31 @@ let test_failure_and_timeout_successors () =
       require_successor "timed out with" true successor
   | _ -> failwith "timed-out close event changed terminal kind"
 
+(** A client-observed workflow failure exposes the application failure type,
+    including when the workflow's failure wraps an activity failure whose
+    application cause carries the type; the public category stays [Workflow]. *)
+let test_failed_result_error_type () =
+  let error_of failure_json =
+    match
+      Backend.native_terminal_result
+        (response "failed" ({|"failure":|} ^ failure_json ^ ",") "null")
+    with
+    | Ok (Backend.Failed { error; _ }) -> error
+    | _ -> failwith "failed close event changed terminal kind"
+  in
+  let flat =
+    error_of
+      {|{"message":"failed","source":"worker","stack_trace":"","encoded_attributes":null,"cause":null,"info":{"kind":"application","type":"Failure","non_retryable":true,"details":[]}}|}
+  in
+  assert (Temporal.Error.error_type flat = Some "Failure");
+  assert ((Temporal.Error.view flat).category = `Workflow);
+  let nested =
+    error_of
+      {|{"message":"activity failed","source":"core","stack_trace":"","encoded_attributes":null,"cause":{"message":"bad","source":"PythonSDK","stack_trace":"","encoded_attributes":null,"cause":null,"info":{"kind":"application","type":"InvalidInput","non_retryable":false,"details":[]}},"info":{"kind":"activity","scheduled_event_id":5,"started_event_id":6,"identity":"worker","activity_type":"activity","activity_id":"activity-1","retry_state":"non_retryable_failure"}}|}
+  in
+  assert (Temporal.Error.error_type nested = Some "InvalidInput");
+  assert ((Temporal.Error.view nested).category = `Workflow)
+
 (** The mock supplies two real exact runs; a private hook substitutes the
     protocol-decoded close event for the first. The public successor returned by
     [wait], not the reset fixture, is passed directly to [follow]. *)
@@ -154,5 +179,6 @@ let test_public_wait_follow kind =
     live Temporal server. *)
 let () =
   test_failure_and_timeout_successors ();
+  test_failed_result_error_type ();
   test_public_wait_follow "failed";
   test_public_wait_follow "timed_out"

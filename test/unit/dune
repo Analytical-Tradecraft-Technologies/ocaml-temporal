@@ -13,6 +13,10 @@
  (libraries temporal-sdk temporal_runtime))
 
 (test
+ (name test_worker_shutdown)
+ (libraries temporal-sdk threads unix))
+
+(test
  (name test_base_error)
  (libraries temporal_base))
 

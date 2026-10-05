@@ -1249,10 +1249,38 @@ let test_base_state_machine () =
   in
   begin
     match Base_async.complete handle () with
-    | Error _ -> ()
+    | Error error when not (Temporal_base.Error.view error).non_retryable -> ()
+    | Error _ -> failwith "dormant base async handle rejected permanently (#766)"
     | Ok () -> failwith "dormant base async handle submitted an operation"
   end;
   if !submitted <> 0 then failwith "dormant base handle entered its submit callback";
+  begin
+    match Base_async.prepare_handoff ~expected:handle handle with
+    | Ok () -> ()
+    | Error _ -> failwith "dormant base async handle could not reserve a handoff"
+  end;
+  (* A reserved handoff is not dormant, so the adapter's cleanup leaves it
+     usable for activation. *)
+  Base_async.close_if_dormant handle;
+  begin
+    match Base_async.complete handle () with
+    | Error error when not (Temporal_base.Error.view error).non_retryable -> ()
+    | Error _ -> failwith "handoff-pending base handle rejected permanently (#766)"
+    | Ok () -> failwith "handoff-pending base handle submitted an operation"
+  end;
+  let abandoned =
+    Base_async.create
+      ~submit:(fun _operation -> incr submitted; Ok ())
+      ~encode_output:(fun _ -> Ok payload)
+  in
+  Base_async.close_if_dormant abandoned;
+  begin
+    match Base_async.complete abandoned () with
+    | Error error when (Temporal_base.Error.view error).non_retryable -> ()
+    | Error _ -> failwith "closed dormant base handle remained retryable"
+    | Ok () -> failwith "closed dormant base handle submitted an operation"
+  end;
+  if !submitted <> 0 then failwith "inactive base handle entered its submit callback";
   begin
     match Base_async.activate handle with
     | Ok () -> ()
@@ -1430,6 +1458,187 @@ let test_in_flight_conflict_is_retryable () =
   | Ok () -> ()
   | Error _ -> failwith "completion after the in-flight heartbeat failed"
 
+(** Asserts that an async handle operation failed with a retryable error, the
+    signal that a completer racing the handoff must retry rather than drop its
+    result (#766). *)
+let expect_retryable_not_active label = function
+  | Error error when not (Temporal.Error.view error).non_retryable -> ()
+  | Error error ->
+      failwith
+        (Printf.sprintf "%s: not-yet-active handle returned a permanent error: %s"
+           label (Temporal.Error.message error))
+  | Ok () -> failwith (label ^ ": inactive async handle submitted an operation")
+
+(** Asserts that a handle which can never become active reports a
+    non-retryable error, so a retry loop around it terminates. *)
+let expect_permanently_closed label = function
+  | Error error when (Temporal.Error.view error).non_retryable -> ()
+  | Error _ -> failwith (label ^ ": unusable async handle remained retryable")
+  | Ok () -> failwith (label ^ ": unusable async handle submitted an operation")
+
+(** Regression for #766. A completer that runs before the callback returns, or
+    while the worker handoff is still unacknowledged, receives a retryable
+    error and no request reaches the client. Once the handoff is accepted the
+    same call succeeds exactly once, without rerunning the callback. *)
+let test_completion_racing_handoff_is_retryable () =
+  let supervisor = fake_supervisor () in
+  let calls = ref 0 and retained = ref None and early = ref None in
+  let activity =
+    Temporal.Activity.define_async ~name:"async_handoff_race"
+      ~input:Temporal.Codec.unit ~output:Temporal.Codec.string
+      (fun context () ->
+        incr calls;
+        let handle = Temporal.Activity.Async_context.handle context in
+        (* Models a completer on another Domain that finishes before this
+           callback has returned [Will_complete_async]. *)
+        early := Some (Temporal.Activity.Async_handle.complete handle "early");
+        retained := Some handle;
+        Temporal.Activity.Will_complete_async handle)
+  in
+  let token = Bytes.of_string "async-handoff-race" in
+  enqueue supervisor
+    (start_task ~token ~activity_type:"async_handoff_race"
+       ~input:[ encode_input Temporal.Codec.unit () ]);
+  let worker = worker supervisor [ Adapter.register_async activity ] in
+  supervisor.reject_next_worker_completion := true;
+  begin
+    match Worker.poll worker with
+    | Error { retryable = true; _ } -> ()
+    | _ -> failwith "uncertain handoff did not retain the worker lease"
+  end;
+  expect_retryable_not_active "dormant" (Option.get !early);
+  let handle = Option.get !retained in
+  (* The callback has returned, but Core has not accepted the handoff. *)
+  expect_retryable_not_active "handoff pending"
+    (Temporal.Activity.Async_handle.complete handle "finished");
+  expect_retryable_not_active "handoff pending heartbeat"
+    (Temporal.Activity.Async_handle.heartbeat handle []);
+  if !(supervisor.async_completion_calls) <> 0
+     || !(supervisor.async_heartbeat_calls) <> 0 then
+    failwith "inactive async handle reached the client";
+  expect_deferred (Worker.poll worker);
+  if !calls <> 1 then failwith "handoff retry reran the async callback";
+  begin
+    match Temporal.Activity.Async_handle.complete handle "finished" with
+    | Ok () -> ()
+    | Error error ->
+        failwith ("retried completion after handoff failed: "
+                  ^ Temporal.Error.message error)
+  end;
+  if !(supervisor.async_completion_calls) <> 1 then
+    failwith "retried completion was not submitted exactly once";
+  match Worker.drain worker with
+  | Ok () -> ()
+  | Error error -> failwith ("completed handoff blocked drain: " ^ error.message)
+
+(** The documented pattern from #766 with a real second Domain: the callback
+    hands its handle to a Domain that retries the retryable not-yet-active
+    error. The first worker handoff is uncertain, so the Domain must keep
+    retrying until the next poll accepts the handoff; its result is delivered
+    exactly once instead of being lost. *)
+let test_completer_domain_retries_until_handoff () =
+  let supervisor = fake_supervisor () in
+  let completer = ref None in
+  let activity =
+    Temporal.Activity.define_async ~name:"async_handoff_domain"
+      ~input:Temporal.Codec.unit ~output:Temporal.Codec.string
+      (fun context () ->
+        let handle = Temporal.Activity.Async_context.handle context in
+        let rec deliver attempts =
+          match Temporal.Activity.Async_handle.complete handle "from-domain" with
+          | Error error
+            when (not (Temporal.Error.view error).non_retryable)
+                 && attempts < 10_000_000 ->
+              Domain.cpu_relax ();
+              deliver (attempts + 1)
+          | result -> result
+        in
+        completer := Some (Domain.spawn (fun () -> deliver 0));
+        Temporal.Activity.Will_complete_async handle)
+  in
+  let token = Bytes.of_string "async-handoff-domain" in
+  enqueue supervisor
+    (start_task ~token ~activity_type:"async_handoff_domain"
+       ~input:[ encode_input Temporal.Codec.unit () ]);
+  let worker = worker supervisor [ Adapter.register_async activity ] in
+  supervisor.reject_next_worker_completion := true;
+  begin
+    match Worker.poll worker with
+    | Error { retryable = true; _ } -> ()
+    | _ -> failwith "uncertain handoff did not retain the worker lease"
+  end;
+  expect_deferred (Worker.poll worker);
+  begin
+    match Domain.join (Option.get !completer) with
+    | Ok () -> ()
+    | Error error ->
+        failwith ("completer Domain lost its result: " ^ Temporal.Error.message error)
+  end;
+  begin
+    match !(supervisor.async_completions) with
+    | [ { Protocol.result = Protocol.Completed (Some payload); task_token } ]
+      when Bytes.equal task_token token
+           && decode_output Temporal.Codec.string payload = "from-domain" -> ()
+    | _ -> failwith "completer Domain did not complete exactly once"
+  end;
+  match Worker.drain worker with
+  | Ok () -> ()
+  | Error error -> failwith ("completed handoff blocked drain: " ^ error.message)
+
+(** A handle that will never be activated must stop being retryable: after a
+    synchronous callback result, and after a reserved handoff is discarded by
+    terminal native cleanup. Otherwise a completer following the retry
+    contract from #766 would spin forever. *)
+let test_unactivated_handles_close () =
+  let supervisor = fake_supervisor () in
+  let calls = ref 0 and retained = ref [] in
+  let activity =
+    Temporal.Activity.define_async ~name:"async_never_active"
+      ~input:Temporal.Codec.unit ~output:Temporal.Codec.string
+      (fun context () ->
+        incr calls;
+        let handle = Temporal.Activity.Async_context.handle context in
+        retained := handle :: !retained;
+        match !calls with
+        | 1 -> Temporal.Activity.Completed "sync"
+        | 2 -> Temporal.Activity.Failed
+                 (Temporal.Error.make ~category:`Activity ~message:"sync failure" ())
+        | 3 -> raise Exit
+        | _ -> Temporal.Activity.Will_complete_async handle)
+  in
+  let input = [ encode_input Temporal.Codec.unit () ] in
+  List.iter
+    (fun name ->
+      enqueue supervisor
+        (start_task ~token:(Bytes.of_string name)
+           ~activity_type:"async_never_active" ~input))
+    [ "never-1"; "never-2"; "never-3"; "never-4" ];
+  let worker = worker supervisor [ Adapter.register_async activity ] in
+  for _ = 1 to 3 do
+    match Worker.poll worker with
+    | Ok (Raw_adapter.Completed _ | Raw_adapter.Rejected _) -> ()
+    | _ -> failwith "synchronous async outcome was not acknowledged"
+  done;
+  List.iter
+    (fun handle ->
+      expect_permanently_closed "synchronous outcome"
+        (Temporal.Activity.Async_handle.complete handle "late"))
+    !retained;
+  supervisor.reject_next_worker_completion := true;
+  begin
+    match Worker.poll worker with
+    | Error { retryable = true; _ } -> ()
+    | _ -> failwith "uncertain handoff did not retain the worker lease"
+  end;
+  let pending = List.hd !retained in
+  expect_retryable_not_active "reserved handoff"
+    (Temporal.Activity.Async_handle.complete pending "late");
+  Worker.discard worker;
+  expect_permanently_closed "discarded handoff"
+    (Temporal.Activity.Async_handle.complete pending "late");
+  if !(supervisor.async_completion_calls) <> 0 then
+    failwith "unactivated async handle reached the client"
+
 (** Runs the isolated async lifecycle assertions. *)
 let () =
   test_base_state_machine ();
@@ -1452,4 +1661,7 @@ let () =
   test_async_heartbeat_and_cancel ();
   test_async_failure ();
   test_async_drain_and_discard ();
-  test_stale_handle_rejected ()
+  test_stale_handle_rejected ();
+  test_completion_racing_handoff_is_retryable ();
+  test_completer_domain_retries_until_handoff ();
+  test_unactivated_handles_close ()

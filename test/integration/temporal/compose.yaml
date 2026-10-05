@@ -6,7 +6,8 @@ services:
       context: ../../..
       dockerfile: Dockerfile.dev
       args:
-        OCAML_IMAGE: ${OCAML_IMAGE:-ocaml/opam:debian-12-ocaml-5.2}
+        # A digest-pinned compiler stage name from Dockerfile.dev.
+        OCAML_IMAGE: ${OCAML_IMAGE:-ocaml-5.2}
     working_dir: /workspace
     environment:
       # All worker/driver services extend dev, including isolated Dune trees.

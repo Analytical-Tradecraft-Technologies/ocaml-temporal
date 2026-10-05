@@ -14,6 +14,7 @@ module Workflow_adapter = Temporal_sdk_kernel.Native_worker_execution
 module Activity_adapter = Temporal_sdk_kernel.Native_activity_execution
 module Worker_loop = Temporal_sdk_kernel.Native_worker_loop
 module Worker_policy = Temporal_sdk_kernel.Native_worker_policy
+module Owner = Temporal_sdk_kernel.Native_worker_owner
 module Observer = Temporal_sdk_kernel.Native_worker_observer
 
 (** Result-bind notation keeps expected startup and lifecycle failures typed. *)
@@ -45,6 +46,7 @@ let bridge_status = function
   | Already_started -> "already_started"
   | Retryable -> "retryable"
   | Async_heartbeat_rejected -> "async_heartbeat_rejected"
+  | Resource_exhausted -> "resource_exhausted"
   | Unknown code -> Printf.sprintf "unknown(%d)" code
 
 (** Converts the supervisor's opaque error into a bounded worker diagnostic.
@@ -297,8 +299,8 @@ type t = {
   workflow_tasks : bool;
       (** [false] for an activity-only worker. Core then runs no workflow
           poller and the Rust workflow lane stays permanently idle, so the run
-          loop skips polling it and spends its native readiness waits on the
-          activity lane instead (#805). *)
+          loop skips polling it (#805). The combined readiness wait never
+          wakes for that idle lane, so it needs no special case there. *)
   closed : bool Atomic.t;
   shutdown_retryable : bool Atomic.t;
       (** [true] while terminal native shutdown has not returned. Adapter maps
@@ -314,11 +316,11 @@ type t = {
   run_mutex : Mutex.t;
       (** Held until both execution Domains leave their adapters. Native
           teardown must not overtake an activity callback or workflow task. *)
-  run_domain : Domain.id option Atomic.t;
-      (** The Domain executing workflow activations. *)
-  activity_domain : Domain.id option Atomic.t;
-      (** The capacity-one Domain executing activity callbacks. Tracking it
-          prevents callbacks from recursively waiting for their own join. *)
+  owner : Owner.t;
+      (** The system threads executing workflow activations and activity
+          callbacks. Tracking the exact threads, not their Domains, rejects a
+          callback that would wait for its own lane while still admitting a
+          sibling system thread on the same Domain (#763). *)
 }
 (** Native worker lifecycle state. The atomic flag is the only state observed by
     the polling lanes from [shutdown]. Each adapter protects its own maps; the
@@ -389,26 +391,24 @@ let poll_activity worker =
 
 (** Uses native event readiness only for the one idle lane holding the wait
     token. When its sibling is busy or already waiting, a 10 ms local yield
-    avoids occupying the sole supervisor owner with a wait for the wrong lane.
-    The next poll checks the Rust queue; when both lanes become idle, they
-    alternate native waits with the OCaml runtime lock released.
+    avoids occupying the sole supervisor owner. The next poll checks the Rust
+    queue; when both lanes become idle, they take turns holding the token.
 
-    An activity-only worker's workflow lane never becomes ready, so when that
-    lane holds the token it waits for activity readiness instead. Otherwise
-    every other idle wait would hold the supervisor on a dead lane for the full
-    bounded timeout and delay the next activity task by up to that long. The
-    wait does not consume the task, so the activity lane still takes it. *)
-let wait_for_lane worker ~workflow_lane ~native_wait =
+    The native wait itself observes both lanes ([Wait_any]), whichever lane
+    holds the token. A lane-specific wait held the sole supervisor owner for
+    the full bounded timeout while a task sat on the other lane, so every step
+    of a sequential activity workflow paid one dead wait (#806). A sibling
+    lane's poll queued in the mailbox during the wait runs as soon as it ends.
+    The wait does not consume the task, so the owning lane still takes it; this
+    also covers an activity-only worker, whose idle workflow lane never wakes
+    it. [workflow_lane] therefore matters only for the local yield. *)
+let wait_for_lane worker ~workflow_lane:_ ~native_wait =
   if not native_wait then begin
     Thread.delay 0.01;
     Ok ()
   end
   else
-    let operation : unit Native.operation =
-      if workflow_lane && worker.workflow_tasks then Native.Wait_workflow
-      else Native.Wait_activity
-    in
-    match Native.perform worker.supervisor operation with
+    match Native.perform worker.supervisor Native.Wait_any with
     | Ok () -> Ok ()
     | Error error when is_not_ready error -> Ok ()
     | Error error -> Error (public_native_error "worker readiness wait" error)
@@ -431,32 +431,31 @@ let retry_pending worker ~workflow_lane =
     | Error error ->
         Error (public_native_error "activity completion retry backoff" error)
 
-(** Detects a call from either execution Domain before a lifecycle mutex is
-    acquired. An activity callback can otherwise wait on a shutdown which in
-    turn waits for that callback's Domain to join. *)
-let is_execution_domain worker =
-  let self = Domain.self () in
-  Atomic.get worker.run_domain = Some self
-  || Atomic.get worker.activity_domain = Some self
+(** Detects a call from either execution lane's system thread before a
+    lifecycle mutex is acquired. A callback could otherwise wait on a shutdown
+    which in turn waits for that callback's lane to return. Another system
+    thread, including one on a lane's Domain, is not re-entrant: it blocks on
+    [run_mutex] with the runtime lock released while the lane exits. *)
+let is_execution_thread worker = Owner.is_execution_thread worker.owner
 
 (** Runs workflow execution on this Domain and capacity-one activity execution
     on a dedicated Domain. Both adapters continue to use the same serialized
     supervisor mailbox. [run_mutex] remains held until the activity Domain is
     joined, so later shutdown can drain and release the graph safely. *)
 let run worker =
-  if is_execution_domain worker then
+  if is_execution_thread worker then
       Error
         (Base_error.defect
            ~message:
-             "worker run is re-entrant on the same Domain; activity or host \
-              code must not call Worker.run while a run loop is active")
+             "worker run is re-entrant on an execution thread; activity or \
+              workflow code must not call Worker.run while its run loop is \
+              active")
   else begin
       Mutex.lock worker.run_mutex;
-      Atomic.set worker.run_domain (Some (Domain.self ()));
+      Owner.enter_run worker.owner;
       Fun.protect
         ~finally:(fun () ->
-          Atomic.set worker.run_domain None;
-          Atomic.set worker.activity_domain None;
+          Owner.leave worker.owner;
           Mutex.unlock worker.run_mutex)
         (fun () ->
           report Logs.Info ~operation:"worker_run_started" ();
@@ -466,7 +465,7 @@ let run worker =
                 ~closed:(fun () -> Atomic.get worker.closed)
                 ~poll_workflow:(fun () -> poll_workflow worker)
                 ~poll_activity:(fun () ->
-                  Atomic.set worker.activity_domain (Some (Domain.self ()));
+                  Owner.enter_activity worker.owner;
                   poll_activity worker)
                 ~wait_for_lane:(fun ~workflow_lane ~native_wait ->
                   wait_for_lane worker ~workflow_lane ~native_wait)
@@ -535,21 +534,22 @@ let schedule_terminal_cleanup worker =
     pending completion is still safe to submit. Other failures mark the public
     worker terminal and immediately force-release the native graph; this
     preserves the original adapter error without retaining Tokio/Core resources
-    behind a worker value that can no longer be retried. An execution-Domain
+    behind a worker value that can no longer be retried. An execution-thread
     admission defect is the exception: no teardown has started, so it remains
-    retryable for a later call from another Domain. *)
+    retryable for a later call from any other thread. *)
 let shutdown worker =
-  if is_execution_domain worker then
-      (* An execution-Domain call cannot wait for [run_mutex] without deadlocking the
-         loop that is making the call. Leave the private graph open and mark
-         this admission failure retryable: the public wrapper reopens its
-         admission flag, and a later call from another Domain can perform the
-         ordinary drain-then-native-shutdown path once the active loop exits.
+  if is_execution_thread worker then
+      (* A call from a lane's own thread cannot wait for [run_mutex] without
+         deadlocking the loop that is making the call. Leave the private graph
+         open and mark this admission failure retryable: the public wrapper
+         reopens its admission flag, and a later call from any other thread
+         (on this or another Domain) can perform the ordinary
+         drain-then-native-shutdown path once the active loop exits.
 
          Critically, this branch must NOT write [worker.closed]. It never set
          [closed] to [true] (it returns before the gate below), so any write
          could only undo a [true] published by a concurrent [shutdown] on
-         another Domain -- clearing the stop request and stranding the loop,
+         another thread -- clearing the stop request and stranding the loop,
          which then holds [run_mutex] forever and deadlocks that caller. The
          policy fixes the action to [Leave_unchanged] for exactly this reason. *)
       let closed_action, shutdown_retryable =
@@ -562,8 +562,8 @@ let shutdown worker =
       Error
         (Base_error.defect
            ~message:
-             "cannot shut down a worker from inside its run loop on the same \
-              Domain; that would deadlock the run mutex")
+             "cannot shut down a worker from inside its own run loop thread; \
+              that would deadlock the run mutex")
   else
       if Atomic.compare_and_set worker.closed false true then begin
         Mutex.lock worker.run_mutex;
@@ -791,8 +791,7 @@ let create ?max_cached_workflows ?(versioning = Bridge.No_versioning) ~target_ur
         terminal_cleanup_pending = Atomic.make false;
         terminal_cleanup_scheduled = Atomic.make false;
         run_mutex = Mutex.create ();
-        run_domain = Atomic.make None;
-        activity_domain = Atomic.make None;
+        owner = Owner.create ();
       }
   in
   match setup with

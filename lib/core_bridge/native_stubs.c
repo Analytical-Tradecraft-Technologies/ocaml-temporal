@@ -743,6 +743,13 @@ CAMLprim value ocaml_temporal_worker_wait_activity(value runtime) {
                         ocaml_temporal_core_v2_worker_wait_activity);
 }
 
+/* Wait for readiness on either worker lane with the OCaml runtime lock
+ * released. The worker loop's single idle native wait uses this so a task on
+ * the lane it did not expect is not delayed by the bounded timeout. */
+CAMLprim value ocaml_temporal_worker_wait_any(value runtime) {
+  return invoke_runtime(runtime, ocaml_temporal_core_v2_worker_wait_any);
+}
+
 /* Apply the fixed activity-completion retry delay on the Rust supervisor
  * Domain. The shared invoke helper releases the OCaml runtime lock while the
  * bounded timer runs, so this cannot block an OCaml workflow scheduler. */

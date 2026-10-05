@@ -27,9 +27,17 @@ let process_order order =
 For a newly started execution, the first call returns `true` and emits a
 non-deprecated patch-marker command. During replay, it returns `true` only
 when Temporal Core reports that the marker exists in that execution's history;
-replay of an older history without the marker returns `false`. The decision is
-retained for the execution, so ordinary OCaml helper functions can call
-`patched` without threading version state through their arguments.
+replay of an older history without the marker returns `false`. The first
+answer for an ID is retained for the execution, so ordinary OCaml helper
+functions can call `patched` without threading version state through their
+arguments, and a later `NotifyHasPatch` job for an ID already consulted never
+changes that answer. A notification that arrives before the first call seeds
+the decision; once workflow code has branched on it, the decision is fixed for
+the run. This matches the memoization in Temporal's official SDKs. A late
+notification is still remembered: the next call for that ID keeps returning
+`false` but emits the `SetPatchMarker` command Core needs to consume the
+reported history marker, because Core treats an unmatched non-deprecated patch
+marker as nondeterminism.
 
 Patch IDs are durable history keys. They must be non-empty, valid UTF-8,
 NUL-free, and no more than 65,536 bytes. Invalid IDs and calls outside workflow
@@ -37,9 +45,13 @@ execution raise `Invalid_argument` because they are programmer defects. Never
 reuse an ID for a different change, derive it from mutable configuration, or
 build it from nondeterministic data.
 
-Every call emits the idempotent `SetPatchMarker` command, including repeated
-calls with the same ID. The OCaml runtime must not locally deduplicate those
-commands: Core owns durable marker state and history-machine deduplication.
+A call emits `SetPatchMarker` only when its retained decision is `true`. A
+`false` replay decision emits nothing: pinned Core creates a real
+`RecordMarker` command for every `SetPatchMarker` it receives during replay and
+keeps it queued unless a later history command displaces it, so emitting a
+marker for the legacy branch could record a marker contradicting the branch the
+run actually took (issue #788). Repeated `true` calls emit repeated same-mode
+commands; Core skips IDs for which it has already created a marker command.
 An emitted completion command is not itself history evidence; the live
 acceptance below checks the normalized server history separately.
 
@@ -57,8 +69,11 @@ let process_order order =
 ```
 
 `deprecate_patch` returns `unit`: it records lifecycle intent and must never be
-used as a branch decision. Repeated deprecation calls are allowed and emit
-`SetPatchMarker { deprecated = true }` for Core to deduplicate. Do not call
+used as a branch decision. It shares the same retained decision as
+`patched`: a fresh execution, or replay of a history whose marker Core
+reported, emits `SetPatchMarker { deprecated = true }` (repeated calls emit
+repeated commands for Core to deduplicate), while replay of a marker-free
+history emits nothing, matching Core's "call allowed" outcome. Do not call
 `patched` and `deprecate_patch` for the same ID during one workflow execution.
 Core retains the first marker command for an ID, so the OCaml runtime rejects
 mixed modes with `Invalid_argument` before it can emit an ambiguous completion.
@@ -87,10 +102,11 @@ The bridge preserves this order for each workflow task:
    protocol.
 2. OCaml validates the complete activation and installs the execution-local
    replay and patch-notification state before workflow fibers run.
-3. `Temporal.Workflow.patched` selects the execution-local branch decision and
-   emits `SetPatchMarker { deprecated = false }`, while
-   `Temporal.Workflow.deprecate_patch` retains the same private decision state
-   and emits `SetPatchMarker { deprecated = true }` without exposing a boolean.
+3. `Temporal.Workflow.patched` fixes the execution-local branch decision on its
+   first call and emits `SetPatchMarker { deprecated = false }` only when that
+   decision is `true`, while `Temporal.Workflow.deprecate_patch` retains the
+   same private decision state and emits `SetPatchMarker { deprecated = true }`
+   under the same condition without exposing a boolean.
 4. Rust validates the completion and converts the marker back to Core's
    protobuf command.
 
@@ -140,7 +156,9 @@ also verifies the active-to-deprecated and deprecated-to-removed transitions.
 ## Focused evidence and remaining boundary
 
 Focused OCaml runtime tests cover patch-in decisions, deprecated marker
-emission, replay with and without a notification, repeated same-mode calls,
+emission, replay with and without a notification (including the absence of a
+marker for a `false` decision), late notifications that must not flip a
+retained decision, repeated same-mode calls,
 mixed-mode rejection, execution isolation, native completion translation, and
 copying mutable source strings before they enter durable state. Shared fixtures
 and Rust tests cover strict JSON validation, duplicate command preservation,

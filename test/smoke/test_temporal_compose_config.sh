@@ -372,7 +372,7 @@ require_source_text "$worker" \
 require_source_text "$definitions" \
   'Temporal.Activity.Retry_policy.make'
 require_source_text "$definitions" \
-  '~non_retryable_error_types:[ "activity" ] ()'
+  '~non_retryable_error_types:[ "SmokeInvalidInput" ] ()'
 require_source_text "$definitions" \
   'Temporal.Activity.define ~name:"smoke.non_retryable_activity"'
 require_source_text "$definitions" \

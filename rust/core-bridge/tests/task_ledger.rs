@@ -603,3 +603,77 @@ fn bridge_enables_only_supported_core_task_types() {
     assert!(task_types.enable_local_activities);
     assert!(!task_types.enable_nexus);
 }
+
+/// Worker shutdown takes exactly the leases OCaml abandoned (issue #769).
+/// Unleased handoffs stay in the ledger because shutdown retires each one
+/// from its own ready-queue message, and no tombstone is written, so Core's
+/// follow-up eviction for a failed workflow task is admitted as new debt.
+#[test]
+fn shutdown_takes_only_leased_tasks_and_keeps_eviction_kind() {
+    let mut ledger = TaskLedger::new();
+    let leased_token: &[u8] = b"leased-activity";
+    let queued_token: &[u8] = b"queued-activity";
+    for run_id in ["leased-task", "leased-eviction", "queued-task"] {
+        assert_eq!(ledger.admit_polled_workflow(run_id), Ok(Admission::New));
+    }
+    assert_eq!(
+        ledger.lease_workflow_activation("leased-task", false),
+        Ok(())
+    );
+    assert_eq!(
+        ledger.lease_workflow_activation("leased-eviction", true),
+        Ok(())
+    );
+    for token in [leased_token, queued_token] {
+        assert_eq!(
+            ledger.admit_polled_activity(token, ActivityAdmission::Start),
+            Ok(Admission::New)
+        );
+    }
+    assert_eq!(
+        ledger.handoff_activity(leased_token, ActivityAdmission::Start),
+        Ok(())
+    );
+    ledger.begin_draining();
+
+    let (mut workflows, activities) = ledger.take_leased_for_shutdown();
+    workflows.sort();
+    assert_eq!(
+        workflows,
+        vec![
+            ("leased-eviction".to_owned(), true),
+            ("leased-task".to_owned(), false)
+        ]
+    );
+    assert_eq!(activities, vec![leased_token.to_vec()]);
+    // Only the queued handoffs remain; a second pass takes nothing.
+    assert_eq!(ledger.outstanding(), 2);
+    assert_eq!(ledger.take_leased_for_shutdown(), (Vec::new(), Vec::new()));
+    // Core's eviction after the failed task is a fresh obligation.
+    assert_eq!(
+        ledger.admit_polled_workflow("leased-task"),
+        Ok(Admission::New)
+    );
+}
+
+/// The eviction bit follows the lease it describes: a completed eviction
+/// leaves no stale bit, a rejected completion restores it, and a later real
+/// workflow task for the same run is not mistaken for an eviction.
+#[test]
+fn eviction_lease_bit_tracks_the_current_lease() {
+    let mut ledger = TaskLedger::new();
+    assert_eq!(ledger.admit_polled_workflow("run-1"), Ok(Admission::New));
+    assert_eq!(ledger.lease_workflow_activation("run-1", true), Ok(()));
+    assert!(ledger.is_eviction_lease("run-1"));
+
+    assert_eq!(ledger.complete_workflow("run-1"), Ok(()));
+    assert!(!ledger.is_eviction_lease("run-1"));
+    assert!(ledger.restore_rejected_workflow_completion("run-1"));
+    ledger.restore_eviction_lease("run-1");
+    assert!(ledger.is_eviction_lease("run-1"));
+
+    assert_eq!(ledger.complete_workflow("run-1"), Ok(()));
+    assert_eq!(ledger.admit_polled_workflow("run-1"), Ok(Admission::New));
+    assert_eq!(ledger.lease_workflow_activation("run-1", false), Ok(()));
+    assert!(!ledger.is_eviction_lease("run-1"));
+}

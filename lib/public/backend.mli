@@ -1,9 +1,16 @@
 (** The private transport boundary used by the public client and worker.
 
     [mock://] targets use the deterministic in-memory records below for unit
-    tests. HTTP(S) targets are routed through the private supervisor and its
-    Rust/Core protocol; that path uses separate activation/completion semantic
-    values and an explicit native lifecycle. Keeping those representations
+    tests of client and worker plumbing. The mock is not a workflow test
+    environment: a client wait echoes the start input as the completed output
+    without running a workflow, and worker tasks carry an empty [binary/null]
+    input unrelated to any client start. A worker task still invokes a
+    registered implementation whose input codec accepts that payload (for
+    example [Codec.unit]), outside any workflow scheduler context, so callback
+    side effects can occur during mock runs. HTTP(S) targets are
+    routed through the private supervisor and its Rust/Core protocol; that
+    path uses separate activation/completion semantic values and an explicit
+    native lifecycle. Keeping those representations
     private lets the installed [Temporal] API avoid Rust handles, JSON bytes,
     and transport-specific ownership rules. *)
 
@@ -220,6 +227,17 @@ val client_start : client -> start_request -> (start_response, Error.t) result
 
 (** Waits for the exact workflow/run pair and returns its terminal outcome. *)
 val client_wait : client -> wait_request -> (terminal_result, Error.t) result
+
+(** The [Error.error_type] of a retryable [`Bridge] error returned when the
+    native client's bounded pending-start or pending-wait registry is full.
+    [Client.is_at_capacity] recognizes it. *)
+val client_at_capacity_error_type : string
+
+(** Converts a private supervisor failure into the public error vocabulary.
+    Exposed in this private interface so bridge tests can verify that a full
+    native registry ([Resource_exhausted]) stays distinct from a closed client
+    ([Invalid_state]) without saturating a live Temporal connection. *)
+val native_supervisor_error : Temporal_sdk_kernel.Supervisor.error -> Error.t
 
 (** Scripts a failed or timed-out exact run in the deterministic mock for the
     public [Client.wait] to [Client.follow] regression. This private test seam

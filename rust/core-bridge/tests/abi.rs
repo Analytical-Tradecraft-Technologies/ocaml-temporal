@@ -18,7 +18,8 @@ use ocaml_temporal_core_bridge::{
     ocaml_temporal_core_v2_worker_try_poll_activity,
     ocaml_temporal_core_v2_worker_try_poll_workflow, ocaml_temporal_core_v2_worker_wait_activity,
     ocaml_temporal_core_v2_worker_wait_activity_completion_retry_backoff,
-    ocaml_temporal_core_v2_worker_wait_workflow, test_invoke_panic, test_worker_bridge_status,
+    ocaml_temporal_core_v2_worker_wait_any, ocaml_temporal_core_v2_worker_wait_workflow,
+    test_invoke_panic, test_worker_bridge_status,
 };
 
 /// Produces writable initialized storage matching the C caller contract.
@@ -272,6 +273,13 @@ fn task_bridge_exports_reject_null_runtime_handles() {
                 unsafe { ocaml_temporal_core_v2_result_free(&mut result) },
                 STATUS_OK
             );
+            unsafe { ocaml_temporal_core_v2_worker_wait_any(ptr::null_mut(), &mut result) }
+        },
+        {
+            assert_eq!(
+                unsafe { ocaml_temporal_core_v2_result_free(&mut result) },
+                STATUS_OK
+            );
             unsafe {
                 ocaml_temporal_core_v2_worker_wait_activity_completion_retry_backoff(
                     ptr::null_mut(),
@@ -484,6 +492,14 @@ fn readiness_waits_require_a_running_worker() {
     );
     assert_eq!(
         unsafe { ocaml_temporal_core_v2_worker_wait_activity(runtime, &mut result) },
+        ocaml_temporal_core_bridge::STATUS_INVALID_STATE
+    );
+    assert_eq!(
+        unsafe { ocaml_temporal_core_v2_result_free(&mut result) },
+        STATUS_OK
+    );
+    assert_eq!(
+        unsafe { ocaml_temporal_core_v2_worker_wait_any(runtime, &mut result) },
         ocaml_temporal_core_bridge::STATUS_INVALID_STATE
     );
     assert_eq!(

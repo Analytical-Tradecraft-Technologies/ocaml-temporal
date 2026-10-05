@@ -618,17 +618,27 @@ let run worker =
     | Native_backend backend ->
         Native_worker.run backend |> Result.map_error Error_private.of_base
 
-(** Shuts down the backend once and remembers that no new poll may be admitted. *)
+(** Shuts down the backend once and remembers that no new poll may be admitted.
+
+    The execution-thread check deliberately precedes [shutdown_mutex] (#764).
+    A concurrent external caller may hold that mutex while it waits for the
+    native run loop to exit; a workflow or activity callback on that loop which
+    then blocked on the same mutex would never return to let the loop exit. The
+    check is per system thread rather than per Domain (#763), so a sibling
+    thread of the run loop's Domain proceeds and waits like any other caller.
+    Callers that pass the check are serialized by the mutex: the first one
+    performs teardown and later ones return its cached terminal result. *)
 let shutdown worker =
   if
     match worker.backend with
-    | Native_backend backend -> Native_worker.is_execution_domain backend
+    | Native_backend backend -> Native_worker.is_execution_thread backend
     | Mock_backend _ -> false
   then
     Error
       (Error.defect
          ~message:
-           "cannot shut down a worker from one of its execution Domains")
+           "cannot shut down a worker from inside its own workflow or activity \
+            execution thread; call shutdown from another thread")
   else begin
   Mutex.lock worker.shutdown_mutex;
   Fun.protect
