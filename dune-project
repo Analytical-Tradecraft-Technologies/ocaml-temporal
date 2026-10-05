@@ -15,7 +15,7 @@
  (description "An experimental typed OCaml 5 workflow SDK backed by Temporal Core")
  (tags (temporal workflow sdk experimental))
  (depends
-  (ocaml (>= 5.2))
+  (ocaml (and (>= 5.2) (< 5.6)))
   conf-rust-2024
   conf-protoc
   (dune (>= 3.18))

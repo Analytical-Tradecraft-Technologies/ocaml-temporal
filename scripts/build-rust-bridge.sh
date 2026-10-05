@@ -38,6 +38,51 @@ case "$(uname -s)" in
     ;;
 esac
 
+# The opam dependency conf-rust-2024 only proves that the host compiler accepts
+# Rust edition 2024 (Rust 1.85), while the workspace declares a newer
+# rust-version. Without this gate an opam user with an older distribution
+# toolchain passes the conf package and then fails deep inside Cargo's
+# dependency resolution with an error that does not name the real cause.
+# Compare against the same compiler Cargo will invoke: Cargo honours RUSTC, and
+# both commands run from this directory, so rustup toolchain selection agrees.
+required_rust_version=$(sed -n 's/^rust-version[[:space:]]*=[[:space:]]*"\([0-9][0-9.]*\)"[[:space:]]*$/\1/p' \
+  "$workspace_root/rust/Cargo.toml" | head -n 1)
+if [ -z "$required_rust_version" ]; then
+  echo "rust/Cargo.toml does not declare a numeric workspace rust-version" >&2
+  exit 1
+fi
+rustc_command=${RUSTC:-rustc}
+if ! rustc_banner=$("$rustc_command" --version 2>/dev/null); then
+  echo "cannot run '$rustc_command --version'; install Rust $required_rust_version or newer (https://rustup.rs)" >&2
+  exit 1
+fi
+# "rustc 1.98.1 (hash date)" or "rustc 1.99.0-nightly (...)": keep only the
+# numeric MAJOR.MINOR.PATCH so prerelease channels compare by their release.
+actual_rust_version=$(printf '%s\n' "$rustc_banner" |
+  sed -n 's/^rustc \([0-9][0-9]*\.[0-9][0-9]*\(\.[0-9][0-9]*\)\{0,1\}\).*$/\1/p')
+if [ -z "$actual_rust_version" ]; then
+  echo "cannot parse the Rust compiler version from: $rustc_banner" >&2
+  exit 1
+fi
+# Prints MAJOR MINOR PATCH with absent components treated as zero.
+rust_version_fields() {
+  printf '%s\n' "$1" | awk -F. '{ printf "%d %d %d\n", $1, $2, $3 }'
+}
+# Succeeds when version $1 is at least version $2, comparing numerically.
+rust_version_at_least() {
+  set -- $(rust_version_fields "$1") $(rust_version_fields "$2")
+  [ "$1" -gt "$4" ] && return 0
+  [ "$1" -lt "$4" ] && return 1
+  [ "$2" -gt "$5" ] && return 0
+  [ "$2" -lt "$5" ] && return 1
+  [ "$3" -ge "$6" ]
+}
+if ! rust_version_at_least "$actual_rust_version" "$required_rust_version"; then
+  echo "the Temporal SDK Rust bridge requires Rust $required_rust_version or newer, but '$rustc_command' is $actual_rust_version." >&2
+  echo "Install a newer toolchain (for example 'rustup update stable') or set RUSTC to a compatible compiler." >&2
+  exit 1
+fi
+
 cargo build \
   --manifest-path "$workspace_root/rust/Cargo.toml" \
   --package ocaml-temporal-core-bridge \

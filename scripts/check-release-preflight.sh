@@ -70,7 +70,32 @@ grep -F '(maintenance_intent "(latest)")' dune-project >/dev/null || fail "dune 
 grep -F 'Community-maintained and unofficial. Not affiliated with or endorsed by Temporal Technologies, Inc.' README.md >/dev/null ||
   fail "README disclaimer is missing"
 grep -F "$repository_url" README.md >/dev/null || fail "README repository link is missing"
-grep -Eiq 'experimental|pre-0\.1\.0' README.md || fail "README must identify the package as experimental"
+# Maturity labelling follows the version rather than being hard-wired (#827).
+# A prerelease (OPAM "~" suffix) or any 0.x version must tell users the package
+# is experimental. A stable version must not: shipping 1.0.0 still labelled
+# experimental would contradict the release, so the README and the Dune/opam
+# package metadata are checked in both directions.
+maturity_pattern='experimental|pre-`?0\.1\.0'
+case "$version" in
+  *~* | 0.*)
+    grep -Eiq "$maturity_pattern" README.md ||
+      fail "README must identify prerelease $version as experimental"
+    for metadata in dune-project temporal-sdk.opam temporal-sdk.opam.locked; do
+      grep -Fiq experimental "$metadata" ||
+        fail "$metadata must label prerelease $version as experimental"
+    done
+    ;;
+  *)
+    if grep -Eiq "$maturity_pattern" README.md; then
+      fail "README still describes stable release $version as experimental or pre-0.1.0"
+    fi
+    for metadata in dune-project temporal-sdk.opam temporal-sdk.opam.locked; do
+      if grep -Fiq experimental "$metadata"; then
+        fail "$metadata still labels stable release $version as experimental"
+      fi
+    done
+    ;;
+esac
 grep -F 'Apache License' LICENSE >/dev/null || fail "LICENSE is not Apache-2.0"
 # The bridge reports this SDK's version to Temporal on every RPC and in
 # workflow-task completion metadata, using SemVer spelling of the OPAM version.
@@ -104,7 +129,17 @@ grep -E 'git = "https://github.com/temporalio/sdk-core.git"' rust/Cargo.toml >/d
 grep -E 'rev = "[0-9a-f]{40}"' rust/Cargo.toml >/dev/null ||
   fail "Temporal Core must be pinned by a 40-character revision"
 
+# The source manifest fingerprints file contents, not just names (#827). Each
+# NUL-terminated `git ls-tree -r` record carries the mode, object type,
+# content-addressed object ID, and path of one tracked entry, so any change to
+# a file's bytes, executable bit, symlink target, or name changes the digest.
+# The clean-tree checks above make HEAD's tree identical to the files that
+# would be archived. Git emits entries in its canonical tree order, and -z
+# disables core.quotePath escaping, so the result does not depend on locale,
+# user Git configuration, mtimes, umask, commit metadata, or checkout location.
+# Per-file identity uses Git's object IDs (collision-detecting SHA-1, or
+# SHA-256 in a SHA-256 repository); SHA-256 then covers the whole manifest.
 [ -n "$(git ls-files)" ] || fail "Git source manifest is empty"
-manifest_hash=$(git ls-files | LC_ALL=C sort | shasum -a 256 | awk '{print $1}')
+manifest_hash=$(git ls-tree -r -z --full-tree HEAD | shasum -a 256 | awk '{print $1}')
 printf '%s\n' "release preflight: ok"
 printf '%s\n' "source manifest sha256: $manifest_hash"
