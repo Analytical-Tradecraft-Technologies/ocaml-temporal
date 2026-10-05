@@ -369,7 +369,8 @@ impl ReplayWorker {
     }
 
     /// Fails one activation that was leased by the replay poll lane but could
-    /// not be represented by the semantic OCaml document.
+    /// not be represented by the semantic OCaml document. A pure cache
+    /// eviction owns no workflow task and is acknowledged empty instead.
     ///
     /// Replay uses the same one-shot completion debt as a live worker. Keeping
     /// this recovery operation on the Rust-owned worker means a malformed

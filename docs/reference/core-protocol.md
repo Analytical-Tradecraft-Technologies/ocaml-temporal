@@ -331,6 +331,12 @@ authoritative for duplicate members and UTF-8 byte limits. A terminal workflow
 command may occur at most once and must be last.
 When acknowledging an eviction, the completion command list must be empty and
 the run ID must match the activation.
+An eviction-only activation is never answered with a failure, even when the
+bridge or OCaml rejects its delivery: Core owes no workflow task for it and
+accepts only an empty acknowledgement, so the private rejection path sends
+that acknowledgement instead (issue #814). Core's eviction `message` is a
+Debug dump of the preceding failure and can exceed the string limit; it is
+truncated like other inbound free text (see the degradation table below).
 
 ### External workflow operations
 

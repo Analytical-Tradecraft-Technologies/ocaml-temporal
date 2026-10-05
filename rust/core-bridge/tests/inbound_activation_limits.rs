@@ -9,7 +9,9 @@
 
 use ocaml_temporal_core_bridge::{
     protocol::MAX_STRING_BYTES,
-    workflow_protocol::{self, ActivationJob, ActivityResolution, Failure, FailureInfo},
+    workflow_protocol::{
+        self, ActivationJob, ActivityResolution, EvictionReason, Failure, FailureInfo,
+    },
 };
 use temporalio_protos::{
     coresdk::{activity_result, workflow_activation as core_activation},
@@ -202,6 +204,43 @@ fn truncates_other_inbound_free_text() {
         jobs => panic!("unexpected cancellation jobs: {jobs:?}"),
     }
     assert_truncated(&semantic.metadata.as_ref().unwrap().last_sdk_version, &long);
+}
+
+/// Core builds the eviction that follows a failed activation completion from a
+/// Debug dump of the whole failure, rendering each payload byte as several
+/// characters (#814). Such a message must truncate rather than reject the
+/// eviction-only activation, keep Core's absent eviction timestamp, and leave
+/// the activation recognizable as a pure eviction.
+#[test]
+fn truncates_oversized_eviction_message() {
+    let details = vec![104u8; 20_000];
+    let long = format!("Workflow activation completion failed: Failure {{ details: {details:?} }}");
+    assert!(long.len() > MAX_STRING_BYTES);
+    let eviction = core_activation::WorkflowActivation {
+        run_id: "run-814".to_owned(),
+        timestamp: None,
+        jobs: vec![core_activation::WorkflowActivationJob {
+            variant: Some(
+                core_activation::workflow_activation_job::Variant::RemoveFromCache(
+                    core_activation::RemoveFromCache {
+                        message: long.clone(),
+                        reason: core_activation::remove_from_cache::EvictionReason::LangFail as i32,
+                    },
+                ),
+            ),
+        }],
+        ..Default::default()
+    };
+    assert!(eviction.is_only_eviction());
+    let semantic = convert_and_round_trip(&eviction);
+    assert_eq!(semantic.timestamp, None);
+    match semantic.jobs.as_slice() {
+        [ActivationJob::RemoveFromCache { message, reason }] => {
+            assert_truncated(message, &long);
+            assert_eq!(*reason, EvictionReason::LangFail);
+        }
+        jobs => panic!("unexpected eviction jobs: {jobs:?}"),
+    }
 }
 
 /// Builds a linear application-failure chain with `layers` failures.
