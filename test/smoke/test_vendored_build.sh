@@ -28,9 +28,13 @@ vendor_root=$scratch/vendor/temporal
 mkdir -p "$vendor_root" "$scratch/app"
 
 # Copy the SDK as a consumer would receive it: tracked and unignored files only,
-# never a stale _build, Cargo target directory or .git metadata. A source
-# archive without Git falls back to an explicit exclusion list.
-if git -C "$sdk_root" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+# never a stale _build, Cargo target directory or .git metadata. Git is used
+# only when the SDK is itself the top level of its worktree; a source archive
+# without Git, including one unpacked inside another project's worktree (for
+# example an ignored vendor/ or duniverse/ directory), falls back to an
+# explicit exclusion list.
+git_top=$(git -C "$sdk_root" rev-parse --show-toplevel 2>/dev/null || true)
+if [ -n "$git_top" ] && [ "$(cd "$git_top" && pwd -P)" = "$(cd "$sdk_root" && pwd -P)" ]; then
   (cd "$sdk_root" && git ls-files -z --cached --others --exclude-standard) |
     (cd "$sdk_root" && xargs -0 tar -cf - --) |
     tar -xf - -C "$vendor_root"
