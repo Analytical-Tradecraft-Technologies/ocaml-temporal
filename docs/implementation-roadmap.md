@@ -45,7 +45,8 @@ part of phases 3 and 7.
 
 The step-by-step working plans written for phases 1 and 2 were internal
 implementation aids, not user documentation, and were removed from the
-published docs; they remain in git history before commit `a102f31`. Their design
+published docs; they remain in git history (last present in commit
+`a102f31`). Their design
 decisions are recorded in the [design documents](design/) and ADRs.
 
 1. Foundation and deterministic runtime
