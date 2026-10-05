@@ -68,8 +68,10 @@ Consequently:
   bridge never silently truncates or ignores a payload. Missing handlers and
   handler errors use the same failed-query response and leave the workflow
   execution unchanged.
-- `DoUpdate` is deliverable to a registered OCaml update handler that accepts
-  exactly one input payload. The private runtime retains the full input,
+- `DoUpdate` is deliverable to a registered OCaml update handler. Zero input
+  payloads, which the Temporal CLI and other SDKs send for a no-argument
+  update, decode as the canonical `binary/null` unit payload; one payload is
+  decoded normally; more than one is rejected. The private runtime retains the full input,
   headers, identity, metadata ID, protocol-instance ID, and replay-validation
   flag while the public handler currently exposes only the typed input value.
   Missing handlers and unsupported input arity are rejected as typed
@@ -269,7 +271,9 @@ contains the `DoUpdate` job:
 | Validation | `accepted` or `rejected` | Always in the same activation as `DoUpdate`. |
 | Handler | `completed` or `rejected` | In that activation or a later activation after the handler finishes. |
 
-The native implementation decodes one payload with the registered input codec,
+The native implementation decodes its input with the registered input codec
+(zero payloads as the canonical unit payload, one payload normally, more than
+one rejected before validation),
 runs the validator when `run_validator` is true, and emits `accepted` before
 calling the implementation. If the implementation parks on a workflow future,
 the scheduler retains its continuation in an execution-owned map keyed by
