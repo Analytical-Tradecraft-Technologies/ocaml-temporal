@@ -147,15 +147,22 @@ val shutdown : t -> (unit, Error.t) result
     This is the function to call from a [SIGTERM] or [SIGINT] handler. It
     performs only atomic writes, with no lock, I/O, logging, or native call,
     so it is safe whichever Domain or thread runs the handler, including the
-    thread blocked in [run] itself:
+    thread blocked in [run] itself. Signal handlers are process-global, so
+    restore the previous ones when the worker stops; otherwise a later signal
+    would be swallowed by this already shut-down worker:
 
     {[
       let serve worker =
         let stop _signal = Temporal.Worker.request_shutdown worker in
-        Sys.set_signal Sys.sigterm (Sys.Signal_handle stop);
-        Sys.set_signal Sys.sigint (Sys.Signal_handle stop);
-        let run_result = Temporal.Worker.run worker in
-        let shutdown_result = Temporal.Worker.shutdown worker in
-        Result.bind run_result (fun () -> shutdown_result)
+        let previous_term = Sys.signal Sys.sigterm (Sys.Signal_handle stop) in
+        let previous_int = Sys.signal Sys.sigint (Sys.Signal_handle stop) in
+        Fun.protect
+          ~finally:(fun () ->
+            Sys.set_signal Sys.sigterm previous_term;
+            Sys.set_signal Sys.sigint previous_int)
+          (fun () ->
+            let run_result = Temporal.Worker.run worker in
+            let shutdown_result = Temporal.Worker.shutdown worker in
+            Result.bind run_result (fun () -> shutdown_result))
     ]} *)
 val request_shutdown : t -> unit

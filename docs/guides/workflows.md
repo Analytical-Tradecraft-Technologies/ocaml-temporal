@@ -909,11 +909,18 @@ blocking `shutdown` from the handler itself.
 ```ocaml
 let serve worker =
   let stop _signal = Temporal.Worker.request_shutdown worker in
-  Sys.set_signal Sys.sigterm (Sys.Signal_handle stop);
-  Sys.set_signal Sys.sigint (Sys.Signal_handle stop);
-  let run_result = Temporal.Worker.run worker in
-  let shutdown_result = Temporal.Worker.shutdown worker in
-  Result.bind run_result (fun () -> shutdown_result)
+  let previous_term = Sys.signal Sys.sigterm (Sys.Signal_handle stop) in
+  let previous_int = Sys.signal Sys.sigint (Sys.Signal_handle stop) in
+  (* Signal handlers are process-global: restore the previous ones so a later
+     signal is not swallowed by this already shut-down worker. *)
+  Fun.protect
+    ~finally:(fun () ->
+      Sys.set_signal Sys.sigterm previous_term;
+      Sys.set_signal Sys.sigint previous_int)
+    (fun () ->
+      let run_result = Temporal.Worker.run worker in
+      let shutdown_result = Temporal.Worker.shutdown worker in
+      Result.bind run_result (fun () -> shutdown_result))
 ```
 
 Both `Temporal.Worker.create` and `Temporal.Client.create` accept an optional
