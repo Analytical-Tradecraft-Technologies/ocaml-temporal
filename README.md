@@ -361,6 +361,7 @@ AI models used to help build this project:
 
 ### Anthropic
 - Fable 5
+- Fable 5.1
 - Opus 4.8
 - Opus 5.5
 - Sonnet 5
