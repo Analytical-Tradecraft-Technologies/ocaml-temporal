@@ -22,3 +22,11 @@ temporalio-sdk-core.workspace = true
 temporalio-protos.workspace = true
 tokio.workspace = true
 uuid.workspace = true
+
+# Test-only doubles. Both crates are already locked transitively through
+# Temporal Core's gRPC transport; they let integration tests serve a minimal
+# plaintext HTTP/2 gRPC endpoint without a Temporal server.
+[dev-dependencies]
+h2.workspace = true
+http.workspace = true
+tokio = { workspace = true, features = ["net"] }

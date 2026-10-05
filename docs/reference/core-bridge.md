@@ -507,8 +507,25 @@ Client connection and worker namespace validation are synchronous ABI calls.
 The C stub copies input before releasing the OCaml runtime lock, Rust performs
 the Tokio wait, and the stub reacquires the lock only to copy the result. A
 failed connection publishes no client. A failed worker construction or
-validation gracefully finalizes the temporary worker and leaves the client
-available for a corrected retry.
+validation releases the temporary worker and leaves the client available for a
+corrected retry.
+
+The validation-failure path (for example, a namespace the server reports as
+missing) is the sole owner of the unpublished Core worker. Core's
+`finalize_shutdown` completes only after both `poll_workflow_activation` and
+`poll_activity_task` have returned `ShutDown`, and no poll lane exists yet, so
+awaiting the finalizer directly hangs forever (issue #770). Rust therefore
+initiates shutdown, drives both poll APIs to `ShutDown` itself (force-failing
+any task Core unexpectedly hands out), and then finalizes, all in one task
+on the Core runtime that owns the worker until `finalize_shutdown` finishes.
+The worker is never dropped mid-release, because only `finalize_shutdown`
+performs Core's `finalize_unregister`; a dropped worker would stay in the
+client's worker registry and keep the client alive. `Worker.create` waits at
+most `UNVALIDATED_WORKER_RELEASE_TIMEOUT` (10 s) for that task, so it always
+returns the typed `Temporal workflow worker validation failed` error instead
+of wedging the supervisor Domain; after the bound the task completes the
+release in the background. `rust/core-bridge/tests/worker_validation_cleanup.rs`
+covers this path with a plaintext HTTP/2 gRPC double rather than a server.
 
 The worker owns two Tokio poll lanes: exactly one calls Core's workflow poll and
 exactly one calls its activity poll. The activity lane admits both remote and
