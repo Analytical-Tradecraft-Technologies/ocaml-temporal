@@ -659,6 +659,7 @@ let _workflow_current_deployment_version :
 
 let _worker_run : T.Worker.t -> (unit, T.Error.t) result = T.Worker.run
 let _worker_shutdown : T.Worker.t -> (unit, T.Error.t) result = T.Worker.shutdown
+let _worker_request_shutdown : T.Worker.t -> unit = T.Worker.request_shutdown
 
 (* The remaining small modules still participate in the public contract. *)
 let _condition_wait_until : (unit -> bool) -> (unit, T.Error.t) result =

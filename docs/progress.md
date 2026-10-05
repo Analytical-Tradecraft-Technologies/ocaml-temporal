@@ -15,6 +15,20 @@ implementation when a later entry documents that work as complete. The
 records the current tested source, named assertions and successful CI job for
 the Temporal acceptance controllers.
 
+## 2026-10-06: Stopping a worker from a signal handler (#830)
+
+An OCaml signal handler may run on the thread blocked in `Worker.run`, so in a
+single-Domain program the natural `SIGTERM` handler calling `Worker.shutdown`
+was rejected as re-entrant and the worker never stopped. The new
+`Worker.request_shutdown` is a single atomic write that both run lanes treat
+as a stop at their next check; `run` returns `Ok ()` and the application then
+calls `Worker.shutdown` to drain and release the worker. A re-entrant
+`shutdown` still returns a defect but now posts the same request. A runtime
+model test raises a real `SIGUSR1` against a loop on the main thread, a mock
+worker test raises it from inside an activity callback, and the examples and
+the Compose smoke worker now use the handler directly instead of a watcher
+Domain.
+
 ## 2026-10-06: One unrepresentable activity task no longer stops the worker (#801)
 
 An activity task the bridge cannot represent (a standalone activity with no

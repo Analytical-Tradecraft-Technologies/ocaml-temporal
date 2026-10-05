@@ -1,4 +1,5 @@
-(** Regression tests for native worker shutdown re-entrancy (#763, #764).
+(** Regression tests for native worker shutdown re-entrancy (#763, #764) and
+    for stopping a run loop from a signal handler on its own thread (#830).
 
     The private native worker cannot be built without a Temporal server, so
     these tests compose the real lane scheduler ([Native_worker_loop]) and the
@@ -17,6 +18,9 @@ type worker = {
   owner : Owner.t;  (** Lane threads, exactly as tracked by the native worker. *)
   run_mutex : Mutex.t;  (** Held by [run] until both lanes have returned. *)
   closed : bool Atomic.t;  (** The stop flag observed by both lanes. *)
+  stop_requested : bool Atomic.t;
+      (** The non-blocking stop request, like [Native_worker.stop_requested]:
+          observed by both lanes but never admitting teardown. *)
   public_mutex : Mutex.t;
       (** Serializes admitted shutdown callers, like [Worker.shutdown_mutex]. *)
   mutable cached : (unit, string) result option;
@@ -33,6 +37,7 @@ let worker () =
     owner = Owner.create ();
     run_mutex = Mutex.create ();
     closed = Atomic.make false;
+    stop_requested = Atomic.make false;
     public_mutex = Mutex.create ();
     cached = None;
     teardowns = Atomic.make 0;
@@ -83,7 +88,8 @@ let run worker ~poll_workflow ~poll_activity =
         Mutex.unlock worker.run_mutex)
       (fun () ->
         Loop.run
-          ~closed:(fun () -> Atomic.get worker.closed)
+          ~closed:(fun () ->
+            Atomic.get worker.closed || Atomic.get worker.stop_requested)
           ~poll_workflow
           ~poll_activity:(fun () ->
             Owner.enter_activity worker.owner;
@@ -94,11 +100,19 @@ let run worker ~poll_workflow ~poll_activity =
           ~retry_pending:(fun ~workflow_lane:_ -> Ok ()))
   end
 
+(** Mirrors [Worker.request_shutdown]: one atomic write, no lock, so it is
+    safe from a signal handler on any thread. *)
+let request_shutdown worker = Atomic.set worker.stop_requested true
+
 (** Mirrors [Worker.shutdown] over [Native_worker.shutdown]: the execution
-    thread check runs before the public mutex; an admitted caller publishes the
-    stop flag, waits for [run_mutex], and caches the terminal result. *)
+    thread check runs before the public mutex and posts a stop request (#830);
+    an admitted caller publishes the stop flag, waits for [run_mutex], and
+    caches the terminal result. *)
 let shutdown worker =
-  if Owner.is_execution_thread worker.owner then Error "re-entrant shutdown"
+  if Owner.is_execution_thread worker.owner then begin
+    request_shutdown worker;
+    Error "re-entrant shutdown"
+  end
   else begin
     Mutex.lock worker.public_mutex;
     Fun.protect
@@ -244,6 +258,76 @@ let test_concurrent_shutdowns_agree () =
     Array.iter (fun result -> assert (result = Ok ())) thread_results;
     assert (Atomic.get worker.teardowns = 1))
 
+(** #830: a callback on [lane] calls the blocking [shutdown], as a signal
+    handler that the runtime runs on a lane thread would. It is rejected, but
+    its stop request alone makes [run] return; no other thread calls shutdown.
+    The thread that ran the loop then completes teardown itself. *)
+let test_lane_shutdown_requests_stop ~workflow_lane () =
+  with_watchdog "lane shutdown requests stop" (fun () ->
+    let worker = worker () in
+    let callback_result = Atomic.make None in
+    let callback () =
+      if Option.is_some (Atomic.get callback_result) then idle ()
+      else begin
+        Atomic.set callback_result (Some (shutdown worker));
+        Ok Loop.Progress
+      end
+    in
+    let poll_workflow, poll_activity =
+      if workflow_lane then (callback, idle) else (idle, callback)
+    in
+    assert (run worker ~poll_workflow ~poll_activity = Ok ());
+    assert (Atomic.get callback_result = Some (Error "re-entrant shutdown"));
+    assert (Atomic.get worker.teardowns = 0);
+    assert (shutdown worker = Ok ());
+    assert (Atomic.get worker.teardowns = 1))
+
+(** #830: a real [SIGUSR1] handler calling [request_shutdown] stops a run
+    loop hosted on the main thread of the only application Domain, with no
+    watcher Domain. A helper thread raises the signal with [Unix.kill] once the
+    loop is polling; the runtime runs the handler at a safe point of whichever
+    thread it picks, which here may be the run loop's own thread. [run] must
+    return [Ok ()], and the same thread then completes shutdown. Windows has no
+    [SIGUSR1] to deliver to itself, so there the handler is invoked directly. *)
+let test_signal_handler_stops_main_thread_loop () =
+  with_watchdog "signal handler stops loop" (fun () ->
+    let worker = worker () in
+    let started = Atomic.make false in
+    let handled = Atomic.make false in
+    let handler _signal =
+      request_shutdown worker;
+      Atomic.set handled true
+    in
+    let previous =
+      if Sys.win32 then None
+      else Some (Sys.signal Sys.sigusr1 (Sys.Signal_handle handler))
+    in
+    Fun.protect
+      ~finally:(fun () ->
+        Option.iter (Sys.set_signal Sys.sigusr1) previous)
+      (fun () ->
+        let raiser =
+          Thread.create
+            (fun () ->
+              await "run loop start" (fun () -> Atomic.get started);
+              if Sys.win32 then handler 0
+              else Unix.kill (Unix.getpid ()) Sys.sigusr1)
+            ()
+        in
+        let result =
+          run worker
+            ~poll_workflow:(fun () ->
+              Atomic.set started true;
+              idle ())
+            ~poll_activity:idle
+        in
+        Thread.join raiser;
+        assert (result = Ok ());
+        assert (Atomic.get handled);
+        assert (Atomic.get worker.teardowns = 0);
+        assert (shutdown worker = Ok ());
+        assert (Atomic.get worker.teardowns = 1)))
+
 (** Runs every case. The concurrency cases repeat to expose interleavings. *)
 let () =
   test_owner_identity ();
@@ -253,5 +337,8 @@ let () =
       ~workflow_lane:true ();
     test_callback_shutdown_rejected_during_concurrent_shutdown
       ~workflow_lane:false ();
-    test_concurrent_shutdowns_agree ()
+    test_concurrent_shutdowns_agree ();
+    test_lane_shutdown_requests_stop ~workflow_lane:true ();
+    test_lane_shutdown_requests_stop ~workflow_lane:false ();
+    test_signal_handler_stops_main_thread_loop ()
   done

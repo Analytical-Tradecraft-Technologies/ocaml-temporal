@@ -105,7 +105,10 @@ val create :
   unit ->
   (t, Error.t) result
 
-(** Runs the workflow and activity poll loops until [shutdown] is requested.
+(** Runs the workflow and activity poll loops until [shutdown] or
+    [request_shutdown] is requested. After [request_shutdown], [run] returns
+    [Ok ()] once both lanes have finished their current task, and a later
+    [run] returns [Ok ()] without polling.
     Each accepted task is decoded, dispatched to its registered OCaml function,
     encoded, and completed before the next task is admitted. This is a blocking
     call: invoke it from an ordinary dedicated Domain or system thread, not
@@ -124,7 +127,35 @@ val run : t -> (unit, Error.t) result
     sibling system thread on the Domain that hosts [run]. It blocks until the
     run loop has stopped and the worker is released. Concurrent callers are
     serialized: one performs the teardown and the others wait for and return
-    the same cached result. A call from inside a workflow or activity callback
-    of this worker cannot wait for its own loop to stop, so it returns a defect
-    [Error] immediately and leaves the worker running. *)
+    the same cached result. A call from the thread running [run], such as a
+    workflow or activity callback of this worker or an OCaml signal handler
+    that the runtime happens to execute on that thread, cannot wait for its
+    own loop to stop. It calls [request_shutdown], so [run] returns, and
+    returns a defect [Error] immediately without releasing anything; call
+    [shutdown] again after [run] returns.
+
+    [shutdown] takes locks and blocks, so do not call it from a signal
+    handler; use [request_shutdown] there. *)
 val shutdown : t -> (unit, Error.t) result
+
+(** Asks [run] to stop and returns immediately. The request is sticky and
+    idempotent: an active [run] returns [Ok ()] once each lane finishes its
+    current task (within the bounded native readiness wait when idle), and a
+    later [run] returns [Ok ()] without polling. Nothing is drained or
+    released, so call [shutdown] after [run] returns.
+
+    This is the function to call from a [SIGTERM] or [SIGINT] handler. It
+    performs only atomic writes, with no lock, I/O, logging, or native call,
+    so it is safe whichever Domain or thread runs the handler, including the
+    thread blocked in [run] itself:
+
+    {[
+      let serve worker =
+        let stop _signal = Temporal.Worker.request_shutdown worker in
+        Sys.set_signal Sys.sigterm (Sys.Signal_handle stop);
+        Sys.set_signal Sys.sigint (Sys.Signal_handle stop);
+        let run_result = Temporal.Worker.run worker in
+        let shutdown_result = Temporal.Worker.shutdown worker in
+        Result.bind run_result (fun () -> shutdown_result)
+    ]} *)
+val request_shutdown : t -> unit

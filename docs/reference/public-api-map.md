@@ -134,6 +134,8 @@ for those rules.
 - `Temporal.Worker` registers workflows, activities, and the signal, query, and
   update handlers attached to each workflow registration. It owns one
   supervisor graph, runs the poll loops, and performs idempotent shutdown.
+  `Worker.request_shutdown` is the signal-handler-safe way to make `run`
+  return; call `Worker.shutdown` afterwards to release the worker.
   `Temporal.Worker.Options` provides typed, immutable resource and worker
   routing settings, including legacy build-ID and deployment-based versioning;
   see the [worker versioning reference](worker-versioning.md). A

@@ -255,16 +255,28 @@ release-complete; the adapter maps are discarded only after that result. If
 native teardown raises before returning, the worker remains terminal for new
 work but retains its maps and schedules a detached retry, with the finalizer
 as a further last-resort path. A shutdown call from an execution lane's own
-system thread (a workflow or activity callback) is different: no teardown has
-started, so it returns a retryable defect without closing the private graph;
-a later call from any other thread can wait for the run mutex and complete
-shutdown. Lane identity is tracked per system thread (Domain plus
+system thread (a workflow or activity callback, or a signal handler the
+runtime runs there) is different: no teardown has started, so it returns a
+retryable defect without closing the private graph. It does post a stop
+request, so the loop returns, and a later call from any thread, including the
+one that ran the loop, can take the run mutex and complete shutdown (#830). Lane identity is tracked per system thread (Domain plus
 `Thread.id`), not per Domain, so a sibling thread on the run loop's Domain is
 an ordinary caller (#763). That branch must not write the shared stop flag: a
 concurrent shutdown on another thread may already have set it to stop the run
 loop, and any write here would race that caller and could strand the loop,
 holding the run mutex forever. It therefore only marks the failure retryable
-and leaves the stop flag exactly as observed. Re-entrant shutdown from either
+and leaves the stop flag exactly as observed. The stop request is a separate,
+sticky atomic that is only ever set to `true`, so posting it cannot undo
+another caller's request.
+
+`Temporal.Worker.request_shutdown` posts the same stop request without the
+admission check or any lock. Both lanes treat it like the shutdown flag at
+their next stop check, so an idle loop returns within one bounded native
+readiness wait. It does not admit teardown: the shutdown flag's
+compare-and-set is still free for the later `shutdown`, which performs the
+ordinary drain and native release. Because the request is one atomic write,
+an OCaml signal handler may make it on any Domain or thread, including the
+run loop's own thread in a single-Domain program. Re-entrant shutdown from either
 execution thread is rejected before the public shutdown mutex is acquired;
 otherwise a callback could deadlock against a concurrent shutdown waiting for
 its lane to return (#764). Admitted callers are serialized by that mutex and
