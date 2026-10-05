@@ -254,17 +254,22 @@ the supervisor has consumed the graph and its defensive runtime close is
 release-complete; the adapter maps are discarded only after that result. If
 native teardown raises before returning, the worker remains terminal for new
 work but retains its maps and schedules a detached retry, with the finalizer
-as a further last-resort path. A same-Domain shutdown call is different: no
-teardown has started, so it returns a retryable defect without closing the
-private graph; a later call from another Domain can wait for the run mutex and
-complete shutdown. That branch must not write the shared stop flag: a
-concurrent shutdown on another Domain may already have set it to stop the run
+as a further last-resort path. A shutdown call from an execution lane's own
+system thread (a workflow or activity callback) is different: no teardown has
+started, so it returns a retryable defect without closing the private graph;
+a later call from any other thread can wait for the run mutex and complete
+shutdown. Lane identity is tracked per system thread (Domain plus
+`Thread.id`), not per Domain, so a sibling thread on the run loop's Domain is
+an ordinary caller (#763). That branch must not write the shared stop flag: a
+concurrent shutdown on another thread may already have set it to stop the run
 loop, and any write here would race that caller and could strand the loop,
 holding the run mutex forever. It therefore only marks the failure retryable
 and leaves the stop flag exactly as observed. Re-entrant shutdown from either
-execution Domain is rejected before the public shutdown mutex is acquired;
+execution thread is rejected before the public shutdown mutex is acquired;
 otherwise a callback could deadlock against a concurrent shutdown waiting for
-its Domain to join. Repeated successful shutdown calls are idempotent. A
+its lane to return (#764). Admitted callers are serialized by that mutex and
+return the first caller's cached terminal result. Repeated successful shutdown
+calls are idempotent. A
 callback that never returns still makes the join and shutdown unbounded; the
 overall deadline and escalation policy are tracked in
 [#495](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/495).

@@ -110,5 +110,14 @@ val run : t -> (unit, Error.t) result
 (** Initiates graceful worker shutdown. Repeated calls are safe and return the
     same cached terminal result. A permanent native teardown error is retained
     so later callers observe [Error] rather than a spurious [Ok]. Retryable
-    failures leave the worker open for another attempt. *)
+    failures leave the worker open for another attempt.
+
+    [shutdown] may be called from any Domain or system thread other than the
+    one running a workflow or activity callback of this worker, including a
+    sibling system thread on the Domain that hosts [run]. It blocks until the
+    run loop has stopped and the worker is released. Concurrent callers are
+    serialized: one performs the teardown and the others wait for and return
+    the same cached result. A call from inside a workflow or activity callback
+    of this worker cannot wait for its own loop to stop, so it returns a defect
+    [Error] immediately and leaves the worker running. *)
 val shutdown : t -> (unit, Error.t) result
