@@ -97,7 +97,8 @@ The remaining reference documents are useful when changing one subsystem:
   libraries are package-private and the installed-consumer regression that
   protects the public `Temporal` surface.
 - [Public API compatibility](reference/api-stability.md) documents the
-  pre-`0.1.0` compatibility policy and the installed-consumer type witness.
+  prerelease (`0.1.0~rc.1`) compatibility policy and the installed-consumer
+  type witness.
 - [Precompiled OCaml SDK](reference/prebuilt-ocaml.md) describes compatible binary
   installations and downstream linking without recompiling the SDK.
 - [MVP v1 prerelease scope](reference/v1-support-policy.md) proposes the core
@@ -163,6 +164,7 @@ links. Keep current support wording aligned with the v1 policy decision.
 | Children and recovery | Live success, failure, explicit cancellation, retry and start rejection; separate controllers prove exact parent/child replay and child failure after replay | Broader policies, races and repeated recovery combinations remain unqualified. |
 | Client/interactions | Named exact-run controls, both query forms, typed updates, direct/external signals and external cancellation pass live, including completed-target signal rejection | Reset/visibility, suspended updates, deadlines and interaction replay/eviction need additional live cases. |
 | Patching and versioning | Live patch-in/deprecation/removal histories; focused legacy/deployment routing support | Dedicated live routing, rollout and arbitrary-history compatibility remain open. |
+| Start metadata and task failures | Post-baseline live controllers cover start memo/search attributes across worker replacement and recovery from workflow-task defects | Not part of the audited September 19 run; search-attribute upserts and priority metadata are not live-qualified. |
 | Native ownership and packaging | OCaml/C/Rust lifecycle, validation, package/installed-consumer, license and preflight gates | Public authentication, supported compatibility/release delivery and production operational qualification remain separate gates. |
 
 The [generated inventory](reference/live-acceptance-inventory.md) lists the
@@ -220,7 +222,7 @@ the live target is required for that claim.
 validates the checked-in patch-history, replay-diagnostic, and controller
 fixtures plus fail-closed normalization and validation cases. The umbrella
 `make test-temporal-workflow-patching` runs that contract before the real
-two-scenario Compose controller. A green contract-only run is not evidence of
+three-scenario Compose controller. A green contract-only run is not evidence of
 Temporal Server replay. The complete [PR #348 CI
 run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29411260374) is the
 corresponding real-server evidence for the original patch-in cases; the

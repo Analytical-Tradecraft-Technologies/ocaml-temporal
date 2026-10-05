@@ -90,13 +90,23 @@ without a private CMI. `Duration.t`, `Error.t`, `Codec.t`, `Workflow.t`, and
 adapters use the documented `name`, `input`, `output`, and `implementation`
 accessors; they do not rely on record layout.
 
-`Future.t` is the one deliberate type-identity exception. Its signature keeps
-an internal equality with the generic Dune package-private
-`temporal_future_kernel` so private runtime adapters can pass scheduler-owned
-values through the facade without unsafe casts. The public `Temporal` root does
-not re-export the kernel module, and `Future.mli` exposes no constructor, record
-field, callback, or lifecycle operation. The kernel is unavailable through the
-supported `temporal-sdk` dependency and is not part of the public API. Public
+Four public types deliberately keep a type equality with a package-private
+library so private runtime adapters can pass SDK-owned values through the
+facade without unsafe casts:
+
+- `Future.t` equals `Temporal_sdk_kernel.Future.t`, an alias of the generic
+  `temporal_future_kernel` future;
+- `Activity.context` equals `Temporal_base.Activity_context.t`;
+- `Activity.async_handle` and `Activity.async_context` equal
+  `Temporal_base.Async_activity.handle` and `.context`.
+
+Each target type is abstract in its private interface. The public `Temporal`
+root does not re-export those modules, and `Future.mli` and `Activity.mli`
+expose no constructor, record field, callback, or lifecycle operation for
+these types. [#793](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/793)
+tracks auditing these equalities before the v1 freeze. The private libraries
+are unavailable through the supported `temporal-sdk` dependency and are not
+part of the public API. Public
 future values originate from SDK operations such as timers, activities, and
 child workflows, or from public combinators over those values. An application
 cannot fabricate an arbitrary scheduler-owned future or access its callbacks

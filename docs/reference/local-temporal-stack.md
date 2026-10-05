@@ -187,8 +187,9 @@ logs automatically before cleanup when a readiness command fails.
 
 ## Image and platform policy
 
-The stack pins official PostgreSQL 16.13 Bookworm and Temporal 1.31.0 Server
-and admin-tools OCI manifests. All three manifest indexes contain native Linux
+The stack pins official PostgreSQL 18.6 Bookworm and Temporal 1.32.0 Server
+and admin-tools OCI manifests by immutable digest in
+[`compose.yaml`](../../test/integration/temporal/compose.yaml). All three manifest indexes contain native Linux
 `amd64` and `arm64` images. Version upgrades require rerunning the clean smoke,
 the stop/start persistence path, manifest inspection, and the dependency and
 license review.
