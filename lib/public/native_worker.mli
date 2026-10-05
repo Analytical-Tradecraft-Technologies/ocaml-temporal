@@ -77,10 +77,12 @@ val create :
     and does not terminate this loop. *)
 val run : t -> (unit, Temporal_base.Error.t) result
 
-(** Whether the current Domain is executing this worker's workflow or activity
-    lane. Public shutdown checks this before its own mutex so a callback cannot
-    deadlock against a concurrent external shutdown. *)
-val is_execution_domain : t -> bool
+(** Whether the calling system thread is executing this worker's workflow or
+    activity lane, and therefore a workflow or activity callback. Public
+    shutdown checks this before its own mutex so a callback cannot deadlock
+    against a concurrent external shutdown. Another system thread on the same
+    Domain as a lane is not an execution thread and may wait for shutdown. *)
+val is_execution_thread : t -> bool
 
 (** Requests stop, waits for an active run loop to leave the adapter, and then
     releases the supervisor's worker, client, and Rust runtime graph exactly

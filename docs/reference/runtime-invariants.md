@@ -315,11 +315,14 @@ and bridge, read the [documentation guide](../README.md) first.
   release-complete by that contract, so OCaml adapter maps are discarded only
   after the result is observed. If native shutdown raises before returning, the
   maps remain retained, a terminal-cleanup-pending flag schedules a detached
-  retry, and the worker finalizer remains a last-resort path. A same-Domain
-  shutdown defect from either execution Domain is different: it cannot wait
-  for its own lane to finish, but no teardown has started, so it remains
-  retryable for a later call from another Domain. The public wrapper checks
-  this before acquiring its shutdown mutex to avoid a cross-Domain deadlock.
+  retry, and the worker finalizer remains a last-resort path. A shutdown
+  defect from either execution lane's own system thread is different: it
+  cannot wait for its own lane to finish, but no teardown has started, so it
+  remains retryable for a later call from any other thread. Lane identity is
+  the system thread (Domain plus `Thread.id`), so a sibling thread on a lane's
+  Domain is an ordinary caller. The public wrapper checks this before
+  acquiring its shutdown mutex to avoid a deadlock against a concurrent
+  shutdown that holds that mutex while waiting for the loop.
 - Each Rust poll lane owns one mutex-protected pending count. Producers hold
   that mutex while publishing a queue message and its wake notification;
   the supervisor holds it while receiving and decrementing. A wake is never

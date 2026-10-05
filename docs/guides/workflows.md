@@ -868,7 +868,12 @@ rejects duplicate names and remote-only definitions before a native graph is
 created. `Temporal.Worker.run` is a blocking lifecycle loop; call it from an
 ordinary dedicated OCaml Domain or system thread rather than directly from a
 cooperative Eio/Lwt scheduler fiber. `Temporal.Worker.shutdown` is idempotent
-and drains retryable completions before releasing the native graph.
+and drains retryable completions before releasing the native graph. Call it
+from any other Domain or system thread, including a sibling thread on the
+Domain running `Temporal.Worker.run`; concurrent callers all wait for the same
+teardown and return its cached result. A call from inside one of the worker's
+own workflow or activity callbacks returns a defect `Error` instead of
+deadlocking, and the worker keeps running.
 
 Both `Temporal.Worker.create` and `Temporal.Client.create` accept an optional
 `~identity`, which Temporal records in history events and task-queue poller
