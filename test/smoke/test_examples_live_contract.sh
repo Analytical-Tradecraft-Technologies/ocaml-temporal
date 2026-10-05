@@ -22,22 +22,42 @@ fail() {
 }
 
 # Lists examples/<directory>/<name>.exe for each `(executable (name ...))`
-# stanza. Only the single-name form used by the examples is recognised; an
-# unrecognised layout yields an empty list, which fails below.
+# stanza, whether the name is on the opening line or a later one. Every
+# executable stanza must yield exactly one name, and the plural `executables`
+# form is rejected, so an unrecognised layout fails instead of silently
+# dropping an example from every later comparison.
 for dune_file in "$root"/examples/*/dune; do
   [ -f "$dune_file" ] || continue
   directory=${dune_file%/dune}
   directory=${directory##*/}
-  awk -v directory="$directory" '
+  awk -v directory="$directory" -v file="$dune_file" '
+    function close_stanza() {
+      if (executable && names != 1) {
+        printf "examples live contract: %s: executable stanza has %d names\n", file, names > "/dev/stderr"
+        failed = 1
+      }
+      executable = 0
+      names = 0
+    }
     { sub(/\r$/, "") }
-    /^\(executable([[:space:]]|$)/ { executable = 1; next }
-    /^\(/ { executable = 0 }
+    /^\(executables([[:space:]]|\)|$)/ {
+      printf "examples live contract: %s: unsupported (executables ...) stanza\n", file > "/dev/stderr"
+      failed = 1
+    }
+    /^\(/ { close_stanza() }
+    /^\(executable([[:space:]]|$)/ { executable = 1 }
     executable && match($0, /\(name [A-Za-z0-9_]+\)/) {
       name = substr($0, RSTART + 6, RLENGTH - 7)
+      names++
       print "examples/" directory "/" name ".exe"
     }
-  ' "$dune_file"
-done | LC_ALL=C sort -u >"$scratch/declared"
+    END {
+      close_stanza()
+      if (failed) exit 1
+    }
+  ' "$dune_file" || fail "unrecognised executable layout in $dune_file"
+done >"$scratch/declared.unsorted"
+LC_ALL=C sort -u "$scratch/declared.unsorted" >"$scratch/declared"
 [ -s "$scratch/declared" ] || fail "no example executables were found"
 
 # EXAMPLE_EXECUTABLES is one Make assignment line of space-separated paths.
