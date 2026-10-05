@@ -130,7 +130,10 @@ already been accepted.
    scheduler never resumes. Pending timer, activity, and child work
    keeps the run entry. A child start failure retires its future immediately; a
    successful start keeps it until the matching terminal resolution arrives.
-   A terminal resolution before its start acknowledgment, or a
+   A child the workflow cancelled between start initiation and start
+   acknowledgment may be resolved by Core as cancelled with no start
+   resolution; that cancelled result completes the future normally. Any other
+   terminal resolution before its start acknowledgment, or a
    duplicate/unknown child sequence, is a typed bridge failure.
 
 Activations without initialization must identify a run already in the map.

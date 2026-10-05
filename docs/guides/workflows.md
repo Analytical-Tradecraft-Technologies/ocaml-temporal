@@ -652,8 +652,10 @@ for another child sequence.
 The definitions and calls above compile, and the synthetic runtime tests cover
 child scheduling and deterministic future resolution. The native protocol and
 worker adapter also carry the child-start acknowledgment and terminal
-resolution required to resume the parent. The adapter rejects final-before-
-start, duplicate, and unknown sequences as typed bridge failures, preserving
+resolution required to resume the parent. A child cancelled by the workflow
+before it started resolves with the typed cancellation error. The adapter
+rejects any other final-before-start result, and duplicate or unknown
+sequences, as typed bridge failures, preserving
 the parent lease rather than acknowledging an unsafe completion. Focused tests
 cover the complete lifecycle. The live Compose fixture covers the parent/child
 success path, propagated failure, child cancellation, and child retry: the

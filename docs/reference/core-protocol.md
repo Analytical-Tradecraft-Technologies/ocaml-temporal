@@ -269,7 +269,12 @@ the sequence from the original start command. The OCaml runtime accepts that
 sequence twice only for this start/terminal pair; duplicate events and
 cross-kind collisions are invalid. A terminal job before a successful start is
 rejected by the runtime so a parent cannot observe a child that Core has not
-started.
+started, with one exception: when the workflow cancels a `Try_cancel` or
+`Abandon` child after start initiation but before
+`ChildWorkflowExecutionStarted`, Core resolves it directly as cancelled, and
+that cancelled terminal job is accepted only after the handle emitted
+`Cancel_child_workflow` (see
+[runtime invariants](runtime-invariants.md)).
 
 Both language decoders validate the complete child-resolution object before an
 activation reaches the runtime. Required identifiers must be nonempty and
@@ -282,9 +287,9 @@ does not know a child run ID and sends `run_id: ""` with
 for this pre-start state; a child failure after start must carry a nonempty run
 ID. A malformed document returns the typed `invalid_message` protocol error and
 has no lifecycle side effect. Runtime ordering checks happen only after this
-parse boundary: a terminal-before-start, duplicate start, duplicate terminal,
-or unknown sequence returns a typed bridge defect and leaves the existing
-resolver state unchanged.
+parse boundary: a terminal-before-start (other than the cancellation case
+above), duplicate start, duplicate terminal, or unknown sequence returns a
+typed bridge defect and leaves the existing resolver state unchanged.
 
 A completion is a closed object sent from OCaml to Rust. Optional
 `task_failure` distinguishes a failed workflow task from successful commands.

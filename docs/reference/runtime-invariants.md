@@ -150,9 +150,16 @@ and bridge, read the [documentation guide](../README.md) first.
   child resolver is registered before its command is emitted. Core resolves a
   child in two stages: the start acknowledgment stores its non-empty run ID,
   while a later terminal resolution removes the resolver and decodes its
-  payload. A start failure removes and resolves the future immediately. A
-  terminal result before start, duplicate acknowledgment, or unknown sequence
-  is a non-retryable bridge defect; no event is silently dropped.
+  payload. A start failure removes and resolves the future immediately. One
+  terminal result may arrive without a start acknowledgment: when the
+  workflow cancels a `Try_cancel` or `Abandon` child after
+  `StartChildWorkflowExecutionInitiated` but before
+  `ChildWorkflowExecutionStarted`, Core resolves it directly as cancelled.
+  That `Cancelled` resolution is accepted only after the handle emitted
+  `Cancel_child_workflow`, and completes the future with the typed
+  cancellation error. Any other terminal result before start, a duplicate
+  acknowledgment, or an unknown sequence is a non-retryable bridge defect; no
+  event is silently dropped.
 - Child task queues are optional validated identifiers. Explicit routing and
   parent-close policy survive runtime, JSON, and Core translation unchanged.
   Omission preserves existing server defaults and default command bytes. Parent
