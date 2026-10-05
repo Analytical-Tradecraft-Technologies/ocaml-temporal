@@ -1696,8 +1696,116 @@ let test_child_routing_options () =
      {|"task_queue":23,|}; {|"parent_close_policy":"unknown",|};
      {|"parent_close_policy":1,|}; {|"task_queue":"a","task_queue":"b",|}]
 
+(** Decodes one activation, re-encodes it, and requires the strict decoder to
+    reproduce the same value, proving the input is representable in both
+    directions of the OCaml side of the bridge. *)
+let round_trip_activation label json =
+  let decoded = unwrap (Protocol.decode_activation json) in
+  let reencoded = unwrap (Protocol.encode_activation decoded) in
+  if unwrap (Protocol.decode_activation reencoded) <> decoded then
+    failwith (label ^ " did not round trip");
+  decoded
+
+(** Wraps activation jobs in a minimal valid activation document. *)
+let activation_with_jobs jobs =
+  Printf.sprintf
+    {|{"run_id":"run-802","timestamp":{"seconds":0,"nanoseconds":0},"is_replaying":false,"history_length":3,"jobs":[%s]}|}
+    jobs
+
+(** Renders one failure layer with an absent info kind. [message] must already
+    be a JSON string literal. *)
+let absent_failure_json ~message ~cause =
+  Printf.sprintf
+    {|{"message":%s,"source":"","stack_trace":"","encoded_attributes":null,"cause":%s,"info":{"kind":"absent"}}|}
+    message cause
+
+(** Wraps a failure JSON object in a failed [resolve_activity] job. *)
+let failed_activity_job failure =
+  Printf.sprintf
+    {|{"kind":"resolve_activity","seq":1,"result":{"kind":"failed","failure":%s}}|}
+    failure
+
+(** Rust degrades server-valid but oversized inbound activations
+    deterministically (#802) instead of rejecting them. The OCaml decoder must
+    accept exactly what Rust emits: text truncated to the shared 65,536-byte
+    limit with its marker, a cause chain capped at 100 layers ending in the
+    synthetic omitted-causes layer at the deepest activation location, and
+    signal and update identities whose NUL bytes became U+FFFD. One byte over
+    the shared limit must still be rejected, keeping both sides' limits
+    identical. *)
+let test_inbound_degraded_activation () =
+  let limit = 65_536 in
+  let marker = "\n[truncated by ocaml-temporal: original length 70000 bytes]" in
+  let truncated = String.make (limit - String.length marker) 'm' ^ marker in
+  if String.length truncated <> limit then failwith "test text has the wrong size";
+  let json_text text =
+    "\"" ^ String.concat "\\n" (String.split_on_char '\n' text) ^ "\""
+  in
+  let truncated_json =
+    activation_with_jobs
+      (failed_activity_job
+         (absent_failure_json ~message:(json_text truncated) ~cause:"null"))
+  in
+  (match (round_trip_activation "truncated text" truncated_json).jobs with
+   | [ Resolve_activity { result = Failed failure; _ } ] ->
+       check_string "truncated message" truncated failure.message
+   | _ -> failwith "truncated failure job changed shape");
+  let over_limit = "x" ^ truncated in
+  require_error
+    (Protocol.decode_activation
+       (activation_with_jobs
+          (failed_activity_job
+             (absent_failure_json ~message:(json_text over_limit) ~cause:"null"))));
+  let max_layers = 100 in
+  let synthetic =
+    absent_failure_json
+      ~message:
+        {|"[truncated by ocaml-temporal: 51 deeper failure causes omitted beyond 100 layers]"|}
+      ~cause:"null"
+  in
+  let rec chain layers inner =
+    if layers = 0 then inner
+    else chain (layers - 1) (absent_failure_json ~message:{|"layer"|} ~cause:inner)
+  in
+  let capped = chain (max_layers - 1) synthetic in
+  let continuation =
+    Printf.sprintf
+      {|{"kind":"initialize_workflow","workflow_id":"w","workflow_type":"t","arguments":[],"randomness_seed":"1","attempt":1,"context":{"headers":{},"memo":null,"search_attributes":null,"workflow_execution_expiration_time":null,"first_workflow_task_backoff":null,"identity":"","parent_workflow":null,"workflow_execution_timeout":null,"workflow_run_timeout":null,"workflow_task_timeout":null,"first_execution_run_id":"first-run","start_time":null,"root_workflow":null,"priority":null,"retry_policy":null,"continuation":{"continued_from_execution_run_id":"previous-run","initiator":"workflow","continued_failure":%s,"last_completion_result":null}}}|}
+      capped
+  in
+  let rec depth (failure : Protocol.failure) =
+    match failure.cause with None -> 1 | Some cause -> 1 + depth cause
+  in
+  (match (round_trip_activation "capped cause chain" (activation_with_jobs continuation)).jobs with
+   | [ Initialize_workflow
+         { context = Some { continuation = Some { continued_failure = Some failure; _ }; _ }; _ } ] ->
+       if depth failure <> max_layers then failwith "capped chain changed depth"
+   | _ -> failwith "capped continuation job changed shape");
+  let replacement = "\xEF\xBF\xBD" in
+  let signal =
+    Printf.sprintf
+      {|{"kind":"signal_workflow","signal_name":"order_updated","input":[],"identity":"client%sone","headers":{}}|}
+      replacement
+  in
+  (match (round_trip_activation "sanitized signal identity" (activation_with_jobs signal)).jobs with
+   | [ Signal_workflow { identity; _ } ] ->
+       check_string "signal identity" ("client" ^ replacement ^ "one") identity
+   | _ -> failwith "signal job changed shape");
+  let update =
+    Printf.sprintf
+      {|{"kind":"do_update","id":"u-1","protocol_instance_id":"p-1","name":"set","input":[],"headers":{},"meta":{"identity":"%s","update_id":"u-1"},"run_validator":true}|}
+      replacement
+  in
+  ignore (round_trip_activation "sanitized update identity" (activation_with_jobs update));
+  (* The raw NUL that Rust replaces is still rejected by the OCaml decoder. *)
+  require_error
+    (Protocol.decode_activation
+       (activation_with_jobs
+          {|{"kind":"signal_workflow","signal_name":"s","input":[],"identity":"a\u0000b","headers":{}}|}))
+
 let () =
   test_child_routing_options ();
+  run "inbound degraded activation" test_inbound_degraded_activation;
   run "terminated failure info" test_terminated_failure_info;
   run "workflow activations" test_valid_activations;
   run "invalid reset seeds" test_invalid_reset_seeds;
