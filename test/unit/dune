@@ -23,3 +23,7 @@
 (test
  (name test_process_identity)
  (libraries temporal_base unix))
+
+(test
+ (name test_example_failures)
+ (libraries temporal-sdk temporal_sdk_examples_common))

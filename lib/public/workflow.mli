@@ -165,7 +165,9 @@ val upsert_search_attributes : (string * Payload.t) list -> unit
 (** Ends the current run and starts a new run of [definition] with [input].
     This operation never returns to the calling workflow fiber. It is
     deterministic: the input is encoded through the definition's codec before
-    the successor command is emitted. A codec failure fails the current run
-    with a typed error; calling it outside workflow execution is programmer
-    misuse and raises [Invalid_argument]. *)
+    the successor command is emitted. A codec failure fails only the current
+    workflow task, like any propagated [Codec] error: no continue-as-new
+    command is emitted and the run stays open so a corrected worker can replay
+    it. Calling it outside workflow execution is programmer misuse and raises
+    [Invalid_argument]. *)
 val continue_as_new : ('input, 'output) t -> 'input -> 'value

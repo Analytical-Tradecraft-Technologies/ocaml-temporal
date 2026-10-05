@@ -307,8 +307,10 @@ let upsert_search_attributes values =
 (** Requests a fresh run of the same workflow type with [input]. This is a
     terminal direct-style operation: it encodes the successor input, buffers a
     Core continue-as-new command, and aborts the current private workflow
-    fiber. If encoding fails, the current run is failed with that typed codec
-    error instead of raising it through the worker loop. *)
+    fiber. If encoding fails, the typed codec error terminates the fiber
+    instead of raising through the worker loop; the runtime classifies a
+    [Codec] error as a workflow-task failure, so the task fails with no
+    commands and the run stays open for a corrected worker to replay. *)
 let continue_as_new definition next_input =
   match Temporal_sdk_kernel.Workflow_context_store.current () with
   | None ->

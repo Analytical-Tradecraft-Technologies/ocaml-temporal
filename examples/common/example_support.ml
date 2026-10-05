@@ -50,14 +50,21 @@ module Definitions = struct
   (** The stable workflow type name used by the workflow worker and client. *)
   let compose_message_name = "ocaml-temporal-example.compose-message"
 
+  (** Creates the terminal business failure returned when workflow input is
+      invalid. The [`Workflow] category fails the workflow execution so the
+      client observes a failed result. [Temporal.Error.defect] must not be used
+      here: a propagated defect fails only the workflow task, which Temporal
+      retries indefinitely while the run stays open. [non_retryable] prevents
+      a configured workflow retry policy from rerunning the same bad input. *)
+  let invalid_input message =
+    Temporal.Error.make ~category:`Workflow ~non_retryable:true ~message ()
+
   (** Builds one activity input without allowing an ambiguous delimiter in the
       name. This function runs in deterministic workflow code, so it only
       performs pure string validation and construction. *)
   let render_request style name =
     if String.contains name ':' then
-      Error
-        (Temporal.Error.defect
-           ~message:"example names must not contain ':'")
+      Error (invalid_input "example names must not contain ':'")
     else Ok (style ^ ":" ^ name)
 
   (** Decodes the compact activity input used by this small example. Real
@@ -110,7 +117,7 @@ module Definitions = struct
     let open Temporal.Result_syntax in
     let normalized_name = String.trim name in
     if String.equal normalized_name "" then
-      Error (Temporal.Error.defect ~message:"a name is required")
+      Error (invalid_input "a name is required")
     else
       let* greeting_input = render_request "greeting" normalized_name in
       let* next_step_input = render_request "next-step" normalized_name in
