@@ -118,8 +118,9 @@ classification (`Native_worker_policy.async_operation_disposition`):
   operations). It releases the request key, even when it answers the exact
   retry of an earlier uncertain request, and keeps the activity handle and
   adapter lease live. The caller may send corrected details or a different
-  terminal operation, for example `fail` after a rejected `cancel` or an
-  oversized `complete`.
+  terminal operation, for example `fail` after a rejected `cancel`. An
+  oversized `complete` result is not rejected this way: the server records a
+  terminal activity failure and acknowledges the RPC, so the handle closes.
 - `NotFound` maps to `Invalid_state` and closes the handle because the server
   has discarded the token. After an uncertain terminal request, this can also
   mean the earlier attempt was applied.

@@ -928,7 +928,7 @@ let test_async_connection_heartbeat_keeps_handle () =
   | Error _ -> failwith "completed async handle still blocked drain")
 
 (** A definitive server rejection of a terminal request (for example cancel
-    without a cancel request, or an oversized result) leaves the activity live:
+    without a cancel request) leaves the activity live:
     the handle stays usable, the lease stays registered, and a different
     terminal operation can still finish the activity (#821). *)
 let test_async_rejected_completion_keeps_live_handle () =
@@ -1349,14 +1349,14 @@ let test_native_rejection_releases_earlier_uncertainty () =
         | 2 -> Error (Base_async.Rejected_submission error)
         | _ -> Ok ()) in
   ignore (Base_async.activate handle);
-  (match Base_async.complete handle "oversized" with
+  (match Base_async.complete handle "rejected" with
   | Error _ -> ()
   | Ok () -> failwith "uncertain completion was accepted");
   (match Base_async.fail handle error with
   | Error _ -> ()
   | Ok () -> failwith "different operation ran before uncertainty settled");
   if !attempts <> 1 then failwith "conflicting request crossed the submit boundary";
-  (match Base_async.complete handle "oversized" with
+  (match Base_async.complete handle "rejected" with
   | Error _ -> ()
   | Ok () -> failwith "rejected exact retry was accepted");
   (match Base_async.fail handle error with

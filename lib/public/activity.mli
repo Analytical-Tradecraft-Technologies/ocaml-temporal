@@ -167,9 +167,12 @@ val implementation_async :
       identical call may follow until it receives a definitive answer; a
       failed [heartbeat] is forgotten and never blocks later calls.
     - A definitive server rejection of the request (for example [cancel]
-      without a cancellation request, or an oversized result) returns a
-      non-retryable error but keeps the handle live, so a corrected or
-      different operation such as [fail] may follow.
+      without a cancellation request) returns a non-retryable error but keeps
+      the handle live, so a corrected or different operation such as [fail]
+      may follow. A result above the server's blob-size limit is not such a
+      rejection: Temporal records a terminal failure for the activity and
+      acknowledges the call, so [complete] returns [Ok] and closes the
+      handle.
     - Acceptance of [complete], [fail], or [cancel], or the server reporting
       that the activity no longer exists, closes the handle. After an
       uncertain terminal call, "no longer exists" can mean that call was

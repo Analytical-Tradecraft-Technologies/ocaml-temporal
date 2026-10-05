@@ -407,9 +407,10 @@ the retained handle uses the namespace-bound client operation. If a
 server is unavailable or the deadline expires), the call returns a retryable
 error and the handle stays live; retry with the identical call until it
 receives a definitive answer. If the server definitively rejects the request
-(for example a `cancel` when no cancellation was requested, or an oversized
-result), the handle also stays live and you may call a different operation,
-such as `fail`. A failed `heartbeat` is reported and forgotten: it never blocks
+(for example a `cancel` when no cancellation was requested), the handle also
+stays live and you may call a different operation, such as `fail`. A result
+larger than the server's blob-size limit is different: Temporal fails the
+activity itself and acknowledges `complete`, which then returns `Ok`. A failed `heartbeat` is reported and forgotten: it never blocks
 a later heartbeat or the terminal call. Only acceptance of a terminal call, or
 the server reporting that the activity no longer exists, closes the handle, so
 a later call fails predictably instead of leaving worker shutdown blocked.
