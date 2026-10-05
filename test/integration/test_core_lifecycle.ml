@@ -33,7 +33,7 @@ let require_supervisor = function
   | Ok value -> value
   | Error (Native.Backend error) -> require (Error error)
   | Error Native.Closed -> failwith "supervisor closed unexpectedly"
-  | Error (Native.Supervisor_failed exn) -> raise exn
+  | Error (Native.Supervisor_failed exn | Native.Owner_unavailable exn) -> raise exn
 
 (** Accepts only the structured lifecycle-state error expected by a negative
     transition assertion and fails with the full unexpected diagnostic. *)

@@ -23,7 +23,8 @@ let require_native = function
   | Ok value -> value
   | Error (Native.Backend { message; _ }) -> failwith message
   | Error Native.Closed -> failwith "replay supervisor closed early"
-  | Error (Native.Supervisor_failed exn) -> raise exn
+  | Error (Native.Supervisor_failed exn | Native.Owner_unavailable exn) ->
+      raise exn
 
 (** Preserves the original sample failure when best-effort cleanup also fails. A
     cleanup failure following a successful sample remains a sample failure. *)
@@ -110,6 +111,7 @@ module Source = struct
     | Native.Backend { message; _ } -> message
     | Native.Closed -> "replay supervisor closed"
     | Native.Supervisor_failed _ -> "replay supervisor failed"
+    | Native.Owner_unavailable _ -> "replay supervisor could not start"
 end
 
 module Replay = Worker.Make (Source)

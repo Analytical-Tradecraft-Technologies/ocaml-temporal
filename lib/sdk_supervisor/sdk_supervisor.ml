@@ -17,6 +17,7 @@ module Make (Backend : Backend) = struct
     | Backend of Backend.error
     | Closed
     | Supervisor_failed of exn
+    | Owner_unavailable of exn
 
   (** Typed messages accepted by the sole owner Domain. *)
   module Request = struct
@@ -231,9 +232,20 @@ module Make (Backend : Backend) = struct
       owner Domain. Failed initialization stops and joins that Domain before
       returning, ensuring no partially published supervisor remains. A
       non-blocking finalizer schedules the same shutdown path as a last-resort
-      safeguard for callers which abandon a live instance. *)
+      safeguard for callers which abandon a live instance.
+
+      [Domain.spawn] raises when the runtime's Domain limit is reached (each
+      live SDK instance holds one owner Domain) or the Domain cannot be
+      allocated. That is an operational, possibly transient failure (another
+      instance may shut down), so it is returned as [Owner_unavailable] rather
+      than escaping a [result]-typed API or being reported as a defect. No owner
+      exists yet, so nothing needs to be stopped. An invalid capacity remains a
+      programmer error and still raises [Invalid_argument]. *)
   let create ~capacity config =
-    let mailbox = Mailbox.create ~capacity ~handler:(owner_handler ()) in
+    match Mailbox.create ~capacity ~handler:(owner_handler ()) with
+    | exception (Invalid_argument _ as exn) -> raise exn
+    | exception exn -> Error (Owner_unavailable exn)
+    | mailbox -> (
     match Mailbox.call mailbox (Initialize config) with
     | Ok (Ok ()) ->
         let supervisor =
@@ -251,7 +263,7 @@ module Make (Backend : Backend) = struct
         Error error
     | Error failure ->
         ignore (stop_mailbox mailbox);
-        Error (mailbox_failure failure)
+        Error (mailbox_failure failure))
 end
 
 (** Converts between OCaml-owned native bytes and the closed semantic protocol

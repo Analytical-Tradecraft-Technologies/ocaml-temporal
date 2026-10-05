@@ -45,6 +45,10 @@ module Make (Backend : Backend) : sig
         (** The graph has begun or completed shutdown. *)
     | Supervisor_failed of exn
         (** The owner contained an unexpected exception and terminated. *)
+    | Owner_unavailable of exn
+        (** The owner Domain could not be spawned, for example because the
+            runtime's Domain limit is reached. This is an operational failure
+            that may succeed once another instance shuts down. *)
 
   (** An abstract instance containing the mailbox, owner Domain, and cached
       terminal result. It contains no publicly accessible native handle. *)
@@ -53,7 +57,9 @@ module Make (Backend : Backend) : sig
   (** [create ~capacity config] starts the owner Domain and creates the backend
       graph on it. [capacity] is the positive number of admitted operations
       which may wait behind the active operation; invalid capacity is a
-      programmer error reported by [Invalid_argument]. *)
+      programmer error reported by [Invalid_argument]. Failure to spawn the
+      owner Domain, for example because the runtime's Domain limit is reached,
+      returns [Owner_unavailable] with the spawn exception. *)
   val create : capacity:int -> Backend.config -> (t, error) result
 
   (** [perform instance operation] blocks an ordinary producer Domain until
@@ -447,6 +453,7 @@ module Native : sig
     | Backend of Temporal_core_bridge.Native_bridge.error
     | Closed
     | Supervisor_failed of exn
+    | Owner_unavailable of exn
 
   (** An abstract SDK instance which owns the complete Rust handle graph. *)
   type t

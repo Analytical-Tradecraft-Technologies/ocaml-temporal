@@ -17,7 +17,7 @@ let require_native = function
   | Ok value -> value
   | Error (Native.Backend { message; _ }) -> failwith message
   | Error Native.Closed -> failwith "replay supervisor closed early"
-  | Error (Native.Supervisor_failed exn) -> raise exn
+  | Error (Native.Supervisor_failed exn | Native.Owner_unavailable exn) -> raise exn
 
 (** Connects the production worker adapter to the private replay operations.
     Observations belong to the test controller, outside workflow execution. *)
@@ -64,6 +64,7 @@ module Source = struct
     | Native.Backend { message; _ } -> message
     | Native.Closed -> "replay supervisor closed"
     | Native.Supervisor_failed _ -> "replay supervisor failed"
+    | Native.Owner_unavailable _ -> "replay supervisor could not start"
 end
 
 (** Uses the same registration, activation translation, and scheduler as live work. *)

@@ -398,6 +398,12 @@ let native_supervisor_error = function
         (Printf.sprintf "native client bridge %s: %s" (native_status_name status)
            message)
   | Native.Closed -> bridge_error "native client supervisor is shut down"
+  | Native.Owner_unavailable exception_ ->
+      (* Resource exhaustion, not a defect: retrying may succeed once another
+         client or worker releases its owner Domain. *)
+      bridge_error
+        (Printf.sprintf "native client supervisor could not start: %s"
+           (Printexc.to_string exception_))
   | Native.Supervisor_failed exception_ ->
       Error.defect
         ~message:
