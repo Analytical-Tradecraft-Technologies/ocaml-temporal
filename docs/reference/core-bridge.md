@@ -222,6 +222,28 @@ returns only `invalid lifecycle configuration JSON`; Serde's syntax, location,
 and unknown-field details are kept inside Rust so application-controlled input
 cannot become a diagnostic at the C/OCaml boundary.
 
+Client connection failures are the documented exception (#833). Because a
+constant message made DNS, refused, TLS, and timeout failures
+indistinguishable, `STATUS_CONNECTION` from client connect carries a closed
+cause category plus the bounded (512-byte), control-character-escaped local
+transport error chain. A failed `GetSystemInfo` contributes only its gRPC code
+name, never the server's status message. Core's own rejection of connection
+options maps to `STATUS_CONFIGURATION` with a constant message, because that
+text may echo configured headers. `rust/core-bridge/src/diagnostics.rs` owns
+this reduction; the message format is described in
+[observability](observability.md).
+
+Runtime creation configures Core telemetry with a push logger whose consumer
+writes one bounded line per record to stderr, at the level selected by
+`OCAML_TEMPORAL_CORE_LOG` (default `warn`, `off` disables it). Core invokes
+the consumer synchronously on whichever thread emitted the record, including
+Tokio workers. The consumer is stateless, holds no OCaml value, never calls
+back into OCaml, ignores write errors, and contains formatting panics. Core
+also installs the subscriber as the thread-local default on the thread that
+creates the runtime (the owning supervisor thread). That guard is removed only
+if the runtime is dropped on the same thread; otherwise it stays with that
+thread and keeps one reference to the stateless subscriber.
+
 All client-operation identifiers are nonempty and NUL-free. The schemas state the
 65,536-character necessary bound, while the bilateral runtime validators apply
 the authoritative 65,536-byte UTF-8 limit, reject duplicate members, and

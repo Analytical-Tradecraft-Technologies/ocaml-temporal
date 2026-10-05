@@ -4,7 +4,7 @@ use crate::worker_bridge::{
     WORKER_FINALIZE_TIMEOUT, WORKER_SHUTDOWN_DRAIN_TIMEOUT, WorkerBridgeError,
     public_poll_lane_error_message, public_worker_error_message,
 };
-use crate::{activity_protocol, client_protocol, workflow_protocol};
+use crate::{activity_protocol, client_protocol, diagnostics, workflow_protocol};
 use serde::Deserialize;
 use std::collections::{HashMap, hash_map::Entry};
 use std::future::Future;
@@ -30,6 +30,7 @@ use temporalio_common::protos::{
     TaskToken,
     temporal::api::{common::v1 as api_common, enums::v1::VersioningBehavior},
 };
+use temporalio_common::telemetry::TelemetryOptions;
 use temporalio_sdk_core::{
     CoreRuntime, PollerBehavior, RuntimeOptions, TokioRuntimeBuilder, WorkerConfig,
     WorkerVersioningStrategy,
@@ -562,12 +563,21 @@ impl Runtime {
         let connection = core
             .tokio_handle()
             .block_on(Connection::connect(options))
-            .map_err(|_error| Failure {
-                status: STATUS_CONNECTION,
-                // Core's connection error can contain gRPC status details or
-                // server-provided text.  Only the closed ABI category may
-                // cross into OCaml; detailed diagnostics stay inside Rust.
-                message: "Temporal client connection failed".to_owned(),
+            .map_err(|error| {
+                // Core's error text can contain server-provided gRPC status
+                // messages or configured header values. Only a closed cause
+                // plus bounded, sanitized local transport detail crosses into
+                // OCaml (#833); see `diagnostics::describe_connect_error`.
+                match diagnostics::describe_connect_error(&error) {
+                    diagnostics::ConnectFailure::Configuration => Failure {
+                        status: STATUS_CONFIGURATION,
+                        message: "Temporal Core rejected the client connection options".to_owned(),
+                    },
+                    diagnostics::ConnectFailure::Connection { cause, detail } => Failure {
+                        status: STATUS_CONNECTION,
+                        message: diagnostics::connection_failure_message(cause, &detail),
+                    },
+                }
             })?;
         self.client = Some(connection);
         Ok(Vec::new())
@@ -3078,7 +3088,19 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_runtime_new(
     // SAFETY: Both output locations were validated above.
     unsafe {
         invoke(output, || {
+            // Core's own log records are forwarded to a bounded stderr sink
+            // at the level chosen by `OCAML_TEMPORAL_CORE_LOG` (default
+            // `warn`), instead of being discarded (#833). The sink never
+            // calls OCaml; see `diagnostics::StderrCoreLogConsumer`.
+            let log_level = diagnostics::core_log_level_from_env().map_err(|message| Failure {
+                status: STATUS_CONFIGURATION,
+                message,
+            })?;
+            let telemetry = TelemetryOptions::builder()
+                .maybe_logging(log_level.map(diagnostics::core_logger))
+                .build();
             let options = RuntimeOptions::builder()
+                .telemetry_options(telemetry)
                 .build()
                 .map_err(|_message| Failure {
                     status: STATUS_INTERNAL,

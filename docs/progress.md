@@ -15,6 +15,21 @@ implementation when a later entry documents that work as complete. The
 records the current tested source, named assertions and successful CI job for
 the Temporal acceptance controllers.
 
+## 2026-10-06: Connection failures name their cause; Core logs reach stderr (#833)
+
+Every client connection failure used to read `Temporal client connection
+failed`, and the runtime was created without a Core logger, so Core's own
+records were discarded. The bridge now reports a closed cause (`dns`,
+`refused`, `tls`, `timeout`, `unauthenticated`, ...) plus the bounded,
+escaped local transport error chain. A failed `GetSystemInfo` adds only its
+gRPC code, never server text, and Core's rejection of connection options is a
+`configuration` error. Runtime creation installs a Core push logger that
+writes one bounded, escaped stderr line per record and never calls OCaml.
+`OCAML_TEMPORAL_CORE_LOG` selects the level (default `warn`; `off` disables
+it). Rust ABI tests cover refused and DNS causes and the message bound, cause
+classification, level parsing and rejection, and line formatting. An OCaml
+unit test proves the cause reaches `Client.create`.
+
 ## 2026-10-06: Retained completions fail closed (#843)
 
 The workflow and activity adapters used to resubmit every retained completion
