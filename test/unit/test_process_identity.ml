@@ -36,6 +36,8 @@ let test_ordinary_hostname () =
 (** Unusual host names are sanitized, bounded, or replaced so the result stays
     valid for the bridge. *)
 let test_unusual_hostnames () =
+  (* Asserts exact string equality, reporting both values with OCaml escapes
+     so control bytes and non-ASCII input are visible in a failure. *)
   let expect_equal expected actual =
     if not (String.equal expected actual) then
       failwith (Printf.sprintf "expected %S, got %S" expected actual)
