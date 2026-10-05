@@ -33,7 +33,11 @@ functions can call `patched` without threading version state through their
 arguments, and a later `NotifyHasPatch` job for an ID already consulted never
 changes that answer. A notification that arrives before the first call seeds
 the decision; once workflow code has branched on it, the decision is fixed for
-the run. This matches the memoization in Temporal's official SDKs.
+the run. This matches the memoization in Temporal's official SDKs. A late
+notification is still remembered: the next call for that ID keeps returning
+`false` but emits the `SetPatchMarker` command Core needs to consume the
+reported history marker, because Core treats an unmatched non-deprecated patch
+marker as nondeterminism.
 
 Patch IDs are durable history keys. They must be non-empty, valid UTF-8,
 NUL-free, and no more than 65,536 bytes. Invalid IDs and calls outside workflow

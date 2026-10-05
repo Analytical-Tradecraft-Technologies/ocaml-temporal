@@ -84,10 +84,15 @@ type patch_mode = Active | Deprecated
     [decision] only records that Core reported the marker and may still be
     seeded by [notify_has_patch]. Once the first local call selects [mode],
     [decision] has been returned to (or acted on by) workflow code and is
-    immutable for the rest of this execution. *)
+    immutable for the rest of this execution. [marker_reported] records
+    separately that Core reported a history marker for the ID, even after the
+    decision was fixed at [false]: Core requires a [SetPatchMarker] command to
+    consume a non-deprecated history marker, so a later call must still emit
+    one without changing the branch already taken. *)
 type patch_state = {
   mutable decision : bool;
   mutable mode : patch_mode option;
+  mutable marker_reported : bool;
 }
 
 (** A typed key for one workflow-local value. The integer is allocated once at
@@ -335,18 +340,26 @@ let snapshot_identifier value = Bytes.to_string (Bytes.of_string value)
 let notify_has_patch context ~patch_id =
   let patch_id = snapshot_identifier patch_id in
   match Hashtbl.find_opt context.patches patch_id with
-  | Some { mode = Some _; _ } -> ()
-  | Some state -> state.decision <- true
+  | Some ({ mode = Some _; _ } as state) ->
+      (* The branch is fixed, but the marker must still be consumed. *)
+      state.marker_reported <- true
+  | Some state ->
+      state.decision <- true;
+      state.marker_reported <- true
   | None ->
-      Hashtbl.add context.patches patch_id { decision = true; mode = None }
+      Hashtbl.add context.patches patch_id
+        { decision = true; mode = None; marker_reported = true }
 
 (** Evaluates one patch operation. The first call for an ID fixes its decision:
     [true] when a Core notification already reported the marker or the current
     activation is not replaying, otherwise [false]. A marker command is emitted
-    only while that decision is [true]. Emitting a marker for a [false] replay
-    decision would let Core record a marker contradicting the branch actually
-    taken: during replay Core creates a real [RecordMarker] command for every
-    [SetPatchMarker] and keeps it queued unless later history displaces it.
+    while that decision is [true], or once Core has reported a history marker
+    for the ID after the decision was fixed at [false] (so the marker is
+    consumed while the branch stays fixed). Emitting a marker for a [false]
+    replay decision without such a report would let Core record a marker
+    contradicting the branch actually taken: during replay Core creates a real
+    [RecordMarker] command for every [SetPatchMarker] and keeps it queued
+    unless later history displaces it.
 
     Repeated calls with a [true] decision emit repeated same-mode commands;
     Core skips IDs for which it has already created a marker command. A
@@ -365,6 +378,7 @@ let call_patch_api context ~patch_id ~mode =
           {
             decision = not context.activation_is_replaying;
             mode = None;
+            marker_reported = false;
           }
         in
         Hashtbl.add context.patches patch_id state;
@@ -376,7 +390,11 @@ let call_patch_api context ~patch_id ~mode =
         "Temporal workflow patch ID cannot be both active and deprecated in one execution"
   | Some _ -> ()
   | None -> state.mode <- Some mode);
-  if state.decision then
+  (* A marker is emitted for a [true] decision, and also when Core reported a
+     history marker after the decision was fixed at [false]; otherwise Core
+     would meet that non-deprecated marker with no matching command and fail
+     the task as nondeterministic. The returned decision never changes. *)
+  if state.decision || state.marker_reported then
     context.commands_rev <-
       Activation.Set_patch_marker
         { patch_id; deprecated = (mode = Deprecated) }

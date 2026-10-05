@@ -1861,13 +1861,16 @@ let test_workflow_patch_decision_is_not_flipped_by_late_notification () =
     (Execution.activate execution [ Activation.Start_workflow ]);
   expect "replay decision" [ false ] !decisions;
   Execution.set_activation_is_replaying execution false;
+  (* The later call keeps the false answer but emits the marker command Core
+     needs to consume the reported history marker. *)
   (match
      Execution.activate execution
        [ Activation.Notify_has_patch { patch_id = "orders.v2" };
          Activation.Fire_timer { seq = 1L } ]
    with
-  | [ Activation.Complete_workflow _ ] -> ()
-  | _ -> failwith "late patch notification emitted a marker");
+  | [ Activation.Set_patch_marker { patch_id = "orders.v2"; deprecated = false };
+      Activation.Complete_workflow _ ] -> ()
+  | _ -> failwith "late patch notification did not consume the history marker");
   expect "late notification did not flip decision" [ false; false ] !decisions;
   (* A notification that precedes the first local call still seeds the
      decision, so replay of a marker history keeps taking the new branch. *)
@@ -1883,6 +1886,8 @@ let test_workflow_patch_decision_is_not_flipped_by_late_notification () =
     (Workflow_context_store.patched context ~patch_id:"orders.present");
   match Workflow_context_store.take_commands context with
   | [ Activation.Set_patch_marker
+        { patch_id = "orders.absent"; deprecated = false };
+      Activation.Set_patch_marker
         { patch_id = "orders.present"; deprecated = false } ] -> ()
   | _ -> failwith "patch decisions emitted unexpected commands"
 
