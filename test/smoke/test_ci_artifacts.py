@@ -5,6 +5,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tarfile
 import tempfile
@@ -78,6 +79,29 @@ class SmokeTests(unittest.TestCase):
         SMOKE.unpack(self.root, self.artifact, COMMIT, VERSION)
         self.assertEqual(self.binary.read_bytes(), self.content)
         self.assertTrue(os.access(self.binary, os.X_OK))
+
+    def test_checkout_below_symlinked_ancestor(self):
+        """A checkout reached through a symlinked ancestor still unpacks (#826).
+
+        macOS places temporary directories and many workspaces under /var or
+        /tmp, both symlinks to /private, so only components below the checkout
+        root may be rejected.
+        """
+        link = Path(self.temp.name + "-link")
+        link.symlink_to(self.root, target_is_directory=True)
+        self.addCleanup(link.unlink)
+        SMOKE.unpack(link, self.artifact, COMMIT, VERSION)
+        self.assertEqual(self.binary.read_bytes(), self.content)
+
+    def test_symlink_inside_checkout_is_rejected(self):
+        """A symlinked build tree below the checkout root is never followed."""
+        outside = Path(self.temp.name) / "outside"
+        outside.mkdir()
+        build = self.root / "_build"
+        shutil.move(build, outside / "_build")
+        build.symlink_to(outside / "_build", target_is_directory=True)
+        with self.assertRaisesRegex(ValueError, "symlink in smoke destination"):
+            SMOKE.unpack(self.root, self.artifact, COMMIT, VERSION)
 
     def test_wrong_provenance(self):
         """Neither another commit nor another patch version may be consumed."""
