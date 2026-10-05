@@ -16,6 +16,9 @@ use temporalio_common::protos::coresdk::{
     workflow_completion::WorkflowActivationCompletion,
 };
 use temporalio_common::protos::temporal::api::enums::v1::WorkflowTaskFailedCause;
+use temporalio_common::protos::temporal::api::failure::v1::{
+    ApplicationFailureInfo, Failure as TemporalFailure, failure::FailureInfo,
+};
 use temporalio_common::worker::WorkerTaskTypes;
 use temporalio_sdk_core::{PollError, Worker};
 use tokio::sync::mpsc;
@@ -47,6 +50,46 @@ pub const WORKFLOW_DELIVERY_REJECTION_BACKOFF: Duration = Duration::from_millis(
 /// server-visible diagnostic while still identifying the conversion category.
 pub fn workflow_rejection_message(reason: &'static str) -> String {
     format!("OCaml bridge could not represent the workflow activation: {reason}")
+}
+
+/// Application failure type reported for an activity task the bridge cannot
+/// represent to OCaml (issue #801).
+///
+/// The type lets workflow code and operators distinguish this bridge-level
+/// rejection from a failure raised by an activity implementation.
+pub const UNREPRESENTABLE_ACTIVITY_TASK_FAILURE_TYPE: &str = "UnrepresentableActivityTask";
+
+/// Builds the bounded failure text sent to Core when a leased activity task
+/// cannot cross the private semantic boundary.
+///
+/// As with [`workflow_rejection_message`], only a process-static category is
+/// accepted, so payloads, headers, and identifiers never reach the
+/// server-visible failure.
+pub fn activity_rejection_message(reason: &'static str) -> String {
+    format!("OCaml bridge could not represent the activity task: {reason}")
+}
+
+/// Builds the Temporal failure for an activity task the bridge cannot
+/// represent to OCaml.
+///
+/// The failure is a non-retryable application failure. Representability is a
+/// deterministic property of the task document and this worker build: every
+/// redelivery of the same task to this worker would be rejected again, and a
+/// retryable failure would make the server redeliver it under the activity's
+/// retry policy indefinitely. Failing it once lets the scheduling workflow
+/// observe a typed activity failure instead.
+pub fn unrepresentable_activity_failure(reason: &'static str) -> TemporalFailure {
+    TemporalFailure {
+        message: activity_rejection_message(reason),
+        failure_info: Some(FailureInfo::ApplicationFailureInfo(
+            ApplicationFailureInfo {
+                r#type: UNREPRESENTABLE_ACTIVITY_TASK_FAILURE_TYPE.to_owned(),
+                non_retryable: true,
+                ..Default::default()
+            },
+        )),
+        ..Default::default()
+    }
 }
 
 /// Builds the bounded failure text sent to Core when a polled workflow
@@ -1903,9 +1946,14 @@ impl PollLanes {
     /// and the inaccessible token is retired on every outcome. Retaining it
     /// after conversion failure would make graceful shutdown impossible
     /// because OCaml never received the token needed to complete it.
+    ///
+    /// The generated failure is [`unrepresentable_activity_failure`] for the
+    /// static `reason`. Core's acceptance of that completion also releases the
+    /// task's activity slot, so the poll lane can take the next task.
     pub async fn reject_activity_delivery(
         &self,
         task_token: &[u8],
+        reason: &'static str,
     ) -> Result<(), WorkerBridgeError> {
         self.ledger
             .lock()
@@ -1915,7 +1963,7 @@ impl PollLanes {
         let completion = ActivityTaskCompletion {
             task_token: task_token.to_vec(),
             result: Some(ActivityExecutionResult::fail(
-                "OCaml bridge could not represent the activity task".into(),
+                unrepresentable_activity_failure(reason),
             )),
         };
         let core_result = self
@@ -2120,12 +2168,32 @@ async fn run_workflow_lane(
     }
 }
 
+/// Reports whether an activity admission outcome is a cancellation update the
+/// poll lane drops silently.
+///
+/// Core represents cancellation as an update on the original Start token, not
+/// as a second completion debt. A Cancel whose Start is unknown (it completed
+/// between Core's poll returning and this admission), already retired by
+/// disposal, already cancelled, malformed, or polled while draining has no
+/// Start lease left to update. Completing it would fabricate a second
+/// completion for the token, and publishing a lane error would make one
+/// benign race terminate `Worker.run` for the whole task queue (issue #801).
+/// Only a Cancel that updates a live Start (`ExistingCancellation`) is
+/// delivered.
+#[doc(hidden)]
+pub fn is_ignorable_activity_cancellation(
+    kind: ActivityAdmission,
+    admission: &Result<Admission, AdmitError>,
+) -> bool {
+    kind == ActivityAdmission::Cancel && matches!(admission, Ok(Admission::Duplicate) | Err(_))
+}
+
 /// Polls remote activities serially and associates cancellation with its start.
 ///
 /// Start tasks that cannot be delivered are force-failed to Core so their
-/// completion debt cannot stall shutdown. Duplicate cancel notifications do
-/// not create a second Core obligation and are therefore dropped without a
-/// completion after the diagnostic error is published.
+/// completion debt cannot stall shutdown. Cancel notifications that do not
+/// update a live Start create no Core obligation and are dropped without a
+/// completion or lane error (see [`is_ignorable_activity_cancellation`]).
 async fn run_activity_lane(
     worker: Arc<Worker>,
     ledger: Arc<Mutex<TaskLedger>>,
@@ -2169,6 +2237,13 @@ async fn run_activity_lane(
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .admit_polled_activity(&task.task_token, kind);
+        if is_ignorable_activity_cancellation(kind, &admission) {
+            // See `is_ignorable_activity_cancellation`: an unknown, retired,
+            // or repeated cancellation owns no Core completion debt, so it
+            // is dropped without a completion and without a lane error.
+            drop(task);
+            continue;
+        }
         match admission {
             Ok(Admission::New | Admission::ExistingCancellation) => {
                 let task_token = task.task_token.clone();
@@ -2196,29 +2271,23 @@ async fn run_activity_lane(
                 // duplicate Start would complete the already-outstanding lease
                 // still queued or held by OCaml. Drop the duplicate delivery
                 // and surface a lane error instead, matching the workflow
-                // duplicate path. Persist the fatal drain blocker only for a
-                // duplicate Start: a duplicate Cancel is a repeated update
-                // for the original start and does not represent another Core
-                // completion lease that could be lost.
-                if kind == ActivityAdmission::Start {
-                    ledger
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner())
-                        .mark_lost_poll_lease();
-                }
+                // duplicate path, and persist the fatal drain blocker. A
+                // duplicate Cancel never reaches this arm: it was dropped
+                // above as an ignorable update.
+                ledger
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .mark_lost_poll_lease();
                 drop(task);
                 if !signal.enqueue(&sender, Err(PollLaneError::DuplicateIdentity)) {
                     return;
                 }
             }
             Err(error) => {
-                // Only Start-shaped debts need a Core completion. Unknown or
-                // duplicate cancel notifications do not create a second
-                // obligation; force-failing them can spuriously complete an
-                // unrelated or already-finished activity for the same token.
-                if kind == ActivityAdmission::Start
-                    && matches!(error, AdmitError::InvalidIdentity | AdmitError::Draining)
-                {
+                // Only Start admissions reach this arm; every Cancel admission
+                // error was dropped above. A Start owns a Core completion
+                // debt, so an invalid or draining Start is force-failed.
+                if matches!(error, AdmitError::InvalidIdentity | AdmitError::Draining) {
                     let reason = match error {
                         AdmitError::InvalidIdentity => "invalid activity task token",
                         AdmitError::Draining => "worker is draining and cannot admit new work",
@@ -2226,11 +2295,6 @@ async fn run_activity_lane(
                     };
                     force_fail_undeliverable_activity(worker.as_ref(), &task.task_token, reason)
                         .await;
-                } else if kind == ActivityAdmission::Cancel {
-                    // Cancellation is an update to an existing start, not a
-                    // second completion debt. Unknown, retired, and repeated
-                    // cancellation notifications are diagnostic only.
-                    drop(task);
                 } else {
                     ledger
                         .lock()

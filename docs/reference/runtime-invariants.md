@@ -255,21 +255,37 @@ and bridge, read the [documentation guide](../README.md) first.
   while the token remains tracked, but it never acquires a second completion
   lease. Only a cancellation that arrives after the start has completed is
   stale and may be discarded. This keeps cancellation delivery observable
-  without allowing duplicate-token completion races.
+  without allowing duplicate-token completion races. A cancellation the poll
+  lane cannot attach to a live Start (unknown because the Start completed
+  first, repeated, retired by disposal, malformed, or polled while draining)
+  is dropped silently: it owns no completion debt, and a lane error for it
+  would end `Worker.run` over a benign race (issue #801).
 - If a Core activity task cannot be converted or encoded before it reaches the
   OCaml adapter, Rust fails only an unrepresentable `Start`, because that is
   the task that owns the completion debt. An unrepresentable `Cancel` is
   dropped as an update; failing it through the activity-completion API would
-  consume the still-needed Start lease.
+  consume the still-needed Start lease. The generated failure is a
+  non-retryable application failure of type `UnrepresentableActivityTask`
+  whose message carries only a static conversion category, because every
+  redelivery of the same task would be rejected again. Once Core accepts it
+  (which also releases the task's activity slot), the poll reports
+  `Not_ready` and the worker keeps serving the queue; only a failed Core
+  rejection is fatal (issue #801). Standalone activities (no workflow
+  execution) are not representable and take this path.
 - If OCaml cannot decode a successful poll, it returns the exact untouched
   Rust document to the private rejection ABI. Rust requires full semantic
   equality with retained handoff state before retiring the lease; changed IDs,
   tokens, or content cannot consume real outstanding work. Rejection cleanup
   for a retained Start removes ledger and semantic ownership together even
-  when Core reports an error, while the original OCaml protocol failure
-  remains the primary result. A retained Cancel is different: it is only an
+  when Core reports an error. A retained Cancel is different: it is only an
   update to the Start's shared token, so rejecting that document removes the
   one semantic update without retiring the Start's native completion debt.
+  On a live worker a successful rejection is local task progress, so the
+  supervisor reports an empty poll and keeps polling (issue #801); a workflow
+  rejection then also applies the fixed 100 ms redelivery backoff. A replay
+  keeps the OCaml protocol failure as its result, because skipping history it
+  could not decode would report an unchecked replay as compatible. A failed
+  rejection always keeps the original protocol failure primary.
 - Rejecting a workflow activation fails its Core workflow task, except for a
   pure cache eviction: it owns no workflow task, so every rejection path
   (Rust conversion or encoding failure, OCaml decode failure, replay
