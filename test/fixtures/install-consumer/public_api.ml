@@ -402,6 +402,9 @@ let _signal_handler_name : T.Signal.Handler.t -> string = T.Signal.Handler.name
 let _signal_handler_dispatch :
     T.Signal.Handler.t -> T.Payload.t -> (unit, T.Error.t) result =
   T.Signal.Handler.dispatch
+let _signal_handler_dispatch_payloads :
+    T.Signal.Handler.t -> T.Payload.t list -> (unit, T.Error.t) result =
+  T.Signal.Handler.dispatch_payloads
 
 let _query_define :
     name:string -> output:'output T.Codec.t -> 'output T.Query.t =

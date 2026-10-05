@@ -57,9 +57,10 @@ Consequently:
 - `SignalWorkflow` is deliverable to a registered OCaml workflow handler,
   including its name, repeated payload list, sender identity, and headers.
   The handler is queued on the execution scheduler. The public handler policy
-  accepts exactly one payload; a missing handler or unsupported arity is logged
-  and completed as a non-retryable workflow failure rather than acknowledged
-  as a no-op.
+  accepts one payload and decodes zero payloads as the canonical `binary/null`
+  unit payload; a missing handler or more than one payload is logged and
+  completed as a non-retryable workflow failure rather than acknowledged as a
+  no-op.
 - `QueryWorkflow` is deliverable to a registered output-only or exactly-one-
   input OCaml query handler. Core's repeated arguments and headers remain in
   the private runtime record. Output-only definitions reject non-empty
@@ -183,8 +184,12 @@ are preserved; the bridge does not select an arbitrary element or silently
 discard extra payloads.
 
 The current public signal definition accepts one typed input. The native public
-handler therefore requires exactly one payload and returns a typed,
-non-retryable workflow error for zero or multiple payloads. The runtime still
+handler (`Signal.Handler.dispatch_payloads`) decodes one payload normally and
+returns a typed, non-retryable workflow error for multiple payloads. Zero
+payloads are decoded as the canonical `binary/null` unit payload, matching
+workflow start input: the Temporal CLI, Web UI, and other SDKs send a
+no-argument signal with no payloads, and rejecting it would let any sender
+with signal permission fail a workflow that registers a unit signal. The runtime still
 retains the complete repeated list so a future repeated-input API can be added
 without changing the transport record.
 
