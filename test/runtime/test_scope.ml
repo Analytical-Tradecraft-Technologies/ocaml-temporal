@@ -197,6 +197,36 @@ let test_cancellation_is_idempotent () =
     (Workflow_context_store.take_commands context);
   Workflow_context_store.shutdown context
 
+(** Cancellation recorded before [Scope.await] wins even when the operation is
+    already complete: [await] reads the scope state before racing, and
+    [cancel] records the state and resolves the private signal together, so no
+    "both ready" tie can reach the race. The completed value is not rewritten
+    and stays observable through the future itself. *)
+let test_cancelled_scope_hides_completed_future () =
+  let scheduler = Scheduler.create () in
+  let context = Workflow_context_store.create scheduler in
+  let source, resolve = promise scheduler in
+  resolve (Ok 42);
+  let awaited = ref None in
+  let peeked = ref None in
+  let direct = ref None in
+  with_active_context scheduler context (fun () ->
+      match Temporal.Scope.create () with
+      | Error error -> failwith (Temporal.Error.message error)
+      | Ok scope ->
+          (match Temporal.Scope.cancel scope with
+           | Ok () -> ()
+           | Error error -> failwith (Temporal.Error.message error));
+          awaited := Some (Temporal.Scope.await scope source);
+          peeked := Some (Temporal.Future.peek source);
+          direct := Some (Temporal.Future.await source));
+  expect "cancelled completed run" "complete" (Scheduler.run_label scheduler);
+  expect_error "await on cancelled scope" "cancelled" "workflow scope cancelled"
+    (Option.get !awaited);
+  expect "completed value via peek" (Some (Some (Ok 42))) !peeked;
+  expect "completed value via Future.await" (Some (Ok 42)) !direct;
+  Workflow_context_store.shutdown context
+
 (** Cancellation hooks run in registration order, all hooks are attempted even
     when one reports a typed error, and a late registration runs immediately.
     These properties make attaching activity and child handles deterministic
@@ -436,6 +466,7 @@ let () =
   test_completed_future_and_cleanup ();
   test_cancellation_resumes_waiter ();
   test_cancellation_is_idempotent ();
+  test_cancelled_scope_hides_completed_future ();
   test_cancellation_hooks ();
   test_with_scope_surfaces_cleanup_error ();
   test_with_scope_preserves_body_error ();

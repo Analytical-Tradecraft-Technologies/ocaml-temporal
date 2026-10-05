@@ -343,8 +343,14 @@ Registration and routing have these rules:
 - A call made with a definition whose name has no local handler returns a
   non-retryable `Workflow` error for signals and queries, or an `Update` error
   for updates.
-- A name match with incompatible encoding metadata returns a typed `Codec`
-  error before the callback is invoked.
+- A name match with incompatible *input* encoding metadata returns a typed
+  `Codec` error before the callback is invoked, because the handler decodes
+  its input before calling it.
+- A name match with incompatible *output* encoding metadata is detected only
+  after the handler has run, when the caller decodes the result. For a query
+  the read-only callback has already executed; for an update the validator and
+  implementation have already run and any state change they made stands, even
+  though the caller receives a typed `Codec` error instead of the result.
 - A duplicate registration returns a non-retryable `Defect` from
   `Interaction.create`.
 - A validator's own `Error` is returned unchanged and its implementation is

@@ -148,7 +148,9 @@ and round trips through the pinned Core protobuf types. The expanded live target
 adds exact server-history and worker-replacement evidence for lifecycle
 transitions once its complete CI run succeeds.
 
-Deployment-based worker versioning, side effects, arbitrary historical
+Worker routing, including legacy build-ID and deployment-based versioning, is
+configured separately through `Temporal.Worker.Options`; see
+[worker versioning](worker-versioning.md). Side effects, arbitrary historical
 compatibility, automated migration safety analysis, and histories that have not
-passed both documented gates remain separate roadmap work. For the overall evidence boundary,
-read [live acceptance coverage](live-acceptance-coverage.md).
+passed both documented gates remain separate roadmap work. For the overall
+evidence boundary, read [live acceptance coverage](live-acceptance-coverage.md).
