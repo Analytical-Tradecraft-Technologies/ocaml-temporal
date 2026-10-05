@@ -1144,8 +1144,10 @@ impl Runtime {
         if handle.block_on(worker.validate()).is_err() {
             // The unpublished worker is released here and nowhere else. Core
             // finalization requires both poll APIs to observe `ShutDown`, so
-            // the helper drains them under a bound instead of awaiting
-            // `finalize_shutdown` directly, which hung forever (issue #770).
+            // the helper drains them in a runtime task that owns the worker
+            // until finalization completes, waiting only a bounded time here,
+            // instead of awaiting `finalize_shutdown` directly, which hung
+            // forever (issue #770).
             // `block_on` supplies the runtime context Core's shutdown
             // initiation needs to spawn its deregistration task.
             handle.block_on(crate::worker_bridge::release_unvalidated_worker(worker));

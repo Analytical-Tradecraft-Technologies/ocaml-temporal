@@ -516,11 +516,15 @@ missing) is the sole owner of the unpublished Core worker. Core's
 `poll_activity_task` have returned `ShutDown`, and no poll lane exists yet, so
 awaiting the finalizer directly hangs forever (issue #770). Rust therefore
 initiates shutdown, drives both poll APIs to `ShutDown` itself (force-failing
-any task Core unexpectedly hands out), and then finalizes. Each phase is
-bounded by `UNVALIDATED_WORKER_RELEASE_TIMEOUT` (10 s); on expiry the worker
-is dropped as a last-resort release, so `Worker.create` always returns the
-typed `Temporal workflow worker validation failed` error instead of wedging
-the supervisor Domain. `rust/core-bridge/tests/worker_validation_cleanup.rs`
+any task Core unexpectedly hands out), and then finalizes, all in one task
+on the Core runtime that owns the worker until `finalize_shutdown` finishes.
+The worker is never dropped mid-release, because only `finalize_shutdown`
+performs Core's `finalize_unregister`; a dropped worker would stay in the
+client's worker registry and keep the client alive. `Worker.create` waits at
+most `UNVALIDATED_WORKER_RELEASE_TIMEOUT` (10 s) for that task, so it always
+returns the typed `Temporal workflow worker validation failed` error instead
+of wedging the supervisor Domain; after the bound the task completes the
+release in the background. `rust/core-bridge/tests/worker_validation_cleanup.rs`
 covers this path with a plaintext HTTP/2 gRPC double rather than a server.
 
 The worker owns two Tokio poll lanes: exactly one calls Core's workflow poll and

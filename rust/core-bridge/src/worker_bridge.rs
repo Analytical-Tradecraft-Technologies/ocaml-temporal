@@ -149,32 +149,32 @@ const UNVALIDATED_WORKER_POLL_ERROR_BACKOFF: Duration = Duration::from_millis(10
 /// observe shutdown, and nobody else will ever poll this worker. Awaiting the
 /// finalizer directly therefore hung `Worker.create` forever (issue #770).
 ///
-/// The function initiates shutdown, drives both poll APIs until each reports
-/// `ShutDown`, force-fails any task Core unexpectedly hands out (so no
-/// completion debt blocks finalization), and then finalizes. Each phase is
-/// bounded by [`UNVALIDATED_WORKER_RELEASE_TIMEOUT`]. If the drain or the
-/// finalizer exceeds that bound, the worker is dropped as a last-resort
-/// release so the caller can still return its typed error. Must run inside
-/// the worker's Tokio runtime, because `initiate_shutdown` spawns Core's
-/// deregistration task.
+/// The release runs as one task on the worker's Tokio runtime. That task owns
+/// the worker until `finalize_shutdown` completes: it initiates shutdown,
+/// drives both poll APIs until each reports `ShutDown`, force-fails any task
+/// Core unexpectedly hands out (so no completion debt blocks finalization), and
+/// then finalizes. The worker is never dropped mid-release, because only
+/// `finalize_shutdown` performs Core's `finalize_unregister`; dropping it
+/// instead would leave the worker registrator in the client's registry, which
+/// keeps the client alive through an `Arc` cycle.
+///
+/// The caller waits at most [`UNVALIDATED_WORKER_RELEASE_TIMEOUT`] so it can
+/// still return its typed error if Core's `ShutdownWorker` RPC is slow. After
+/// that bound the task keeps ownership and completes the release in the
+/// background; it ends only when finalization finishes or the runtime itself
+/// is shut down. Must run inside the worker's Tokio runtime.
 pub async fn release_unvalidated_worker(worker: Worker) {
-    worker.initiate_shutdown();
-    let drained = tokio::time::timeout(UNVALIDATED_WORKER_RELEASE_TIMEOUT, async {
+    let release = tokio::spawn(async move {
+        worker.initiate_shutdown();
         tokio::join!(
             drain_unvalidated_workflow_polls(&worker),
             drain_unvalidated_activity_polls(&worker)
-        )
-    })
-    .await
-    .is_ok();
-    if drained {
-        // A timeout drops the finalizer future, and with it the worker.
-        let _ = tokio::time::timeout(
-            UNVALIDATED_WORKER_RELEASE_TIMEOUT,
-            worker.finalize_shutdown(),
-        )
-        .await;
-    }
+        );
+        worker.finalize_shutdown().await;
+    });
+    // Elapsing only stops waiting: the spawned task keeps the worker and still
+    // completes `finalize_shutdown`, including Core's unregister step.
+    let _ = tokio::time::timeout(UNVALIDATED_WORKER_RELEASE_TIMEOUT, release).await;
 }
 
 /// Polls workflow activations on a shut-down, unvalidated worker until Core
