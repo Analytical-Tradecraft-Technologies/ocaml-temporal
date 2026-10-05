@@ -671,7 +671,10 @@ language completions. On the dedicated cleanup thread it force-fails
 outstanding Core tasks, joins the poll lanes with the same bounded drain, and
 attempts the same bounded finalization. Its force-completion acknowledges a
 pure cache eviction (leased or queued) empty and fails every other activation,
-and it tombstones each completed run ID until the lanes join. Core answers
+and it tombstones each completed run ID until the lanes join. The workflow
+lane records the eviction bit in the same ledger critical section that admits
+the run, so dispose classifies an entry correctly even when the lane has
+admitted it but not yet enqueued its message. Core answers
 each such failure with a same-run eviction; the workflow poll lane
 acknowledges a retired run's eviction empty instead of dropping it as a
 duplicate, because Core keeps at most one activation outstanding per run and

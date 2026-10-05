@@ -2688,6 +2688,9 @@ the workflow poll never reported `ShutDown`: close waited out the 90 s drain
 bound and released an unfinalized worker. The lane now acknowledges a retired
 run's pure eviction with an empty completion, and dispose's own
 force-completion acknowledges leased or queued evictions empty instead of
-failing them. `rust/core-bridge/tests/runtime_dispose_eviction.rs` drives a
+failing them. The ledger records each run's eviction bit when the poll lane
+admits it, so an entry admitted but not yet enqueued at the disposal snapshot
+is still acknowledged rather than failed.
+`rust/core-bridge/tests/runtime_dispose_eviction.rs` drives a
 leased activation through runtime close against a gRPC double and fails
 within 30 s without the fix.
