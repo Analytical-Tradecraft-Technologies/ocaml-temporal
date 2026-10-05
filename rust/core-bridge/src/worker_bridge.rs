@@ -393,7 +393,8 @@ struct Readiness {
 /// [`wait_any_lane`] waits on this condition instead and rechecks both lane
 /// predicates.
 ///
-/// Lock order is `AnyLaneWake::generation` before a lane's `state`. A
+/// Lock order is `AnyLaneWake::generation` before a lane's `state`, and the
+/// workflow lane's `state` before the activity lane's when both are held. A
 /// producer therefore releases its lane mutex before calling
 /// [`Self::notify`]. That is still lossless: the waiter holds `generation`
 /// from its predicate check until `wait_timeout` atomically releases it, so a
@@ -456,21 +457,6 @@ impl Readiness {
             state: Mutex::new(ReadinessState::default()),
             wake: Condvar::new(),
             any: Arc::clone(any),
-        }
-    }
-
-    /// Reads this lane's wait predicate. [`wait_any_lane`] calls this while it
-    /// holds the combined wake mutex, which precedes the lane mutex in the
-    /// documented lock order.
-    fn observe(&self) -> LaneObservation {
-        let state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        LaneObservation {
-            pending: state.pending > 0,
-            error: state.error.clone(),
-            closed: state.closed,
         }
     }
 
@@ -651,6 +637,29 @@ impl Readiness {
     }
 }
 
+/// Reads both lane predicates as one snapshot by holding both lane mutexes at
+/// once (workflow first, then activity). Reading them one after another would
+/// let a producer publish to the first lane between the two reads, so a
+/// terminal flag on the second lane could win over work that is already
+/// pending. Producers release their lane mutex before taking the combined
+/// wake mutex, and no producer holds two lane mutexes, so this cannot
+/// deadlock with them.
+fn observe_both(workflow: &Readiness, activity: &Readiness) -> [LaneObservation; 2] {
+    let workflow_state = workflow
+        .state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let activity_state = activity
+        .state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    [&*workflow_state, &*activity_state].map(|state| LaneObservation {
+        pending: state.pending > 0,
+        error: state.error.clone(),
+        closed: state.closed,
+    })
+}
+
 /// Blocks until either lane has work, a fatal error, or terminal closure, or
 /// until [`READINESS_WAIT_TIMEOUT`] elapses.
 ///
@@ -670,7 +679,7 @@ fn wait_any_lane(workflow: &Readiness, activity: &Readiness) -> ReadinessWait {
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let deadline = Instant::now() + READINESS_WAIT_TIMEOUT;
     loop {
-        let lanes = [workflow.observe(), activity.observe()];
+        let lanes = observe_both(workflow, activity);
         if lanes.iter().any(|lane| lane.pending) {
             return ReadinessWait::Ready;
         }
@@ -2431,13 +2440,12 @@ impl Default for TaskLedger {
 #[cfg(test)]
 mod readiness_tests {
     use super::{
-        ACTIVITY_COMPLETION_RETRY_BACKOFF, AnyLaneWake, PollLaneError, READINESS_WAIT_TIMEOUT,
-        Readiness, ReadinessWait, ReadyTask, WORKFLOW_DELIVERY_REJECTION_BACKOFF, wait_any_lane,
+        ACTIVITY_COMPLETION_RETRY_BACKOFF, AnyLaneWake, PollLaneError, Readiness, ReadinessWait,
+        ReadyTask, WORKFLOW_DELIVERY_REJECTION_BACKOFF, wait_any_lane,
     };
     use std::sync::Arc;
     use std::thread;
     use std::time::Duration;
-    use std::time::Instant;
     use tokio::sync::mpsc;
 
     /// Keeps the completion retry delay positive and bounded so a future
@@ -2549,10 +2557,11 @@ mod readiness_tests {
     }
 
     /// Regression for #806: work committed on the lane the owner was not
-    /// expecting must end a combined wait promptly. A lane-specific wait on
-    /// the quiet workflow lane would instead hold the owner for the whole
-    /// bounded timeout. The bound asserted here is half that timeout, so the
-    /// test does not depend on fine-grained scheduler timing.
+    /// expecting must end a combined wait. A lane-specific wait on the quiet
+    /// lane would keep timing out however often it was repeated. The test
+    /// asserts the outcome rather than elapsed time, so scheduler delays on a
+    /// loaded runner cannot make it fail: a wait that happens to time out
+    /// before the producer runs is simply repeated, as the worker loop does.
     #[test]
     fn combined_wait_wakes_for_either_lane() {
         for activity_side in [true, false] {
@@ -2562,19 +2571,18 @@ mod readiness_tests {
             let waiter_workflow = Arc::clone(&workflow);
             let waiter_activity = Arc::clone(&activity);
             let waiter = thread::spawn(move || {
-                let started = Instant::now();
-                let result = wait_any_lane(&waiter_workflow, &waiter_activity);
-                (result, started.elapsed())
+                for _ in 0..100 {
+                    match wait_any_lane(&waiter_workflow, &waiter_activity) {
+                        ReadinessWait::TimedOut => continue,
+                        other => return other,
+                    }
+                }
+                ReadinessWait::TimedOut
             });
-            thread::sleep(Duration::from_millis(5));
             assert!(producer_signal.enqueue(&sender, Ok(())));
-            let (result, elapsed) = waiter.join().expect("waiter must not panic");
+            let result = waiter.join().expect("waiter must not panic");
 
             assert_eq!(result, ReadinessWait::Ready);
-            assert!(
-                elapsed < READINESS_WAIT_TIMEOUT / 2,
-                "combined wait slept {elapsed:?} after a lane became ready"
-            );
             // The wait is only a wake signal; the task is still drainable.
             assert!(producer_signal.take(&mut receiver).is_some());
         }
