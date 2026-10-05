@@ -2,7 +2,14 @@
 set -eu
 
 target_dir=${CARGO_TARGET_DIR:-_build/rust}
-archive="$target_dir/debug/libocaml_temporal_core_bridge.a"
+# Test the archive of the same Cargo profile that scripts/build-rust-bridge.sh
+# selects (#779): Dune's release profile links target/release, every other
+# profile target/debug. The default matches Dune's default dev build.
+case "${OCAML_TEMPORAL_BUILD_PROFILE:-dev}" in
+  release) cargo_profile=release; profile_dir=release ;;
+  *) cargo_profile=dev; profile_dir=debug ;;
+esac
+archive="$target_dir/$profile_dir/libocaml_temporal_core_bridge.a"
 output_dir=_build/test/bridge
 binary="$output_dir/abi_harness"
 native_link_output=$(mktemp)
@@ -26,6 +33,7 @@ else
 CARGO_TERM_COLOR=never cargo rustc \
   --manifest-path rust/Cargo.toml \
   --package ocaml-temporal-core-bridge \
+  --profile "$cargo_profile" \
   --locked \
   --lib \
   --crate-type staticlib \
