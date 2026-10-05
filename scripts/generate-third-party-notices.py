@@ -26,7 +26,7 @@ import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 
 HEADER = "ocaml-temporal third-party notices"
@@ -161,7 +161,18 @@ def collect_files(package: dict[str, Any]) -> list[Notice]:
     return notices
 
 
-def standard_choice(node: Any, available: set[str]) -> list[str] | None:
+class LicenseExpression(Protocol):
+    """Structural view of a parsed SPDX expression node from the shared
+    licence scanner (`check-cargo-licenses.py`'s `Node`): a leaf licence, or an
+    `and`/`or`/`with` combination of a left and right operand."""
+
+    kind: str
+    value: str | None
+    left: "LicenseExpression | None"
+    right: "LicenseExpression | None"
+
+
+def standard_choice(node: LicenseExpression, available: set[str]) -> list[str] | None:
     """Pick licence identifiers satisfiable with this repository's standard texts.
 
     An `OR` takes its first satisfiable branch, an `AND` needs both branches,
