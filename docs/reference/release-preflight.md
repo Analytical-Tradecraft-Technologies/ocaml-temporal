@@ -149,10 +149,14 @@ before publishing.
 ## Tag consistency gate
 
 Before creating a release tag, run `make release-tag-check RELEASE_TAG=vX.Y.Z`.
-For a prerelease, use either the familiar `v1.0.0-beta.1` spelling or the
-equivalent OPAM-native `v1.0.0~beta.1` spelling. The checker records the
-package version as `1.0.0~beta.1` in both cases, because OPAM's tilde ordering
-keeps the beta below the eventual `1.0.0` release.
+For a prerelease, the Git tag uses the SemVer hyphen spelling
+`v1.0.0-beta.1`, while `.release-version` and both opam files use the OPAM
+spelling `1.0.0~beta.1`, because OPAM's tilde ordering keeps the beta below
+the eventual `1.0.0` release. The checker converts exactly one character: the
+first hyphen after `vMAJOR.MINOR.PATCH` becomes `~`, and the prerelease suffix
+is otherwise compared unchanged. Git refnames cannot contain `~`, so a tag
+input such as `v1.0.0~beta.1` can never exist; the checker and the release
+asset packager reject it with an error that names the hyphen spelling.
 The check accepts only a three-part numeric tag with an optional prerelease
 suffix and verifies the normalized version against `.release-version`,
 `temporal-sdk.opam`, and `temporal-sdk.opam.locked`. A development checkout

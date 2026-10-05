@@ -111,7 +111,7 @@ jobs:
           set -euo pipefail
           flags=()
           case "$RELEASE_TAG" in
-            *-*|*~*) flags=(--prerelease) ;;
+            *-*) flags=(--prerelease) ;;
           esac
           sh scripts/check-release-tag-commit.sh "$RELEASE_TAG" "$GITHUB_SHA"
           # Assets are uploaded to a draft before anything is published.

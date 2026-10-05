@@ -36,6 +36,20 @@ git -C "$fixture/checkout" push origin refs/tags/v1.0.0-light refs/tags/v1.0.0-a
 (cd "$fixture/checkout" && sh "$script" v1.0.0-light "$first")
 (cd "$fixture/checkout" && sh "$script" v1.0.0-annotated "$first")
 
+# The OPAM tilde spelling can never name a Git tag; it fails with guidance
+# before any fetch is attempted.
+if error=$(cd "$fixture/checkout" && sh "$script" 'v1.0.0~beta.1' "$first" 2>&1); then
+  echo "release accepted a '~' tag that Git cannot represent" >&2
+  exit 1
+fi
+case "$error" in
+  *"cannot contain '~'"*) ;;
+  *)
+    echo "release gave an unclear '~' tag rejection: $error" >&2
+    exit 1
+    ;;
+esac
+
 # A missing tag or a tag on another commit must stop publication.
 if (cd "$fixture/checkout" && sh "$script" v1.0.0-missing "$first" >/dev/null 2>&1); then
   echo 'release accepted a missing tag' >&2

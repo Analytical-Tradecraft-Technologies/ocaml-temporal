@@ -66,7 +66,11 @@ def validate_bundle(bundle, platform):
 
 def package_bridges(bundles, output, tag, commit):
     """Require all supported platforms before creating the release manifest."""
-    if not re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+(?:[-~][A-Za-z0-9.-]+)?", tag):
+    # Git refnames cannot contain "~", so prerelease tags use the SemVer hyphen
+    # (v1.0.0-beta.1) even though OPAM records the version as 1.0.0~beta.1.
+    if "~" in tag:
+        raise ValueError("invalid release tag: Git tags cannot contain '~'; use the hyphen spelling")
+    if not re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9.-]+)?", tag):
         raise ValueError("invalid release tag")
     if not re.fullmatch(r"[0-9a-f]{40}", commit):
         raise ValueError("release source must be an exact commit")

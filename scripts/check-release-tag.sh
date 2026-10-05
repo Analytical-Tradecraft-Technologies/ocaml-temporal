@@ -19,30 +19,28 @@ case "$tag" in
   *) fail "tag must start with v (got $tag)" ;;
 esac
 
+# Git refnames cannot contain "~" (see git-check-ref-format(1)), so a tag such
+# as v1.0.0~beta.1 can never exist. Reject that spelling explicitly instead of
+# validating a tag the release workflow could never fetch or publish.
+case "$tag" in
+  *~*)
+    fail "tag cannot contain '~' because Git refnames forbid it; spell the prerelease with a hyphen, e.g. $(printf '%s\n' "$tag" | sed 's/~/-/') (got $tag)" ;;
+esac
+
 # Accept three numeric components plus an optional prerelease suffix. Git tags
-# may use the familiar SemVer hyphen (v1.0.0-beta.1), but OPAM deliberately
-# uses a tilde for prereleases so that a beta sorts before the final 1.0.0.
-# Normalize the former to the latter before comparing package metadata.
+# spell a prerelease with the SemVer hyphen (v1.0.0-beta.1), while OPAM
+# deliberately uses a tilde so that a beta sorts before the final 1.0.0. The
+# normalization is exact: only the first hyphen, which separates the core
+# version from the prerelease, becomes "~"; the suffix is otherwise unchanged.
 tag_version=${tag#v}
 core=$tag_version
 prerelease=
-separator=
 case "$tag_version" in
   *-*)
     core=${tag_version%%-*}
     prerelease=${tag_version#*-}
-    separator=-
-    ;;
-  *~*)
-    core=${tag_version%%~*}
-    prerelease=${tag_version#*~}
-    separator='~'
-    ;;
-esac
-case "$separator" in
-  -|~)
     case "$prerelease" in
-      '' | .* | *. | *..* | *[!A-Za-z0-9.-]* | *~*)
+      '' | .* | *. | *..* | *[!A-Za-z0-9.-]*)
         fail "tag has an invalid prerelease suffix (got $tag)" ;;
     esac
     ;;
@@ -59,10 +57,11 @@ for component in "$@"; do
   [ -n "$component" ] || fail "tag contains an empty version component"
 done
 
-case "$separator" in
-  -) version="$core~$prerelease" ;;
-  *) version="$tag_version" ;;
-esac
+if [ -n "$prerelease" ]; then
+  version="$core~$prerelease"
+else
+  version="$core"
+fi
 
 [ -f .release-version ] || fail "missing .release-version"
 release_version=$(sed 's/\r$//' .release-version)
