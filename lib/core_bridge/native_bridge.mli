@@ -15,6 +15,7 @@ type status =
   | Already_started
   | Retryable
   | Async_heartbeat_rejected
+  | Resource_exhausted
   | Unknown of int
 
 (** Error copied into the OCaml heap. Once returned, it contains no pointer to
@@ -241,6 +242,12 @@ val worker_try_poll_activity : runtime -> (bytes, error) result
 (** Waits for remote-activity readiness without consuming a task. It has the
     same bounded lock-release semantics as [worker_wait_workflow]. *)
 val worker_wait_activity : runtime -> (unit, error) result
+
+(** Waits for readiness on either worker lane without consuming a task. It has
+    the same bounded lock-release semantics as [worker_wait_workflow], but a
+    queued task on either lane ends it, so the worker loop's single idle wait
+    cannot sleep through work on the lane it did not expect. *)
+val worker_wait_any : runtime -> (unit, error) result
 
 (** Applies the fixed native delay used only after an explicit retryable
     activity-completion transport outcome. *)

@@ -19,8 +19,12 @@ type progress =
     a separate per-run signal; it never changes the worker shutdown flag.
 
     [wait_for_lane] receives [native_wait = true] only when both lanes are idle
-    and this lane holds the single native-wait token. Otherwise it must perform
-    a short bounded local yield without entering the supervisor mailbox.
+    and this lane holds the single native-wait token. That bounded native wait
+    must end as soon as {e either} lane has work, not only the token holder's:
+    the token rotates between lanes, so a lane-specific wait would sleep
+    through the sibling's task for the whole bound on every other step of a
+    sequential workflow (#806). Otherwise it must perform a short bounded local
+    yield without entering the supervisor mailbox.
     [retry_pending] must apply a real bounded backoff even if unrelated work is
     ready, so an uncertain completion cannot spin or rerun its callback. *)
 val run :

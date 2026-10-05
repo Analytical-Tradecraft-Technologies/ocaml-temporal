@@ -49,12 +49,26 @@ let fetch_embedding =
     ~output:Temporal.Codec.string
     (fun context prompt ->
       let handle = Temporal.Activity.Async_context.handle context in
+      (* Retry while the error is retryable: the handoff may not be accepted
+         yet, or the RPC outcome may be uncertain. Production code should back
+         off between attempts and bound the retry budget. *)
+      let rec deliver submit =
+        match submit () with
+        | Error error when not (Temporal.Error.view error).non_retryable ->
+            Unix.sleepf 0.05;
+            deliver submit
+        | result -> result
+      in
       start_external_request prompt (fun result ->
-        match result with
-        | Ok embedding ->
-            ignore (Temporal.Activity.Async_handle.complete handle embedding)
-        | Error error ->
-            ignore (Temporal.Activity.Async_handle.fail handle error));
+        let outcome =
+          match result with
+          | Ok embedding ->
+              deliver (fun () ->
+                  Temporal.Activity.Async_handle.complete handle embedding)
+          | Error error ->
+              deliver (fun () -> Temporal.Activity.Async_handle.fail handle error)
+        in
+        Result.iter_error report_undelivered_result outcome);
       Temporal.Activity.Will_complete_async handle)
 ```
 
@@ -63,6 +77,22 @@ let fetch_embedding =
 acknowledgement does the adapter activate the opaque handle and move the copied
 binary task token into its asynchronous-lease registry. The callback cannot use
 the handle synchronously before the handoff is accepted.
+
+External code can nevertheless race the handoff: the completer may finish
+before the callback returns, or while the worker acknowledgement is still
+waiting on the supervisor or on a retry after an uncertain submission. Such a
+call returns a retryable error (`non_retryable = false`) without contacting
+Temporal or reserving a request, so the caller simply retries the same
+operation (#766). The handle neither buffers the operation nor blocks the
+caller: a buffered request could only report its later native outcome to a
+caller that has already returned, and blocking could deadlock when the caller
+is the dispatch thread itself. A retry loop always terminates, because every
+handle that can no longer be activated is closed and then returns a
+non-retryable error: the callback returned `Completed` or `Failed`, raised, ran
+as a local activity, or returned another attempt's handle; or the worker
+discarded the unaccepted handoff during terminal cleanup. Calling the handle
+synchronously from inside the callback is a programmer error; retrying there
+cannot succeed because the handoff only starts after the callback returns.
 
 This definition is executable only on the native worker path, where the Rust
 bridge can acknowledge the Core handoff and own the later client operation. A

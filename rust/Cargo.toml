@@ -10,6 +10,7 @@ rust-version = "1.94"
 
 [workspace.dependencies]
 base64 = "0.23.0"
+flate2 = "1.1.10"
 h2 = "0.4.19"
 http = "1.5.0"
 prost = "0.14.4"
@@ -23,7 +24,15 @@ temporalio-protos = { git = "https://github.com/temporalio/sdk-core.git", rev = 
 tokio = { version = "1.52.3", features = ["rt", "sync", "time"] }
 uuid = { version = "1.23.4", default-features = false, features = ["v4"] }
 
+# Linked by Dune's release profile, which [opam install] and [dune build -p]
+# select, and by published release bridge bundles (#779). Other Dune profiles
+# use Cargo's dev profile for fast local iteration.
 [profile.release]
 lto = "thin"
 codegen-units = 1
 strip = "debuginfo"
+# The bridge contains Rust panics with catch_unwind at the C ABI boundary and
+# reports them to OCaml as typed failures. Aborting on panic would turn those
+# contained failures into process aborts, so unwinding is pinned here rather
+# than left to Cargo's default.
+panic = "unwind"

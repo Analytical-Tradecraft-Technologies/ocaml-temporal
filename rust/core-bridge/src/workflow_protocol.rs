@@ -2174,6 +2174,92 @@ use temporalio_protos::{
     temporal::api::{common::v1 as api_common, enums::v1 as api_enums, failure::v1 as api_failure},
 };
 
+/// Maximum failure layers (the outermost failure plus its causes) that one
+/// inbound Core failure may contribute to a semantic document.
+///
+/// Temporal Server accepts cause chains that, once wrapped in an activation
+/// job, can exceed the bilateral 128-level JSON nesting limit. Prost's default
+/// 100-level decode recursion limit already bounds chains received over gRPC,
+/// so this cap matches it: chains Core can actually deliver convert unchanged,
+/// while a longer chain degrades deterministically instead of making the
+/// activation unrepresentable. The deepest activation location
+/// (`continued_failure`, at JSON depth 6) plus 100 layers plus the five levels
+/// beneath one layer's detail payload metadata stays at depth 110, leaving
+/// headroom for a completion that wraps the received failure in its own
+/// layers.
+pub const MAX_INBOUND_FAILURE_LAYERS: usize = 100;
+
+/// Fits inbound Core free text into the bridge's decoded-string limit.
+///
+/// Temporal Server permits failure messages, stack traces, identities, and
+/// reasons longer than [`MAX_STRING_BYTES`]. Because the history event is
+/// immutable, rejecting such text would fail every replay of the workflow
+/// task forever. Oversized text is instead cut at the last UTF-8 character
+/// boundary that leaves room for a marker naming the original byte length, so
+/// the result is at most [`MAX_STRING_BYTES`] bytes. The transformation is a
+/// pure function of its input, so every replay of the same history observes
+/// the same text. Text already within the limit is returned unchanged.
+pub(crate) fn inbound_text(value: &str) -> String {
+    if value.len() <= MAX_STRING_BYTES {
+        return value.to_owned();
+    }
+    let marker = format!(
+        "\n[truncated by ocaml-temporal: original length {} bytes]",
+        value.len()
+    );
+    let mut cut = MAX_STRING_BYTES - marker.len();
+    while !value.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let mut truncated = String::with_capacity(cut + marker.len());
+    truncated.push_str(&value[..cut]);
+    truncated.push_str(&marker);
+    truncated
+}
+
+/// Fits an inbound sender identity into the stricter text contract that the
+/// OCaml decoder applies to signal and update identities.
+///
+/// Temporal accepts any protobuf string as a caller identity, including one
+/// with an embedded NUL, but the semantic protocol keeps NUL out of these
+/// fields. Identities are diagnostic metadata that workflow code cannot use
+/// to address anything, so each NUL is replaced with U+FFFD before the length
+/// bound of [`inbound_text`] is applied. Both steps are deterministic, keeping
+/// replay stable.
+fn inbound_identity(value: &str) -> String {
+    if value.as_bytes().contains(&0) {
+        inbound_text(&value.replace('\0', "\u{FFFD}"))
+    } else {
+        inbound_text(value)
+    }
+}
+
+/// Reports whether an inbound header or memo key can cross the semantic
+/// protocol, whose map keys share the Temporal identifier contract
+/// (non-empty, NUL-free, bounded).
+fn addressable_map_key(key: &str) -> bool {
+    !key.is_empty() && key.len() <= MAX_STRING_BYTES && !key.as_bytes().contains(&0)
+}
+
+/// Converts an inbound Core header or memo map.
+///
+/// Temporal Server forwards client-supplied header and memo keys without
+/// applying the semantic protocol's key rule, so a remote client can send an
+/// empty or NUL-containing key. Rejecting the activation would wedge the
+/// workflow on every replay, and escaping the key could collide with a real
+/// key. Such an entry is therefore dropped, deterministically; no OCaml
+/// workflow or interceptor could name it through the SDK's identifier-checked
+/// API anyway. Payload values of retained entries are copied exactly.
+fn inbound_payload_map_from_core<'a>(
+    entries: impl IntoIterator<Item = (&'a String, &'a api_common::Payload)>,
+) -> Result<BTreeMap<String, Payload>, CoreConversionError> {
+    entries
+        .into_iter()
+        .filter(|(key, _)| addressable_map_key(key))
+        .map(|(key, payload)| Ok((key.clone(), payload_from_core(payload)?)))
+        .collect()
+}
+
 /// Copies one Core payload while rejecting external references this JSON slice cannot preserve.
 pub(crate) fn payload_from_core(
     value: &api_common::Payload,
@@ -2385,17 +2471,27 @@ fn nexus_retry_behavior_to_core(value: NexusHandlerRetryBehavior) -> i32 {
 /// Converts a recursive official failure. Every `failure_info` arm of the
 /// pinned schema has a semantic variant, and an absent `failure_info` becomes
 /// [`FailureInfo::Absent`], so a failure kind alone never rejects an
-/// activation.
+/// activation. Free text is bounded with [`inbound_text`] and the cause chain
+/// with [`MAX_INBOUND_FAILURE_LAYERS`], so text length and chain depth that
+/// Temporal Server accepts never reject one either.
 pub(crate) fn failure_from_core(
     value: &api_failure::Failure,
 ) -> Result<Failure, CoreConversionError> {
+    failure_from_core_at(value, 1)
+}
+
+/// Converts the failure found at 1-based `layer` of an inbound cause chain.
+fn failure_from_core_at(
+    value: &api_failure::Failure,
+    layer: usize,
+) -> Result<Failure, CoreConversionError> {
     use api_failure::failure::FailureInfo as Core;
     let Some(core_info) = value.failure_info.as_ref() else {
-        return failure_layer_from_core(value, FailureInfo::Absent {});
+        return failure_layer_from_core(value, FailureInfo::Absent {}, layer);
     };
     let info = match core_info {
         Core::ApplicationFailureInfo(info) => FailureInfo::Application {
-            type_name: info.r#type.clone(),
+            type_name: inbound_text(&info.r#type),
             non_retryable: info.non_retryable,
             details: payloads_from_core(info.details.as_ref())?,
             category: application_category_from_core(info.category)?,
@@ -2407,15 +2503,15 @@ pub(crate) fn failure_from_core(
         },
         Core::CanceledFailureInfo(info) => FailureInfo::Canceled {
             details: payloads_from_core(info.details.as_ref())?,
-            identity: info.identity.clone(),
+            identity: inbound_text(&info.identity),
         },
         Core::TerminatedFailureInfo(info) => FailureInfo::Terminated {
-            identity: info.identity.clone(),
+            identity: inbound_text(&info.identity),
         },
         Core::ActivityFailureInfo(info) => FailureInfo::Activity {
             scheduled_event_id: info.scheduled_event_id,
             started_event_id: info.started_event_id,
-            identity: info.identity.clone(),
+            identity: inbound_text(&info.identity),
             activity_type: info
                 .activity_type
                 .as_ref()
@@ -2461,44 +2557,153 @@ pub(crate) fn failure_from_core(
             let operation_id = info.operation_id.clone();
             FailureInfo::NexusOperation(Box::new(NexusOperationFailure {
                 scheduled_event_id: info.scheduled_event_id,
-                endpoint: info.endpoint.clone(),
-                service: info.service.clone(),
-                operation: info.operation.clone(),
-                operation_id,
-                operation_token: info.operation_token.clone(),
+                endpoint: inbound_text(&info.endpoint),
+                service: inbound_text(&info.service),
+                operation: inbound_text(&info.operation),
+                operation_id: inbound_text(&operation_id),
+                operation_token: inbound_text(&info.operation_token),
             }))
         }
         Core::NexusHandlerFailureInfo(info) => FailureInfo::NexusHandler {
-            type_name: info.r#type.clone(),
+            type_name: inbound_text(&info.r#type),
             retry_behavior: nexus_retry_behavior_from_core(info.retry_behavior)?,
         },
     };
-    failure_layer_from_core(value, info)
+    failure_layer_from_core(value, info, layer)
 }
 
 /// Converts the fields shared by every failure layer around an already
 /// converted `info`, recursing through the cause chain.
+///
+/// When the chain is longer than [`MAX_INBOUND_FAILURE_LAYERS`], the cause
+/// that would become the final permitted layer is replaced, together with
+/// everything beneath it, by one synthetic
+/// [`FailureInfo::Absent`] layer whose message names how many layers were
+/// omitted. Retained layers convert exactly as usual, and the replacement
+/// depends only on the history, so replay remains deterministic.
 fn failure_layer_from_core(
     value: &api_failure::Failure,
     info: FailureInfo,
+    layer: usize,
 ) -> Result<Failure, CoreConversionError> {
+    let cause = match value.cause.as_deref() {
+        None => None,
+        // The cause becomes layer `layer + 1`, which never exceeds the cap.
+        // At the cap it is kept only when it is the chain's final failure.
+        Some(cause) if layer + 1 < MAX_INBOUND_FAILURE_LAYERS || cause.cause.is_none() => {
+            Some(Box::new(failure_from_core_at(cause, layer + 1)?))
+        }
+        Some(cause) => Some(Box::new(omitted_causes_failure(cause))),
+    };
     Ok(Failure {
-        message: value.message.clone(),
-        source: value.source.clone(),
-        stack_trace: value.stack_trace.clone(),
+        message: inbound_text(&value.message),
+        source: inbound_text(&value.source),
+        stack_trace: inbound_text(&value.stack_trace),
         encoded_attributes: value
             .encoded_attributes
             .as_ref()
             .map(payload_from_core)
             .transpose()?,
-        cause: value
-            .cause
-            .as_deref()
-            .map(failure_from_core)
-            .transpose()?
-            .map(Box::new),
+        cause,
         info,
     })
+}
+
+/// Decides retryability for the omitted tail of a cause chain with the same
+/// rule as the OCaml `Workflow_protocol.failure_non_retryable`: the first layer
+/// that carries a decision wins, and layers that defer to their cause (timeout,
+/// reset-workflow, Nexus operation, absent, or an activity/child wrapper with
+/// an unset or unspecified retry state) are skipped. A chain with no deciding
+/// layer is retryable. The walk is iterative, so the tail's length needs no
+/// recursion, and unknown enum values defer like an unspecified state.
+fn omitted_tail_non_retryable(first_omitted: &api_failure::Failure) -> bool {
+    use api_enums::NexusHandlerErrorRetryBehavior as Nexus;
+    use api_enums::RetryState;
+    use api_failure::failure::FailureInfo as Core;
+    let wrapper = |retry_state: i32| match RetryState::try_from(retry_state) {
+        Ok(RetryState::NonRetryableFailure | RetryState::MaximumAttemptsReached) => Some(true),
+        Ok(
+            RetryState::InProgress
+            | RetryState::Timeout
+            | RetryState::InternalServerError
+            | RetryState::CancelRequested,
+        ) => Some(false),
+        Ok(RetryState::RetryPolicyNotSet | RetryState::Unspecified) | Err(_) => None,
+    };
+    let mut cursor = Some(first_omitted);
+    while let Some(failure) = cursor {
+        let decision = match failure.failure_info.as_ref() {
+            Some(Core::ApplicationFailureInfo(info)) => Some(info.non_retryable),
+            Some(Core::CanceledFailureInfo(_)) => Some(false),
+            Some(Core::TerminatedFailureInfo(_)) => Some(true),
+            Some(Core::ActivityFailureInfo(info)) => wrapper(info.retry_state),
+            Some(Core::ChildWorkflowExecutionFailureInfo(info)) => wrapper(info.retry_state),
+            Some(Core::ServerFailureInfo(info)) => Some(info.non_retryable),
+            Some(Core::NexusHandlerFailureInfo(info)) => {
+                match Nexus::try_from(info.retry_behavior) {
+                    Ok(Nexus::NonRetryable) => Some(true),
+                    Ok(Nexus::Retryable) => Some(false),
+                    // Mirrors the OCaml Nexus specification default by type.
+                    Ok(Nexus::Unspecified) | Err(_) => Some(matches!(
+                        info.r#type.as_str(),
+                        "BAD_REQUEST"
+                            | "UNAUTHENTICATED"
+                            | "UNAUTHORIZED"
+                            | "NOT_FOUND"
+                            | "NOT_IMPLEMENTED"
+                            | "CONFLICT"
+                    )),
+                }
+            }
+            Some(
+                Core::TimeoutFailureInfo(_)
+                | Core::ResetWorkflowFailureInfo(_)
+                | Core::NexusOperationExecutionFailureInfo(_),
+            )
+            | None => None,
+        };
+        if let Some(non_retryable) = decision {
+            return non_retryable;
+        }
+        cursor = failure.cause.as_deref();
+    }
+    false
+}
+
+/// Builds the synthetic final layer that stands in for the omitted tail of an
+/// over-deep inbound cause chain. The tail is walked iteratively, so counting
+/// it needs no recursion however long it is.
+///
+/// The stand-in must not change the chain's public retryability. When the
+/// omitted tail decides the failure is non-retryable, the stand-in carries an
+/// authoritative `Server { non_retryable: true }` decision; otherwise it is an
+/// `Absent` layer, which defers to its (missing) cause and so stays retryable,
+/// exactly as the omitted tail would have decided.
+fn omitted_causes_failure(first_omitted: &api_failure::Failure) -> Failure {
+    let mut omitted = 0usize;
+    let mut cursor = Some(first_omitted);
+    while let Some(failure) = cursor {
+        omitted += 1;
+        cursor = failure.cause.as_deref();
+    }
+    let info = if omitted_tail_non_retryable(first_omitted) {
+        FailureInfo::Server {
+            non_retryable: true,
+        }
+    } else {
+        FailureInfo::Absent {}
+    };
+    Failure {
+        message: format!(
+            "[truncated by ocaml-temporal: {omitted} deeper failure causes omitted \
+             beyond {MAX_INBOUND_FAILURE_LAYERS} layers]"
+        ),
+        source: String::new(),
+        stack_trace: String::new(),
+        encoded_attributes: None,
+        cause: None,
+        info,
+    }
 }
 
 /// Builds an official failure using only options represented in semantic JSON.
@@ -2923,7 +3128,17 @@ fn suggestion_from_core(value: i32) -> Result<SuggestContinueAsNewReason, CoreCo
     )
 }
 
-/// Converts an official pinned-Core activation without silently dropping data.
+/// Converts an official pinned-Core activation.
+///
+/// Conversion is lossless except for the documented, deterministic
+/// degradations that keep server-valid history representable: oversized free
+/// text is truncated by [`inbound_text`], NUL in signal and update sender
+/// identities becomes U+FFFD, header and memo entries whose keys the semantic
+/// protocol cannot carry are dropped, and failure cause chains are capped at
+/// [`MAX_INBOUND_FAILURE_LAYERS`]. Payload bytes are never altered. Because a
+/// rejected activation would fail the same history on every replay, these
+/// inbound rules are deliberately more permissive than the strict validation
+/// applied to SDK-produced completions.
 pub fn activation_from_core(
     value: &core_activation::WorkflowActivation,
 ) -> Result<Activation, CoreConversionError> {
@@ -2951,24 +3166,11 @@ pub fn activation_from_core(
                         randomness_seed: value.randomness_seed.to_string(),
                         attempt: value.attempt,
                         context: Some(Box::new(InitializeContext {
-                            headers: value
-                                .headers
-                                .iter()
-                                .map(|(key, payload)| {
-                                    Ok((key.clone(), payload_from_core(payload)?))
-                                })
-                                .collect::<Result<_, CoreConversionError>>()?,
+                            headers: inbound_payload_map_from_core(&value.headers)?,
                             memo: value
                                 .memo
                                 .as_ref()
-                                .map(|memo| {
-                                    memo.fields
-                                        .iter()
-                                        .map(|(key, payload)| {
-                                            Ok((key.clone(), payload_from_core(payload)?))
-                                        })
-                                        .collect::<Result<_, CoreConversionError>>()
-                                })
+                                .map(|memo| inbound_payload_map_from_core(&memo.fields))
                                 .transpose()?,
                             search_attributes: value
                                 .search_attributes
@@ -2997,7 +3199,7 @@ pub fn activation_from_core(
                                     seconds: time.seconds,
                                     nanoseconds: time.nanos,
                                 }),
-                            identity: value.identity.clone(),
+                            identity: inbound_text(&value.identity),
                             parent_workflow: value.parent_workflow_info.as_ref().map(|parent| {
                                 NamespacedWorkflowExecution {
                                     namespace: parent.namespace.clone(),
@@ -3096,12 +3298,8 @@ pub fn activation_from_core(
                         .iter()
                         .map(payload_from_core)
                         .collect::<Result<_, _>>()?,
-                    identity: value.identity.clone(),
-                    headers: value
-                        .headers
-                        .iter()
-                        .map(|(key, payload)| Ok((key.clone(), payload_from_core(payload)?)))
-                        .collect::<Result<BTreeMap<_, _>, CoreConversionError>>()?,
+                    identity: inbound_identity(&value.identity),
+                    headers: inbound_payload_map_from_core(&value.headers)?,
                 }),
                 Variant::QueryWorkflow(value) => Ok(ActivationJob::QueryWorkflow {
                     // Preserve the exact Core identifier. In particular, the
@@ -3116,11 +3314,7 @@ pub fn activation_from_core(
                         .iter()
                         .map(payload_from_core)
                         .collect::<Result<_, _>>()?,
-                    headers: value
-                        .headers
-                        .iter()
-                        .map(|(key, payload)| Ok((key.clone(), payload_from_core(payload)?)))
-                        .collect::<Result<BTreeMap<_, _>, CoreConversionError>>()?,
+                    headers: inbound_payload_map_from_core(&value.headers)?,
                 }),
                 Variant::DoUpdate(value) => {
                     let meta = value
@@ -3149,13 +3343,9 @@ pub fn activation_from_core(
                             .iter()
                             .map(payload_from_core)
                             .collect::<Result<_, _>>()?,
-                        headers: value
-                            .headers
-                            .iter()
-                            .map(|(key, payload)| Ok((key.clone(), payload_from_core(payload)?)))
-                            .collect::<Result<BTreeMap<_, _>, CoreConversionError>>()?,
+                        headers: inbound_payload_map_from_core(&value.headers)?,
                         meta: UpdateMeta {
-                            identity: meta.identity.clone(),
+                            identity: inbound_identity(&meta.identity),
                             update_id: value.id.clone(),
                         },
                         run_validator: value.run_validator,
@@ -3169,10 +3359,10 @@ pub fn activation_from_core(
                 }),
                 Variant::FireTimer(value) => Ok(ActivationJob::FireTimer { seq: value.seq }),
                 Variant::CancelWorkflow(value) => Ok(ActivationJob::CancelWorkflow {
-                    reason: value.reason.clone(),
+                    reason: inbound_text(&value.reason),
                 }),
                 Variant::RemoveFromCache(value) => Ok(ActivationJob::RemoveFromCache {
-                    message: value.message.clone(),
+                    message: inbound_text(&value.message),
                     reason: eviction_reason_from_core(value.reason)?,
                 }),
                 _ => Err(unsupported("Core activation job kind is not supported")),
@@ -3196,10 +3386,10 @@ pub fn activation_from_core(
                 .deployment_version_for_current_task
                 .as_ref()
                 .map(|version| WorkerDeploymentVersion {
-                    deployment_name: version.deployment_name.clone(),
+                    deployment_name: inbound_text(&version.deployment_name),
                     build_id: version.build_id.clone(),
                 }),
-            last_sdk_version: value.last_sdk_version.clone(),
+            last_sdk_version: inbound_text(&value.last_sdk_version),
             suggest_continue_as_new_reasons: value
                 .suggest_continue_as_new_reasons
                 .iter()

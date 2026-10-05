@@ -21,7 +21,9 @@ type 'error lane_failure = Source_error of 'error | Raised of exn
     the start of its poll through callback/completion and any retained-completion
     backoff. Only a [Not_ready] result makes it idle. The shared wait token lets
     at most one idle lane occupy the native supervisor with a readiness wait;
-    the other lane yields locally and keeps checking for its own work. *)
+    the other lane yields locally and keeps checking for its own work. The
+    native wait must observe both lanes (see [run] in the interface), so the
+    token bounds supervisor occupancy without deciding which lane is woken. *)
 let run_lane ~stopped ~poll ~wait ~retry_pending ~busy ~sibling_busy
     ~wait_token ~prefer_workflow ~wait_epoch ~workflow_lane =
   let deferred_epoch = ref (-1) in

@@ -158,7 +158,8 @@ the entire request, including `request_id`, and share the existing ten-second
 overall deadline. A definitive rejection remains terminal; an unanswered
 request remains uncertain when the deadline expires. Callback-transport tests
 under `tests/support/client_start.rs` cover recovery, request identity,
-non-retryable rejection, and cancellation of a hung request.
+non-retryable rejection, cancellation of a hung request, and the 64-ticket
+admission bound.
 
 The wait request names `namespace`, `workflow_id`, and one concrete `run_id`.
 There is no `follow_runs` escape hatch in the document: the operation always
@@ -173,7 +174,14 @@ still admit shutdown and other lifecycle messages.
 
 At most 64 distinct exact-run observations may be retained per runtime. Calls
 with the same namespace, workflow ID, and run ID share an in-flight future;
-admitting a new identity at capacity returns `INVALID_STATE`. A terminal
+admitting a new identity at capacity returns status `15`
+(`RESOURCE_EXHAUSTED`). That status is reserved for a full bounded
+client-operation registry: nothing was sent to Temporal and the client stays
+connected, so it is distinct from the `INVALID_STATE` returned for a closed
+client or runtime. The same status and bound of 64 apply to outstanding
+asynchronous start tickets. The public adapter maps it to a retryable
+`bridge` error with `error_type` `resource_exhausted`, which
+`Client.is_at_capacity` recognizes. A terminal
 result or error removes its entry before returning to OCaml. A later wait may
 observe the same closed run again through a fresh request; this table is not
 a result cache. Client disconnect and both explicit and finalizer runtime
@@ -237,8 +245,10 @@ client waits use the expected `NOT_READY` status. For a worker lane it means no
 task is queued; for a client wait it means the 100 ms owner interval elapsed
 without a terminal result. In both cases the caller or a later orchestration
 loop can resume through the supervisor mailbox.
-`OUTSTANDING_TASKS` means shutdown cannot finalize until the language side
-completes leased work.
+For live worker shutdown, `OUTSTANDING_TASKS` means a task leased to the
+language side was never completed: the bridge force-completed it, finalized
+the worker, and released it, and reports the abandoned work so the caller can
+surface it. For replay it means recorded input was not fully drained.
 
 A result has one success buffer and one error buffer. At most one owns memory:
 
@@ -320,6 +330,7 @@ native worker adapter and are not part of the public workflow-authoring API:
 | `worker_reject_workflow_json` | Retire the lease when OCaml cannot decode the exact Rust-produced activation document | `unit` |
 | `worker_try_poll_activity` | Drain one already-ready remote or local activity task without waiting | semantic activity JSON bytes |
 | `worker_wait_activity` | Wait for activity readiness without consuming a task | `unit` wake signal |
+| `worker_wait_any` | Wait for readiness on either lane without consuming a task | `unit` wake signal |
 | `worker_record_activity_heartbeat_json` | Validate and record progress for an outstanding activity lease without completing it; Core reports cancellation, pause, and reset asynchronously in a later `Cancel` task | `unit` acknowledgement |
 | `worker_complete_activity_json` | Validate and complete one leased activity task | `unit` |
 | `worker_reject_activity_json` | Retire the lease when OCaml cannot decode the exact Rust-produced activity document | `unit` |
@@ -365,16 +376,22 @@ operations. It exposes a typed GADT rather than raw JSON bytes:
 | `Complete_workflow completion` | canonical strict JSON is generated and reparsed before the native completion call |
 | `Try_poll_activity` | `Activity_protocol.task option`; `None` means the activity lane was empty at that instant |
 | `Wait_activity` | bounded native readiness wait; it does not consume an activity task and releases the OCaml runtime lock |
+| `Wait_any` | bounded native readiness wait that any queued workflow activation or activity task ends; it consumes nothing and releases the OCaml runtime lock |
 | `Record_activity_heartbeat heartbeat` | canonical strict heartbeat JSON is validated and recorded for the outstanding activity lease without retiring it; the acknowledgement carries no cancellation flags, which arrive later on the activity poll lane |
 | `Complete_activity completion` | the opaque token and result are validated before the native completion call |
 
-All seven operations enter the same bounded mailbox as client and worker
+All eight operations enter the same bounded mailbox as client and worker
 lifecycle changes. A poll, completion, worker shutdown, and runtime shutdown
 therefore cannot race native graph state. The pure protocol conversion module
 is visible only from the private supervisor library so both serialization
 directions can be tested without constructing a Core worker.
 
 The two Rust readiness signals use one mutex-protected pending count per lane.
+Each signal also notifies a worker-wide combined wake after releasing its lane
+mutex; `worker_wait_any` holds that wake's mutex while it checks both lane
+predicates, so a task published on either lane after the check still wakes it
+(#806). Queued work on either lane wins over a fatal error, which wins over
+closure.
 The poll task holds that mutex while it sends a message and increments the
 count; the supervisor holds it while receiving and decrementing. This makes a
 send and its wake notification one linearizable operation and prevents a
@@ -564,11 +581,11 @@ independent prevents an idle activity poll from delaying workflow completion,
 or vice versa.
 
 ABI version 2 includes private readiness-wait symbols for the two independent
-poll lanes. The supervisor may invoke them only from the owner-domain mailbox
-handler; the C boundary releases the OCaml runtime lock while Rust waits and
-reacquires it before returning. Callers must not turn a readiness wait into a
-blocking condition wait on a workflow scheduler fiber or allow a second owner
-to access the native worker graph.
+poll lanes and one combined wait over both. The supervisor may invoke them
+only from the owner-domain mailbox handler; the C boundary releases the OCaml
+runtime lock while Rust waits and reacquires it before returning. Callers must
+not turn a readiness wait into a blocking condition wait on a workflow scheduler
+fiber or allow a second owner to access the native worker graph.
 
 One mutex-protected ledger is the authority for every task Core expects the
 language runtime to complete. A task enters the ledger before its ready message
@@ -584,13 +601,29 @@ one workflow-task or activity failure for Core and retires the inaccessible
 lease on every outcome. For an activity cancellation, however, the task is an
 update to a previously leased Start and does not own another completion debt;
 an unrepresentable cancellation is dropped without completing the shared
-token. A rejected generated completion remains a fatal worker error, but it
-cannot also leave a fabricated language-side debt that blocks shutdown
-forever. Regression tests cover this rule independently for workflow and
-activity conversion failures, including the cancellation classification.
+token. The generated activity failure is a non-retryable application failure
+of type `UnrepresentableActivityTask` with a static conversion category as its
+message: representability is deterministic, so a retryable failure would only
+make the server redeliver the task to be rejected again. Once Core accepts the
+generated completion, the poll returns `NOT_READY` and the worker keeps
+polling, exactly as for a rejected workflow activation; one task such as a
+standalone activity or a header key another SDK allowed therefore cannot end
+`Worker.run` for the whole task queue (issue #801). A rejected generated
+completion remains a fatal worker error, but it cannot also leave a fabricated
+language-side debt that blocks shutdown forever. Regression tests cover this
+rule independently for workflow and activity conversion failures, including
+the cancellation classification, and
+`rust/core-bridge/tests/activity_task_rejection.rs` drives the activity case
+through the ABI against a gRPC double.
+
+The activity poll lane applies the same reasoning to cancellations it cannot
+attach to a live Start. An unknown cancellation (its Start completed between
+Core's poll returning and admission), a repeated or retired one, or one
+polled while draining owns no completion debt, so the lane drops it without a
+completion and without publishing a lane error.
 
 There is also a post-handoff decode-failure path for version or implementation
-drift between the two strict decoders. OCaml preserves its original protocol
+drift between the two strict decoders. OCaml keeps its original protocol
 error, returns the exact Rust-produced bytes to the private rejection ABI, and
 never reflects those bytes in diagnostics. Rust accepts rejection only after
 full semantic equality with retained handoff state. For a Start, it then
@@ -599,16 +632,44 @@ semantic state even if Core reports that generated failure as unsuccessful.
 For a Cancel update, it retires only that retained semantic state: the shared
 Start debt remains owned by the activity implementation. This prevents
 shutdown from waiting forever without turning a malformed cancellation into a
-spurious `UnknownActivity` completion failure, while keeping the original
-decode failure primary.
+spurious `UnknownActivity` completion failure. When the rejection succeeds on
+a live worker, the task is handled: Rust writes the static diagnostic (and,
+for a workflow activation, applies the 100 ms redelivery backoff) and the
+OCaml supervisor reports an empty poll so `Worker.run` continues (issue #801).
+A replay instead returns the protocol error, because it must not report
+history it never checked as compatible. If the rejection itself fails, the
+original decode failure stays primary with the rejection category appended.
 
 Shutdown first closes ledger admission and both readiness signals, then asks
-Core to wake both polls and joins the lane tasks. Existing ready and leased
-work remains completable while the worker drains. Core finalization is refused
-until the ledger is empty, and only then consumes the worker before client and
-runtime destruction. The garbage-collection fallback cannot obtain missing
+Core to wake both polls. From that point the supervisor Domain is blocked in
+the shutdown call and OCaml has already stopped its run loop and drained its
+retained completions, so no language completion can arrive. Core, however,
+returns `ShutDown` from a poll only after every task it produced has been
+completed, so joining the lanes without completing those tasks hung forever
+(issue #769). `PollLanes::drain_and_join_for_shutdown` therefore completes each
+outstanding debt exactly once while it joins both lanes: a lease taken by
+OCaml is removed from the ledger and failed (or acknowledged empty if it was a
+pure cache eviction, which owns no workflow task); a queued handoff is removed
+and completed from its own queue message; activity cancellations and lane
+diagnostics own no debt and are dropped. It keeps draining both queues while
+the lanes run, because polls in flight and Core's follow-up evictions publish
+new tasks until each lane sees `ShutDown`. Each identity leaves the ledger
+before its Core completion is awaited, and no tombstone is written, so a
+same-run eviction that answers a failed workflow task is admitted and
+acknowledged. The drain is bounded by `WORKER_SHUTDOWN_DRAIN_TIMEOUT` (90 s,
+above one server long poll); on timeout the unjoined lanes stay owned by the
+graph, the ledger is marked as having lost a lease, and the call returns a
+worker failure so runtime close disposes the worker. Core finalization then
+runs in a Tokio task that owns the worker until `finalize_shutdown` returns,
+and the caller waits at most `WORKER_FINALIZE_TIMEOUT` (30 s); after that the
+task finishes the release in the background, so a worker is never dropped
+between the lane join and Core's `finalize_unregister`. Tasks that never
+reached OCaml are retired silently and shutdown returns `OK`; if a leased task
+had to be force-completed, the worker is still released but shutdown returns
+`OUTSTANDING_TASKS`. The garbage-collection fallback cannot obtain missing
 language completions. On the dedicated cleanup thread it force-fails
-outstanding Core tasks, joins the poll lanes, and attempts normal finalization;
+outstanding Core tasks, joins the poll lanes with the same bounded drain, and
+attempts the same bounded finalization;
 it drops an undrained worker only if finalization still fails. This preserves
 memory ownership and collector progress, while explicit supervisor shutdown
 remains the required graceful path.

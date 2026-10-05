@@ -24,8 +24,24 @@ For example, a business rule that should close the execution returns:
 ```ocaml
 Error
   (Temporal.Error.make ~category:`Workflow ~non_retryable:true
-     ~message:"order rejected" ())
+     ~error_type:"OrderRejected" ~message:"order rejected" ())
 ```
+
+The optional `~error_type` becomes the failure's Temporal
+`ApplicationFailureInfo.type`, which parents, clients, the Temporal UI, and
+code written with other Temporal SDKs use to identify a business failure.
+Without it the SDK sends the lowercase category name (`Error.kind`, here
+`"workflow"`), which was the only type available before `~error_type`
+existed. Activity failures follow the same rule, and a retry policy's
+`non_retryable_error_types` is matched against this type (see the [durable
+operation policies](durable-operation-policies.md#retry-policy)). In the other
+direction, an error received from an activity, a child workflow, an update, or
+a client `wait` reports the type of the innermost application failure through
+`Error.error_type`, even when Temporal nests it under an activity or
+child-workflow wrapper; its category still describes the wrapper. The cause
+chain itself is not yet preserved as structure: inbound causes appear only in
+the error message, and outbound OCaml failures carry no `cause`. Every failure
+the SDK emits uses the source `"ocaml-temporal"`.
 
 `non_retryable=false` permits Temporal's configured workflow retry policy to
 start another run. It does not itself install a retry policy. The current

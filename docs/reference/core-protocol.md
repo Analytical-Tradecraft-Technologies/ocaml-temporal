@@ -331,6 +331,12 @@ authoritative for duplicate members and UTF-8 byte limits. A terminal workflow
 command may occur at most once and must be last.
 When acknowledging an eviction, the completion command list must be empty and
 the run ID must match the activation.
+An eviction-only activation is never answered with a failure, even when the
+bridge or OCaml rejects its delivery: Core owes no workflow task for it and
+accepts only an empty acknowledgement, so the private rejection path sends
+that acknowledgement instead (issue #814). Core's eviction `message` is a
+Debug dump of the preceding failure and can exceed the string limit; it is
+truncated like other inbound free text (see the degradation table below).
 
 ### External workflow operations
 
@@ -503,6 +509,38 @@ error instead of a bridge rejection. Application failures retain Core's
 and client outcomes. The default category and absent delay are omitted from
 the canonical JSON to preserve existing documents. These Core-only options
 are included in the bounded public error diagnostic.
+
+### Inbound degradation of server-valid activations
+
+Temporal Server accepts history that exceeds the bridge's safety limits: a
+failure message or stack trace longer than 65,536 bytes, a cause chain deeper
+than the 128-level JSON nesting allows, a client-supplied header or memo key
+that is empty or contains NUL, or a sender identity containing NUL. History
+is immutable, so rejecting such an activation would fail the same workflow
+task on every replay. The Rust Core-to-semantic conversion
+(`activation_from_core`, and `failure_from_core` for client outcomes) instead
+applies these deterministic rules, so every replay of the same history
+produces the same semantic activation:
+
+| Inbound value | Rule |
+|---|---|
+| Free text over 65,536 bytes: failure `message`, `source`, `stack_trace`, failure-info identities, application/Nexus-handler `type`, Nexus-operation text, cancellation `reason`, eviction `message`, initialization `identity`, signal/update identity, `last_sdk_version`, `deployment_name` | Cut at the last UTF-8 character boundary that leaves room for `\n[truncated by ocaml-temporal: original length N bytes]`; the result is at most 65,536 bytes. Shorter text is unchanged. |
+| Failure chain longer than 100 layers (`MAX_INBOUND_FAILURE_LAYERS`) | The first 99 layers are kept exactly; the remainder becomes one final layer whose message is `[truncated by ocaml-temporal: N deeper failure causes omitted beyond 100 layers]`. Its kind preserves the omitted tail's retryability decision (the same rule as `failure_non_retryable`): `{"kind":"server","non_retryable":true}` when the tail is non-retryable, otherwise `{"kind":"absent"}`. |
+| NUL in a signal or update sender identity | Each NUL becomes U+FFFD before the length rule. |
+| Signal, query, update, or initialization header key, or memo key, that is empty, contains NUL, or exceeds 65,536 bytes | The entry is dropped. No OCaml API can name such a key, and escaping it could collide with a real key. |
+
+The 100-layer cap matches prost's default 100-level decode recursion limit,
+so any chain Core can receive over gRPC converts unchanged; from the deepest
+activation location (`continued_failure`, depth 6) a capped chain whose last
+layer carries detail payload metadata reaches depth 110, leaving room for a
+completion that rethrows it inside its own failure. Payload bytes, payload
+metadata, and identifiers that Temporal Server itself bounds (workflow,
+activity, run, and update IDs, type names, signal names, search-attribute
+names) are never rewritten and keep their strict checks. The OCaml decoder
+needs no relaxation: every degraded value satisfies its existing limits.
+Outbound semantic documents (completions, and any activation passed to
+`encode_activation` or `decode_activation`) remain strictly validated; the
+degradation exists only in the Core-to-semantic conversion.
 
 An activation with a future unsupported category or invalid delay is failed
 to Core and its lease retired. After Core accepts that rejection, the native

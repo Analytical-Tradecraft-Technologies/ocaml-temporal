@@ -1,7 +1,8 @@
 # Dependency and License Inventory
 
 All project and build dependencies are checked before a milestone commit.
-`make license-check` reads `temporal-sdk.opam.locked`, asks OPAM for each package's
+`make license-check` reads `temporal-sdk.opam.locked` and the per-compiler
+replacements in `scripts/opam-lock-overrides.txt`, asks OPAM for each package's
 exact license metadata, and rejects missing or unapproved values. The
 standalone GitHub Actions license job streams locked metadata emitted by
 `make cargo-metadata` into the repository scanner running in a separate
@@ -73,11 +74,57 @@ matching exact-name and version checker change.
 
 ## Builder image tooling
 
-The development image is based on `ocaml/opam:debian-12-ocaml-5.2` and uses
-OPAM to install the locked closure. Operating-system and ambient base-image
-tools are not linked into or redistributed with the future worker artifact.
-Release containers will use a separate minimal runtime stage and will receive
-their own package/SBOM audit before publication.
+The development image starts from one `ocaml/opam:debian-12-ocaml-<series>`
+stage per supported compiler series (5.2 through 5.5, matching
+`scripts/ci-matrix.py`). Each stage in `Dockerfile.dev` is pinned to the
+multi-architecture manifest index digest below; those `FROM` lines are the
+single source of truth. The Makefile selects the stage `ocaml-<series>` from
+`OCAML_VERSION`, and the Compose file and live-test scripts default to
+`ocaml-5.2`. BuildKit resolves only the selected stage. Dependabot's `docker`
+ecosystem refreshes the digests in place; it is configured to ignore minor and
+major `ocaml/opam` tag updates so a stage is never retargeted to another
+compiler series. An explicit `OCAML_IMAGE=<image reference>` is still accepted
+for local experiments but is not used by CI or release lanes.
+
+| Stage | Image tag | Manifest index digest |
+|---|---|---|
+| `ocaml-5.2` | `ocaml/opam:debian-12-ocaml-5.2` | `sha256:b06c7348b6ed3e83b5f66267254504a8f066ec9be9c020c30a8e28ce10ab3ef6` |
+| `ocaml-5.3` | `ocaml/opam:debian-12-ocaml-5.3` | `sha256:bbaac53e502f6602013d8967c3a54cfcb898b556f453ab72e8e23966c3c681df` |
+| `ocaml-5.4` | `ocaml/opam:debian-12-ocaml-5.4` | `sha256:ba37cf7a29709fa2f19124fda8f4cabdea3156a648276fc98c9d528998ae2e59` |
+| `ocaml-5.5` | `ocaml/opam:debian-12-ocaml-5.5` | `sha256:57f87030c6082e3f46f59988fbf12a84947945baf2974d4567a9dcee85780090` |
+
+Each index contains native `linux/amd64` and `linux/arm64` images.
+Operating-system and ambient base-image tools are not linked into or
+redistributed with the future worker artifact. Release containers will use a
+separate minimal runtime stage and will receive their own package/SBOM audit
+before publication.
+
+### Installing the locked OPAM closure
+
+Every lane that produces an OCaml artifact (the Docker image used by the Linux
+matrix and the native macOS/Windows jobs) installs dependencies with
+`scripts/opam-locked-deps.sh install`, not by re-solving `temporal-sdk.opam`.
+The script installs each locked package at its exact version and then runs
+`scripts/opam-locked-deps.sh check`, which fails the build with a `MISMATCH`
+line for any package whose installed version differs. The audited versions are
+therefore the versions the published `.cmxa` archives are compiled against.
+
+`temporal-sdk.opam.locked` is solved for OCaml 5.2.1, but the artifact matrix
+also builds OCaml 5.3, 5.4, and 5.5. `opam install --locked` cannot serve that
+matrix: it would pin the compiler too, and the lock's `pin-depends` would
+rebuild 5.2.1 from source. The script therefore leaves compiler-provided
+packages (`ocaml`, `ocaml-base-compiler`, `ocaml-config`,
+`ocaml-options-*`, and `base-*`) to the pinned image or setup-ocaml and only
+reports them; the exact compiler patch level is asserted by the Makefile's
+version checks. Every other package is held to the lock on every compiler.
+
+When OPAM metadata makes a locked version uninstallable for one compiler
+series, `scripts/opam-lock-overrides.txt` may name a replacement version for
+that series only. Overrides cannot add packages or replace compiler packages,
+and `make license-check` audits them alongside the lock. The only current
+entry is `ocamlfind.1.9.9~preview` for OCaml 5.5, because `ocamlfind.1.9.8`
+declares `ocaml < 5.5.0~`; ocamlfind (MIT) is a build-only tool reached
+through topkg and is not linked into the SDK.
 
 The image copies Rust 1.98.1, Cargo, Clippy, and rustfmt from the official
 multi-architecture `rust:1.98-bookworm` image at manifest digest
@@ -159,7 +206,8 @@ Docker, Docker Compose, Rust toolchains, and GitHub Actions have separate daily
 entries. Versions embedded in arbitrary scripts, Makefiles, and action inputs
 still require explicit maintenance. OCaml and OPAM are intentionally absent
 because GitHub Dependabot does not support that ecosystem; the locked OPAM
-closure continues to be reviewed and updated manually.
+closure and its per-compiler overrides continue to be reviewed and updated
+manually.
 
 See the [Dependabot allow reference](https://docs.github.com/en/code-security/reference/supply-chain-security/dependabot-options-reference#allow)
 for the direct/indirect update behavior.

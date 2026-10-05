@@ -59,7 +59,10 @@ type ('input, 'output) implementation =
   'output context -> 'input -> 'output async_result
 
 (** Creates a dormant handle. It cannot submit an operation until [activate]
-    succeeds after the worker accepts [WillCompleteAsync]. [encode_output] is
+    succeeds after the worker accepts [WillCompleteAsync]; until then every
+    operation returns a retryable "not active yet" error without entering
+    [submit], so external code that races the handoff can retry instead of
+    losing its result. [encode_output] is
     retained by the handle so callers can complete it with the activity's
     typed output rather than constructing a wire payload themselves. *)
 val create :
@@ -83,6 +86,13 @@ val activate : 'output handle -> submit_result
     retained from an earlier attempt whose submit callback still captures the
     earlier task token. Only the owning adapter calls this function. *)
 val prepare_handoff : expected:'output handle -> 'output handle -> submit_result
+
+(** Closes the handle if it is still [Dormant], that is, if it was never
+    reserved by [prepare_handoff]. The owning adapter calls this after every
+    callback outcome that does not hand the handle off, so retained copies
+    report a non-retryable closed error instead of retrying forever. Handles in
+    any other state are unchanged. *)
+val close_if_dormant : 'output handle -> unit
 
 (** Encodes and submits one complete operation. The state machine derives a
     canonical key from the encoded payload; if the native outcome is

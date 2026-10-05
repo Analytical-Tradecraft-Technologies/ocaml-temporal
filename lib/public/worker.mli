@@ -76,7 +76,14 @@ type t
 
 (** Creates and validates a worker. Duplicate names and remote-only definitions
     return typed defects before any backend graph is allocated. A [mock://]
-    target selects the deterministic test backend; an [http://] or [https://]
+    target selects an in-memory backend for testing registration and dispatch
+    plumbing only: it queues one synthetic task per registered definition with
+    an empty [binary/null] input, unrelated to any mock client start, and calls
+    each implementation whose input codec accepts that payload (for example
+    [Codec.unit]) outside a workflow context. Callback side effects therefore
+    still run, while workflow operations such as [Activity.start] or
+    [Workflow.sleep] return defects. It is not a
+    workflow test environment. An [http://] or [https://]
     target creates the OCaml-owned native Core worker and its private Rust
     bridge. [max_cached_workflows] optionally bounds Core's sticky workflow
     cache; omitting it preserves the default, while a small positive bound can
@@ -110,5 +117,14 @@ val run : t -> (unit, Error.t) result
 (** Initiates graceful worker shutdown. Repeated calls are safe and return the
     same cached terminal result. A permanent native teardown error is retained
     so later callers observe [Error] rather than a spurious [Ok]. Retryable
-    failures leave the worker open for another attempt. *)
+    failures leave the worker open for another attempt.
+
+    [shutdown] may be called from any Domain or system thread other than the
+    one running a workflow or activity callback of this worker, including a
+    sibling system thread on the Domain that hosts [run]. It blocks until the
+    run loop has stopped and the worker is released. Concurrent callers are
+    serialized: one performs the teardown and the others wait for and return
+    the same cached result. A call from inside a workflow or activity callback
+    of this worker cannot wait for its own loop to stop, so it returns a defect
+    [Error] immediately and leaves the worker running. *)
 val shutdown : t -> (unit, Error.t) result

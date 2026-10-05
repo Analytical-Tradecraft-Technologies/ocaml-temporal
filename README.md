@@ -134,7 +134,10 @@ The OPAM metadata depends on `conf-rust-2024` and `conf-protoc`, so dependency
 resolution checks that `cargo`, a compiler supporting Rust edition 2024, and
 `protoc` are available before Dune builds the private native bridge. Cargo
 still enforces the package's more specific Rust 1.94 minimum from
-`rust/Cargo.toml`. Applications link only the installed `temporal-sdk` library
+`rust/Cargo.toml`. `opam install` builds with Dune's release profile, which
+compiles the private Rust bridge with Cargo's optimized release profile; a
+plain `dune build` of the checkout uses Cargo's faster-to-build, unoptimized
+dev profile. Applications link only the installed `temporal-sdk` library
 and use the wrapped `Temporal` module; the native build tools are prerequisites,
 not part of the public OCaml API.
 

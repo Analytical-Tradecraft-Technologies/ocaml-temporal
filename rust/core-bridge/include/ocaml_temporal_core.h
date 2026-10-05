@@ -28,7 +28,10 @@ enum {
   OCAML_TEMPORAL_CORE_STATUS_PROTOCOL = 11,
   OCAML_TEMPORAL_CORE_STATUS_ALREADY_STARTED = 12,
   OCAML_TEMPORAL_CORE_STATUS_RETRYABLE = 13,
-  OCAML_TEMPORAL_CORE_STATUS_ASYNC_HEARTBEAT_REJECTED = 14
+  OCAML_TEMPORAL_CORE_STATUS_ASYNC_HEARTBEAT_REJECTED = 14,
+  /* A bounded client-operation registry is full; the request was not admitted
+     and may be retried after another in-flight operation finishes. */
+  OCAML_TEMPORAL_CORE_STATUS_RESOURCE_EXHAUSTED = 15
 };
 
 /* Rust-owned byte allocation. `{ NULL, 0 }` is the sole empty representation. */
@@ -301,6 +304,13 @@ ocaml_temporal_core_status ocaml_temporal_core_v2_worker_wait_activity(
     ocaml_temporal_core_runtime *runtime,
     ocaml_temporal_core_result *output);
 
+/* Bounded readiness wait for either live-worker lane. Any queued workflow
+ * activation or activity task ends it; otherwise it has the same lock,
+ * timeout, and non-consuming semantics as the lane-specific waits. */
+ocaml_temporal_core_status ocaml_temporal_core_v2_worker_wait_any(
+    ocaml_temporal_core_runtime *runtime,
+    ocaml_temporal_core_result *output);
+
 /* Apply the fixed native delay used only after Rust has explicitly proven
  * that an activity completion was not consumed. The C binding must release
  * the OCaml runtime lock while this bounded timer runs. */
@@ -391,6 +401,8 @@ static_assert(OCAML_TEMPORAL_CORE_STATUS_RETRYABLE == 13,
               "status numbering is part of the ABI");
 static_assert(OCAML_TEMPORAL_CORE_STATUS_ASYNC_HEARTBEAT_REJECTED == 14,
               "status numbering is part of the ABI");
+static_assert(OCAML_TEMPORAL_CORE_STATUS_RESOURCE_EXHAUSTED == 15,
+              "status numbering is part of the ABI");
 static_assert(offsetof(ocaml_temporal_core_buffer, ptr) == 0,
               "buffer pointer must be the first field");
 static_assert(offsetof(ocaml_temporal_core_buffer, len) == sizeof(void *),
@@ -439,6 +451,8 @@ _Static_assert(OCAML_TEMPORAL_CORE_STATUS_ALREADY_STARTED == 12,
 _Static_assert(OCAML_TEMPORAL_CORE_STATUS_RETRYABLE == 13,
                "status numbering is part of the ABI");
 _Static_assert(OCAML_TEMPORAL_CORE_STATUS_ASYNC_HEARTBEAT_REJECTED == 14,
+               "status numbering is part of the ABI");
+_Static_assert(OCAML_TEMPORAL_CORE_STATUS_RESOURCE_EXHAUSTED == 15,
                "status numbering is part of the ABI");
 _Static_assert(offsetof(ocaml_temporal_core_buffer, ptr) == 0,
                "buffer pointer must be the first field");

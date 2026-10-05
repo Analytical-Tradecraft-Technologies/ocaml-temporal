@@ -408,7 +408,10 @@ let runtime_payloads path payloads =
   loop 0 [] payloads
 
 (** Converts an activity implementation's structured error while preserving its
-    retryability classification and every application-supplied detail payload.
+    retryability classification, its application error type (falling back to
+    the category label when untyped; this is the value Temporal matches against
+    a retry policy's [non_retryable_error_types]), and every
+    application-supplied detail payload.
     Adapter-generated input/registry errors use [failure_of_error] and are
     always non-retryable; an application error may intentionally remain
     retryable so Temporal can apply its retry policy. Detail payloads are
@@ -438,7 +441,7 @@ let failure_of_application_error (diagnostic : error_view)
         info =
           Application
             {
-              type_name = Base_error.kind error;
+              type_name = Base_error.application_failure_type error;
               non_retryable = view.non_retryable;
               details;
               category = Application_category_unspecified;
@@ -1040,7 +1043,8 @@ module Make (Supervisor : SUPERVISOR) = struct
 
   (** Executes an asynchronous activity callback. The handle is dormant while
       the callback runs; only an accepted remote [Will_complete_async]
-      completion causes [finish_lease] to publish and activate it. Core cannot
+      completion causes [finish_lease] to publish and activate it; any other
+      outcome closes it. Core cannot
       accept this handoff for a local activity, so that outcome is converted to
       an ordinary failure before a completion is queued. *)
   let process_async_start adapter token definition
@@ -1068,6 +1072,16 @@ module Make (Supervisor : SUPERVISOR) = struct
               in
               let context = Async_activity.context handle in
               let context_handle = Async_activity.handle context in
+              (* External code may retain this handle and retry the retryable
+                 "not active yet" error while the handoff is outstanding
+                 (#766). Every outcome that does not reserve it for the
+                 handoff (a synchronous result, a callback defect, a local
+                 activity, or a handle from another attempt) closes it here,
+                 so such a retry loop ends with a non-retryable error. A
+                 reserved handle is left to [finish_lease] or [discard]. *)
+              Fun.protect
+                ~finally:(fun () -> Async_activity.close_if_dormant context_handle)
+              @@ fun () ->
               (try
                  match implementation context input with
                  | exception exception_ ->
@@ -1303,13 +1317,25 @@ module Make (Supervisor : SUPERVISOR) = struct
 
   (** Drops copied activity completions after terminal native cleanup. The Rust
       runtime has already force-retired its leases, so retaining or retrying
-      these tokens could duplicate a completion. The mutex keeps discard
+      these tokens could duplicate a completion. Async handles, whether
+      reserved for an unaccepted handoff or already admitted, are closed so
+      retained copies stop reporting retryable errors. The mutex keeps discard
       ordered with any final adapter operation. *)
   let discard adapter =
     Mutex.lock adapter.mutex;
     Fun.protect
       ~finally:(fun () -> Mutex.unlock adapter.mutex)
       (fun () ->
+        (* A handoff that was never accepted leaves its handle reserved in
+           [Handoff_pending]. Close it so external code retrying the
+           retryable "not active yet" error observes a terminal error instead
+           of waiting for an activation that can no longer happen. *)
+        Token_map.iter
+          (fun _ lease ->
+            match lease.accepted_result with
+            | Async_handoff handle -> ignore (Async_activity.close handle)
+            | Completed_result _ | Rejected_result _ -> ())
+          adapter.leases;
         adapter.leases <- Token_map.empty;
         Mutex.lock adapter.async_mutex;
         Fun.protect

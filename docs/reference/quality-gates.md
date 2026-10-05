@@ -98,7 +98,13 @@ Windows additionally bundles the required MinGW import archives; the consumer
 regenerates their search path after relocation. Producers disable incremental
 state and use line-table debug information, retaining file/line backtraces,
 debug assertions, and the development optimization level while reducing
-artifact size. Normal local source builds keep their existing Cargo profiles.
+artifact size. Release bundles instead package Cargo's `[profile.release]`
+(thin LTO, one codegen unit, stripped debug information, unwinding panics);
+their Rust tests use the same optimization level without debug assertions or
+overflow checks. Local source builds follow Dune's profile: `opam install`,
+`dune build -p`, and `--profile release` link Cargo's release profile, while
+Dune's default dev profile links Cargo's unoptimized dev profile for fast
+iteration. `test/smoke/test_rust_bridge_profile.sh` checks that selection.
 
 Only the finished bundle is cached, never Cargo's registry or target tree.
 Keys include platform, the complete Rust source/header/test/lockfile tree,
@@ -167,10 +173,10 @@ queued Actions run does not make the local verification boundary ambiguous:
 
 | CI job | Workflow command | Local command | What the local result proves |
 | --- | --- | --- | --- |
-| `verify` | `make verify OCAML_VERSION=<matrix version>` with the verified bridge bundle | `make verify OCAML_VERSION=5.2` (or another locally available image) | Docker-backed OCaml build/lint, bridge/install tests, and repository quality contracts. CI gets Rust validation from its producer; the default local command also runs Rust tests. PRs use the representative cells; the `master` tier uses the exhaustive matrix. |
+| `verify` | `make verify OCAML_VERSION=<matrix version>` with the verified bridge bundle | `make verify OCAML_VERSION=5.2` (or another supported series; each selects a digest-pinned `ocaml-<series>` stage of `Dockerfile.dev`) | Docker-backed OCaml build/lint against the exact locked OPAM closure (the image build fails on drift), bridge/install tests, and repository quality contracts. CI gets Rust validation from its producer; the default local command also runs Rust tests. PRs use the representative cells; the `master` tier uses the exhaustive matrix. |
 | `quality` | `make test-ci-artifacts`, then `make quality` | `make quality` | CI checks matrix selection and artifact failure cases before running the pinned native `cargo-deny`, `cargo-machete`, and `typos` scans. The exact binaries must be installed on the host. |
 | `license-audit` | `make license-check OCAML_VERSION=5.2`, plus the two isolated Python Cargo-license checks | `make license-check OCAML_VERSION=5.2` | The package/OCaml dependency license policy. The locked Cargo license scanner remains a single CI-only step and is not repeated in the OCaml matrix. |
-| `native-macos`, `native-windows` | `make native-verify` | `make native-verify` on a matching native host | The OCaml 5.5 and Rust native link, format, lint, install, and test path. Both platforms run for every PR and merge group and in the `master` tier. |
+| `native-macos`, `native-windows` | `sh scripts/opam-locked-deps.sh install --assume-depexts`, then `make native-verify` | the same two commands on a matching native host | The OCaml 5.5 and Rust native link, format, lint, install, and test path. Both platforms run for every PR and merge group and in the `master` tier. |
 | `temporal-integration` | `make test-temporal-start-metadata-live`, `make test-temporal-task-failure-live`, then `make test-temporal-live-ci` | Run the corresponding target when Docker and network access are available | The live CI target runs seven sequential controllers, in addition to the workflow-start metadata and task-failure recovery scenarios. Each owns a fresh Temporal/PostgreSQL lifecycle. The 45-minute CI ceiling includes the bilateral parent/child recovery gates; contract-only results are not live evidence. |
 
 `make check OCAML_VERSION=5.2` is a convenient Docker-backed local baseline:

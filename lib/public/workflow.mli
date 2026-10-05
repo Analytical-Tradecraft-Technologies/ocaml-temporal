@@ -131,8 +131,10 @@ val start_metadata : unit -> (start_metadata, Error.t) result
 (** Returns whether workflow code should take the new branch identified by
     [id]. On a new execution the first call returns [true] and records a patch
     marker; replay returns [true] only when Core reports that marker, otherwise
-    it returns [false]. The decision is retained per workflow run and every
-    call emits Core's idempotent marker command.
+    it returns [false] and records nothing. The first answer for [id] is
+    retained for the workflow run, so later calls and later history
+    notifications cannot change it. Calls whose answer is [true] emit Core's
+    idempotent marker command.
 
     Patch IDs must be non-empty, valid UTF-8, NUL-free, and at most 65,536
     bytes. Invalid IDs or calls outside workflow execution raise

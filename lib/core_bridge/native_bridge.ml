@@ -15,6 +15,7 @@ type status =
   | Already_started
   | Retryable
   | Async_heartbeat_rejected
+  | Resource_exhausted
   | Unknown of int
 
 (** Error data copied into OCaml. It never owns Rust memory. *)
@@ -218,6 +219,9 @@ external worker_try_poll_activity_raw : runtime -> response
 external worker_wait_activity_raw : runtime -> response
   = "ocaml_temporal_worker_wait_activity"
 
+external worker_wait_any_raw : runtime -> response
+  = "ocaml_temporal_worker_wait_any"
+
 external worker_wait_activity_completion_retry_backoff_raw : runtime -> response
   = "ocaml_temporal_worker_wait_activity_completion_retry_backoff"
 
@@ -252,6 +256,7 @@ let status = function
   | 12 -> Already_started
   | 13 -> Retryable
   | 14 -> Async_heartbeat_rejected
+  | 15 -> Resource_exhausted
   | code -> Unknown code
 
 (** Converts a bridge status to a bounded stable tag value without exposing the
@@ -271,6 +276,7 @@ let status_name = function
   | Already_started -> "already_started"
   | Retryable -> "retryable"
   | Async_heartbeat_rejected -> "async_heartbeat_rejected"
+  | Resource_exhausted -> "resource_exhausted"
   | Unknown _ -> "unknown"
 
 (** Constructs a local configuration failure without entering native code. *)
@@ -535,8 +541,9 @@ let bridge_error_log_level = function
          operator. *)
       (Logs.Debug, "bridge operation not ready")
   | Outstanding_tasks ->
-      (* Shutdown can be retried after the language side finishes its leased
-         work. Keep this visible without classifying it as a bridge failure. *)
+      (* Live worker shutdown force-completed a lease the language side never
+         completed and still released the worker; replay reports undrained
+         input. Keep this visible without classifying it as a bridge failure. *)
       (Logs.Warning, "bridge operation waiting for outstanding tasks")
   | _ ->
       (* Protocol, lifecycle, configuration, and native failures all indicate
@@ -786,6 +793,14 @@ let worker_try_poll_activity runtime =
 let worker_wait_activity runtime =
   bridge_call "worker_wait_activity" (fun () ->
       Result.map (fun _ -> ()) (decode (worker_wait_activity_raw runtime)))
+
+(** Waits for readiness on either worker lane under the same bounded,
+    runtime-lock-free contract as [worker_wait_workflow]. A queued task on
+    either lane ends the wait without being consumed; drain it with the
+    matching [worker_try_poll_*] call. *)
+let worker_wait_any runtime =
+  bridge_call "worker_wait_any" (fun () ->
+      Result.map (fun _ -> ()) (decode (worker_wait_any_raw runtime)))
 
 (** Applies the fixed native delay used only after Rust explicitly reports a
     retryable activity-completion transport outcome. The C stub releases the

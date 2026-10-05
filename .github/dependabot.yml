@@ -29,6 +29,14 @@ updates:
     timezone: Australia/Sydney
   cooldown:
     default-days: 3
+  # Dockerfile.dev pins one ocaml/opam stage per supported compiler series.
+  # Refresh each stage's digest for its own tag, but never retarget a stage to
+  # another series; the series set follows scripts/ci-matrix.py.
+  ignore:
+  - dependency-name: ocaml/opam
+    update-types:
+    - version-update:semver-major
+    - version-update:semver-minor
 - package-ecosystem: docker-compose
   directory: /test/integration/temporal
   schedule:

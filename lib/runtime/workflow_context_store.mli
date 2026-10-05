@@ -87,20 +87,24 @@ val activation_deployment_version : t -> (string * string) option
 val set_activation_is_replaying : t -> bool -> unit
 
 (** Records authoritative history evidence that [patch_id] is present for this
-    execution. The ID has already passed the closed protocol validator and is
-    copied before this execution retains it. *)
+    execution. The evidence seeds only an ID that workflow code has not yet
+    consulted; a decision already returned by [patched] or acted on by
+    [deprecate_patch] is never changed. The ID has already passed the closed
+    protocol validator and is copied before this execution retains it. *)
 val notify_has_patch : t -> patch_id:string -> unit
 
-(** Returns this execution's deterministic decision for [patch_id] and emits a
-    non-deprecated marker command on every call. The first decision is true in
-    live execution and false during replay unless Core previously notified the
-    marker. The ID is copied before retention and emission. Calling this after
-    shutdown raises [Invalid_argument]. *)
+(** Returns this execution's deterministic decision for [patch_id]. The first
+    call fixes the decision for the run: true in live execution and false
+    during replay unless Core previously notified the marker. Every call whose
+    decision is true emits a non-deprecated marker command; a false decision
+    emits nothing. The ID is copied before retention and emission. Calling this
+    after shutdown raises [Invalid_argument]. *)
 val patched : t -> patch_id:string -> bool
 
-(** Emits a deprecated marker command for [patch_id] and retains the same
-    execution-local decision state used by [patched]. Repeated deprecation calls
-    are allowed. Mixing [patched] and [deprecate_patch] for one ID in the same
+(** Emits a deprecated marker command for [patch_id] when its retained
+    decision is true, sharing the execution-local decision state used by
+    [patched]; replay of a marker-free history emits nothing. Repeated
+    deprecation calls are allowed. Mixing [patched] and [deprecate_patch] for one ID in the same
     execution raises [Invalid_argument] before a conflicting command is emitted;
     Core would otherwise keep only the first mode. The ID is copied before
     retention and emission, and calls after shutdown raise [Invalid_argument]. *)

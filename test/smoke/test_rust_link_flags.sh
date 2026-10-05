@@ -14,7 +14,7 @@ printf 'cargo:rustc-link-search=native=%s\n' "$search_dir" >"$build_dir/output"
 output=$temporary_root/flags.sexp
 sh "$workspace_root/scripts/render-rust-link-flags.sh" \
   'MINGW64_NT-test' \
-  "$temporary_root/target" \
+  "$temporary_root/target/debug" \
   "$output" \
   '-lwinapi_ntdll -lbcrypt'
 
@@ -33,7 +33,7 @@ fi
 non_windows_output=$temporary_root/non-windows-flags.sexp
 sh "$workspace_root/scripts/render-rust-link-flags.sh" \
   'Linux' \
-  "$temporary_root/target" \
+  "$temporary_root/target/debug" \
   "$non_windows_output" \
   '-lpthread -ldl'
 printf '(-lpthread -ldl)\n' >"$temporary_root/expected-non-windows.sexp"
@@ -43,10 +43,10 @@ cmp "$temporary_root/expected-non-windows.sexp" "$non_windows_output"
 # linker flags must point to the downloaded import libraries, including when
 # the consumer's checkout path contains spaces.
 sh "$workspace_root/scripts/render-rust-link-flags.sh" \
-  'MINGW64_NT-test' "$temporary_root/target" "$output" \
+  'MINGW64_NT-test' "$temporary_root/target/debug" "$output" \
   '-lwinapi_ntdll -lbcrypt' "$temporary_root/bundle/import-libs"
 mv "$temporary_root/bundle" "$temporary_root/relocated bundle"
-rm -rf "$search_dir" "$temporary_root/target"
+rm -rf "$search_dir" "$temporary_root/target/debug"
 sh "$workspace_root/scripts/render-rust-link-flags.sh" \
   'MINGW64_NT-test' "$temporary_root/relocated bundle" "$output" \
   '-lwinapi_ntdll -lbcrypt'

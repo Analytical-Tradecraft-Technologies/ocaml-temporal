@@ -38,7 +38,11 @@ action and the GNU/MinGW toolchain. Each producer runs Rust formatting, Clippy,
 and the locked Rust tests before packaging static/dynamic libraries and native
 link dependencies. An exact cache hit reuses the verified bundle; its key
 includes sources, tests, build machinery, profile, and native environment.
-Release builds use a separate optimized profile for tests and packaging.
+Release builds package Cargo's `[profile.release]` and run their Rust tests
+with the same optimization level and without debug assertions or overflow
+checks. Source and opam installations build the same Cargo release profile,
+because Dune's release profile (selected by `opam install` and `dune build -p`)
+selects it; only Dune's dev profile uses Cargo's unoptimized dev profile.
 
 OCaml jobs download their platform's Rust bundle, validate its identity and
 checksums, and compile the OCaml library and C stubs for the selected compiler.

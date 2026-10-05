@@ -168,3 +168,24 @@ let failure_diagnostic (failure : failure) =
     | Some cause -> loop (depth + 1) (current :: reversed) cause
   in
   loop 0 [] failure
+
+(** Searches outer-to-inner for the first [Application] layer. In the standard
+    Temporal shapes that layer is the innermost meaningful failure: Core wraps
+    an application failure as [Activity -> Application] or
+    [Child_workflow -> Application], possibly with a timeout layer between.
+    This mirrors how [Workflow_protocol.failure_non_retryable] lets wrappers
+    defer to their cause, and uses the same bounded depth as
+    [failure_diagnostic]. *)
+let application_failure_type (failure : failure) =
+  let rec loop depth (value : failure) =
+    match value.info with
+    | Application { type_name = ""; _ } -> None
+    | Application { type_name; _ } -> Some type_name
+    | Canceled _ | Terminated _ | Activity _ | Child_workflow _
+    | Timeout_failure _ | Server _ | Reset_workflow _ | Nexus_operation _
+    | Nexus_handler _ | Absent -> (
+        match value.cause with
+        | Some cause when depth < max_cause_depth -> loop (depth + 1) cause
+        | None | Some _ -> None)
+  in
+  loop 0 failure

@@ -17,14 +17,30 @@ boundary honestly:
 
 | Target | What it is useful for today |
 | --- | --- |
-| `mock://...` | Fast deterministic unit tests for client/worker registration and dispatch. The pure runtime tests also exercise timers, activities, child scheduling, replay, cancellation, and future combinators without a server. |
+| `mock://...` | Fast in-memory checks of client and worker plumbing: request validation, registration, codecs, and handle lifecycle. It is **not** a workflow test environment; see below. |
 | `http://...` or `https://...` | The OCaml-owned native client/worker path backed by Rust Temporal Core. The current native command slice handles activity, timer, terminal, cancellation, cache, and two-stage child-resolution paths. It is covered by focused bridge and adapter tests. |
 | Live Compose acceptance | Real PostgreSQL and Temporal Server validation with two separate OCaml binaries: a public worker and a public client driver. It asserts a fan-out activity result, a timer-then-activity result, and a parent awaiting a timer-owning child workflow. |
 
-The first two rows are different test boundaries, not different workflow
-languages. The same typed definitions and direct-style functions are used in
-both; `mock://` keeps tests local, while an HTTP(S) target uses the native
-OCaml/Rust bridge. The live Compose target proves the listed success paths
+`mock://` is not a workflow test environment. A mock client records each start
+and `Temporal.Client.wait` echoes the encoded start input back as the output,
+without running any workflow; it returns `Completed` only when the workflow's
+output codec can decode that echoed input, and a codec error otherwise. A mock worker dispatches one
+synthetic task per registered definition with an empty `binary/null` payload,
+unrelated to anything a mock client started. If the implementation's input
+codec accepts that payload (for example `Codec.unit`), the worker calls the
+implementation, so its side effects do run, but outside a workflow context: `Activity.start`, `Workflow.sleep`, `Scope.create`,
+and similar operations return an "outside a workflow" defect (`Workflow.patched`
+and `Workflow.upsert_search_attributes` raise `Invalid_argument`), and a
+`Codec.string` input fails to decode. Queries and updates against a mock
+client return typed errors. A `mock://` test that appears to pass therefore
+says nothing about workflow logic.
+
+To test workflow code, run a worker with an `http://` or `https://` target
+against a real Temporal Server, such as a local development server or the
+repository's PostgreSQL Compose stack (`make test-temporal-integration`). The
+SDK's own timer, activity, child, replay, cancellation, and future-combinator
+tests use a private runtime harness under `test/runtime`; it is not part of the
+installed `temporal-sdk` API. The live Compose target proves the listed paths
 through a real Temporal Server; it does not yet cover every failure, recovery,
 or child-workflow scenario.
 
@@ -188,31 +204,6 @@ outcome. Do not use
 while the run stays open so that corrected code can replay it. See
 [Workflow task and execution failures](../reference/workflow-failures.md).
 
-## Update indexed search attributes
-
-Workflows can publish indexed search attributes by emitting one deterministic
-merge command. The values are ordinary `Temporal.Payload.t` values, so the
-same codecs used for activity and workflow inputs can be reused. Keys must be
-unique, non-empty, valid UTF-8 strings no longer than 65,536 bytes; invalid
-keys are programmer errors and are rejected before the command is buffered.
-
-```ocaml
-let classify_workflow () =
-  let status = Temporal.Codec.encode Temporal.Codec.string "ready" in
-  match status with
-  | Error error -> Error error
-  | Ok status ->
-      Temporal.Workflow.upsert_search_attributes [ ("agent_status", status) ];
-      Ok "classified"
-```
-
-The update is recorded in workflow history and becomes visible to Temporal's
-visibility layer after the workflow task completion is accepted. Calling this
-operation does not perform network I/O, read wall-clock time, or mutate
-process-global state, which keeps replay deterministic. The current release
-has focused OCaml and Rust conversion coverage; a live visibility acceptance
-scenario is still tracked separately in the [feature coverage
-matrix](../reference/feature-coverage.md).
 That is the normal way to report an expected workflow failure. Pattern-match
 when the caller needs to choose a recovery path, or use `let*` when the error
 should finish the workflow:
@@ -250,6 +241,32 @@ OCaml values and SDK operations:
 Activities are the place for external work such as calling an LLM. The
 activity result is recorded by Temporal, so replay can use that recorded result
 without calling the external service again.
+
+### Update indexed search attributes
+
+Workflows can publish indexed search attributes by emitting one deterministic
+merge command. The values are ordinary `Temporal.Payload.t` values, so the
+same codecs used for activity and workflow inputs can be reused. Keys must be
+unique, non-empty, valid UTF-8 strings no longer than 65,536 bytes; invalid
+keys are programmer errors and are rejected before the command is buffered.
+
+```ocaml
+let classify_workflow () =
+  let status = Temporal.Codec.encode Temporal.Codec.string "ready" in
+  match status with
+  | Error error -> Error error
+  | Ok status ->
+      Temporal.Workflow.upsert_search_attributes [ ("agent_status", status) ];
+      Ok "classified"
+```
+
+The update is recorded in workflow history and becomes visible to Temporal's
+visibility layer after the workflow task completion is accepted. Calling this
+operation does not perform network I/O, read wall-clock time, or mutate
+process-global state, which keeps replay deterministic. The current release
+has focused OCaml and Rust conversion coverage; a live visibility acceptance
+scenario is still tracked separately in the [feature coverage
+matrix](../reference/feature-coverage.md).
 
 ### Introduce a new branch with a patch marker
 
@@ -675,9 +692,11 @@ let run_review document =
 
 The policy's intervals are exact durations and its coefficient is carried as
 lossless IEEE-754 bits through the private JSON protocol. Omitting
-`~retry_policy` emits `null`, which selects Core's default child policy. The
-current focused tests verify command construction and the bilateral Core
-conversion; the live Compose fixture has not yet exercised a child retry.
+`~retry_policy` emits `null`, which selects Core's default child policy.
+Focused tests verify command construction and the bilateral Core conversion,
+and the live Compose fixture runs a child whose first attempt fails retryably
+and whose second attempt, scheduled by Temporal under the parent's child
+retry policy, succeeds (see the coverage summary at the end of this section).
 
 When a workflow needs to keep the child operation alongside other work, retain
 the opaque handle returned by `start_handle`:
@@ -859,16 +878,22 @@ let worker_result =
     ~workflows:[ Temporal.Worker.workflow summarize_workflow ]
     ~activities:[ Temporal.Worker.activity summarize_activity ]
     ()
-  |> Result.bind Temporal.Worker.run
+  |> fun created -> Result.bind created Temporal.Worker.run
 ```
 
-Use `http://` or `https://` for a real native worker. `mock://` is a private,
-deterministic test backend and does not contact Temporal Server. Registration
+Use `http://` or `https://` for a real native worker. `mock://` does not
+contact Temporal Server and does not run workflow code in a workflow context
+(see the start of this guide). Registration
 rejects duplicate names and remote-only definitions before a native graph is
 created. `Temporal.Worker.run` is a blocking lifecycle loop; call it from an
 ordinary dedicated OCaml Domain or system thread rather than directly from a
 cooperative Eio/Lwt scheduler fiber. `Temporal.Worker.shutdown` is idempotent
-and drains retryable completions before releasing the native graph.
+and drains retryable completions before releasing the native graph. Call it
+from any other Domain or system thread, including a sibling thread on the
+Domain running `Temporal.Worker.run`; concurrent callers all wait for the same
+teardown and return its cached result. A call from inside one of the worker's
+own workflow or activity callbacks returns a defect `Error` instead of
+deadlocking, and the worker keeps running.
 
 Both `Temporal.Worker.create` and `Temporal.Client.create` accept an optional
 `~identity`, which Temporal records in history events and task-queue poller

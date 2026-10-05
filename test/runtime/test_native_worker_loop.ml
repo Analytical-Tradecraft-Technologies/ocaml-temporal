@@ -386,6 +386,117 @@ let test_rejected_delivery_keeps_workflow_lane_live () =
   if Atomic.get workflow_polls <> 3 || Atomic.get workflow_waits <> 2 then
     failwith "workflow lane did not advance beyond rejected deliveries"
 
+(** Readiness semantics a sequential-workflow fixture gives the native wait.
+    [Combined] is the loop's contract: any queued task on either lane ends the
+    wait. [Lane_specific] models the pre-#806 bridge, where the token holder
+    waited only on its own lane. *)
+type wait_model = Combined | Lane_specific
+
+(** Counters observed by one simulated sequential activity workflow run. *)
+type sequential_stats = {
+  completed_activities : int;
+  native_waits : int;
+  dead_waits : int;
+      (** Native waits that a real bridge would have spent sleeping for the
+          whole bounded timeout although a task was already queued. *)
+}
+
+(** Runs a workflow that awaits [steps] activities one after another through
+    the real lane scheduler. A mutex stands in for the sole supervisor owner:
+    every poll and native wait holds it, so a sibling's poll queues behind a
+    wait just as it does in the supervisor mailbox. Completing an activity
+    enqueues the next workflow activation and that activation schedules the
+    next activity, so a task is always queued whenever the owner is free until
+    the workflow completes.
+
+    Instead of sleeping for the bridge's 100 ms timeout, a wait that cannot see
+    the queued task returns at once and is counted as dead. Counting rather
+    than timing keeps the regression independent of host speed. *)
+let run_sequential_activity_workflow ~model ~steps =
+  let owner = Mutex.create () in
+  let workflow_pending = ref 1 in
+  let activity_pending = ref 0 in
+  let completed = ref 0 in
+  let closed = Atomic.make false in
+  let native_waits = Atomic.make 0 in
+  let dead_waits = Atomic.make 0 in
+  let poll_workflow () =
+    Mutex.protect owner (fun () ->
+        if !workflow_pending = 0 then Ok Loop.Not_ready
+        else begin
+          decr workflow_pending;
+          if !completed = steps then Atomic.set closed true
+          else incr activity_pending;
+          Ok Loop.Progress
+        end)
+  in
+  let poll_activity () =
+    Mutex.protect owner (fun () ->
+        if !activity_pending = 0 then Ok Loop.Not_ready
+        else begin
+          decr activity_pending;
+          incr completed;
+          incr workflow_pending;
+          Ok Loop.Progress
+        end)
+  in
+  let wait_for_lane ~workflow_lane ~native_wait =
+    if native_wait then
+      Mutex.protect owner (fun () ->
+          ignore (Atomic.fetch_and_add native_waits 1);
+          let own_pending, sibling_pending =
+            if workflow_lane then (!workflow_pending, !activity_pending)
+            else (!activity_pending, !workflow_pending)
+          in
+          let observed =
+            match model with
+            | Combined -> own_pending + sibling_pending > 0
+            | Lane_specific -> own_pending > 0
+          in
+          if (not observed) && own_pending + sibling_pending > 0 then
+            ignore (Atomic.fetch_and_add dead_waits 1)
+          else if (not observed) && not (Atomic.get closed) then
+            (* Work is produced only under [owner], so an empty fixture here
+               could never be woken and would stall the run. *)
+            failwith "native wait found no queued work before completion")
+    else Thread.delay 0.001;
+    Ok ()
+  in
+  begin match
+    Loop.run ~closed:(fun () -> Atomic.get closed) ~poll_workflow
+      ~poll_activity ~wait_for_lane
+      ~retry_pending:(fun ~workflow_lane:_ ->
+        failwith "sequential workflow fixture entered completion retry")
+  with
+  | Ok () -> ()
+  | Error _ -> failwith "sequential workflow fixture returned an error"
+  end;
+  {
+    completed_activities = Mutex.protect owner (fun () -> !completed);
+    native_waits = Atomic.get native_waits;
+    dead_waits = Atomic.get dead_waits;
+  }
+
+(** Regression for #806: with the combined readiness contract, a workflow that
+    awaits activities sequentially never has its idle native wait sleep through
+    a task queued on the other lane. The lane-specific control run proves the
+    fixture detects that pattern: there the alternating token holder repeatedly
+    waits on the lane that has nothing queued. *)
+let test_sequential_activities_have_no_dead_waits () =
+  let steps = 20 in
+  let combined = run_sequential_activity_workflow ~model:Combined ~steps in
+  if combined.completed_activities <> steps then
+    failwith "sequential workflow did not complete every activity";
+  if combined.dead_waits <> 0 then
+    failwith
+      (Printf.sprintf "combined readiness left %d dead waits in %d native waits"
+         combined.dead_waits combined.native_waits);
+  let control = run_sequential_activity_workflow ~model:Lane_specific ~steps in
+  if control.completed_activities <> steps then
+    failwith "lane-specific control did not complete every activity";
+  if control.dead_waits = 0 then
+    failwith "lane-specific control no longer exhibits the #806 dead wait"
+
 (** A native stop request short-circuits before either lane is touched. *)
 let test_closed_loop_does_not_poll () =
   let calls = Atomic.make 0 in
@@ -418,4 +529,5 @@ let () =
   test_transient_completion_retries_and_progresses ();
   test_permanent_activity_error_stops_sibling_without_shutdown ();
   test_rejected_delivery_keeps_workflow_lane_live ();
+  test_sequential_activities_have_no_dead_waits ();
   test_closed_loop_does_not_poll ()

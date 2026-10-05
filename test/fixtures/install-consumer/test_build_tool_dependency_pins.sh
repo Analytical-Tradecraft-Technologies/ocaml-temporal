@@ -17,7 +17,8 @@ cleanup() {
 trap cleanup EXIT HUP INT TERM
 
 prepare_fixture() {
-  mkdir -p "$fixture_root/.github/workflows"
+  mkdir -p "$fixture_root/.github/workflows" "$fixture_root/scripts"
+  sed -n 'p' "$root/scripts/ci-matrix.py" >"$fixture_root/scripts/ci-matrix.py"
   sed -n 'p' "$root/.gitattributes" >"$fixture_root/.gitattributes"
   sed -n 'p' "$root/Dockerfile.dev" >"$fixture_root/Dockerfile.dev"
   sed -n 'p' "$root/dune-project" >"$fixture_root/dune-project"

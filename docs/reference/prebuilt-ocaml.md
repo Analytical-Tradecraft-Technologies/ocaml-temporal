@@ -54,13 +54,19 @@ The following Linux ARM64 example assumes the compiler and compiled dependencies
 above are already installed in the current OPAM switch. Select the SDK matching
 that environment. Use a trusted release/tag or tested checkout to obtain the
 expected source commit, independently of the downloaded SDK manifest.
+Release tags are annotated (`git tag -a`), so the tag ref names a tag object
+rather than the source commit. Resolve the tag through the commits endpoint,
+which peels annotated and lightweight tags alike to their commit; the
+`git/ref/tags` endpoint's `.object.sha` is the tag object and fails the
+installer's provenance check. In a trusted checkout,
+`git rev-parse "$version^{commit}"` gives the same commit.
 
 ```sh
 set -eu
 repository=Analytical-Tradecraft-Technologies/ocaml-temporal
 version=v0.1.0-rc.1
 asset="ocaml-temporal-sdk-$version-linux-arm64-ocaml-5.5.1.tar.gz"
-expected_commit=$(gh api "repos/$repository/git/ref/tags/$version" --jq '.object.sha')
+expected_commit=$(gh api "repos/$repository/commits/refs/tags/$version" --jq '.sha')
 gh release download "$version" --repo "$repository" \
   --pattern "$asset" --pattern SHA256SUMS --dir downloads
 (

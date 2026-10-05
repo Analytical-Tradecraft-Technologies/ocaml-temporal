@@ -932,18 +932,20 @@ let activity_heartbeat_timeout_retry =
             ~retry_policy:policy ~do_not_eagerly_execute:true
             heartbeat_timeout_retry_activity seed)
 
-(** Uses Temporal's [non_retryable_error_types] policy matching against the
-    public activity error kind. The callback returns a retryable typed error on
-    its first attempt and would succeed on a second attempt; the workflow
-    catches the first activity future so the live result proves both that the
-    server stopped retrying and that the runtime preserved the activity category
-    and non-retryable decision. *)
+(** Uses Temporal's [non_retryable_error_types] policy matching against an
+    application-defined error type set with [Error.make ~error_type]. The
+    callback returns a retryable typed error on its first attempt and would
+    succeed on a second attempt; the workflow catches the first activity future
+    so the live result proves that the type reached the server as
+    [ApplicationFailureInfo.type], that the server stopped retrying, and that
+    the runtime preserved the activity category, error type and non-retryable
+    decision. *)
 let non_retryable_activity_policy =
   Temporal.Activity.Retry_policy.make
     ~initial_interval:(Temporal.Duration.of_ms 100L)
     ~backoff_coefficient:1.0
     ~maximum_interval:(Temporal.Duration.of_ms 100L)
-    ~maximum_attempts:2 ~non_retryable_error_types:[ "activity" ] ()
+    ~maximum_attempts:2 ~non_retryable_error_types:[ "SmokeInvalidInput" ] ()
 
 (** Counts attempts only inside the worker process. A correct policy match
     leaves the second-attempt success branch unreachable; retaining that branch
@@ -968,7 +970,8 @@ let non_retryable_activity =
           | Error error -> Error error
           | Ok detail ->
               Error
-                (Temporal.Error.make ~category:`Activity ~details:[ detail ]
+                (Temporal.Error.make ~error_type:"SmokeInvalidInput"
+                   ~category:`Activity ~details:[ detail ]
                    ~message:"SMOKE:ACTIVITY_NON_RETRYABLE:ATTEMPT:1" ()))
       | 2 -> Ok "SMOKE:ACTIVITY_NON_RETRYABLE:RETRIED"
       | attempt ->
@@ -998,15 +1001,19 @@ let activity_non_retryable_failure =
           with
           | Error error -> (
               let view = Temporal.Error.view error in
-              if view.category <> `Activity || not view.non_retryable then
+              if
+                view.category <> `Activity || not view.non_retryable
+                || view.error_type <> Some "SmokeInvalidInput"
+              then
                 Error
                   (Temporal.Error.defect
                      ~message:
                        (Printf.sprintf
                           "activity non-retryable metadata was not preserved \
-                           (kind=%s, non_retryable=%b)"
+                           (kind=%s, non_retryable=%b, error_type=%s)"
                           (Temporal.Error.kind error)
-                          view.non_retryable))
+                          view.non_retryable
+                          (Option.value view.error_type ~default:"<none>")))
               else
                 match view.details with
                 | [ detail ] -> (
