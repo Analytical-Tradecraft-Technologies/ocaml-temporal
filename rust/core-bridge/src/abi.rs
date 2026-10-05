@@ -90,11 +90,24 @@ const MAX_LIFECYCLE_CONFIG_BYTES: usize = 64 * 1024;
 const MAX_TRANSPORT_STRING_BYTES: usize = 64 * 1024;
 /// Prevents accidental allocation of unreasonable in-process worker state.
 const MAX_WORKER_COUNT: u32 = 1_000_000;
-/// Initial remote-activity concurrency until the private worker config grows a
-/// separately tuned activity field in the end-to-end worker slice.
-const DEFAULT_MAX_OUTSTANDING_ACTIVITIES: usize = 100;
-/// Initial Core server-poll concurrency for remote activity tasks.
-const DEFAULT_MAX_CONCURRENT_ACTIVITY_POLLS: usize = 5;
+/// Remote-activity slots granted to Core, matched to the OCaml executor.
+///
+/// The OCaml worker decodes, invokes, and completes one activity callback
+/// before admitting another. Every slot beyond that lets Core accept a task
+/// from the server, which starts its start-to-close clock, only for the task to
+/// wait in the bridge queue where it can time out and where other workers on
+/// the task queue cannot take it. Keep this equal to the executor's real
+/// concurrency until activity execution becomes concurrent and configurable
+/// (#498). An asynchronously completed activity releases its slot once the
+/// callback returns `WillCompleteAsync`.
+const DEFAULT_MAX_OUTSTANDING_ACTIVITIES: usize = 1;
+/// Local-activity slots granted to Core, for the same reason as remote
+/// activities: local activities share the same serial OCaml executor. Core's
+/// unset default would otherwise be 100.
+const DEFAULT_MAX_OUTSTANDING_LOCAL_ACTIVITIES: usize = 1;
+/// Core server-poll concurrency for remote activity tasks. Core reserves a
+/// slot before polling, so pollers beyond the slot count would only wait.
+const DEFAULT_MAX_CONCURRENT_ACTIVITY_POLLS: usize = DEFAULT_MAX_OUTSTANDING_ACTIVITIES;
 /// Temporal Core requires two workflow-task pollers whenever workflow caching
 /// is enabled. This mirrors the OCaml sender-side validation.
 const MIN_CACHED_WORKFLOW_POLLS: u32 = 2;
@@ -2541,6 +2554,7 @@ impl WorkerConfigInput {
             .graceful_shutdown_period(Duration::from_millis(self.graceful_shutdown_timeout_ms))
             .versioning_strategy(versioning_strategy)
             .max_outstanding_activities(DEFAULT_MAX_OUTSTANDING_ACTIVITIES)
+            .max_outstanding_local_activities(DEFAULT_MAX_OUTSTANDING_LOCAL_ACTIVITIES)
             .activity_task_poller_behavior(PollerBehavior::SimpleMaximum(
                 DEFAULT_MAX_CONCURRENT_ACTIVITY_POLLS,
             ))
@@ -4347,6 +4361,18 @@ mod worker_config_tests {
                 .message
                 .contains("max_concurrent_workflow_task_polls must be at least 2")
         );
+    }
+
+    /// Core must never be given more activity slots than the serial OCaml
+    /// executor can run (#777); surplus slots let the server start tasks
+    /// whose timeouts then expire while they wait in the bridge queue.
+    #[test]
+    fn activity_slots_match_serial_executor() {
+        let core = config(MIN_CACHED_WORKFLOW_POLLS)
+            .into_core()
+            .expect("default worker configuration should be valid");
+        assert_eq!(core.max_outstanding_activities, Some(1));
+        assert_eq!(core.max_outstanding_local_activities, Some(1));
     }
 
     /// Accepts the public default poller count before any runtime or network
