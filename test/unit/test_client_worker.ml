@@ -764,6 +764,28 @@ let test_reset_retired_exact_run_again () =
   | Error error -> failwith (Temporal.Error.message error));
   unwrap (Temporal.Client.shutdown client)
 
+(** Without an explicit request ID, two resets of the same run at the same
+    event are distinct operator actions (#774). A derived key would let the
+    server deduplicate the second call and return the first successor. *)
+let test_reset_without_request_id_is_not_deduplicated () =
+  let client =
+    unwrap
+      (Temporal.Client.create ~target_url:"mock://client"
+         ~namespace:"unit-test" ())
+  in
+  let original =
+    unwrap
+      (Temporal.Client.start client ~workflow:echo_workflow
+         ~task_queue:"unit-test" ~id:"unit-reset-fresh-id" ~input:"fresh" ())
+  in
+  let reset () =
+    unwrap (Temporal.Client.reset ~workflow_task_finish_event_id:4L original)
+  in
+  let first = reset () in
+  let second = reset () in
+  assert (first.run_id <> second.run_id);
+  unwrap (Temporal.Client.shutdown client)
+
 (** Reset deduplication belongs to one workflow, even when the mock service
     ledger is shared. Independent workflows may reuse an explicit request ID;
     each still returns its own successor on retry and rejects changed data. *)
@@ -1264,6 +1286,7 @@ let () =
   test_exact_run_reset ();
   test_reset_retired_exact_run_again ();
   test_reset_request_id_is_scoped_to_workflow ();
+  test_reset_without_request_id_is_not_deduplicated ();
   test_exact_run_termination ();
   test_completed_mock_run_is_immutable ();
   test_reset_preserves_completed_mock_run ();
