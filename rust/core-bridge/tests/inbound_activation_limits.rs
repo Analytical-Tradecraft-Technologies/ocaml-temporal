@@ -271,6 +271,49 @@ fn caps_deeply_nested_failure_causes() {
         .expect("rethrown capped chain must remain a valid completion");
 }
 
+/// The synthetic layer must not change public retryability. A chain whose
+/// retained prefix only defers (failures without failure info) and whose
+/// omitted tail ends in a non-retryable application failure must remain
+/// non-retryable, so the stand-in carries an authoritative server decision;
+/// a retryable tail keeps the deferring `Absent` stand-in.
+#[test]
+fn capped_chain_preserves_omitted_tail_retryability() {
+    let max = workflow_protocol::MAX_INBOUND_FAILURE_LAYERS;
+    let deferring_chain = |non_retryable: bool| {
+        let mut leaf = application_failure("leaf".to_owned(), String::new(), None);
+        if let Some(api_failure::failure::FailureInfo::ApplicationFailureInfo(info)) =
+            leaf.failure_info.as_mut()
+        {
+            info.non_retryable = non_retryable;
+        }
+        (1..max + 20).fold(leaf, |cause, _| api_failure::Failure {
+            message: "wrapper".to_owned(),
+            cause: Some(Box::new(cause)),
+            ..Default::default()
+        })
+    };
+
+    let semantic = convert_and_round_trip(&failed_activity(deferring_chain(true)));
+    let failure = resolved_failure(&semantic);
+    let last = std::iter::successors(Some(failure), |layer| layer.cause.as_deref())
+        .last()
+        .unwrap();
+    assert_eq!(chain_layers(failure), max);
+    assert!(matches!(
+        last.info,
+        FailureInfo::Server {
+            non_retryable: true
+        }
+    ));
+
+    let semantic = convert_and_round_trip(&failed_activity(deferring_chain(false)));
+    let failure = resolved_failure(&semantic);
+    let last = std::iter::successors(Some(failure), |layer| layer.cause.as_deref())
+        .last()
+        .unwrap();
+    assert!(matches!(last.info, FailureInfo::Absent {}));
+}
+
 /// The deepest place a failure appears in an activation is a continuation's
 /// `continued_failure`. A chain at the layer cap whose final layer carries a
 /// detail payload with metadata (the deepest JSON beneath one layer) must

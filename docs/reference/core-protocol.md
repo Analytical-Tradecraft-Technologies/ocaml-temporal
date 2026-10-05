@@ -519,7 +519,7 @@ produces the same semantic activation:
 | Inbound value | Rule |
 |---|---|
 | Free text over 65,536 bytes: failure `message`, `source`, `stack_trace`, failure-info identities, application/Nexus-handler `type`, Nexus-operation text, cancellation `reason`, eviction `message`, initialization `identity`, signal/update identity, `last_sdk_version`, `deployment_name` | Cut at the last UTF-8 character boundary that leaves room for `\n[truncated by ocaml-temporal: original length N bytes]`; the result is at most 65,536 bytes. Shorter text is unchanged. |
-| Failure chain longer than 100 layers (`MAX_INBOUND_FAILURE_LAYERS`) | The first 99 layers are kept exactly; the remainder becomes one final `{"kind":"absent"}` layer whose message is `[truncated by ocaml-temporal: N deeper failure causes omitted beyond 100 layers]`. |
+| Failure chain longer than 100 layers (`MAX_INBOUND_FAILURE_LAYERS`) | The first 99 layers are kept exactly; the remainder becomes one final layer whose message is `[truncated by ocaml-temporal: N deeper failure causes omitted beyond 100 layers]`. Its kind preserves the omitted tail's retryability decision (the same rule as `failure_non_retryable`): `{"kind":"server","non_retryable":true}` when the tail is non-retryable, otherwise `{"kind":"absent"}`. |
 | NUL in a signal or update sender identity | Each NUL becomes U+FFFD before the length rule. |
 | Signal, query, update, or initialization header key, or memo key, that is empty, contains NUL, or exceeds 65,536 bytes | The entry is dropped. No OCaml API can name such a key, and escaping it could collide with a real key. |
 

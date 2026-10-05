@@ -2609,9 +2609,76 @@ fn failure_layer_from_core(
     })
 }
 
+/// Decides retryability for the omitted tail of a cause chain with the same
+/// rule as the OCaml `Workflow_protocol.failure_non_retryable`: the first layer
+/// that carries a decision wins, and layers that defer to their cause (timeout,
+/// reset-workflow, Nexus operation, absent, or an activity/child wrapper with
+/// an unset or unspecified retry state) are skipped. A chain with no deciding
+/// layer is retryable. The walk is iterative, so the tail's length needs no
+/// recursion, and unknown enum values defer like an unspecified state.
+fn omitted_tail_non_retryable(first_omitted: &api_failure::Failure) -> bool {
+    use api_enums::NexusHandlerErrorRetryBehavior as Nexus;
+    use api_enums::RetryState;
+    use api_failure::failure::FailureInfo as Core;
+    let wrapper = |retry_state: i32| match RetryState::try_from(retry_state) {
+        Ok(RetryState::NonRetryableFailure | RetryState::MaximumAttemptsReached) => Some(true),
+        Ok(
+            RetryState::InProgress
+            | RetryState::Timeout
+            | RetryState::InternalServerError
+            | RetryState::CancelRequested,
+        ) => Some(false),
+        Ok(RetryState::RetryPolicyNotSet | RetryState::Unspecified) | Err(_) => None,
+    };
+    let mut cursor = Some(first_omitted);
+    while let Some(failure) = cursor {
+        let decision = match failure.failure_info.as_ref() {
+            Some(Core::ApplicationFailureInfo(info)) => Some(info.non_retryable),
+            Some(Core::CanceledFailureInfo(_)) => Some(false),
+            Some(Core::TerminatedFailureInfo(_)) => Some(true),
+            Some(Core::ActivityFailureInfo(info)) => wrapper(info.retry_state),
+            Some(Core::ChildWorkflowExecutionFailureInfo(info)) => wrapper(info.retry_state),
+            Some(Core::ServerFailureInfo(info)) => Some(info.non_retryable),
+            Some(Core::NexusHandlerFailureInfo(info)) => {
+                match Nexus::try_from(info.retry_behavior) {
+                    Ok(Nexus::NonRetryable) => Some(true),
+                    Ok(Nexus::Retryable) => Some(false),
+                    // Mirrors the OCaml Nexus specification default by type.
+                    Ok(Nexus::Unspecified) | Err(_) => Some(matches!(
+                        info.r#type.as_str(),
+                        "BAD_REQUEST"
+                            | "UNAUTHENTICATED"
+                            | "UNAUTHORIZED"
+                            | "NOT_FOUND"
+                            | "NOT_IMPLEMENTED"
+                            | "CONFLICT"
+                    )),
+                }
+            }
+            Some(
+                Core::TimeoutFailureInfo(_)
+                | Core::ResetWorkflowFailureInfo(_)
+                | Core::NexusOperationExecutionFailureInfo(_),
+            )
+            | None => None,
+        };
+        if let Some(non_retryable) = decision {
+            return non_retryable;
+        }
+        cursor = failure.cause.as_deref();
+    }
+    false
+}
+
 /// Builds the synthetic final layer that stands in for the omitted tail of an
 /// over-deep inbound cause chain. The tail is walked iteratively, so counting
 /// it needs no recursion however long it is.
+///
+/// The stand-in must not change the chain's public retryability. When the
+/// omitted tail decides the failure is non-retryable, the stand-in carries an
+/// authoritative `Server { non_retryable: true }` decision; otherwise it is an
+/// `Absent` layer, which defers to its (missing) cause and so stays retryable,
+/// exactly as the omitted tail would have decided.
 fn omitted_causes_failure(first_omitted: &api_failure::Failure) -> Failure {
     let mut omitted = 0usize;
     let mut cursor = Some(first_omitted);
@@ -2619,6 +2686,13 @@ fn omitted_causes_failure(first_omitted: &api_failure::Failure) -> Failure {
         omitted += 1;
         cursor = failure.cause.as_deref();
     }
+    let info = if omitted_tail_non_retryable(first_omitted) {
+        FailureInfo::Server {
+            non_retryable: true,
+        }
+    } else {
+        FailureInfo::Absent {}
+    };
     Failure {
         message: format!(
             "[truncated by ocaml-temporal: {omitted} deeper failure causes omitted \
@@ -2628,7 +2702,7 @@ fn omitted_causes_failure(first_omitted: &api_failure::Failure) -> Failure {
         stack_trace: String::new(),
         encoded_attributes: None,
         cause: None,
-        info: FailureInfo::Absent {},
+        info,
     }
 }
 
