@@ -657,15 +657,19 @@ let payload path json =
 
 (** Encodes one payload without changing metadata key or byte content. *)
 let payload_json (value : payload) =
+  (* A randomly seeded hash set keeps the duplicate check linear in the
+     metadata size, even for adversarially chosen keys. *)
+  let seen = Hashtbl.create ~random:true (List.length value.metadata) in
   let rec metadata_json encoded = function
     | [] -> Ok (`Assoc (List.rev encoded))
     | (key, bytes) :: rest ->
         if String.length key = 0 || String.length key > 65_536 then
           Error (invalid "$.metadata" "metadata key length is outside protocol limits")
-        else if List.exists (fun (existing, _) -> String.equal existing key) encoded
-        then Error (invalid "$.metadata" "duplicate metadata key")
+        else if Hashtbl.mem seen key then
+          Error (invalid "$.metadata" "duplicate metadata key")
         else
           let* wrapped = bytes_wrapper_json bytes in
+          Hashtbl.add seen key ();
           metadata_json ((key, wrapped) :: encoded) rest
   in
   let* metadata = metadata_json [] value.metadata in
@@ -1409,33 +1413,45 @@ let eviction_reason_string = function
   | Pagination_or_history_fetch -> "pagination_or_history_fetch"
   | Workflow_execution_ending -> "workflow_execution_ending"
 
-(** Decodes a canonical object map whose values are Temporal payloads. *)
+(** Decodes a canonical object map whose values are Temporal payloads.
+
+    Header, memo, and search-attribute maps arrive from remote clients, so the
+    duplicate-key check uses a hash set: an untrusted map with many entries must
+    cost linear rather than quadratic time on the supervisor Domain. The table
+    is seeded randomly so that precomputed colliding keys cannot restore the
+    quadratic cost. Hashtbl draws seeds from its own domain-local generator,
+    so this does not perturb [Random]. *)
 let payload_map path = function
   | `Assoc entries ->
+      let seen = Hashtbl.create ~random:true (List.length entries) in
       let rec loop decoded = function
         | [] -> Ok (List.rev decoded)
         | (key, value) :: rest ->
             let* key = identifier (path ^ ".key") (`String key) in
-            if List.exists (fun (existing, _) -> String.equal existing key) decoded then
+            if Hashtbl.mem seen key then
               Error (invalid path "duplicate payload-map key")
             else
               let* value = payload (path ^ "." ^ key) value in
+              Hashtbl.add seen key ();
               loop ((key, value) :: decoded) rest
       in
       let* values = loop [] entries in
       Ok (List.sort (fun (left, _) (right, _) -> String.compare left right) values)
   | _ -> Error (invalid path "expected JSON object")
 
-(** Encodes a payload map and rejects duplicate keys before canonical sorting. *)
+(** Encodes a payload map and rejects duplicate keys before canonical sorting.
+    The duplicate check is linear in the number of entries. *)
 let payload_map_json path values =
+  let seen = Hashtbl.create ~random:true (List.length values) in
   let rec loop encoded = function
     | [] -> Ok (`Assoc (List.rev encoded))
     | (key, value) :: rest ->
         let* key = identifier (path ^ ".key") (`String key) in
-        if List.exists (fun (existing, _) -> String.equal existing key) encoded then
+        if Hashtbl.mem seen key then
           Error (invalid path "duplicate payload-map key")
         else
           let* value = payload_json value in
+          Hashtbl.add seen key ();
           loop ((key, value) :: encoded) rest
   in
   loop [] values
