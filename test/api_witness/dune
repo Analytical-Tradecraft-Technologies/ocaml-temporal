@@ -1,0 +1,45 @@
+; In-tree public API compatibility gate.
+;
+; The witness lives with the installed-consumer fixture so `make test-install`
+; also compiles it against the installed package. Copying it here compiles the
+; same file against the in-tree `temporal-sdk` library during every
+; `dune runtest`, which every CI lane runs, without Docker or an installation.
+; The `#` form keeps line directives, so type errors point at the fixture file.
+
+(copy_files#
+ (files ../fixtures/install-consumer/public_api.ml))
+
+; A library (rather than an executable) type-checks the witness without
+; linking the Rust bridge. The witness has no top-level effects.
+
+(library
+ (name temporal_api_witness)
+ (modules public_api)
+ (libraries temporal-sdk))
+
+; Reads the public interfaces and the witness as source; it never links the
+; SDK itself.
+
+(executable
+ (name check_api_witness)
+ (modules check_api_witness)
+ (libraries compiler-libs.common))
+
+; Depending on the witness interface makes this rule fail when any annotation
+; no longer matches the public API; the program then fails if a public value
+; is not referenced by the witness at all.
+
+(rule
+ (alias runtest)
+ (package temporal-sdk)
+ (deps
+  %{cmi:public_api}
+  ../../lib/public/temporal.ml
+  (glob_files ../../lib/public/*.mli)
+  ../fixtures/install-consumer/public_api.ml)
+ (action
+  (run
+   %{exe:check_api_witness.exe}
+   ../../lib/public/temporal.ml
+   ../../lib/public
+   ../fixtures/install-consumer/public_api.ml)))

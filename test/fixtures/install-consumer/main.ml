@@ -1,5 +1,11 @@
 module T = Temporal
 
+(* Dune compiles and links only the modules reachable from an executable's
+   main module, so an unreferenced [Public_api] would never be type-checked
+   by the installed-consumer build.  This reference keeps the compatibility
+   witness in that build; the witness has no top-level effects. *)
+let (_ : string T.Codec.t) = Public_api._codec_string
+
 (** Converts an expected SDK result into a test value while retaining the
     public error message if the installed package violates its contract. *)
 let expect_ok label = function
