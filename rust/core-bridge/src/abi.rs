@@ -428,6 +428,32 @@ struct WorkerConfigInput {
     max_outstanding_workflow_tasks: u32,
     max_concurrent_workflow_task_polls: u32,
     graceful_shutdown_timeout_ms: u64,
+    /// Task kinds the OCaml registration can execute. Omitted documents keep
+    /// the historical poll-everything behavior; the OCaml encoder always
+    /// sends the field explicitly.
+    #[serde(default)]
+    task_types: WorkerTaskTypesInput,
+}
+
+/// Task kinds a live worker polls, derived on the OCaml side from whether any
+/// workflow or activity implementation is registered (#805). The mapping to
+/// Core's local/remote/Nexus switches lives in
+/// [`crate::worker_bridge::bridge_task_types`]; at least one kind is required.
+#[derive(Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkerTaskTypesInput {
+    workflows: bool,
+    activities: bool,
+}
+
+impl Default for WorkerTaskTypesInput {
+    /// Preserves the behavior of documents written before the field existed.
+    fn default() -> Self {
+        Self {
+            workflows: true,
+            activities: true,
+        }
+    }
 }
 
 /// Explicit worker-routing mode carried across the OCaml/Rust JSON boundary.
@@ -2574,7 +2600,16 @@ impl WorkerConfigInput {
             .activity_task_poller_behavior(PollerBehavior::SimpleMaximum(
                 DEFAULT_MAX_CONCURRENT_ACTIVITY_POLLS,
             ))
-            .task_types(crate::worker_bridge::bridge_task_types())
+            .task_types(
+                crate::worker_bridge::bridge_task_types(
+                    self.task_types.workflows,
+                    self.task_types.activities,
+                )
+                .map_err(|message| Failure {
+                    status: STATUS_CONFIGURATION,
+                    message: message.to_owned(),
+                })?,
+            )
             .build()
             .map_err(|message| Failure {
                 status: STATUS_CONFIGURATION,
@@ -4360,6 +4395,7 @@ mod worker_config_tests {
             max_outstanding_workflow_tasks: 100,
             max_concurrent_workflow_task_polls: pollers,
             graceful_shutdown_timeout_ms: 1_000,
+            task_types: Default::default(),
         }
     }
 
@@ -4507,6 +4543,10 @@ mod pending_start_cleanup_tests;
 #[cfg(test)]
 #[path = "../tests/support/worker_slot_limits.rs"]
 mod worker_slot_limits;
+
+#[cfg(test)]
+#[path = "../tests/support/worker_task_types.rs"]
+mod worker_task_types;
 
 /// SDK name reported to Temporal as the `client-name` RPC header and recorded
 /// in `WorkflowTaskCompleted.sdk_metadata`. Core would otherwise attribute

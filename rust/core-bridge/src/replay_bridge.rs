@@ -400,6 +400,9 @@ impl ReplayWorker {
     /// 1. `finish_input` has closed the feeder;
     /// 2. `wait_workflow` has returned `Shutdown`; and
     /// 3. the bridge ledger has no outstanding completion debt.
+    // The error deliberately returns the worker itself so ownership is never
+    // lost on failure; boxing it would only move the same value to the heap.
+    #[allow(clippy::result_large_err)]
     pub(crate) async fn finalize(
         mut self,
         handle: &Handle,
@@ -465,6 +468,9 @@ impl ReplayWorker {
     /// worker is returned with the typed error instead of being dropped; the
     /// caller must retry disposal or take another explicit ownership-preserving
     /// recovery action.
+    // The error deliberately returns the worker itself so ownership is never
+    // lost on failure; boxing it would only move the same value to the heap.
+    #[allow(clippy::result_large_err)]
     pub(crate) async fn dispose(
         mut self,
         handle: &Handle,

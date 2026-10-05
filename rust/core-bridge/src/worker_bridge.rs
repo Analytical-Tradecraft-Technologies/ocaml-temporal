@@ -114,17 +114,57 @@ fn is_stale_activity_cancellation(task: &ActivityTask, error: CompleteError) -> 
     ) && matches!(error, CompleteError::UnknownActivity)
 }
 
-/// Returns the exact Core task surface implemented by the first worker slice.
-pub fn bridge_task_types() -> WorkerTaskTypes {
-    WorkerTaskTypes {
-        enable_workflows: true,
-        // Local activities use the same Core activity-task handoff as remote
-        // activities, but Core marks their task token as local and records the
-        // result in workflow history instead of sending an RPC to the server.
-        enable_local_activities: true,
-        enable_remote_activities: true,
-        enable_nexus: false,
+/// Maps the task kinds an OCaml worker registration can execute onto the
+/// exact Core task surface the bridge enables.
+///
+/// `workflows` and `activities` report whether the OCaml worker registered at
+/// least one workflow or activity implementation. Core polls the server only
+/// for the kinds enabled here, so a worker that cannot execute a task kind
+/// never takes such a task from a shared task queue (#805). Polling a kind
+/// without an implementation would let this worker win tasks that a sibling
+/// worker on the same queue could execute, and then fail them.
+///
+/// Local activities are enabled exactly when workflows are. Local activities
+/// use the same Core activity-task handoff as remote activities, but they are
+/// never polled from the server: Core dispatches them in-process from this
+/// worker's own workflow commands and records the result in workflow history,
+/// so they cannot steal another worker's tasks. Keeping them enabled for a
+/// worker without registered activities makes a local activity scheduled by
+/// one of its workflows fail promptly as an unregistered type instead of
+/// waiting forever on a disabled Core manager. Core itself rejects local
+/// activities without workflows. Nexus is never enabled because the bridge has
+/// no Nexus task handoff.
+///
+/// Returns an error when neither kind is selected: such a worker could never
+/// make progress, and Core would reject it with a less specific diagnostic.
+pub fn bridge_task_types(
+    workflows: bool,
+    activities: bool,
+) -> Result<WorkerTaskTypes, &'static str> {
+    if !workflows && !activities {
+        return Err("task_types must enable workflows or activities");
     }
+    Ok(WorkerTaskTypes {
+        enable_workflows: workflows,
+        enable_local_activities: workflows,
+        enable_remote_activities: activities,
+        enable_nexus: false,
+    })
+}
+
+/// Reports which guarded poll lanes a Core worker with `task_types` needs, as
+/// `(workflow_lane, activity_lane)`.
+///
+/// The workflow lane must not run when workflows are disabled: Core's
+/// `poll_workflow_activation` then returns `ShutDown` immediately *and*
+/// initiates shutdown of the whole worker, which would stop an activity-only
+/// worker before it executes anything. The activity lane is needed whenever
+/// Core can produce either a remote or a local activity task.
+pub fn poll_lanes_for(task_types: &WorkerTaskTypes) -> (bool, bool) {
+    (
+        task_types.enable_workflows,
+        task_types.enable_remote_activities || task_types.enable_local_activities,
+    )
 }
 
 /// Upper bound for each phase of releasing a worker whose validation failed.
@@ -532,10 +572,11 @@ impl Readiness {
 
 /// Rust-owned pair of guarded Core poll lanes for one worker.
 ///
-/// Exactly one Tokio task invokes each Core poll API. The channels are only
-/// consumed by the owner Domain through non-blocking `try_take_*` calls, so a
-/// long Core poll can never block lifecycle or completion messages in the
-/// OCaml supervisor mailbox.
+/// Exactly one Tokio task invokes each Core poll API that the worker's
+/// configured task types enable. The channels are only consumed by the owner
+/// Domain through non-blocking `try_take_*` calls, so a long Core poll can
+/// never block lifecycle or completion messages in the OCaml supervisor
+/// mailbox.
 pub struct PollLanes {
     worker: Arc<Worker>,
     ledger: Arc<Mutex<TaskLedger>>,
@@ -545,13 +586,36 @@ pub struct PollLanes {
     activity_signal: Arc<Readiness>,
     workflow_lane: Option<JoinHandle<()>>,
     activity_lane: Option<JoinHandle<()>>,
+    /// Senders retained for lanes that a live worker deliberately did not
+    /// start. Holding them keeps the receivers connected, so a disabled lane
+    /// reports "no work" rather than the disconnect that marks a lane closed.
+    /// They never send and are dropped with the lanes.
+    idle_senders: IdleSenders,
     shutdown_started: bool,
 }
 
+/// Producer halves kept alive for disabled live-worker lanes; see
+/// [`PollLanes::start`].
+type IdleSenders = (
+    Option<mpsc::UnboundedSender<ReadyTask<WorkflowActivation>>>,
+    Option<mpsc::UnboundedSender<ReadyTask<ActivityTask>>>,
+);
+
 impl PollLanes {
-    /// Starts the sole workflow poll and sole remote-activity poll loops.
+    /// Starts the sole workflow poll and sole activity poll loops that the
+    /// worker's configured Core task types require.
+    ///
+    /// The lane plan is derived from the configuration Core was actually
+    /// given (see [`poll_lanes_for`]), so the bridge can neither poll a task
+    /// kind that Core disabled nor skip one that it enabled. A lane that is
+    /// not started stays *open and idle*: non-blocking takes report no work
+    /// and readiness waits time out exactly as for a quiet lane, until
+    /// [`Self::initiate_shutdown`] closes both lanes. Closing it eagerly would
+    /// make a readiness wait report shutdown while the worker is still
+    /// running, which the OCaml owner treats as a lifecycle error.
     pub fn start(worker: Worker, handle: &tokio::runtime::Handle) -> Self {
-        Self::start_with_activity_lane(worker, handle, true)
+        let (workflow, activity) = poll_lanes_for(&worker.get_config().task_types);
+        Self::start_lanes(worker, handle, workflow, activity, false)
     }
 
     /// Starts only the workflow poll loop for a replay worker.
@@ -563,16 +627,23 @@ impl PollLanes {
     /// worker failure. The shared ledger and readiness machinery remain the
     /// same as the live-worker path.
     pub fn start_workflow_only(worker: Worker, handle: &tokio::runtime::Handle) -> Self {
-        Self::start_with_activity_lane(worker, handle, false)
+        Self::start_lanes(worker, handle, true, false, true)
     }
 
     /// Builds the guarded lanes shared by live and workflow-only replay
-    /// workers. The boolean is internal to construction so the public methods
-    /// cannot create a partially configured lane graph.
-    fn start_with_activity_lane(
+    /// workers. The booleans are internal to construction so the public
+    /// methods cannot create a partially configured lane graph.
+    ///
+    /// `close_absent` selects how a lane without a producer behaves. Replay
+    /// marks it closed before publication so a defensive wait cannot sleep on
+    /// a condition replay can never satisfy. Live workers keep it open and
+    /// idle by retaining its sender; see [`Self::start`].
+    fn start_lanes(
         worker: Worker,
         handle: &tokio::runtime::Handle,
+        start_workflow_lane: bool,
         start_activity_lane: bool,
+        close_absent: bool,
     ) -> Self {
         let worker = Arc::new(worker);
         let ledger = Arc::new(Mutex::new(TaskLedger::new()));
@@ -584,13 +655,23 @@ impl PollLanes {
         let (activity_sender, activity_ready) = mpsc::unbounded_channel();
         let workflow_signal = Arc::new(Readiness::new());
         let activity_signal = Arc::new(Readiness::new());
+        let mut idle_senders: IdleSenders = (None, None);
 
-        let workflow_lane = handle.spawn(run_workflow_lane(
-            Arc::clone(&worker),
-            Arc::clone(&ledger),
-            workflow_sender,
-            Arc::clone(&workflow_signal),
-        ));
+        let workflow_lane = if start_workflow_lane {
+            Some(handle.spawn(run_workflow_lane(
+                Arc::clone(&worker),
+                Arc::clone(&ledger),
+                workflow_sender,
+                Arc::clone(&workflow_signal),
+            )))
+        } else {
+            if close_absent {
+                workflow_signal.close();
+            } else {
+                idle_senders.0 = Some(workflow_sender);
+            }
+            None
+        };
         let activity_lane = if start_activity_lane {
             Some(handle.spawn(run_activity_lane(
                 Arc::clone(&worker),
@@ -599,10 +680,11 @@ impl PollLanes {
                 Arc::clone(&activity_signal),
             )))
         } else {
-            // No producer exists for this lane in workflow-only mode. Mark it
-            // closed before publication so a defensive wait cannot sleep on a
-            // condition that replay can never satisfy.
-            activity_signal.close();
+            if close_absent {
+                activity_signal.close();
+            } else {
+                idle_senders.1 = Some(activity_sender);
+            }
             None
         };
         Self {
@@ -612,10 +694,31 @@ impl PollLanes {
             activity_ready,
             workflow_signal,
             activity_signal,
-            workflow_lane: Some(workflow_lane),
+            workflow_lane,
             activity_lane,
+            idle_senders,
             shutdown_started: false,
         }
+    }
+
+    /// Reports whether a Core workflow poll loop was started for this worker.
+    pub fn polls_workflow_tasks(&self) -> bool {
+        self.workflow_lane.is_some()
+    }
+
+    /// Reports whether a Core activity poll loop was started for this worker.
+    ///
+    /// A worker with workflows but no registered activities still starts this
+    /// lane so Core can dispatch its local activities, but Core never polls
+    /// the server for remote activity tasks on its behalf; see
+    /// [`Self::task_types`].
+    pub fn polls_activity_tasks(&self) -> bool {
+        self.activity_lane.is_some()
+    }
+
+    /// Returns the Core task types this worker was constructed with.
+    pub fn task_types(&self) -> WorkerTaskTypes {
+        self.worker.get_config().task_types
     }
 
     /// Takes one ready activation without waiting for Core or a channel lock.
@@ -1345,6 +1448,7 @@ impl PollLanes {
             activity_signal,
             workflow_lane,
             activity_lane,
+            idle_senders,
             shutdown_started,
         } = self;
         match Arc::try_unwrap(worker) {
@@ -1362,6 +1466,7 @@ impl PollLanes {
                     activity_signal,
                     workflow_lane,
                     activity_lane,
+                    idle_senders,
                     shutdown_started,
                 },
                 WorkerBridgeError::WorkerStillShared,

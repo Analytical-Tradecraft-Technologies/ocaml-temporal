@@ -201,8 +201,16 @@ the registry lock or strand a second caller.
 `Temporal.Worker.create` validates all registration definitions before opening a
 native resource. A `mock://` target selects the deterministic in-memory backend
 used by unit tests; an `http://` or `https://` target creates one private
-supervisor, connects the Core client, starts one workflow/remote-activity
-worker, and installs the two typed adapters described above. The application
+supervisor, connects the Core client, starts one Core worker, and installs the
+two typed adapters described above. The worker polls only the task kinds it
+registered (#805): with no activities, Core does not poll remote activity tasks
+(local activities scheduled by its own workflows still run in-process); with no
+workflows, Core runs no workflow poller. Registering neither is rejected as a
+defect before any native allocation. This keeps a workflow-only and an
+activity-only worker on the same task queue from taking, and failing as
+unregistered, tasks meant for each other. For an activity-only worker the run
+loop skips the idle workflow lane and spends its native readiness waits on the
+activity lane. The application
 still owns the final executable: Rust remains a static implementation detail
 behind the private supervisor and no native handle is exposed through the
 public API.

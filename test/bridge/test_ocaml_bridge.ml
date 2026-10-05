@@ -93,6 +93,35 @@ let () =
   | Error { status = Invalid_state; message } ->
       assert (String.length message > 0)
   | _ -> failwith "deployment worker construction without a client was accepted");
+  (* A worker must poll only the task kinds it registered (#805). Reaching the
+     missing-client state, rather than a configuration error, proves Rust
+     strictly decoded each serialized task_types document. *)
+  List.iter
+    (fun (workflow_tasks, activity_tasks) ->
+      let config =
+        unwrap
+          (Bridge.worker_config ~namespace:"temporal-sdk-test"
+             ~task_queue:"ocaml-temporal-unit" ~build_id:"unit-build"
+             ~max_cached_workflows:100 ~max_outstanding_workflow_tasks:100
+             ~max_concurrent_workflow_task_polls:2
+             ~graceful_shutdown_timeout_ms:1_000L ~workflow_tasks
+             ~activity_tasks ())
+      in
+      match Bridge.worker_start runtime config with
+      | Error { status = Invalid_state; message } ->
+          assert (String.length message > 0)
+      | _ -> failwith "task-type worker construction without a client was accepted")
+    [ (true, false); (false, true) ];
+  (match
+     Bridge.worker_config ~namespace:"temporal-sdk-test"
+       ~task_queue:"ocaml-temporal-unit" ~build_id:"unit-build"
+       ~max_cached_workflows:100 ~max_outstanding_workflow_tasks:100
+       ~max_concurrent_workflow_task_polls:2 ~graceful_shutdown_timeout_ms:1_000L
+       ~workflow_tasks:false ~activity_tasks:false ()
+   with
+  | Error { status = Configuration; message } ->
+      assert (message = "task_types must enable workflows or activities")
+  | _ -> failwith "worker configuration without task types was accepted");
   (match Bridge.worker_try_poll_workflow runtime with
   | Error { status = Invalid_state; message } ->
       assert (String.length message > 0)

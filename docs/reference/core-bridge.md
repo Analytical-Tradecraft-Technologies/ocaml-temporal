@@ -436,8 +436,27 @@ assemble these strings themselves. The client document contains exactly
 `target_url` and `identity`. The worker document contains exactly `namespace`,
 `task_queue`, `build_id`, `versioning`, `max_cached_workflows`,
 `max_outstanding_workflow_tasks`, `max_concurrent_workflow_task_polls`, and
-`graceful_shutdown_timeout_ms`. Closed Draft 2020-12 schemas live under
-`docs/schemas/bridge/`.
+`graceful_shutdown_timeout_ms`, plus `task_types`. Closed Draft 2020-12
+schemas live under `docs/schemas/bridge/`.
+
+`task_types` is a closed `{ "workflows": bool, "activities": bool }` object
+that the OCaml worker derives from its registrations: a kind with no
+registered implementation is `false` (#805). Rust maps it onto Core's
+`WorkerTaskTypes` in `worker_bridge::bridge_task_types`: `workflows` enables
+workflow polling and in-process local activities, and `activities` enables
+remote activity polling; Nexus is always off. A worker that registers no
+activities therefore never takes an activity task from a shared task queue
+that a sibling activity worker could have executed, and an activity-only
+worker never takes workflow tasks. A document with both `false` is rejected
+with `STATUS_CONFIGURATION`. The member may be omitted for compatibility, in
+which case both kinds are polled; the OCaml encoder always sends it.
+`PollLanes::start` derives its lanes from the configuration Core actually
+received: no workflow poll lane runs without workflows (Core's workflow poll
+would otherwise report `ShutDown` and shut the whole worker down), and the
+activity lane runs whenever local or remote activities are enabled. A lane
+that is not started stays open and idle — polls report no work and readiness
+waits time out — until shutdown closes it, so the OCaml run loop never sees a
+spurious lane shutdown.
 
 `versioning` is a closed object: `{ "kind": "none" }` preserves the existing
 unversioned worker behavior, while `{ "kind": "legacy_build_id", "build_id":

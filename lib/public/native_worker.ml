@@ -300,6 +300,11 @@ type t = {
   supervisor : Native.t;
   workflows : Workflow.t;
   activities : Activity.t;
+  workflow_tasks : bool;
+      (** [false] for an activity-only worker. Core then runs no workflow
+          poller and the Rust workflow lane stays permanently idle, so the run
+          loop skips polling it and spends its native readiness waits on the
+          activity lane instead (#805). *)
   closed : bool Atomic.t;
   shutdown_retryable : bool Atomic.t;
       (** [true] while terminal native shutdown has not returned. Adapter maps
@@ -352,16 +357,20 @@ type progress = Worker_loop.progress = Progress | Not_ready | Retry_pending
     outer loop needs. The adapter's detailed rejection is logged without copying
     a run ID into an error message. *)
 let poll_workflow worker =
-  match Workflow.poll worker.workflows with
-  | Ok Workflow_adapter.Not_ready -> Ok Not_ready
-  | Ok (Workflow_adapter.Completed _) -> Ok Progress
-  | Ok (Workflow_adapter.Rejected { error; lease_retired = true; _ }) ->
-      report Logs.Warning ~operation:"workflow_task_rejected"
-        ~error_kind:error.code ();
-      Ok Progress
-  | Ok (Workflow_adapter.Rejected { error; lease_retired = false; _ }) ->
-      Error (public_adapter_error "workflow task completion" error)
-  | Error error -> Error (public_adapter_error "workflow task poll" error)
+  (* An activity-only worker has no workflow poller in Core; the Rust lane can
+     never produce work, so avoid a supervisor round trip per loop turn. *)
+  if not worker.workflow_tasks then Ok Not_ready
+  else
+    match Workflow.poll worker.workflows with
+    | Ok Workflow_adapter.Not_ready -> Ok Not_ready
+    | Ok (Workflow_adapter.Completed _) -> Ok Progress
+    | Ok (Workflow_adapter.Rejected { error; lease_retired = true; _ }) ->
+        report Logs.Warning ~operation:"workflow_task_rejected"
+          ~error_kind:error.code ();
+        Ok Progress
+    | Ok (Workflow_adapter.Rejected { error; lease_retired = false; _ }) ->
+        Error (public_adapter_error "workflow task completion" error)
+    | Error error -> Error (public_adapter_error "workflow task poll" error)
 
 (** Maps one activity adapter poll using the same lease-retirement rule as the
     workflow path. An acknowledged activity failure is ordinary progress. *)
@@ -388,7 +397,13 @@ let poll_activity worker =
     token. When its sibling is busy or already waiting, a 10 ms local yield
     avoids occupying the sole supervisor owner with a wait for the wrong lane.
     The next poll checks the Rust queue; when both lanes become idle, they
-    alternate native waits with the OCaml runtime lock released. *)
+    alternate native waits with the OCaml runtime lock released.
+
+    An activity-only worker's workflow lane never becomes ready, so when that
+    lane holds the token it waits for activity readiness instead. Otherwise
+    every other idle wait would hold the supervisor on a dead lane for the full
+    bounded timeout and delay the next activity task by up to that long. The
+    wait does not consume the task, so the activity lane still takes it. *)
 let wait_for_lane worker ~workflow_lane ~native_wait =
   if not native_wait then begin
     Thread.delay 0.01;
@@ -396,7 +411,8 @@ let wait_for_lane worker ~workflow_lane ~native_wait =
   end
   else
     let operation : unit Native.operation =
-      if workflow_lane then Native.Wait_workflow else Native.Wait_activity
+      if workflow_lane && worker.workflow_tasks then Native.Wait_workflow
+      else Native.Wait_activity
     in
     match Native.perform worker.supervisor operation with
     | Ok () -> Ok ()
@@ -716,9 +732,23 @@ let create ?max_cached_workflows ?(versioning = Bridge.No_versioning) ~target_ur
     | Bridge.Deployment_based { build_id; _ } -> build_id
   in
   let { Observer.on_activation; on_completion } = Observer.current () in
+  (* Core polls only the task kinds this worker can execute (#805). A worker
+     that registers no activities must not take activity tasks from a shared
+     task queue, where a sibling worker could have run them, only to fail them
+     as unregistered; likewise for workflows. A worker with neither could
+     never make progress, so it is rejected before any native allocation. *)
+  let workflow_tasks = workflows <> [] in
+  let activity_tasks = activities <> [] in
   let* client_config =
     Native.client_config ~target_url ~identity
     |> Result.map_error (public_bridge_error "client configuration")
+  in
+  let* () =
+    if workflow_tasks || activity_tasks then Ok ()
+    else
+      Error
+        (Base_error.defect
+           ~message:"worker must register at least one workflow or activity")
   in
   let* worker_config =
     Native.worker_config ~namespace ~task_queue ~build_id ~versioning
@@ -726,7 +756,8 @@ let create ?max_cached_workflows ?(versioning = Bridge.No_versioning) ~target_ur
       ~max_outstanding_workflow_tasks:default_max_outstanding_workflow_tasks
       ~max_concurrent_workflow_task_polls:
         default_max_concurrent_workflow_task_polls
-      ~graceful_shutdown_timeout_ms:default_graceful_shutdown_timeout_ms ()
+      ~graceful_shutdown_timeout_ms:default_graceful_shutdown_timeout_ms
+      ~workflow_tasks ~activity_tasks ()
     |> Result.map_error (public_bridge_error "worker configuration")
   in
   let* supervisor =
@@ -760,6 +791,7 @@ let create ?max_cached_workflows ?(versioning = Bridge.No_versioning) ~target_ur
         supervisor;
         workflows;
         activities;
+        workflow_tasks;
         closed = Atomic.make false;
         shutdown_retryable = Atomic.make false;
         terminal_cleanup_pending = Atomic.make false;

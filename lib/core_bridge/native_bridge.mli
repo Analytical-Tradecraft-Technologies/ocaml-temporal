@@ -78,8 +78,16 @@ val conformance_wait_ms : int -> (unit, error) result
 val client_config :
   target_url:string -> identity:string -> (client_config, error) result
 
-(** Validates workflow-only worker settings without constructing a worker.
-    Counts are explicit so resource policy is visible to the application. *)
+(** Validates worker settings without constructing a worker.
+    Counts are explicit so resource policy is visible to the application.
+
+    [workflow_tasks] and [activity_tasks] (both default [true]) select which
+    task kinds Core polls from the server. A worker must pass [false] for a
+    kind it has no registered implementation for, or it would take and fail
+    tasks that a sibling worker on the same task queue could execute. Local
+    activities follow [workflow_tasks] because Core dispatches them in-process.
+    At least one kind must be enabled; otherwise a [Configuration] error is
+    returned. Replay workers ignore both: Core forces workflow-only replay. *)
 val worker_config :
   namespace:string ->
   task_queue:string ->
@@ -89,6 +97,8 @@ val worker_config :
   max_outstanding_workflow_tasks:int ->
   max_concurrent_workflow_task_polls:int ->
   graceful_shutdown_timeout_ms:int64 ->
+  ?workflow_tasks:bool ->
+  ?activity_tasks:bool ->
   unit ->
   (worker_config, error) result
 
