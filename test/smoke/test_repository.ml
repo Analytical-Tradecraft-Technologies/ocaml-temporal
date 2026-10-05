@@ -62,9 +62,10 @@ let test_license () =
   if not (String.starts_with ~prefix:"Apache License" (read license)) then
     failwith "LICENSE does not begin with the Apache License marker"
 
-(** Checks package identity, maintainership, experimental status, repository
-    links, and exact dependency declarations in both generated build
-    ecosystems. *)
+(** Checks package identity, maintainership, repository links, and exact
+    dependency declarations in both generated build ecosystems. Maturity
+    labelling depends on the release version and is checked separately by
+    [test_package_maturity]. *)
 let test_package_metadata () =
   let source_root = Sys.getenv "TEMPORAL_SOURCE_ROOT" in
   let source path = Filename.concat source_root path in
@@ -75,15 +76,8 @@ let test_package_metadata () =
   let cargo_sbom = source "scripts/generate-cargo-sbom.py" in
   if Sys.file_exists (source "temporal.opam") then
     failwith "the retired temporal.opam package manifest still exists";
-  require_text ~path:opam
-    ~needle:"synopsis: \"Experimental Temporal workflows in modern OCaml\"";
-  require_text ~path:opam
-    ~needle:
-      "description: \"An experimental typed OCaml 5 workflow SDK backed by Temporal Core\"";
   require_text ~path:opam ~needle:"maintainer: \"Michael Fowlie\"";
   require_text ~path:opam ~needle:"authors: \"Michael Fowlie\"";
-  require_text ~path:opam
-    ~needle:"tags: [ \"temporal\" \"workflow\" \"sdk\" \"experimental\" ]";
   require_text ~path:opam ~needle:"x-maintenance-intent: [ \"(latest)\" ]";
   require_text ~path:opam
     ~needle:
@@ -94,18 +88,12 @@ let test_package_metadata () =
   require_text ~path:opam
     ~needle:
       "dev-repo: \"git+https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal.git\"";
+  require_text ~path:opam ~needle:"\"ocaml\" {>= \"5.2\" & < \"5.6\"}";
   require_text ~path:opam ~needle:"\"logs\" {>= \"0.10\"}";
   require_text ~path:opam ~needle:"\"yojson\" {>= \"3.0\"}";
   require_text ~path:locked ~needle:"name: \"temporal-sdk\"";
-  require_text ~path:locked
-    ~needle:"synopsis: \"Experimental Temporal workflows in modern OCaml\"";
-  require_text ~path:locked
-    ~needle:
-      "description: \"An experimental typed OCaml 5 workflow SDK backed by Temporal Core\"";
   require_text ~path:locked ~needle:"maintainer: \"Michael Fowlie\"";
   require_text ~path:locked ~needle:"authors: \"Michael Fowlie\"";
-  require_text ~path:locked
-    ~needle:"tags: [ \"temporal\" \"workflow\" \"sdk\" \"experimental\" ]";
   require_text ~path:locked ~needle:"x-maintenance-intent: [ \"(latest)\" ]";
   require_text ~path:locked
     ~needle:
@@ -126,21 +114,62 @@ let test_package_metadata () =
   require_text ~path:cargo_sbom
     ~needle:
       "NAMESPACE = \"https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/sbom/cargo\"";
-  require_text ~path:dune_project
-    ~needle:"(synopsis \"Experimental Temporal workflows in modern OCaml\")";
-  require_text ~path:dune_project
-    ~needle:
-      "(description \"An experimental typed OCaml 5 workflow SDK backed by Temporal Core\")";
-  require_text ~path:dune_project
-    ~needle:"(tags (temporal workflow sdk experimental))";
   require_text ~path:dune_project ~needle:"(authors \"Michael Fowlie\")";
   require_text ~path:dune_project ~needle:"(maintainers \"Michael Fowlie\")";
   require_text ~path:dune_project ~needle:"(maintenance_intent \"(latest)\")";
   require_text ~path:dune_project ~needle:"(name temporal-sdk)";
+  require_text ~path:dune_project ~needle:"(ocaml (and (>= 5.2) (< 5.6)))";
   require_text ~path:dune_project ~needle:"(logs (>= 0.10))";
   require_text ~path:dune_project ~needle:"(yojson (>= 3.0))";
   if contains ~needle:"alcotest" (read (source "test/bridge/dune")) then
     failwith "bridge protocol tests must not add an Alcotest dependency"
+
+(** Reports whether an OPAM version string is a prerelease or pre-1.0 version.
+    OPAM spells a prerelease with [~] (for example [0.1.0~rc.1]), and every
+    [0.x] version is pre-stable regardless of suffix. *)
+let is_prerelease_version version =
+  String.contains version '~' || String.starts_with ~prefix:"0." version
+
+(** Checks that package maturity labelling matches the release version (#827).
+    A prerelease or [0.x] version must keep the experimental synopsis,
+    description, and tag in the Dune project and both opam files, while a stable
+    version must not ship any of them labelled experimental. This mirrors the
+    release preflight rule so a stable release is never blocked by, or
+    published with, the prerelease wording. *)
+let test_package_maturity () =
+  let source_root = Sys.getenv "TEMPORAL_SOURCE_ROOT" in
+  let source path = Filename.concat source_root path in
+  let version = String.trim (read (source ".release-version")) in
+  let opam_files =
+    [ source "temporal-sdk.opam"; source "temporal-sdk.opam.locked" ]
+  in
+  let dune_project = source "dune-project" in
+  if is_prerelease_version version then (
+    List.iter
+      (fun path ->
+        require_text ~path
+          ~needle:"synopsis: \"Experimental Temporal workflows in modern OCaml\"";
+        require_text ~path
+          ~needle:
+            "description: \"An experimental typed OCaml 5 workflow SDK backed by Temporal Core\"";
+        require_text ~path
+          ~needle:"tags: [ \"temporal\" \"workflow\" \"sdk\" \"experimental\" ]")
+      opam_files;
+    require_text ~path:dune_project
+      ~needle:"(synopsis \"Experimental Temporal workflows in modern OCaml\")";
+    require_text ~path:dune_project
+      ~needle:
+        "(description \"An experimental typed OCaml 5 workflow SDK backed by Temporal Core\")";
+    require_text ~path:dune_project
+      ~needle:"(tags (temporal workflow sdk experimental))")
+  else
+    List.iter
+      (fun path ->
+        if contains ~needle:"xperimental" (read path) then
+          failwith
+            (Printf.sprintf "%s labels stable version %s as experimental" path
+               version))
+      (dune_project :: opam_files)
 
 (** Ensures Dune never attempts to turn the statically linked Rust bridge into a
     dynamically loadable OCaml stub library. Rust reports GNU-style native
@@ -251,6 +280,7 @@ let () =
   test_line_ending_normalization ();
   test_license ();
   test_package_metadata ();
+  test_package_maturity ();
   test_static_foreign_archives ();
   test_mailbox_is_private ();
   test_sdk_supervisor_is_private ();

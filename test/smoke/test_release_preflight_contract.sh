@@ -12,7 +12,9 @@ if [ -n "$(git status --porcelain --untracked-files=all)" ]; then
   echo "release preflight contract requires a clean checkout" >&2
   exit 1
 fi
-sh scripts/check-release-preflight.sh .
+checkout_hash=$(sh scripts/check-release-preflight.sh . |
+  sed -n 's/^source manifest sha256: //p')
+[ -n "$checkout_hash" ] || { echo "release preflight printed no source manifest" >&2; exit 1; }
 
 # A release preflight must reject package metadata that points to the former
 # repository location, even when the checkout is otherwise clean. Build a
@@ -46,6 +48,7 @@ git archive --format=tar HEAD | tar -x -C "$fixture"
   git config user.name 'Release contract'
   git add -A
   git -c commit.gpgSign=false commit -q -m 'release fixture'
+  base_commit=$(git rev-parse HEAD)
   sed 's#Analytical-Tradecraft-Technologies/ocaml-temporal#mfow/ocaml-temporal#g' \
     temporal-sdk.opam > temporal-sdk.opam.tmp
   mv temporal-sdk.opam.tmp temporal-sdk.opam
@@ -65,6 +68,103 @@ git archive --format=tar HEAD | tar -x -C "$fixture"
   git -c commit.gpgSign=false commit -q -m 'stale documentation link'
   if sh scripts/check-release-preflight.sh . >/dev/null 2>&1; then
     echo "release preflight accepted a stale repository URL in documentation" >&2
+    exit 1
+  fi
+
+  # Stores the committed fixture's source manifest digest in $manifest. It is
+  # called directly rather than through $(...) so a preflight rejection or a
+  # missing digest exits this fixture subshell instead of yielding an empty
+  # value that could make a "digest changed" assertion pass vacuously.
+  read_manifest_hash() {
+    manifest=$(sh scripts/check-release-preflight.sh . |
+      sed -n 's/^source manifest sha256: //p')
+    if [ -z "$manifest" ]; then
+      echo "release preflight rejected the fixture or printed no source manifest" >&2
+      exit 1
+    fi
+  }
+  # Commits every fixture change so preflight sees a clean tree.
+  commit_fixture() {
+    git add -A
+    git -c commit.gpgSign=false commit -q -m "$1"
+  }
+
+  # The manifest must fingerprint contents, not only path names (#827). The
+  # fixture's first commit has the same tree as the checkout under test, so
+  # its digest must be reproducible across the two clones.
+  git reset -q --hard "$base_commit"
+  read_manifest_hash
+  base_hash=$manifest
+  if [ "$base_hash" != "$checkout_hash" ]; then
+    echo "source manifest differs between two checkouts of the same tree" >&2
+    exit 1
+  fi
+  printf '\nContent-only change.\n' >> docs/README.md
+  commit_fixture 'content change'
+  read_manifest_hash
+  if [ "$manifest" = "$base_hash" ]; then
+    echo "source manifest did not change when file contents changed" >&2
+    exit 1
+  fi
+  # Restoring the content in a new commit restores the digest: it depends on
+  # the tree, not on commit metadata or history.
+  git checkout -q "$base_commit" -- docs/README.md
+  commit_fixture 'restore content'
+  read_manifest_hash
+  if [ "$manifest" != "$base_hash" ]; then
+    echo "source manifest depends on commit history rather than tree contents" >&2
+    exit 1
+  fi
+  # Only the executable bit changes here. Setting it in both the worktree and
+  # the index keeps the tree clean whether or not core.fileMode is honoured.
+  chmod +x LICENSE
+  git update-index --chmod=+x LICENSE
+  git -c commit.gpgSign=false commit -q -m 'mode change'
+  read_manifest_hash
+  if [ "$manifest" = "$base_hash" ]; then
+    echo "source manifest did not change when a file mode changed" >&2
+    exit 1
+  fi
+
+  # Maturity labelling follows the version (#827). A prerelease that drops
+  # its experimental labels is rejected.
+  git reset -q --hard "$base_commit"
+  # Rewrites every maturity label in the README and package metadata.
+  strip_experimental_labels() {
+    for file in README.md dune-project temporal-sdk.opam temporal-sdk.opam.locked; do
+      sed -e 's/[Ee]xperimental//g' -e 's/pre-`\{0,1\}0\.1\.0/stable/g' \
+        "$file" > "$file.tmp"
+      mv "$file.tmp" "$file"
+    done
+  }
+  strip_experimental_labels
+  commit_fixture 'unlabelled prerelease'
+  if sh scripts/check-release-preflight.sh . >/dev/null 2>&1; then
+    echo "release preflight accepted a prerelease not labelled experimental" >&2
+    exit 1
+  fi
+
+  # A stable version that is still labelled experimental is rejected, and the
+  # same version passes once the labels are removed.
+  git reset -q --hard "$base_commit"
+  current_version=$(cat .release-version)
+  current_sdk_version=$(printf '%s\n' "$current_version" | sed 's/~/-/')
+  for file in .release-version temporal-sdk.opam temporal-sdk.opam.locked; do
+    sed "s/$current_version/1.0.0/" "$file" > "$file.tmp"
+    mv "$file.tmp" "$file"
+  done
+  sed "s/SDK_VERSION: &str = \"$current_sdk_version\"/SDK_VERSION: \&str = \"1.0.0\"/" \
+    rust/core-bridge/src/abi.rs > rust/core-bridge/src/abi.rs.tmp
+  mv rust/core-bridge/src/abi.rs.tmp rust/core-bridge/src/abi.rs
+  commit_fixture 'stable version still labelled experimental'
+  if sh scripts/check-release-preflight.sh . >/dev/null 2>&1; then
+    echo "release preflight accepted a stable release labelled experimental" >&2
+    exit 1
+  fi
+  strip_experimental_labels
+  commit_fixture 'stable labels'
+  if ! sh scripts/check-release-preflight.sh . >/dev/null; then
+    echo "release preflight rejected a correctly labelled stable release" >&2
     exit 1
   fi
 )

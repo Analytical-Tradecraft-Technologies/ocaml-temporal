@@ -94,8 +94,14 @@ jobs:
             sha256sum ./*.tar.gz ./*.json > SHA256SUMS
             sha256sum --check SHA256SUMS
           )
+          # Match the release preflight maturity rule: prereleases and 0.x
+          # versions are experimental; a stable version is not labelled so.
+          case "$RELEASE_TAG" in
+            *-* | v0.*) release_label="Experimental OCaml Temporal SDK" ;;
+            *) release_label="OCaml Temporal SDK" ;;
+          esac
           cat > "$RUNNER_TEMP/release-notes.md" <<EOF
-          Experimental OCaml Temporal SDK, built and tested from commit $GITHUB_SHA.
+          $release_label, built and tested from commit $GITHUB_SHA.
 
           Includes optimized Rust bridge libraries for Linux x64 and ARM64
           (Debian 12/glibc), macOS ARM64, and Windows x64 GNU/MinGW.

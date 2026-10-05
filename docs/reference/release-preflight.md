@@ -119,15 +119,65 @@ or a Rust build. It verifies:
 - the working tree has no staged, unstaged, or untracked files;
 - the opam manifests, Dune project, README, license, and pinned Temporal Core
   revision agree on identity, ownership, licensing, release metadata, and the
-  canonical GitHub repository location; and
-- generated build trees are not tracked and the sorted Git source manifest can
-  be fingerprinted reproducibly.
+  canonical GitHub repository location;
+- the README and package metadata carry the maturity label that matches the
+  version (see below); and
+- generated build trees are not tracked and the Git source manifest can be
+  fingerprinted reproducibly.
 
 The clean-tree requirement is intentional: a preflight result must describe
 the exact inputs that would be archived or built, not a mixture of committed
-files and local output. The target also runs the stale-owner rejection fixture;
-that fixture stays out of the ordinary quality target so contributors can run
-the latter from a dirty worktree.
+files and local output. The target also runs the preflight fixture contract
+(`test/smoke/test_release_preflight_contract.sh`), which covers stale-owner
+rejection, manifest content sensitivity, and both maturity directions; it stays
+out of the ordinary quality target so contributors can run the latter from a
+dirty worktree.
+
+### Maturity label
+
+The maturity expectation is derived from `.release-version`, not hard-wired:
+
+- A **prerelease** (an OPAM `~` suffix such as `0.1.0~rc.1`) or any **`0.x`**
+  version is experimental. `README.md` must say so (it must match
+  `experimental` or `pre-0.1.0`, case-insensitively), and `dune-project`,
+  `temporal-sdk.opam`, and `temporal-sdk.opam.locked` must each contain the
+  word `experimental` (the synopsis, description, and `experimental` tag).
+- A **stable** version (`1.0.0` and later, without `~`) must not be labelled
+  experimental: none of those four files may contain `experimental`, and the
+  README may not describe the package as pre-`0.1.0`. Preparing a stable
+  release therefore includes rewording the README status section and removing
+  the experimental synopsis, description, and tag from the package metadata.
+
+`test/smoke/test_repository.ml` applies the same rule to the exact package
+metadata strings, and the Release workflow titles its notes "Experimental OCaml
+Temporal SDK" only for a prerelease or `v0.x` tag.
+
+### Source manifest
+
+The preflight prints `source manifest sha256:` followed by the SHA-256 of the
+NUL-terminated `git ls-tree -r -z --full-tree HEAD` listing. Each record holds
+one tracked entry's mode, object type, Git object ID, and path, so the digest
+changes whenever any file's contents, executable bit, symlink target, or path
+changes, and it is identical for two checkouts of the same tree. Because the
+clean-tree checks pass first, HEAD's tree is exactly what would be archived.
+Git's canonical tree order and `-z` (which bypasses `core.quotePath` escaping)
+make the digest independent of locale, user Git configuration, mtimes, umask,
+commit metadata, and checkout location. Per-file identity relies on Git's
+object IDs (collision-detecting SHA-1, or SHA-256 in a SHA-256 repository).
+The digest is reproducibility evidence for review, not a signed attestation.
+
+## Toolchain bounds
+
+`temporal-sdk.opam` and `dune-project` bound OCaml to `>= 5.2 & < 5.6`,
+matching the CI-tested 5.2–5.5 series; raise the upper bound only together with
+the CI matrix. The opam `conf-rust-2024` dependency only proves edition 2024
+support (Rust 1.85), while the workspace `rust-version` in `rust/Cargo.toml` is
+newer. `scripts/build-rust-bridge.sh` therefore compares the compiler Cargo
+will use (`$RUSTC`, default `rustc`) against that `rust-version` before
+running Cargo, and fails with the required and found versions instead of a
+dependency-resolution error deep inside Cargo.
+`test/smoke/test_rust_version_gate.sh` exercises this with stand-in compilers.
+The package declares no `available:` platform restriction yet.
 
 ## CI SBOM
 

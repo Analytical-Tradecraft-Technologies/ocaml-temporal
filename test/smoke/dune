@@ -1,6 +1,7 @@
 (test
  (name test_repository)
  (deps
+  ../../.release-version
   ../../LICENSE
   ../../Makefile
   ../../deny.toml
@@ -32,6 +33,15 @@
  (deps ../../scripts/render-rust-link-flags.sh test_rust_link_flags.sh)
  (action
   (run sh %{dep:test_rust_link_flags.sh} %{workspace_root})))
+
+(rule
+ (alias runtest)
+ (deps
+  ../../scripts/build-rust-bridge.sh
+  ../../rust/Cargo.toml
+  test_rust_version_gate.sh)
+ (action
+  (run sh %{dep:test_rust_version_gate.sh} %{workspace_root})))
 
 (rule
  (alias runtest)
