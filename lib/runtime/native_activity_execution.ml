@@ -408,7 +408,10 @@ let runtime_payloads path payloads =
   loop 0 [] payloads
 
 (** Converts an activity implementation's structured error while preserving its
-    retryability classification and every application-supplied detail payload.
+    retryability classification, its application error type (falling back to
+    the category label when untyped; this is the value Temporal matches against
+    a retry policy's [non_retryable_error_types]), and every
+    application-supplied detail payload.
     Adapter-generated input/registry errors use [failure_of_error] and are
     always non-retryable; an application error may intentionally remain
     retryable so Temporal can apply its retry policy. Detail payloads are
@@ -438,7 +441,7 @@ let failure_of_application_error (diagnostic : error_view)
         info =
           Application
             {
-              type_name = Base_error.kind error;
+              type_name = Base_error.application_failure_type error;
               non_retryable = view.non_retryable;
               details;
               category = Application_category_unspecified;

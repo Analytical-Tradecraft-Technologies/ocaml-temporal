@@ -308,6 +308,7 @@ let _duration_to_ms : T.Duration.t -> int64 = T.Duration.to_ms
 
 let _error_make :
     ?non_retryable:bool ->
+    ?error_type:string ->
     ?details:T.Payload.t list ->
     category:T.Error.category ->
     message:string ->
@@ -317,6 +318,11 @@ let _error_make :
 let _error_view : T.Error.t -> T.Error.view = T.Error.view
 let _error_kind : T.Error.t -> string = T.Error.kind
 let _error_message : T.Error.t -> string = T.Error.message
+let _error_error_type : T.Error.t -> string option = T.Error.error_type
+
+(* The application failure type is also part of the inspectable view record. *)
+let _error_view_error_type (view : T.Error.view) : string option =
+  view.error_type
 let _error_codec : message:string -> T.Error.t = T.Error.codec
 let _error_defect : message:string -> T.Error.t = T.Error.defect
 

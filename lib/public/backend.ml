@@ -495,7 +495,8 @@ let failure_details failure =
   loop 0 [] failure |> List.map public_payload
 
 (** Converts a native workflow failure into the broad public error type while
-    retaining retryability, structured details, and a bounded diagnostic. A
+    retaining retryability, structured details, the innermost application
+    failure type, and a bounded diagnostic. A
     terminal client failure remains a workflow failure even when its Core
     diagnostic contains an activity or child-workflow wrapper; those more
     specific categories are reserved for errors observed inside a running
@@ -503,7 +504,8 @@ let failure_details failure =
 let workflow_failure_error ?(category = `Workflow)
     (failure : Workflow_protocol.failure) =
   let non_retryable = Workflow_protocol.failure_non_retryable failure in
-  Error.make ~non_retryable ~category
+  let error_type = Failure_diagnostic.application_failure_type failure in
+  Error.make ~non_retryable ?error_type ~category
     ~details:(failure_details failure)
     ~message:(Failure_diagnostic.failure_diagnostic failure) ()
 

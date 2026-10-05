@@ -165,8 +165,67 @@ let test_truncation_keeps_utf_8 () =
   assert (contains diagnostic "\xe6\x97\xa5...");
   assert (String.length diagnostic < 2048 + 512 + 1024 + 256)
 
+(** The application type is read through activity, child-workflow, and timeout
+    wrappers; the first application layer wins; an empty type, a chain without
+    an application layer, and a layer beyond the depth bound yield [None]. *)
+let test_application_failure_type () =
+  let application type_name cause =
+    layer ~message:"app" ~source:"worker"
+      ~info:(Protocol.Application
+               { type_name; non_retryable = false; details = [];
+                 category = Protocol.Application_category_unspecified;
+                 next_retry_delay = None })
+      ~cause
+  in
+  let activity cause =
+    layer ~message:"activity" ~source:"core"
+      ~info:(Protocol.Activity
+               { scheduled_event_id = 1L; started_event_id = 2L;
+                 identity = "w"; activity_type = "act"; activity_id = "a";
+                 retry_state = Protocol.Non_retryable_failure })
+      ~cause
+  in
+  let child cause =
+    layer ~message:"child" ~source:"core"
+      ~info:(Protocol.Child_workflow
+               { namespace = "default"; workflow_id = "c"; run_id = "r";
+                 workflow_type = "child"; initiated_event_id = 1L;
+                 started_event_id = 2L;
+                 retry_state = Protocol.Non_retryable_failure })
+      ~cause
+  in
+  let timeout cause =
+    layer ~message:"timeout" ~source:"core"
+      ~info:(Protocol.Timeout_failure
+               { timeout_type = Protocol.Timeout_start_to_close;
+                 last_heartbeat_details = [] })
+      ~cause
+  in
+  let type_of = Diagnostic.application_failure_type in
+  assert (type_of (application "InvalidInput" None) = Some "InvalidInput");
+  assert (
+    type_of (activity (Some (application "InvalidInput" None)))
+    = Some "InvalidInput");
+  assert (
+    type_of (child (Some (activity (Some (application "Deep" None)))))
+    = Some "Deep");
+  assert (
+    type_of (activity (Some (timeout (Some (application "Late" None)))))
+    = Some "Late");
+  assert (
+    type_of (application "Outer" (Some (application "Inner" None)))
+    = Some "Outer");
+  assert (type_of (activity (Some (application "" None))) = None);
+  assert (type_of (activity (Some (timeout None))) = None);
+  let rec wrap depth inner =
+    if depth = 0 then inner else activity (Some (wrap (depth - 1) inner))
+  in
+  assert (type_of (wrap 128 (application "Bounded" None)) = Some "Bounded");
+  assert (type_of (wrap 129 (application "TooDeep" None)) = None)
+
 (** Runs the pure diagnostic regression cases. *)
 let () =
+  test_application_failure_type ();
   test_nested_timeout_is_visible ();
   test_depth_is_bounded ();
   test_application_options_survive_cause_diagnostic ();

@@ -253,9 +253,13 @@ type 'output handle
     durations, with the maximum at least as large as the initial delay.
     [backoff_coefficient] must be finite and at least [1.0].  A
     [maximum_attempts] value of [0] means that Temporal imposes no attempt
-    count limit; positive values include the initial attempt.  The constructor
-    returns a typed defect instead of raising so callers can validate policy
-    configuration while assembling a workflow definition. *)
+    count limit; positive values include the initial attempt.
+    [non_retryable_error_types] lists application error types that stop
+    retries; Temporal matches them against the failure type set by
+    [Error.make ~error_type] (or the category name, {!Error.kind}, for an
+    untyped error).  The constructor returns a typed defect instead of
+    raising so callers can validate policy configuration while assembling a
+    workflow definition. *)
 module Retry_policy : sig
   (** Opaque immutable retry policy validated before command construction. *)
   type t

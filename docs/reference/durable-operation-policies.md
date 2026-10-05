@@ -18,6 +18,17 @@ records the wire-format decision.
 same policy type is accepted by activity and child-workflow operations:
 
 ```ocaml
+(* An activity marks a business failure with an application error type. The
+   error itself stays retryable; the caller's policy decides. *)
+let validate_order =
+  Temporal.Activity.define ~name:"validate_order"
+    ~input:Temporal.Codec.string ~output:Temporal.Codec.string (fun order ->
+      if String.equal order "" then
+        Error
+          (Temporal.Error.make ~error_type:"InvalidInput" ~category:`Activity
+             ~message:"order must not be empty" ())
+      else Ok order)
+
 let run_with_retry activity child input =
   let open Temporal.Result_syntax in
   let* retry_policy =
@@ -47,8 +58,14 @@ The constructor validates before a command is emitted and returns a typed
   positive values include the initial attempt.
 - `non_retryable_error_types` is a copied list of Temporal application error
   type names. A matching application failure is not retried by this policy.
-  Names must satisfy the same strict text constraints as other values crossing
-  the native boundary.
+  Temporal compares each name with the failure's
+  `ApplicationFailureInfo.type` (use the exact spelling; Core's local-activity
+  check ignores case, but do not rely on that): for an OCaml activity that is the
+  `~error_type` given to `Temporal.Error.make` (`"InvalidInput"` in
+  `validate_order` above), or the lowercase category name (`Error.kind`, for
+  example `"activity"`) when no type was set. A category name therefore
+  matches every untyped error of that category. Names must satisfy the same
+  strict text constraints as other values crossing the native boundary.
 
 `Retry_policy.create` is an alias for `make`. The accessor functions return
 copies or immutable scalar values, so changing a caller-owned list after
