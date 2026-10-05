@@ -126,9 +126,9 @@ entry is `ocamlfind.1.9.9~preview` for OCaml 5.5, because `ocamlfind.1.9.8`
 declares `ocaml < 5.5.0~`; ocamlfind (MIT) is a build-only tool reached
 through topkg and is not linked into the SDK.
 
-The image copies Rust 1.98.1, Cargo, Clippy, and rustfmt from the official
-multi-architecture `rust:1.98-bookworm` image at manifest digest
-`sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e`.
+The image copies Rust 1.99.0, Cargo, Clippy, and rustfmt from the official
+multi-architecture `rust:1.99-bookworm` image at manifest digest
+`sha256:59037199c44290f2befcdd58dcc540164763fc296950255aaefeef096a1866b0`.
 That manifest contains native `linux/amd64` and `linux/arm64/v8` images. Rust
 is dual-licensed Apache-2.0 OR MIT. Debian's `protobuf-compiler` and
 `libprotobuf-dev` packages are installed as build-only tools required by
