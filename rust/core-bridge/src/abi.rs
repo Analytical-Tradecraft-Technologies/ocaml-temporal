@@ -1723,6 +1723,32 @@ impl Runtime {
         }
     }
 
+    /// Waits for readiness on either live-worker lane without consuming a task.
+    ///
+    /// The worker loop uses this for its single idle native wait so a task on
+    /// the lane it did not expect wakes the supervisor at once rather than
+    /// after the bounded timeout (#806). Statuses match the lane-specific
+    /// waits: `STATUS_NOT_READY` on timeout and `STATUS_INVALID_STATE` once a
+    /// lane has closed without queued work.
+    fn wait_any(&self) -> Operation {
+        let worker = self.worker.as_ref().ok_or_else(|| Failure {
+            status: STATUS_INVALID_STATE,
+            message: "Temporal worker is not running".to_owned(),
+        })?;
+        match worker.wait_any() {
+            ReadinessWait::Ready => Ok(Vec::new()),
+            ReadinessWait::TimedOut => Err(Failure {
+                status: STATUS_NOT_READY,
+                message: "Temporal worker readiness wait timed out; retry".to_owned(),
+            }),
+            ReadinessWait::Shutdown => Err(Failure {
+                status: STATUS_INVALID_STATE,
+                message: "Temporal worker readiness wait ended during worker shutdown".to_owned(),
+            }),
+            ReadinessWait::Error(error) => Err(poll_lane_failure(error)),
+        }
+    }
+
     /// Applies the fixed native backoff used only after an explicitly
     /// retryable activity-completion outcome.
     ///
@@ -3836,6 +3862,34 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_worker_wait_activity(
                     message: "runtime pointer is null".to_owned(),
                 })?
                 .wait_activity()
+        })
+    }
+}
+
+/// Wait for readiness on either worker lane without consuming a queued task.
+///
+/// The caller must release the OCaml runtime lock around this operation. It
+/// has the same bounded timeout and status contract as the lane-specific
+/// waits, but any queued workflow activation or activity task ends it.
+///
+/// # Safety
+///
+/// `runtime` must be a live exclusively owned runtime handle and `output` must
+/// satisfy the standard initialized-result contract.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ocaml_temporal_core_v2_worker_wait_any(
+    runtime: *mut Runtime,
+    output: *mut Result,
+) -> Status {
+    unsafe {
+        invoke(output, || {
+            runtime
+                .as_ref()
+                .ok_or_else(|| Failure {
+                    status: STATUS_INVALID_ARGUMENT,
+                    message: "runtime pointer is null".to_owned(),
+                })?
+                .wait_any()
         })
     }
 }

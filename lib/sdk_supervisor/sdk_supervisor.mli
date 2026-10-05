@@ -425,6 +425,11 @@ module Native : sig
     | Wait_activity : unit operation
         (** Waits for activity readiness with the same runtime-lock-free bridge
             contract as [Wait_workflow]. *)
+    | Wait_any : unit operation
+        (** Waits until either worker lane is ready, under the same bounded
+            runtime-lock-free contract as [Wait_workflow]. The worker loop uses
+            it for its single idle native wait so a task on the lane it did not
+            expect is not delayed by the bounded timeout. *)
     | Wait_activity_completion_retry_backoff : unit operation
         (** Applies the fixed native delay used only after an explicit
             retryable activity-completion transport outcome. The supervisor

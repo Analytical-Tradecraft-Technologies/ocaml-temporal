@@ -376,9 +376,55 @@ pub const READINESS_WAIT_TIMEOUT: Duration = Duration::from_millis(100);
 /// decrement a count before the producer increments it. The condition variable
 /// is only a wake mechanism; every waiter rechecks the state predicate while
 /// holding the mutex, so notifications cannot be lost before a wait begins.
+///
+/// Each signal also notifies a worker-wide [`AnyLaneWake`] after every state
+/// change, so one owner-domain wait can observe either lane (#806).
 struct Readiness {
     state: Mutex<ReadinessState>,
     wake: Condvar,
+    any: Arc<AnyLaneWake>,
+}
+
+/// Worker-wide wake shared by the workflow and activity [`Readiness`] signals.
+///
+/// A lane-specific wait leaves the sole supervisor owner blind to the other
+/// lane for up to [`READINESS_WAIT_TIMEOUT`], which made every step of a
+/// sequential activity workflow pay one dead bounded wait (#806).
+/// [`wait_any_lane`] waits on this condition instead and rechecks both lane
+/// predicates.
+///
+/// Lock order is `AnyLaneWake::generation` before a lane's `state`, and the
+/// workflow lane's `state` before the activity lane's when both are held. A
+/// producer therefore releases its lane mutex before calling
+/// [`Self::notify`]. That is still lossless: the waiter holds `generation`
+/// from its predicate check until `wait_timeout` atomically releases it, so a
+/// producer whose lane update the check missed cannot notify until the waiter
+/// is already blocked. The counter only makes each notification a state
+/// change; waiters never trust a wake without rechecking the lane predicates.
+#[derive(Debug, Default)]
+struct AnyLaneWake {
+    generation: Mutex<u64>,
+    wake: Condvar,
+}
+
+impl AnyLaneWake {
+    /// Wakes every combined waiter after a lane's predicate changed. Callers
+    /// must not hold any lane `state` mutex (see the lock order above).
+    fn notify(&self) {
+        let mut generation = self
+            .generation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *generation = generation.wrapping_add(1);
+        self.wake.notify_all();
+    }
+}
+
+/// Snapshot of one lane's wait predicate taken under its state mutex.
+struct LaneObservation {
+    pending: bool,
+    error: Option<PollLaneError>,
+    closed: bool,
 }
 
 /// Mutable predicate protected by [`Readiness::state`].
@@ -397,11 +443,20 @@ struct ReadinessState {
 }
 
 impl Readiness {
-    /// Creates an open signal with no queued work.
+    /// Creates an open signal with no queued work and a private combined
+    /// wake. Only isolated tests use a signal that no sibling lane shares.
+    #[cfg(test)]
     fn new() -> Self {
+        Self::sharing(&Arc::new(AnyLaneWake::default()))
+    }
+
+    /// Creates an open signal that also notifies `any` on every state change.
+    /// Both lanes of one [`PollLanes`] share the same `any` wake.
+    fn sharing(any: &Arc<AnyLaneWake>) -> Self {
         Self {
             state: Mutex::new(ReadinessState::default()),
             wake: Condvar::new(),
+            any: Arc::clone(any),
         }
     }
 
@@ -420,20 +475,25 @@ impl Readiness {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if sender.send(message).is_err() {
+        let sent = if sender.send(message).is_err() {
             // The owner has gone away. No future caller can drain this lane,
             // but marking it closed also prevents a defensive waiter from
             // sleeping forever if it is still holding the runtime graph.
             state.closed = true;
-            self.wake.notify_all();
-            return false;
-        }
-        // Core's outstanding-task permits keep this count far below `usize::MAX`
-        // in normal operation. Saturation is still safer than panicking in a
-        // background lane if a future producer violates that assumption.
-        state.pending = state.pending.saturating_add(1);
+            false
+        } else {
+            // Core's outstanding-task permits keep this count far below
+            // `usize::MAX` in normal operation. Saturation is still safer than
+            // panicking in a background lane if a future producer violates
+            // that assumption.
+            state.pending = state.pending.saturating_add(1);
+            true
+        };
         self.wake.notify_all();
-        true
+        // Release the lane mutex before the combined wake (lock order).
+        drop(state);
+        self.any.notify();
+        sent
     }
 
     /// Consumes one queue message while atomically retiring its pending count.
@@ -486,11 +546,14 @@ impl Readiness {
             Err(TryRecvError::Disconnected) => {
                 state.closed = true;
                 self.wake.notify_all();
-                if report_failure {
+                let result = if report_failure {
                     state.error.clone().map(Err)
                 } else {
                     None
-                }
+                };
+                drop(state);
+                self.any.notify();
+                result
             }
         }
     }
@@ -523,6 +586,8 @@ impl Readiness {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.error = Some(error);
         self.wake.notify_all();
+        drop(state);
+        self.any.notify();
     }
 
     /// Marks the lane as normally closed while retaining queued work for drain.
@@ -533,6 +598,8 @@ impl Readiness {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.closed = true;
         self.wake.notify_all();
+        drop(state);
+        self.any.notify();
     }
 
     /// Blocks until work, a fatal error, or terminal closure is observable.
@@ -567,6 +634,73 @@ impl Readiness {
                 return ReadinessWait::TimedOut;
             }
         }
+    }
+}
+
+/// Reads both lane predicates as one snapshot by holding both lane mutexes at
+/// once (workflow first, then activity). Reading them one after another would
+/// let a producer publish to the first lane between the two reads, so a
+/// terminal flag on the second lane could win over work that is already
+/// pending. Producers release their lane mutex before taking the combined
+/// wake mutex, and no producer holds two lane mutexes, so this cannot
+/// deadlock with them.
+fn observe_both(workflow: &Readiness, activity: &Readiness) -> [LaneObservation; 2] {
+    let workflow_state = workflow
+        .state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let activity_state = activity
+        .state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    [&*workflow_state, &*activity_state].map(|state| LaneObservation {
+        pending: state.pending > 0,
+        error: state.error.clone(),
+        closed: state.closed,
+    })
+}
+
+/// Blocks until either lane has work, a fatal error, or terminal closure, or
+/// until [`READINESS_WAIT_TIMEOUT`] elapses.
+///
+/// Queued work in *either* lane wins over every terminal state, so the owner
+/// drains everything before it reports a failure or shutdown. Without work, a
+/// fatal error in either lane is reported before closure, and closure of
+/// either lane is reported as shutdown, matching what a lane-specific wait on
+/// that lane would return. Both signals must share one [`AnyLaneWake`]. The
+/// wait never consumes a task, so the matching non-blocking drain still owns
+/// delivery.
+fn wait_any_lane(workflow: &Readiness, activity: &Readiness) -> ReadinessWait {
+    debug_assert!(Arc::ptr_eq(&workflow.any, &activity.any));
+    let any = &workflow.any;
+    let mut generation = any
+        .generation
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let deadline = Instant::now() + READINESS_WAIT_TIMEOUT;
+    loop {
+        let lanes = observe_both(workflow, activity);
+        if lanes.iter().any(|lane| lane.pending) {
+            return ReadinessWait::Ready;
+        }
+        if let Some(error) = lanes.iter().find_map(|lane| lane.error.clone()) {
+            return ReadinessWait::Error(error);
+        }
+        if lanes.iter().any(|lane| lane.closed) {
+            return ReadinessWait::Shutdown;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return ReadinessWait::TimedOut;
+        }
+        // `wait_timeout` releases `generation` atomically, so a producer that
+        // committed after the observation above cannot notify before this
+        // thread is blocked. Every wake loops back to recheck both lanes.
+        let (next, _timeout) = any
+            .wake
+            .wait_timeout(generation, remaining)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        generation = next;
     }
 }
 
@@ -653,8 +787,10 @@ impl PollLanes {
         // joining poll lanes during shutdown.
         let (workflow_sender, workflow_ready) = mpsc::unbounded_channel();
         let (activity_sender, activity_ready) = mpsc::unbounded_channel();
-        let workflow_signal = Arc::new(Readiness::new());
-        let activity_signal = Arc::new(Readiness::new());
+        // One combined wake lets the owner wait on both lanes at once (#806).
+        let any_lane_wake = Arc::new(AnyLaneWake::default());
+        let workflow_signal = Arc::new(Readiness::sharing(&any_lane_wake));
+        let activity_signal = Arc::new(Readiness::sharing(&any_lane_wake));
         let mut idle_senders: IdleSenders = (None, None);
 
         let workflow_lane = if start_workflow_lane {
@@ -892,6 +1028,15 @@ impl PollLanes {
     /// Waits for the next activity-lane message without holding the OCaml lock.
     pub fn wait_activity(&self) -> ReadinessWait {
         self.activity_signal.wait()
+    }
+
+    /// Waits for the next message on either lane without holding the OCaml
+    /// lock. The live worker loop uses this for its single idle native wait,
+    /// so work arriving on the lane it did not expect wakes the owner at once
+    /// instead of after the bounded timeout (#806). A disabled lane of a live
+    /// worker stays open and idle, so it never satisfies this wait.
+    pub fn wait_any(&self) -> ReadinessWait {
+        wait_any_lane(&self.workflow_signal, &self.activity_signal)
     }
 
     /// Sleeps for one bounded completion retry interval on the supervisor
@@ -2295,8 +2440,8 @@ impl Default for TaskLedger {
 #[cfg(test)]
 mod readiness_tests {
     use super::{
-        ACTIVITY_COMPLETION_RETRY_BACKOFF, PollLaneError, Readiness, ReadinessWait, ReadyTask,
-        WORKFLOW_DELIVERY_REJECTION_BACKOFF,
+        ACTIVITY_COMPLETION_RETRY_BACKOFF, AnyLaneWake, PollLaneError, Readiness, ReadinessWait,
+        ReadyTask, WORKFLOW_DELIVERY_REJECTION_BACKOFF, wait_any_lane,
     };
     use std::sync::Arc;
     use std::thread;
@@ -2400,5 +2545,95 @@ mod readiness_tests {
         signal.fail(error.clone());
         assert_eq!(signal.take_or_failure(&mut receiver), Some(Ok(7)));
         assert_eq!(signal.take_or_failure(&mut receiver), Some(Err(error)));
+    }
+
+    /// Builds the workflow/activity signal pair exactly as a live worker does.
+    fn lane_pair() -> (Arc<Readiness>, Arc<Readiness>) {
+        let any = Arc::new(AnyLaneWake::default());
+        (
+            Arc::new(Readiness::sharing(&any)),
+            Arc::new(Readiness::sharing(&any)),
+        )
+    }
+
+    /// Regression for #806: work committed on the lane the owner was not
+    /// expecting must end a combined wait. A lane-specific wait on the quiet
+    /// lane would keep timing out however often it was repeated. The test
+    /// asserts the outcome rather than elapsed time, so scheduler delays on a
+    /// loaded runner cannot make it fail: a wait that happens to time out
+    /// before the producer runs is simply repeated, as the worker loop does.
+    #[test]
+    fn combined_wait_wakes_for_either_lane() {
+        for activity_side in [true, false] {
+            let (workflow, activity) = lane_pair();
+            let (sender, mut receiver) = mpsc::unbounded_channel::<ReadyTask<()>>();
+            let producer_signal = Arc::clone(if activity_side { &activity } else { &workflow });
+            let waiter_workflow = Arc::clone(&workflow);
+            let waiter_activity = Arc::clone(&activity);
+            let waiter = thread::spawn(move || {
+                for _ in 0..100 {
+                    match wait_any_lane(&waiter_workflow, &waiter_activity) {
+                        ReadinessWait::TimedOut => continue,
+                        other => return other,
+                    }
+                }
+                ReadinessWait::TimedOut
+            });
+            assert!(producer_signal.enqueue(&sender, Ok(())));
+            let result = waiter.join().expect("waiter must not panic");
+
+            assert_eq!(result, ReadinessWait::Ready);
+            // The wait is only a wake signal; the task is still drainable.
+            assert!(producer_signal.take(&mut receiver).is_some());
+        }
+    }
+
+    /// Queued work on one lane wins over a fatal error or closure on the
+    /// other, and the combined wait never consumes that work.
+    #[test]
+    fn combined_wait_prefers_work_then_error_then_shutdown() {
+        let (workflow, activity) = lane_pair();
+        let (sender, mut receiver) = mpsc::unbounded_channel::<ReadyTask<()>>();
+        let error = PollLaneError::Core("poll failed".to_owned());
+
+        assert!(activity.enqueue(&sender, Ok(())));
+        workflow.fail(error.clone());
+        assert_eq!(wait_any_lane(&workflow, &activity), ReadinessWait::Ready);
+        assert_eq!(wait_any_lane(&workflow, &activity), ReadinessWait::Ready);
+        assert!(activity.take(&mut receiver).is_some());
+        assert_eq!(
+            wait_any_lane(&workflow, &activity),
+            ReadinessWait::Error(error)
+        );
+
+        let (workflow, activity) = lane_pair();
+        activity.close();
+        assert_eq!(wait_any_lane(&workflow, &activity), ReadinessWait::Shutdown);
+    }
+
+    /// Closing either lane wakes a combined waiter instead of leaving it
+    /// blocked until the bounded timeout.
+    #[test]
+    fn combined_wait_wakes_on_shutdown() {
+        let (workflow, activity) = lane_pair();
+        let waiter_workflow = Arc::clone(&workflow);
+        let waiter_activity = Arc::clone(&activity);
+        let waiter = thread::spawn(move || wait_any_lane(&waiter_workflow, &waiter_activity));
+        thread::sleep(Duration::from_millis(10));
+        workflow.close();
+
+        assert_eq!(
+            waiter.join().expect("waiter must not panic"),
+            ReadinessWait::Shutdown
+        );
+    }
+
+    /// Two quiet lanes still return control to the supervisor within the
+    /// documented bound, preserving shutdown responsiveness.
+    #[test]
+    fn quiet_combined_wait_is_bounded() {
+        let (workflow, activity) = lane_pair();
+
+        assert_eq!(wait_any_lane(&workflow, &activity), ReadinessWait::TimedOut);
     }
 }

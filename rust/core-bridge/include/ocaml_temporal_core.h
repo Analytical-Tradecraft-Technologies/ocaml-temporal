@@ -301,6 +301,13 @@ ocaml_temporal_core_status ocaml_temporal_core_v2_worker_wait_activity(
     ocaml_temporal_core_runtime *runtime,
     ocaml_temporal_core_result *output);
 
+/* Bounded readiness wait for either live-worker lane. Any queued workflow
+ * activation or activity task ends it; otherwise it has the same lock,
+ * timeout, and non-consuming semantics as the lane-specific waits. */
+ocaml_temporal_core_status ocaml_temporal_core_v2_worker_wait_any(
+    ocaml_temporal_core_runtime *runtime,
+    ocaml_temporal_core_result *output);
+
 /* Apply the fixed native delay used only after Rust has explicitly proven
  * that an activity completion was not consumed. The C binding must release
  * the OCaml runtime lock while this bounded timer runs. */

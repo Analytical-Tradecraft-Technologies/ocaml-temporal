@@ -218,6 +218,9 @@ external worker_try_poll_activity_raw : runtime -> response
 external worker_wait_activity_raw : runtime -> response
   = "ocaml_temporal_worker_wait_activity"
 
+external worker_wait_any_raw : runtime -> response
+  = "ocaml_temporal_worker_wait_any"
+
 external worker_wait_activity_completion_retry_backoff_raw : runtime -> response
   = "ocaml_temporal_worker_wait_activity_completion_retry_backoff"
 
@@ -786,6 +789,14 @@ let worker_try_poll_activity runtime =
 let worker_wait_activity runtime =
   bridge_call "worker_wait_activity" (fun () ->
       Result.map (fun _ -> ()) (decode (worker_wait_activity_raw runtime)))
+
+(** Waits for readiness on either worker lane under the same bounded,
+    runtime-lock-free contract as [worker_wait_workflow]. A queued task on
+    either lane ends the wait without being consumed; drain it with the
+    matching [worker_try_poll_*] call. *)
+let worker_wait_any runtime =
+  bridge_call "worker_wait_any" (fun () ->
+      Result.map (fun _ -> ()) (decode (worker_wait_any_raw runtime)))
 
 (** Applies the fixed native delay used only after Rust explicitly reports a
     retryable activity-completion transport outcome. The C stub releases the

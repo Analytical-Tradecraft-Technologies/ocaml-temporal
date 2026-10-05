@@ -320,6 +320,7 @@ native worker adapter and are not part of the public workflow-authoring API:
 | `worker_reject_workflow_json` | Retire the lease when OCaml cannot decode the exact Rust-produced activation document | `unit` |
 | `worker_try_poll_activity` | Drain one already-ready remote or local activity task without waiting | semantic activity JSON bytes |
 | `worker_wait_activity` | Wait for activity readiness without consuming a task | `unit` wake signal |
+| `worker_wait_any` | Wait for readiness on either lane without consuming a task | `unit` wake signal |
 | `worker_record_activity_heartbeat_json` | Validate and record progress for an outstanding activity lease without completing it; Core reports cancellation, pause, and reset asynchronously in a later `Cancel` task | `unit` acknowledgement |
 | `worker_complete_activity_json` | Validate and complete one leased activity task | `unit` |
 | `worker_reject_activity_json` | Retire the lease when OCaml cannot decode the exact Rust-produced activity document | `unit` |
@@ -365,16 +366,22 @@ operations. It exposes a typed GADT rather than raw JSON bytes:
 | `Complete_workflow completion` | canonical strict JSON is generated and reparsed before the native completion call |
 | `Try_poll_activity` | `Activity_protocol.task option`; `None` means the activity lane was empty at that instant |
 | `Wait_activity` | bounded native readiness wait; it does not consume an activity task and releases the OCaml runtime lock |
+| `Wait_any` | bounded native readiness wait that any queued workflow activation or activity task ends; it consumes nothing and releases the OCaml runtime lock |
 | `Record_activity_heartbeat heartbeat` | canonical strict heartbeat JSON is validated and recorded for the outstanding activity lease without retiring it; the acknowledgement carries no cancellation flags, which arrive later on the activity poll lane |
 | `Complete_activity completion` | the opaque token and result are validated before the native completion call |
 
-All seven operations enter the same bounded mailbox as client and worker
+All eight operations enter the same bounded mailbox as client and worker
 lifecycle changes. A poll, completion, worker shutdown, and runtime shutdown
 therefore cannot race native graph state. The pure protocol conversion module
 is visible only from the private supervisor library so both serialization
 directions can be tested without constructing a Core worker.
 
 The two Rust readiness signals use one mutex-protected pending count per lane.
+Each signal also notifies a worker-wide combined wake after releasing its lane
+mutex; `worker_wait_any` holds that wake's mutex while it checks both lane
+predicates, so a task published on either lane after the check still wakes it
+(#806). Queued work on either lane wins over a fatal error, which wins over
+closure.
 The poll task holds that mutex while it sends a message and increments the
 count; the supervisor holds it while receiving and decrementing. This makes a
 send and its wake notification one linearizable operation and prevents a
@@ -564,11 +571,11 @@ independent prevents an idle activity poll from delaying workflow completion,
 or vice versa.
 
 ABI version 2 includes private readiness-wait symbols for the two independent
-poll lanes. The supervisor may invoke them only from the owner-domain mailbox
-handler; the C boundary releases the OCaml runtime lock while Rust waits and
-reacquires it before returning. Callers must not turn a readiness wait into a
-blocking condition wait on a workflow scheduler fiber or allow a second owner
-to access the native worker graph.
+poll lanes and one combined wait over both. The supervisor may invoke them
+only from the owner-domain mailbox handler; the C boundary releases the OCaml
+runtime lock while Rust waits and reacquires it before returning. Callers must
+not turn a readiness wait into a blocking condition wait on a workflow scheduler
+fiber or allow a second owner to access the native worker graph.
 
 One mutex-protected ledger is the authority for every task Core expects the
 language runtime to complete. A task enters the ledger before its ready message
