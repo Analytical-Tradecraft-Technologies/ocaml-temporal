@@ -270,6 +270,12 @@ and bridge, read the [documentation guide](../README.md) first.
   remains the primary result. A retained Cancel is different: it is only an
   update to the Start's shared token, so rejecting that document removes the
   one semantic update without retiring the Start's native completion debt.
+- Rejecting a workflow activation fails its Core workflow task, except for a
+  pure cache eviction: it owns no workflow task, so every rejection path
+  (Rust conversion or encoding failure, OCaml decode failure, replay
+  rejection) acknowledges it with an empty completion instead. Failing an
+  eviction leaves it outstanding in release Core and panics debug Core
+  (issue #814).
 - Native `Not_ready` is represented as `Ok None`. ABI version 2 also exposes
   bounded `Wait_workflow`, `Wait_activity`, and combined `Wait_any` readiness
   operations. Only the

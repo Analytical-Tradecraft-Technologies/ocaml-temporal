@@ -707,3 +707,46 @@ fn replay_complete_retires_lease_before_core_completion() {
     // and releases every native resource so the test cannot leak a worker.
     dispose_or_panic(worker, &handle);
 }
+
+/// Regression guard for issue #814: rejecting the delivery of a pure cache
+/// eviction must acknowledge it with an empty completion, never fail it.
+///
+/// An eviction owns no workflow task. Failing one leaves it outstanding in
+/// release Core and trips Core's debug-build "no workflow task" panic, so the
+/// replay could never drain. This test obtains a real Core eviction (an empty
+/// completion of the initialization activation is a replay nondeterminism),
+/// rejects its delivery through the same path used when conversion or OCaml
+/// decoding fails, and then requires the replay to drain and finalize with no
+/// outstanding completion debt.
+#[test]
+fn replay_reject_of_eviction_acknowledges_it_empty() {
+    let core = core_runtime();
+    let handle = core.tokio_handle().clone();
+    let mut worker =
+        ReplayWorker::start(&core, replay_config()).expect("replay worker should construct");
+    let document = encode_history_document("workflow-replay-test", &complete_history())
+        .expect("history should encode");
+    worker
+        .feed_json(&handle, &document)
+        .expect("bounded feeder should accept one history");
+
+    let activation = wait_and_lease_activation(&mut worker, &handle);
+    assert!(activation_is_initialize_workflow(&activation));
+    handle
+        .block_on(worker.complete_workflow(WorkflowActivationCompletion::empty(&activation.run_id)))
+        .expect("replay activation should accept an empty completion");
+
+    let eviction = wait_and_lease_activation(&mut worker, &handle);
+    assert!(
+        eviction.is_only_eviction(),
+        "nondeterministic replay should be followed by a pure eviction, got {:?}",
+        eviction.jobs
+    );
+    handle
+        .block_on(worker.reject_workflow_delivery(&eviction.run_id, "test eviction rejection"))
+        .expect("rejecting a leased eviction should be accepted by Core");
+
+    worker.finish_input();
+    drain_replay_evictions_until_shutdown(&mut worker, &handle);
+    finalize_or_panic(worker, &handle);
+}

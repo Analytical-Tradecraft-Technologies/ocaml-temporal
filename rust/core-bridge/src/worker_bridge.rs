@@ -1784,7 +1784,9 @@ impl PollLanes {
         Ok(())
     }
 
-    /// Fails an activation that could not cross the semantic JSON boundary.
+    /// Fails an activation that could not cross the semantic JSON boundary,
+    /// or acknowledges it empty when it is a pure cache eviction (see
+    /// [`Self::reject_workflow_delivery_with_reason`]).
     ///
     /// The activation was leased by [`Self::try_take_workflow`] but was never
     /// exposed to OCaml, so no language-side caller can return its completion.
@@ -1802,6 +1804,15 @@ impl PollLanes {
 
     /// Rejects a leased activation with a privacy-safe static conversion
     /// category and then retires the lease exactly once.
+    ///
+    /// A pure cache eviction owns no workflow task, so it is never failed:
+    /// Core accepts only an empty acknowledgement for it (issue #814), and a
+    /// failure would leave the eviction outstanding in release Core and panic
+    /// debug Core's workflow stream. The eviction is therefore acknowledged
+    /// empty, which is exactly what the language side would have sent had the
+    /// activation crossed the boundary; the static `reason` is not reported
+    /// to Core in that case. Every other activation belongs to a real
+    /// workflow task and is failed with [`workflow_rejection_message`].
     pub async fn reject_workflow_delivery_with_reason(
         &self,
         run_id: &str,
@@ -1826,16 +1837,27 @@ impl PollLanes {
         // Core result. This mirrors the retire-before-await ordering already
         // used by the dispose queue drain in
         // `force_complete_outstanding_for_dispose`.
-        self.ledger
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .retire_rejected_workflow(run_id)
-            .map_err(WorkerBridgeError::Completion)?;
-        let completion = WorkflowActivationCompletion::fail(
-            run_id,
-            workflow_rejection_message(reason).into(),
-            Some(WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure),
-        );
+        let eviction_only = {
+            let mut ledger = self
+                .ledger
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            // Read the eviction bit first: retirement clears it.
+            let eviction_only = ledger.is_eviction_lease(run_id);
+            ledger
+                .retire_rejected_workflow(run_id)
+                .map_err(WorkerBridgeError::Completion)?;
+            eviction_only
+        };
+        let completion = if eviction_only {
+            WorkflowActivationCompletion::empty(run_id)
+        } else {
+            WorkflowActivationCompletion::fail(
+                run_id,
+                workflow_rejection_message(reason).into(),
+                Some(WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure),
+            )
+        };
         // Record the ledger state at the exact handoff to Core. The retirement
         // above must already have removed this run, so a correct ordering
         // always probes `false`. A regression that retired after this await

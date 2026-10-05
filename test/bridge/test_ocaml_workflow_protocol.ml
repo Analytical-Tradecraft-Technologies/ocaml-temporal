@@ -1803,9 +1803,31 @@ let test_inbound_degraded_activation () =
        (activation_with_jobs
           {|{"kind":"signal_workflow","signal_name":"s","input":[],"identity":"a\u0000b","headers":{}}|}))
 
+(** Core's eviction message after a failed activation is a Debug dump of the
+    whole failure and can exceed the string limit (#814). Rust truncates it like
+    other inbound text, so the OCaml decoder must accept an eviction-only
+    activation whose message is exactly the truncated 65,536-byte form, with
+    Core's null eviction timestamp, and still reject one byte more. *)
+let test_inbound_truncated_eviction_message () =
+  let limit = 65_536 in
+  let marker = "\n[truncated by ocaml-temporal: original length 300000 bytes]" in
+  let truncated = String.make (limit - String.length marker) 'f' ^ marker in
+  if String.length truncated <> limit then failwith "test text has the wrong size";
+  let eviction message =
+    Printf.sprintf
+      {|{"run_id":"run-814","timestamp":null,"is_replaying":false,"history_length":0,"jobs":[{"kind":"remove_from_cache","message":"%s","reason":"lang_fail"}]}|}
+      (String.concat "\\n" (String.split_on_char '\n' message))
+  in
+  (match (round_trip_activation "truncated eviction" (eviction truncated)).jobs with
+   | [ Remove_from_cache { message; reason = Lang_fail } ] ->
+       check_string "truncated eviction message" truncated message
+   | _ -> failwith "truncated eviction job changed shape");
+  require_error (Protocol.decode_activation (eviction ("x" ^ truncated)))
+
 let () =
   test_child_routing_options ();
   run "inbound degraded activation" test_inbound_degraded_activation;
+  run "inbound truncated eviction message" test_inbound_truncated_eviction_message;
   run "terminated failure info" test_terminated_failure_info;
   run "workflow activations" test_valid_activations;
   run "invalid reset seeds" test_invalid_reset_seeds;

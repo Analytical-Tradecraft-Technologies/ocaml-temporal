@@ -1819,6 +1819,7 @@ impl Runtime {
     }
 
     /// Fails and retires a workflow activation that was never exposed to OCaml.
+    /// A pure cache eviction is acknowledged empty instead (issue #814).
     fn reject_workflow_delivery(&self, run_id: &str) -> std::result::Result<(), Failure> {
         self.reject_workflow_delivery_with_reason(
             run_id,
