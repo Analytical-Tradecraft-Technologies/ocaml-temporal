@@ -331,7 +331,8 @@ module Context = struct
     Temporal_base.Activity_context.heartbeat context payloads
     |> Result.map_error Error_private.of_base
 
-  (** Returns details retained from the preceding heartbeat attempt. *)
+  (** Returns the previous attempt's heartbeat details; this attempt's own
+      heartbeats never change the value. *)
   let details context =
     Temporal_base.Activity_context.details context
     |> List.map

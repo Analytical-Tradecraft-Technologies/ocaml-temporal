@@ -202,7 +202,12 @@ module Context : sig
   (** Sends already encoded detail payloads in order. *)
   val heartbeat_payloads : t -> Payload.t list -> (unit, Error.t) result
 
-  (** Returns a copied list of details from the preceding heartbeat attempt. *)
+  (** Returns a copied list of the last heartbeat details recorded by the
+      previous attempt of this activity, or [[]] on a first attempt or when
+      the previous attempt never heartbeated. The value is fixed for the whole
+      attempt: details sent with {!heartbeat} or {!heartbeat_payloads} are
+      delivered to the next attempt and do not change what this attempt
+      reads. *)
   val details : t -> Payload.t list
 
   (** Returns the configured heartbeat interval, if one was supplied. *)

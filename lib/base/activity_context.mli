@@ -17,10 +17,14 @@ val create :
 val unavailable :
   details:Payload.t list -> heartbeat_timeout:Duration.t option -> t
 
-(** Submits copied heartbeat details while the attempt is active. *)
+(** Submits copied heartbeat details while the attempt is active. Success does
+    not change {!details}. *)
 val heartbeat : t -> Payload.t list -> (unit, Error.t) result
 
-(** Returns copied details from the preceding heartbeat attempt. *)
+(** Returns copied heartbeat details delivered with this task, i.e. the last
+    details recorded by the previous attempt (empty on a first attempt). The
+    value is stable for the whole attempt: heartbeats sent through {!heartbeat}
+    are recorded for the next attempt and never change it. *)
 val details : t -> Payload.t list
 
 (** Returns the server-supplied heartbeat interval for this attempt. *)
