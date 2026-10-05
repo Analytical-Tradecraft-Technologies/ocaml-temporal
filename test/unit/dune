@@ -1,6 +1,7 @@
 (tests
  (names
   test_codec
+  test_codec_json
   test_definition
   test_error
   test_workflow_authoring

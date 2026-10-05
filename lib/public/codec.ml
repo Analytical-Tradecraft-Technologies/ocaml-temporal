@@ -256,3 +256,152 @@ let option codec =
             | Ok inner -> Result.map Option.some (decode codec inner))
         | Ok _ -> Result.map Option.some (decode codec payload));
   }
+
+(** Name used by every built-in JSON codec. It is the standard Temporal
+    data-converter encoding, so other SDKs read and write these payloads. *)
+let json_encoding = "json/plain"
+
+(** Recognizes the JSON integer grammar: an optional minus sign followed by
+    either a lone [0] or a non-zero digit and any further digits. Yojson
+    prints [`Intlit] text verbatim, so an application-constructed literal must
+    be checked before encoding or the payload could contain arbitrary text. *)
+let valid_json_integer_literal literal =
+  let length = String.length literal in
+  let start = if length > 0 && literal.[0] = '-' then 1 else 0 in
+  let is_digit character = character >= '0' && character <= '9' in
+  let rec all_digits index =
+    index = length || (is_digit literal.[index] && all_digits (index + 1))
+  in
+  start < length
+  && is_digit literal.[start]
+  && (literal.[start] <> '0' || start + 1 = length)
+  && all_digits start
+
+(** Checks that a Yojson value is representable as standard JSON text: every
+    float is finite, every string and object key is valid UTF-8, and every
+    integer literal follows the JSON grammar. The same check runs after
+    parsing, because Yojson's reader accepts the non-standard [NaN] and
+    [Infinity] tokens and overflows large exponents to infinity. Recursion
+    depth is bounded by the nesting depth of the value. *)
+let rec validate_json : Yojson.Safe.t -> (unit, Error.t) result = function
+  | `Null | `Bool _ | `Int _ -> Ok ()
+  | `Intlit literal ->
+      if valid_json_integer_literal literal then Ok ()
+      else Error (Error.codec ~message:"JSON integer literal is malformed")
+  | `Float value ->
+      if Float.is_finite value then Ok ()
+      else
+        Error
+          (Error.codec
+             ~message:"JSON numbers must be finite; NaN and infinities are rejected")
+  | `String value ->
+      if valid_utf_8 value then Ok ()
+      else Error (Error.codec ~message:"JSON string contains invalid UTF-8")
+  | `List items -> validate_json_list items
+  | `Assoc fields -> validate_json_fields fields
+
+(** Validates list elements in order, stopping at the first failure. *)
+and validate_json_list = function
+  | [] -> Ok ()
+  | item :: rest -> (
+      match validate_json item with
+      | Error _ as error -> error
+      | Ok () -> validate_json_list rest)
+
+(** Validates object keys and values in order, stopping at the first failure. *)
+and validate_json_fields = function
+  | [] -> Ok ()
+  | (key, value) :: rest ->
+      if not (valid_utf_8 key) then
+        Error (Error.codec ~message:"JSON object key contains invalid UTF-8")
+      else (
+        match validate_json value with
+        | Error _ as error -> error
+        | Ok () -> validate_json_fields rest)
+
+(** Serializes a validated JSON value using strict standard syntax. *)
+let encode_json_value value =
+  match validate_json value with
+  | Error _ as error -> error
+  | Ok () -> Ok (Bytes.of_string (Yojson.Safe.to_string ~std:true value))
+
+(** Parses exactly one JSON value and applies {!validate_json}, so non-finite
+    numbers and invalid UTF-8 never reach an application decoder. *)
+let decode_json_value data =
+  match Yojson.Safe.from_string (Bytes.to_string data) with
+  | exception Yojson.Json_error message ->
+      Error (Error.codec ~message:("invalid JSON: " ^ message))
+  | value -> Result.map (fun () -> value) (validate_json value)
+
+(** Builds a [json/plain] codec from conversions to and from a Yojson value.
+    Validation and parsing happen inside {!make}'s callbacks, so conversion
+    exceptions receive the same typed, payload-free codec error as other
+    application callbacks. *)
+let json_conv ~to_json ~of_json =
+  make ~encoding:json_encoding
+    ~encode:(fun value -> encode_json_value (to_json value))
+    ~decode:(fun data -> Result.bind (decode_json_value data) of_json)
+
+(** Passes validated Yojson values through unchanged. *)
+let json = json_conv ~to_json:Fun.id ~of_json:Result.ok
+
+(** Accepts only JSON integer literals within OCaml's native [int] range.
+    Yojson parses in-range integers as [`Int] and wider ones as [`Intlit]. *)
+let int =
+  json_conv
+    ~to_json:(fun value -> `Int value)
+    ~of_json:(function
+      | `Int value -> Ok value
+      | `Intlit _ ->
+          Error (Error.codec ~message:"JSON integer is outside the OCaml int range")
+      | _ -> Error (Error.codec ~message:"payload is not a JSON integer"))
+
+(** Writes the exact decimal text of a signed 64-bit integer and reads back any
+    JSON integer literal that fits that range. *)
+let int64 =
+  json_conv
+    ~to_json:(fun value -> `Intlit (Int64.to_string value))
+    ~of_json:(function
+      | `Int value -> Ok (Int64.of_int value)
+      | `Intlit literal -> (
+          match Int64.of_string_opt literal with
+          | Some value -> Ok value
+          | None ->
+              Error (Error.codec ~message:"JSON integer is outside the int64 range"))
+      | _ -> Error (Error.codec ~message:"payload is not a JSON integer"))
+
+(** Encodes booleans as the JSON literals [true] and [false]. *)
+let bool =
+  json_conv
+    ~to_json:(fun value -> `Bool value)
+    ~of_json:(function
+      | `Bool value -> Ok value
+      | _ -> Error (Error.codec ~message:"payload is not a JSON boolean"))
+
+(** Encodes finite floats as JSON numbers and accepts any finite JSON number on
+    decode. Integer literals are accepted because SDKs such as Go and
+    TypeScript write integral floats without a fraction; values beyond 2^53 are
+    rounded to the nearest float. A literal too large to represent is rejected
+    rather than decoded as infinity.
+
+    Go's JSON encoder writes negative zero as the integer literal [-0], which
+    Yojson parses as [`Int 0]. The decoder therefore inspects the payload text
+    for that one case so negative zero keeps its sign across SDKs. *)
+let float =
+  make ~encoding:json_encoding
+    ~encode:(fun value -> encode_json_value (`Float value))
+    ~decode:(fun data ->
+      Result.bind (decode_json_value data) (function
+      | `Float value -> Ok value
+      | `Int 0
+        when String.starts_with ~prefix:"-" (String.trim (Bytes.to_string data))
+        ->
+          Ok (-0.0)
+      | `Int value -> Ok (Float.of_int value)
+      | `Intlit literal -> (
+          match Float.of_string_opt literal with
+          | Some value when Float.is_finite value -> Ok value
+          | _ ->
+              Error
+                (Error.codec ~message:"JSON number is outside the float range"))
+      | _ -> Error (Error.codec ~message:"payload is not a JSON number")))
