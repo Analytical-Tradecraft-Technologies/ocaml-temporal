@@ -303,7 +303,7 @@ are excluded from log messages. See the [observability reference](docs/reference
 - [Documentation guide and glossary](docs/README.md)
 - [Supported public API map](docs/reference/public-api-map.md)
 - [Workflow authoring guide](docs/guides/workflows.md)
-- [Architecture specification](docs/superpowers/specs/2026-07-11-ocaml-temporal-sdk-design.md)
+- [Architecture specification](docs/design/sdk-architecture.md)
 - [Implementation roadmap](docs/implementation-roadmap.md)
 - [Runtime invariants](docs/reference/runtime-invariants.md)
 - [Native Core bridge and ownership](docs/reference/core-bridge.md)

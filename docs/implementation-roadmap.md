@@ -43,8 +43,13 @@ part of phases 3 and 7.
 
 ## Plan documents
 
-1. [Foundation and deterministic runtime](superpowers/plans/2026-07-11-foundation-and-deterministic-runtime.md)
-2. [Core bridge and first real workflow](superpowers/plans/2026-07-11-core-bridge-and-first-real-workflow.md)
+The step-by-step working plans written for phases 1 and 2 were internal
+implementation aids, not user documentation, and were removed from the
+published docs; they remain in git history before commit `a102f31`. Their design
+decisions are recorded in the [design documents](design/) and ADRs.
+
+1. Foundation and deterministic runtime
+2. Core bridge and first real workflow
    The private mailbox processor is a completed Phase 2 foundation described
    by [ADR 0003](decisions/0003-private-mailbox-processor.md). The one-Domain
    SDK graph supervisor now owns the real Rust runtime, client, and validated
