@@ -85,18 +85,35 @@ CI=true dry_run DUNE_JOBS=3
 expect_jobs 'explicit CI limit' 3
 
 # Cargo's test-only serial default must not slow the bridge build, while an
-# explicit CARGO_BUILD_JOBS reaches the Cargo build that Dune's bridge rule and
-# `make build` start inside the container.
+# explicit CARGO_BUILD_JOBS is passed into every Compose container, so it
+# reaches the Cargo build that Dune's bridge rule, `make build`, executable
+# batches, and benchmarks start inside the container.
 CI= dry_run
-if grep -E 'dune (build|runtest)|cargo build' "$temporary_root/plan" |
+if grep -E 'dune (build|runtest)|cargo build|build-temporal-executables' "$temporary_root/plan" |
   grep -Fq CARGO_BUILD_JOBS; then
   echo 'default bridge builds were serialized by CARGO_BUILD_JOBS' >&2
   exit 1
 fi
 CI= dry_run CARGO_BUILD_JOBS=3
-for command in 'opam exec -- dune build -j 2' 'opam exec -- dune runtest -j 2' 'cargo build --manifest-path'; do
-  grep -F "$command" "$temporary_root/plan" | grep -Fq 'env CARGO_BUILD_JOBS=3' || {
-    echo "explicit CARGO_BUILD_JOBS did not reach: $command" >&2
+for command in 'opam exec -- dune build -j 2' 'opam exec -- dune runtest -j 2' \
+  'cargo build --manifest-path' 'build-temporal-executables.sh'; do
+  # Native targets run on the host, where Make already exports a command-line
+  # or environment value to recipes; only container commands need the flag.
+  grep -F "$command" "$temporary_root/plan" | grep -F ' run --rm ' \
+    >"$temporary_root/matches" || {
+    echo "dry run printed no container command matching: $command" >&2
     exit 1
   }
+  if grep -Fv -- '-e CARGO_BUILD_JOBS=3' "$temporary_root/matches" | grep -q .; then
+    echo "explicit CARGO_BUILD_JOBS did not reach: $command" >&2
+    exit 1
+  fi
 done
+# Every container started through COMPOSE_RUN, including direct Dune paths
+# such as `make bench`, carries the explicit value.
+make --no-print-directory -n -C "$source_root" -f Makefile MAKE=true CARGO_BUILD_JOBS=3 bench \
+  >"$temporary_root/bench" 2>&1 || { cat "$temporary_root/bench" >&2; exit 1; }
+if grep -F ' run --rm ' "$temporary_root/bench" | grep -Fv -- '-e CARGO_BUILD_JOBS=3' | grep -q .; then
+  echo 'explicit CARGO_BUILD_JOBS did not reach every bench container' >&2
+  exit 1
+fi

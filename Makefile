@@ -73,10 +73,12 @@ CARGO_BUILD_JOBS ?= 1
 CARGO_TEST_ENV := CARGO_BUILD_JOBS=$(CARGO_BUILD_JOBS) CARGO_INCREMENTAL=0
 # Cargo's own parallelism is kept for the bridge build (the staticlib has no
 # memory-heavy link step), so the serial test default above is not forwarded.
-# A CARGO_BUILD_JOBS given on the command line or in the environment also
-# reaches the containerized `cargo build` and the Cargo build that Dune's bridge
-# rule starts, for VMs where even Rust compilation needs bounding.
-CARGO_BUILD_JOBS_ENV := $(if $(filter environment command,$(firstword $(origin CARGO_BUILD_JOBS))),env CARGO_BUILD_JOBS=$(CARGO_BUILD_JOBS),)
+# A CARGO_BUILD_JOBS given on the command line or in the environment is passed
+# into every Compose container (`compose run -e`), so it reaches the
+# containerized `cargo build` and every Cargo build that a Dune bridge rule
+# starts, including direct COMPOSE_RUN paths such as executable batches and
+# benchmarks, for VMs where even Rust compilation needs bounding.
+CARGO_BUILD_JOBS_RUN_FLAG := $(if $(filter environment command,$(firstword $(origin CARGO_BUILD_JOBS))),-e CARGO_BUILD_JOBS=$(CARGO_BUILD_JOBS),)
 STRUCTURED_FUZZ_CASES ?= 128
 STRUCTURED_FUZZ_SEED ?= 0x521506a1
 STRUCTURED_FUZZ_TARGET ?= fuzz_
@@ -101,9 +103,9 @@ RUST_BRIDGE_BUILD_PROFILE = $(if $(filter release,$(RUST_BRIDGE_PROFILE)),releas
 # Build separately so Compose's build output goes to stderr and failures stop
 # the command. Only container stdout reaches version and Cargo metadata probes.
 COMPOSE_RUN := OCAML_IMAGE=$(OCAML_IMAGE) $(COMPOSE) --progress plain build $(SERVICE) >&2 && \
-	OCAML_IMAGE=$(OCAML_IMAGE) $(COMPOSE) --progress quiet run --rm --user $(HOST_UID):$(HOST_GID) $(SERVICE)
-RUN := $(COMPOSE_RUN) $(CARGO_BUILD_JOBS_ENV) opam exec --
-CARGO := $(COMPOSE_RUN) $(CARGO_BUILD_JOBS_ENV) cargo
+	OCAML_IMAGE=$(OCAML_IMAGE) $(COMPOSE) --progress quiet run --rm --user $(HOST_UID):$(HOST_GID) $(CARGO_BUILD_JOBS_RUN_FLAG) $(SERVICE)
+RUN := $(COMPOSE_RUN) opam exec --
+CARGO := $(COMPOSE_RUN) cargo
 CARGO_MANIFEST := rust/Cargo.toml
 NATIVE_RUN := opam exec --
 NATIVE_CARGO_TARGET_DIR ?= $(CARGO_TARGET_DIR)
@@ -178,7 +180,7 @@ bench:
 	image_id=$$(docker image inspect --format '{{.Id}}' "$(TEMPORAL_COMPOSE_PROJECT)-$(SERVICE)" 2>/dev/null || true); \
 	if test -z "$$image_id"; then image_id=unavailable; fi; \
 	status=0; \
-	OCAML_IMAGE=$(OCAML_IMAGE) $(COMPOSE) --progress quiet run --rm --user $(HOST_UID):$(HOST_GID) $(SERVICE) env \
+	OCAML_IMAGE=$(OCAML_IMAGE) $(COMPOSE) --progress quiet run --rm --user $(HOST_UID):$(HOST_GID) $(CARGO_BUILD_JOBS_RUN_FLAG) $(SERVICE) env \
 		BENCH_SOURCE_COMMIT="$$source_commit" \
 		BENCH_SOURCE_DIRTY="$$source_dirty" \
 		BENCH_SDK_VERSION="$$(cat .release-version)" \
@@ -831,7 +833,7 @@ test-worker-poll-isolation-live-build:
 
 .PHONY: test-worker-poll-isolation-live-run
 test-worker-poll-isolation-live-run:
-	OCAML_IMAGE=$(OCAML_IMAGE) $(COMPOSE) --progress quiet run --rm --user $(HOST_UID):$(HOST_GID) $(SERVICE) env TEMPORAL_NAMESPACE=temporal-sdk-test TEMPORAL_POLL_ISOLATION_LOG_FILE=/workspace/test/integration/temporal/.smoke-poll-isolation.log sh scripts/run-temporal-executable.sh --build-dir=/workspace/_build/worker-poll-isolation test/integration/worker_poll_isolation/regression.exe check $(TEMPORAL_CLIENT_TEST_URL)
+	OCAML_IMAGE=$(OCAML_IMAGE) $(COMPOSE) --progress quiet run --rm --user $(HOST_UID):$(HOST_GID) $(CARGO_BUILD_JOBS_RUN_FLAG) $(SERVICE) env TEMPORAL_NAMESPACE=temporal-sdk-test TEMPORAL_POLL_ISOLATION_LOG_FILE=/workspace/test/integration/temporal/.smoke-poll-isolation.log sh scripts/run-temporal-executable.sh --build-dir=/workspace/_build/worker-poll-isolation test/integration/worker_poll_isolation/regression.exe check $(TEMPORAL_CLIENT_TEST_URL)
 
 lint:
 	$(RUN) dune build @install $(DUNE_BUILD_ARGS)
