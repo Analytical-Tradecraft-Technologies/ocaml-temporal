@@ -302,8 +302,10 @@ let failure_details (failure : Protocol.failure) =
   loop 0 [] failure
 
 (** Converts one protocol failure to the broad typed error used by workflow
-    futures. The error view retains the primary category and details, while the
-    protocol's richer recursive fields are included in its diagnostic. *)
+    futures. The error view retains the primary category, details, and the
+    innermost application failure type (so OCaml code can branch on a business
+    error type raised by an activity or child in any SDK), while the protocol's
+    richer recursive fields are included in its diagnostic. *)
 let runtime_error_of_failure path ~category (failure : Protocol.failure) =
   let rec details_loop reversed = function
     | [] -> Ok (List.rev reversed)
@@ -314,8 +316,9 @@ let runtime_error_of_failure path ~category (failure : Protocol.failure) =
   let details = failure_details failure in
   let* details = details_loop [] details in
   let non_retryable = Protocol.failure_non_retryable failure in
+  let error_type = Failure_diagnostic.application_failure_type failure in
   Ok
-    (Temporal_base.Error.make ~non_retryable ~details ~category
+    (Temporal_base.Error.make ~non_retryable ?error_type ~details ~category
        ~message:(Failure_diagnostic.failure_diagnostic failure)
        ())
 
@@ -775,8 +778,11 @@ let protocol_child_cancellation_type = function
       Protocol.Child_wait_cancellation_requested
 
 (** Converts the broad runtime error into the protocol's structured failure
-    shape. Category and retryability remain explicit in the application-info
-    variant, while details are copied as binary-safe protocol payloads. *)
+    shape. Retryability remains explicit in the application-info variant, and
+    its [type] is the error's explicit application type or, when absent, the
+    category label, so untyped errors keep their historical wire type. Details
+    are copied as binary-safe protocol payloads. [source] is the SDK-wide
+    ["ocaml-temporal"] marker shared with activity failures. *)
 let protocol_failure path (error : Temporal_base.Error.t) =
   let view = Temporal_base.Error.view error in
   let rec details_loop reversed = function
@@ -792,7 +798,7 @@ let protocol_failure path (error : Temporal_base.Error.t) =
     | _ ->
         Protocol.Application
           {
-            type_name = Temporal_base.Error.kind error;
+            type_name = Temporal_base.Error.application_failure_type error;
             non_retryable = view.non_retryable;
             details;
             category = Protocol.Application_category_unspecified;
@@ -803,7 +809,7 @@ let protocol_failure path (error : Temporal_base.Error.t) =
     Protocol.
       {
         message = bounded_protocol_message view.message;
-        source = "ocaml";
+        source = "ocaml-temporal";
         stack_trace = "";
         encoded_attributes = None;
         cause = None;

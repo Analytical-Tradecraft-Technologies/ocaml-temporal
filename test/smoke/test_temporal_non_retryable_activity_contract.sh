@@ -33,11 +33,17 @@ require_file "$driver"
 require_file "$worker"
 
 # The callback is retryable by itself; the policy's application error type is
-# what makes this a useful live test of Temporal's non-retryable matching.
+# what makes this a useful live test of Temporal's non-retryable matching. The
+# type is user-defined (not a category label) so the test proves that
+# Error.make ~error_type reaches ApplicationFailureInfo.type on the wire.
 require_text "$definitions" \
   'let non_retryable_activity_policy ='
 require_text "$definitions" \
-  '~non_retryable_error_types:[ "activity" ] ()'
+  '~non_retryable_error_types:[ "SmokeInvalidInput" ] ()'
+require_text "$definitions" \
+  '(Temporal.Error.make ~error_type:"SmokeInvalidInput"'
+require_text "$definitions" \
+  '|| view.error_type <> Some "SmokeInvalidInput"'
 require_text "$definitions" \
   'Temporal.Activity.define ~name:"smoke.non_retryable_activity"'
 require_text "$definitions" \
@@ -49,7 +55,7 @@ require_text "$definitions" \
 require_text "$definitions" \
   'let activity_non_retryable_failure ='
 require_text "$definitions" \
-  'view.category <> `Activity'
+  'view.category <> `Activity || not view.non_retryable'
 require_text "$definitions" \
   'view.non_retryable'
 require_text "$definitions" \

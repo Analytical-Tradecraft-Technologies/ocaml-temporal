@@ -205,8 +205,9 @@ let add_payloads buffer payloads =
   List.iter (add_payload buffer) payloads
 
 (** Derives the stable equality key used to permit only byte-identical retries
-    after an uncertain supervisor submission. Error category, retryability, and
-    detail payloads are included because they affect the completion request. *)
+    after an uncertain supervisor submission. Error category, application
+    failure type, retryability, and detail payloads are included because they
+    affect the completion request. *)
 let operation_key operation =
   let buffer = Buffer.create 64 in
   (match operation with
@@ -219,6 +220,7 @@ let operation_key operation =
         Error.view error
       in
       add_field buffer (Error.kind error);
+      add_field buffer (Error.application_failure_type error);
       add_field buffer message;
       add_field buffer (if non_retryable then "1" else "0");
       add_payloads buffer details

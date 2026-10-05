@@ -23,6 +23,7 @@ let base_payload (payload : Temporal.Payload.t) : Temporal_base.Payload.t =
 let base_error (error : Temporal.Error.t) : Temporal_base.Error.t =
   let view = Temporal.Error.view error in
   Temporal_base.Error.make ~non_retryable:view.non_retryable
+    ?error_type:view.error_type
     ~details:(List.map base_payload view.details) ~category:view.category
     ~message:view.message ()
 
@@ -513,7 +514,49 @@ let test_typed_failure () =
   | _ ->
       failwith
         "typed activity failure did not preserve retryability or details"
+  end;
+  (* Without an explicit application type the category label remains the wire
+     type, preserving the pre-existing behaviour for untyped errors. *)
+  begin match (latest_completion supervisor).Protocol.result with
+  | Protocol.Failed
+      { info = Protocol.Application { type_name = "activity"; _ }; source; _ }
+    when String.equal source "ocaml-temporal" ->
+      ()
+  | _ -> failwith "untyped activity failure changed its wire type or source"
   end
+
+(** An explicit [~error_type] becomes [ApplicationFailureInfo.type] on the
+    activity completion. This is the field Temporal Server and Core match
+    against a retry policy's [non_retryable_error_types], so it must be the
+    user's type rather than the category label. *)
+let test_typed_failure_error_type () =
+  let supervisor = fake_supervisor () in
+  let activity =
+    Temporal.Activity.define ~name:"native_activity_typed_failure"
+      ~input:Temporal.Codec.unit ~output:Temporal.Codec.unit (fun () ->
+        Error
+          (Temporal.Error.make ~error_type:"InvalidInput" ~category:`Activity
+             ~message:"rejected input" ()))
+  in
+  enqueue supervisor
+    (start_task ~token:(Bytes.of_string "typed-failure-token")
+       ~activity_type:"native_activity_typed_failure"
+       ~input:[ encode_input Temporal.Codec.unit () ]);
+  let worker = worker supervisor [ Adapter.register activity ] in
+  begin match Worker.poll worker with
+  | Ok (Adapter.Rejected { lease_retired = true; _ }) -> ()
+  | _ -> failwith "typed activity failure was not retired"
+  end;
+  match (latest_completion supervisor).Protocol.result with
+  | Protocol.Failed
+      {
+        info =
+          Protocol.Application
+            { type_name = "InvalidInput"; non_retryable = false; _ };
+        _;
+      } ->
+      ()
+  | _ -> failwith "activity failure did not carry its explicit error type"
 
 (** Malformed application details must fail only their own activity. Each case
     queues unrelated work behind the rejected task to detect a poisoned retry
@@ -1220,6 +1263,7 @@ let test_poll_error_is_typed () =
 let () =
   test_successful_dispatch ();
   test_typed_failure ();
+  test_typed_failure_error_type ();
   test_invalid_failure_details_allow_next_activity ();
   test_invalid_failure_completion_retry ();
   test_unrepresentable_context_retires_lease ();
