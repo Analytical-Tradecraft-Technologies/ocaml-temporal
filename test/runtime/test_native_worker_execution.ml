@@ -2801,6 +2801,53 @@ let test_update_defect_discards_acceptance_and_commands () =
   if completion.commands <> [] || Option.is_none completion.task_failure then
     failwith "broken update leaked accepted response or buffered timer"
 
+(** A validator's defect, whether returned or raised, rejects the update
+    before acceptance instead of failing the workflow task (#790). The
+    documented validator example returns [Error.defect]; failing the task
+    would discard buffered commands and stall the workflow on redelivery. *)
+let test_update_validator_defect_rejects () =
+  let update = Temporal.Update.define ~name:"validated-update"
+      ~input:Temporal.Codec.string ~output:Temporal.Codec.unit in
+  let calls = ref 0 in
+  let handler = Temporal.Update.Handler.make update
+      ~validator:(function
+        | "" -> Error (Temporal.Error.defect ~message:"tool name is empty")
+        | "raise" -> failwith "validator defect"
+        | _ -> Ok ())
+      (fun _ -> incr calls; Ok ()) in
+  let definition = Temporal.Workflow.define ~name:"update-validator-defect"
+      ~input:Temporal.Codec.unit ~output:Temporal.Codec.unit (fun () ->
+        Temporal.Workflow.sleep (Temporal.Duration.of_ms 1000L)) in
+  let supervisor = fake_supervisor () in
+  let run_id = "update-validator-defect-run" in
+  let worker = worker supervisor [ Adapter.register
+      ~update_handlers:[ public_update_handler handler ] definition ] in
+  enqueue supervisor (activation ~run_id
+      [ initialize ~run_id ~workflow_type:"update-validator-defect" ]);
+  expect_completed ~terminal:false (Result.get_ok (Worker.poll worker));
+  enqueue supervisor (activation ~run_id
+      [ update_job ~id:"empty" ~protocol_instance_id:"empty-protocol"
+          ~name:"validated-update"
+          ~input:[ encoded_protocol Temporal.Codec.string "" ] ~run_validator:true;
+        update_job ~id:"raise" ~protocol_instance_id:"raise-protocol"
+          ~name:"validated-update"
+          ~input:[ encoded_protocol Temporal.Codec.string "raise" ]
+          ~run_validator:true ]);
+  expect_completed ~terminal:false (Result.get_ok (Worker.poll worker));
+  let completion = latest_completion supervisor in
+  if Option.is_some completion.task_failure then
+    failwith "validator defect failed the workflow task";
+  (match completion.commands with
+  | [ Protocol.Update_response
+        { protocol_instance_id = "empty-protocol";
+          response = Protocol.Update_rejected _ };
+      Protocol.Update_response
+        { protocol_instance_id = "raise-protocol";
+          response = Protocol.Update_rejected _ } ] -> ()
+  | _ -> failwith "validator defects were not rejected in order");
+  if !calls <> 0 then failwith "rejected update ran its handler";
+  Worker.discard worker
+
 (** A terminated child resolves as an ordinary typed error. The parent handles
     it, schedules more work, and completes; another run on the same worker can
     then progress with no outstanding native lease. Replay uses the same path. *)
@@ -2867,6 +2914,7 @@ let () =
   test_output_encoder_failure_is_task_failure ();
   test_deliberate_application_failure_remains_terminal ();
   test_update_defect_discards_acceptance_and_commands ();
+  test_update_validator_defect_rejects ();
   test_terminal_workflow ();
   test_completed_workflow_queries ();
   test_activation_metadata_hook ();
