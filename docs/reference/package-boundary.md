@@ -101,9 +101,13 @@ facade without unsafe casts:
   `Temporal_base.Async_activity.handle` and `.context`.
 
 Each target type is abstract in its private interface. The public `Temporal`
-root does not re-export those modules, and `Future.mli` and `Activity.mli`
-expose no constructor, record field, callback, or lifecycle operation for
-these types. [#793](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/793)
+root does not re-export those modules, and neither `Future.mli` nor
+`Activity.mli` exposes a constructor or record field for these types, so an
+application cannot build one directly. `Future.mli` also exposes no callback or
+scheduler lifecycle operation. `Activity.mli` deliberately exposes the
+supported activity operations on values the SDK supplies: the context
+operations, `Async_context.handle`, and the `Async_handle` completion,
+failure, cancellation, and heartbeat functions. [#793](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/793)
 tracks auditing these equalities before the v1 freeze. The private libraries
 are unavailable through the supported `temporal-sdk` dependency and are not
 part of the public API. Public
