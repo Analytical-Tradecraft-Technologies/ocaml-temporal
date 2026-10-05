@@ -27,6 +27,9 @@ enum Final {
     NeverAccepted,
     /// Stage `Completed` but no outcome, which is an invalid server answer.
     CompletedWithoutOutcome,
+    /// A failure outcome paired with a lifecycle stage this bridge does not
+    /// know, as a malformed or forward-incompatible server might send.
+    OutcomeWithUnknownStage,
 }
 
 /// Records every update request the scripted server received.
@@ -79,6 +82,17 @@ fn scripted_response(
                 })),
             }),
             stage: i32::from(UpdateWorkflowExecutionLifecycleStage::Completed),
+            ..Default::default()
+        },
+        Final::OutcomeWithUnknownStage => UpdateWorkflowExecutionResponse {
+            update_ref: Some(update_ref()),
+            outcome: Some(update::v1::Outcome {
+                value: Some(update::v1::outcome::Value::Failure(CoreFailure {
+                    message: "validator rejected the update".to_owned(),
+                    ..Default::default()
+                })),
+            }),
+            stage: 99,
             ..Default::default()
         },
         Final::CompletedWithoutOutcome => UpdateWorkflowExecutionResponse {
@@ -222,6 +236,16 @@ fn completed_stage_without_outcome_fails_closed() {
     let (core, connection, _probe) = scripted_connection(0, Final::CompletedWithoutOutcome);
     let error = start_update(&core, connection, Duration::from_secs(10))
         .expect_err("completed stage needs an outcome");
+    assert!(matches!(error, ClientOperationError::Core(_)));
+}
+
+/// An outcome does not excuse an unknown lifecycle stage: the response fails
+/// closed as a Core defect instead of being trusted.
+#[test]
+fn outcome_with_unknown_stage_fails_closed() {
+    let (core, connection, _probe) = scripted_connection(0, Final::OutcomeWithUnknownStage);
+    let error = start_update(&core, connection, Duration::from_secs(10))
+        .expect_err("unknown stage must fail closed even with an outcome");
     assert!(matches!(error, ClientOperationError::Core(_)));
 }
 

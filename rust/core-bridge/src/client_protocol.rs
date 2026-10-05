@@ -1250,7 +1250,13 @@ pub(crate) async fn update_workflow_within(
         // a server answering for another update fails closed immediately.
         let response_stage = response.stage;
         let converted = update_response_from_core(&request, response)?;
-        if converted.outcome.is_some() || update_stage_is_accepted(response_stage)? {
+        if converted.outcome.is_some() {
+            // An outcome is final, but its stage must still be a known one so
+            // a malformed or forward-incompatible response fails closed.
+            validate_update_stage_with_outcome(response_stage)?;
+            return Ok(converted);
+        }
+        if update_stage_is_accepted(response_stage)? {
             return Ok(converted);
         }
         // Admitted (or an older server's unspecified stage) without an
@@ -1284,6 +1290,20 @@ fn update_stage_is_accepted(stage: i32) -> Result<bool, ClientOperationError> {
             "Temporal update response used an unknown lifecycle stage",
         ))),
     }
+}
+
+/// Checks the lifecycle stage of an update response that carried an outcome.
+/// Any known stage is accepted (servers report `Completed`, and older ones
+/// may leave it unspecified), while an unknown numeric stage is a Core
+/// conversion error so the bridge never trusts a forward-incompatible reply.
+fn validate_update_stage_with_outcome(stage: i32) -> Result<(), ClientOperationError> {
+    UpdateWorkflowExecutionLifecycleStage::try_from(stage)
+        .map(|_| ())
+        .map_err(|_| {
+            ClientOperationError::Core(workflow_protocol::invalid_core(
+                "Temporal update response used an unknown lifecycle stage",
+            ))
+        })
 }
 
 /// Converts one `UpdateWorkflowExecution` response into the closed bridge
