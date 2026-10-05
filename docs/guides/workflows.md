@@ -927,6 +927,10 @@ model, or fork test processes before the first native SDK value is created, and
 create the client or worker in the child. Starting a separate program with
 `Unix.create_process`, `Unix.open_process_in`, or a similar spawn API remains
 available at any time, because those calls do not duplicate the OCaml runtime.
+This applies to Unix platforms such as Linux and macOS. On Windows,
+`Unix.fork` is not implemented at all and raises `Invalid_argument` whether or
+not the SDK has started; use `Unix.create_process` or `Unix.open_process*` to
+run other processes there.
 
 **Link a native or `-custom` bytecode executable.** The private Rust bridge and
 its C stubs are installed only as static archives; no shared library is
