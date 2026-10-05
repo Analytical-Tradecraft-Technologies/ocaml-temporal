@@ -381,7 +381,10 @@ val start_local :
   'input ->
   ('output, Error.t) Future.t
 
-(** Schedules a local activity and waits for its result. *)
+(** Schedules a local activity and waits for its result. It has the same
+    contract as [start_local], including the [Wait_cancellation_completed]
+    default for [cancellation_type] and the fact that the option currently has
+    no observable effect, because no local activity can be cancelled. *)
 val execute_local :
   ?activity_id:string ->
   ?schedule_to_close_timeout:Duration.t ->
