@@ -229,6 +229,18 @@ class ReleaseTests(unittest.TestCase):
         for platform, entry in manifest["bridges"].items():
             self.assertEqual(RELEASE.sha256(output / entry["asset"]), entry["sha256"])
 
+    def test_tag_spelling(self):
+        """Git cannot store a tilde tag, so packaging accepts only the hyphen form."""
+        output = self.root / "assets"
+        with self.assertRaisesRegex(ValueError, "cannot contain '~'"):
+            RELEASE.package_bridges(self.root, output, "v1.0.0~beta.1", COMMIT)
+        with self.assertRaisesRegex(ValueError, "invalid release tag"):
+            RELEASE.package_bridges(self.root, output, "v1.0.0-", COMMIT)
+        self.assertFalse(output.exists())
+        RELEASE.package_bridges(self.root, output, "v1.0.0-beta.1", COMMIT)
+        manifest = json.loads((output / "manifest.json").read_text())
+        self.assertEqual(manifest["tag"], "v1.0.0-beta.1")
+
     def test_corrupt_or_nonrelease_bundle(self):
         """Library corruption and debug profiles cannot be shipped as releases."""
         bundle = self.root / "rust-bridge-linux-arm64"

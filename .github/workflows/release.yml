@@ -31,8 +31,10 @@ jobs:
         run: |
           set -euo pipefail
           test "$RELEASE_REF" = refs/heads/master
-          git check-ref-format "refs/tags/$RELEASE_TAG"
+          # The descriptive tag check runs first so a "~" spelling gets its
+          # hyphen guidance; Git's ref-format check exits silently.
           sh scripts/check-release-tag.sh . "$RELEASE_TAG"
+          git check-ref-format "refs/tags/$RELEASE_TAG"
           make release-preflight
           sh scripts/check-release-tag-commit.sh "$RELEASE_TAG" "$GITHUB_SHA"
 
@@ -111,7 +113,7 @@ jobs:
           set -euo pipefail
           flags=()
           case "$RELEASE_TAG" in
-            *-*|*~*) flags=(--prerelease) ;;
+            *-*) flags=(--prerelease) ;;
           esac
           sh scripts/check-release-tag-commit.sh "$RELEASE_TAG" "$GITHUB_SHA"
           # Assets are uploaded to a draft before anything is published.
