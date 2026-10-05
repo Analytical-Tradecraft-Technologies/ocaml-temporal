@@ -242,8 +242,9 @@ and bridge, read the [documentation guide](../README.md) first.
   deduplicate same-mode commands or share patch state between runs, but it
   rejects active and deprecated calls for one ID in one execution before
   emitting the second mode. Patch IDs are durable history keys, not deployment or process state.
-- Replay-safe randomness, side effects, and workflow logging APIs remain
-  required before production release. The complete [PR #348 CI
+- Replay-safe randomness is provided by `Temporal.Workflow.random_int`.
+  Side-effect and replay-aware workflow logging APIs remain required before
+  production release. The complete [PR #348 CI
   run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29411260374) verifies
   the two original live patch-in histories. The complete [PR #356 run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29469232271) additionally
   verifies active-to-deprecated and deprecated-to-removed replacement.
