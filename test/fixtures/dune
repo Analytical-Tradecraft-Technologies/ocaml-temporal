@@ -7,6 +7,7 @@
   ../../.github/workflows/build.yml
   ../../dune-project
   ../../Dockerfile.dev
+  ../../scripts/ci-matrix.py
   ../../temporal-sdk.opam
   ../../temporal-sdk.opam.locked
   install-consumer/test_build_tool_dependencies.sh)
@@ -25,6 +26,7 @@
   ../../.github/workflows/build.yml
   ../../dune-project
   ../../Dockerfile.dev
+  ../../scripts/ci-matrix.py
   ../../temporal-sdk.opam
   ../../temporal-sdk.opam.locked
   install-consumer/test_build_tool_dependencies.sh

@@ -57,7 +57,7 @@ producer_status=0
 # Normalizes every Compose invocation so the bind-mounted build tree has one
 # numeric owner and every process joins the same isolated Temporal project.
 compose() {
-  OCAML_IMAGE=${OCAML_IMAGE:-ocaml/opam:debian-12-ocaml-5.2} \
+  OCAML_IMAGE=${OCAML_IMAGE:-ocaml-5.2} \
     HOST_UID=${HOST_UID:-$(id -u)} HOST_GID=${HOST_GID:-$(id -g)} \
     SMOKE_PARENT_CHILD_RESTART_TIMEOUT_SECONDS=${SMOKE_PARENT_CHILD_RESTART_TIMEOUT_SECONDS:-900} \
     SMOKE_PARENT_CHILD_REPLAY_SCENARIO=failure \

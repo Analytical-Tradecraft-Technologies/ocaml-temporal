@@ -48,7 +48,11 @@ SMOKE_REPLAY_WORKFLOW_ID ?= two-binary-worker-restart-replay
 SERVICE ?= dev
 OCAML_VERSION ?= 5.2
 OCAML_SERIES = $(shell printf '%s' "$(OCAML_VERSION)" | cut -d. -f1,2)
-OCAML_IMAGE ?= ocaml/opam:debian-12-ocaml-$(OCAML_SERIES)
+# Dockerfile.dev stage holding the digest-pinned ocaml/opam image for this
+# compiler series. An explicit image reference may still be supplied locally.
+OCAML_IMAGE ?= ocaml-$(OCAML_SERIES)
+# Immutable base image behind OCAML_IMAGE, recorded in benchmark reports.
+OCAML_IMAGE_REFERENCE = $(or $(shell awk '$$1 == "FROM" && $$3 == "AS" && $$4 == "$(OCAML_IMAGE)" { print $$2 }' Dockerfile.dev),$(OCAML_IMAGE))
 HOST_UID ?= $(shell id -u)
 HOST_GID ?= $(shell id -g)
 # Leave Dune's worker count unchanged by default. A constrained Docker VM can
@@ -164,7 +168,7 @@ bench:
 		BENCH_SDK_VERSION="$$(cat .release-version)" \
 		BENCH_CORE_REVISION="$$core_revision" \
 		BENCH_DUNE_PROFILE=release \
-		BENCH_BASE_IMAGE_REFERENCE="$(OCAML_IMAGE)" \
+		BENCH_BASE_IMAGE_REFERENCE="$(OCAML_IMAGE_REFERENCE)" \
 		BENCH_DEVELOPMENT_IMAGE_ID="$$image_id" \
 		BENCH_HOST_LABEL="$(BENCH_HOST_LABEL)" \
 		BENCH_REPLAY_HISTORY="$(BENCH_REPLAY_HISTORY)" \
@@ -276,6 +280,7 @@ test-live-acceptance-inventory-contract:
 
 test-quality-contract: check-live-acceptance-inventory test-live-acceptance-inventory-contract test-temporal-namespace-readiness
 	sh test/smoke/test_quality_contract.sh .
+	sh test/smoke/test_opam_locked_deps.sh .
 	sh test/smoke/test_release_tag_contract.sh .
 	sh test/smoke/test_release_tag_commit_contract.sh .
 	sh test/smoke/test_make_docker_commands.sh .
