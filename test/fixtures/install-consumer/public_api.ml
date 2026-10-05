@@ -128,6 +128,7 @@ let _activity_context_heartbeat_timeout :
   T.Activity.Context.heartbeat_timeout
 
 let _activity_execute :
+    ?scope:T.Scope.t ->
     ?activity_id:string ->
     ?task_queue:string ->
     ?schedule_to_close_timeout:T.Duration.t ->
@@ -135,6 +136,7 @@ let _activity_execute :
     ?start_to_close_timeout:T.Duration.t ->
     ?heartbeat_timeout:T.Duration.t ->
     ?retry_policy:T.Activity.Retry_policy.t ->
+    ?priority:T.Activity.Priority.t ->
     ?cancellation_type:T.Activity.cancellation_type ->
     ?do_not_eagerly_execute:bool ->
     ('input, 'output) T.Activity.t ->
@@ -193,6 +195,7 @@ let _activity_retry_policy_non_retryable :
   T.Activity.Retry_policy.non_retryable_error_types
 
 let _activity_start_handle :
+    ?scope:T.Scope.t ->
     ?activity_id:string ->
     ?task_queue:string ->
     ?schedule_to_close_timeout:T.Duration.t ->
@@ -200,6 +203,7 @@ let _activity_start_handle :
     ?start_to_close_timeout:T.Duration.t ->
     ?heartbeat_timeout:T.Duration.t ->
     ?retry_policy:T.Activity.Retry_policy.t ->
+    ?priority:T.Activity.Priority.t ->
     ?cancellation_type:T.Activity.cancellation_type ->
     ?do_not_eagerly_execute:bool ->
     ('input, 'output) T.Activity.t ->
@@ -207,6 +211,7 @@ let _activity_start_handle :
   T.Activity.start_handle
 
 let _activity_start :
+    ?scope:T.Scope.t ->
     ?activity_id:string ->
     ?task_queue:string ->
     ?schedule_to_close_timeout:T.Duration.t ->
@@ -214,6 +219,7 @@ let _activity_start :
     ?start_to_close_timeout:T.Duration.t ->
     ?heartbeat_timeout:T.Duration.t ->
     ?retry_policy:T.Activity.Retry_policy.t ->
+    ?priority:T.Activity.Priority.t ->
     ?cancellation_type:T.Activity.cancellation_type ->
     ?do_not_eagerly_execute:bool ->
     ('input, 'output) T.Activity.t ->
@@ -221,8 +227,11 @@ let _activity_start :
   T.Activity.start
 
 let _child_start :
+    ?scope:T.Scope.t ->
     ?cancellation_type:T.Child_workflow.cancellation_type ->
     ?retry_policy:T.Activity.Retry_policy.t ->
+    ?task_queue:string ->
+    ?parent_close_policy:T.Child_workflow.Parent_close_policy.t ->
     id:string ->
     ('input, 'output) T.Workflow.t ->
     'input ->
@@ -230,8 +239,11 @@ let _child_start :
   T.Child_workflow.start
 
 let _child_start_handle :
+    ?scope:T.Scope.t ->
     ?cancellation_type:T.Child_workflow.cancellation_type ->
     ?retry_policy:T.Activity.Retry_policy.t ->
+    ?task_queue:string ->
+    ?parent_close_policy:T.Child_workflow.Parent_close_policy.t ->
     id:string ->
     ('input, 'output) T.Workflow.t ->
     'input -> 'output T.Child_workflow.handle =
@@ -247,8 +259,11 @@ let _child_cancel :
   T.Child_workflow.cancel
 
 let _child_execute :
+    ?scope:T.Scope.t ->
     ?cancellation_type:T.Child_workflow.cancellation_type ->
     ?retry_policy:T.Activity.Retry_policy.t ->
+    ?task_queue:string ->
+    ?parent_close_policy:T.Child_workflow.Parent_close_policy.t ->
     id:string ->
     ('input, 'output) T.Workflow.t ->
     'input ->
@@ -483,6 +498,7 @@ let _update_handler_handle :
 let _update_handler_name : T.Update.Handler.t -> string = T.Update.Handler.name
 let _update_handler_dispatch :
     ?run_validator:bool ->
+    ?on_validated:(unit -> unit) ->
     T.Update.Handler.t -> T.Payload.t -> (T.Payload.t, T.Error.t) result =
   T.Update.Handler.dispatch
 
@@ -525,6 +541,8 @@ let _client_create :
 let _client_start :
     T.Client.t ->
     ?request_id:string ->
+    ?memo:(string * T.Payload.t) list ->
+    ?search_attributes:(string * T.Payload.t) list ->
     workflow:('input, 'output) T.Workflow.t ->
     task_queue:string ->
     id:string ->
@@ -687,3 +705,138 @@ let _routed_child definition input =
   T.Child_workflow.start ~id:"cross-sdk-child" ~task_queue:"go-llm-worker"
     ~parent_close_policy:T.Child_workflow.Parent_close_policy.Abandon
     definition input
+
+(* Values below completed the witness for #841.  Since then the in-tree
+   [test/api_witness] gate fails `dune runtest` when any value exported by a
+   public interface is not referenced here, so a new public value must gain an
+   explicit annotation in the same change that exports it. *)
+
+(* Activity priorities and local activities. *)
+let _activity_priority_make :
+    ?priority_key:int ->
+    ?fairness_key:string ->
+    ?fairness_weight:float ->
+    unit -> (T.Activity.Priority.t, T.Error.t) result =
+  T.Activity.Priority.make
+
+let _activity_priority_create :
+    ?priority_key:int ->
+    ?fairness_key:string ->
+    ?fairness_weight:float ->
+    unit -> (T.Activity.Priority.t, T.Error.t) result =
+  T.Activity.Priority.create
+
+let _activity_priority_key : T.Activity.Priority.t -> int option =
+  T.Activity.Priority.priority_key
+
+let _activity_priority_fairness_key : T.Activity.Priority.t -> string option =
+  T.Activity.Priority.fairness_key
+
+let _activity_priority_fairness_weight :
+    T.Activity.Priority.t -> float option =
+  T.Activity.Priority.fairness_weight
+
+let _activity_start_local :
+    ?activity_id:string ->
+    ?schedule_to_close_timeout:T.Duration.t ->
+    ?schedule_to_start_timeout:T.Duration.t ->
+    ?start_to_close_timeout:T.Duration.t ->
+    ?retry_policy:T.Activity.Retry_policy.t ->
+    ?cancellation_type:T.Activity.cancellation_type ->
+    ('input, 'output) T.Activity.t ->
+    'input -> ('output, T.Error.t) T.Future.t =
+  T.Activity.start_local
+
+let _activity_execute_local :
+    ?activity_id:string ->
+    ?schedule_to_close_timeout:T.Duration.t ->
+    ?schedule_to_start_timeout:T.Duration.t ->
+    ?start_to_close_timeout:T.Duration.t ->
+    ?retry_policy:T.Activity.Retry_policy.t ->
+    ?cancellation_type:T.Activity.cancellation_type ->
+    ('input, 'output) T.Activity.t ->
+    'input -> ('output, T.Error.t) result =
+  T.Activity.execute_local
+
+(* Client termination, visibility listing, and workflow updates. *)
+let _client_terminate :
+    ?reason:string ->
+    ('input, 'output) T.Client.handle -> (unit, T.Error.t) result =
+  T.Client.terminate
+
+let _client_list_visibility :
+    ?page_size:int ->
+    ?page_token:string ->
+    T.Client.t ->
+    query:string ->
+    unit -> (T.Client.visibility_page, T.Error.t) result =
+  T.Client.list_visibility
+
+let _client_visibility_page_fields (page : T.Client.visibility_page) :
+    (string * string * string * string * string) list * string option =
+  ( List.map
+      (fun (execution : T.Client.visibility_execution) ->
+        ( execution.workflow_id,
+          execution.run_id,
+          execution.workflow_type,
+          execution.task_queue,
+          execution.status ))
+      page.executions,
+    page.next_page_token )
+
+let _client_start_update :
+    ?update_id:string ->
+    ('workflow_input, 'workflow_output) T.Client.handle ->
+    update:('input, 'output) T.Update.t ->
+    input:'input ->
+    unit -> (('input, 'output) T.Client.update_handle, T.Error.t) result =
+  T.Client.start_update
+
+let _client_wait_update :
+    ('input, 'output) T.Client.update_handle -> ('output, T.Error.t) result =
+  T.Client.wait_update
+
+let _client_update_id : ('input, 'output) T.Client.update_handle -> string =
+  T.Client.update_id
+
+(* Scope cancellation callbacks. *)
+let _scope_on_cancel :
+    ?until:('value, 'error) T.Future.t ->
+    T.Scope.t ->
+    (unit -> (unit, T.Error.t) result) ->
+    (unit, T.Error.t) result =
+  T.Scope.on_cancel
+
+(* Worker options. *)
+let _worker_options_default : T.Worker.Options.t = T.Worker.Options.default
+
+let _worker_options_make :
+    ?versioning:T.Worker.Options.versioning ->
+    ?max_cached_workflows:int ->
+    unit -> (T.Worker.Options.t, T.Error.t) result =
+  T.Worker.Options.make
+
+let _worker_options_versioning :
+    T.Worker.Options.t -> T.Worker.Options.versioning =
+  T.Worker.Options.versioning
+
+let _worker_options_max_cached_workflows : T.Worker.Options.t -> int option =
+  T.Worker.Options.max_cached_workflows
+
+(* External workflow commands and search attributes from workflow code. *)
+let _workflow_signal_external_workflow :
+    workflow_id:string ->
+    run_id:string ->
+    signal:'input T.Signal.t ->
+    input:'input -> (unit, T.Error.t) T.Future.t =
+  T.Workflow.signal_external_workflow
+
+let _workflow_cancel_external_workflow :
+    workflow_id:string ->
+    run_id:string ->
+    reason:string -> (unit, T.Error.t) T.Future.t =
+  T.Workflow.cancel_external_workflow
+
+let _workflow_upsert_search_attributes :
+    (string * T.Payload.t) list -> unit =
+  T.Workflow.upsert_search_attributes
