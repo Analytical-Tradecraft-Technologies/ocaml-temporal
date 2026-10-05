@@ -77,6 +77,29 @@ let test_nested_timeout_is_visible () =
   assert (contains diagnostic "application type=LlmUnavailable non_retryable=false details=1");
   assert (contains diagnostic " | ")
 
+(** Failure kinds outside the application/activity/child family, including a
+    failure with no info at all, still render a typed summary for every layer
+    so a server-generated cause stays diagnosable. *)
+let test_extended_kinds_are_visible () =
+  let absent =
+    layer ~message:"no info" ~source:"" ~info:Protocol.Absent ~cause:None
+  in
+  let handler =
+    layer ~message:"handler failed" ~source:""
+      ~info:(Protocol.Nexus_handler
+               { type_name = "INTERNAL"; retry_behavior = Protocol.Nexus_retry_non_retryable })
+      ~cause:(Some absent)
+  in
+  let server =
+    layer ~message:"result too large" ~source:""
+      ~info:(Protocol.Server { non_retryable = true })
+      ~cause:(Some handler)
+  in
+  let diagnostic = Diagnostic.failure_diagnostic server in
+  assert (contains diagnostic "result too large server non_retryable=true");
+  assert (contains diagnostic "nexus_handler type=INTERNAL retry_behavior=non_retryable");
+  assert (contains diagnostic "no info no_failure_info")
+
 (** A recursively constructed value cannot make diagnostics grow without a
     bound, even though normal JSON decoding already rejects excessive depth. *)
 let test_depth_is_bounded () =
@@ -147,4 +170,5 @@ let () =
   test_nested_timeout_is_visible ();
   test_depth_is_bounded ();
   test_application_options_survive_cause_diagnostic ();
-  test_truncation_keeps_utf_8 ()
+  test_truncation_keeps_utf_8 ();
+  test_extended_kinds_are_visible ()

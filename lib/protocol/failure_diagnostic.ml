@@ -103,6 +103,34 @@ let failure_info_summary = function
       Printf.sprintf "timeout type=%s last_heartbeat_details=%d"
         (timeout_type_string timeout_type)
         (List.length last_heartbeat_details)
+  | Server { non_retryable } ->
+      Printf.sprintf "server non_retryable=%b" non_retryable
+  | Reset_workflow { last_heartbeat_details } ->
+      Printf.sprintf "reset_workflow last_heartbeat_details=%d"
+        (List.length last_heartbeat_details)
+  | Nexus_operation
+      {
+        scheduled_event_id;
+        endpoint;
+        service;
+        operation;
+        operation_id;
+        operation_token;
+      } ->
+      Printf.sprintf
+        "nexus_operation endpoint=%s service=%s operation=%s operation_id=%s operation_token=%s scheduled_event_id=%Ld"
+        endpoint service operation operation_id operation_token
+        scheduled_event_id
+  | Nexus_handler { type_name; retry_behavior } ->
+      let retry_behavior =
+        match retry_behavior with
+        | Nexus_retry_unspecified -> "unspecified"
+        | Nexus_retry_retryable -> "retryable"
+        | Nexus_retry_non_retryable -> "non_retryable"
+      in
+      Printf.sprintf "nexus_handler type=%s retry_behavior=%s" type_name
+        retry_behavior
+  | Absent -> "no_failure_info"
 
 (** Renders one failure layer, keeping the same field order for stable logs and
     tests. The marker for encoded attributes confirms presence without copying

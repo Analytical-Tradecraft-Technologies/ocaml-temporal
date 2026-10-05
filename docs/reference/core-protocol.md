@@ -463,9 +463,26 @@ start-to-close timeout must be nonzero because Temporal treats zero as unset;
 timestamps allow signed seconds with the same nanosecond range. Payload metadata
 and initialization header maps normalize keys lexicographically on both sides.
 Payload values preserve opaque data and metadata bytes using the canonical
-base64 wrapper. Supported structured failures are application, cancellation,
-termination, activity, child-workflow, and timeout failures, including recursive causes,
-child execution identity, event IDs, and retry state. A timeout failure keeps
+base64 wrapper. Structured failures cover every `failure_info` arm of the
+pinned Core schema: application, cancellation, termination, activity,
+child-workflow, timeout, server, reset-workflow, Nexus-operation, and
+Nexus-handler failures, including recursive causes, child execution identity,
+event IDs, and retry state. A Core failure with no `failure_info` becomes
+`{"kind":"absent"}`; prost also decodes a kind added by a newer server this
+way. The message, source, stack trace, encoded attributes, and cause chain are
+kept for every kind, so a failure's kind alone never rejects an activation.
+Before this, a server-generated cause such as an oversized activity result
+failed every workflow task on that history and stuck the workflow.
+`{"kind":"server","non_retryable":...}` keeps the server's retry decision.
+`reset_workflow` keeps `last_heartbeat_details`. `nexus_operation` keeps
+`scheduled_event_id` (nonnegative), `endpoint`, `service`, `operation`,
+`operation_token`, and the deprecated `operation_id`; all text there is bounded
+and may be empty. `nexus_handler` keeps the Nexus error `type` and
+`retry_behavior` (`unspecified`, `retryable`, or `non_retryable`). Public
+retryability uses `server.non_retryable` and an explicit handler retry
+behavior. For reset-workflow, Nexus-operation, unspecified handler behavior,
+and absent kinds it uses the nested cause, like an activity wrapper whose
+retry policy is unset. A timeout failure keeps
 Core's exact `timeout_type` (`unspecified`, `start_to_close`,
 `schedule_to_start`, `schedule_to_close`, or `heartbeat`) and the ordered
 `last_heartbeat_details` payload list. A termination cause uses
@@ -485,8 +502,11 @@ poll returns `not_ready` so `Worker.run` can process other tasks; a fixed,
 internal 100 ms delay bounds immediate redelivery churn and warning volume.
 A failed Core rejection remains a fatal worker error. The rejection reason is
 static and contains no run ID or payload. Unknown
-protobuf oneofs, enum values, external payload references, unsupported failure
-variants, or omitted Core fields with non-default values fail conversion.
+protobuf oneofs, enum values (including a future Nexus handler retry
+behavior), external payload references, or omitted Core fields with
+non-default values fail conversion. Failure kinds are not part of this list.
+Every pinned `failure_info` kind has a variant, and an absent or future kind
+is `absent`.
 
 The Rust conversion functions are the only protobuf boundary. They convert
 official pinned Core activations to semantic values and semantic completions
