@@ -1644,7 +1644,18 @@ let test_extended_failure_info_kinds () =
     (over
        (Nexus_handler { type_name = "X"; retry_behavior = Nexus_retry_retryable })
        non_retryable_application);
-  check "handler unspecified" true
+  (* An unspecified override follows the Nexus default for the handler type,
+     not the unrelated cause. *)
+  check "handler unspecified bad request" true
+    (failure_with_info
+       (Nexus_handler
+          { type_name = "BAD_REQUEST"; retry_behavior = Nexus_retry_unspecified }));
+  check "handler unspecified internal" false
+    (over
+       (Nexus_handler
+          { type_name = "INTERNAL"; retry_behavior = Nexus_retry_unspecified })
+       non_retryable_application);
+  check "handler unspecified unknown type" false
     (over
        (Nexus_handler { type_name = "X"; retry_behavior = Nexus_retry_unspecified })
        non_retryable_application);

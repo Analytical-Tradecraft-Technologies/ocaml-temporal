@@ -172,16 +172,29 @@ type initialize_context = {
   continuation : continuation option;
 }
 
+(** The Nexus specification's default retryability for predefined handler
+    error types when the handler did not override it: request, authentication,
+    authorization, not-found, not-implemented and conflict errors are not
+    retried; internal, unavailable, resource-exhausted, upstream-timeout and
+    request-timeout errors, and unrecognised types, are retried. *)
+let nexus_handler_type_non_retryable = function
+  | "BAD_REQUEST" | "UNAUTHENTICATED" | "UNAUTHORIZED" | "NOT_FOUND"
+  | "NOT_IMPLEMENTED" | "CONFLICT" ->
+      true
+  | _ -> false
+
 (** Computes the public retryability flag without discarding an application
     failure nested inside a Core activity or child-workflow wrapper. Explicit
     retry states are authoritative: a timeout or in-progress retry remains
     retryable, while Core's non-retryable and attempt-exhausted states do not.
     [Retry_policy_not_set] and [Unspecified] carry no retryability decision of
     their own, so the nested cause is consulted. A server failure's flag and an
-    explicit Nexus handler retry behavior are likewise authoritative, while
-    timeout, reset-workflow, Nexus-operation, unspecified-handler and [Absent]
-    layers defer to their cause. The depth limit matches the
-    protocol's bounded recursive failure representation. *)
+    explicit Nexus handler retry behavior are likewise authoritative. An
+    unspecified handler retry behavior follows the Nexus specification's
+    default for the handler error type (see [nexus_handler_type_non_retryable]).
+    Timeout, reset-workflow, Nexus-operation and [Absent] layers defer to their
+    cause. The depth limit matches the protocol's bounded recursive failure
+    representation. *)
 let failure_non_retryable failure =
   let rec loop depth (value : failure) =
     let nested () =
@@ -202,9 +215,9 @@ let failure_non_retryable failure =
     | Server { non_retryable } -> non_retryable
     | Nexus_handler { retry_behavior = Nexus_retry_non_retryable; _ } -> true
     | Nexus_handler { retry_behavior = Nexus_retry_retryable; _ } -> false
-    | Timeout_failure _ | Reset_workflow _ | Nexus_operation _
-    | Nexus_handler { retry_behavior = Nexus_retry_unspecified; _ }
-    | Absent ->
+    | Nexus_handler { retry_behavior = Nexus_retry_unspecified; type_name } ->
+        nexus_handler_type_non_retryable type_name
+    | Timeout_failure _ | Reset_workflow _ | Nexus_operation _ | Absent ->
         nested ()
   in
   loop 0 failure

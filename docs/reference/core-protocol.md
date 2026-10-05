@@ -480,9 +480,12 @@ failed every workflow task on that history and stuck the workflow.
 and may be empty. `nexus_handler` keeps the Nexus error `type` and
 `retry_behavior` (`unspecified`, `retryable`, or `non_retryable`). Public
 retryability uses `server.non_retryable` and an explicit handler retry
-behavior. For reset-workflow, Nexus-operation, unspecified handler behavior,
-and absent kinds it uses the nested cause, like an activity wrapper whose
-retry policy is unset. A timeout failure keeps
+behavior. An unspecified handler behavior follows the Nexus specification's
+default for the handler `type`: `BAD_REQUEST`, `UNAUTHENTICATED`,
+`UNAUTHORIZED`, `NOT_FOUND`, `NOT_IMPLEMENTED`, and `CONFLICT` are not
+retried, and every other type is. For reset-workflow, Nexus-operation, and
+absent kinds it uses the nested cause, like an activity wrapper whose retry
+policy is unset. A timeout failure keeps
 Core's exact `timeout_type` (`unspecified`, `start_to_close`,
 `schedule_to_start`, `schedule_to_close`, or `heartbeat`) and the ordered
 `last_heartbeat_details` payload list. A termination cause uses
