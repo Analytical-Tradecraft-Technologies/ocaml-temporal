@@ -804,6 +804,31 @@ ordered payload list. The bridge maps it to Temporal Core's
 `ContinueAsNewWorkflowExecution` command, fills only explicit Core defaults,
 and rejects unsupported non-default options instead of silently dropping them.
 
+Long-running workflows should not count events by hand. `Temporal.Workflow.info ()`
+returns a snapshot whose `Info.continue_as_new_suggested`,
+`Info.history_length`, and `Info.history_size_bytes` report what Temporal sent
+with the current activation, so a loop can continue as new at a safe point
+once the server suggests it:
+
+```ocaml
+let rec drain queue =
+  match Temporal.Workflow.info () with
+  | Ok info when Temporal.Workflow.Info.continue_as_new_suggested info ->
+      Temporal.Workflow.continue_as_new drain_workflow queue
+  | Ok _ -> (* process one item, then *) drain queue
+  | Error error -> Error error
+```
+
+The same snapshot carries the run's identity (workflow ID, run ID, first run
+ID of the chain, type, task queue, retry attempt, parent, and start time), all
+taken from Temporal's activations rather than host state. Identity is fixed
+for the run; history facts and `Info.is_replaying` describe the activation
+current when `info` was called, so call it again after a suspension.
+`Temporal.Workflow.is_replaying ()` is the shorthand for side effects outside
+workflow state, such as suppressing duplicate log lines during replay. Never
+choose a workflow command from the replay flag: replay must take the same
+branch as the original execution.
+
 `Temporal.Client.wait` treats the current run as terminal and returns its
 typed continued-as-new outcome with the successor execution reference; it does
 not follow the successor automatically. The complete [PR #253 CI run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29286560471)
