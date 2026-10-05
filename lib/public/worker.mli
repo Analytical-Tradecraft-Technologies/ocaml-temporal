@@ -76,7 +76,14 @@ type t
 
 (** Creates and validates a worker. Duplicate names and remote-only definitions
     return typed defects before any backend graph is allocated. A [mock://]
-    target selects the deterministic test backend; an [http://] or [https://]
+    target selects an in-memory backend for testing registration and dispatch
+    plumbing only: it queues one synthetic task per registered definition with
+    an empty [binary/null] input, unrelated to any mock client start, and calls
+    each implementation whose input codec accepts that payload (for example
+    [Codec.unit]) outside a workflow context. Callback side effects therefore
+    still run, while workflow operations such as [Activity.start] or
+    [Workflow.sleep] return defects. It is not a
+    workflow test environment. An [http://] or [https://]
     target creates the OCaml-owned native Core worker and its private Rust
     bridge. [max_cached_workflows] optionally bounds Core's sticky workflow
     cache; omitting it preserves the default, while a small positive bound can

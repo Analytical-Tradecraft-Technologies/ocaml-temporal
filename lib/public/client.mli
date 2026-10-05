@@ -71,7 +71,14 @@ type visibility_page = {
     as a typed defect. An explicit [identity] is used unchanged. When omitted,
     the identity defaults to [<pid>@<hostname>], matching the official
     Temporal SDKs, computed once when the client is created; host names are
-    sanitized to printable ASCII and bounded so the default is always valid. *)
+    sanitized to printable ASCII and bounded so the default is always valid.
+
+    A [mock://] target selects an in-memory ledger for testing client plumbing
+    only. It runs no workflow code: [wait] echoes the encoded start input back
+    as the output, completing only when the workflow's output codec can
+    decode it and returning a codec error otherwise, and queries and updates return
+    typed errors. Use an [http://] or [https://] target against a Temporal
+    Server to observe real workflow results. *)
 val create :
   ?identity:string ->
   target_url:string ->
