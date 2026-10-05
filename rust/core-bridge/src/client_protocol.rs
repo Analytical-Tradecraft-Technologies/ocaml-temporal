@@ -1212,7 +1212,7 @@ pub(crate) async fn update_workflow_within(
             run_id: request.run_id.clone(),
         }),
         wait_policy: Some(WaitPolicy {
-            lifecycle_stage: UpdateWorkflowExecutionLifecycleStage::Accepted as i32,
+            lifecycle_stage: i32::from(UpdateWorkflowExecutionLifecycleStage::Accepted),
         }),
         request: Some(update::v1::Request {
             meta: Some(update::v1::Meta {
@@ -1357,7 +1357,7 @@ pub async fn poll_workflow_update(
                 }),
                 identity: connection.identity().to_owned(),
                 wait_policy: Some(WaitPolicy {
-                    lifecycle_stage: UpdateWorkflowExecutionLifecycleStage::Completed as i32,
+                    lifecycle_stage: i32::from(UpdateWorkflowExecutionLifecycleStage::Completed),
                 }),
             }
             .into_request(),

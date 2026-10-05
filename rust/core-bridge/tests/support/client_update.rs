@@ -56,7 +56,7 @@ fn scripted_response(
     let admitted_only = UpdateWorkflowExecutionResponse {
         update_ref: Some(update_ref()),
         outcome: None,
-        stage: UpdateWorkflowExecutionLifecycleStage::Admitted as i32,
+        stage: i32::from(UpdateWorkflowExecutionLifecycleStage::Admitted),
         ..Default::default()
     };
     if index < admitted {
@@ -67,7 +67,7 @@ fn scripted_response(
         Final::Accepted => UpdateWorkflowExecutionResponse {
             update_ref: Some(update_ref()),
             outcome: None,
-            stage: UpdateWorkflowExecutionLifecycleStage::Accepted as i32,
+            stage: i32::from(UpdateWorkflowExecutionLifecycleStage::Accepted),
             ..Default::default()
         },
         Final::Rejected => UpdateWorkflowExecutionResponse {
@@ -78,13 +78,13 @@ fn scripted_response(
                     ..Default::default()
                 })),
             }),
-            stage: UpdateWorkflowExecutionLifecycleStage::Completed as i32,
+            stage: i32::from(UpdateWorkflowExecutionLifecycleStage::Completed),
             ..Default::default()
         },
         Final::CompletedWithoutOutcome => UpdateWorkflowExecutionResponse {
             update_ref: Some(update_ref()),
             outcome: None,
-            stage: UpdateWorkflowExecutionLifecycleStage::Completed as i32,
+            stage: i32::from(UpdateWorkflowExecutionLifecycleStage::Completed),
             ..Default::default()
         },
     }
@@ -173,7 +173,7 @@ fn admitted_update_is_reissued_until_accepted() {
         assert_eq!(meta.update_id, "update-1");
         assert_eq!(
             request.wait_policy.as_ref().unwrap().lifecycle_stage,
-            UpdateWorkflowExecutionLifecycleStage::Accepted as i32
+            i32::from(UpdateWorkflowExecutionLifecycleStage::Accepted)
         );
     }
 }
@@ -230,10 +230,12 @@ fn completed_stage_without_outcome_fails_closed() {
 #[test]
 fn lifecycle_stage_classification() {
     assert!(
-        update_stage_is_accepted(UpdateWorkflowExecutionLifecycleStage::Accepted as i32).unwrap()
+        update_stage_is_accepted(i32::from(UpdateWorkflowExecutionLifecycleStage::Accepted))
+            .unwrap()
     );
     assert!(
-        !update_stage_is_accepted(UpdateWorkflowExecutionLifecycleStage::Admitted as i32).unwrap()
+        !update_stage_is_accepted(i32::from(UpdateWorkflowExecutionLifecycleStage::Admitted))
+            .unwrap()
     );
     assert!(!update_stage_is_accepted(0).unwrap());
     assert!(update_stage_is_accepted(99).is_err());
