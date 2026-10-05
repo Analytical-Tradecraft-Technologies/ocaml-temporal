@@ -13,8 +13,10 @@ module Options : sig
   (** Worker routing mode. [No_versioning] keeps the build ID as metadata;
       [Legacy_build_id] enables Temporal's whole-worker build-ID versioning;
       [Deployment_based] selects Temporal Core's deployment/version routing
-      for the named deployment and build, optionally with a default
-      versioning behavior for workflows that do not declare one. *)
+      for the named deployment and build. When [use_worker_versioning] is
+      [true], [default_versioning_behavior] must be [Some]: the SDK has no
+      per-workflow behavior, so this default is what every workflow-task
+      completion reports. When it is [false], the default must be [None]. *)
   type versioning =
     | No_versioning
     | Legacy_build_id of string
@@ -34,7 +36,9 @@ module Options : sig
 
   (** Validates and constructs options. A supplied cache value overrides the
       normal worker default; [0] disables sticky workflow caching. Legacy build
-      IDs must be non-empty, NUL-free, and within the bridge transport limit. *)
+      IDs must be non-empty, NUL-free, and within the bridge transport limit.
+      Deployment versioning returns a defect when [use_worker_versioning] and
+      [default_versioning_behavior] disagree as described on [versioning]. *)
   val make :
     ?versioning:versioning ->
     ?max_cached_workflows:int ->

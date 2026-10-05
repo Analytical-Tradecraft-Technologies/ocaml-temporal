@@ -59,12 +59,22 @@ let options =
 ```
 
 `use_worker_versioning` controls whether Core applies deployment routing. When
-it is `false`, `default_versioning_behavior` must be `None`. When it is `true`,
-`None` leaves the server/Core default in place, `Some `Auto_upgrade` allows a
-workflow to move to a newer compatible deployment, and `Some `Pinned` keeps
-the default on the selected deployment version. These choices are passed to
-Temporal Core's `WorkerDeploymentBased` strategy; the SDK does not perform
-deployment registration or rollout automation.
+it is `false`, `default_versioning_behavior` must be `None` and workflow-task
+completions are unversioned. When it is `true`, a default behavior is
+required: `Some `Auto_upgrade` allows a workflow to move to a newer compatible
+deployment, and `Some `Pinned` keeps it on the selected deployment version.
+These choices are passed to Temporal Core's `WorkerDeploymentBased` strategy;
+the SDK does not perform deployment registration or rollout automation.
+
+The default is mandatory because this SDK does not yet offer a per-workflow
+versioning behavior. Every workflow-task completion therefore leaves the
+behavior `UNSPECIFIED`, and the pinned Temporal Core substitutes only a
+configured worker default. Temporal defines `UNSPECIFIED` as "versioning is not
+enabled in the worker" and requires each workflow type on a versioned worker to
+choose between pinned and auto-upgrade, so a versioned worker without a default
+would advertise a deployment while declaring every workflow unversioned.
+`Options.make` rejects that combination with a defect, and the private bridge
+rejects it again as a configuration error.
 
 ## Reading the selected deployment in a workflow
 
@@ -117,7 +127,7 @@ the decoded document again. Unknown keys and modes are rejected, and the
 nested build ID in either routing form must exactly equal the top-level
 `build_id`. For deployment-based routing, `default_versioning_behavior` may be
 `"auto_upgrade"`, `"pinned"`, or `null`; it must be `null` when
-`use_worker_versioning` is `false`. This redundancy is intentional: either
+`use_worker_versioning` is `false` and non-`null` when it is `true`. This redundancy is intentional: either
 side must fail closed if a stale or hand-authored document reaches the ABI
 boundary.
 

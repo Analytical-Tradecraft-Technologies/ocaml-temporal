@@ -357,16 +357,19 @@ let worker_config ~namespace ~task_queue ~build_id ?(versioning = No_versioning)
             if String.equal build_id deployment_build_id then Ok ()
             else configuration_error "versioning.build_id must match build_id"
           in
-          if use_worker_versioning then
-            (match default_versioning_behavior with
-            | None -> Ok ()
-            | Some (Auto_upgrade | Pinned) -> Ok ())
-          else
-            match default_versioning_behavior with
-            | None -> Ok ()
-            | Some _ ->
-                configuration_error
-                  "versioning.default_versioning_behavior requires use_worker_versioning");
+          (* Mirrors the Rust validator: completions never carry a
+             per-workflow behavior, so a versioned worker must configure the
+             default Core substitutes for UNSPECIFIED (issue #817). *)
+          (match (use_worker_versioning, default_versioning_behavior) with
+          | true, Some (Auto_upgrade | Pinned) | false, None -> Ok ()
+          | true, None ->
+              configuration_error
+                "versioning.use_worker_versioning requires \
+                 default_versioning_behavior"
+          | false, Some _ ->
+              configuration_error
+                "versioning.default_versioning_behavior requires \
+                 use_worker_versioning"));
       validate_count ~allow_zero:true "max_cached_workflows"
         max_cached_workflows;
       validate_count ~allow_zero:false "max_outstanding_workflow_tasks"

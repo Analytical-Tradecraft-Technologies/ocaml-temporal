@@ -89,6 +89,32 @@ let () =
          ~max_concurrent_workflow_task_polls:1
          ~graceful_shutdown_timeout_ms:1_000L ())
   in
+  (* The sender-side mirror rejects a versioned worker without a default
+     behavior; completions never carry a per-workflow behavior, so Core would
+     otherwise send UNSPECIFIED for every task (issue #817). *)
+  (match
+     Bridge.worker_config ~namespace:"temporal-sdk-test"
+       ~task_queue:"ocaml-temporal-unit" ~build_id:"agents-v3"
+       ~versioning:
+         (Bridge.Deployment_based
+            {
+              deployment_name = "agents";
+              build_id = "agents-v3";
+              use_worker_versioning = true;
+              default_versioning_behavior = None;
+            })
+       ~max_cached_workflows:0 ~max_outstanding_workflow_tasks:100
+       ~max_concurrent_workflow_task_polls:1
+       ~graceful_shutdown_timeout_ms:1_000L ()
+   with
+  | Error { status = Configuration; message } ->
+      assert
+        (String.starts_with
+           ~prefix:
+             "versioning.use_worker_versioning requires \
+              default_versioning_behavior"
+           message)
+  | _ -> failwith "versioned worker without a default behavior was accepted");
   (match Bridge.worker_start runtime deployment_worker_config with
   | Error { status = Invalid_state; message } ->
       assert (String.length message > 0)

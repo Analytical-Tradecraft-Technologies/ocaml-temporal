@@ -1226,7 +1226,8 @@ let test_worker_options_versioning () =
 
 (** Deployment-based routing keeps the deployment identity and default task
     behavior together, while rejecting a default behavior on an opted-out
-    worker before the native bridge can allocate resources. *)
+    worker, or a versioned worker without one, before the native bridge can
+    allocate resources. *)
 let test_worker_options_deployment_versioning () =
   let options =
     match
@@ -1266,7 +1267,38 @@ let test_worker_options_deployment_versioning () =
               use_worker_versioning = false;
               default_versioning_behavior = Some `Pinned;
             })
-       ())
+       ());
+  (* A versioned worker without a default would complete every workflow task
+     with an unspecified behavior because the SDK has no per-workflow
+     behavior API (issue #817). *)
+  expect_error_message_contains "defect"
+    "use_worker_versioning requires default_versioning_behavior"
+    (Temporal.Worker.Options.make
+       ~versioning:
+         (Temporal.Worker.Options.Deployment_based
+            {
+              deployment_name = "agents";
+              build_id = "agents-v3";
+              use_worker_versioning = true;
+              default_versioning_behavior = None;
+            })
+       ());
+  (* Deployment metadata without worker versioning remains valid; its
+     completions are intentionally unversioned. *)
+  match
+    Temporal.Worker.Options.make
+      ~versioning:
+        (Temporal.Worker.Options.Deployment_based
+           {
+             deployment_name = "agents";
+             build_id = "agents-v3";
+             use_worker_versioning = false;
+             default_versioning_behavior = None;
+           })
+      ()
+  with
+  | Ok _ -> ()
+  | Error _ -> failwith "unversioned deployment options were rejected"
 
 (** Runs all public worker and client regression assertions. *)
 let () =
