@@ -1,0 +1,110 @@
+{0 temporal-sdk}
+
+An unofficial, community-maintained Temporal SDK for OCaml 5. It is not
+affiliated with or endorsed by Temporal Technologies, Inc., and it is
+experimental: the API may change before a stable release.
+
+The SDK lets an OCaml application own a worker that runs deterministic
+workflow code as well as activities, and a client that starts workflows and
+awaits their results. The library's single public entry point is
+{!Temporal}.
+
+{1 Concepts}
+
+- A {e workflow} ({!Temporal.Workflow}) is a direct-style OCaml function that
+  Temporal can replay from its history. It must be deterministic: no I/O, no
+  wall-clock reads, no unseeded randomness, and no process-global mutation
+  outside the replay-safe SDK operations.
+- An {e activity} ({!Temporal.Activity}) is an ordinary OCaml function that may
+  perform I/O. Temporal records only its input and result.
+- A {e future} ({!Temporal.Future}) is a result that may arrive in a later
+  Temporal activation. Awaiting one suspends only the current workflow fiber.
+- A {e codec} ({!Temporal.Codec}) converts typed values to and from the
+  payloads Temporal stores.
+- A {e worker} ({!Temporal.Worker}) polls a task queue and runs the registered
+  workflows and activities; a {e client} ({!Temporal.Client}) starts
+  executions and waits for their terminal results.
+
+Expected operational failures are values of type {!Temporal.Error.t} returned
+in [result]; exceptions are reserved for programming defects.
+{!Temporal.Result_syntax} provides [let*] and [let+] for sequencing them.
+
+{1 Quick start}
+
+Define a remote activity reference and a workflow that calls it:
+
+{[
+let greet =
+  Temporal.Activity.remote ~name:"example.greet"
+    ~input:Temporal.Codec.string ~output:Temporal.Codec.string
+
+let hello =
+  Temporal.Workflow.define ~name:"example.hello"
+    ~input:Temporal.Codec.string ~output:Temporal.Codec.string
+    (fun name -> Temporal.Future.await (Temporal.Activity.start greet name))
+]}
+
+Register the workflow with a worker and run it on a dedicated Domain or system
+thread; [Temporal.Worker.run] blocks until [Temporal.Worker.shutdown] is
+called:
+
+{[
+let run_worker () =
+  let open Temporal.Result_syntax in
+  let* worker =
+    Temporal.Worker.create ~target_url:"http://localhost:7233"
+      ~namespace:"default" ~task_queue:"example"
+      ~workflows:[ Temporal.Worker.workflow hello ]
+      ~activities:[] ()
+  in
+  Temporal.Worker.run worker
+]}
+
+Start an execution from a client and wait for its typed terminal result:
+
+{[
+let run_client () =
+  let open Temporal.Result_syntax in
+  let* client =
+    Temporal.Client.create ~target_url:"http://localhost:7233"
+      ~namespace:"default" ()
+  in
+  let* handle =
+    Temporal.Client.start client ~workflow:hello ~task_queue:"example"
+      ~id:"hello-1" ~input:"world" ()
+  in
+  let* terminal = Temporal.Client.wait handle in
+  let* () = Temporal.Client.shutdown client in
+  match terminal with
+  | Temporal.Client.Completed message -> Ok (print_endline message)
+  | _ -> Ok (prerr_endline "workflow did not complete")
+]}
+
+A separate activity worker registers an implementation of ["example.greet"]
+with {!Temporal.Activity.define} and {!Temporal.Worker.activity}. The
+repository's [examples/] directory contains complete, buildable workflow
+worker, activity worker, and client programs.
+
+{1 Modules}
+
+{!modules:
+Temporal.Workflow
+Temporal.Activity
+Temporal.Child_workflow
+Temporal.Future
+Temporal.Scope
+Temporal.Condition
+Temporal.Signal
+Temporal.Query
+Temporal.Update
+Temporal.Interaction
+Temporal.Worker
+Temporal.Client
+Temporal.Codec
+Temporal.Payload
+Temporal.Error
+Temporal.Result_syntax
+Temporal.Duration
+Temporal.Time
+Temporal.Workflow_context
+Temporal.Runtime_info}

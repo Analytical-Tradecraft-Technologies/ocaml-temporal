@@ -3,6 +3,11 @@
     The context deliberately lives in the private base library. The public
     [Temporal.Activity.Context] module exposes only safe operations; native
     task tokens and supervisor handles never become OCaml values. *)
+
+(** The opaque context for one activity attempt. Public documentation renders
+    it through its supported alias.
+
+    @canonical Temporal.Activity.context *)
 type t
 
 (** Creates an active context after the adapter has validated all values

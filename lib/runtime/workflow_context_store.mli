@@ -115,7 +115,7 @@ val deprecate_patch : t -> patch_id:string -> unit
     Raises [Invalid_argument] for malformed seeds or after shutdown. *)
 val update_random_seed : t -> randomness_seed:string -> unit
 
-(** Draws one deterministic integer in [0, bound). The stream is seeded from
+(** Draws one deterministic integer [n] with [0 <= n < bound]. The stream is seeded from
     Temporal's initialization or reset metadata and advances only in this execution's
     owner Domain.  Invalid bounds and lifecycle misuse are typed defects. *)
 val random_int : t -> bound:int -> (int, Temporal_base.Error.t) result

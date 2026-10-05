@@ -19,7 +19,7 @@ FROM ocaml/opam:debian-12-ocaml-5.3@sha256:bbaac53e502f6602013d8967c3a54cfcb898b
 FROM ocaml/opam:debian-12-ocaml-5.4@sha256:ba37cf7a29709fa2f19124fda8f4cabdea3156a648276fc98c9d528998ae2e59 AS ocaml-5.4
 FROM ocaml/opam:debian-12-ocaml-5.5@sha256:57f87030c6082e3f46f59988fbf12a84947945baf2974d4567a9dcee85780090 AS ocaml-5.5
 
-FROM ${OCAML_IMAGE}
+FROM ${OCAML_IMAGE} AS dev
 
 USER root
 # Retry transient package downloads without retrying the build or test suite.
@@ -48,3 +48,24 @@ RUN opam repository set-url default https://opam.ocaml.org \
     && sh scripts/opam-locked-deps.sh install --no-depexts
 
 CMD ["opam", "exec", "--", "dune", "build"]
+
+# CI-only API documentation tooling for `make docs`. odoc and its closure are
+# installed at the exact versions in scripts/docs-tools.locked on top of the
+# locked SDK closure, which is re-checked so the documentation tool cannot
+# silently move an SDK dependency. Nothing in this stage is linked into or
+# shipped with the SDK; see docs/reference/quality-gates.md.
+FROM dev AS docs
+COPY --chown=opam:opam scripts/docs-tools.locked ./scripts/
+RUN set -eu; \
+    tools=$(sed -e 's/#.*//' -e '/^[[:space:]]*$/d' scripts/docs-tools.locked); \
+    opam install --yes --no-depexts $(printf '%s\n' "$tools" | awk '{ print $1 "." $2 }'); \
+    printf '%s\n' "$tools" | while read -r package version; do \
+        actual=$(opam var "$package:version"); \
+        [ "$actual" = "$version" ] || { \
+            echo "docs tool $package installed=$actual expected=$version" >&2; exit 1; }; \
+    done; \
+    sh scripts/opam-locked-deps.sh check
+
+# The default (last) stage stays the ordinary development image, so builds
+# that do not request the `docs` target never install the documentation tools.
+FROM dev

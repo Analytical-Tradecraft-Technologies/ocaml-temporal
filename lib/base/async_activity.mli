@@ -35,10 +35,14 @@ type submission_error =
   | Retryable_submission of Error.t
   | Terminal_submission of Error.t
 
-(** An opaque handle paired with the output type of its activity definition. *)
+(** An opaque handle paired with the output type of its activity definition.
+
+    @canonical Temporal.Activity.async_handle *)
 type 'output handle
 
-(** An attempt-scoped context from which the callback can obtain its handle. *)
+(** An attempt-scoped context from which the callback can obtain its handle.
+
+    @canonical Temporal.Activity.async_context *)
 type 'output context
 
 (** The outcome returned by an asynchronous activity implementation.

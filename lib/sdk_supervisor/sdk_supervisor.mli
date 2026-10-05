@@ -469,7 +469,7 @@ module Native : sig
 
   (** Validates explicit worker resource settings without network access.
       [workflow_tasks] and [activity_tasks] select the task kinds Core polls;
-      see {!Temporal_core_bridge.Native_bridge.worker_config}. *)
+      see {!Temporal_core_bridge.Native_bridge.val-worker_config}. *)
   val worker_config :
     namespace:string ->
     task_queue:string ->

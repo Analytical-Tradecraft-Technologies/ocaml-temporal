@@ -18,3 +18,4 @@ dune-project text eol=lf
 .github/actions/*/action.yml text eol=lf
 scripts/ci-smoke-executables.txt text eol=lf
 scripts/opam-lock-overrides.txt text eol=lf
+scripts/docs-tools.locked text eol=lf
