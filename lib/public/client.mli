@@ -68,7 +68,10 @@ type visibility_page = {
     the private backend graph and [namespace] is required for every operation.
     The namespace and optional identity must be non-empty, valid UTF-8,
     NUL-free, and no more than 65,536 bytes; invalid configuration is returned
-    as a typed defect. *)
+    as a typed defect. An explicit [identity] is used unchanged. When omitted,
+    the identity defaults to [<pid>@<hostname>], matching the official
+    Temporal SDKs, computed once when the client is created; host names are
+    sanitized to printable ASCII and bounded so the default is always valid. *)
 val create :
   ?identity:string ->
   target_url:string ->

@@ -18,3 +18,7 @@
 (test
  (name test_client_request_id)
  (libraries temporal_base unix))
+
+(test
+ (name test_process_identity)
+ (libraries temporal_base unix))

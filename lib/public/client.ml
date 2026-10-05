@@ -93,10 +93,6 @@ type visibility_page = {
   next_page_token : string option;
 }
 
-(** The default identity is stable and descriptive without using process-global
-    randomness, which keeps client construction straightforward in tests. *)
-let default_identity = "ocaml-temporal-client"
-
 (** Rejects empty, oversized, malformed UTF-8, or NUL-containing identifiers
     before they can enter a backend request. The UTF-8 and 65,536-byte bounds
     are shared by the JSON protocol and native bridge, so mock and native
@@ -116,8 +112,11 @@ let validate_name field value =
   else Ok ()
 
 (** Builds the private backend configuration after checking every user-facing
-    connection field. Routine configuration failures remain [result] values. *)
-let create ?(identity = default_identity) ~target_url ~namespace () =
+    connection field. Routine configuration failures remain [result] values.
+    An omitted identity is derived once here as [<pid>@<hostname>]; this runs
+    outside workflow code, so reading process state is replay-safe. *)
+let create ?identity ~target_url ~namespace () =
+  let identity = Temporal_base.Process_identity.resolve identity in
   match validate_name "namespace" namespace with
   | Error error -> Error error
   | Ok () -> (

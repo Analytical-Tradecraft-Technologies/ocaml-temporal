@@ -810,6 +810,15 @@ ordinary dedicated OCaml Domain or system thread rather than directly from a
 cooperative Eio/Lwt scheduler fiber. `Temporal.Worker.shutdown` is idempotent
 and drains retryable completions before releasing the native graph.
 
+Both `Temporal.Worker.create` and `Temporal.Client.create` accept an optional
+`~identity`, which Temporal records in history events and task-queue poller
+listings. An explicit identity is used unchanged. When it is omitted, the SDK
+uses `<pid>@<hostname>`, the same convention as the official Temporal SDKs,
+computed once at creation time so separate processes stay distinguishable.
+Host names are restricted to printable ASCII and at most 255 bytes, and an
+unavailable host name becomes `unknown-host`, so the default is always a valid
+identity.
+
 This restriction applies to the worker lifecycle call, not to
 `Future.await` inside a workflow. The worker's native readiness wait releases
 the OCaml runtime lock, but `Worker.run` still owns a blocking loop. Keep it on
