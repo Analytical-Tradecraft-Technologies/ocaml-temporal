@@ -183,6 +183,19 @@ and bridge, read the [documentation guide](../README.md) first.
   [runtime regression](../../test/runtime/test_local_activity_cancellation.ml)
   and [live history/replay fixture](../../test/integration/local_activity_cancellation/README.md)
   cover these ownership boundaries.
+- Local-activity backoff commands are emitted in scheduler order, not during
+  the activation job pass (#809). The backoff job and the retry timer's firing
+  are validated in the job pass, but allocating the timer sequence and
+  emitting `StartTimer`, and later re-emitting `ScheduleLocalActivity`, are
+  queued scheduler work at that job's position, after fibers woken by earlier
+  jobs. Core may merge jobs that a live worker received in separate
+  activations (for example inside a heartbeating workflow task) into one
+  activation on replay; queuing keeps sequence numbers and command order
+  identical in both cases, as in the TypeScript and Python SDKs where the
+  coroutine awaiting the activity handles its backoff. Cancellation while
+  that work is queued settles the future and the queued work emits nothing.
+  The [split/merged activation regression](../../test/runtime/test_local_activity_backoff_order.ml)
+  compares the command streams.
 - An activity retry policy is immutable once attached to a command. Its initial
   interval is positive, its maximum interval is at least the initial interval,
   its finite backoff coefficient is at least 1.0, and its maximum-attempt count

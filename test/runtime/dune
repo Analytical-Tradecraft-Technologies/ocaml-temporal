@@ -16,6 +16,7 @@
   test_future_retention
   test_activity_retry_policy
   test_local_activity_cancellation
+  test_local_activity_backoff_order
   test_scope
   test_scope_retention
   test_scope_server_cancel
