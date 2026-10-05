@@ -496,6 +496,11 @@ let _update_handler_dispatch :
     ?run_validator:bool ->
     T.Update.Handler.t -> T.Payload.t -> (T.Payload.t, T.Error.t) result =
   T.Update.Handler.dispatch
+let _update_handler_dispatch_payloads :
+    ?run_validator:bool ->
+    ?on_validated:(unit -> unit) ->
+    T.Update.Handler.t -> T.Payload.t list -> (T.Payload.t, T.Error.t) result =
+  T.Update.Handler.dispatch_payloads
 
 let _interaction_create :
     ?signals:T.Signal.Handler.t list ->

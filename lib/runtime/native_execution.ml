@@ -266,6 +266,22 @@ let null_runtime_payload : Temporal_base.Codec.payload =
     data = Bytes.empty;
   }
 
+(** Converts the single encoded input of a child-workflow or continue-as-new
+    command into Core's repeated input payloads using the shared
+    [Temporal_base.Payload.input_arguments] rule: a canonical unit input is sent
+    as zero payloads, matching other SDKs, and OCaml workflow starts decode
+    [[]] back to that unit payload. Core compares only the workflow type when
+    replaying these commands, so histories recorded with one [binary/null]
+    input still replay. *)
+let protocol_input path input =
+  let rec loop reversed = function
+    | [] -> Ok (List.rev reversed)
+    | payload :: rest ->
+        let* payload = protocol_payload path payload in
+        loop (payload :: reversed) rest
+  in
+  loop [] (Temporal_base.Payload.input_arguments input)
+
 (** Recognizes the same canonical null marker after conversion to protocol
     payload bytes. *)
 let is_null_protocol_payload (value : Protocol.payload) =
@@ -1046,7 +1062,7 @@ let command_to_protocol command =
         | Activation.Parent_terminate -> Protocol.Parent_terminate
         | Activation.Parent_abandon -> Protocol.Parent_abandon
         | Activation.Parent_request_cancel -> Protocol.Parent_request_cancel) parent_close_policy in
-      let* input = protocol_payload "$.command.input" input in
+      let* input = protocol_input "$.command.input" input in
       let* retry_policy =
         match retry_policy with
         | None -> Ok None
@@ -1085,7 +1101,7 @@ let command_to_protocol command =
              workflow_id = id;
              workflow_type = name;
              task_queue; parent_close_policy;
-             input = [ input ];
+             input;
              retry_policy;
              cancellation_type = protocol_child_cancellation_type cancellation_type;
            })
@@ -1207,8 +1223,8 @@ let command_to_protocol command =
       Ok (Protocol.Fail_workflow { failure })
   | Activation.Continue_as_new { workflow_type; input } ->
       let* () = validate_identifier "$.command.workflow_type" workflow_type in
-      let* input = protocol_payload "$.command.input" input in
-      Ok (Protocol.Continue_as_new { workflow_type; input = [ input ] })
+      let* input = protocol_input "$.command.input" input in
+      Ok (Protocol.Continue_as_new { workflow_type; input })
   | Activation.Cancel_workflow_execution ->
       Ok Protocol.Cancel_workflow_execution
 

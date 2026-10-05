@@ -77,8 +77,12 @@ non-retryable query failure rather than silently dropping data. Query callbacks
 are synchronous and non-suspending; they do not enter the workflow scheduler.
 
 Native update activations are validated and copied in the same way, then routed
-by update name to a typed `Temporal.Update.Handler.t`. The adapter requires
-exactly one input payload. It runs the validator when Core requests it, skips
+by update name to a typed `Temporal.Update.Handler.t`.
+`Update.Handler.dispatch_payloads` applies the signal arity rule: zero
+payloads, which the Temporal CLI, Web UI, other SDKs, and this SDK's client
+send for a no-argument update, decode as the canonical `binary/null` unit
+payload; multiple payloads are rejected before validation. It runs the
+validator when Core requests it, skips
 validation on replay, and emits accepted before invoking the handler. A handler
 that awaits a workflow future retains its continuation in the execution-owned
 pending map; a later activation emits completed or rejected and removes that

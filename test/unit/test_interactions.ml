@@ -143,6 +143,78 @@ let test_signal_payload_arity () =
   expect_error_kind "codec"
     (Temporal.Signal.Handler.dispatch_payloads string_handler [])
 
+(** Update payload arity matches signals and the wider ecosystem (#819). A
+    no-argument update from the CLI, Web UI, another SDK, or this SDK's own
+    client carries zero payloads and must reach a unit handler, including its
+    validator and acknowledgement hook. A non-unit handler reports its codec
+    error, and repeated payloads are rejected non-retryably before validation,
+    acknowledgement, or the callback can run. *)
+let test_update_payload_arity () =
+  let validations = ref 0 in
+  let acknowledgements = ref 0 in
+  let calls = ref 0 in
+  let unit_update =
+    Temporal.Update.define ~name:"poke" ~input:Temporal.Codec.unit
+      ~output:Temporal.Codec.string
+  in
+  let unit_handler =
+    Temporal.Update.Handler.make
+      ~validator:(fun () ->
+        incr validations;
+        Ok ())
+      unit_update
+      (fun () ->
+        incr calls;
+        Ok "poked")
+  in
+  let on_validated () = incr acknowledgements in
+  let decode_output payload =
+    unwrap (Temporal.Codec.decode Temporal.Codec.string payload)
+  in
+  let output =
+    unwrap
+      (Temporal.Update.Handler.dispatch_payloads ~on_validated unit_handler [])
+  in
+  if decode_output output <> "poked" then
+    failwith "zero-payload update returned the wrong output";
+  let null = unwrap (Temporal.Codec.encode Temporal.Codec.unit ()) in
+  ignore
+    (unwrap
+       (Temporal.Update.Handler.dispatch_payloads ~on_validated unit_handler
+          [ null ]));
+  if !calls <> 2 || !validations <> 2 || !acknowledgements <> 2 then
+    failwith "unit update did not validate and run for zero and one payloads";
+  (* Replay passes [~run_validator:false]; the zero-payload path must honor
+     it exactly like the one-payload path. *)
+  ignore
+    (unwrap
+       (Temporal.Update.Handler.dispatch_payloads ~run_validator:false
+          unit_handler []));
+  if !validations <> 2 || !calls <> 3 then
+    failwith "zero-payload update ignored run_validator:false";
+  (match
+     Temporal.Update.Handler.dispatch_payloads ~on_validated unit_handler
+       [ null; null ]
+   with
+  | Error error ->
+      let view = Temporal.Error.view error in
+      if not view.non_retryable then
+        failwith "repeated update payloads were retryable";
+      if not (contains_substring ~needle:"poke" view.message) then
+        failwith "update arity error did not name the update"
+  | Ok _ -> failwith "repeated update payloads were accepted");
+  if !calls <> 3 || !validations <> 2 || !acknowledgements <> 2 then
+    failwith "repeated update payloads reached the validator or callback";
+  let string_update =
+    Temporal.Update.define ~name:"rename" ~input:Temporal.Codec.string
+      ~output:Temporal.Codec.unit
+  in
+  let string_handler =
+    Temporal.Update.Handler.make string_update (fun _ -> Ok ())
+  in
+  expect_error_kind "codec"
+    (Temporal.Update.Handler.dispatch_payloads string_handler [])
+
 (** Duplicate names are rejected while building a dispatcher, and unknown
     definitions fail before any callback can run. *)
 let test_registration_and_missing_handlers () =
@@ -316,6 +388,7 @@ let () =
   test_dispatch_and_ordering ();
   test_typed_query_arguments ();
   test_signal_payload_arity ();
+  test_update_payload_arity ();
   test_registration_and_missing_handlers ();
   test_codec_mismatch ();
   test_exception_containment ();

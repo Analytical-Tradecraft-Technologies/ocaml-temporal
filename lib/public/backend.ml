@@ -444,6 +444,19 @@ let protocol_payload (payload : Payload.t) : Client_protocol.payload =
     data = Bytes.copy payload.data;
   }
 
+(** Converts a client operation's one encoded input into Temporal's repeated
+    input payloads by the shared rule [Temporal_base.Payload.input_arguments]:
+    the canonical [Codec.unit] payload is sent as zero payloads, as the CLI and
+    other SDKs do for a no-argument call, so a zero-parameter foreign handler
+    is not given a surplus [null] argument. The base record built here only
+    shares the caller's fields for inspection; [protocol_payload] copies. *)
+let protocol_input (payload : Payload.t) =
+  if
+    Temporal_base.Payload.is_unit_null
+      { Temporal_base.Payload.metadata = payload.metadata; data = payload.data }
+  then []
+  else [ protocol_payload payload ]
+
 (** Copies one protocol payload into the public representation. OCaml strings
     are byte strings, so converting metadata with [Bytes.to_string] is
     lossless even for a future binary metadata value. *)
@@ -701,7 +714,7 @@ let native_start_request client (request : start_request) : Client_protocol.star
     workflow_id = request.workflow_id;
     workflow_type = request.workflow_name;
     task_queue = request.task_queue;
-    input = [ protocol_payload request.input ];
+    input = protocol_input request.input;
     memo = metadata request.memo;
     search_attributes = metadata request.search_attributes;
   }
@@ -1050,7 +1063,7 @@ let native_signal_request client (request : signal_request) :
       };
     signal_name = request.signal_name;
     request_id = request.request_id;
-    input = [ protocol_payload request.input ];
+    input = protocol_input request.input;
   }
 
 (** Sends one signal through the serialized supervisor operation. The result is
@@ -1504,7 +1517,7 @@ let native_update_request client (request : update_request) :
       };
     update_id = request.update_id;
     update_name = request.update_name;
-    input = [ protocol_payload request.input ];
+    input = protocol_input request.input;
   }
 
 (** Converts one protocol update outcome into public payloads or a typed

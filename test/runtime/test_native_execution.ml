@@ -1610,10 +1610,25 @@ let test_command_order_and_validation () =
              { workflow_type = "native"; input = continue_input };
          ])
   in
-  match continue_completion.commands with
-  | [ Protocol.Continue_as_new { workflow_type = "native"; input = [ _ ] } ] ->
+  (* A unit continue-as-new input is sent as zero payloads (#819), matching
+     other SDKs; the next run's start decodes [[]] back to unit. *)
+  (match continue_completion.commands with
+  | [ Protocol.Continue_as_new { workflow_type = "native"; input = [] } ] ->
       ()
-  | _ -> failwith "continue-as-new command was not translated as terminal"
+  | _ -> failwith "continue-as-new command was not translated as terminal");
+  let continue_completion =
+    unwrap "continue-as-new command with input"
+      (Native_execution.completion_of_commands ~run_id:"run-native-translation"
+         [
+           Activation.Continue_as_new
+             { workflow_type = "native"; input = runtime_payload "next" };
+         ])
+  in
+  match continue_completion.commands with
+  | [ Protocol.Continue_as_new { workflow_type = "native"; input = [ next ] } ]
+    when next = protocol_payload "next" ->
+      ()
+  | _ -> failwith "continue-as-new command did not keep its non-unit input"
 
 (** Activity commands retain every Core-required field through translation, and
     malformed timeout/identity options fail before a completion is returned. *)
@@ -1775,17 +1790,31 @@ let test_activity_command_translation_and_validation () =
         seq = 2L;
         workflow_id = "child/1";
         workflow_type = "child";
-        input = [ child_input ];
+        (* A unit child input is sent as zero payloads (#819). *)
+        input = [];
         retry_policy = None;
         cancellation_type = Protocol.Child_abandon;
-      }
-    when child_input =
-      {
-        Protocol.metadata = [ ("encoding", Bytes.of_string "binary/null") ];
-        data = Bytes.empty;
       } ->
       ()
   | _ -> failwith "child command fields were not preserved"
+  end;
+  begin match
+    unwrap "child command translation with input"
+      (Native_execution.command_to_protocol
+         (Activation.Start_child_workflow
+            { task_queue = None; parent_close_policy = None;
+              seq = 3L;
+              id = "child/2";
+              name = "child";
+              input = runtime_payload "argument";
+              retry_policy = None;
+              cancellation_type = Activation.Child_abandon;
+            }))
+  with
+  | Protocol.Start_child_workflow { input = [ child_input ]; _ }
+    when child_input = protocol_payload "argument" ->
+      ()
+  | _ -> failwith "child command did not keep its non-unit input"
   end;
   begin match
     unwrap "child cancellation translation"

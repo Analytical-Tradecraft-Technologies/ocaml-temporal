@@ -313,9 +313,28 @@ let test_failure_owner_boundaries () =
   Workflow_context_store.shutdown context;
   Workflow_context_store.shutdown foreign_context
 
+(** A unit external signal is sent with zero payloads (#819), as other SDKs
+    do; the receiving [Signal.Handler.dispatch_payloads] decodes [[]] as unit. *)
+let test_unit_external_signal_has_no_payloads () =
+  let scheduler = Scheduler.create () in
+  let context = Workflow_context_store.create scheduler in
+  let signal = Temporal.Signal.define ~name:"wake" ~input:Temporal.Codec.unit in
+  let _future =
+    Workflow_context_store.with_context context (fun () ->
+        Temporal.Workflow.signal_external_workflow ~workflow_id:"target"
+          ~run_id:"" ~signal ~input:())
+  in
+  (match Workflow_context_store.take_commands context with
+  | [ Activation.Signal_external_workflow
+        { signal_name = "wake"; input = []; _ } ] ->
+      ()
+  | _ -> failwith "unit external signal was not sent with zero payloads");
+  Workflow_context_store.shutdown context
+
 (** Runs the isolated external-operation lifecycle and validation scenarios. *)
 let () =
   test_external_operation_lifecycle ();
   test_external_operation_validation ();
+  test_unit_external_signal_has_no_payloads ();
   List.iter test_failure_composition (failure_cases ());
   test_failure_owner_boundaries ()

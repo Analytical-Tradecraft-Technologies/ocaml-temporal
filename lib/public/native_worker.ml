@@ -241,28 +241,20 @@ let runtime_query_handler (handler : Query.Handler.t) =
       |> Result.map Payload_private.to_base
       |> Result.map_error Error_private.to_base)
 
-(** Converts one public update handler into the private runtime callback. The
-    public API currently accepts one input payload; an update activation with
-    another arity is rejected without silently discarding Core data. *)
+(** Converts one public update handler into the private runtime callback.
+    [Update.Handler.dispatch_payloads] owns the payload-arity policy: zero
+    payloads (a no-argument update from the CLI, Web UI, or another SDK)
+    decode as the canonical unit payload, and more than one is rejected
+    without silently discarding Core data. *)
 let runtime_update_handler (handler : Update.Handler.t) =
   let name = Update.Handler.name handler in
   Workflow_adapter.make_update_handler ~name
     ~dispatch:(fun ~run_validator ~on_validated update ->
-      match Workflow_adapter.update_input update with
-      | [ payload ] ->
-          Update.Handler.dispatch ~run_validator ~on_validated handler
-            (Payload_private.of_base payload)
-          |> Result.map Payload_private.to_base
-          |> Result.map_error Error_private.to_base
-      | _ ->
-          Error
-            (Base_error.make ~non_retryable:true ~category:`Workflow
-               ~message:
-                 (Printf.sprintf
-                    "update %s must contain exactly one payload for its \
-                     registered OCaml handler"
-                    name)
-               ()))
+      Workflow_adapter.update_input update
+      |> List.map Payload_private.of_base
+      |> Update.Handler.dispatch_payloads ~run_validator ~on_validated handler
+      |> Result.map Payload_private.to_base
+      |> Result.map_error Error_private.to_base)
 
 (** Packs a workflow definition and its handlers for the private runtime
     adapter. The public [Worker] module validates names and duplicates before

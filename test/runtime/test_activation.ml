@@ -1176,6 +1176,29 @@ let test_activity_cancel_after_natural_completion_is_noop () =
     (Workflow_context_store.take_commands context);
   Workflow_context_store.shutdown context
 
+(** A unit activity input is scheduled with zero arguments (#819), matching
+    other SDKs so a zero-parameter foreign activity is not given a surplus
+    [null]; both remote and local activities use the shared rule. *)
+let test_unit_activity_input_has_no_arguments () =
+  let scheduler = Scheduler.create () in
+  let context = Workflow_context_store.create scheduler in
+  let unit_input = Temporal_base.Payload.unit_null () in
+  let _remote, _cancel =
+    Workflow_context_store.schedule_activity context ~name:"ping"
+      ~input:unit_input ~decode:(fun value -> Ok value) ()
+  in
+  let _local, _cancel_local =
+    Workflow_context_store.schedule_local_activity context ~name:"local-ping"
+      ~input:unit_input ~decode:(fun value -> Ok value) ()
+  in
+  (match Workflow_context_store.take_commands context with
+  | [ Activation.Schedule_activity { activity_type = "ping"; arguments = []; _ };
+      Activation.Schedule_local_activity
+        { activity_type = "local-ping"; arguments = []; _ } ] ->
+      ()
+  | _ -> failwith "unit activity input was not sent as zero arguments");
+  Workflow_context_store.shutdown context
+
 (** A Core backoff keeps the original local-activity future pending, creates a
     separate workflow timer, and re-emits the same activity sequence with the
     supplied retry attempt when that timer fires. *)
@@ -2199,6 +2222,7 @@ let () =
   test_child_cancelled_before_start_acknowledgment ();
   test_child_start_conflicting_result_keeps_future_pending ();
   test_activity_cancel_after_natural_completion_is_noop ();
+  test_unit_activity_input_has_no_arguments ();
   test_local_activity_backoff_reschedules_without_resolving ();
   test_activity_cancel_after_failure_is_noop ();
   test_activity_cancel_owner_check ();
