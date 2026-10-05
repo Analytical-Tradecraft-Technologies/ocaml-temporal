@@ -3,8 +3,10 @@
     can be reproduced during replay. *)
 type t
 
-(** Creates a duration from milliseconds. A negative value raises
-    [Invalid_argument] because it is a programming error. *)
+(** Creates a duration from milliseconds. A negative value, or one above
+    315,576,000,000,000 ms (the protobuf [Duration] maximum of 10,000 years),
+    raises [Invalid_argument] because it is a programming error; Temporal
+    would otherwise reject the resulting command on every workflow task. *)
 val of_ms : int64 -> t
 
 (** Returns the exact number of milliseconds supplied to [of_ms]. *)

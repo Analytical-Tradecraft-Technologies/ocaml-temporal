@@ -1055,6 +1055,8 @@ fn rejects_malformed_workflow_documents() {
         "completion-terminal-not-last",
         "completion-invalid-duration",
         "completion-no-activity-timeout",
+        "completion-zero-activity-timeout",
+        "completion-duration-too-large",
         "completion-unknown-nested",
         "completion-duplicate-field",
     ] {

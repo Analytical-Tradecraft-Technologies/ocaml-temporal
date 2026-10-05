@@ -987,7 +987,31 @@ pub(crate) fn validate_time(
             "duration must not be negative",
         ));
     }
+    if duration && seconds > MAX_DURATION_SECONDS {
+        return Err(ProtocolError::invalid(
+            path,
+            "duration exceeds the protobuf maximum",
+        ));
+    }
     Ok(())
+}
+
+/// The protobuf `Duration` maximum (10,000 years). Temporal rejects commands
+/// with larger durations on every workflow-task retry, so the bridge refuses
+/// them before they reach Core.
+const MAX_DURATION_SECONDS: i64 = 315_576_000_000;
+
+/// Rejects an explicitly zero activity close timeout. Temporal treats zero as
+/// unset, so a zero close timeout either leaves the command without any close
+/// timeout (rejected by the server on every retry) or, for local activities,
+/// expires immediately. Absent timeouts are checked separately.
+fn validate_close_timeout(value: &Option<Duration>, path: &str) -> Result<(), ProtocolError> {
+    match value {
+        Some(duration) if duration.seconds == 0 && duration.nanoseconds == 0 => Err(
+            ProtocolError::invalid(path, "activity close timeout must be positive"),
+        ),
+        _ => Ok(()),
+    }
 }
 
 /// Parses canonical unsigned decimal seeds and exact floating-point bits.
@@ -1626,6 +1650,14 @@ fn validate_completion(value: &Completion) -> Result<(), ProtocolError> {
                         "activity requires schedule-to-close or start-to-close timeout",
                     ));
                 }
+                validate_close_timeout(
+                    schedule_to_close_timeout,
+                    "$.commands.schedule_to_close_timeout",
+                )?;
+                validate_close_timeout(
+                    start_to_close_timeout,
+                    "$.commands.start_to_close_timeout",
+                )?;
                 for duration in [
                     schedule_to_close_timeout,
                     schedule_to_start_timeout,
@@ -1675,6 +1707,14 @@ fn validate_completion(value: &Completion) -> Result<(), ProtocolError> {
                         "local activity requires schedule-to-close or start-to-close timeout",
                     ));
                 }
+                validate_close_timeout(
+                    schedule_to_close_timeout,
+                    "$.commands.schedule_to_close_timeout",
+                )?;
+                validate_close_timeout(
+                    start_to_close_timeout,
+                    "$.commands.start_to_close_timeout",
+                )?;
                 for duration in [
                     schedule_to_close_timeout,
                     schedule_to_start_timeout,
