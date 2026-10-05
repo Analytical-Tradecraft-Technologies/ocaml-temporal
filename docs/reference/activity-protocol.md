@@ -26,7 +26,12 @@ Start context retains whether Core leased a local activity, the scheduling
 workflow identity, activity identity,
 headers, ordered arguments, heartbeat details, timestamps, timeouts, one-based
 attempt supplied by Core, normalized retry policy, task priority, and optional
-standalone activity run ID. Cancellation context retains both Core's primary
+standalone activity run ID. The scheduling workflow identity is still
+required: a standalone activity task, which has no workflow, and a task with
+an empty or NUL-containing header key are not representable. Rust fails such
+a task back to Core with a non-retryable `UnrepresentableActivityTask`
+application failure and the worker keeps polling (issue #801; see
+`docs/reference/core-bridge.md`). Cancellation context retains both Core's primary
 reason and its independent detail flags. The completion result is a closed
 variant: completed with an optional payload, failed, cancelled, or
 will-complete-asynchronously.

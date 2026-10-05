@@ -100,8 +100,22 @@ module Native : sig
       ( Temporal_protocol.Workflow_protocol.activation option,
         Temporal_core_bridge.Native_bridge.error )
       result
-    (** Maps native [Not_ready] to [None]. If successful bytes fail semantic
-        validation, [reject] must retire their exact native lease first. *)
+    (** Live-worker workflow poll. Maps native [Not_ready] to [None]. If
+        successful bytes fail semantic validation, [reject] must retire their
+        exact native lease first; a successful rejection is local task progress
+        and also maps to [None], so one undecodable activation cannot end
+        [Worker.run]. A failed rejection keeps the [Protocol] error. *)
+
+    val replay_workflow_poll_result :
+      reject:(bytes -> (unit, Temporal_core_bridge.Native_bridge.error) result) ->
+      (bytes, Temporal_core_bridge.Native_bridge.error) result ->
+      ( Temporal_protocol.Workflow_protocol.activation option,
+        Temporal_core_bridge.Native_bridge.error )
+      result
+    (** Replay-worker workflow poll. As {!workflow_poll_result}, except that
+        the original [Protocol] error remains the result after a successful
+        rejection: a replay must fail rather than skip history it could not
+        check. *)
 
     val encode_workflow_completion :
       Temporal_protocol.Workflow_protocol.completion ->
@@ -122,7 +136,10 @@ module Native : sig
         Temporal_core_bridge.Native_bridge.error )
       result
     (** Maps native [Not_ready] to [None]. If successful bytes fail semantic
-        validation, [reject] must retire their exact native lease first. *)
+        validation, [reject] must retire their exact native lease first; a
+        successful rejection (Rust fails the task back to Core) also maps to
+        [None], so one undecodable task cannot end [Worker.run]. A failed
+        rejection keeps the [Protocol] error. *)
 
     val encode_activity_completion :
       Temporal_protocol.Activity_protocol.completion ->
