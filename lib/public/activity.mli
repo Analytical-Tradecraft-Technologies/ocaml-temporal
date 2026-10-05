@@ -78,7 +78,15 @@ end
     name is validated immediately; it must be non-empty, valid UTF-8, NUL-free,
     and no more than 65,536 bytes because it crosses the native protocol into
     Temporal history. Violations raise [Invalid_argument] as construction
-    defects. *)
+    defects.
+
+    An exception escaping the implementation is reported as a retryable
+    Temporal application failure of type ["ocaml_exception"], so the
+    activity's retry policy applies just as for a returned retryable error.
+    List ["ocaml_exception"] in [non_retryable_error_types] to fail on the
+    first raise instead. The failure's stack trace contains the OCaml
+    backtrace when [Printexc.record_backtrace] is enabled. The same applies to
+    local and asynchronous activity callbacks. *)
 val define :
   name:string ->
   input:'input Codec.t ->

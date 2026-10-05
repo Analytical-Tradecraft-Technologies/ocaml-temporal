@@ -1142,8 +1142,14 @@ let test_registration_validation () =
   end
 
 (** Exceptions from application activity code are converted into a typed,
-    retired non-retryable failure instead of escaping the worker loop. *)
+    retired failure instead of escaping the worker loop. The failure is
+    retryable with type [ocaml_exception] so the activity's retry policy
+    applies (#822), and carries the backtrace when recording is enabled. *)
 let test_implementation_exception_is_retired () =
+  let recording = Printexc.backtrace_status () in
+  Printexc.record_backtrace true;
+  Fun.protect ~finally:(fun () -> Printexc.record_backtrace recording)
+  @@ fun () ->
   let supervisor = fake_supervisor () in
   let activity =
     Temporal.Activity.define ~name:"native_activity_exception"
@@ -1161,7 +1167,20 @@ let test_implementation_exception_is_retired () =
     when String.equal error.code "ocaml_exception" ->
       ()
   | _ -> failwith "activity exception did not retire its task lease"
-  end
+  end;
+  match (latest_completion supervisor).Protocol.result with
+  | Protocol.Failed
+      { message; stack_trace;
+        info = Protocol.Application { type_name; non_retryable; _ }; _ } ->
+      if not (String.equal type_name "ocaml_exception") then
+        failwith "activity exception used the wrong failure type";
+      if non_retryable then
+        failwith "activity exception bypassed the retry policy";
+      if not (String.equal message "Failure(\"defect in activity\")") then
+        failwith "activity exception lost its message";
+      if String.equal stack_trace "" then
+        failwith "activity exception lost its recorded backtrace"
+  | _ -> failwith "activity exception did not submit an application failure"
 
 (** A source-side poll failure remains a typed adapter error because no task
     token was available to acknowledge. *)

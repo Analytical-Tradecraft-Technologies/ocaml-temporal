@@ -167,8 +167,7 @@ type async_lease =
 (** Bounds diagnostics before they are sent to Logs or embedded in a
     non-retryable Temporal failure. Invalid UTF-8 is replaced because the
     protocol's string fields are strict UTF-8. *)
-let bounded_text ~fallback value =
-  let maximum = 1_024 in
+let bounded_text ?(maximum = 1_024) ~fallback value =
   if not (Codec.valid_utf_8 value) then fallback
   else if String.length value <= maximum then value
   else
@@ -239,6 +238,34 @@ let failure_of_error (error : error_view) : Protocol.failure =
           {
             type_name = "ocaml_temporal_native_activity";
             non_retryable = true;
+            details = [];
+            category = Application_category_unspecified;
+            next_retry_delay = None;
+          };
+    }
+
+(** Builds the failure for an exception raised by application activity code.
+    Activity code commonly performs I/O through libraries that raise on
+    transient errors ([Unix.Unix_error], [End_of_file], [Sys_error]), so the
+    failure is retryable and subject to the activity's retry policy, as in the
+    official SDKs. The distinct [ocaml_exception] type lets a retry policy opt
+    out through [non_retryable_error_types]. The OCaml backtrace is included
+    when backtrace recording is enabled; it is bounded and must be valid UTF-8
+    to fit the protocol's strict string fields. *)
+let callback_exception_failure (diagnostic : error_view) backtrace :
+    Protocol.failure =
+  Protocol.
+    {
+      message = diagnostic.message;
+      source = "ocaml-temporal";
+      stack_trace = bounded_text ~maximum:8_192 ~fallback:"" backtrace;
+      encoded_attributes = None;
+      cause = None;
+      info =
+        Application
+          {
+            type_name = "ocaml_exception";
+            non_retryable = false;
             details = [];
             category = Application_category_unspecified;
             next_retry_delay = None;
@@ -1002,6 +1029,19 @@ module Make (Supervisor : SUPERVISOR) = struct
     reject_task_with_failure adapter ~token ~activity_type
       ~failure:(failure_of_error error) error
 
+  (** Retires a task whose application callback raised. Must be called directly
+      from the exception handler so the captured backtrace is the callback's. *)
+  let reject_callback_exception adapter ~token ~activity_type exception_ =
+    let backtrace = Printexc.get_raw_backtrace () in
+    let backtrace =
+      try Printexc.raw_backtrace_to_string backtrace with _ -> ""
+    in
+    let diagnostic =
+      exception_error ~path:"$.implementation" ~retryable:true exception_
+    in
+    reject_task_with_failure adapter ~token ~activity_type
+      ~failure:(callback_exception_failure diagnostic backtrace) diagnostic
+
   (** Executes an asynchronous activity callback. The handle is dormant while
       the callback runs; only an accepted remote [Will_complete_async]
       completion causes [finish_lease] to publish and activate it. Core cannot
@@ -1034,6 +1074,9 @@ module Make (Supervisor : SUPERVISOR) = struct
               let context_handle = Async_activity.handle context in
               (try
                  match implementation context input with
+                 | exception exception_ ->
+                     reject_callback_exception adapter ~token ~activity_type
+                       exception_
                  | Async_activity.Completed output ->
                      (match encode_output output with
                      | Error error ->
@@ -1141,6 +1184,9 @@ module Make (Supervisor : SUPERVISOR) = struct
                     ~finally:(fun () -> Activity_context.invalidate context)
                     (fun () ->
                       match implementation context input with
+                      | exception exception_ ->
+                          reject_callback_exception adapter ~token
+                            ~activity_type exception_
                       | Error implementation_error ->
                           let diagnostic =
                             application_error ~path:"$.implementation"
