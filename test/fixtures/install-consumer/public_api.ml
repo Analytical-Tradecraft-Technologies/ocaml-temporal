@@ -276,6 +276,17 @@ let _codec_option : 'a T.Codec.t -> 'a option T.Codec.t = T.Codec.option
 let _codec_string : string T.Codec.t = T.Codec.string
 let _codec_bytes : bytes T.Codec.t = T.Codec.bytes
 let _codec_unit : unit T.Codec.t = T.Codec.unit
+let _codec_int : int T.Codec.t = T.Codec.int
+let _codec_int64 : int64 T.Codec.t = T.Codec.int64
+let _codec_bool : bool T.Codec.t = T.Codec.bool
+let _codec_float : float T.Codec.t = T.Codec.float
+let _codec_json : Yojson.Safe.t T.Codec.t = T.Codec.json
+
+let _codec_json_conv :
+    to_json:('a -> Yojson.Safe.t) ->
+    of_json:(Yojson.Safe.t -> ('a, T.Error.t) result) ->
+    'a T.Codec.t =
+  T.Codec.json_conv
 
 let _duration_of_ms : int64 -> T.Duration.t = T.Duration.of_ms
 let _duration_to_ms : T.Duration.t -> int64 = T.Duration.to_ms
