@@ -15,6 +15,21 @@ implementation when a later entry documents that work as complete. The
 records the current tested source, named assertions and successful CI job for
 the Temporal acceptance controllers.
 
+## 2026-10-06: Large client signal, query, and update inputs (#771)
+
+The Rust bridge decoded signal, query, and update requests with the generic
+object parser, which applies the 65,536-byte text limit to base64 payload
+data. Any input over 49,152 raw bytes was therefore rejected before the RPC,
+and OCaml reported it as a malformed client error. These requests now use the
+same payload-aware decoder as workflow start: each payload byte field may hold
+128 MiB inside the 192 MiB document limit, while identifiers, handler names,
+and metadata keys keep the 65,536-byte text limit. Rust ABI tests submit
+payloads at and above the old ceiling, at exactly 128 MiB, and one base64
+quantum above it, plus identifiers and metadata keys at and above the text
+limit, to an unconnected runtime and check which ones reach the lifecycle
+guard. An OCaml test sends payloads from the real OCaml encoders through the
+C stubs to the same guard.
+
 ## 2026-10-06: One unrepresentable activity task no longer stops the worker (#801)
 
 An activity task the bridge cannot represent (a standalone activity with no

@@ -704,19 +704,29 @@ pub fn encode_reset_response(
 }
 
 /// Strictly parses one exact-run signal request.
+///
+/// Like [`decode_start_request`], this uses the payload-aware parser: base64
+/// payload data may use the 128 MiB per-field allowance, while
+/// [`validate_signal_request`] immediately reapplies the 65,536-byte text
+/// limit to every identifier and payload metadata key. Using the generic
+/// object parser here would cap signal input at 49,152 raw bytes (issue #771).
 pub fn decode_signal_request(
     input: &str,
 ) -> Result<SignalWorkflowRequest, protocol::ProtocolError> {
-    protocol::decode_object(input)?;
+    protocol::decode_payload_object(input)?;
     let request = serde_json::from_str(input)
         .map_err(|_| protocol::ProtocolError::invalid("$", "invalid client signal request"))?;
     validate_signal_request(&request)?;
     Ok(request)
 }
 
-/// Strictly parses one exact-run output-only query request.
+/// Strictly parses one exact-run query request.
+///
+/// Query arguments are payloads, so the payload-aware parser applies the same
+/// per-field and whole-document bounds as start and signal input; the semantic
+/// validator then bounds identifiers and metadata keys as ordinary text.
 pub fn decode_query_request(input: &str) -> Result<QueryWorkflowRequest, protocol::ProtocolError> {
-    protocol::decode_object(input)?;
+    protocol::decode_payload_object(input)?;
     let request = serde_json::from_str(input)
         .map_err(|_| protocol::ProtocolError::invalid("$", "invalid client query request"))?;
     validate_query_request(&request)?;
@@ -724,10 +734,14 @@ pub fn decode_query_request(input: &str) -> Result<QueryWorkflowRequest, protoco
 }
 
 /// Strictly parses a request that starts one workflow update.
+///
+/// Update arguments use the payload-aware parser for the same reason as
+/// signal input; [`validate_update_request`] keeps every identifier and
+/// metadata key within the ordinary text limit.
 pub fn decode_update_request(
     input: &str,
 ) -> Result<UpdateWorkflowRequest, protocol::ProtocolError> {
-    protocol::decode_object(input)?;
+    protocol::decode_payload_object(input)?;
     let request = serde_json::from_str(input)
         .map_err(|_| protocol::ProtocolError::invalid("$", "invalid client update request"))?;
     validate_update_request(&request)?;
