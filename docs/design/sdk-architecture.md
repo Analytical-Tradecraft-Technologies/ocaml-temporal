@@ -6,8 +6,8 @@
 **Target:** A reusable, publishable OCaml 5 SDK for authoring Temporal workflows
 
 This document describes the intended completed SDK. It is not a list of
-features available today. See the [progress log](../../progress.md) for
-verified current behavior and the [roadmap](../../implementation-roadmap.md)
+features available today. See the [progress log](../progress.md) for
+verified current behavior and the [roadmap](../implementation-roadmap.md)
 for remaining work.
 
 ## 1. Purpose
@@ -126,8 +126,7 @@ The intended top-level layout is:
     ├── reference/
     ├── design/
     ├── decisions/
-    ├── progress.md
-    └── superpowers/
+    └── progress.md
 ```
 
 The experimental public OPAM package is named `temporal-sdk`. The Rust toolchain is a build dependency, not an application programming dependency. Cargo dependencies are locked, and the public OCaml package version controls which Core revision it embeds.

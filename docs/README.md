@@ -108,11 +108,12 @@ The remaining reference documents are useful when changing one subsystem:
 - [Release preflight](reference/release-preflight.md) documents the clean-tree
   metadata and source-input gate, deterministic CI-only Cargo
   SBOM audit, and stable/prerelease tag-to-manifest consistency check.
-- [Architecture specification](superpowers/specs/2026-07-11-ocaml-temporal-sdk-design.md)
-  records the long-term design. APIs described there may be future work.
-
-Files under `superpowers/plans/` are historical implementation plans. When a
-plan and the source disagree, the source, tests, and progress record win.
+- [Architecture specification](design/sdk-architecture.md) records the
+  long-term design. APIs described there may be future work. The
+  [workflow authoring API](design/workflow-authoring-api.md) and
+  [JSON control protocol foundation](design/json-control-protocol-foundation.md)
+  designs record earlier phase decisions; when a design and the source
+  disagree, the source, tests, and progress record win.
 
 ## How the pieces fit together
 
