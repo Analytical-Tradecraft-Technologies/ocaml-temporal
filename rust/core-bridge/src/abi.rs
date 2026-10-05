@@ -1684,14 +1684,26 @@ impl Runtime {
 
     /// Revalidates and retires the exact workflow activation whose OCaml
     /// semantic decode failed after Rust handed off its lease.
+    ///
+    /// Success is local task progress, as for a Rust conversion failure: the
+    /// OCaml supervisor reports an empty poll and keeps polling (issue #801).
+    /// The static diagnostic and the redelivery backoff of
+    /// [`Self::reject_unrepresentable_workflow_delivery`] apply here too,
+    /// because Core may redeliver the failed workflow task at once.
     fn reject_polled_workflow(&mut self, input: &[u8]) -> Operation {
+        const REASON: &str = "OCaml semantic workflow activation decoding failed";
         let run_id = workflow_rejection_run_id(&self.workflow_activations, input)?;
         // reject_workflow_delivery retires the ledger even when Core rejects
         // the generated failure. Remove the semantic handoff on the same path
         // so a Core error cannot leave a stale run_id that blocks later work.
-        let rejection = self.reject_workflow_delivery(&run_id);
+        let rejection = self.reject_workflow_delivery_with_reason(&run_id, REASON);
         self.workflow_activations.remove(&run_id);
         rejection?;
+        write_rejected_workflow_diagnostic(std::io::stderr().lock(), REASON);
+        self.worker
+            .as_ref()
+            .expect("rejected workflow delivery retains worker")
+            .wait_workflow_delivery_rejection_backoff();
         Ok(Vec::new())
     }
 
@@ -1716,20 +1728,17 @@ impl Runtime {
             .map_err(poll_lane_failure)?;
         let semantic = match activity_protocol::task_from_core(&task) {
             Ok(semantic) => semantic,
-            Err(error) => {
-                self.reject_unrepresentable_activity(&task)?;
-                return Err(core_conversion_failure(error));
-            }
+            Err(error) => return self.reject_unrepresentable_activity(&task, error.message),
         };
         match activity_protocol::encode_task(&semantic) {
             Ok(encoded) => {
                 retain_activity_task(&mut self.activity_tasks, task.task_token.clone(), semantic);
                 Ok(encoded.into_bytes())
             }
-            Err(error) => {
-                self.reject_unrepresentable_activity(&task)?;
-                Err(protocol_failure(error))
-            }
+            Err(_error) => self.reject_unrepresentable_activity(
+                &task,
+                "semantic activity task JSON encoding failed",
+            ),
         }
     }
 
@@ -1740,15 +1749,26 @@ impl Runtime {
     /// Cancel variant is only an update to that Start; it has no independent
     /// completion to fail, so dropping a malformed update preserves the
     /// in-flight Start lease for the activity implementation.
+    ///
+    /// A handled rejection is local task progress, not a worker failure: one
+    /// task the bridge cannot represent (for example a standalone activity
+    /// with no workflow, or a header key another SDK allowed) must not end
+    /// `Worker.run` for every task on the queue (issue #801). After Core
+    /// accepts the generated non-retryable failure, the bounded static
+    /// `reason` is written to stderr and the poll returns `STATUS_NOT_READY`
+    /// so the worker keeps polling. A Core rejection error remains fatal
+    /// through the `?` below. No backoff is needed, unlike the workflow lane:
+    /// the failure is non-retryable, so the server does not redeliver it.
     fn reject_unrepresentable_activity(
         &self,
         task: &CoreActivityTask,
-    ) -> std::result::Result<(), Failure> {
+        reason: &'static str,
+    ) -> Operation {
         if activity_task_owns_completion_debt(task) {
-            self.reject_activity_delivery(&task.task_token)
-        } else {
-            Ok(())
+            self.reject_activity_delivery(&task.task_token, reason)?;
         }
+        write_rejected_activity_diagnostic(std::io::stderr().lock(), reason);
+        Err(not_ready())
     }
 
     /// Waits for remote-activity-lane readiness without consuming its task.
@@ -1818,15 +1838,6 @@ impl Runtime {
         Ok(Vec::new())
     }
 
-    /// Fails and retires a workflow activation that was never exposed to OCaml.
-    /// A pure cache eviction is acknowledged empty instead (issue #814).
-    fn reject_workflow_delivery(&self, run_id: &str) -> std::result::Result<(), Failure> {
-        self.reject_workflow_delivery_with_reason(
-            run_id,
-            "semantic workflow activation conversion failed",
-        )
-    }
-
     /// Fails and retires a workflow activation with a static diagnostic
     /// describing the private conversion branch that rejected it.
     fn reject_workflow_delivery_with_reason(
@@ -1866,8 +1877,13 @@ impl Runtime {
         Err(not_ready())
     }
 
-    /// Fails and retires an activity task that was never exposed to OCaml.
-    fn reject_activity_delivery(&self, task_token: &[u8]) -> std::result::Result<(), Failure> {
+    /// Fails and retires an activity task that was never exposed to OCaml,
+    /// reporting the static `reason` in the non-retryable Core failure.
+    fn reject_activity_delivery(
+        &self,
+        task_token: &[u8],
+        reason: &'static str,
+    ) -> std::result::Result<(), Failure> {
         let worker = self.worker.as_ref().ok_or_else(|| Failure {
             status: STATUS_INVALID_STATE,
             message: "Temporal worker is not running".to_owned(),
@@ -1878,7 +1894,7 @@ impl Runtime {
             .expect("worker retains parent runtime")
             .tokio_handle();
         handle
-            .block_on(worker.reject_activity_delivery(task_token))
+            .block_on(worker.reject_activity_delivery(task_token, reason))
             .map_err(worker_bridge_failure)
     }
 
@@ -2075,7 +2091,12 @@ impl Runtime {
     /// native lease. A cancellation is only an update attached to the same
     /// token. If its JSON cannot be decoded, dropping that one update must not
     /// retire the start lease that another OCaml call still has to complete.
+    ///
+    /// Success means the task was handled locally (issue #801): the OCaml
+    /// supervisor then reports an empty poll and keeps polling. The static
+    /// diagnostic is written only after the rejection succeeded.
     fn reject_polled_activity(&mut self, input: &[u8]) -> Operation {
+        const REASON: &str = "OCaml semantic activity task decoding failed";
         let rejection = activity_rejection_task(&self.activity_tasks, input)?;
         let owns_completion_debt = matches!(
             &rejection.task.variant,
@@ -2085,7 +2106,7 @@ impl Runtime {
         // Cancel has no independent completion to reject; removing just its
         // retained document preserves the shared Start debt.
         let native_rejection = if owns_completion_debt {
-            self.reject_activity_delivery(&rejection.task_token)
+            self.reject_activity_delivery(&rejection.task_token, REASON)
         } else {
             Ok(())
         };
@@ -2095,6 +2116,7 @@ impl Runtime {
             &rejection.task,
         );
         native_rejection?;
+        write_rejected_activity_diagnostic(std::io::stderr().lock(), REASON);
         Ok(Vec::new())
     }
 
@@ -2386,6 +2408,14 @@ fn write_rejected_workflow_diagnostic(mut output: impl Write, reason: &'static s
         output,
         "ocaml-temporal: rejected workflow delivery: {reason}"
     );
+}
+
+/// Best-effort stderr diagnostic after an unrepresentable activity task was
+/// handled locally. As for workflows, only the static category is written;
+/// no task token, identifier, header, or payload reaches the log, and a closed
+/// stderr cannot turn the handled task into an ABI panic.
+fn write_rejected_activity_diagnostic(mut output: impl Write, reason: &'static str) {
+    let _ = writeln!(output, "ocaml-temporal: rejected activity task: {reason}");
 }
 
 /// Reports an exact-run wait that must be retried without exposing a fake
@@ -4348,7 +4378,7 @@ mod rejection_tests;
 
 #[cfg(test)]
 mod rejection_diagnostic_tests {
-    use super::write_rejected_workflow_diagnostic;
+    use super::{write_rejected_activity_diagnostic, write_rejected_workflow_diagnostic};
     use std::io::{self, Write};
 
     /// Models a closed stderr stream without changing process-wide descriptors.
@@ -4370,6 +4400,14 @@ mod rejection_diagnostic_tests {
     fn closed_stderr_does_not_panic_after_workflow_rejection() {
         let mut stderr = BrokenStderr(0);
         write_rejected_workflow_diagnostic(&mut stderr, "unsupported Core failure category");
+        assert_eq!(stderr.0, 1);
+    }
+
+    /// The activity rejection diagnostic is equally best effort (issue #801).
+    #[test]
+    fn closed_stderr_does_not_panic_after_activity_rejection() {
+        let mut stderr = BrokenStderr(0);
+        write_rejected_activity_diagnostic(&mut stderr, "activity task header key is empty");
         assert_eq!(stderr.0, 1);
     }
 }

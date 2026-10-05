@@ -15,6 +15,22 @@ implementation when a later entry documents that work as complete. The
 records the current tested source, named assertions and successful CI job for
 the Temporal acceptance controllers.
 
+## 2026-10-06: One unrepresentable activity task no longer stops the worker (#801)
+
+An activity task the bridge cannot represent (a standalone activity with no
+workflow, or a header key another SDK allowed) used to be failed back to Core
+retryably and then reported as a fatal protocol status, so `Worker.run` ended
+for the whole task queue, again after every redelivery. Rust now fails only
+that task with a non-retryable `UnrepresentableActivityTask` application
+failure carrying a static category, writes a bounded stderr diagnostic, and
+returns `NOT_READY` so the worker keeps polling. When OCaml's decoder rejects
+a document Rust accepted, a successful rejection is likewise reported as an
+empty poll on live workers (a replay still fails). The activity poll lane
+also drops an orphaned, repeated, or retired cancellation silently instead of
+publishing a fatal lane error. A gRPC-double ABI test proves the rejected
+task's failure, slot release, and delivery of the next task; ledger and OCaml
+adapter tests cover the cancellation and decode-failure classifications.
+
 ## 2026-10-06: Retryable client capacity errors (#796)
 
 The native client's two bounded registries, 64 in-flight starts and 64
