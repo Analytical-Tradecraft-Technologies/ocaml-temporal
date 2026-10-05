@@ -1,9 +1,13 @@
 (** The private transport boundary used by the public client and worker.
 
     [mock://] targets use the deterministic in-memory records below for unit
-    tests of client and worker plumbing. The mock never executes workflow
-    code: a client wait echoes the start input as the completed output, and
-    worker tasks carry an empty [binary/null] input. HTTP(S) targets are
+    tests of client and worker plumbing. The mock is not a workflow test
+    environment: a client wait echoes the start input as the completed output
+    without running a workflow, and worker tasks carry an empty [binary/null]
+    input unrelated to any client start. A worker task still invokes a
+    registered implementation whose input codec accepts that payload (for
+    example [Codec.unit]), outside any workflow scheduler context, so callback
+    side effects can occur during mock runs. HTTP(S) targets are
     routed through the private supervisor and its Rust/Core protocol; that
     path uses separate activation/completion semantic values and an explicit
     native lifecycle. Keeping those representations

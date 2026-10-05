@@ -17,16 +17,18 @@ boundary honestly:
 
 | Target | What it is useful for today |
 | --- | --- |
-| `mock://...` | Fast in-memory checks of client and worker plumbing: request validation, registration, codecs, and handle lifecycle. It does **not** execute workflow code; see below. |
+| `mock://...` | Fast in-memory checks of client and worker plumbing: request validation, registration, codecs, and handle lifecycle. It is **not** a workflow test environment; see below. |
 | `http://...` or `https://...` | The OCaml-owned native client/worker path backed by Rust Temporal Core. The current native command slice handles activity, timer, terminal, cancellation, cache, and two-stage child-resolution paths. It is covered by focused bridge and adapter tests. |
 | Live Compose acceptance | Real PostgreSQL and Temporal Server validation with two separate OCaml binaries: a public worker and a public client driver. It asserts a fan-out activity result, a timer-then-activity result, and a parent awaiting a timer-owning child workflow. |
 
 `mock://` is not a workflow test environment. A mock client records each start
-and `Temporal.Client.wait` returns `Completed` with the start input echoed back
-as the output, without running any workflow. A mock worker dispatches one
+and `Temporal.Client.wait` echoes the encoded start input back as the output,
+without running any workflow; it returns `Completed` only when the workflow's
+output codec can decode that echoed input, and a codec error otherwise. A mock worker dispatches one
 synthetic task per registered definition with an empty `binary/null` payload,
-unrelated to anything a mock client started, and calls the implementation
-outside a workflow context: `Activity.start`, `Workflow.sleep`, `Scope.create`,
+unrelated to anything a mock client started. If the implementation's input
+codec accepts that payload (for example `Codec.unit`), the worker calls the
+implementation, so its side effects do run, but outside a workflow context: `Activity.start`, `Workflow.sleep`, `Scope.create`,
 and similar operations return an "outside a workflow" defect (`Workflow.patched`
 and `Workflow.upsert_search_attributes` raise `Invalid_argument`), and a
 `Codec.string` input fails to decode. Queries and updates against a mock

@@ -74,8 +74,9 @@ type visibility_page = {
     sanitized to printable ASCII and bounded so the default is always valid.
 
     A [mock://] target selects an in-memory ledger for testing client plumbing
-    only. It runs no workflow code: [wait] completes a mock execution with its
-    start input echoed back as the output, and queries and updates return
+    only. It runs no workflow code: [wait] echoes the encoded start input back
+    as the output, completing only when the workflow's output codec can
+    decode it and returning a codec error otherwise, and queries and updates return
     typed errors. Use an [http://] or [https://] target against a Temporal
     Server to observe real workflow results. *)
 val create :
