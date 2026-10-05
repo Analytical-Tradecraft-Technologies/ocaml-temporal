@@ -2540,6 +2540,20 @@ impl WorkerConfigInput {
                                 .to_owned(),
                     });
                 }
+                // Every successful completion leaves the per-workflow
+                // behavior UNSPECIFIED because the OCaml SDK has no
+                // per-workflow behavior API, and pinned Core substitutes only
+                // a configured worker default. A versioned worker without a
+                // default would therefore declare every workflow unversioned,
+                // which Temporal defines as invalid for versioned workers.
+                if use_worker_versioning && default_versioning_behavior.is_none() {
+                    return Err(Failure {
+                        status: STATUS_CONFIGURATION,
+                        message: "versioning.use_worker_versioning requires \
+                                  default_versioning_behavior"
+                            .to_owned(),
+                    });
+                }
                 WorkerVersioningStrategy::WorkerDeploymentBased(
                     temporalio_common::worker::WorkerDeploymentOptions {
                         version: temporalio_common::worker::WorkerDeploymentVersion {
@@ -4562,6 +4576,54 @@ mod worker_config_tests {
                 .message
                 .contains("default_versioning_behavior requires use_worker_versioning")
         );
+    }
+
+    /// Rejects an enabled versioned worker without a default behavior. The
+    /// bridge never sends a per-workflow behavior, so Core would otherwise
+    /// stamp UNSPECIFIED on every workflow-task completion of a versioned
+    /// deployment (issue #817).
+    #[test]
+    fn worker_versioning_requires_default_behavior() {
+        let mut worker = config(MIN_CACHED_WORKFLOW_POLLS);
+        worker.versioning = super::WorkerVersioningInput::DeploymentBased {
+            deployment_name: "agents".to_owned(),
+            build_id: worker.build_id.clone(),
+            use_worker_versioning: true,
+            default_versioning_behavior: None,
+        };
+        let failure = match worker.into_core() {
+            Err(failure) => failure,
+            Ok(_) => panic!("versioned workers must not complete with UNSPECIFIED behavior"),
+        };
+        assert_eq!(failure.status, STATUS_CONFIGURATION);
+        assert_eq!(
+            failure.message,
+            "versioning.use_worker_versioning requires default_versioning_behavior"
+        );
+    }
+
+    /// Keeps the opted-out deployment form valid: without worker versioning
+    /// Core does not route by deployment, so UNSPECIFIED is the correct
+    /// completion behavior and no default may be supplied.
+    #[test]
+    fn deployment_without_worker_versioning_accepts_no_behavior() {
+        let mut worker = config(MIN_CACHED_WORKFLOW_POLLS);
+        worker.versioning = super::WorkerVersioningInput::DeploymentBased {
+            deployment_name: "agents".to_owned(),
+            build_id: worker.build_id.clone(),
+            use_worker_versioning: false,
+            default_versioning_behavior: None,
+        };
+        let core = worker
+            .into_core()
+            .expect("unversioned deployment metadata should be accepted");
+        match core.versioning_strategy {
+            temporalio_sdk_core::WorkerVersioningStrategy::WorkerDeploymentBased(options) => {
+                assert!(!options.use_worker_versioning);
+                assert_eq!(options.default_versioning_behavior, None);
+            }
+            other => panic!("unexpected Core versioning strategy: {other:?}"),
+        }
     }
 }
 

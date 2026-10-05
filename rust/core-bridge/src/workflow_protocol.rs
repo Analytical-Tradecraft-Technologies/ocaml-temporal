@@ -4022,6 +4022,12 @@ fn completion_to_core_with_child_namespace(
                         .map(|command| command_to_core(command, child_workflow_namespace))
                         .collect::<Result<_, _>>()?,
                     used_internal_flags: Vec::new(),
+                    // UNSPECIFIED asks Core to apply the worker's
+                    // configured default behavior, if any; unversioned
+                    // workers correctly keep UNSPECIFIED. Worker configuration
+                    // rejects versioned workers without that default, so a
+                    // versioned deployment never reaches the server with
+                    // UNSPECIFIED (issue #817).
                     versioning_behavior: 0,
                 },
             ),

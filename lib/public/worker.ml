@@ -84,15 +84,26 @@ module Options = struct
               match validate_build_id build_id with
               | Error _ as error -> error
               | Ok () ->
-                  if use_worker_versioning then Ok ()
-                  else
-                    match default_versioning_behavior with
-                    | None -> Ok ()
-                    | Some _ ->
-                        Error
-                          (Error.defect
-                             ~message:
-                               "default_versioning_behavior requires use_worker_versioning")))
+                  (* The SDK has no per-workflow behavior API, so every
+                     completion leaves the behavior unspecified and Core
+                     substitutes only a configured worker default. A
+                     versioned worker therefore needs a default; otherwise
+                     every completion would declare the workflow unversioned
+                     (issue #817). *)
+                  match (use_worker_versioning, default_versioning_behavior) with
+                  | true, Some _ | false, None -> Ok ()
+                  | true, None ->
+                      Error
+                        (Error.defect
+                           ~message:
+                             "use_worker_versioning requires \
+                              default_versioning_behavior")
+                  | false, Some _ ->
+                      Error
+                        (Error.defect
+                           ~message:
+                             "default_versioning_behavior requires \
+                              use_worker_versioning")))
     in
     match build_id_validation with
     | Error _ as error -> error

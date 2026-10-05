@@ -477,9 +477,11 @@ The modern deployment form is:
 
 Its nested `build_id` is subject to the same equality check. The deployment
 name identifies the Temporal deployment, while `use_worker_versioning` and
-the optional `default_versioning_behavior` (`"auto_upgrade"` or `"pinned"`)
-are passed to Core's `WorkerDeploymentBased` strategy. A behavior is rejected
-when worker versioning is disabled. Registration, rollout, and compatibility
+`default_versioning_behavior` (`"auto_upgrade"` or `"pinned"`) are passed
+to Core's `WorkerDeploymentBased` strategy. A behavior is rejected when worker
+versioning is disabled and required when it is enabled, because completions
+never carry a per-workflow behavior and Core substitutes only the configured
+worker default for `UNSPECIFIED`. Registration, rollout, and compatibility
 set management remain server-side responsibilities.
 
 Temporal Core requires at least two workflow-task pollers when

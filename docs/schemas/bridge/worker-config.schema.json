@@ -56,6 +56,17 @@
               "type": ["string", "null"],
               "enum": ["auto_upgrade", "pinned", null]
             }
+          },
+          "if": {
+            "properties": { "use_worker_versioning": { "const": true } }
+          },
+          "then": {
+            "properties": {
+              "default_versioning_behavior": { "enum": ["auto_upgrade", "pinned"] }
+            }
+          },
+          "else": {
+            "properties": { "default_versioning_behavior": { "const": null } }
           }
         }
       ]
