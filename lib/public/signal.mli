@@ -6,10 +6,8 @@
     the native activation bridge. This module provides the typed definition
     and deterministic in-memory handler path. Native workflow signal delivery
     is available when the handler is attached with [Temporal.Worker.workflow].
-    Native output-only query delivery and immediate one-input, non-suspending
-    update delivery are provided by their respective modules; typed query
-    inputs, suspended updates, and live query/update acceptance remain future
-    milestones. *)
+    Queries and updates are separate message kinds with their own definitions
+    and handlers in [Temporal.Query] and [Temporal.Update]. *)
 
 (** A validated signal name paired with the type of its input value. *)
 type 'input definition

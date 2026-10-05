@@ -149,11 +149,14 @@ val wait :
 (** Requests cancellation of the exact run retained by [handle]. A successful
     call acknowledges Temporal's cancellation RPC; it does not wait for the
     workflow to stop. Call [wait handle] to observe [Cancelled]. [request_id]
-    is the idempotency key for this logical control operation and should be
-    supplied again if the caller retries after an uncertain transport error.
-    [request_id] must be non-empty and valid UTF-8. Both [request_id] and
-    [reason] are limited to 65,536 bytes and may not contain NUL; [reason] may
-    be empty. *)
+    is the idempotency key for this logical control operation. When omitted,
+    the client derives a stable key from the handle's workflow ID and run ID,
+    so every defaulted call for the same run, including a retry after an
+    uncertain transport error, is the same logical request. Supply an explicit
+    value only when separate cancellation requests for the same run must be
+    distinguished. An explicit [request_id] must be non-empty and valid UTF-8.
+    Both [request_id] and [reason] are limited to 65,536 bytes and may not
+    contain NUL; [reason] may be empty. *)
 val cancel :
   ?request_id:string ->
   ?reason:string ->

@@ -362,7 +362,14 @@ val execute :
     callback executes in this worker process and Core records the result as a
     history marker. Local activities support activity IDs, retry policies, and
     local timeout controls, but do not accept a remote task queue, heartbeat,
-    priority, or eager-execution option. *)
+    priority, or eager-execution option.
+
+    [cancellation_type] defaults to [Wait_cancellation_completed], unlike the
+    [Try_cancel] default of [start]. The policy is recorded with the schedule
+    command, but this API returns only a future and accepts no [scope], so
+    workflow code currently has no way to request cancellation of a local
+    activity and the option has no observable effect. It is retained so a
+    future local cancellation API can honour it without a signature change. *)
 val start_local :
   ?activity_id:string ->
   ?schedule_to_close_timeout:Duration.t ->
