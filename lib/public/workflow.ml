@@ -145,10 +145,14 @@ let signal_external_workflow ~workflow_id ~run_id ~(signal : 'input Signal.t)
           | Error error ->
               failed_external_operation context (Error_private.of_base error)
           | Ok payload ->
+              (* A unit signal is sent as zero payloads, as other SDKs do;
+                 [Signal.Handler.dispatch_payloads] decodes [[]] as unit. Core
+                 does not compare signal arguments during replay. *)
               let future =
                 Temporal_sdk_kernel.Workflow_context_store.signal_external_workflow
                   context ~workflow_id ~run_id
-                  ~signal_name:(Signal.name signal) ~input:[ payload ] ()
+                  ~signal_name:(Signal.name signal)
+                  ~input:(Temporal_base.Payload.input_arguments payload) ()
               in
               Future_private.of_internal future))
 

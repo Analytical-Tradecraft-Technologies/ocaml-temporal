@@ -67,4 +67,16 @@ module Handler : sig
     ?run_validator:bool ->
     ?on_validated:(unit -> unit) ->
     t -> Payload.t -> (Payload.t, Error.t) result
+
+  (** Dispatches Temporal's repeated update input list. This is the worker
+      adapter boundary. Zero payloads, which the Temporal CLI, Web UI, other
+      SDKs, and this SDK's client send for a no-argument update, are decoded
+      as the canonical [binary/null] unit payload; one payload is passed to
+      [dispatch] with the same optional arguments; more than one is a
+      non-retryable workflow error returned before decoding, validation, or
+      [on_validated]. *)
+  val dispatch_payloads :
+    ?run_validator:bool ->
+    ?on_validated:(unit -> unit) ->
+    t -> Payload.t list -> (Payload.t, Error.t) result
 end

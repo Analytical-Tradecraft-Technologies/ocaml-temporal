@@ -64,6 +64,17 @@ base64 without whitespace. `input` is ordered and may be empty. Payload
 metadata and bytes use the shared workflow payload codec, so binary values are
 never treated as UTF-8 text.
 
+Start, signal, and update requests carry one encoded typed value, with one
+exception (#819): when that value is exactly the canonical `Codec.unit`
+payload (`encoding` = `binary/null`, no data), `input` is the empty list. The
+Temporal CLI, Web UI, and other SDKs send zero payloads for a no-argument call,
+and an SDK that binds payloads positionally (Python, for example) would reject a
+surplus `null` argument. OCaml workers decode an empty list back to that unit
+payload, so OCaml-to-OCaml calls are unchanged. The same
+`Temporal_base.Payload.input_arguments` rule is applied to workflow commands
+that carry input: activities, local activities, child workflows,
+continue-as-new, and external signals.
+
 Rust validates every identifier, rejects NUL bytes, rejects duplicate or
 unknown members, validates payloads, and then calls Core's raw
 `WorkflowService::start_workflow_execution`. The first slice deliberately

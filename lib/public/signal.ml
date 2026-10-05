@@ -90,10 +90,11 @@ module Handler = struct
                   (Printexc.to_string exception_)))
 
   (** Adapts Temporal's repeated signal payload list to the one typed input.
-      Zero payloads are what the Temporal CLI, Web UI, and other SDKs send for a
-      no-argument signal (only the OCaml client sends one [binary/null]
-      payload), so they decode as the canonical [binary/null] unit payload, as
-      workflow start input already does. A handler whose codec rejects unit
+      Zero payloads are what the Temporal CLI, Web UI, other SDKs, and (since
+      #819) this SDK's client and external signals send for a no-argument
+      signal, so they decode as the canonical [binary/null] unit payload, as
+      workflow start input already does. Older OCaml senders' single
+      [binary/null] payload still decodes through the one-payload case. A handler whose codec rejects unit
       reports its own codec error. Multiple payloads fail non-retryably rather
       than silently dropping data. *)
   let dispatch_payloads handler = function

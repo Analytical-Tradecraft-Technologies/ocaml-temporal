@@ -158,4 +158,28 @@ module Handler = struct
                              ~message:
                                (Printf.sprintf "update output codec raised: %s"
                                   (Printexc.to_string exception_)))))))
+
+  (** Adapts Temporal's repeated update input list to the one typed input.
+      Zero payloads are what the Temporal CLI, Web UI, other SDKs, and this
+      SDK's own client send for a no-argument update, so they decode as the
+      canonical [binary/null] unit payload, as workflow start, activity, and
+      signal input already do. A handler whose codec rejects unit reports its
+      own codec error. Multiple payloads fail non-retryably before decoding,
+      validation, or acknowledgement rather than silently dropping data. *)
+  let dispatch_payloads ?run_validator ?on_validated handler payloads =
+    let dispatch payload =
+      dispatch ?run_validator ?on_validated handler payload
+    in
+    match payloads with
+    | [] -> dispatch (Payload_private.of_base (Temporal_base.Payload.unit_null ()))
+    | [ payload ] -> dispatch payload
+    | _ :: _ :: _ ->
+        Error
+          (Error.make ~non_retryable:true ~category:`Workflow
+             ~message:
+               (Printf.sprintf
+                  "update %s must contain at most one payload for its \
+                   registered OCaml handler"
+                  (name handler))
+             ())
 end
