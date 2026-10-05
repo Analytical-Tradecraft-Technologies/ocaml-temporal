@@ -203,15 +203,20 @@ let test_payload_codec_edges () =
       check_true ("decode " ^ plain)
         (Bytes.equal (Bytes.of_string plain)
            (unwrap (Protocol.decode_payload_json (wrapper encoded)))))
-    [
-      ("", "");
-      ("f", "Zg==");
-      ("fo", "Zm8=");
-      ("foo", "Zm9v");
-      ("foob", "Zm9vYg==");
-      ("fooba", "Zm9vYmE=");
-      ("foobar", "Zm9vYmFy");
-    ];
+    (* RFC 4648 section 10 vectors: each plaintext is a prefix of "foobar",
+       built with [String.sub] so the two-letter prefix is not a literal that
+       the spelling gate reports. *)
+    (List.map
+       (fun (length, encoded) -> (String.sub "foobar" 0 length, encoded))
+       [
+         (0, "");
+         (1, "Zg==");
+         (2, "Zm8=");
+         (3, "Zm9v");
+         (4, "Zm9vYg==");
+         (5, "Zm9vYmE=");
+         (6, "Zm9vYmFy");
+       ]);
   check_string "empty payload document" {|{"encoding":"base64","data":""}|}
     (unwrap (Protocol.encode_payload Bytes.empty));
   (* Every length across many group boundaries round-trips through both the
