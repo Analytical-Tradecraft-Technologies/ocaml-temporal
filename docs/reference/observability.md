@@ -32,7 +32,8 @@ Current events use these levels:
   an execution after cache eviction, a rejected workflow/activity task or
   activation completion, or a worker shutdown that still has leased tasks to
   finish.
-- `Error` records failed bridge operations and workflow failures.
+- `Error` records failed bridge operations, workflow task failures, and
+  terminal workflow failures.
 
 At the bridge boundary, an empty non-blocking worker poll lane, an exact-run
 client wait whose bounded 100 ms interval elapsed, or an asynchronous
@@ -46,8 +47,9 @@ lifecycle, configuration, and native bridge failures remain `Error` records.
 This level split keeps a healthy worker or waiting client from producing
 error-volume logs while retaining actionable diagnostics for conditions that
 require intervention. These level assignments describe the SDK's current
-reporting callsites; applications may use the generic `Observability.report`
-helper for additional application events.
+reporting callsites. Applications can emit their own events through `Logs`;
+the SDK's `Observability.report` helper is not exported by the public
+`Temporal` module.
 
 The SDK never logs at `App`, which is reserved for the application.
 
@@ -74,9 +76,9 @@ also has a higher-level lifecycle record:
 
 | Source | Current operation identifiers |
 |---|---|
-| `temporal.sdk.bridge` | `check_abi_version`, `echo`, `conformance_wait_ms`, `runtime_create`, `runtime_close`, `client_connect`, `client_disconnect`, `client_start_workflow_json`, `client_begin_start_workflow_json`, `client_poll_start_workflow_json`, `client_wait_start_workflow_json`, `client_wait_workflow_json`, `client_cancel_workflow_json`, `client_signal_workflow_json`, `client_query_workflow_json`, `client_update_workflow_json`, `client_poll_update_workflow_json`, `client_complete_async_activity_json`, `client_record_async_activity_heartbeat_json`, `worker_start`, `worker_try_poll_workflow`, `worker_wait_workflow`, `worker_complete_workflow_json`, `worker_reject_workflow_json`, `worker_try_poll_activity`, `worker_wait_activity`, `worker_wait_activity_completion_retry_backoff`, `worker_complete_activity_json`, `worker_reject_activity_json`, `worker_record_activity_heartbeat_json`, `worker_shutdown`, `replay_worker_start`, `replay_worker_feed_history`, `replay_worker_try_poll_workflow`, `replay_worker_wait_workflow`, `replay_worker_complete_workflow`, `replay_worker_reject_workflow`, `replay_worker_finish_input`, `replay_worker_finalize`, `replay_worker_dispose` |
-| `temporal.sdk.lifecycle` | `runtime_create`, `runtime_close`, `workflow_task_rejected`, `activity_task_rejected`, `activity_completion_retry`, `worker_run_started`, `worker_run_finished`, `worker_terminal_cleanup`, `worker_terminal_cleanup_failed`, `worker_shutdown`, `worker_shutdown_failed`, `workflow_activation_completed`, `workflow_activation_rejected`, `workflow_poll_not_ready`, `activity_task_completed`, `activity_async_handoff_accepted`, `activity_poll_not_ready` |
-| `temporal.sdk.workflow` | `execution_created`, `workflow_started`, `workflow_completed`, `workflow_failed`, `workflow_query_unhandled`, `workflow_query_completed`, `workflow_query_failed`, `workflow_update_unhandled`, `workflow_signal_unhandled`, `workflow_signal_received`, `workflow_signal_handled`, `workflow_cancelled`, `execution_evicted`, `activation_ignored`, `activate` |
+| `temporal.sdk.bridge` | `check_abi_version`, `echo`, `conformance_wait_ms`, `runtime_create`, `runtime_close`, `client_connect`, `client_disconnect`, `client_start_workflow_json`, `client_begin_start_workflow_json`, `client_poll_start_workflow_json`, `client_wait_start_workflow_json`, `client_wait_workflow_json`, `client_cancel_workflow_json`, `client_reset_workflow_json`, `client_terminate_workflow_json`, `client_list_visibility_json`, `client_signal_workflow_json`, `client_query_workflow_json`, `client_update_workflow_json`, `client_poll_update_workflow_json`, `client_complete_async_activity_json`, `client_record_async_activity_heartbeat_json`, `worker_start`, `worker_try_poll_workflow`, `worker_wait_workflow`, `worker_complete_workflow_json`, `worker_reject_workflow_json`, `worker_try_poll_activity`, `worker_wait_activity`, `worker_wait_activity_completion_retry_backoff`, `worker_complete_activity_json`, `worker_reject_activity_json`, `worker_record_activity_heartbeat_json`, `worker_shutdown`, `replay_worker_start`, `replay_worker_feed_history`, `replay_worker_try_poll_workflow`, `replay_worker_wait_workflow`, `replay_worker_complete_workflow`, `replay_worker_reject_workflow`, `replay_worker_finish_input`, `replay_worker_finalize`, `replay_worker_dispose` |
+| `temporal.sdk.lifecycle` | `runtime_create`, `runtime_close`, `workflow_task_rejected`, `activity_task_rejected`, `activity_completion_retry`, `worker_run_started`, `worker_run_finished`, `worker_terminal_cleanup`, `worker_terminal_cleanup_failed`, `worker_shutdown`, `worker_shutdown_failed`, `workflow_activation_completed`, `workflow_completion_diagnostic_failed`, `workflow_activation_rejected`, `workflow_poll_not_ready`, `activity_task_completed`, `activity_async_handoff_accepted`, `activity_poll_not_ready` |
+| `temporal.sdk.workflow` | `execution_created`, `workflow_started`, `workflow_completed`, `workflow_failed`, `workflow_task_failed`, `workflow_query_unhandled`, `workflow_query_completed`, `workflow_query_failed`, `workflow_update_unhandled`, `workflow_signal_unhandled`, `workflow_signal_received`, `workflow_signal_handled`, `workflow_cancelled`, `execution_evicted`, `activation_ignored`, `activate` |
 
 The bridge source emits a completion record for every bridge call and a
 second status record when the typed result is unsuccessful. That second record
@@ -118,7 +120,8 @@ accepted by Temporal:
 | `execution_created` | `Debug` | The SDK allocated the scheduler and workflow context for one execution. This is local state creation, not proof that Temporal accepted a start request. |
 | `workflow_started` | `Info` | A `Start_workflow` activation was accepted and the workflow callback was queued. The callback is run at most once for that execution. |
 | `workflow_completed` | `Info` | Workflow code returned successfully, its output was encoded, and the SDK buffered a terminal completion command. It does not by itself prove that the worker's native completion RPC succeeded. |
-| `workflow_failed` | `Error` | The SDK buffered a terminal failure command for a typed workflow, codec, activation, or bridge error. Inspect `temporal.error_kind`; the event is local failure evidence, not a server-side failure classification. |
+| `workflow_failed` | `Error` | A non-task workflow error caused the SDK to buffer a terminal failure command. Inspect `temporal.error_kind`; the event is local failure evidence, not a server-side failure classification. |
+| `workflow_task_failed` | `Error` | A codec, bridge, or defect error caused the SDK to discard the activation's commands and fail the workflow task. The run remains open for replay or recovery; no terminal workflow failure command is buffered. |
 | `workflow_cancelled` | `Info` | A cancellation activation was received for a non-terminal execution and the SDK is emitting its terminal cancellation command. It does not mean that the server has already observed the completion. |
 | `execution_evicted` | `Debug` | Core asked the SDK to remove an execution from its sticky cache. The execution context is shut down and no workflow commands are produced for that eviction activation. |
 | `activation_ignored` | `Warning` | A later activation arrived for an execution already removed from the cache. The SDK intentionally ignores it and returns no commands; repeated occurrences indicate a stale or out-of-order delivery that needs investigation. |
@@ -128,20 +131,24 @@ Interaction events distinguish admission from handler completion. A matching
 signal emits `workflow_signal_received` when it is queued on the owning
 scheduler and `workflow_signal_handled` only after the handler returns `Ok ()`.
 An absent signal handler emits `workflow_signal_unhandled` and fails the
-workflow; a handler error instead leads to `workflow_failed` without a
-successful handled event. Queries are synchronous and do not fail the
-workflow: `workflow_query_completed` means that the output was encoded,
+workflow task, leaving the run open. A signal handler error emits
+`workflow_failed` for a terminal workflow error or `workflow_task_failed`
+for a task failure, without a successful handled event. Queries are
+synchronous and do not fail the workflow: `workflow_query_completed` means
+that the output was encoded,
 `workflow_query_failed` records a typed handler or encoding error, and
 `workflow_query_unhandled` means that no handler was registered. Each query
 outcome is still returned to the caller as a query response.
 
 The current update event set is deliberately smaller. A missing update handler
 emits `workflow_update_unhandled` at `Error` level and returns a rejected
-update response. Validator or implementation errors also return a rejection,
-but do not currently have separate named workflow log operations; absence of
-`workflow_update_unhandled` must therefore not be read as proof that an update
-was accepted. Acceptance and completion remain protocol responses rather than
-separate log operations so callers can correlate them by
+update response. Ordinary validation or input errors reject the update without
+a separate named workflow log operation. A bridge or defect error in a
+validator or implementation can instead fail the workflow task and emit
+`workflow_task_failed`; an accepted update's codec error can reject its update
+response. Absence of `workflow_update_unhandled` must therefore not be read as
+proof that an update was accepted. Acceptance and completion remain protocol
+responses rather than separate log operations so callers can correlate them by
 `protocol_instance_id`.
 
 ### Native worker lifecycle and completion events
@@ -152,13 +159,14 @@ adapter from a public `Worker.run` or `Worker.shutdown` result:
 
 | Operation | Level | Meaning |
 |---|---|---|
-| `workflow_activation_completed` | `Debug` | The native supervisor accepted a retained workflow completion and the adapter retired that completion. A terminal or eviction completion also removes the corresponding execution from the adapter registry; this is not a server-side workflow-result acknowledgement. |
+| `workflow_activation_completed` | `Debug` | The native supervisor accepted a retained workflow completion and the adapter retired that completion. A task failure or Core eviction removes the execution from the adapter registry; a terminal workflow completion remains available for queries until eviction. This is not a server-side workflow-result acknowledgement. |
+| `workflow_completion_diagnostic_failed` | `Warning` | A diagnostic callback raised after the supervisor accepted a workflow completion. The adapter contains the observer exception, so the completion stays accepted. |
 | `workflow_activation_rejected` | `Warning` | The adapter submitted an SDK-generated failure completion for a malformed or otherwise rejected activation, and the native supervisor accepted that rejection. `temporal.error_kind` identifies the stable reason; a transport failure that leaves the completion pending does not emit this event. |
 | `workflow_task_rejected` | `Warning` | The public worker observed an adapter rejection whose failure completion already retired the workflow lease. The worker loop treats that as progress and continues polling; a rejection that did not retire its lease is returned as a worker error instead. |
 | `worker_run_started` | `Info` | One invocation of `Temporal.Worker.run` acquired the run ownership guard and began polling. It does not mean that a workflow or activity task is currently available. |
 | `worker_run_finished` | `Info` | That polling invocation returned and released the run guard. It may have stopped because shutdown was requested or because the loop returned an error; inspect the public `result` rather than treating this event as success. |
-| `worker_terminal_cleanup` | `Info` | A terminal cleanup attempt obtained a native shutdown result and the adapter then discarded its OCaml-owned maps. It can occur after an earlier public shutdown error because cleanup is the force-release boundary. |
-| `worker_terminal_cleanup_failed` | `Error` | Native terminal cleanup returned an error or raised before its release result was proven. The worker retains the cleanup-pending state and may schedule another detached attempt; inspect `temporal.error_kind` when present. |
+| `worker_terminal_cleanup` | `Info` | A detached cleanup retry received `Ok` from native shutdown. It then attempts to discard its OCaml-owned maps and clear cleanup-pending state. The original public shutdown path does not emit this event. |
+| `worker_terminal_cleanup_failed` | `Error` | Native terminal cleanup returned `Error` or cleanup raised. A returned native error still proves the force-release boundary, so the adapter maps are discarded and cleanup-pending is cleared. An exception leaves cleanup-pending set for later retry or finalization; inspect `temporal.error_kind` when present. |
 | `worker_shutdown` | `Info` | Public worker shutdown drained the adapters and the native supervisor returned `Ok`. Repeated shutdown calls are cached and do not represent new native work. |
 | `worker_shutdown_failed` | `Error` | An unexpected exception escaped the public native-shutdown call before a typed result was returned. This is narrower than every typed shutdown error; the cleanup path is scheduled separately. |
 
