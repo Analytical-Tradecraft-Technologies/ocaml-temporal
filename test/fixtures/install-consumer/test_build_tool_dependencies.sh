@@ -59,7 +59,7 @@ require_lf_attribute() {
 
 for lf_pattern in \
   '.gitattributes' 'Dockerfile*' dune-project '*.opam' '*.opam.locked' \
-  '.github/workflows/*.yml'; do
+  '.github/workflows/*.yml' scripts/opam-lock-overrides.txt; do
   require_lf_attribute "$lf_pattern"
 done
 
@@ -68,15 +68,24 @@ done
 # that clone, so refresh it in the same layer that resolves dependencies. The
 # image installs protoc through apt and copies the pinned Rust toolchain from
 # the official Rust image, so opam must validate the conf packages without
-# attempting or solving their distribution-level depexts.
+# attempting or solving their distribution-level depexts. Release artifacts
+# must be compiled against the audited lock, so the layer installs and checks
+# the exact locked closure rather than re-solving temporal-sdk.opam.
 if ! awk '
   before_previous == "RUN opam repository set-url default https://opam.ocaml.org \\" &&
     previous == "    && opam update \\" &&
-    $0 == "    && opam install --deps-only --with-test --no-depexts -y ." { found = 1 }
+    $0 == "    && sh scripts/opam-locked-deps.sh install --no-depexts" { found = 1 }
   { before_previous = previous; previous = $0 }
   END { exit !found }
 ' "$root/Dockerfile.dev"; then
-  fail "Dockerfile.dev does not use the current HTTPS opam repository before installing dependencies"
+  fail "Dockerfile.dev does not install the locked closure from the current HTTPS opam repository"
+fi
+
+if ! grep -Fx 'COPY --chown=opam:opam temporal-sdk.opam temporal-sdk.opam.locked dune-project ./' \
+    "$root/Dockerfile.dev" >/dev/null ||
+  ! grep -Fx 'COPY --chown=opam:opam scripts/opam-locked-deps.sh scripts/opam-lock-overrides.txt ./scripts/' \
+    "$root/Dockerfile.dev" >/dev/null; then
+  fail "Dockerfile.dev does not copy the lock and its installer into the dependency layer"
 fi
 
 if ! grep -F 'protobuf-compiler \' "$root/Dockerfile.dev" >/dev/null ||
@@ -85,12 +94,36 @@ if ! grep -F 'protobuf-compiler \' "$root/Dockerfile.dev" >/dev/null ||
   fail "Dockerfile.dev does not install the native tools required by its conf packages"
 fi
 
+# Every compiler series in the CI matrix must build from its own ocaml/opam
+# stage pinned to an immutable manifest digest, and no other base reference
+# may name ocaml/opam by tag alone.
+compilers=$(tr -d '\r' <"$root/scripts/ci-matrix.py" |
+  sed -n 's/^COMPILERS = (\(.*\))$/\1/p' | tr -d '",')
+[ -n "$compilers" ] || fail "could not read compiler series from scripts/ci-matrix.py"
+for compiler in $compilers; do
+  series=${compiler%.*}
+  if ! grep -E "^FROM ocaml/opam:debian-12-ocaml-$series@sha256:[0-9a-f]{64} AS ocaml-$series\$" \
+      "$root/Dockerfile.dev" >/dev/null; then
+    fail "Dockerfile.dev has no digest-pinned ocaml-$series stage"
+  fi
+done
+if grep -E 'ocaml/opam:' "$root/Dockerfile.dev" | grep -Ev '@sha256:[0-9a-f]{64}' >/dev/null; then
+  fail "Dockerfile.dev references an ocaml/opam image without a digest"
+fi
+
 for workflow in "$root/.github/workflows/build.yml" "$root/.github/workflows/build-pr.yml"; do
-  if grep -E 'opam install .*--deps-only.*--with-test' "$workflow" |
+  if grep -E 'opam install .*--deps-only' "$workflow" >/dev/null; then
+    fail "$(basename "$workflow") installs unlocked OCaml dependencies"
+  fi
+  if grep -F 'opam-locked-deps.sh install' "$workflow" |
     grep -v -- '--assume-depexts' >/dev/null; then
     fail "$(basename "$workflow") allows conf packages to replace the pinned native toolchain"
   fi
 done
+if [ "$(grep -c 'run: sh scripts/opam-locked-deps.sh install --assume-depexts$' \
+    "$root/.github/workflows/build-pr.yml")" -ne 2 ]; then
+  fail "build-pr.yml native macOS/Windows lanes do not install the locked closure"
+fi
 
 for required_dependency in $required_dependencies; do
   case "$opam_dependencies" in

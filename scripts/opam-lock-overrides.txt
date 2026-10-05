@@ -1,0 +1,18 @@
+# Per-compiler-series exceptions to temporal-sdk.opam.locked.
+#
+# Format: <OCaml MAJOR.MINOR> <locked package> <exact version>
+#
+# temporal-sdk.opam.locked is solved for OCaml 5.2.1. scripts/opam-locked-deps.sh
+# installs every non-compiler package at its locked version on every supported
+# compiler series, except where a line below replaces that version for one
+# series. An entry is permitted only when OPAM metadata makes the locked
+# version uninstallable for that compiler, only for a package already in the
+# lock, and only after `make license-check` has audited the replacement (the
+# licence audit reads this file as well as the lock). Prefer a build-only tool;
+# a replaced runtime library needs an explicit review note here.
+
+# ocamlfind.1.9.8 declares `ocaml < 5.5.0~`. It is a build-only tool that
+# reaches the closure through topkg (the build system of logs and mtime); it is
+# not linked into or redistributed with the SDK. 1.9.9~preview is the only
+# opam-repository release that supports OCaml 5.5. License: MIT.
+5.5 ocamlfind 1.9.9~preview

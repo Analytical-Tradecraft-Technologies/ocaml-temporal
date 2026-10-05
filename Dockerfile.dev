@@ -1,8 +1,23 @@
 ARG RUST_IMAGE=rust:1.98-bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
-ARG OCAML_IMAGE=ocaml/opam:debian-12-ocaml-5.2
+# Select one of the digest-pinned compiler stages below (`ocaml-5.2` through
+# `ocaml-5.5`); the Makefile derives it from OCAML_VERSION. An explicit image
+# reference is still accepted for local experiments, but CI and release lanes
+# only use the named stages so every artifact starts from an immutable image.
+ARG OCAML_IMAGE=ocaml-5.2
 
 FROM ${RUST_IMAGE} AS rust-toolchain
 RUN rustup component add clippy rustfmt
+
+# Supported compiler series, each pinned to an ocaml/opam multi-architecture
+# manifest index (linux/amd64 and linux/arm64 among others). These literal FROM
+# lines are the single source of truth for the OCaml base images and are kept
+# in this form so Dependabot's docker ecosystem can refresh the digests.
+# BuildKit only resolves the stage selected by OCAML_IMAGE. Keep the series in
+# step with scripts/ci-matrix.py.
+FROM ocaml/opam:debian-12-ocaml-5.2@sha256:b06c7348b6ed3e83b5f66267254504a8f066ec9be9c020c30a8e28ce10ab3ef6 AS ocaml-5.2
+FROM ocaml/opam:debian-12-ocaml-5.3@sha256:bbaac53e502f6602013d8967c3a54cfcb898b556f453ab72e8e23966c3c681df AS ocaml-5.3
+FROM ocaml/opam:debian-12-ocaml-5.4@sha256:ba37cf7a29709fa2f19124fda8f4cabdea3156a648276fc98c9d528998ae2e59 AS ocaml-5.4
+FROM ocaml/opam:debian-12-ocaml-5.5@sha256:57f87030c6082e3f46f59988fbf12a84947945baf2974d4567a9dcee85780090 AS ocaml-5.5
 
 FROM ${OCAML_IMAGE}
 
@@ -24,9 +39,12 @@ ENV RUSTUP_HOME=/usr/local/rustup \
 
 USER opam
 WORKDIR /workspace
-COPY --chown=opam:opam temporal-sdk.opam dune-project ./
+COPY --chown=opam:opam temporal-sdk.opam temporal-sdk.opam.locked dune-project ./
+COPY --chown=opam:opam scripts/opam-locked-deps.sh scripts/opam-lock-overrides.txt ./scripts/
+# Install the exact locked closure (minus the image-owned compiler packages)
+# and fail the image build if any installed version differs from the lock.
 RUN opam repository set-url default https://opam.ocaml.org \
     && opam update \
-    && opam install --deps-only --with-test --no-depexts -y .
+    && sh scripts/opam-locked-deps.sh install --no-depexts
 
 CMD ["opam", "exec", "--", "dune", "build"]

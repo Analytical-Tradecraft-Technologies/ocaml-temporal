@@ -2617,3 +2617,17 @@ uploads its bounded synthetic evidence immediately, even on failure. The
 retained protobuf histories also replay offline through the existing private
 Core ABI; this does not introduce a public replay API or establish the broader
 transport-fault/mixed-deployment qualification required by later issues.
+
+## 2026-10-06: Digest-pinned OCaml images and locked OPAM installs (#804)
+
+`Dockerfile.dev` now selects one of four `ocaml/opam` stages (5.2 through 5.5),
+each pinned to its multi-architecture manifest index digest, and the Docker and
+native macOS/Windows artifact lanes install dependencies through
+`scripts/opam-locked-deps.sh` instead of re-solving `temporal-sdk.opam`. The
+script installs every non-compiler package at its locked version, applies only
+the per-series replacements listed in `scripts/opam-lock-overrides.txt`
+(currently `ocamlfind.1.9.9~preview` on OCaml 5.5), and fails on any drift. See
+[Installing the locked OPAM closure](dependencies.md#installing-the-locked-opam-closure).
+Local validation covered the repository contract scripts and a stub-OPAM test
+of the installer; the image builds and native installs are validated by the
+hosted CI matrix.

@@ -59,7 +59,7 @@ driver_pid=''
 # identity are explicit so bind-mounted Dune output has the same ownership in
 # every worker and client process.
 compose() {
-  OCAML_IMAGE=${OCAML_IMAGE:-ocaml/opam:debian-12-ocaml-5.2} \
+  OCAML_IMAGE=${OCAML_IMAGE:-ocaml-5.2} \
     HOST_UID=${HOST_UID:-$(id -u)} HOST_GID=${HOST_GID:-$(id -g)} \
     SMOKE_DRIVER_TIMEOUT_SECONDS=${SMOKE_DRIVER_TIMEOUT_SECONDS:-300} \
     docker compose --project-directory "$fixture" --file "$compose_file" \
