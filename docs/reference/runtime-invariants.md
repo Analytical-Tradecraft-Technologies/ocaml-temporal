@@ -268,7 +268,8 @@ and bridge, read the [documentation guide](../README.md) first.
   update to the Start's shared token, so rejecting that document removes the
   one semantic update without retiring the Start's native completion debt.
 - Native `Not_ready` is represented as `Ok None`. ABI version 2 also exposes
-  bounded `Wait_workflow` and `Wait_activity` readiness operations. Only the
+  bounded `Wait_workflow`, `Wait_activity`, and combined `Wait_any` readiness
+  operations. Only the
   owner-Domain supervisor may invoke them; the C boundary releases the OCaml
   runtime lock while Rust waits, and no workflow fiber or effect scheduler
   invokes or blocks on a native lock, condition variable, or timer.
@@ -279,7 +280,9 @@ and bridge, read the [documentation guide](../README.md) first.
   quiet lane, so a supervisor handler cannot strand a queued shutdown request.
   Only one idle execution lane enters a native wait at a time; the preferred
   lane alternates after each wait, with a one-yield fallback for staggered idle
-  polls. While its sibling is busy or already owns the wait, a lane yields
+  polls. The live worker's native wait is `Wait_any`, so work on either lane
+  ends it and the token holder can never sleep through the sibling's task
+  (#806). While its sibling is busy or already owns the wait, a lane yields
   locally for 10 ms, then retries its nonblocking poll. The poll reports a
   fatal Rust lane error even with no queued task.
 - The workflow execution Domain and capacity-one activity execution Domain

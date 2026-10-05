@@ -303,8 +303,8 @@ type t = {
   workflow_tasks : bool;
       (** [false] for an activity-only worker. Core then runs no workflow
           poller and the Rust workflow lane stays permanently idle, so the run
-          loop skips polling it and spends its native readiness waits on the
-          activity lane instead (#805). *)
+          loop skips polling it (#805). The combined readiness wait never
+          wakes for that idle lane, so it needs no special case there. *)
   closed : bool Atomic.t;
   shutdown_retryable : bool Atomic.t;
       (** [true] while terminal native shutdown has not returned. Adapter maps
@@ -395,26 +395,24 @@ let poll_activity worker =
 
 (** Uses native event readiness only for the one idle lane holding the wait
     token. When its sibling is busy or already waiting, a 10 ms local yield
-    avoids occupying the sole supervisor owner with a wait for the wrong lane.
-    The next poll checks the Rust queue; when both lanes become idle, they
-    alternate native waits with the OCaml runtime lock released.
+    avoids occupying the sole supervisor owner. The next poll checks the Rust
+    queue; when both lanes become idle, they take turns holding the token.
 
-    An activity-only worker's workflow lane never becomes ready, so when that
-    lane holds the token it waits for activity readiness instead. Otherwise
-    every other idle wait would hold the supervisor on a dead lane for the full
-    bounded timeout and delay the next activity task by up to that long. The
-    wait does not consume the task, so the activity lane still takes it. *)
-let wait_for_lane worker ~workflow_lane ~native_wait =
+    The native wait itself observes both lanes ([Wait_any]), whichever lane
+    holds the token. A lane-specific wait held the sole supervisor owner for
+    the full bounded timeout while a task sat on the other lane, so every step
+    of a sequential activity workflow paid one dead wait (#806). A sibling
+    lane's poll queued in the mailbox during the wait runs as soon as it ends.
+    The wait does not consume the task, so the owning lane still takes it; this
+    also covers an activity-only worker, whose idle workflow lane never wakes
+    it. [workflow_lane] therefore matters only for the local yield. *)
+let wait_for_lane worker ~workflow_lane:_ ~native_wait =
   if not native_wait then begin
     Thread.delay 0.01;
     Ok ()
   end
   else
-    let operation : unit Native.operation =
-      if workflow_lane && worker.workflow_tasks then Native.Wait_workflow
-      else Native.Wait_activity
-    in
-    match Native.perform worker.supervisor operation with
+    match Native.perform worker.supervisor Native.Wait_any with
     | Ok () -> Ok ()
     | Error error when is_not_ready error -> Ok ()
     | Error error -> Error (public_native_error "worker readiness wait" error)

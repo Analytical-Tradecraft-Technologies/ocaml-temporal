@@ -16,11 +16,18 @@ complete_workflow : supervisor -> completion -> (unit, error) result
 ```
 
 The concrete `Sdk_supervisor.Native` module instantiates this signature with
-operations on its owner Domain. The public worker loop also uses two private,
-bounded readiness operations (`Wait_workflow` and `Wait_activity`). They do not
-consume a task or return one; they wait for a wake-up from the corresponding
-Rust/Core poll lane. At most one of the two idle execution lanes enters a
-native wait at a time, alternating the preferred lane after each wait. A
+operations on its owner Domain. The public worker loop also uses one private,
+bounded readiness operation, `Wait_any`. It does not consume a task or return
+one; it waits for a wake-up from *either* Rust/Core poll lane. At most one of
+the two idle execution lanes enters this native wait at a time, alternating the
+preferred lane after each wait. Because the wait observes both lanes, which
+lane holds it does not matter for latency: a task arriving on the other lane
+ends the wait at once, and that lane's poll, queued behind the wait in the
+supervisor mailbox, runs next. An earlier lane-specific wait held the sole
+owner for the full bounded timeout while a task sat on the other lane, so every
+step of a sequential activity workflow paid a dead 100 ms wait (#806). The
+lane-specific `Wait_workflow` and `Wait_activity` operations remain for
+bridge tests and replay. A
 nonpreferred lane may claim the free wait after one local deferral if staggered
 polls keep the preferred lane from observing both lanes idle. If its sibling is
 busy or owns the native wait, a lane yields locally for 10 ms and then retries
@@ -209,8 +216,9 @@ workflows, Core runs no workflow poller. Registering neither is rejected as a
 defect before any native allocation. This keeps a workflow-only and an
 activity-only worker on the same task queue from taking, and failing as
 unregistered, tasks meant for each other. For an activity-only worker the run
-loop skips the idle workflow lane and spends its native readiness waits on the
-activity lane. The application
+loop skips the idle workflow lane; the combined readiness wait never wakes for
+that lane, so it cannot hold the supervisor on a lane that has no poller. The
+application
 still owns the final executable: Rust remains a static implementation detail
 behind the private supervisor and no native handle is exposed through the
 public API.
@@ -219,7 +227,7 @@ public API.
 run: the calling Domain polls and executes workflow activations, and one
 dedicated Domain polls and executes activity tasks. Both Domains send native
 operations through the same owner-Domain supervisor mailbox. Each lane waits
-on alternating bounded native readiness operations when both are idle, and
+in turn on the bounded combined readiness operation when both are idle, and
 uses a short local yield while its sibling is busy. A slow activity callback
 therefore cannot hold up an unrelated workflow activation; the activity lane
 has capacity one and cannot poll another activity while its callback or exact
