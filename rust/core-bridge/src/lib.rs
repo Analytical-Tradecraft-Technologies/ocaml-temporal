@@ -5,7 +5,6 @@
 
 mod abi;
 pub mod activity_protocol;
-mod activity_slots;
 mod client_protocol;
 pub mod protocol;
 mod replay_bridge;
