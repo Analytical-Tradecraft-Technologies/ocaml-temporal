@@ -181,7 +181,8 @@ implementation, so it cannot be registered in `Temporal.Worker.create`.
 
 The function above returns an `Error.t` value instead of raising an exception.
 Its `Workflow` category makes the empty name a deliberate business failure:
-the workflow execution fails and `Client.result` reports it. Do not use
+the workflow execution fails and `Temporal.Client.wait` returns its `Failed`
+outcome. Do not use
 `Error.defect` for input validation. A propagated `Defect`, `Bridge`, or
 `Codec` error fails only the current workflow task, which Temporal retries
 while the run stays open so that corrected code can replay it. See
@@ -724,8 +725,11 @@ let process_batch batch =
     process_items batch
 ```
 
-The successor input must be deterministic workflow data. A codec failure is a
-typed failure of the current run; it is not raised as an ordinary exception.
+The successor input must be deterministic workflow data. A codec failure while
+encoding that input is not raised as an ordinary exception and does not end
+the current run: it fails only the current workflow task, emits no
+continue-as-new command, and leaves the run open so corrected code can replay
+it (see [workflow failures](../reference/workflow-failures.md)).
 Calling this function outside a running workflow is programmer misuse and is
 reported as `Invalid_argument`. The private completion protocol represents the
 operation as a terminal `continue_as_new` command with a workflow type and an
