@@ -117,8 +117,34 @@ let test_application_options_survive_cause_diagnostic () =
   assert (contains diagnostic "next_retry_delay=3.000000007s");
   assert (contains diagnostic "activity id=lookup-1")
 
+(** Truncated messages, sources, and stack traces must stay valid UTF-8 (#773).
+    Each field is filled with three-byte characters so that a byte cut
+    at the field limit (2,048, 512, or 1,024 bytes) would split a code point;
+    an invalid result would later be replaced wholesale by a generic workflow
+    failure diagnostic. *)
+let test_truncation_keeps_utf_8 () =
+  let straddling limit =
+    (* No limit is a multiple of three, so each byte cut lands mid-character. *)
+    assert (limit mod 3 <> 0);
+    String.concat "" (List.init ((limit / 3) + 2) (fun _ -> "\xe6\x97\xa5"))
+  in
+  let value =
+    {
+      (layer ~message:(straddling 2048) ~source:(straddling 512)
+         ~info:(Protocol.Terminated { identity = "operator" })
+         ~cause:None)
+      with
+      stack_trace = straddling 1024;
+    }
+  in
+  let diagnostic = Diagnostic.failure_diagnostic value in
+  assert (String.is_valid_utf_8 diagnostic);
+  assert (contains diagnostic "\xe6\x97\xa5...");
+  assert (String.length diagnostic < 2048 + 512 + 1024 + 256)
+
 (** Runs the pure diagnostic regression cases. *)
 let () =
   test_nested_timeout_is_visible ();
   test_depth_is_bounded ();
-  test_application_options_survive_cause_diagnostic ()
+  test_application_options_survive_cause_diagnostic ();
+  test_truncation_keeps_utf_8 ()
