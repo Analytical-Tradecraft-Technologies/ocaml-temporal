@@ -45,6 +45,7 @@ let bridge_status = function
   | Already_started -> "already_started"
   | Retryable -> "retryable"
   | Async_heartbeat_rejected -> "async_heartbeat_rejected"
+  | Resource_exhausted -> "resource_exhausted"
   | Unknown code -> Printf.sprintf "unknown(%d)" code
 
 (** Converts the supervisor's opaque error into a bounded worker diagnostic.

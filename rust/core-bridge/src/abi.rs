@@ -81,6 +81,13 @@ pub const STATUS_RETRYABLE: Status = 13;
 /// is gone. The caller may correct the request or submit a different one. The
 /// name predates terminal operations and is kept for ABI stability.
 pub const STATUS_ASYNC_HEARTBEAT_REJECTED: Status = 14;
+/// A bounded bridge-owned registry for client operations is full, so this
+/// request was not admitted and nothing was sent to Temporal.
+///
+/// Unlike `STATUS_INVALID_STATE`, the client remains connected and usable: the
+/// caller may retry once another of its in-flight operations finishes. The
+/// bounds are `MAX_PENDING_WAITS` and `MAX_PENDING_STARTS`.
+pub const STATUS_RESOURCE_EXHAUSTED: Status = 15;
 
 /// Maximum accepted lifecycle configuration document size.
 const MAX_LIFECYCLE_CONFIG_BYTES: usize = 64 * 1024;
@@ -130,6 +137,9 @@ const MAX_GRACEFUL_SHUTDOWN_MS: u64 = 24 * 60 * 60 * 1_000;
 const CLIENT_WAIT_TIMEOUT: Duration = Duration::from_millis(100);
 /// Bounds retained exact-run observations, including their RPC and page state.
 /// Completed or failed waits release their slot; disconnect cancels all waits.
+/// Waiting on another distinct run at capacity returns
+/// `STATUS_RESOURCE_EXHAUSTED`; concurrent waits on an already retained run
+/// share its slot. The public `Client.wait` documentation repeats this value.
 const MAX_PENDING_WAITS: usize = 64;
 /// Bounds the number of in-flight client starts retained by one supervisor.
 ///
@@ -137,7 +147,9 @@ const MAX_PENDING_WAITS: usize = 64;
 /// request payload until the RPC completes. A finite ceiling prevents a caller
 /// that forgets tickets from turning the supervisor into an unbounded task
 /// registry; the caller can submit more work after polling or closing
-/// completed tickets.
+/// completed tickets. Admission at capacity returns
+/// `STATUS_RESOURCE_EXHAUSTED` before any RPC is issued; the public
+/// `Client.start` documentation repeats this value.
 const MAX_PENDING_STARTS: usize = 64;
 /// Maximum time spent in one wait-ticket ABI call before the owner regains
 /// control of its mailbox and can service lifecycle messages.
@@ -882,8 +894,10 @@ impl Runtime {
         }
         if self.pending_starts.len() >= MAX_PENDING_STARTS {
             return Err(Failure {
-                status: STATUS_INVALID_STATE,
-                message: "too many Temporal workflow starts are pending".to_owned(),
+                status: STATUS_RESOURCE_EXHAUSTED,
+                message: format!(
+                    "too many Temporal workflow starts are pending (limit {MAX_PENDING_STARTS})"
+                ),
             });
         }
 
@@ -1100,8 +1114,10 @@ impl Runtime {
         if !self.pending_waits.contains_key(&request) {
             if self.pending_waits.len() >= MAX_PENDING_WAITS {
                 return Err(Failure {
-                    status: STATUS_INVALID_STATE,
-                    message: "too many Temporal workflow waits are pending".to_owned(),
+                    status: STATUS_RESOURCE_EXHAUSTED,
+                    message: format!(
+                        "too many Temporal workflow waits are pending (limit {MAX_PENDING_WAITS})"
+                    ),
                 });
             }
             self.pending_waits.try_reserve(1).map_err(|_| Failure {

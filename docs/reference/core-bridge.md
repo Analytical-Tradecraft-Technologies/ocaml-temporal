@@ -158,7 +158,8 @@ the entire request, including `request_id`, and share the existing ten-second
 overall deadline. A definitive rejection remains terminal; an unanswered
 request remains uncertain when the deadline expires. Callback-transport tests
 under `tests/support/client_start.rs` cover recovery, request identity,
-non-retryable rejection, and cancellation of a hung request.
+non-retryable rejection, cancellation of a hung request, and the 64-ticket
+admission bound.
 
 The wait request names `namespace`, `workflow_id`, and one concrete `run_id`.
 There is no `follow_runs` escape hatch in the document: the operation always
@@ -173,7 +174,14 @@ still admit shutdown and other lifecycle messages.
 
 At most 64 distinct exact-run observations may be retained per runtime. Calls
 with the same namespace, workflow ID, and run ID share an in-flight future;
-admitting a new identity at capacity returns `INVALID_STATE`. A terminal
+admitting a new identity at capacity returns status `15`
+(`RESOURCE_EXHAUSTED`). That status is reserved for a full bounded
+client-operation registry: nothing was sent to Temporal and the client stays
+connected, so it is distinct from the `INVALID_STATE` returned for a closed
+client or runtime. The same status and bound of 64 apply to outstanding
+asynchronous start tickets. The public adapter maps it to a retryable
+`bridge` error with `error_type` `resource_exhausted`, which
+`Client.is_at_capacity` recognizes. A terminal
 result or error removes its entry before returning to OCaml. A later wait may
 observe the same closed run again through a fresh request; this table is not
 a result cache. Client disconnect and both explicit and finalizer runtime

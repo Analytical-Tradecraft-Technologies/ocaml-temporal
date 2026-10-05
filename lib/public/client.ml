@@ -750,6 +750,15 @@ let workflow_id (handle : ('input, 'output) handle) = handle.workflow_id
 (** Returns the exact server run identity retained by a handle. *)
 let run_id (handle : ('input, 'output) handle) = handle.run_id
 
+(** Recognizes the backend's capacity rejection by its structural fields
+    rather than its diagnostic message, so wording changes cannot alter the
+    classification. *)
+let is_at_capacity error =
+  let view = Error.view error in
+  view.category = `Bridge
+  && (not view.non_retryable)
+  && view.error_type = Some Backend.client_at_capacity_error_type
+
 (** Closes backend resources once and returns the same cached result to later
     shutdown callers.
     Native supervisor shutdown is terminal and cached: even when its result is

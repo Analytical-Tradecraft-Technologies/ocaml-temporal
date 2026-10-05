@@ -379,7 +379,14 @@ let native_status_name = function
   | Bridge.Already_started -> "already_started"
   | Bridge.Retryable -> "retryable"
   | Bridge.Async_heartbeat_rejected -> "async_heartbeat_rejected"
+  | Bridge.Resource_exhausted -> "resource_exhausted"
   | Bridge.Unknown code -> Printf.sprintf "unknown(%d)" code
+
+(** The [Error.error_type] carried by a client operation that the native
+    bridge refused because its bounded pending-start or pending-wait registry
+    was full. The value mirrors gRPC's [RESOURCE_EXHAUSTED] code and is part
+    of the documented [Client.is_at_capacity] contract. *)
+let client_at_capacity_error_type = "resource_exhausted"
 
 (** Converts a supervisor failure to the public bridge/defect vocabulary.
     Backend errors are expected operational failures; a supervisor exception
@@ -387,6 +394,15 @@ let native_status_name = function
     non-retryable. Worker statuses are normalized here as a final defense
     against Core/gRPC diagnostic prose escaping through a client callsite. *)
 let native_supervisor_error = function
+  | Native.Backend { Bridge.status = Bridge.Resource_exhausted; message } ->
+      (* A full bridge registry rejected admission before any RPC, while the
+         client stays connected. The explicit retryable flag and stable
+         [error_type] let callers tell this apart from a closed client
+         without parsing [message]. *)
+      Error.make ~non_retryable:false ~error_type:client_at_capacity_error_type
+        ~category:`Bridge
+        ~message:("native client bridge resource_exhausted: " ^ message)
+        ()
   | Native.Backend { Bridge.status; message } ->
       let message =
         match status with

@@ -301,6 +301,9 @@ fn cancellation_and_disconnect_remain_responsive() {
 }
 
 /// Admission is bounded without blocking an already retained wait at capacity.
+/// The excess wait reports the dedicated retryable capacity status rather than
+/// the invalid-state status used for a closed client, and leaves the client
+/// connected so a later wait succeeds once a slot is released.
 #[test]
 fn pending_wait_capacity_rejects_only_new_executions() {
     let (mut runtime, probe) = connected_runtime(Reply::Pending);
@@ -318,8 +321,9 @@ fn pending_wait_capacity_rejects_only_new_executions() {
             .wait_workflow_json(&request("excess"))
             .unwrap_err()
             .status,
-        STATUS_INVALID_STATE
+        STATUS_RESOURCE_EXHAUSTED
     );
+    assert!(runtime.client.is_some());
     assert_eq!(
         runtime
             .wait_workflow_json(&request("run-0"))

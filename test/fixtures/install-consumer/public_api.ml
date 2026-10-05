@@ -627,6 +627,7 @@ let _client_workflow_id :
   T.Client.workflow_id
 
 let _client_run_id : ('input, 'output) T.Client.handle -> string = T.Client.run_id
+let _client_is_at_capacity : T.Error.t -> bool = T.Client.is_at_capacity
 let _client_shutdown : T.Client.t -> (unit, T.Error.t) result = T.Client.shutdown
 
 let _worker_workflow :

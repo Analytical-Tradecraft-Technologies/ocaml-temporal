@@ -43,6 +43,7 @@ let require_bridge = function
         | Already_started -> "already_started"
         | Retryable -> "retryable"
         | Async_heartbeat_rejected -> "async_heartbeat_rejected"
+        | Resource_exhausted -> "resource_exhausted"
         | Unknown code -> Printf.sprintf "unknown(%d)" code
       in
       failwith (Printf.sprintf "%s: %s" status message)

@@ -15,6 +15,7 @@ type status =
   | Already_started
   | Retryable
   | Async_heartbeat_rejected
+  | Resource_exhausted
   | Unknown of int
 
 (** Error copied into the OCaml heap. Once returned, it contains no pointer to

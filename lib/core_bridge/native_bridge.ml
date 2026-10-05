@@ -15,6 +15,7 @@ type status =
   | Already_started
   | Retryable
   | Async_heartbeat_rejected
+  | Resource_exhausted
   | Unknown of int
 
 (** Error data copied into OCaml. It never owns Rust memory. *)
@@ -252,6 +253,7 @@ let status = function
   | 12 -> Already_started
   | 13 -> Retryable
   | 14 -> Async_heartbeat_rejected
+  | 15 -> Resource_exhausted
   | code -> Unknown code
 
 (** Converts a bridge status to a bounded stable tag value without exposing the
@@ -271,6 +273,7 @@ let status_name = function
   | Already_started -> "already_started"
   | Retryable -> "retryable"
   | Async_heartbeat_rejected -> "async_heartbeat_rejected"
+  | Resource_exhausted -> "resource_exhausted"
   | Unknown _ -> "unknown"
 
 (** Constructs a local configuration failure without entering native code. *)

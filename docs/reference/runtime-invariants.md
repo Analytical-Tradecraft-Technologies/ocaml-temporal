@@ -425,7 +425,10 @@ and bridge, read the [documentation guide](../README.md) first.
   a second native free.
 - Exact-run client waits retain their history future and pagination state
   across bounded owner turns. The runtime admits at most 64 distinct pending
-  executions and retires each on a terminal result or error. Disconnect and
+  executions and at most 64 outstanding start tickets, retiring each on a
+  terminal result or error. Admission beyond either bound returns
+  `Resource_exhausted` without side effects and leaves the client usable; it
+  never reuses `Invalid_state`, which callers treat as a closed graph. Disconnect and
   runtime shutdown cancel all retained futures before releasing Core; no
   background wait task outlives the owner.
 - A backend shutdown result, including `Error`, means the graph has been
