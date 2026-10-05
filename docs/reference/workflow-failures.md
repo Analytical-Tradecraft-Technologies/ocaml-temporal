@@ -12,6 +12,7 @@ complete the same workflow ID and run ID. Applications must no longer use
 | Workflow propagates an expected activity, child, cancellation, or timeout error | Existing terminal failure/cancellation semantics remain |
 | Unexpected body/scheduler/signal exception, or a propagated `Defect`, `Bridge`, or `Codec` error | Failed workflow task, no commands |
 | Workflow result encoder returns an error or raises | Failed workflow task, regardless of the encoder's error category |
+| `Workflow.continue_as_new` input encoder returns an error | Failed workflow task, no continue-as-new command |
 | Missing workflow registration, malformed activation, invalid resolver state, adapter exception before submission | Failed workflow task, no commands |
 | Query lookup, handler, or codec failure | Failed query answer for the original query ID; does not fail the workflow |
 | Missing update handler, input rejection, any validator error (returned in any category, or raised), or deliberate typed handler failure | Rejected update response; does not fail the workflow |

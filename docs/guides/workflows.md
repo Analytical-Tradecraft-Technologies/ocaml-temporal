@@ -157,7 +157,9 @@ let normalize name = String.trim name
 let greeting input =
   let name = normalize input in
   if String.equal name "" then
-    Error (Temporal.Error.defect ~message:"name must not be empty")
+    Error
+      (Temporal.Error.make ~category:`Workflow ~non_retryable:true
+         ~message:"name must not be empty" ())
   else
     Ok ("Hello, " ^ name)
 
@@ -178,6 +180,12 @@ implementation, so it cannot be registered in `Temporal.Worker.create`.
 `result` values; it does not introduce a second effect system.
 
 The function above returns an `Error.t` value instead of raising an exception.
+Its `Workflow` category makes the empty name a deliberate business failure:
+the workflow execution fails and `Client.result` reports it. Do not use
+`Error.defect` for input validation. A propagated `Defect`, `Bridge`, or
+`Codec` error fails only the current workflow task, which Temporal retries
+while the run stays open so that corrected code can replay it. See
+[Workflow task and execution failures](../reference/workflow-failures.md).
 
 ## Update indexed search attributes
 

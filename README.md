@@ -238,7 +238,11 @@ let compose_message name =
   let open Temporal.Result_syntax in
   let name = String.trim name in
   if String.equal name "" then
-    Error (Temporal.Error.defect ~message:"a name is required")
+    (* A [`Workflow] error fails the workflow; [Error.defect] would instead
+       fail only the workflow task and leave the run retrying. *)
+    Error
+      (Temporal.Error.make ~category:`Workflow ~non_retryable:true
+         ~message:"a name is required" ())
   else
     let greeting =
       Temporal.Activity.start render_message ("greeting:" ^ name)
