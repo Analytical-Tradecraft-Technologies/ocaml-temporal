@@ -53,7 +53,9 @@ module Make (Backend : Backend) : sig
   (** [create ~capacity config] starts the owner Domain and creates the backend
       graph on it. [capacity] is the positive number of admitted operations
       which may wait behind the active operation; invalid capacity is a
-      programmer error reported by [Invalid_argument]. *)
+      programmer error reported by [Invalid_argument]. Failure to spawn the
+      owner Domain, for example because the runtime's Domain limit is reached,
+      returns [Supervisor_failed] with the spawn exception. *)
   val create : capacity:int -> Backend.config -> (t, error) result
 
   (** [perform instance operation] blocks an ordinary producer Domain until

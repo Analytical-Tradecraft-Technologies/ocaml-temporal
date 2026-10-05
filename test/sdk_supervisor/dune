@@ -12,3 +12,14 @@
 (test
  (name test_native_lifecycle)
  (libraries temporal_sdk_supervisor temporal_protocol threads))
+
+; Limits the runtime to two Domains so spawn failure is deterministic.
+(test
+ (name test_domain_exhaustion)
+ (modules test_domain_exhaustion)
+ (libraries temporal_sdk_supervisor)
+ (action
+  (setenv
+   OCAMLRUNPARAM
+   d=2
+   (run %{test}))))
