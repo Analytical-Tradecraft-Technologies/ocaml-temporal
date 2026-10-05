@@ -484,10 +484,11 @@ impl Runtime {
         }
         validate_identifier("identity", &config.identity)?;
 
-        let options = ConnectionOptions::new(target)
-            .identity(config.identity)
-            .maybe_metrics_meter(core.telemetry().get_temporal_metric_meter())
-            .build();
+        let options = connection_options(
+            target,
+            config.identity,
+            core.telemetry().get_temporal_metric_meter(),
+        );
         let connection = core
             .tokio_handle()
             .block_on(Connection::connect(options))
@@ -2553,6 +2554,32 @@ impl WorkerConfigInput {
     }
 }
 
+/// SDK name reported to Temporal as the `client-name` RPC header and recorded
+/// in `WorkflowTaskCompleted.sdk_metadata`. Core would otherwise attribute
+/// every OCaml client and worker to the official Rust SDK (`temporal-rust`).
+/// This value is durable in workflow histories, so it must stay stable.
+const SDK_NAME: &str = "temporal-ocaml";
+/// SDK version reported with [`SDK_NAME`]. It is the package version from
+/// `.release-version` in SemVer spelling (`~` becomes `-`); the release
+/// preflight gate rejects a release whose metadata disagrees with it.
+const SDK_VERSION: &str = "0.1.0-rc.1";
+
+/// Builds Core connection options with this SDK's identity rather than Core's
+/// `temporal-rust` default, so server metrics, histories, and the Web UI
+/// attribute calls to the OCaml SDK and its own version.
+fn connection_options(
+    target: temporalio_sdk_core::Url,
+    identity: String,
+    meter: Option<temporalio_common::telemetry::metrics::TemporalMeter>,
+) -> ConnectionOptions {
+    ConnectionOptions::new(target)
+        .identity(identity)
+        .client_name(SDK_NAME.to_owned())
+        .client_version(SDK_VERSION.to_owned())
+        .maybe_metrics_meter(meter)
+        .build()
+}
+
 /// Validates only bridge-owned string invariants before Core sees the value.
 fn validate_identifier(name: &str, value: &str) -> std::result::Result<(), Failure> {
     if value.is_empty() {
@@ -4346,6 +4373,22 @@ mod worker_config_tests {
             failure
                 .message
                 .contains("max_concurrent_workflow_task_polls must be at least 2")
+        );
+    }
+
+    /// Every connection reports this SDK's own name and package version
+    /// instead of Core's `temporal-rust` default (#816).
+    #[test]
+    fn connections_report_ocaml_sdk_identity() {
+        let target = temporalio_sdk_core::Url::parse("http://localhost:7233").unwrap();
+        let options = super::connection_options(target, "worker@host".to_owned(), None);
+        assert_eq!(options.get_client_name(), "temporal-ocaml");
+        assert_eq!(options.get_client_version(), super::SDK_VERSION);
+        assert_eq!(
+            super::SDK_VERSION,
+            include_str!("../../../.release-version")
+                .trim()
+                .replacen('~', "-", 1)
         );
     }
 

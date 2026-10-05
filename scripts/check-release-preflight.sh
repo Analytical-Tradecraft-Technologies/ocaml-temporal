@@ -72,6 +72,11 @@ grep -F 'Community-maintained and unofficial. Not affiliated with or endorsed by
 grep -F "$repository_url" README.md >/dev/null || fail "README repository link is missing"
 grep -Eiq 'experimental|pre-0\.1\.0' README.md || fail "README must identify the package as experimental"
 grep -F 'Apache License' LICENSE >/dev/null || fail "LICENSE is not Apache-2.0"
+# The bridge reports this SDK's version to Temporal on every RPC and in
+# workflow-task completion metadata, using SemVer spelling of the OPAM version.
+sdk_version=$(printf '%s\n' "$version" | sed 's/~/-/')
+grep -F "const SDK_VERSION: &str = \"$sdk_version\";" rust/core-bridge/src/abi.rs >/dev/null ||
+  fail "bridge SDK_VERSION does not match .release-version"
 grep -F "repository = \"$repository_url\"" rust/Cargo.toml >/dev/null ||
   fail "Cargo repository metadata differs"
 grep -F "NAMESPACE = \"$repository_url/sbom/cargo\"" scripts/generate-cargo-sbom.py >/dev/null ||
