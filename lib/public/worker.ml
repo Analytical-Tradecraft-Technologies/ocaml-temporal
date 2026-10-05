@@ -193,9 +193,6 @@ type t = {
   mutable shutdown_result : (unit, Error.t) result option;
 }
 
-(** Stable default identity for worker diagnostics. *)
-let default_identity = "ocaml-temporal-worker"
-
 (** Rejects empty or NUL-containing worker settings before backend allocation. *)
 let validate_name field value =
   if String.equal value "" then
@@ -289,7 +286,7 @@ let resolve_options options max_cached_workflows =
       Options.make ~max_cached_workflows ()
   | None, None -> Ok Options.default
 
-let create ?(identity = default_identity) ?options ?max_cached_workflows
+let create ?identity ?options ?max_cached_workflows
     ~target_url
     ~namespace ~task_queue ~workflows ~activities () =
   match resolve_options options max_cached_workflows with
@@ -322,6 +319,10 @@ let create ?(identity = default_identity) ?options ?max_cached_workflows
                   default_versioning_behavior;
             }
     in
+  (* An omitted identity is derived once per worker as [<pid>@<hostname>] so
+     pollers from different processes are distinguishable in Temporal. This
+     is worker construction, not workflow code, so process state is safe. *)
+  let identity = Temporal_base.Process_identity.resolve identity in
   match validate_name "namespace" namespace with
   | Error error -> Error error
   | Ok () -> (

@@ -72,7 +72,11 @@ type t
     bridge. [max_cached_workflows] optionally bounds Core's sticky workflow
     cache; omitting it preserves the default, while a small positive bound can
     cause explicit cache-eviction activations that the worker acknowledges with
-    an empty completion. *)
+    an empty completion. An explicit [identity] is used unchanged and must be
+    non-empty and NUL-free. When omitted, the
+    identity defaults to [<pid>@<hostname>], matching the official Temporal
+    SDKs, computed once when the worker is created so pollers from different
+    processes are distinguishable in Temporal. *)
 val create :
   ?identity:string ->
   ?options:Options.t ->
