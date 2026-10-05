@@ -181,6 +181,60 @@ for those exact package names, the immutable Core git revision, and a file
 named `LICENSE.txt`; the reviewed upstream license is MIT. See
 [ADR 0001](decisions/0001-temporal-core-c-boundary.md).
 
+That conclusion lives once, as `concluded_license` in
+`scripts/check-cargo-licenses.py`, and the SBOM generator and the notices
+generator below import it rather than repeating the package list. Following
+SPDX 2.3, the Cargo SBOM records what each package declares separately from
+what this project concludes: the six Core packages have `licenseDeclared`
+`NOASSERTION` (Cargo metadata names only a file), `licenseConcluded` `MIT`, and
+a `licenseComments` entry naming the reviewed `LICENSE.txt`. Every other
+package's Cargo expression is used for both fields, with the historical
+`MIT/Apache-2.0` slash rewritten as SPDX `OR`. The SBOM audit rejects a package
+whose concluded license is missing or `NOASSERTION`.
+
+## Third-party notices in release archives
+
+Every release archive contains the Rust bridge, which statically links the
+locked Cargo graph, and the MIT, BSD, ISC, Apache-2.0, Unicode-3.0, and similar
+licenses of those packages require their texts and attributions to accompany
+binary redistribution. `scripts/generate-third-party-notices.py` produces
+`THIRD-PARTY-NOTICES.txt` from `cargo metadata --locked` without any new tool
+dependency: it copies each package's top-level `LICENSE*`, `LICENCE*`,
+`COPYING*`, `COPYRIGHT*`, `NOTICE*`, and `UNLICENSE*` files (and one level of a
+`LICENSES` directory) from the package sources Cargo already downloaded, plus
+the metadata `license_file` (the Core workspace `LICENSE.txt`). The document
+contains this project's `LICENSE`, an inventory of every non-workspace package
+grouped by concluded license, and each distinct text once with the packages
+that use it. Output depends only on the Cargo graph: no checkout path,
+timestamp, or environment value is recorded, and CRLF and trailing whitespace
+are normalized.
+
+Some published crates declare a license in Cargo metadata but omit the file
+(for example the OpenTelemetry, `prost-wkt`, `pbjson`, and `winapi` target
+crates). For those packages only, the generator reproduces the standard text
+from `scripts/license-texts/` (Apache-2.0, MIT, and BSD-3-Clause, taking the
+first satisfiable `OR` branch) and names the copyright holders from Cargo's
+`authors` and `repository` fields. A package with no licence file and no
+satisfiable standard text, an unconcluded license, or a missing declared
+`license_file` fails generation with every affected package listed; no partial
+file is written. The list covers the whole locked graph, including
+platform-specific and build-only packages, so it is a superset of what any
+single platform links.
+
+OCaml packages need no entry: the SDK archive contains only the installed
+`temporal-sdk` package, while the OCaml runtime, `logs`, and `yojson` are
+linked by the application from its own OPAM switch and are not redistributed
+(see the locked OCaml closure table above).
+
+The Release workflow generates the file on the publish runner, audits it
+against the same metadata (every package listed exactly once, every referenced
+text present), and passes it to `scripts/package-release-bridges.py`. Packaging
+rejects a notices file that is not generated or does not embed the project
+`LICENSE`, adds `LICENSE` and `THIRD-PARTY-NOTICES.txt` at the root of every
+bridge and SDK archive, re-reads each archive to confirm both files, and
+publishes the notices as a separate checksummed asset recorded in
+`manifest.json`.
+
 ## CI-only quality tools
 
 The independent quality job installs checksum-verified release artifacts with
