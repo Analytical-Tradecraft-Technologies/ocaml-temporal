@@ -15,6 +15,19 @@ implementation when a later entry documents that work as complete. The
 records the current tested source, named assertions and successful CI job for
 the Temporal acceptance controllers.
 
+## 2026-10-06: Retryable client capacity errors (#796)
+
+The native client's two bounded registries, 64 in-flight starts and 64
+distinct waited runs, now reject excess admissions with a dedicated ABI status
+`15` (`RESOURCE_EXHAUSTED`) instead of reusing `INVALID_STATE`, which callers
+could not tell apart from a closed client. The public adapter returns a
+retryable `bridge` error with `error_type` `resource_exhausted`, recognized by
+the new `Client.is_at_capacity`. Both bounds are documented on `Client.start`
+and `Client.wait`. Rust callback-transport tests prove both bounds, ticket
+reuse at capacity, and re-admission after a slot is freed; an OCaml bridge
+test proves the public classification. The bounds remain fixed; making them
+configurable is left for a follow-up.
+
 ## 2026-10-05: Activity timeout and duration bounds (#812)
 
 `Activity.start`, `start_local`, and `start_handle` reject an explicit zero

@@ -228,6 +228,17 @@ val client_start : client -> start_request -> (start_response, Error.t) result
 (** Waits for the exact workflow/run pair and returns its terminal outcome. *)
 val client_wait : client -> wait_request -> (terminal_result, Error.t) result
 
+(** The [Error.error_type] of a retryable [`Bridge] error returned when the
+    native client's bounded pending-start or pending-wait registry is full.
+    [Client.is_at_capacity] recognizes it. *)
+val client_at_capacity_error_type : string
+
+(** Converts a private supervisor failure into the public error vocabulary.
+    Exposed in this private interface so bridge tests can verify that a full
+    native registry ([Resource_exhausted]) stays distinct from a closed client
+    ([Invalid_state]) without saturating a live Temporal connection. *)
+val native_supervisor_error : Temporal_sdk_kernel.Supervisor.error -> Error.t
+
 (** Scripts a failed or timed-out exact run in the deterministic mock for the
     public [Client.wait] to [Client.follow] regression. This private test seam
     rejects native clients and does not create successor runs. *)

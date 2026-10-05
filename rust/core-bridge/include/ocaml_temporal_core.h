@@ -28,7 +28,10 @@ enum {
   OCAML_TEMPORAL_CORE_STATUS_PROTOCOL = 11,
   OCAML_TEMPORAL_CORE_STATUS_ALREADY_STARTED = 12,
   OCAML_TEMPORAL_CORE_STATUS_RETRYABLE = 13,
-  OCAML_TEMPORAL_CORE_STATUS_ASYNC_HEARTBEAT_REJECTED = 14
+  OCAML_TEMPORAL_CORE_STATUS_ASYNC_HEARTBEAT_REJECTED = 14,
+  /* A bounded client-operation registry is full; the request was not admitted
+     and may be retried after another in-flight operation finishes. */
+  OCAML_TEMPORAL_CORE_STATUS_RESOURCE_EXHAUSTED = 15
 };
 
 /* Rust-owned byte allocation. `{ NULL, 0 }` is the sole empty representation. */
@@ -398,6 +401,8 @@ static_assert(OCAML_TEMPORAL_CORE_STATUS_RETRYABLE == 13,
               "status numbering is part of the ABI");
 static_assert(OCAML_TEMPORAL_CORE_STATUS_ASYNC_HEARTBEAT_REJECTED == 14,
               "status numbering is part of the ABI");
+static_assert(OCAML_TEMPORAL_CORE_STATUS_RESOURCE_EXHAUSTED == 15,
+              "status numbering is part of the ABI");
 static_assert(offsetof(ocaml_temporal_core_buffer, ptr) == 0,
               "buffer pointer must be the first field");
 static_assert(offsetof(ocaml_temporal_core_buffer, len) == sizeof(void *),
@@ -446,6 +451,8 @@ _Static_assert(OCAML_TEMPORAL_CORE_STATUS_ALREADY_STARTED == 12,
 _Static_assert(OCAML_TEMPORAL_CORE_STATUS_RETRYABLE == 13,
                "status numbering is part of the ABI");
 _Static_assert(OCAML_TEMPORAL_CORE_STATUS_ASYNC_HEARTBEAT_REJECTED == 14,
+               "status numbering is part of the ABI");
+_Static_assert(OCAML_TEMPORAL_CORE_STATUS_RESOURCE_EXHAUSTED == 15,
                "status numbering is part of the ABI");
 _Static_assert(offsetof(ocaml_temporal_core_buffer, ptr) == 0,
                "buffer pointer must be the first field");

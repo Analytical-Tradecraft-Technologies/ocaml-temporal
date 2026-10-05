@@ -116,7 +116,14 @@ val create :
     execution/run/task timeout options yet. OCaml workers reject cron and
     nonzero root start delay; do not start those policies from another SDK on
     a queue served by this worker. Server-applied workflow/retry continuation
-    backoff, timeouts, and execution expiration metadata are preserved. *)
+    backoff, timeouts, and execution expiration metadata are preserved.
+
+    The native client keeps at most 64 starts in flight at once. A start
+    beyond that bound is rejected before anything is sent to Temporal, with a
+    retryable error recognized by [is_at_capacity]; the client stays usable
+    and the start may be retried once another one finishes. Retrying a start
+    that is still in flight with the same [request_id] does not use another
+    slot. *)
 val start :
   t ->
   ?request_id:string ->
@@ -145,10 +152,13 @@ val follow :
 
 (** Waits for the exact workflow ID and run ID returned by [start]. Failed,
     timed-out, and continued-as-new outcomes may carry a typed successor;
-    the wait never follows one implicitly. The native client
-    retains at most 64 distinct pending runs; waiting on another run at capacity
-    returns an error. Terminal results and errors free their slots, and client
-    shutdown interrupts pending waits. *)
+    the wait never follows one implicitly.
+
+    The native client retains at most 64 distinct runs being waited on.
+    Concurrent waits on the same run share one slot. Waiting on another run
+    at capacity returns a retryable error recognized by [is_at_capacity]; the
+    client stays usable. Terminal results and errors free their slots, and
+    client shutdown interrupts pending waits. *)
 val wait :
   ('input, 'output) handle ->
   ('output terminal_result, Error.t) result
@@ -278,6 +288,16 @@ val workflow_id : ('input, 'output) handle -> string
 
 (** Returns the server-issued run ID supplied to [start]. *)
 val run_id : ('input, 'output) handle -> string
+
+(** Returns [true] when [error] means the native client refused a [start] or
+    [wait] because its bounded set of in-flight operations was full (64 starts
+    or 64 distinct waited runs). Nothing was sent to Temporal, the client
+    remains connected, and the same call may be retried after another
+    operation on this client finishes, for example with a backoff. Such an
+    error has category [`Bridge], is not marked non-retryable, and has
+    [Error.error_type] [Some "resource_exhausted"]. A closed client or any
+    other failure returns [false]. *)
+val is_at_capacity : Error.t -> bool
 
 (** Shuts down the client graph. Repeated calls are idempotent and return the
     same cached result, including a terminal teardown error, after the first
