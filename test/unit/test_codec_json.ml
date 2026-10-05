@@ -99,6 +99,13 @@ let test_float () =
     [ Float.nan; Float.infinity; Float.neg_infinity ];
   assert (Codec.decode Codec.float (json_payload "3") = Ok 3.0);
   assert (Codec.decode Codec.float (json_payload "-3") = Ok (-3.0));
+  (* Go writes negative zero as the integer literal -0; the sign must survive. *)
+  (match Codec.decode Codec.float (json_payload " -0 ") with
+  | Ok value -> assert (Int64.bits_of_float value = Int64.bits_of_float (-0.0))
+  | Error _ -> failwith "integer literal -0 was rejected as a float");
+  (match Codec.decode Codec.float (json_payload "0") with
+  | Ok value -> assert (Int64.bits_of_float value = Int64.bits_of_float 0.0)
+  | Error _ -> failwith "integer literal 0 was rejected as a float");
   assert (
     Codec.decode Codec.float (json_payload "18446744073709551616")
     = Ok 18446744073709551616.0);

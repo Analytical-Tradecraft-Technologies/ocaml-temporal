@@ -382,12 +382,21 @@ let bool =
     decode. Integer literals are accepted because SDKs such as Go and
     TypeScript write integral floats without a fraction; values beyond 2^53 are
     rounded to the nearest float. A literal too large to represent is rejected
-    rather than decoded as infinity. *)
+    rather than decoded as infinity.
+
+    Go's JSON encoder writes negative zero as the integer literal [-0], which
+    Yojson parses as [`Int 0]. The decoder therefore inspects the payload text
+    for that one case so negative zero keeps its sign across SDKs. *)
 let float =
-  json_conv
-    ~to_json:(fun value -> `Float value)
-    ~of_json:(function
+  make ~encoding:json_encoding
+    ~encode:(fun value -> encode_json_value (`Float value))
+    ~decode:(fun data ->
+      Result.bind (decode_json_value data) (function
       | `Float value -> Ok value
+      | `Int 0
+        when String.starts_with ~prefix:"-" (String.trim (Bytes.to_string data))
+        ->
+          Ok (-0.0)
       | `Int value -> Ok (Float.of_int value)
       | `Intlit literal -> (
           match Float.of_string_opt literal with
@@ -395,4 +404,4 @@ let float =
           | _ ->
               Error
                 (Error.codec ~message:"JSON number is outside the float range"))
-      | _ -> Error (Error.codec ~message:"payload is not a JSON number"))
+      | _ -> Error (Error.codec ~message:"payload is not a JSON number")))
