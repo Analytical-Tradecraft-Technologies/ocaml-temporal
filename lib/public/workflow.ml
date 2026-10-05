@@ -273,7 +273,7 @@ module Info = struct
   let parent info =
     Option.map
       (fun (parent :
-             Temporal_protocol.Workflow_protocol.namespaced_workflow_execution) ->
+             Temporal_sdk_kernel.Workflow_protocol.namespaced_workflow_execution) ->
         {
           namespace = parent.namespace;
           workflow_id = parent.workflow_id;
@@ -285,7 +285,7 @@ module Info = struct
       failure would be a violated internal invariant. *)
   let start_time info =
     Option.map
-      (fun (time : Temporal_protocol.Workflow_protocol.timestamp) ->
+      (fun (time : Temporal_sdk_kernel.Workflow_protocol.timestamp) ->
         match Time.of_unix ~seconds:time.seconds ~nanoseconds:time.nanoseconds with
         | Ok time -> time
         | Error _ ->
