@@ -322,6 +322,18 @@ and bridge, read the [documentation guide](../README.md) first.
   failures, so `Connection`, `Not_ready`, and `Worker` never authorize a
   second completion attempt. The dedicated retry backoff is a 10 ms native
   timer with the OCaml runtime lock released; it is not a readiness signal.
+- Both the workflow and activity adapters record the first completion failure
+  that is not explicitly retryable (a typed error, an exception, or an async
+  handle admission that fails after Core accepted `WillCompleteAsync`) on the
+  retained entry. From then on neither a later `poll`, a second `Worker.run`,
+  nor a shutdown drain submits that completion again; each returns the
+  recorded error without a native call, and only terminal `discard` releases
+  it (issue #843). No workflow completion failure is retryable: the bridge
+  defines `Retryable` only for activity completion, and pinned Core reports
+  only deterministic validation failures from
+  `complete_workflow_activation`, so an identical resubmission could at best
+  fail again and, after a lost acknowledgement, could complete a later
+  activation of the same run.
 - Namespace-bound async heartbeats and async complete/fail/cancel do not
   consume that Core completion lease, so they do not fail closed. An
   uncertain RPC `Connection` keeps the public handle and adapter async lease

@@ -135,6 +135,13 @@ module Source = struct
 
   (** Returns the fixture's fixed diagnostic. *)
   let error_message error = error
+
+  (** This fixture never classifies a completion failure as retryable,
+      matching the production fail-closed workflow source. *)
+  let error_is_retryable _ = false
+
+  (** A raised completion is equally fail-closed. *)
+  let exception_is_retryable _ = false
 end
 
 module Worker = Adapter.Make (Source)

@@ -120,6 +120,13 @@ type fake_supervisor = {
   (* One-shot transient exception used to prove raised completion failures
      retain the same lease and are classified through the source boundary. *)
   raise_next_completion : bool ref;
+  (* One-shot non-retryable rejection. It models a failure after which Core
+     may already have consumed the lease, so the adapter must never resubmit
+     the retained completion (issue #843). *)
+  reject_next_completion_permanently : bool ref;
+  (* One-shot exception that is not classified retryable: an uncertain
+     acknowledgement that must also fail closed. *)
+  raise_next_completion_uncertain : bool ref;
   (* Optional source poll failure, modelling a lower-layer typed rejection. *)
   poll_error : source_error option ref;
 }
@@ -137,6 +144,8 @@ let fake_supervisor () =
     heartbeats = ref [];
     reject_next_completion = ref false;
     raise_next_completion = ref false;
+    reject_next_completion_permanently = ref false;
+    raise_next_completion_uncertain = ref false;
     poll_error = ref None;
   }
 
@@ -209,6 +218,17 @@ module Fake_supervisor = struct
           message = "completion transport unavailable";
           retryable = true;
         }
+    end else if !(supervisor.reject_next_completion_permanently) then begin
+      supervisor.reject_next_completion_permanently := false;
+      Error
+        {
+          code = "core_rejected";
+          message = "completion lease may already be consumed";
+          retryable = false;
+        }
+    end else if !(supervisor.raise_next_completion_uncertain) then begin
+      supervisor.raise_next_completion_uncertain := false;
+      failwith "injected uncertain completion exception"
     end
     else
       let found, remaining =
@@ -917,6 +937,63 @@ let test_transient_completion_exception_does_not_redo_activity () =
   if !(supervisor.leased) <> [] then
     failwith "raised completion retry left lease active"
 
+(** A completion failure that is not explicitly retryable is fail-closed
+    (issue #843): the retained completion is never submitted again, neither by
+    a later poll nor by a shutdown drain, and it keeps blocking new tasks until
+    terminal [discard]. Both a typed rejection and an unclassified exception
+    must follow this rule. *)
+let test_non_retryable_completion_is_never_resubmitted () =
+  List.iter
+    (fun (label, inject) ->
+      let supervisor = fake_supervisor () in
+      let calls = ref 0 in
+      let name = "native_activity_fail_closed_" ^ label in
+      let activity =
+        Temporal.Activity.define ~name ~input:Temporal.Codec.unit
+          ~output:Temporal.Codec.string (fun () ->
+            incr calls;
+            Ok "once")
+      in
+      let start token =
+        start_task ~token:(Bytes.of_string token) ~activity_type:name
+          ~input:[ encode_input Temporal.Codec.unit () ]
+      in
+      enqueue supervisor (start (label ^ "-token"));
+      inject supervisor;
+      let worker = worker supervisor [ Adapter.register activity ] in
+      (* Matches the fail-closed error and returns it for later comparison. *)
+      let expect_refusal context (result : (_, Adapter.error_view) result) =
+        match result with
+        | Error ({ code = "completion_failed"; retryable = false; _ } as error) ->
+            error
+        | Error error ->
+            failwith
+              (Printf.sprintf "%s %s returned the wrong error: %s" label context
+                 error.code)
+        | Ok _ ->
+            failwith (Printf.sprintf "%s %s acknowledged a refused lease" label context)
+      in
+      let first = expect_refusal "poll" (Worker.poll worker) in
+      (* A queued task must not be polled while the refused lease is retained. *)
+      enqueue supervisor (start (label ^ "-next-token"));
+      let again = expect_refusal "second poll" (Worker.poll worker) in
+      let drained = expect_refusal "drain" (Worker.drain worker) in
+      if again <> first || drained <> first then
+        failwith (label ^ " refusal changed its recorded diagnostic");
+      if List.length !(supervisor.completion_attempts) <> 1 then
+        failwith (label ^ " retained completion was submitted more than once");
+      if !calls <> 1 || Queue.length supervisor.queue <> 1 then
+        failwith (label ^ " refused lease allowed further activity execution");
+      Worker.discard worker;
+      match Worker.drain worker with
+      | Ok () -> ()
+      | Error error ->
+          failwith (label ^ " discard left a retained lease: " ^ error.code))
+    [ ("rejected", fun supervisor ->
+        supervisor.reject_next_completion_permanently := true);
+      ("raised", fun supervisor ->
+        supervisor.raise_next_completion_uncertain := true) ]
+
 (** A contextual activity receives the previous attempt's heartbeat details,
     reports a typed progress value through the supervisor, and cannot submit a
     second heartbeat after terminal completion invalidates its context. *)
@@ -1271,6 +1348,7 @@ let () =
   test_cancellation ();
   test_completion_retry_does_not_redo_activity ();
   test_transient_completion_exception_does_not_redo_activity ();
+  test_non_retryable_completion_is_never_resubmitted ();
   test_contextual_heartbeat_lifecycle ();
   test_context_payloads_are_copied ();
   test_context_callback_exception_and_invalidation ();
