@@ -127,6 +127,98 @@ pub fn bridge_task_types() -> WorkerTaskTypes {
     }
 }
 
+/// Upper bound for each phase of releasing a worker whose validation failed.
+///
+/// A worker that never entered the graph has no OCaml-owned tasks, so both
+/// the poll drain and Core's finalizer normally finish in milliseconds. The
+/// bound exists only so a Core regression returns the typed validation error
+/// to `Worker.create` instead of wedging the supervisor Domain forever.
+pub const UNVALIDATED_WORKER_RELEASE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Delay before re-polling after Core reports a non-shutdown poll error while
+/// an unvalidated worker drains, preventing a tight error loop.
+const UNVALIDATED_WORKER_POLL_ERROR_BACKOFF: Duration = Duration::from_millis(10);
+
+/// Releases a Core worker whose namespace validation failed before it was
+/// published into the runtime graph.
+///
+/// The caller transfers sole ownership of the never-published worker; this
+/// function is its only release path. Core's `finalize_shutdown` does not
+/// complete until both `poll_workflow_activation` and `poll_activity_task`
+/// have returned `ShutDown`: the activity manager waits for its poll stream to
+/// observe shutdown, and nobody else will ever poll this worker. Awaiting the
+/// finalizer directly therefore hung `Worker.create` forever (issue #770).
+///
+/// The function initiates shutdown, drives both poll APIs until each reports
+/// `ShutDown`, force-fails any task Core unexpectedly hands out (so no
+/// completion debt blocks finalization), and then finalizes. Each phase is
+/// bounded by [`UNVALIDATED_WORKER_RELEASE_TIMEOUT`]. If the drain or the
+/// finalizer exceeds that bound, the worker is dropped as a last-resort
+/// release so the caller can still return its typed error. Must run inside
+/// the worker's Tokio runtime, because `initiate_shutdown` spawns Core's
+/// deregistration task.
+pub async fn release_unvalidated_worker(worker: Worker) {
+    worker.initiate_shutdown();
+    let drained = tokio::time::timeout(UNVALIDATED_WORKER_RELEASE_TIMEOUT, async {
+        tokio::join!(
+            drain_unvalidated_workflow_polls(&worker),
+            drain_unvalidated_activity_polls(&worker)
+        )
+    })
+    .await
+    .is_ok();
+    if drained {
+        // A timeout drops the finalizer future, and with it the worker.
+        let _ = tokio::time::timeout(
+            UNVALIDATED_WORKER_RELEASE_TIMEOUT,
+            worker.finalize_shutdown(),
+        )
+        .await;
+    }
+}
+
+/// Polls workflow activations on a shut-down, unvalidated worker until Core
+/// reports `ShutDown`. Any activation is force-failed because no OCaml owner
+/// exists to complete it.
+async fn drain_unvalidated_workflow_polls(worker: &Worker) {
+    loop {
+        match worker.poll_workflow_activation().await {
+            Err(PollError::ShutDown) => return,
+            Ok(activation) => {
+                force_fail_undeliverable_workflow(
+                    worker,
+                    &activation.run_id,
+                    "worker validation failed before delivery",
+                )
+                .await;
+            }
+            Err(_) => tokio::time::sleep(UNVALIDATED_WORKER_POLL_ERROR_BACKOFF).await,
+        }
+    }
+}
+
+/// Polls activity tasks on a shut-down, unvalidated worker until Core reports
+/// `ShutDown`. Start-shaped tasks are force-failed; cancellation updates carry
+/// no separate completion debt and are dropped.
+async fn drain_unvalidated_activity_polls(worker: &Worker) {
+    loop {
+        match worker.poll_activity_task().await {
+            Err(PollError::ShutDown) => return,
+            Ok(task) => {
+                if !matches!(task.variant, Some(activity_task::Variant::Cancel(_))) {
+                    force_fail_undeliverable_activity(
+                        worker,
+                        &task.task_token,
+                        "worker validation failed before delivery",
+                    )
+                    .await;
+                }
+            }
+            Err(_) => tokio::time::sleep(UNVALIDATED_WORKER_POLL_ERROR_BACKOFF).await,
+        }
+    }
+}
+
 /// Fatal reason a guarded poll lane stopped before ordinary Core shutdown.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PollLaneError {

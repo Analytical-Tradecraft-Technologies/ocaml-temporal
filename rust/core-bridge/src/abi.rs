@@ -1142,14 +1142,13 @@ impl Runtime {
         })?;
 
         if handle.block_on(worker.validate()).is_err() {
-            {
-                // Core's synchronous shutdown initiation spawns its server
-                // deregistration task, so it needs the same runtime context
-                // as synchronous worker construction.
-                let _runtime_guard = handle.enter();
-                worker.initiate_shutdown();
-            }
-            handle.block_on(worker.finalize_shutdown());
+            // The unpublished worker is released here and nowhere else. Core
+            // finalization requires both poll APIs to observe `ShutDown`, so
+            // the helper drains them under a bound instead of awaiting
+            // `finalize_shutdown` directly, which hung forever (issue #770).
+            // `block_on` supplies the runtime context Core's shutdown
+            // initiation needs to spawn its deregistration task.
+            handle.block_on(crate::worker_bridge::release_unvalidated_worker(worker));
             return Err(Failure {
                 status: STATUS_WORKER,
                 // Validation performs Core/Server work, so its diagnostic is
