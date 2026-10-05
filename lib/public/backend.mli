@@ -1,9 +1,12 @@
 (** The private transport boundary used by the public client and worker.
 
     [mock://] targets use the deterministic in-memory records below for unit
-    tests. HTTP(S) targets are routed through the private supervisor and its
-    Rust/Core protocol; that path uses separate activation/completion semantic
-    values and an explicit native lifecycle. Keeping those representations
+    tests of client and worker plumbing. The mock never executes workflow
+    code: a client wait echoes the start input as the completed output, and
+    worker tasks carry an empty [binary/null] input. HTTP(S) targets are
+    routed through the private supervisor and its Rust/Core protocol; that
+    path uses separate activation/completion semantic values and an explicit
+    native lifecycle. Keeping those representations
     private lets the installed [Temporal] API avoid Rust handles, JSON bytes,
     and transport-specific ownership rules. *)
 
