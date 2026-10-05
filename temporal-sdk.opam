@@ -17,6 +17,7 @@ depends: [
   "conf-protoc"
   "dune" {>= "3.18"}
   "logs" {>= "0.10"}
+  "mtime" {>= "2.1" & with-test}
   "yojson" {>= "3.0"}
 ]
 build: [

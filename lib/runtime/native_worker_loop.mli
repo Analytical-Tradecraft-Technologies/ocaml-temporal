@@ -1,11 +1,8 @@
-(** Private scheduler for the two native worker lanes.
+(** Private scheduler for two independent native worker lanes.
 
-    The workflow and activity adapters own task leases and typed execution.
-    This small module owns only the decision made after one lane has been
-    polled: continue immediately after progress, wait for readiness when both
-    lanes are empty, or apply a bounded wait before retrying a retained native
-    completion. Keeping that policy separate makes it testable with fake lane
-    sources without constructing Rust handles or a Temporal Server. *)
+    The workflow adapter executes on the caller Domain; one activity Domain
+    executes at most one callback at a time. The adapters still serialize their
+    own task leases, and every native operation uses the same supervisor. *)
 
 (** Scheduling summary returned by one lane poll. *)
 type progress =
@@ -14,23 +11,22 @@ type progress =
   | Not_ready
       (** The lane had no work at this instant. *)
   | Retry_pending
-      (** A completion or other explicitly retryable native operation remains
-          pending; the worker must wait before trying the same operation. *)
+      (** The exact retained completion needs a bounded backoff before retry. *)
 
-(** Runs the serialized workflow/activity polling policy until [closed] is
-    observed or a non-retryable lane/wait error is returned.
+(** Runs both lanes until [closed] or a fatal lane result. The activity Domain
+    is joined before returning, so the caller may then safely drain adapters
+    and release the native graph. An error in either lane stops the other through
+    a separate per-run signal; it never changes the worker shutdown flag.
 
-    [wait_for_lane] receives [true] for the workflow readiness lane and [false]
-    for the activity lane. The callback must perform a bounded wait and must
-    not hold an OCaml adapter mutex while it blocks. [retry_pending] receives
-    the same lane flag but must apply a real bounded backoff (normally through
-    the dedicated native supervisor Domain) before the next poll. Retry-pending
-    work always selects its own lane, so a transient completion rejection
-    cannot become a tight loop or be mistaken for ordinary idle state. *)
+    [wait_for_lane] receives [native_wait = true] only when both lanes are idle
+    and this lane holds the single native-wait token. Otherwise it must perform
+    a short bounded local yield without entering the supervisor mailbox.
+    [retry_pending] must apply a real bounded backoff even if unrelated work is
+    ready, so an uncertain completion cannot spin or rerun its callback. *)
 val run :
   closed:(unit -> bool) ->
   poll_workflow:(unit -> (progress, 'error) result) ->
   poll_activity:(unit -> (progress, 'error) result) ->
-  wait_for_lane:(workflow_lane:bool -> (unit, 'error) result) ->
+  wait_for_lane:(workflow_lane:bool -> native_wait:bool -> (unit, 'error) result) ->
   retry_pending:(workflow_lane:bool -> (unit, 'error) result) ->
   (unit, 'error) result

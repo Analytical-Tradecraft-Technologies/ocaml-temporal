@@ -12,6 +12,12 @@ fixture=$(mktemp -d './.temporal-release-ref.XXXXXX')
 trap 'rm -rf "$fixture"' EXIT HUP INT TERM
 git init --bare "$fixture/origin.git" >/dev/null
 git init -b master "$fixture/checkout" >/dev/null
+# Neither short-lived repository may start detached maintenance while the
+# fixture's EXIT trap removes its Git directories.
+git --git-dir="$fixture/origin.git" config maintenance.auto false
+git --git-dir="$fixture/origin.git" config gc.auto 0
+git -C "$fixture/checkout" config maintenance.auto false
+git -C "$fixture/checkout" config gc.auto 0
 git -C "$fixture/checkout" config user.name 'Release test'
 git -C "$fixture/checkout" config user.email 'release-test@example.invalid'
 git -C "$fixture/checkout" config commit.gpgsign false

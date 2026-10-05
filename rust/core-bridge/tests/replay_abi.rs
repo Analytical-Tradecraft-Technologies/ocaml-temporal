@@ -2,8 +2,8 @@ use std::ptr;
 
 use ocaml_temporal_core_bridge::{
     ABI_VERSION, Buffer, Result as AbiResult, Runtime, STATUS_INVALID_ARGUMENT,
-    STATUS_INVALID_STATE, STATUS_NOT_READY, STATUS_OK, STATUS_OUTSTANDING_TASKS, STATUS_PROTOCOL,
-    ocaml_temporal_core_v2_replay_worker_complete_workflow_json,
+    STATUS_INVALID_STATE, STATUS_NOT_READY, STATUS_OK, STATUS_OUTSTANDING_TASKS, STATUS_PANIC,
+    STATUS_PROTOCOL, ocaml_temporal_core_v2_replay_worker_complete_workflow_json,
     ocaml_temporal_core_v2_replay_worker_dispose,
     ocaml_temporal_core_v2_replay_worker_feed_history_json,
     ocaml_temporal_core_v2_replay_worker_finalize,
@@ -12,7 +12,7 @@ use ocaml_temporal_core_bridge::{
     ocaml_temporal_core_v2_replay_worker_start_json,
     ocaml_temporal_core_v2_replay_worker_try_poll_workflow,
     ocaml_temporal_core_v2_replay_worker_wait_workflow, ocaml_temporal_core_v2_result_free,
-    ocaml_temporal_core_v2_runtime_free, ocaml_temporal_core_v2_runtime_new,
+    ocaml_temporal_core_v2_runtime_free, ocaml_temporal_core_v2_runtime_new, test_invoke_panic,
 };
 
 #[path = "support/replay_fixture.rs"]
@@ -521,6 +521,112 @@ fn replay_abi_disposes_a_leased_activation_without_core_failure() {
         unsafe { ocaml_temporal_core_v2_runtime_free(&mut runtime) },
         STATUS_OK
     );
+}
+
+#[test]
+/// A malformed completion after handoff owns an error buffer but must not
+/// consume the activation lease. A synthetic panic in the shared ABI wrapper
+/// must also return a releasable error without crossing C. The same run can
+/// then complete, retire its one-shot lease, and finalize normally; the panic
+/// probe does not inject a failure into Core or replay-worker internals.
+fn replay_abi_retains_lease_after_malformed_completion() {
+    use ocaml_temporal_core_bridge::workflow_protocol::{self, CompletionCommand};
+
+    let mut runtime = new_replay_runtime();
+    let mut result = empty_result();
+    let document = replay_fixture::complete_history_document("workflow-replay-test");
+    assert_eq!(
+        unsafe {
+            ocaml_temporal_core_v2_replay_worker_feed_history_json(
+                runtime,
+                document.as_ptr(),
+                document.len(),
+                &mut result,
+            )
+        },
+        STATUS_OK
+    );
+    assert_status(&mut result, STATUS_OK);
+    assert_eq!(
+        unsafe { ocaml_temporal_core_v2_replay_worker_finish_input(runtime, &mut result) },
+        STATUS_OK
+    );
+    assert_status(&mut result, STATUS_OK);
+
+    let activation = poll_replay_activation(runtime);
+    let semantic = workflow_protocol::decode_activation(
+        std::str::from_utf8(&activation).expect("activation should be UTF-8"),
+    )
+    .expect("activation should decode");
+    let malformed = serde_json::json!({
+        "run_id": semantic.run_id.clone(),
+        "commands": [{"kind": "unknown"}],
+    })
+    .to_string();
+    assert_eq!(
+        unsafe {
+            ocaml_temporal_core_v2_replay_worker_complete_workflow_json(
+                runtime,
+                malformed.as_ptr(),
+                malformed.len(),
+                &mut result,
+            )
+        },
+        STATUS_PROTOCOL
+    );
+    assert!(result.value.ptr.is_null());
+    assert!(!buffer_bytes(&result.error).is_empty());
+    assert_status(&mut result, STATUS_PROTOCOL);
+
+    assert_eq!(unsafe { test_invoke_panic(&mut result) }, STATUS_PANIC);
+    assert!(result.value.ptr.is_null());
+    assert!(!buffer_bytes(&result.error).is_empty());
+    assert_status(&mut result, STATUS_PANIC);
+
+    assert_eq!(
+        unsafe { ocaml_temporal_core_v2_replay_worker_finalize(runtime, &mut result) },
+        STATUS_OUTSTANDING_TASKS
+    );
+    assert_status(&mut result, STATUS_OUTSTANDING_TASKS);
+
+    let completion = workflow_protocol::encode_completion(&workflow_protocol::Completion {
+        run_id: semantic.run_id,
+        commands: vec![CompletionCommand::CompleteWorkflow { result: None }],
+        task_failure: None,
+    })
+    .expect("valid completion should encode");
+    assert_eq!(
+        unsafe {
+            ocaml_temporal_core_v2_replay_worker_complete_workflow_json(
+                runtime,
+                completion.as_ptr(),
+                completion.len(),
+                &mut result,
+            )
+        },
+        STATUS_OK
+    );
+    assert_status(&mut result, STATUS_OK);
+    assert_eq!(
+        unsafe {
+            ocaml_temporal_core_v2_replay_worker_complete_workflow_json(
+                runtime,
+                completion.as_ptr(),
+                completion.len(),
+                &mut result,
+            )
+        },
+        STATUS_PROTOCOL
+    );
+    assert_status(&mut result, STATUS_PROTOCOL);
+
+    complete_follow_up_eviction(runtime);
+    finalize_after_natural_shutdown(runtime);
+    assert_eq!(
+        unsafe { ocaml_temporal_core_v2_runtime_free(&mut runtime) },
+        STATUS_OK
+    );
+    assert!(runtime.is_null());
 }
 
 #[test]

@@ -45,6 +45,9 @@ The remaining reference documents are useful when changing one subsystem:
   build-ID and deployment-based routing options, task-local selected deployment
   metadata, the closed OCaml/Rust JSON contract, and the current evidence
   boundary.
+- [Worker upgrade and rollback rehearsal](reference/worker-upgrade-rollback.md)
+  records the proposed separate-queue cutover, operator stop points, and the
+  live evidence still required before any upgrade claim.
 - [Interactive workflows](reference/interactive-workflows.md) documents the
   experimental typed signal, query, and update definitions, deterministic
   handler dispatcher, and the remaining native-delivery boundary.
@@ -57,6 +60,9 @@ The remaining reference documents are useful when changing one subsystem:
   are recorded in the live two-binary evidence.
 - [OCaml SDK logging](reference/observability.md) documents log sources, tags,
   levels, privacy, and Domain behavior.
+- [Benchmark harness](reference/benchmark-harness.md) documents the first
+  no-server workload, reproducible command, versioned report, and measurement
+  boundary.
 - [Local Temporal stack](reference/local-temporal-stack.md) documents the
   PostgreSQL/Temporal Server Compose fixture and Make targets.
 - [Two-OCaml-binary acceptance design](reference/two-ocaml-binary-e2e-acceptance.md)
@@ -152,7 +158,7 @@ links. Keep current support wording aligned with the v1 policy decision.
 | Layer | Evidence | Important limit |
 | --- | --- | --- |
 | Workflow runtime | Focused tests for typed definitions, scheduling, futures, deterministic time/randomness, conditions and scope hooks; live timer/activity/child waits | Detailed ordering and direct scope cancellation remain focused-test evidence. |
-| Activities | Remote retry/heartbeat/timeout/async paths and local activity success pass live | Callback concurrency, cooperative cancellation observation, local retry/recovery and bounded shutdown remain incomplete. |
+| Activities | Remote retry/heartbeat/timeout/async paths and local activity success pass live | Parallel activity callbacks, cooperative cancellation observation, local retry/recovery and bounded shutdown remain incomplete. |
 | Children and recovery | Live success, failure, explicit cancellation, retry and start rejection; separate controllers prove exact parent/child replay and child failure after replay | Broader policies, races and repeated recovery combinations remain unqualified. |
 | Client/interactions | Named exact-run controls, both query forms, typed updates, direct/external signals and external cancellation pass live, including completed-target signal rejection | Reset/visibility, suspended updates, deadlines and interaction replay/eviction need additional live cases. |
 | Patching and versioning | Live patch-in/deprecation/removal histories; focused legacy/deployment routing support | Dedicated live routing, rollout and arbitrary-history compatibility remain open. |
@@ -198,30 +204,8 @@ Compose file from the repository root.
 
 ### CI lanes
 
-A code pull request runs representative compatibility lanes: Linux amd64 on
-OCaml 5.2 and 5.5, Linux arm64 on OCaml 5.5, macOS ARM64 on OCaml 5.5, the
-quality and dependency-license audits, and the OCaml 5.5 Temporal/PostgreSQL
-smoke. The Windows x64 OCaml 5.5 native lane is enabled when native bridge,
-build/toolchain, workflow, or composite-action configuration changes.
-Documentation-only pull requests still run the standalone license audit; JSON
-protocol schemas under `docs/schemas/` are instead treated as code. A pull
-request that changes only the live acceptance fixture under
-`test/integration/temporal/` runs the license audit and its live smoke rather
-than the representative matrix. A push to `master` and the scheduled run are
-the exhaustive gate: OCaml 5.2–5.5 on both Linux architectures, both OCaml 5.5
-native desktop jobs, quality, license audit, and the live smoke.
-
-When a GitHub Actions run is still `queued`, it has not produced verification
-evidence. The representative local baseline is `make check OCAML_VERSION=5.2`,
-which combines `make verify` with the package/OCaml license audit. Run
-`make quality` separately for the pinned host scanners, and run
-`make native-verify` on a matching Windows or macOS host for the native
-compatibility path. The locked Cargo license scanner is intentionally a single
-CI-only job; `make license-check` does not claim to replace that scanner. Use
-`make test-temporal-integration` only when a real Temporal Server/PostgreSQL
-result is required. These local results are useful interim evidence, but they
-do not turn an unexecuted matrix, platform, or live-server job green; queued
-required checks still need to finish when Actions becomes available.
+See [quality and security gates](reference/quality-gates.md) for the current
+event triggers, CI matrix, required checks, cache policy, and local equivalents.
 
 `make test-temporal-worker-restart-contract` is the Docker-free contract gate:
 it validates the normalized history/replay diagnostic contract, the ordered

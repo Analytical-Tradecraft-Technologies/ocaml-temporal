@@ -19,6 +19,7 @@ SMOKE_CACHE_EVICTION_TIMEOUT_SECONDS ?= 900
 # child timer a process-level budget independent of the ordinary smoke driver.
 SMOKE_PARENT_CHILD_RESTART_TIMEOUT_SECONDS ?= 900
 SMOKE_DRIVER_LOG_FILE := $(TEMPORAL_FIXTURE_DIR)/.smoke-driver.log
+SMOKE_POLL_ISOLATION_LOG_FILE := $(TEMPORAL_FIXTURE_DIR)/.smoke-poll-isolation.log
 SMOKE_CANCELLATION_READY_FILE := $(TEMPORAL_FIXTURE_DIR)/.cancellation-ready
 SMOKE_WORKER_STOPPED_FILE := $(TEMPORAL_FIXTURE_DIR)/.worker-stopped
 SMOKE_REPLAY_DIAGNOSTICS_FILE := $(TEMPORAL_FIXTURE_DIR)/.restart-replay-diagnostics.json
@@ -97,8 +98,25 @@ NATIVE_ENV := CARGO_TARGET_DIR="$(NATIVE_CARGO_TARGET_DIR)"
 QUALITY_CARGO_DENY_VERSION ?= 0.20.2
 QUALITY_CARGO_MACHETE_VERSION ?= 0.9.2
 QUALITY_TYPOS_VERSION ?= 1.48.0
+# Exploratory, no-server benchmark. The report stays under ignored _build by
+# default; callers can retain it elsewhere with BENCH_REPORT.
+BENCH_WARMUP ?= 100
+BENCH_SAMPLES ?= 1000
+BENCH_REPETITIONS ?= 3
+BENCH_SEED ?= 1
+BENCH_HOST_LABEL ?= unspecified
+BENCH_REPORT ?= _build/benchmarks/local-minimal-activation.json
+BENCH_EXECUTABLE ?= bench_local_activation
+BENCH_REPLAY_HISTORY ?= test/integration/temporal/initial_signals/history.replay.json
+BENCH_WARM_REPORT ?= _build/benchmarks/ocaml-warm-cache-activation.json
+BENCH_COLD_REPORT ?= _build/benchmarks/core-cold-replay.json
+BENCH_COLD_WARMUP ?= 1
+BENCH_COLD_SAMPLES ?= 10
+BENCH_COLD_REPETITIONS ?= 3
 
 .PHONY: test-temporal-live-ci test-temporal-diagnostics-contract
+.PHONY: bench bench-activation bench-activation-warm bench-activation-cold
+.NOTPARALLEL: bench-activation
 .PHONY: version-check build build-examples cargo-metadata test test-unit test-runtime test-rust test-bridge test-install test-api release-preflight release-tag-check test-quality-contract test-temporal-config test-temporal-worker-readiness-contract test-temporal-worker-stop-contract test-temporal-worker-crash-recovery-contract test-temporal-worker-cache-eviction-contract test-core-lifecycle-integration temporal-start temporal-start-worker temporal-run-driver temporal-inspect-smoke temporal-stop-worker test-temporal-two-binary test-temporal-integration test-temporal-worker-restart test-temporal-worker-restart-contract test-temporal-worker-restart-live test-temporal-worker-crash-recovery test-temporal-worker-cache-eviction test-temporal-worker-cache-eviction-live test-temporal-workflow-patching test-temporal-workflow-patching-contract test-temporal-workflow-patching-live test-temporal-parent-child-restart test-temporal-parent-child-restart-contract test-temporal-parent-child-restart-live test-temporal-parent-child-failure-replay test-temporal-parent-child-failure-replay-contract test-temporal-parent-child-failure-replay-live temporal-health temporal-status temporal-logs temporal-stop temporal-clean lint lint-rust fmt quality quality-tool-version-check quality-rust quality-spelling license-check audit clean verify check native-version-check native-build native-test native-test-rust native-test-install native-lint native-lint-rust native-verify
 version-check:
 	@output="$$( $(RUN) ocamlc -version )" || exit $$?; \
@@ -123,6 +141,56 @@ build-examples:
 # it into the isolated license scanner without knowing the Compose fixture path.
 cargo-metadata:
 	@$(CARGO) metadata --manifest-path $(CARGO_MANIFEST) --locked --format-version 1
+
+# Runs one selected no-server activation workload in the development container.
+# It deliberately does not start Temporal Server or apply a performance gate.
+bench:
+	@set -eu; \
+	source_commit=$$(git rev-parse HEAD); \
+	if test -z "$$(git status --porcelain)"; then source_dirty=false; else source_dirty=true; fi; \
+	core_revision=$$(awk -F '"' '/^temporalio-sdk-core =/ { print $$4; exit }' rust/Cargo.toml); \
+	test -n "$$core_revision"; \
+	mkdir -p "$(dir $(BENCH_REPORT))"; \
+	report="$(BENCH_REPORT)"; \
+	tmp=$$(mktemp "$$report.tmp.XXXXXX"); \
+	trap 'rm -f "$$tmp"' EXIT HUP INT TERM; \
+	OCAML_IMAGE=$(OCAML_IMAGE) $(COMPOSE) --progress plain build $(SERVICE) >&2; \
+	image_id=$$(docker image inspect --format '{{.Id}}' "$(TEMPORAL_COMPOSE_PROJECT)-$(SERVICE)" 2>/dev/null || true); \
+	if test -z "$$image_id"; then image_id=unavailable; fi; \
+	status=0; \
+	OCAML_IMAGE=$(OCAML_IMAGE) $(COMPOSE) --progress quiet run --rm --user $(HOST_UID):$(HOST_GID) $(SERVICE) env \
+		BENCH_SOURCE_COMMIT="$$source_commit" \
+		BENCH_SOURCE_DIRTY="$$source_dirty" \
+		BENCH_SDK_VERSION="$$(cat .release-version)" \
+		BENCH_CORE_REVISION="$$core_revision" \
+		BENCH_DUNE_PROFILE=release \
+		BENCH_BASE_IMAGE_REFERENCE="$(OCAML_IMAGE)" \
+		BENCH_DEVELOPMENT_IMAGE_ID="$$image_id" \
+		BENCH_HOST_LABEL="$(BENCH_HOST_LABEL)" \
+		BENCH_REPLAY_HISTORY="$(BENCH_REPLAY_HISTORY)" \
+		opam exec -- dune exec --profile release test/benchmark/$(BENCH_EXECUTABLE).exe -- \
+		--warmup "$(BENCH_WARMUP)" --samples "$(BENCH_SAMPLES)" \
+		--repetitions "$(BENCH_REPETITIONS)" --seed "$(BENCH_SEED)" \
+		>"$$tmp" || status=$$?; \
+	if test -s "$$tmp" && python3 -m json.tool "$$tmp" >/dev/null 2>&1; then \
+		mv "$$tmp" "$$report"; \
+		printf 'benchmark report: %s\n' "$$report"; \
+	else \
+		status=1; \
+	fi; \
+	exit "$$status"
+
+# Run the two bounded activation scenarios independently; their timing
+# boundaries and throughput denominators differ and must not be combined.
+bench-activation: bench-activation-warm bench-activation-cold
+
+bench-activation-warm:
+	$(MAKE) bench BENCH_EXECUTABLE=bench_warm_activation BENCH_REPORT="$(BENCH_WARM_REPORT)"
+
+bench-activation-cold:
+	$(MAKE) bench BENCH_EXECUTABLE=bench_cold_replay BENCH_REPORT="$(BENCH_COLD_REPORT)" \
+		BENCH_WARMUP="$(BENCH_COLD_WARMUP)" BENCH_SAMPLES="$(BENCH_COLD_SAMPLES)" \
+		BENCH_REPETITIONS="$(BENCH_COLD_REPETITIONS)"
 
 test:
 	$(MAKE) test-temporal-config
@@ -325,7 +393,8 @@ temporal-stop:
 		"$(SMOKE_RESTART_TERMINAL_HISTORY).describe.json" \
 		"$(SMOKE_RESTART_CONTROLLER_FILE)" "$(SMOKE_CACHE_EVICTION_FILE)" \
 		"$(SMOKE_CACHE_EVICTION_READY_FILE)" "$(SMOKE_CACHE_EVICTION_SECOND_READY_FILE)" \
-		"$(SMOKE_CACHE_EVICTION_DRIVER_LOG_FILE)"
+		"$(SMOKE_CACHE_EVICTION_DRIVER_LOG_FILE)" \
+		"$(SMOKE_POLL_ISOLATION_LOG_FILE)"
 
 temporal-clean:
 	$(TEMPORAL_COMPOSE) down --volumes --remove-orphans
@@ -338,7 +407,8 @@ temporal-clean:
 		"$(SMOKE_RESTART_TERMINAL_HISTORY).describe.json" \
 		"$(SMOKE_RESTART_CONTROLLER_FILE)" "$(SMOKE_CACHE_EVICTION_FILE)" \
 		"$(SMOKE_CACHE_EVICTION_READY_FILE)" "$(SMOKE_CACHE_EVICTION_SECOND_READY_FILE)" \
-		"$(SMOKE_CACHE_EVICTION_DRIVER_LOG_FILE)"
+		"$(SMOKE_CACHE_EVICTION_DRIVER_LOG_FILE)" \
+		"$(SMOKE_POLL_ISOLATION_LOG_FILE)"
 
 # CI uses the same controllers as local acceptance, each with a bounded log
 # wrapper. A failed scenario stops the suite; workflow finalizers upload all
@@ -358,14 +428,19 @@ test-temporal-diagnostics-contract:
 
 test-temporal-integration: test-temporal-config
 	@set -eu; \
+	cleanup_command() { \
+		if [ "$${TEMPORAL_PREBUILT_SMOKE:-0}" = 1 ]; then \
+			timeout --signal=TERM --kill-after=10s 60s "$$@"; \
+		else "$$@"; fi; \
+	}; \
 	cleanup() { \
 		status=$$?; \
 		trap - EXIT HUP INT TERM; \
 		sh test/integration/temporal/scripts/collect-live-diagnostics.sh cleanup || echo "live diagnostic snapshot failed" >&2; \
 		if [ "$$status" -ne 0 ]; then \
-			$(MAKE) temporal-logs || true; \
+			cleanup_command $(MAKE) temporal-logs || true; \
 		fi; \
-		$(MAKE) temporal-clean || true; \
+		cleanup_command $(MAKE) temporal-clean || true; \
 		exit "$$status"; \
 	}; \
 	$(MAKE) temporal-clean; \
@@ -375,6 +450,7 @@ test-temporal-integration: test-temporal-config
 	trap 'exit 143' TERM; \
 	$(MAKE) temporal-start; \
 	$(MAKE) temporal-health; \
+	$(MAKE) test-worker-poll-isolation-live TEMPORAL_CLIENT_TEST_URL=http://temporal:7233; \
 	$(MAKE) test-core-lifecycle-integration; \
 	$(MAKE) temporal-start-worker; \
 	$(MAKE) temporal-run-driver; \
@@ -694,6 +770,35 @@ test-runtime:
 .PHONY: test-client-request-ids-live
 test-client-request-ids-live:
 	$(RUN) dune exec test/integration/client_request_ids/regression.exe -- check $(TEMPORAL_CLIENT_TEST_URL)
+
+# Requires a disposable running Temporal server. One worker runs both lanes;
+# a fresh client reads the exact timer-workflow result while its activity gate
+# remains closed, then the fixture releases and shuts down its worker.
+.PHONY: test-worker-poll-isolation-live
+test-worker-poll-isolation-live:
+	@printf 'poll isolation phase=compose_build status=begin\n' >"$(SMOKE_POLL_ISOLATION_LOG_FILE)"
+	@run_bounded() { \
+		if [ "$${TEMPORAL_PREBUILT_SMOKE:-0}" = 1 ]; then \
+			timeout --signal=TERM --kill-after=10s "$$1" $(MAKE) "$$2"; \
+		else $(MAKE) "$$2"; fi; \
+	}; \
+	status=0; run_bounded 600 test-worker-poll-isolation-live-build || status=$$?; \
+	case "$$status" in 0) outcome=ok ;; 124|137) outcome=timeout ;; *) outcome=failed ;; esac; \
+	printf 'poll isolation phase=compose_build status=%s\n' "$$outcome" >>"$(SMOKE_POLL_ISOLATION_LOG_FILE)"; \
+	[ "$$status" -eq 0 ] || exit "$$status"; \
+	printf 'poll isolation phase=fixture_run status=begin\n' >>"$(SMOKE_POLL_ISOLATION_LOG_FILE)"; \
+	status=0; run_bounded 180 test-worker-poll-isolation-live-run || status=$$?; \
+	case "$$status" in 0) outcome=ok ;; 124|137) outcome=timeout ;; *) outcome=failed ;; esac; \
+	printf 'poll isolation phase=fixture_run status=%s\n' "$$outcome" >>"$(SMOKE_POLL_ISOLATION_LOG_FILE)"; \
+	exit "$$status"
+
+.PHONY: test-worker-poll-isolation-live-build
+test-worker-poll-isolation-live-build:
+	OCAML_IMAGE=$(OCAML_IMAGE) $(COMPOSE) --progress plain build $(SERVICE) >&2
+
+.PHONY: test-worker-poll-isolation-live-run
+test-worker-poll-isolation-live-run:
+	OCAML_IMAGE=$(OCAML_IMAGE) $(COMPOSE) --progress quiet run --rm --user $(HOST_UID):$(HOST_GID) $(SERVICE) env TEMPORAL_NAMESPACE=temporal-sdk-test TEMPORAL_POLL_ISOLATION_LOG_FILE=/workspace/test/integration/temporal/.smoke-poll-isolation.log sh scripts/run-temporal-executable.sh --build-dir=/workspace/_build/worker-poll-isolation test/integration/worker_poll_isolation/regression.exe check $(TEMPORAL_CLIENT_TEST_URL)
 
 lint:
 	$(RUN) dune build @install $(DUNE_BUILD_ARGS)

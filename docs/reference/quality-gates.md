@@ -46,30 +46,35 @@ with checksum validation enabled and fallback installation disabled, and the
 native lanes pin
 [`ocaml/setup-ocaml`](https://github.com/ocaml/setup-ocaml) rather than following
 its mutable `v3` reference. The quality action installs the same exact tool
-versions and then invokes `make quality`. The job runs once for each code pull
-request or merge group and once per scheduled run; it is not repeated for
-every OCaml matrix cell. Documentation-only changes skip the code jobs,
-including the standalone license audit.
+versions and then invokes `make quality`. The job runs once for each pull
+request, merge group, `master` push, scheduled run, or manual Build dispatch;
+it is not repeated for every OCaml matrix cell. Documentation-only PRs run
+this job and the full required build graph.
 
 ## CI matrix policy
 
-PRs and merge groups use a representative compatibility sample: Linux amd64
-on OCaml 5.2 and 5.5, Linux arm64, macOS ARM64, and Windows x64 on OCaml 5.5,
-and a live Temporal/PostgreSQL smoke on Linux amd64 with OCaml 5.5.
-All these jobs and the quality/license jobs share a single changed-code gate.
+The Build workflow runs for every PR and merge group through
+`.github/workflows/build-pr.yml`. A push to `master`, the daily 19:00 UTC
+scheduled run, and a manual dispatch run `.github/workflows/build.yml`, which
+calls the same workflow with the `master` matrix tier.
 
-Markdown and legal-documentation-only changes skip the code jobs. GitHub
-workflows, composite actions, and protocol schemas under `docs/schemas/`
-always count as code. Other paths, including unknown inputs and live test
-fixtures, also trigger all code jobs. The required path-detection job always
-runs; a failed diff fails that job. PRs compare against their merge base to
-exclude unrelated master changes, and merge groups include every queued
-change relative to the group's base. Renames include both old and new paths.
-The separate release metadata/SBOM workflow still runs without compiling code.
+| Event | Linux OCaml matrix | Native OCaml matrix | Other build jobs |
+| --- | --- | --- | --- |
+| PR or merge group | amd64 5.2 and 5.5; arm64 5.5 | macOS ARM64 and Windows x64 on 5.5 | Four Rust producers, quality, standalone license audit, and the live Temporal/PostgreSQL smoke on Linux amd64/5.5 |
+| `master` push, schedule, or manual Build dispatch | amd64 and arm64 on 5.2, 5.3, 5.4, and 5.5 | macOS ARM64 and Windows x64 on 5.5 | The same Rust, quality, license, and live smoke jobs |
 
-Scheduled runs retain the exhaustive OCaml 5.2–5.5 Linux matrix plus both
-native platforms. Intermediate-compiler regressions outside the PR sample
-are caught by the next scheduled run. Pushes to `master` do not run CI.
+The required PR and merge-group graph runs even for documentation-only,
+fixture-only, or empty effective diffs. The `changes` job validates the
+base-to-head comparison and then emits `code=true` for every valid event; a
+failed comparison fails the job. The four Rust producers, Linux and native
+matrices, quality, license audit, and live smoke therefore have no path-based
+skip. PRs compare against their merge base, and merge groups compare against
+the group's base. The separate release metadata/SBOM workflow also runs for
+PRs and merge groups without compiling the SDK.
+
+The broader `master` matrix catches intermediate-compiler regressions outside
+the PR sample. These entries describe configured jobs, not evidence that a
+particular Actions run completed.
 
 ## Rust artifact sharing
 
@@ -109,14 +114,16 @@ build directory.
 The existing required OCaml and live-smoke checks explicitly fail when their
 Rust producers fail. Their job conditions override GitHub's default dependency
 skipping, because a skipped required job would otherwise count as successful.
-Documentation-only PRs retain the existing path-based skips.
+Documentation-only PRs run the same required Rust and OCaml graph.
 
-Only successful Rust producers on scheduled `master` runs save shared
-caches. PR and merge-queue jobs can restore these default-branch caches without
-write credentials. OCaml-only changes therefore reuse the same Rust bundle
-across PR, queue, and scheduled runs even though their commit IDs differ. A change to
-Rust or its build inputs needs a fresh producer on each event until a scheduled run
-seeds the new key. This deliberately does not promote PR artifacts into
+On a cache miss, successful Rust producers save shared caches only on `master`
+pushes or scheduled runs. PR and merge-queue jobs can restore these
+default-branch caches without write credentials. OCaml-only changes therefore
+reuse the same Rust bundle
+across PR, queue, `master` push, and scheduled runs even though their commit IDs
+differ. A change to Rust or its build inputs needs a fresh producer on each
+event until a `master` push or scheduled run seeds the new key. This
+deliberately does not promote PR artifacts into
 master: GitHub scopes PR caches to their merge ref. Cache eviction or a new
 native runner image also causes a normal rebuild. Live dependency-advisory and
 license checks continue independently on every applicable workflow run.
@@ -160,11 +167,11 @@ queued Actions run does not make the local verification boundary ambiguous:
 
 | CI job | Workflow command | Local command | What the local result proves |
 | --- | --- | --- | --- |
-| `verify` | `make verify OCAML_VERSION=<matrix version>` with the verified bridge bundle | `make verify OCAML_VERSION=5.2` (or another locally available image) | Docker-backed OCaml build/lint, bridge/install tests, and repository quality contracts. CI gets Rust validation from its producer; the default local command also runs Rust tests. PRs use the representative cells; scheduled runs use the exhaustive matrix. |
-| `quality` | `make quality` | `make quality` | The pinned native `cargo-deny`, `cargo-machete`, and `typos` scans. The exact binaries must be installed on the host. |
+| `verify` | `make verify OCAML_VERSION=<matrix version>` with the verified bridge bundle | `make verify OCAML_VERSION=5.2` (or another locally available image) | Docker-backed OCaml build/lint, bridge/install tests, and repository quality contracts. CI gets Rust validation from its producer; the default local command also runs Rust tests. PRs use the representative cells; the `master` tier uses the exhaustive matrix. |
+| `quality` | `make test-ci-artifacts`, then `make quality` | `make quality` | CI checks matrix selection and artifact failure cases before running the pinned native `cargo-deny`, `cargo-machete`, and `typos` scans. The exact binaries must be installed on the host. |
 | `license-audit` | `make license-check OCAML_VERSION=5.2`, plus the two isolated Python Cargo-license checks | `make license-check OCAML_VERSION=5.2` | The package/OCaml dependency license policy. The locked Cargo license scanner remains a single CI-only step and is not repeated in the OCaml matrix. |
-| `native` (scheduled) / `native-macos`, `native-windows` (PR) | `make native-verify` | `make native-verify` on a matching native host | The OCaml 5.5 and Rust native link, format, lint, install, and test path. macOS ARM64 runs for every code PR; Windows x64 uses the same code gate; scheduled runs cover both platforms. |
-| `temporal-integration` | `make test-temporal-integration`, `make test-temporal-worker-restart`, `make test-temporal-worker-crash-recovery`, `make test-temporal-worker-cache-eviction`, `make test-temporal-workflow-patching`, `make test-temporal-parent-child-restart`, and `make test-temporal-parent-child-failure-replay` | Run the corresponding target when Docker and network access are available | Seven sequential live controllers reuse one job's checkout/build cache while each owns a fresh Temporal/PostgreSQL lifecycle. The 45-minute CI ceiling includes the bilateral parent/child recovery gates; contract-only results are not live evidence. |
+| `native-macos`, `native-windows` | `make native-verify` | `make native-verify` on a matching native host | The OCaml 5.5 and Rust native link, format, lint, install, and test path. Both platforms run for every PR and merge group and in the `master` tier. |
+| `temporal-integration` | `make test-temporal-start-metadata-live`, `make test-temporal-task-failure-live`, then `make test-temporal-live-ci` | Run the corresponding target when Docker and network access are available | The live CI target runs seven sequential controllers, in addition to the workflow-start metadata and task-failure recovery scenarios. Each owns a fresh Temporal/PostgreSQL lifecycle. The 45-minute CI ceiling includes the bilateral parent/child recovery gates; contract-only results are not live evidence. |
 
 `make check OCAML_VERSION=5.2` is a convenient Docker-backed local baseline:
 it combines `make verify` and `make license-check`. It does not run
