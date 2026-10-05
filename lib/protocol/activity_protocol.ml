@@ -194,16 +194,19 @@ let payload_map path = function
   | _ -> Error (Shared.invalid path "expected JSON object")
 
 (** Encodes a payload map while rejecting keys that are invalid or repeated in
-    OCaml's association-list representation. *)
+    OCaml's association-list representation. The duplicate check is linear in
+    the number of entries. *)
 let payload_map_json path values =
+  let seen = Hashtbl.create (List.length values) in
   let rec loop encoded = function
     | [] -> Ok (`Assoc encoded)
     | (key, value) :: rest ->
         let* _ = Shared.identifier (path ^ ".<key>") (`String key) in
-        if List.exists (fun (existing, _) -> String.equal existing key) encoded then
+        if Hashtbl.mem seen key then
           Error (Shared.invalid path "duplicate payload-map key")
         else
           let* value = Shared.payload_json value in
+          Hashtbl.add seen key ();
           loop ((key, value) :: encoded) rest
   in
   loop [] values

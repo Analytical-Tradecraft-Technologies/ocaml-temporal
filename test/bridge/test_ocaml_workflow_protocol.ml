@@ -1312,6 +1312,52 @@ let test_initialize_header_keys () =
   in
   require_error (Protocol.encode_activation { activation with jobs })
 
+(** Replaces the realistic initialization fixture's headers so payload-map
+    tests can exercise remote-controlled map sizes and keys. *)
+let initialize_with_headers headers =
+  let activation =
+    unwrap
+      (Protocol.decode_activation
+         (fixture [ "valid"; "realistic-initialize.input.json" ]))
+  in
+  match activation.jobs with
+  | Protocol.Initialize_workflow value :: rest ->
+      let context = Option.get value.context in
+      {
+        activation with
+        jobs =
+          Protocol.Initialize_workflow
+            { value with context = Some { context with headers } }
+          :: rest;
+      }
+  | _ -> failwith "fixture must start with initialization"
+
+(** Proves payload-map duplicate detection is linear (#803). A remote client
+    controls header counts, and the former quadratic scan took about ten
+    seconds of supervisor-Domain CPU for 80,000 entries. The CPU bound is
+    deliberately generous so that only the quadratic regression, not runner
+    load, can exceed it. Duplicate keys must still be rejected. *)
+let test_large_payload_map () =
+  let payload : Protocol.payload = { metadata = []; data = Bytes.empty } in
+  let count = 80_000 in
+  let headers = List.init count (fun index -> (Printf.sprintf "h%d" index, payload)) in
+  let started = Sys.time () in
+  let encoded =
+    unwrap (Protocol.encode_activation (initialize_with_headers headers))
+  in
+  let decoded = unwrap (Protocol.decode_activation encoded) in
+  let elapsed = Sys.time () -. started in
+  (match decoded.jobs with
+  | Protocol.Initialize_workflow { context = Some context; _ } :: _ ->
+      if List.length context.headers <> count then
+        failwith "large payload map lost entries"
+  | _ -> failwith "large payload map lost initialization");
+  if elapsed > 5.0 then
+    failwith (Printf.sprintf "large payload map took %.2fs of CPU" elapsed);
+  require_error
+    (Protocol.encode_activation
+       (initialize_with_headers [ ("trace", payload); ("other", payload); ("trace", payload) ]))
+
 (** Proves two server-default-sized payload byte fields, and their base64
     expansion, fit in one validated semantic document. *)
 let test_batched_default_temporal_payloads () =
@@ -1570,6 +1616,7 @@ let () =
   run "failure retryability inheritance" test_failure_retryability_inheritance;
   run "recursive failure depth" test_recursive_failure_depth;
   run "initialize header keys" test_initialize_header_keys;
+  run "large payload map" test_large_payload_map;
   run "batched default Temporal payloads" test_batched_default_temporal_payloads;
   run "required nullable fields" test_required_nullable_fields;
   run "activity retry policy" test_activity_retry_policy
