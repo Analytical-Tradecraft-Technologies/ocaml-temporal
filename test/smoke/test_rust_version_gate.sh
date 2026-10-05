@@ -77,10 +77,10 @@ for banner in "rustc $required.0 (0000000 2025-01-01)" \
   fi
 done
 
-unparseable_rustc=$fake_bin/rustc-unparseable
+unparseable_rustc=$fake_bin/rustc-unparsable
 make_rustc "$unparseable_rustc" "not a compiler"
 status=$(run_build "$unparseable_rustc")
 if [ "$status" -eq 0 ] || [ -e "$temporary_root/cargo-invoked" ]; then
-  echo "bridge build accepted an unparseable rustc version" >&2
+  echo "bridge build accepted an unparsable rustc version" >&2
   exit 1
 fi
