@@ -64,6 +64,12 @@ and bridge, read the [documentation guide](../README.md) first.
   checks the same stream through live execution and offline Core replay.
 - Resolving a future appends its waiters in waiter-registration order.
 - No hash-table traversal determines runnable or command ordering.
+- Per-pending-operation registrations (scheduler teardowns, condition
+  waiters, scope cancellation hooks, future observers) live in
+  `Temporal_base.Ordered_registry`: append and removal are O(1) and every
+  traversal is in explicit registration order. Settling one future therefore
+  costs O(its own registrations), not O(all pending futures), and shutdown
+  still tears down pending futures in creation order (#847).
 - Command sequence numbers are monotonic per execution and begin at one.
 - Commands are returned in emission order.
 

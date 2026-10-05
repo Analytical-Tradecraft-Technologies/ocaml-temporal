@@ -15,6 +15,21 @@ implementation when a later entry documents that work as complete. The
 records the current tested source, named assertions and successful CI job for
 the Temporal acceptance controllers.
 
+## 2026-10-06: Linear-time future settlement (#847)
+
+Settling one future no longer scans every other pending registration. The
+scheduler's teardown ledger, condition waiters, scope cancellation hooks, and
+both runtime and derived future observers now use
+`Temporal_base.Ordered_registry`, an intrusive doubly linked list with O(1)
+append and removal whose traversals follow explicit registration order (no
+hashing). Settling `n` pending futures, releasing `n` condition waiters, or
+unlinking `n` completed scoped operations is therefore O(n) rather than
+O(n²). Resume, teardown, hook, and callback order are unchanged.
+`test/runtime/test_settle_scaling.ml` checks that order and a generous CPU
+budget for 50,000-wide fan-outs, and `test/unit/test_ordered_registry.ml`
+covers the registry contract; focused unit and runtime suites passed locally
+on OCaml 5.4.1.
+
 ## 2026-10-05: Activity timeout and duration bounds (#812)
 
 `Activity.start`, `start_local`, and `start_handle` reject an explicit zero
