@@ -80,8 +80,11 @@ type external_workflow_state = {
 type patch_mode = Active | Deprecated
 
 (** Replay evidence and source-level API mode retained for one durable patch
-    ID. History notification may update [decision] before or after source code
-    selects [mode], while [mode = None] means no local patch call has run yet. *)
+    ID. [mode = None] means no local patch call has run yet; in that state
+    [decision] only records that Core reported the marker and may still be
+    seeded by [notify_has_patch]. Once the first local call selects [mode],
+    [decision] has been returned to (or acted on by) workflow code and is
+    immutable for the rest of this execution. *)
 type patch_state = {
   mutable decision : bool;
   mutable mode : patch_mode option;
@@ -113,7 +116,7 @@ type t = {
      one run to different builds, so replace it before every activation. *)
   mutable activation_deployment_version : (string * string) option;
   (* Replaced before every activation. Patch decisions use this flag only when
-     their ID has not already been fixed for this workflow execution. *)
+     their ID has neither been notified nor consulted in this execution. *)
   mutable activation_is_replaying : bool;
   (* Patch decisions are execution-local durable-language state. A cached
      [false] is as significant as [true], because replay without a marker must
@@ -321,22 +324,35 @@ let set_activation_is_replaying context is_replaying =
     changing a command after the runtime has accepted it. *)
 let snapshot_identifier value = Bytes.to_string (Bytes.of_string value)
 
-(** Applies passive patch metadata before workflow fibers run. Replacing a
-    prior decision is deliberate: a marker reported by Core is authoritative
-    history evidence and must win over any earlier provisional absence. The ID
-    is copied because this execution retains it beyond the activation adapter. *)
+(** Applies passive patch metadata before workflow fibers run. A notification
+    seeds only an ID that workflow code has not consulted yet. Once a local
+    call has fixed the decision it is never replaced: a later notification can
+    only describe a marker recorded after that point (for example by a later
+    task), and flipping an answer the workflow already branched on would make
+    a subsequent call in the same run diverge from the original execution.
+    This mirrors the memoization in Temporal's official SDKs. The ID is copied
+    because this execution retains it beyond the activation adapter. *)
 let notify_has_patch context ~patch_id =
   let patch_id = snapshot_identifier patch_id in
   match Hashtbl.find_opt context.patches patch_id with
+  | Some { mode = Some _; _ } -> ()
   | Some state -> state.decision <- true
   | None ->
       Hashtbl.add context.patches patch_id { decision = true; mode = None }
 
-(** Evaluates one patch operation and emits its Core marker command on every
-    call. Repeated same-mode commands are intentional because Core owns normal
-    marker deduplication. A conflicting mode is rejected before emission:
-    Core retains the first command for an ID, so accepting both would silently
-    make durable deprecation depend on call order. *)
+(** Evaluates one patch operation. The first call for an ID fixes its decision:
+    [true] when a Core notification already reported the marker or the current
+    activation is not replaying, otherwise [false]. A marker command is emitted
+    only while that decision is [true]. Emitting a marker for a [false] replay
+    decision would let Core record a marker contradicting the branch actually
+    taken: during replay Core creates a real [RecordMarker] command for every
+    [SetPatchMarker] and keeps it queued unless later history displaces it.
+
+    Repeated calls with a [true] decision emit repeated same-mode commands;
+    Core skips IDs for which it has already created a marker command. A
+    conflicting mode is rejected before emission: Core retains the first
+    command for an ID, so accepting both would silently make durable
+    deprecation depend on call order. *)
 let call_patch_api context ~patch_id ~mode =
   if context.sealed then
     invalid_arg "Temporal workflow patch API used after workflow execution ended";
@@ -360,10 +376,11 @@ let call_patch_api context ~patch_id ~mode =
         "Temporal workflow patch ID cannot be both active and deprecated in one execution"
   | Some _ -> ()
   | None -> state.mode <- Some mode);
-  context.commands_rev <-
-    Activation.Set_patch_marker
-      { patch_id; deprecated = (mode = Deprecated) }
-    :: context.commands_rev;
+  if state.decision then
+    context.commands_rev <-
+      Activation.Set_patch_marker
+        { patch_id; deprecated = (mode = Deprecated) }
+      :: context.commands_rev;
   state.decision
 
 (** Returns the deterministic branch decision for one active patch ID. *)
@@ -371,8 +388,9 @@ let patched context ~patch_id =
   call_patch_api context ~patch_id ~mode:Active
 
 (** Marks one patch ID as deprecated without exposing a branch decision. The
-    internal decision remains cached so replay state matches [patched], but the
-    public operation exists only to record the marker lifecycle transition. *)
+    internal decision is fixed exactly as for [patched], so replay of a history
+    without the marker emits no deprecated marker, matching Core's "call
+    allowed" outcome and the official SDKs. *)
 let deprecate_patch context ~patch_id =
   ignore (call_patch_api context ~patch_id ~mode:Deprecated)
 

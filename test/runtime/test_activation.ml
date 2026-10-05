@@ -1739,9 +1739,10 @@ let test_continue_as_new_finally_cannot_emit_cancel () =
     (Execution.activate execution [ Activation.Start_workflow ])
 
 (** Exercises the complete per-execution patch decision rule. Live code takes
-    the new branch, replay without a marker takes the old branch, and replay
-    with Core's notification takes the new branch. Repeated calls deliberately
-    emit repeated marker commands for Core to deduplicate. *)
+    the new branch, replay without a marker takes the old branch and emits no
+    marker, and replay with Core's notification takes the new branch. Repeated
+    [true] calls deliberately emit repeated marker commands for Core to
+    deduplicate. *)
 let test_workflow_patch_decisions () =
   let run ~name ~is_replaying ~jobs implementation =
     let definition =
@@ -1777,10 +1778,10 @@ let test_workflow_patch_decisions () =
         Ok ())
   in
   expect "replay absent patch decision" (Some false) !absent_decision;
+  (* A [false] replay decision must not emit a marker: Core would otherwise
+     queue a real RecordMarker that contradicts the legacy branch taken. *)
   (match absent_commands with
-  | Activation.Set_patch_marker
-      { patch_id = "orders.v2"; deprecated = false }
-    :: Activation.Complete_workflow _ :: [] -> ()
+  | [ Activation.Complete_workflow _ ] -> ()
   | _ -> failwith "replay without marker emitted unexpected commands");
   let present_decision = ref None in
   let present_commands =
@@ -1818,11 +1819,72 @@ let test_workflow_patch_decisions () =
         Temporal.Workflow.deprecate_patch ~id:"orders.v2";
         Ok ())
   in
-  match replay_deprecated_commands with
+  (match replay_deprecated_commands with
+  | [ Activation.Complete_workflow _ ] -> ()
+  | _ -> failwith "marker-free replay emitted a deprecated marker");
+  let replay_deprecated_present_commands =
+    run ~name:"patch_deprecated_replay_present" ~is_replaying:true
+      ~jobs:
+        [ Activation.Start_workflow;
+          Activation.Notify_has_patch { patch_id = "orders.v2" } ]
+      (fun () ->
+        Temporal.Workflow.deprecate_patch ~id:"orders.v2";
+        Ok ())
+  in
+  match replay_deprecated_present_commands with
   | [ Activation.Set_patch_marker
         { patch_id = "orders.v2"; deprecated = true };
       Activation.Complete_workflow _ ] -> ()
-  | _ -> failwith "marker-free replay rejected patch deprecation"
+  | _ -> failwith "replay with marker did not emit the deprecated marker"
+
+(** A decision already returned to workflow code is fixed for the run. The
+    first activation replays history without the marker, so [patched] returns
+    [false] and emits nothing. A later activation that carries
+    [NotifyHasPatch] for the same ID (for example because a stale marker was
+    recorded by an earlier SDK release) must not flip later answers, otherwise
+    the second call would take a branch the original run never took. *)
+let test_workflow_patch_decision_is_not_flipped_by_late_notification () =
+  let decisions = ref [] in
+  let definition =
+    Temporal.Workflow.define ~name:"patch_late_notification"
+      ~input:Temporal.Codec.unit ~output:Temporal.Codec.unit (fun () ->
+        let open Temporal.Result_syntax in
+        decisions := [ Temporal.Workflow.patched ~id:"orders.v2" ];
+        let* () = Temporal.Workflow.sleep (Temporal.Duration.of_ms 10L) in
+        decisions := !decisions @ [ Temporal.Workflow.patched ~id:"orders.v2" ];
+        Ok ())
+  in
+  let execution = Execution.start definition () in
+  Execution.set_activation_is_replaying execution true;
+  expect "replayed legacy branch emits only its timer"
+    [ Activation.Start_timer { seq = 1L; milliseconds = 10L } ]
+    (Execution.activate execution [ Activation.Start_workflow ]);
+  expect "replay decision" [ false ] !decisions;
+  Execution.set_activation_is_replaying execution false;
+  (match
+     Execution.activate execution
+       [ Activation.Notify_has_patch { patch_id = "orders.v2" };
+         Activation.Fire_timer { seq = 1L } ]
+   with
+  | [ Activation.Complete_workflow _ ] -> ()
+  | _ -> failwith "late patch notification emitted a marker");
+  expect "late notification did not flip decision" [ false; false ] !decisions;
+  (* A notification that precedes the first local call still seeds the
+     decision, so replay of a marker history keeps taking the new branch. *)
+  let context = Workflow_context_store.create (Scheduler.create ()) in
+  Workflow_context_store.set_activation_is_replaying context true;
+  expect "unnotified replay decision" false
+    (Workflow_context_store.patched context ~patch_id:"orders.absent");
+  Workflow_context_store.notify_has_patch context ~patch_id:"orders.absent";
+  Workflow_context_store.notify_has_patch context ~patch_id:"orders.present";
+  expect "late notification keeps false" false
+    (Workflow_context_store.patched context ~patch_id:"orders.absent");
+  expect "early notification seeds true" true
+    (Workflow_context_store.patched context ~patch_id:"orders.present");
+  match Workflow_context_store.take_commands context with
+  | [ Activation.Set_patch_marker
+        { patch_id = "orders.present"; deprecated = false } ] -> ()
+  | _ -> failwith "patch decisions emitted unexpected commands"
 
 (** One execution may repeat one marker mode but must never emit both active
     and deprecated commands for the same ID. Core retains the first command,
@@ -1953,9 +2015,10 @@ let test_workflow_patch_mode_isolation_and_public_deprecation_snapshot () =
   | _ -> failwith "public deprecation ID mutation changed retained command"
 
 (** Patch state belongs to one workflow execution and patch IDs are copied at
-    the public boundary. A notification in run A must not affect run B, and a
-    caller mutating an unsafe string alias after [patched] returns must not
-    change the emitted durable marker. *)
+    the public boundary. A notification in run A must not affect run B, which
+    replays without a marker and therefore emits none. A caller mutating an
+    unsafe string alias after [patched] returns in live run C must not change
+    the emitted durable marker. *)
 let test_workflow_patch_isolation_and_public_id_snapshot () =
   let decision_a = ref None in
   let definition_a =
@@ -1965,19 +2028,28 @@ let test_workflow_patch_isolation_and_public_id_snapshot () =
         Ok ())
   in
   let decision_b = ref None in
-  let mutable_id = Bytes.of_string "shared.patch" in
-  let aliased_id = Bytes.unsafe_to_string mutable_id in
   let definition_b =
     Temporal.Workflow.define ~name:"patch_run_b" ~input:Temporal.Codec.unit
       ~output:Temporal.Codec.unit (fun () ->
-        decision_b := Some (Temporal.Workflow.patched ~id:aliased_id);
+        decision_b := Some (Temporal.Workflow.patched ~id:"shared.patch");
+        Ok ())
+  in
+  let decision_c = ref None in
+  let mutable_id = Bytes.of_string "shared.patch" in
+  let aliased_id = Bytes.unsafe_to_string mutable_id in
+  let definition_c =
+    Temporal.Workflow.define ~name:"patch_run_c" ~input:Temporal.Codec.unit
+      ~output:Temporal.Codec.unit (fun () ->
+        decision_c := Some (Temporal.Workflow.patched ~id:aliased_id);
         Bytes.set mutable_id 0 'X';
         Ok ())
   in
   let execution_a = Execution.start definition_a () in
   let execution_b = Execution.start definition_b () in
+  let execution_c = Execution.start definition_c () in
   Execution.set_activation_is_replaying execution_a true;
   Execution.set_activation_is_replaying execution_b true;
+  Execution.set_activation_is_replaying execution_c false;
   let commands_a =
     Execution.activate execution_a
       [ Activation.Start_workflow;
@@ -1986,12 +2058,19 @@ let test_workflow_patch_isolation_and_public_id_snapshot () =
   let commands_b =
     Execution.activate execution_b [ Activation.Start_workflow ]
   in
+  let commands_c =
+    Execution.activate execution_c [ Activation.Start_workflow ]
+  in
   expect "patch run A decision" (Some true) !decision_a;
   expect "patch run B decision" (Some false) !decision_b;
+  expect "patch run C decision" (Some true) !decision_c;
   (match commands_a with
   | Activation.Set_patch_marker { patch_id = "shared.patch"; _ } :: _ -> ()
   | _ -> failwith "patch run A did not emit its marker");
-  match commands_b with
+  (match commands_b with
+  | [ Activation.Complete_workflow _ ] -> ()
+  | _ -> failwith "patch run B emitted a marker for a false decision");
+  match commands_c with
   | Activation.Set_patch_marker { patch_id = "shared.patch"; _ } :: _ -> ()
   | _ -> failwith "patch ID mutation changed the emitted marker"
 
@@ -2214,6 +2293,7 @@ let () =
   test_continue_as_new_finally_cannot_emit_cancel ();
   test_workflow_patch_decisions ();
   test_workflow_patch_mode_invariant ();
+  test_workflow_patch_decision_is_not_flipped_by_late_notification ();
   test_workflow_patch_mode_isolation_and_public_deprecation_snapshot ();
   test_workflow_patch_isolation_and_public_id_snapshot ();
   test_incoming_patch_notification_snapshot ();
