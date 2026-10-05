@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/mfow/ocaml-temporal/docs/schemas/bridge/metadata-field.schema.json",
+  "$id": "https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/docs/schemas/bridge/metadata-field.schema.json",
   "title": "Named Temporal metadata payload",
   "description": "One key/value entry used by workflow-start memo and search-attribute collections.",
   "type": "object",

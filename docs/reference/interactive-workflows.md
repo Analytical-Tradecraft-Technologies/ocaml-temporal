@@ -19,18 +19,18 @@ updates have an experimental typed slice: a registered one-input handler may
  suspend on a workflow future; acceptance is emitted before it parks and
  completion is emitted when it resumes. PR #266 provides the first focused live proof of the typed
 signal/condition path; the recorded seventeen-result Compose baseline is
-also covered by the [PR #289 Actions run](https://github.com/mfow/ocaml-temporal/actions/runs/29339077368).
-The [PR #302 Actions run](https://github.com/mfow/ocaml-temporal/actions/runs/29351689638)
+also covered by the [PR #289 Actions run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29339077368).
+The [PR #302 Actions run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29351689638)
 first verifies the later long-backoff extension, and the complete [PR #439
-Actions run](https://github.com/mfow/ocaml-temporal/actions/runs/29824441578)
+Actions run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29824441578)
 retains both paths in its historical baseline. The [current evidence audit](live-acceptance-coverage.md)
 records the later successful source snapshot and the distinction between
 signal-dependent completion and focused tests of already-parked condition wake-up.
-The [PR #406 Actions run](https://github.com/mfow/ocaml-temporal/actions/runs/29557704643)
+The [PR #406 Actions run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29557704643)
 also proves an output-only client query against the exact signal-condition run
-while it is parked. The complete [PR #434 Actions run](https://github.com/mfow/ocaml-temporal/actions/runs/29684113836)
+while it is parked. The complete [PR #434 Actions run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29684113836)
 also proves the typed-input query against that parked run, while the [PR #428
-Actions run](https://github.com/mfow/ocaml-temporal/actions/runs/29676120429)
+Actions run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29676120429)
 proves typed update admission and completion. Suspended update recovery,
 query deadlines and replay/cache-eviction behavior, and broader interaction
 coverage remain future work.
@@ -372,7 +372,7 @@ readiness is observed through its scheduler-safe boundary. Rust never calls an
 OCaml closure. The focused runtime tests prove scheduler delivery, metadata
 retention, and fail-closed handling. PR #266 established the first focused
 live signal/condition acceptance, and the recorded seventeen-result baseline
-is covered by the [PR #289 Actions run](https://github.com/mfow/ocaml-temporal/actions/runs/29339077368).
+is covered by the [PR #289 Actions run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29339077368).
 Native query delivery now uses the same private registration path:
 query IDs, repeated arguments, and headers are retained, handlers run
 synchronously on the owner Domain, and argument arity is checked by the

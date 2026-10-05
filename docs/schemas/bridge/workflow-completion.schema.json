@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/mfow/ocaml-temporal/docs/schemas/bridge/workflow-completion.schema.json",
+  "$id": "https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/docs/schemas/bridge/workflow-completion.schema.json",
   "title": "Workflow completion",
   "description": "A closed successful command batch or a failed workflow task sent from the private OCaml workflow runtime to the Rust Temporal Core bridge.",
   "type": "object",

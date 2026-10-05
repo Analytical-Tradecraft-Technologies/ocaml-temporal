@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/mfow/ocaml-temporal/docs/schemas/bridge/client-error.schema.json",
+  "$id": "https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/docs/schemas/bridge/client-error.schema.json",
   "title": "OCaml Temporal native client error body",
   "description": "Closed JSON error body returned in the ABI error buffer for client start and wait operations. Server diagnostic text is deliberately not copied.",
   "oneOf": [

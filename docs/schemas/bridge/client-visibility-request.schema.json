@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/mfow/ocaml-temporal/schemas/bridge/client-visibility-request.schema.json",
+  "$id": "https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/schemas/bridge/client-visibility-request.schema.json",
   "title": "OCaml Temporal visibility request",
   "type": "object",
   "additionalProperties": false,

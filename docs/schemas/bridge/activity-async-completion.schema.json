@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/mfow/ocaml-temporal/docs/schemas/bridge/activity-async-completion.schema.json",
+  "$id": "https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/docs/schemas/bridge/activity-async-completion.schema.json",
   "title": "Accepted asynchronous activity completion",
   "description": "A terminal completion sent through the namespace-bound client after the worker has accepted will_complete_async. The handoff marker is deliberately not valid here.",
   "type": "object",

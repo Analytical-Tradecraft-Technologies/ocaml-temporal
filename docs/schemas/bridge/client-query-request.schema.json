@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/mfow/ocaml-temporal/docs/schemas/bridge/client-query-request.schema.json",
+  "$id": "https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/docs/schemas/bridge/client-query-request.schema.json",
   "title": "OCaml Temporal native client exact-run query request",
   "description": "Closed JSON document used only by the private Rust client bridge. The request names one exact workflow run and one output-only query. The first public API sends an empty input array; the array remains explicit so a future typed-input query extension can preserve Temporal's normal WorkflowQuery shape.",
   "type": "object",

@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/mfow/ocaml-temporal/blob/master/docs/schemas/bridge/worker-config.schema.json",
+  "$id": "https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/blob/master/docs/schemas/bridge/worker-config.schema.json",
   "title": "OCaml Temporal Core bridge workflow worker configuration",
   "description": "Private, strict workflow-only worker configuration sent from the OCaml supervisor to Rust.",
   "type": "object",

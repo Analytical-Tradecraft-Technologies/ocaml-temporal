@@ -81,7 +81,7 @@ history.
 - `None` and an explicit policy remain distinguishable, which prevents an
   omitted option from being accidentally normalized into a concrete default.
 - Retry behavior is validated and translated. The complete
-  [PR #279 Actions run](https://github.com/mfow/ocaml-temporal/actions/runs/29331237061)
+  [PR #279 Actions run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29331237061)
   live-verifies ordinary, heartbeat-detail, start-to-close-timeout,
   heartbeat-timeout, and non-retryable activity retry delivery. Broader
   activity failure/cancellation behavior and replay acceptance remain

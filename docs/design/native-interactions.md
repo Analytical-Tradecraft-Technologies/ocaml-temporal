@@ -81,19 +81,19 @@ Consequently:
   validation, duplicate-name rejection, and validator ordering locally.
 - The signal transport tests prove the native activation boundary. The first
   focused typed signal/condition acceptance is recorded in the [PR #266
-  Actions run](https://github.com/mfow/ocaml-temporal/actions/runs/29311239247):
+  Actions run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29311239247):
   the driver signals an exact run only after its worker-visible readiness
   marker, and the handler wakes a deterministic condition before returning its
   terminal value. The recorded seventeen-result baseline is also covered by
-  the [PR #289 Actions run](https://github.com/mfow/ocaml-temporal/actions/runs/29339077368).
-  The [PR #302 Actions run](https://github.com/mfow/ocaml-temporal/actions/runs/29351689638)
+  the [PR #289 Actions run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29339077368).
+  The [PR #302 Actions run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29351689638)
   first verifies the later long-backoff extension, and the complete [PR #439
-  Actions run](https://github.com/mfow/ocaml-temporal/actions/runs/29824441578)
+  Actions run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29824441578)
   retains both paths in the current 26-start baseline.
-  The [PR #434 Actions run](https://github.com/mfow/ocaml-temporal/actions/runs/29684113836)
+  The [PR #434 Actions run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29684113836)
   proves both query forms against parked exact runs. Typed update
   admission/completion is live-verified by the [PR #428 Actions
-  run](https://github.com/mfow/ocaml-temporal/actions/runs/29676120429); the
+  run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29676120429); the
   focused scheduler and bridge tests remain the evidence for suspended update
   continuation behavior.
 
@@ -401,8 +401,8 @@ single side accepting a new variant early:
    semantic/runtime slice:** bilateral Core conversion, exact query-ID
    preservation (including Core's `legacy_query` path), output-only and
    exactly-one-input handler dispatch, and rejected extra arguments. Output-only
-   query acceptance is live-verified by [PR #406](https://github.com/mfow/ocaml-temporal/actions/runs/29557704643),
-   and both query forms are live-verified by [PR #434](https://github.com/mfow/ocaml-temporal/actions/runs/29684113836).
+   query acceptance is live-verified by [PR #406](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29557704643),
+   and both query forms are live-verified by [PR #434](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29684113836).
 3. **Implemented bounded milestone:** add `DoUpdate` and `UpdateResponse`
    semantic records, strict JSON/schema validation, pinned-Core conversion,
    immediate and suspended public handler dispatch, replay validator skipping,
@@ -418,9 +418,9 @@ single side accepting a new variant early:
    PostgreSQL to cover suspended update continuations, query deadlines, and
    replay/cache-eviction behavior through the two OCaml binaries. The current
    typed query path is live-verified in the [PR #434 Actions
-   run](https://github.com/mfow/ocaml-temporal/actions/runs/29684113836), and
+   run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29684113836), and
    typed update admission/completion is live-verified in [PR
-   #428](https://github.com/mfow/ocaml-temporal/actions/runs/29676120429).
+   #428](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29676120429).
    Record recovery and deadline results separately from the existing
    acceptance evidence.
 

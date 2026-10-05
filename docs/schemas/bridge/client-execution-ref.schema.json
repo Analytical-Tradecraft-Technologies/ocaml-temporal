@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/mfow/ocaml-temporal/docs/schemas/bridge/client-execution-ref.schema.json",
+  "$id": "https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/docs/schemas/bridge/client-execution-ref.schema.json",
   "title": "OCaml Temporal execution reference",
   "description": "One exact Temporal execution identity. Runtime validators additionally enforce a 65,536-byte UTF-8 safety limit for each identifier; maxLength is the corresponding character-count bound expressible in standard JSON Schema.",
   "type": "object",

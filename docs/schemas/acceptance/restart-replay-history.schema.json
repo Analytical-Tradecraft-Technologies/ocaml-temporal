@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/mfow/ocaml-temporal/docs/schemas/acceptance/restart-replay-history.schema.json",
+  "$id": "https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/docs/schemas/acceptance/restart-replay-history.schema.json",
   "title": "Normalized worker restart/replay history",
   "description": "A payload-free projection of one Temporal workflow history used by the restart/replay acceptance controller. The adapter that obtains this document must use a strict JSON parser and preserve the server event order and event IDs. Terminal-stage validation additionally requires this document to extend the exact event prefix captured by the initial-stage document; that cross-document relationship is enforced by the validator, not by this standalone schema.",
   "type": "object",

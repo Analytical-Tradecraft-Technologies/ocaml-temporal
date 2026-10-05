@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/mfow/ocaml-temporal/docs/schemas/bridge/client-start-request.schema.json",
+  "$id": "https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/docs/schemas/bridge/client-start-request.schema.json",
   "title": "OCaml Temporal native client start request",
   "description": "Closed JSON document used only by the private Rust client bridge. Runtime validators also enforce 65,536-byte UTF-8 string limits, duplicate-key rejection, NUL-free identifiers, canonical payload encoding, and whole-document resource bounds. maxLength is the character-count bound expressible in standard JSON Schema; the runtime byte limit remains authoritative.",
   "type": "object",

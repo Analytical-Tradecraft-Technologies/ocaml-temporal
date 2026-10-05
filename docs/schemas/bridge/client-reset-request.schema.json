@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/mfow/ocaml-temporal/docs/schemas/bridge/client-reset-request.schema.json",
+  "$id": "https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/docs/schemas/bridge/client-reset-request.schema.json",
   "title": "OCaml Temporal native client exact-run reset request",
   "description": "Closed JSON document used only by the private Rust client bridge. The event boundary is a signed Temporal workflow-task finish event ID and must be greater than 1. Runtime validators also reject duplicate keys, NUL bytes, and strings over the 65,536-byte safety limit; maxLength is the character-count bound expressible in standard JSON Schema.",
   "type": "object",

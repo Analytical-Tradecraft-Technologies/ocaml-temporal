@@ -34,7 +34,7 @@ The live gate, which requires Docker, PostgreSQL, and Temporal Server, is:
 make test-temporal-parent-child-failure-replay-live
 ```
 
-The [complete PR #361 CI run](https://github.com/mfow/ocaml-temporal/actions/runs/29475615866)
+The [complete PR #361 CI run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29475615866)
 passed the supported OCaml and native-platform matrix and the Temporal /
 PostgreSQL live gate. That live smoke verified replay before failure, the
 typed child failure, and the recovered parent result. The source-only contract

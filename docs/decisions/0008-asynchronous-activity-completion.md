@@ -1,7 +1,7 @@
 # ADR 0008: Asynchronous activity completion boundary
 
 - Status: implemented; normal delayed completion is live-verified in the
-  complete [PR #279 Actions run](https://github.com/mfow/ocaml-temporal/actions/runs/29331237061),
+  complete [PR #279 Actions run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29331237061),
   while Core response-flag handling and broader edge cases remain pending
 - Date: 2026-07-13
 - Decision owners: OCaml Temporal maintainers
@@ -178,7 +178,7 @@ reviewable:
    client requests, rejection of `will_complete_async` on that endpoint,
    duplicate/unknown fields, malformed tokens, payload limits, and canonical
    re-encoding.
-4. **Live Compose acceptance.** The complete [PR #279 Actions run](https://github.com/mfow/ocaml-temporal/actions/runs/29331237061)
+4. **Live Compose acceptance.** The complete [PR #279 Actions run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29331237061)
    verifies the two-OCaml-binary stack's delayed asynchronous completion,
    timeout, cancellation, and graceful-shutdown integration paths. Focused
    fake-supervisor tests remain authoritative for duplicate completion and

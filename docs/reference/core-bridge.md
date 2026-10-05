@@ -129,7 +129,7 @@ This plumbing is unit-tested native evidence plus the implemented acceptance
 controller. The public C/OCaml replay operation remains separate work. The
 two-generation Docker Compose restart target now proves the exact run, replay
 marker, terminal result, and fresh PostgreSQL-volume cleanup in the [PR #253
-Actions run](https://github.com/mfow/ocaml-temporal/actions/runs/29286560471).
+Actions run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29286560471).
 
 ## Native client start and exact-run wait
 

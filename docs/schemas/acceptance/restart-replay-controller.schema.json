@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/mfow/ocaml-temporal/docs/schemas/acceptance/restart-replay-controller.schema.json",
+  "$id": "https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/docs/schemas/acceptance/restart-replay-controller.schema.json",
   "title": "Worker restart/replay controller evidence",
   "description": "A payload-free, ordered record of the lifecycle observations emitted by the two-generation Temporal restart/replay controller. The live controller records the exact workflow identity, initial and terminal history checks, graceful or forced worker replacement, replay marker, graceful teardown, and PostgreSQL volume removal.",
   "type": "object",

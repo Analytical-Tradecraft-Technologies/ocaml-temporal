@@ -9,6 +9,12 @@ version in SemVer spelling (`0.1.0-rc.1`), recorded as `SDK_VERSION` in
 `rust/core-bridge/src/abi.rs`; the preflight gate and a Rust unit test reject a
 mismatch with `.release-version`.
 
+Every repository link, including JSON schema `$id` values, uses the canonical
+`https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal` URL. The
+preflight gate rejects any tracked file that still uses the pre-transfer
+location, because GitHub's transfer redirect is not permanent and published
+schema identifiers cannot change later.
+
 ## Build coverage and artifact reuse
 
 All event types call the graph in `.github/workflows/build-pr.yml`:

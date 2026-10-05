@@ -255,7 +255,7 @@ input, and optional retry policy represented by the protocol. Core child options
 not yet exposed by the OCaml runtime remain explicit defaults, but the two child
 resolution activations are decoded and validated losslessly. Start and
 terminal events share one Core sequence; only that exact pair is accepted. The
-complete [PR #289 Compose run](https://github.com/mfow/ocaml-temporal/actions/runs/29339077368)
+complete [PR #289 Compose run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29339077368)
 live-verifies the initial workflow/activity success path, exact-run
 cancellation, heartbeat and timeout behavior, one parent awaiting a successful
 child result, child failure/cancellation, one server-managed activity retry,
@@ -301,7 +301,7 @@ focused supervisor tests cover operation admission, bounded waits, and
 idempotent shutdown; bridge tests cover the C/Rust readiness and null/error
 paths; and the Rust task-ledger tests cover exact lease identity, conversion
 rejection, and retirement ordering. The complete [PR #289 Compose
-run](https://github.com/mfow/ocaml-temporal/actions/runs/29339077368) also
+run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29339077368) also
 verifies timer, remote-activity, parent/child success, propagated child
 failure, and child cancellation against a real Temporal Server. Dedicated
 restart/replay, cache-eviction, patching, and parent/child recovery gates add

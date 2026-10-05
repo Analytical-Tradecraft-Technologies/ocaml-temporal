@@ -55,6 +55,18 @@ git archive --format=tar HEAD | tar -x -C "$fixture"
     echo "release preflight accepted stale package repository metadata" >&2
     exit 1
   fi
+  # Documentation and schema identifiers must not use the former location
+  # either, even when package metadata is correct.
+  git checkout -q HEAD~1 -- temporal-sdk.opam
+  former_owner=mfow
+  printf '\n[CI](https://github.com/%s/ocaml-temporal/actions)\n' \
+    "$former_owner" >> docs/README.md
+  git add temporal-sdk.opam docs/README.md
+  git -c commit.gpgSign=false commit -q -m 'stale documentation link'
+  if sh scripts/check-release-preflight.sh . >/dev/null 2>&1; then
+    echo "release preflight accepted a stale repository URL in documentation" >&2
+    exit 1
+  fi
 )
 
 if grep -F '"maintenance","run","--auto"' "$git_trace" >/dev/null; then

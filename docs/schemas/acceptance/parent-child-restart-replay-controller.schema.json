@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/mfow/ocaml-temporal/docs/schemas/acceptance/parent-child-restart-replay-controller.schema.json",
+  "$id": "https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/docs/schemas/acceptance/parent-child-restart-replay-controller.schema.json",
   "title": "Parent-child restart-replay controller evidence",
   "description": "A payload-free, closed chronology for one parent workflow and its child. It records the initial durable snapshots, complete replacement of the generation-one worker, replay observations for both roles, terminal history checks, and PostgreSQL volume removal. The executable validator pins all role, identity, container, and ordering relationships that JSON Schema cannot express alone.",
   "type": "object",

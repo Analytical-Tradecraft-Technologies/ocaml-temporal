@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/mfow/ocaml-temporal/docs/schemas/acceptance/parent-child-restart-replay-history.schema.json",
+  "$id": "https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/docs/schemas/acceptance/parent-child-restart-replay-history.schema.json",
   "title": "Normalized parent-child restart-replay history",
   "description": "Payload-free projection of one parent or child Temporal history. The projection retains exact execution identities and only the child lifecycle references needed to prove that a restarted worker replayed the same parent-child relationship. The executable validator enforces role-specific ordering, cross-history linkage, and exact initial-prefix preservation.",
   "type": "object",
