@@ -199,12 +199,46 @@ fn take_all_outstanding_drains_workflow_and_activity_debt() {
         Ok(Admission::New)
     );
     let (workflows, activities) = ledger.take_all_outstanding();
-    assert_eq!(workflows, vec!["run-1".to_owned()]);
+    assert_eq!(workflows, vec![("run-1".to_owned(), false)]);
     assert_eq!(activities, vec![token.to_vec()]);
     assert_eq!(ledger.outstanding(), 0);
     assert!(!ledger.can_finalize()); // still Open, not Draining
     ledger.begin_draining();
     assert!(ledger.can_finalize());
+}
+
+/// The disposal snapshot reports which leased runs are pure cache evictions,
+/// so dispose acknowledges them empty instead of failing them (issue #775).
+/// An unleased entry reports `false`; dispose takes its bit from the queued
+/// activation instead.
+#[test]
+fn take_all_outstanding_reports_leased_eviction_bits() {
+    let mut ledger = TaskLedger::new();
+    assert_eq!(ledger.admit_workflow("evicted-run"), Ok(Admission::New));
+    assert_eq!(
+        ledger.lease_workflow_activation("evicted-run", true),
+        Ok(())
+    );
+    assert_eq!(ledger.admit_workflow("task-run"), Ok(Admission::New));
+    assert_eq!(ledger.lease_workflow_activation("task-run", false), Ok(()));
+    assert_eq!(ledger.admit_workflow("queued-run"), Ok(Admission::New));
+
+    let (mut workflows, activities) = ledger.take_all_outstanding();
+    workflows.sort();
+    assert_eq!(
+        workflows,
+        vec![
+            ("evicted-run".to_owned(), true),
+            ("queued-run".to_owned(), false),
+            ("task-run".to_owned(), false),
+        ]
+    );
+    assert!(activities.is_empty());
+    assert!(!ledger.is_eviction_lease("evicted-run"));
+    assert_eq!(
+        ledger.admit_polled_workflow("evicted-run"),
+        Err(AdmitError::Retired)
+    );
 }
 
 /// A poll already in Core can finish after the first dispose drain has emptied
@@ -224,7 +258,7 @@ fn post_join_dispose_pass_harvests_late_poll_admissions() {
     // This models the first force-complete pass, which runs before the poll
     // lanes join so Core can observe shutdown without waiting for OCaml.
     let (initial_workflows, initial_activities) = ledger.take_all_outstanding();
-    assert_eq!(initial_workflows, vec!["initial-run".to_owned()]);
+    assert_eq!(initial_workflows, vec![("initial-run".to_owned(), false)]);
     assert_eq!(initial_activities, vec![initial_token.to_vec()]);
 
     // A same-identity poll racing after the snapshot is rejected before the
@@ -251,7 +285,7 @@ fn post_join_dispose_pass_harvests_late_poll_admissions() {
     );
 
     let (late_workflows, late_activities) = ledger.take_all_outstanding();
-    assert_eq!(late_workflows, vec!["late-run".to_owned()]);
+    assert_eq!(late_workflows, vec![("late-run".to_owned(), false)]);
     assert_eq!(late_activities, vec![late_token.to_vec()]);
     assert_eq!(ledger.outstanding(), 0);
     assert_eq!(
@@ -286,7 +320,10 @@ fn disposal_snapshot_queue_boundary_retires_workflow_and_activity_once() {
     // Snapshot phase: both initial identities become retired before any late
     // poll result can be reconciled.
     let (initial_workflows, initial_activities) = ledger.take_all_outstanding();
-    assert_eq!(initial_workflows, vec!["initial-dispose-run".to_owned()]);
+    assert_eq!(
+        initial_workflows,
+        vec![("initial-dispose-run".to_owned(), false)]
+    );
     assert_eq!(initial_activities, vec![initial_token.to_vec()]);
     assert_eq!(
         ledger.admit_polled_workflow("initial-dispose-run"),

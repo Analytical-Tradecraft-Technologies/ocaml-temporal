@@ -669,7 +669,15 @@ had to be force-completed, the worker is still released but shutdown returns
 `OUTSTANDING_TASKS`. The garbage-collection fallback cannot obtain missing
 language completions. On the dedicated cleanup thread it force-fails
 outstanding Core tasks, joins the poll lanes with the same bounded drain, and
-attempts the same bounded finalization;
+attempts the same bounded finalization. Its force-completion acknowledges a
+pure cache eviction (leased or queued) empty and fails every other activation,
+and it tombstones each completed run ID until the lanes join. Core answers
+each such failure with a same-run eviction; the workflow poll lane
+acknowledges a retired run's eviction empty instead of dropping it as a
+duplicate, because Core keeps at most one activation outstanding per run and
+reports `ShutDown` only after that eviction is completed. Dropping it made
+runtime close wait out the whole drain bound and release an unfinalized
+worker (issue #775);
 it drops an undrained worker only if finalization still fails. This preserves
 memory ownership and collector progress, while explicit supervisor shutdown
 remains the required graceful path.
