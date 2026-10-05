@@ -442,19 +442,14 @@ let validate_reset_fields ~request_id ~reason ~workflow_task_finish_event_id =
       Error (Error.defect ~message:"reset reason must not contain NUL")
   | Ok () -> Ok ()
 
-(** Derives an idempotency key for an omitted reset request ID from the exact
-    execution identity. Taking copied identity fields rather than a particular
-    public handle keeps this private helper independent of record-label
-    inference: workflow and update handles deliberately share those labels,
-    but only a workflow handle is accepted by [reset]. The run and event
-    boundary make retries of one logical reset stable while distinct reset
-    points cannot alias one another. *)
-let generated_reset_request_id ~workflow_id ~run_id event_id =
-  "ocaml-client-reset-"
-  ^ Digest.to_hex
-      (Digest.string
-         (workflow_id ^ "\000" ^ run_id ^ "\000"
-        ^ Int64.to_string event_id))
+(** Allocates a fresh request ID for a reset whose caller did not supply one.
+    Resetting the same run at the same event again is a legitimate operator
+    action (for example when the first successor also went wrong), so each
+    call must be a distinct server request; a key derived from the run and
+    event would make the server silently return the earlier successor. Callers
+    that need idempotent retries of one logical reset, for example after an
+    uncertain transport result, pass an explicit [request_id]. *)
+let generated_reset_request_id = Temporal_base.Client_request_id.create
 
 (** Resets one exact run and returns the new execution identity. A successful
     acknowledgement does not imply the new run has completed; use [follow] and
@@ -473,9 +468,7 @@ let reset ?request_id ?(reason = "") ~workflow_task_finish_event_id
         let request_id =
           match request_id with
           | Some request_id -> request_id
-          | None ->
-              generated_reset_request_id ~workflow_id:handle.workflow_id
-                ~run_id:handle.run_id workflow_task_finish_event_id
+          | None -> generated_reset_request_id ()
         in
         let request : Backend.reset_request =
           {

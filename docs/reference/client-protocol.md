@@ -294,9 +294,10 @@ The event ID is serialized as a JSON integer literal and remains a signed
 64-bit value in OCaml, Rust, and the Temporal protobuf request. This avoids
 loss of precision for histories whose event IDs exceed the exact integer range
 of a JavaScript number. `request_id` is the idempotency key for one logical
-reset; if the caller omits it, OCaml derives a deterministic value from the
-exact run and event boundary. Retrying an uncertain transport result with the
-same request ID is therefore safe. Temporal scopes reset deduplication to the
+reset; if the caller omits it, OCaml allocates a fresh value for each call,
+so resetting the same run at the same event twice creates two successors (a
+legitimate operator action when the first successor also fails). Retrying an
+uncertain transport result is safe only with the same explicit request ID. Temporal scopes reset deduplication to the
 workflow: distinct workflow IDs may use the same explicit request ID without
 colliding, while a retry for one workflow must retain the original reset data.
 
