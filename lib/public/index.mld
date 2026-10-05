@@ -69,12 +69,24 @@ let run_client () =
     Temporal.Client.create ~target_url:"http://localhost:7233"
       ~namespace:"default" ()
   in
-  let* handle =
-    Temporal.Client.start client ~workflow:hello ~task_queue:"example"
-      ~id:"hello-1" ~input:"world" ()
+  (* The client owns a native handle graph with no finalizer, so shut it down
+     on every path, including typed errors from start or wait. *)
+  let outcome =
+    match
+      let* handle =
+        Temporal.Client.start client ~workflow:hello ~task_queue:"example"
+          ~id:"hello-1" ~input:"world" ()
+      in
+      Temporal.Client.wait handle
+    with
+    | outcome -> outcome
+    | exception exn ->
+        ignore (Temporal.Client.shutdown client);
+        raise exn
   in
-  let* terminal = Temporal.Client.wait handle in
-  let* () = Temporal.Client.shutdown client in
+  let shutdown = Temporal.Client.shutdown client in
+  let* terminal = outcome in
+  let* () = shutdown in
   match terminal with
   | Temporal.Client.Completed message -> Ok (print_endline message)
   | _ -> Ok (prerr_endline "workflow did not complete")
