@@ -22,10 +22,13 @@ type submit_result = (unit, Error.t) result
     error category. [Not_submitted] proves local validation prevented any
     native call, permitting a corrected or different operation unless an
     earlier submission is still unresolved. [Rejected_submission] is a
-    definitive native heartbeat rejection that also permits a corrected
-    request while retaining the live handle and lease. An explicitly retryable
-    submission retains the exact request key; a terminal native rejection or
-    closed capability retires the handle. *)
+    definitive native rejection of this exact request (heartbeat or terminal)
+    that releases its key, even after an earlier uncertain attempt, while
+    retaining the live handle and lease. [Retryable_submission] means the
+    native outcome is unknown: a terminal operation retains its exact key for
+    a byte-identical retry, while a heartbeat key is released because a newer
+    heartbeat supersedes it. [Terminal_submission] (lost token or closed
+    capability) retires the handle. *)
 type submission_error =
   | Not_submitted of Error.t
   | Rejected_submission of Error.t
@@ -82,8 +85,9 @@ val activate : 'output handle -> submit_result
 val prepare_handoff : expected:'output handle -> 'output handle -> submit_result
 
 (** Encodes and submits one complete operation. The state machine derives a
-    canonical key from the encoded payload; if the transport fails, only the
-    same byte-identical request may retry. *)
+    canonical key from the encoded payload; if the native outcome is
+    uncertain, only the same byte-identical request may retry until it
+    receives a definitive answer. *)
 val complete : 'output handle -> 'output -> submit_result
 
 (** Submits one failed operation attempt. *)
@@ -92,7 +96,9 @@ val fail : 'output handle -> Error.t -> submit_result
 (** Submits one cancellation operation attempt with optional detail payloads. *)
 val cancel : 'output handle -> Payload.t list -> submit_result
 
-(** Sends one heartbeat without changing the terminal lifecycle. *)
+(** Sends one heartbeat without changing the terminal lifecycle. A failed
+    heartbeat is reported and forgotten unless the token is gone; it never
+    blocks a later heartbeat or terminal operation. *)
 val heartbeat : 'output handle -> Payload.t list -> submit_result
 
 (** Closes a handle after the owning SDK has stopped. Closing while an

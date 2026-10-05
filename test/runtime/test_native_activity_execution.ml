@@ -277,9 +277,9 @@ module Fake_supervisor = struct
       protocol failures and must remain fatal. *)
   let error_is_retryable error = error.retryable
 
-  (** This fake does not submit async heartbeats; preserve its explicit source
+  (** This fake does not submit async operations; preserve its explicit source
       classification to satisfy the operation-specific adapter contract. *)
-  let async_heartbeat_error_disposition error =
+  let async_operation_error_disposition error =
     if error.retryable then Temporal_runtime.Native_worker_policy.Retry_exact
     else Temporal_runtime.Native_worker_policy.Retired
 

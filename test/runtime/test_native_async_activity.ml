@@ -114,6 +114,7 @@ type fake_supervisor = {
   reject_next_worker_completion : bool ref;
   reject_next_async_completion : bool ref;
   reject_next_async_completion_terminal : bool ref;
+  reject_next_async_completion_rejected : bool ref;
   reject_next_async_heartbeat : bool ref;
   reject_next_async_heartbeat_connection : bool ref;
   reject_next_async_heartbeat_rejected : bool ref;
@@ -138,6 +139,7 @@ let fake_supervisor () =
     reject_next_worker_completion = ref false;
     reject_next_async_completion = ref false;
     reject_next_async_completion_terminal = ref false;
+    reject_next_async_completion_rejected = ref false;
     reject_next_async_heartbeat = ref false;
     reject_next_async_heartbeat_connection = ref false;
     reject_next_async_heartbeat_rejected = ref false;
@@ -222,8 +224,10 @@ module Fake_supervisor = struct
     end
 
   (** Accepts one late terminal completion only from the async ledger. The
-      one-shot rejection proves that the OCaml handle retains and retries the
-      exact request without rerunning user code. *)
+      one-shot failures return the native statuses the Rust bridge actually
+      emits for namespace-bound completions: [Invalid_state] for a server
+      [NotFound], [Connection] for an ambiguous RPC outcome, and
+      [Async_heartbeat_rejected] for a definitive rejection. *)
   let complete_async_activity supervisor (completion : Protocol.completion) =
     incr supervisor.async_completion_calls;
     if !(supervisor.reject_next_async_completion_terminal) then begin
@@ -237,13 +241,20 @@ module Fake_supervisor = struct
       in
       supervisor.async_leased := remaining;
       Error
-        (source_error "not_found" "async activity no longer exists")
+        (source_error ~native_status:Bridge.Invalid_state "not_found"
+           "async activity no longer exists")
     end
     else if !(supervisor.reject_next_async_completion) then begin
       supervisor.reject_next_async_completion := false;
       Error
-        (source_error ~retryable:true "temporarily_unavailable"
+        (source_error ~native_status:Bridge.Connection "connection"
            "async completion transport unavailable")
+    end
+    else if !(supervisor.reject_next_async_completion_rejected) then begin
+      supervisor.reject_next_async_completion_rejected := false;
+      Error
+        (source_error ~native_status:Bridge.Async_heartbeat_rejected
+           "async_heartbeat_rejected" "async completion request rejected")
     end
     else
       let found, remaining =
@@ -313,11 +324,12 @@ module Fake_supervisor = struct
     | Some status -> Worker_policy.activity_completion_retryable status
     | None -> error.retryable
 
-  (** Exercise the production heartbeat classifier on statuses that the Rust
-      async client actually returns, rather than on a premarked retryable fake. *)
-  let async_heartbeat_error_disposition error =
+  (** Exercise the production async-operation classifier on statuses that the
+      Rust async client actually returns, rather than on a premarked retryable
+      fake. *)
+  let async_operation_error_disposition error =
     match error.native_status with
-    | Some status -> Worker_policy.async_heartbeat_disposition status
+    | Some status -> Worker_policy.async_operation_disposition status
     | None ->
         if error.retryable then Worker_policy.Retry_exact
         else Worker_policy.Retired
@@ -738,7 +750,8 @@ let test_async_invalid_encoding_preserves_handle () =
   | Ok () when !(supervisor.async_leased) = [] -> ()
   | _ -> failwith "corrected public codec output left completion debt"
 
-(** A rejected late completion retains the exact request key. Retrying it
+(** An ambiguous [Connection] failure of a late completion keeps the handle
+    and native lease and retains the exact request key (#821). Retrying it
     succeeds without invoking the asynchronous implementation again. *)
 let test_async_completion_retry () =
   let supervisor = fake_supervisor () in
@@ -763,12 +776,17 @@ let test_async_completion_retry () =
   let handle = Option.get !retained in
   begin
     match Temporal.Activity.Async_handle.complete handle "once" with
+    | Error error when (Temporal.Error.view error).non_retryable ->
+        failwith "uncertain async completion was reported as non-retryable"
     | Error _ -> ()
     | Ok () -> failwith "rejected async completion was reported as accepted"
   end;
   if !calls <> 1 then failwith "async completion retry reran the callback";
   if not (has_token token !(supervisor.async_leased)) then
     failwith "async completion rejection retired the client lease";
+  (match Worker.drain worker with
+  | Error { code = "outstanding_async_leases"; retryable = true; _ } -> ()
+  | _ -> failwith "uncertain completion dropped the adapter async lease");
   (match Temporal.Activity.Async_handle.complete handle "different" with
   | Error _ -> ()
   | Ok () -> failwith "uncertain completion allowed a different output");
@@ -858,8 +876,9 @@ let heartbeat_status_fixture ~name ~token =
 
 (** A native [Connection] heartbeat result is uncertain, not terminal: the
     client did not consume the worker completion lease, and the server activity
-    can still be live. Keep both OCaml registries until the exact heartbeat is
-    retried, then accept one terminal completion. *)
+    can still be live. The handle and lease survive, and because a heartbeat is
+    superseded by the next one, a newer heartbeat and the terminal completion
+    are both allowed immediately (#836). *)
 let test_async_connection_heartbeat_keeps_handle () =
   let token = Bytes.of_string "async-connection-token" in
   let supervisor, worker, handle, calls =
@@ -867,7 +886,7 @@ let test_async_connection_heartbeat_keeps_handle () =
   in
   let detail : Temporal.Payload.t =
     { metadata = [ ("encoding", "binary/plain") ];
-      data = Bytes.of_string "progress" }
+      data = Bytes.of_string "50" }
   in
   supervisor.reject_next_async_heartbeat_connection := true;
   (match Temporal.Activity.Async_handle.heartbeat handle [ detail ] with
@@ -881,28 +900,24 @@ let test_async_connection_heartbeat_keeps_handle () =
   (match Worker.drain worker with
   | Error { code = "outstanding_async_leases"; retryable = true; _ } -> ()
   | _ -> failwith "connection failure let worker drain an active async lease");
-  let changed_detail : Temporal.Payload.t =
-    { detail with data = Bytes.of_string "changed" }
+  let newer_detail : Temporal.Payload.t =
+    { detail with data = Bytes.of_string "60" }
   in
-  (match Temporal.Activity.Async_handle.heartbeat handle [ changed_detail ] with
-  | Error _ -> ()
-  | Ok () -> failwith "uncertain heartbeat allowed changed retry details");
-  (match Temporal.Activity.Async_handle.complete handle "premature" with
-  | Error _ -> ()
-  | Ok () -> failwith "uncertain heartbeat allowed a terminal operation");
-  if !(supervisor.async_heartbeat_calls) <> 1
-     || !(supervisor.async_completion_calls) <> 0 then
-    failwith "conflicting async request reached the native client";
-  (match Temporal.Activity.Async_handle.heartbeat handle [ detail ] with
+  (match Temporal.Activity.Async_handle.heartbeat handle [ newer_detail ] with
   | Ok () -> ()
   | Error error ->
-      failwith ("identical heartbeat retry failed: " ^ Temporal.Error.message error));
+      failwith ("uncertain heartbeat blocked a newer heartbeat: "
+        ^ Temporal.Error.message error));
+  supervisor.reject_next_async_heartbeat_connection := true;
+  (match Temporal.Activity.Async_handle.heartbeat handle [ newer_detail ] with
+  | Error _ -> ()
+  | Ok () -> failwith "second connection failure was reported as accepted");
   (match Temporal.Activity.Async_handle.complete handle "done" with
   | Ok () -> ()
   | Error error ->
-      failwith ("completion after heartbeat recovery failed: "
+      failwith ("uncertain heartbeat blocked completion: "
         ^ Temporal.Error.message error));
-  if !calls <> 1 || !(supervisor.async_heartbeat_calls) <> 2
+  if !calls <> 1 || !(supervisor.async_heartbeat_calls) <> 3
      || List.length !(supervisor.async_heartbeats) <> 1
      || !(supervisor.async_completion_calls) <> 1
      || List.length !(supervisor.async_completions) <> 1
@@ -911,6 +926,47 @@ let test_async_connection_heartbeat_keeps_handle () =
   (match Worker.drain worker with
   | Ok () -> ()
   | Error _ -> failwith "completed async handle still blocked drain")
+
+(** A definitive server rejection of a terminal request (for example cancel
+    without a cancel request, or an oversized result) leaves the activity live:
+    the handle stays usable, the lease stays registered, and a different
+    terminal operation can still finish the activity (#821). *)
+let test_async_rejected_completion_keeps_live_handle () =
+  let token = Bytes.of_string "async-rejected-cancel-token" in
+  let supervisor, worker, handle, calls =
+    heartbeat_status_fixture ~name:"async_rejected_cancel" ~token
+  in
+  supervisor.reject_next_async_completion_rejected := true;
+  (match Temporal.Activity.Async_handle.cancel handle [] with
+  | Error error when (Temporal.Error.view error).non_retryable -> ()
+  | Error _ -> failwith "rejected cancellation was marked retryable"
+  | Ok () -> failwith "rejected cancellation was reported as accepted");
+  if !calls <> 1 || !(supervisor.async_leased) <> [ token ] then
+    failwith "rejected cancellation retired the live async activity";
+  (match Worker.drain worker with
+  | Error { code = "outstanding_async_leases"; retryable = true; _ } -> ()
+  | _ -> failwith "rejected cancellation dropped the adapter async lease");
+  (match Temporal.Activity.Async_handle.heartbeat handle [] with
+  | Ok () -> ()
+  | Error error ->
+      failwith ("rejected cancellation blocked a heartbeat: "
+        ^ Temporal.Error.message error));
+  let failure =
+    Temporal.Error.make ~category:`Activity ~message:"external work failed" ()
+  in
+  (match Temporal.Activity.Async_handle.fail handle failure with
+  | Ok () -> ()
+  | Error error ->
+      failwith ("fail after rejected cancellation was blocked: "
+        ^ Temporal.Error.message error));
+  (match !(supervisor.async_completions) with
+  | [ { Protocol.result = Protocol.Failed _; _ } ] -> ()
+  | _ -> failwith "fail after rejected cancellation was not submitted once");
+  if !(supervisor.async_completion_calls) <> 2 || !(supervisor.async_leased) <> []
+  then failwith "rejected cancellation recovery did not retire the lease";
+  match Worker.drain worker with
+  | Ok () -> ()
+  | Error _ -> failwith "failed async handle still blocked drain"
 
 (** A definitive server rejection discards only that heartbeat request. The
     activity token may still be live, so a corrected heartbeat and one terminal
@@ -1276,12 +1332,13 @@ let test_local_rejection_preserves_earlier_uncertainty () =
   | Ok () when !attempts = 3 -> ()
   | _ -> failwith "original uncertain request could not be retried"
 
-(** A definitive rejection on an exact retry cannot erase uncertainty from the
-    earlier attempt. The handle still blocks different requests until the
-    original heartbeat receives an accepted result. *)
-let test_native_rejection_preserves_earlier_uncertainty () =
+(** A definitive native rejection of the exact retry answers the earlier
+    uncertain terminal request too, so it releases the key: the handle stays
+    live and a different terminal operation may run (#821). Before that
+    answer, a different operation stays blocked. *)
+let test_native_rejection_releases_earlier_uncertainty () =
   let attempts = ref 0 in
-  let error = Temporal_base.Error.make ~category:`Bridge ~message:"heartbeat failed" () in
+  let error = Temporal_base.Error.make ~category:`Bridge ~message:"completion failed" () in
   let handle = Base_async.create
       ~encode_output:(fun text -> Ok Temporal_base.Payload.
         { metadata = []; data = Bytes.of_string text })
@@ -1291,36 +1348,96 @@ let test_native_rejection_preserves_earlier_uncertainty () =
         | 1 -> Error (Base_async.Retryable_submission error)
         | 2 -> Error (Base_async.Rejected_submission error)
         | _ -> Ok ()) in
+  ignore (Base_async.activate handle);
+  (match Base_async.complete handle "oversized" with
+  | Error _ -> ()
+  | Ok () -> failwith "uncertain completion was accepted");
+  (match Base_async.fail handle error with
+  | Error _ -> ()
+  | Ok () -> failwith "different operation ran before uncertainty settled");
+  if !attempts <> 1 then failwith "conflicting request crossed the submit boundary";
+  (match Base_async.complete handle "oversized" with
+  | Error _ -> ()
+  | Ok () -> failwith "rejected exact retry was accepted");
+  (match Base_async.fail handle error with
+  | Ok () when !attempts = 3 -> ()
+  | _ -> failwith "definitive rejection left the handle blocked");
+  match Base_async.complete handle "late" with
+  | Error _ when !attempts = 3 -> ()
+  | _ -> failwith "terminal handle accepted another operation"
+
+(** An uncertain heartbeat is reported and forgotten (#836): a newer heartbeat
+    and every terminal operation remain possible, and the same stale heartbeat
+    is never required as a retry. *)
+let test_uncertain_heartbeat_is_not_retained () =
+  let submitted = ref [] in
+  let error = Temporal_base.Error.make ~category:`Bridge ~message:"unavailable" () in
+  let handle = Base_async.create
+      ~encode_output:(fun text -> Ok Temporal_base.Payload.
+        { metadata = []; data = Bytes.of_string text })
+      ~submit:(fun operation ->
+        submitted := operation :: !submitted;
+        match operation with
+        | Base_async.Heartbeat _ when List.length !submitted = 1 ->
+            Error (Base_async.Retryable_submission error)
+        | _ -> Ok ()) in
   let detail text =
     Temporal_base.Payload.{ metadata = []; data = Bytes.of_string text }
   in
   ignore (Base_async.activate handle);
-  (match Base_async.heartbeat handle [ detail "original" ] with
-  | Error _ -> ()
+  (match Base_async.heartbeat handle [ detail "50" ] with
+  | Error error when not (Temporal_base.Error.view error).non_retryable -> ()
+  | Error _ -> failwith "uncertain heartbeat was reported as non-retryable"
   | Ok () -> failwith "uncertain heartbeat was accepted");
-  (match Base_async.heartbeat handle [ detail "original" ] with
-  | Error _ -> ()
-  | Ok () -> failwith "rejected exact retry was accepted");
-  (match Base_async.heartbeat handle [ detail "corrected" ] with
-  | Error _ -> ()
-  | Ok () -> failwith "rejection erased earlier heartbeat uncertainty");
-  (match Base_async.complete handle "early" with
-  | Error _ -> ()
-  | Ok () -> failwith "rejection allowed completion before uncertainty settled");
-  if !attempts <> 2 then failwith "conflicting request crossed the submit boundary";
-  (match Base_async.heartbeat handle [ detail "original" ] with
-  | Ok () when !attempts = 3 -> ()
-  | _ -> failwith "original uncertain heartbeat could not be retried");
+  (match Base_async.heartbeat handle [ detail "60" ] with
+  | Ok () -> ()
+  | Error _ -> failwith "uncertain heartbeat blocked a newer heartbeat");
   (match Base_async.complete handle "done" with
-  | Ok () when !attempts = 4 -> ()
-  | _ -> failwith "completion remained blocked after heartbeat settled")
+  | Ok () -> ()
+  | Error _ -> failwith "uncertain heartbeat blocked completion");
+  match List.rev !submitted with
+  | [ Base_async.Heartbeat _; Base_async.Heartbeat [ newer ]; Base_async.Complete _ ]
+    when Bytes.equal newer.data (Bytes.of_string "60") -> ()
+  | _ -> failwith "heartbeat recovery submitted an unexpected sequence"
+
+(** A request that collides with another Domain's in-flight operation is a
+    transient conflict, so it is reported as retryable rather than as a
+    permanent rejection. The re-entrant submit callback models the second
+    Domain deterministically: it runs while the first request is in flight. *)
+let test_in_flight_conflict_is_retryable () =
+  let handle_ref = ref None in
+  let inner = ref None in
+  let handle = Base_async.create
+      ~encode_output:(fun text -> Ok Temporal_base.Payload.
+        { metadata = []; data = Bytes.of_string text })
+      ~submit:(fun operation ->
+        (match operation, !inner with
+        | Base_async.Heartbeat _, None ->
+            inner := Some (Base_async.complete (Option.get !handle_ref) "done")
+        | _ -> ());
+        Ok ()) in
+  handle_ref := Some handle;
+  ignore (Base_async.activate handle);
+  (match Base_async.heartbeat handle [] with
+  | Ok () -> ()
+  | Error _ -> failwith "in-flight heartbeat failed");
+  (match !inner with
+  | Some (Error error) when not (Temporal_base.Error.view error).non_retryable -> ()
+  | Some (Error _) -> failwith "in-flight conflict was reported as permanent"
+  | Some (Ok ()) -> failwith "concurrent operation bypassed the in-flight request"
+  | None -> failwith "conflicting operation was not attempted");
+  match Base_async.complete handle "done" with
+  | Ok () -> ()
+  | Error _ -> failwith "completion after the in-flight heartbeat failed"
 
 (** Runs the isolated async lifecycle assertions. *)
 let () =
   test_base_state_machine ();
   test_operation_key_boundaries ();
   test_local_rejection_preserves_earlier_uncertainty ();
-  test_native_rejection_preserves_earlier_uncertainty ();
+  test_native_rejection_releases_earlier_uncertainty ();
+  test_uncertain_heartbeat_is_not_retained ();
+  test_in_flight_conflict_is_retryable ();
   test_local_deferred_failure_keeps_worker_progress ();
   test_deferred_lifecycle ();
   test_invalid_async_payload_preserves_handle ();
@@ -1329,6 +1446,7 @@ let () =
   test_async_completion_retry ();
   test_async_terminal_rejection_closes_lease ();
   test_async_connection_heartbeat_keeps_handle ();
+  test_async_rejected_completion_keeps_live_handle ();
   test_async_rejected_heartbeat_keeps_live_handle ();
   test_async_not_found_heartbeat_closes_handle ();
   test_async_heartbeat_and_cancel ();

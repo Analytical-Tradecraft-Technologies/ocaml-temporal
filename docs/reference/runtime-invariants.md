@@ -287,15 +287,19 @@ and bridge, read the [documentation guide](../README.md) first.
   failures, so `Connection`, `Not_ready`, and `Worker` never authorize a
   second completion attempt. The dedicated retry backoff is a 10 ms native
   timer with the OCaml runtime lock released; it is not a readiness signal.
-- A namespace-bound async heartbeat is nonterminal and does not consume that
-  Core completion lease. An uncertain RPC `Connection` keeps the public handle
-  and adapter async lease tracked for an identical heartbeat retry. A definite
-  non-`NotFound` RPC rejection clears a fresh heartbeat request so corrected
-  details or completion may proceed, but keeps both the handle and lease live;
-  it cannot erase an earlier uncertain request. Worker drain must still report
-  the outstanding obligation. Confirmed `NotFound` maps to `Invalid_state` and
-  closes the handle. This decision does not change worker or async terminal
-  completion retry policy.
+- Namespace-bound async heartbeats and async complete/fail/cancel do not
+  consume that Core completion lease, so they do not fail closed. An
+  uncertain RPC `Connection` keeps the public handle and adapter async lease
+  tracked and returns a retryable error; a terminal operation may then only
+  be retried byte-for-byte, while an uncertain heartbeat is dropped so it
+  never blocks a newer heartbeat or the terminal operation. A definite
+  non-`NotFound` RPC rejection releases that request key (even after an
+  earlier uncertain attempt of the same request) but keeps both the handle and
+  lease live for a corrected or different operation. Worker drain must still
+  report the outstanding obligation. Confirmed `NotFound` maps to
+  `Invalid_state` and closes the handle. The adapter removes the lease exactly
+  once: on an accepted terminal operation or a retiring error. This decision
+  does not change Core worker completion retry policy.
 - Adapter shutdown reopens admission only for an explicitly retryable activity
   drain. Workflow-drain errors and permanent activity errors invoke the
   supervisor's `Native.shutdown`/`runtime_close` path before leaving the private

@@ -138,13 +138,19 @@ allowing a corrected or different operation without rerunning the activity
 callback. A local rejection during a retry preserves any earlier unresolved
 submission and its original key.
 
-After native submission, an explicitly retryable result retains the copied
-token and operation key; a terminal result, including `NotFound`, closes the
-handle and retires its adapter lease. Generic connection failures remain
-fail-closed. The state machine retains the key rather than the original
-operation value, so a permitted retry must reconstruct the byte-identical
-request. Callers must not issue a different operation while that request is
-unresolved. Focused regressions cover local metadata conversion errors,
+After native submission, an uncertain (`Connection`) result keeps the copied
+token and adapter lease. For a terminal operation it also retains the
+operation key; a heartbeat key is released, because a heartbeat is superseded
+by the next one and retaining it would block newer progress and the terminal
+operation (#836). A definitive server rejection releases the key, even after
+an earlier uncertain attempt, and keeps the handle live for a different
+operation (#821). `NotFound` closes the handle and retires its adapter lease.
+These by-token client RPCs do not consume a Core worker lease and the server
+accepts at most one terminal response per activity, so unlike Core worker
+completions they need not fail closed on a generic transport error. The state
+machine retains the key rather than the original operation value, so a
+permitted retry must reconstruct the byte-identical request. Callers cannot
+issue a different operation while a terminal request is unresolved. Focused regressions cover local metadata conversion errors,
 duplicate and oversized metadata caught by full request validation, corrected
 requests through all four methods, and retained versus terminal native errors.
 

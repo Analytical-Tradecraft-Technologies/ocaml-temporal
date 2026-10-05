@@ -95,23 +95,36 @@ shutdown still reports the outstanding lease until a terminal operation complete
 If an earlier submission is still uncertain, a local rejection of its retry
 cannot clear the original operation key or allow a conflicting request.
 
-On the native worker path, a failed operation keeps its key only when its
-operation-specific supervisor classifier reports uncertainty. Core worker
-completions and late async terminal completions retain the conservative
+On the native worker path, Core worker completions retain the conservative
 bilateral policy: only the dedicated `Retryable` bridge status authorizes an
-exact-request retry. A namespace-bound async heartbeat is nonterminal and
-does not consume the worker completion lease. An uncertain RPC status such as
-`Unavailable` or `DeadlineExceeded` maps to `Connection`: the handle and
-adapter lease stay tracked, and only the same byte-identical heartbeat may
-retry until its outcome is known. A definitive non-`NotFound` RPC rejection
-such as `InvalidArgument`, `PermissionDenied`, or `FailedPrecondition` maps to
-`Async_heartbeat_rejected`. It clears a fresh pending request but keeps the
-activity handle and adapter lease live, permitting corrected heartbeat details
-or a terminal completion. If an earlier attempt was already uncertain, the
-rejection of its exact retry does not erase that earlier request key.
-`NotFound` maps to `Invalid_state` and closes the handle because the server has
-discarded the token. The activity callback is never rerun for a submission
-retry. The handle is not a retained activity context: ordinary
+exact-request retry, because Core consumes the worker lease. Late async
+operations (heartbeat, complete, fail, cancel) are namespace-bound
+`RespondActivityTask*ByToken`/`RecordActivityTaskHeartbeat` RPCs that never
+consume that lease, and the server applies at most one terminal response per
+activity, answering any later one with `NotFound`. They share one
+classification (`Native_worker_policy.async_operation_disposition`):
+
+- An uncertain RPC status such as `Unavailable`, `DeadlineExceeded`, or
+  `ResourceExhausted` maps to `Connection`. The handle and adapter lease stay
+  tracked and the caller receives a retryable error. A terminal operation
+  keeps its key, so only the same byte-identical request may follow until it
+  receives a definitive answer. A heartbeat key is released instead: a
+  heartbeat is non-terminal and superseded by the next one, so the uncertain
+  heartbeat is reported and forgotten and never blocks a newer heartbeat or a
+  terminal operation.
+- A definitive non-`NotFound` RPC rejection such as `InvalidArgument`,
+  `PermissionDenied`, or `FailedPrecondition` maps to
+  `Async_heartbeat_rejected` (the status name predates its use for terminal
+  operations). It releases the request key, even when it answers the exact
+  retry of an earlier uncertain request, and keeps the activity handle and
+  adapter lease live. The caller may send corrected details or a different
+  terminal operation, for example `fail` after a rejected `cancel` or an
+  oversized `complete`.
+- `NotFound` maps to `Invalid_state` and closes the handle because the server
+  has discarded the token. After an uncertain terminal request, this can also
+  mean the earlier attempt was applied.
+
+The activity callback is never rerun for a submission retry. The handle is not a retained activity context: ordinary
 `Activity.Context` values are still invalidated when their callback returns.
 
 ## Registration and dispatch
