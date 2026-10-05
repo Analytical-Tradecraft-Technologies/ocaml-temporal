@@ -158,7 +158,8 @@ the entire request, including `request_id`, and share the existing ten-second
 overall deadline. A definitive rejection remains terminal; an unanswered
 request remains uncertain when the deadline expires. Callback-transport tests
 under `tests/support/client_start.rs` cover recovery, request identity,
-non-retryable rejection, and cancellation of a hung request.
+non-retryable rejection, cancellation of a hung request, and the 64-ticket
+admission bound.
 
 The wait request names `namespace`, `workflow_id`, and one concrete `run_id`.
 There is no `follow_runs` escape hatch in the document: the operation always
@@ -173,7 +174,14 @@ still admit shutdown and other lifecycle messages.
 
 At most 64 distinct exact-run observations may be retained per runtime. Calls
 with the same namespace, workflow ID, and run ID share an in-flight future;
-admitting a new identity at capacity returns `INVALID_STATE`. A terminal
+admitting a new identity at capacity returns status `15`
+(`RESOURCE_EXHAUSTED`). That status is reserved for a full bounded
+client-operation registry: nothing was sent to Temporal and the client stays
+connected, so it is distinct from the `INVALID_STATE` returned for a closed
+client or runtime. The same status and bound of 64 apply to outstanding
+asynchronous start tickets. The public adapter maps it to a retryable
+`bridge` error with `error_type` `resource_exhausted`, which
+`Client.is_at_capacity` recognizes. A terminal
 result or error removes its entry before returning to OCaml. A later wait may
 observe the same closed run again through a fresh request; this table is not
 a result cache. Client disconnect and both explicit and finalizer runtime
@@ -593,13 +601,29 @@ one workflow-task or activity failure for Core and retires the inaccessible
 lease on every outcome. For an activity cancellation, however, the task is an
 update to a previously leased Start and does not own another completion debt;
 an unrepresentable cancellation is dropped without completing the shared
-token. A rejected generated completion remains a fatal worker error, but it
-cannot also leave a fabricated language-side debt that blocks shutdown
-forever. Regression tests cover this rule independently for workflow and
-activity conversion failures, including the cancellation classification.
+token. The generated activity failure is a non-retryable application failure
+of type `UnrepresentableActivityTask` with a static conversion category as its
+message: representability is deterministic, so a retryable failure would only
+make the server redeliver the task to be rejected again. Once Core accepts the
+generated completion, the poll returns `NOT_READY` and the worker keeps
+polling, exactly as for a rejected workflow activation; one task such as a
+standalone activity or a header key another SDK allowed therefore cannot end
+`Worker.run` for the whole task queue (issue #801). A rejected generated
+completion remains a fatal worker error, but it cannot also leave a fabricated
+language-side debt that blocks shutdown forever. Regression tests cover this
+rule independently for workflow and activity conversion failures, including
+the cancellation classification, and
+`rust/core-bridge/tests/activity_task_rejection.rs` drives the activity case
+through the ABI against a gRPC double.
+
+The activity poll lane applies the same reasoning to cancellations it cannot
+attach to a live Start. An unknown cancellation (its Start completed between
+Core's poll returning and admission), a repeated or retired one, or one
+polled while draining owns no completion debt, so the lane drops it without a
+completion and without publishing a lane error.
 
 There is also a post-handoff decode-failure path for version or implementation
-drift between the two strict decoders. OCaml preserves its original protocol
+drift between the two strict decoders. OCaml keeps its original protocol
 error, returns the exact Rust-produced bytes to the private rejection ABI, and
 never reflects those bytes in diagnostics. Rust accepts rejection only after
 full semantic equality with retained handoff state. For a Start, it then
@@ -608,8 +632,13 @@ semantic state even if Core reports that generated failure as unsuccessful.
 For a Cancel update, it retires only that retained semantic state: the shared
 Start debt remains owned by the activity implementation. This prevents
 shutdown from waiting forever without turning a malformed cancellation into a
-spurious `UnknownActivity` completion failure, while keeping the original
-decode failure primary.
+spurious `UnknownActivity` completion failure. When the rejection succeeds on
+a live worker, the task is handled: Rust writes the static diagnostic (and,
+for a workflow activation, applies the 100 ms redelivery backoff) and the
+OCaml supervisor reports an empty poll so `Worker.run` continues (issue #801).
+A replay instead returns the protocol error, because it must not report
+history it never checked as compatible. If the rejection itself fails, the
+original decode failure stays primary with the rejection category appended.
 
 Shutdown first closes ledger admission and both readiness signals, then asks
 Core to wake both polls. From that point the supervisor Domain is blocked in

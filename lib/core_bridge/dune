@@ -26,22 +26,31 @@
   ;; Docker or native Makefile workflows build the Rust graph twice. The
   ;; fallback stays inside the SDK's own build directory so a vendored SDK
   ;; never writes Cargo output into the consumer's build root.
+  ;;
+  ;; [%{profile}] selects the Cargo profile (#779). [opam install] and
+  ;; [dune build -p] use Dune's release profile, so installed and opam builds
+  ;; link Cargo's optimized [profile.release]; Dune's default dev profile keeps
+  ;; Cargo's fast, unoptimized dev profile. Expanding the variable in the
+  ;; action makes Dune rerun this rule whenever the profile changes.
   (setenv
-   OCAML_TEMPORAL_RUST_TARGET_FALLBACK
-   ../../rust-target
+   OCAML_TEMPORAL_BUILD_PROFILE
+   %{profile}
    (setenv
-    TEMPORAL_OCAML_IMPORT_DIR
-    rust-imports
+    OCAML_TEMPORAL_RUST_TARGET_FALLBACK
+    ../../rust-target
     (setenv
-     TEMPORAL_OCAML_LINK_FLAGS
-     rust_ocaml_link_flags.sexp
-     (run
-      sh
-      %{dep:../../scripts/build-rust-bridge.sh}
-      ../..
-      libocaml_temporal_core_bridge.a
-      dllocaml_temporal_core_bridge%{ext_dll}
-      rust_static_link_flags.sexp))))))
+     TEMPORAL_OCAML_IMPORT_DIR
+     rust-imports
+     (setenv
+      TEMPORAL_OCAML_LINK_FLAGS
+      rust_ocaml_link_flags.sexp
+      (run
+       sh
+       %{dep:../../scripts/build-rust-bridge.sh}
+       ../..
+       libocaml_temporal_core_bridge.a
+       dllocaml_temporal_core_bridge%{ext_dll}
+       rust_static_link_flags.sexp)))))))
 
 (include install-rust-imports.inc)
 

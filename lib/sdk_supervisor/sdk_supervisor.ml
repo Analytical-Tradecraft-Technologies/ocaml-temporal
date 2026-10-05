@@ -350,6 +350,7 @@ module Protocol_adapter = struct
       | Already_started -> "already_started"
       | Retryable -> "retryable"
       | Async_heartbeat_rejected -> "async_heartbeat_rejected"
+      | Resource_exhausted -> "resource_exhausted"
       | Unknown code -> Printf.sprintf "unknown(%d)" code
     in
     {
@@ -359,19 +360,42 @@ module Protocol_adapter = struct
           protocol_error.Bridge.message status rejection_error.Bridge.message;
     }
 
-  (** Converts a nonblocking native workflow poll into an optional typed
-      activation. [Not_ready] is the empty-lane state, not a worker failure. *)
-  let workflow_poll_result ~reject = function
+  (** Shared nonblocking poll conversion for both lanes. [decode] strictly
+      validates successful native bytes. When it fails, [reject] must retire
+      their exact native lease first. A successful rejection is reported as
+      [Ok None] when [rejected_is_progress] holds: the task was failed back to
+      Core and is no longer this worker's debt, so a live worker keeps polling
+      instead of ending [Worker.run] for the whole task queue (issue #801).
+      Otherwise the original protocol error stays primary. A failed rejection
+      is always an error, because the native lease state is then uncertain.
+      [Not_ready] is the empty-lane state, not a worker failure. *)
+  let poll_result ~decode ~reject ~rejected_is_progress = function
     | Ok input -> (
-        match decode_workflow_activation input with
-        | Ok activation -> Ok (Some activation)
+        match decode input with
+        | Ok value -> Ok (Some value)
         | Error protocol_error -> (
             match reject input with
+            | Ok () when rejected_is_progress -> Ok None
             | Ok () -> Error protocol_error
             | Error rejection_error ->
                 Error (rejection_failed protocol_error rejection_error)))
     | Error { Bridge.status = Not_ready; _ } -> Ok None
     | Error error -> Error (sanitize_native_worker_error error)
+
+  (** Converts a nonblocking live-worker workflow poll into an optional typed
+      activation. An activation OCaml cannot decode but Rust successfully
+      rejected is local task progress and maps to [Ok None]. *)
+  let workflow_poll_result ~reject result =
+    poll_result ~decode:decode_workflow_activation ~reject
+      ~rejected_is_progress:true result
+
+  (** Converts a nonblocking replay poll into an optional typed activation.
+      Unlike a live worker, a replay must not skip history it cannot decode:
+      that would report a replay as compatible without checking it, so the
+      protocol error remains the result after a successful rejection. *)
+  let replay_workflow_poll_result ~reject result =
+    poll_result ~decode:decode_workflow_activation ~reject
+      ~rejected_is_progress:false result
 
   (** Canonically serializes and reparses one workflow completion before it
       can be submitted across the C boundary. *)
@@ -386,19 +410,13 @@ module Protocol_adapter = struct
     | Ok task -> Ok task
     | Error error -> activity_error "activity task decoding" error
 
-  (** Converts a nonblocking native activity poll into an optional typed task
-      while preserving every bridge failure other than an empty lane. *)
-  let activity_poll_result ~reject = function
-    | Ok input -> (
-        match decode_activity_task input with
-        | Ok task -> Ok (Some task)
-        | Error protocol_error -> (
-            match reject input with
-            | Ok () -> Error protocol_error
-            | Error rejection_error ->
-                Error (rejection_failed protocol_error rejection_error)))
-    | Error { Bridge.status = Not_ready; _ } -> Ok None
-    | Error error -> Error (sanitize_native_worker_error error)
+  (** Converts a nonblocking native activity poll into an optional typed task.
+      A task OCaml cannot decode but Rust successfully failed back to Core
+      maps to [Ok None] (issue #801); every other bridge failure except an
+      empty lane is preserved. *)
+  let activity_poll_result ~reject result =
+    poll_result ~decode:decode_activity_task ~reject ~rejected_is_progress:true
+      result
 
   (** Canonically serializes and reparses one activity completion before it
       can be submitted across the C boundary. *)
@@ -992,7 +1010,7 @@ module Native_backend = struct
         Bridge.replay_worker_feed_history runtime input
     | Finish_replay_input -> Bridge.replay_worker_finish_input runtime
     | Try_poll_replay_workflow ->
-        Protocol_adapter.workflow_poll_result
+        Protocol_adapter.replay_workflow_poll_result
           ~reject:(Bridge.replay_worker_reject_workflow_json runtime)
           (Bridge.replay_worker_try_poll_workflow runtime)
     | Wait_replay_workflow -> Bridge.replay_worker_wait_workflow runtime

@@ -98,7 +98,13 @@ Windows additionally bundles the required MinGW import archives; the consumer
 regenerates their search path after relocation. Producers disable incremental
 state and use line-table debug information, retaining file/line backtraces,
 debug assertions, and the development optimization level while reducing
-artifact size. Normal local source builds keep their existing Cargo profiles.
+artifact size. Release bundles instead package Cargo's `[profile.release]`
+(thin LTO, one codegen unit, stripped debug information, unwinding panics);
+their Rust tests use the same optimization level without debug assertions or
+overflow checks. Local source builds follow Dune's profile: `opam install`,
+`dune build -p`, and `--profile release` link Cargo's release profile, while
+Dune's default dev profile links Cargo's unoptimized dev profile for fast
+iteration. `test/smoke/test_rust_bridge_profile.sh` checks that selection.
 
 Only the finished bundle is cached, never Cargo's registry or target tree.
 Keys include platform, the complete Rust source/header/test/lockfile tree,

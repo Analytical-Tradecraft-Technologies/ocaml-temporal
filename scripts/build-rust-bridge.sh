@@ -13,6 +13,27 @@ if [ -n "${TEMPORAL_RUST_BRIDGE_DIR:-}" ]; then
     "$static_output" "$dynamic_output" "$link_flags_output"
 fi
 
+# Select the Cargo profile from the build profile requesting the bridge (#779).
+# Dune passes its own profile: [opam install] and [dune build -p] select
+# "release", which must link Cargo's optimized [profile.release] into the
+# user's worker. Every other value, including Dune's default "dev" and any
+# custom Dune profile, keeps Cargo's unoptimized dev profile for fast iteration
+# and debug assertions. Cargo writes the two profiles to different output
+# directories, so the copied archive and the Windows build-script metadata are
+# always read from the directory of the profile that was just built, never from
+# a stale build of the other profile. An unset value is a caller defect.
+build_profile=${OCAML_TEMPORAL_BUILD_PROFILE:?set OCAML_TEMPORAL_BUILD_PROFILE to the requesting build profile}
+case "$build_profile" in
+  release)
+    cargo_profile=release
+    profile_dir=release
+    ;;
+  *)
+    cargo_profile=dev
+    profile_dir=debug
+    ;;
+esac
+
 # Dune copy sandboxes expose the Rust source tree read-only. They set the
 # private fallback below to a writable sibling, while callers such as Docker
 # and the native Makefile set CARGO_TARGET_DIR directly. Keep the explicit
@@ -86,6 +107,7 @@ fi
 cargo build \
   --manifest-path "$workspace_root/rust/Cargo.toml" \
   --package ocaml-temporal-core-bridge \
+  --profile "$cargo_profile" \
   --locked
 
 native_link_output=$(mktemp)
@@ -94,6 +116,7 @@ trap 'rm -f "$native_link_output"' EXIT HUP INT TERM
 if ! CARGO_TERM_COLOR=never cargo rustc \
   --manifest-path "$workspace_root/rust/Cargo.toml" \
   --package ocaml-temporal-core-bridge \
+  --profile "$cargo_profile" \
   --locked \
   --lib \
   --crate-type staticlib \
@@ -121,10 +144,10 @@ fi
 # bundled MinGW import archives from OCaml's foreign linker.
 sh "$workspace_root/scripts/render-rust-link-flags.sh" \
   "$(uname -s)" \
-  "$artifact_root" \
+  "$artifact_root/$profile_dir" \
   "$link_flags_output" \
   "$native_link_flags" \
   "${bundle_output:+$bundle_output/import-libs}"
 
 "$workspace_root/scripts/copy-rust-bridge-artifacts.sh" \
-  "$artifact_root/debug" "$static_output" "$dynamic_output"
+  "$artifact_root/$profile_dir" "$static_output" "$dynamic_output"

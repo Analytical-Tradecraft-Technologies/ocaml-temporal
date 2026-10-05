@@ -123,7 +123,11 @@ directory rather than the consumer's build root. An explicit `CARGO_TARGET_DIR`
 remains authoritative exactly as in the in-repository build, and
 `TEMPORAL_RUST_BRIDGE_DIR`/`TEMPORAL_RUST_BRIDGE_KEY` still select a verified
 prebuilt bundle. Building from source requires the same Rust toolchain and
-`protoc` as any other source build.
+`protoc` as any other source build. The bridge rule forwards Dune's
+`%{profile}`: the release profile builds Cargo's optimized `[profile.release]`
+and every other profile, including the default dev profile, builds Cargo's dev
+profile. Consumers that ship a vendored worker should therefore build it with
+`--profile release` (or `-p`).
 
 A vendored SDK's `dune-workspace` is ignored, so the consumer does not inherit
 its `(disable_dynamically_linked_foreign_archives true)` context setting. On

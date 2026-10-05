@@ -126,7 +126,11 @@ for those rules.
   fail because of a concurrent `Client.start`: an in-flight native start is
   aborted, and that caller receives a non-retryable `bridge` error saying
   Temporal did not prove whether the start was accepted, including its
-  workflow and request IDs for reconciliation.
+  workflow and request IDs for reconciliation. One native client keeps at
+  most 64 starts in flight and waits on at most 64 distinct runs at once; a
+  call beyond either bound is rejected before reaching Temporal with a
+  retryable `bridge` error that `Client.is_at_capacity` recognizes, and the
+  client stays usable.
 - `Temporal.Worker` registers workflows, activities, and the signal, query, and
   update handlers attached to each workflow registration. It owns one
   supervisor graph, runs the poll loops, and performs idempotent shutdown.
