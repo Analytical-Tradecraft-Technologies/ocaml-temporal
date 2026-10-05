@@ -104,6 +104,12 @@ const DEFAULT_MAX_OUTSTANDING_ACTIVITIES: usize = 1;
 /// Local-activity slots granted to Core, for the same reason as remote
 /// activities: local activities share the same serial OCaml executor. Core's
 /// unset default would otherwise be 100.
+///
+/// The two kinds deliberately keep separate pools. Core's local-activity
+/// manager reserves its next permit while idle, before any request arrives,
+/// so one pool shared with remote activities would starve remote polling
+/// entirely. At most one remote and one local activity task can therefore be
+/// outstanding at once: a remote task may wait behind one local callback.
 const DEFAULT_MAX_OUTSTANDING_LOCAL_ACTIVITIES: usize = 1;
 /// Core server-poll concurrency for remote activity tasks. Core reserves a
 /// slot before polling, so pollers beyond the slot count would only wait.
