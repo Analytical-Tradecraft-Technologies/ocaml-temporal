@@ -56,9 +56,13 @@ the workflow. The callback is queued on that execution's scheduler, so it can
 use deterministic workflow APIs and follows the same source ordering as root,
 timer, activity, and child continuations.
 
-The native public handler currently accepts exactly one payload. An activation
-with zero or multiple payloads is completed as a non-retryable workflow failure
-instead of dropping data or choosing an arbitrary element. A signal with no
+The native public handler accepts one payload. An activation with zero
+payloads, which the Temporal CLI, Web UI, and other SDKs send for a
+no-argument signal, is decoded as the canonical `binary/null` unit payload, the
+same rule used for workflow start input; a handler whose codec rejects unit
+reports its decode error. An activation with multiple payloads is completed as
+a non-retryable workflow failure instead of dropping data or choosing an
+arbitrary element. A signal with no
 matching handler follows the same fail-closed path. Identity and headers are
 validated and retained by the runtime, but the first public handler API exposes
 only the typed payload; a later API can add those metadata fields without

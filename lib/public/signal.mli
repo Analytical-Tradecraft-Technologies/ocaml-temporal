@@ -53,4 +53,11 @@ module Handler : sig
       the package's deterministic dispatcher; exposing only this typed
       boundary keeps codec and callback ownership inside the handler. *)
   val dispatch : t -> Payload.t -> (unit, Error.t) result
+
+  (** Dispatches Temporal's repeated signal payload list. This is the worker
+      adapter boundary. Zero payloads, which the Temporal CLI, Web UI, and
+      other SDKs send for a no-argument signal, are decoded as the canonical
+      [binary/null] unit payload; one payload is passed to [dispatch]; more
+      than one is a non-retryable workflow error. *)
+  val dispatch_payloads : t -> Payload.t list -> (unit, Error.t) result
 end

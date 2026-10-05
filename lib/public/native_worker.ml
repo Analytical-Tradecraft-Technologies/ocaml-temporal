@@ -207,26 +207,17 @@ type workflow_registration = Workflow_adapter.registered_workflow
 
 type activity_registration = Activity_adapter.registered_activity
 
-(** Converts one public signal handler into a private scheduler callback. The
-    public handler intentionally accepts one typed value, while Temporal Core
-    carries a repeated payload list; zero or multiple payloads therefore fail
-    the workflow non-retryably instead of silently changing the input. *)
+(** Converts one public signal handler into a private scheduler callback.
+    [Signal.Handler.dispatch_payloads] owns the payload-arity policy: zero
+    payloads decode as unit and multiple payloads fail the workflow
+    non-retryably instead of silently changing the input. *)
 let runtime_signal_handler (handler : Signal.Handler.t) =
   let name = Signal.Handler.name handler in
   Workflow_adapter.make_signal_handler ~name ~dispatch:(fun signal ->
-      match Workflow_adapter.signal_input signal with
-      | [ payload ] ->
-          Signal.Handler.dispatch handler (Payload_private.of_base payload)
-          |> Result.map_error Error_private.to_base
-      | _ ->
-          Error
-            (Base_error.make ~non_retryable:true ~category:`Workflow
-               ~message:
-                 (Printf.sprintf
-                    "signal %s must contain exactly one payload for its \
-                     registered OCaml handler"
-                    name)
-               ()))
+      Workflow_adapter.signal_input signal
+      |> List.map Payload_private.of_base
+      |> Signal.Handler.dispatch_payloads handler
+      |> Result.map_error Error_private.to_base)
 
 (** Converts one public query handler into the private synchronous callback
     package. The handler owns the typed payload decoding boundary, so both

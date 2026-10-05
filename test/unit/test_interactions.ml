@@ -111,6 +111,38 @@ let test_typed_query_arguments () =
   expect_error_kind "defect"
     (Temporal.Query.Handler.dispatch_payloads handler [ payload; payload ])
 
+(** Signal payload arity matches the wider Temporal ecosystem (#813). The
+    Temporal CLI, Web UI, and other SDKs send a no-argument signal with zero
+    payloads, which must reach a unit handler instead of failing the workflow.
+    A non-unit handler reports its codec error for zero payloads, and repeated
+    payloads are rejected non-retryably without invoking the callback. *)
+let test_signal_payload_arity () =
+  let calls = ref 0 in
+  let unit_signal = Temporal.Signal.define ~name:"wake" ~input:Temporal.Codec.unit in
+  let unit_handler =
+    Temporal.Signal.Handler.make unit_signal (fun () ->
+        incr calls;
+        Ok ())
+  in
+  unwrap (Temporal.Signal.Handler.dispatch_payloads unit_handler []);
+  let null = unwrap (Temporal.Codec.encode Temporal.Codec.unit ()) in
+  unwrap (Temporal.Signal.Handler.dispatch_payloads unit_handler [ null ]);
+  if !calls <> 2 then failwith "unit signal did not run for zero and one payloads";
+  (match Temporal.Signal.Handler.dispatch_payloads unit_handler [ null; null ] with
+  | Error error ->
+      if not (Temporal.Error.view error).non_retryable then
+        failwith "repeated signal payloads were retryable"
+  | Ok () -> failwith "repeated signal payloads were accepted");
+  if !calls <> 2 then failwith "repeated signal payloads invoked the callback";
+  let string_signal =
+    Temporal.Signal.define ~name:"rename" ~input:Temporal.Codec.string
+  in
+  let string_handler =
+    Temporal.Signal.Handler.make string_signal (fun _ -> Ok ())
+  in
+  expect_error_kind "codec"
+    (Temporal.Signal.Handler.dispatch_payloads string_handler [])
+
 (** Duplicate names are rejected while building a dispatcher, and unknown
     definitions fail before any callback can run. *)
 let test_registration_and_missing_handlers () =
@@ -283,6 +315,7 @@ let test_update_handler_codec_exception_containment () =
 let () =
   test_dispatch_and_ordering ();
   test_typed_query_arguments ();
+  test_signal_payload_arity ();
   test_registration_and_missing_handlers ();
   test_codec_mismatch ();
   test_exception_containment ();

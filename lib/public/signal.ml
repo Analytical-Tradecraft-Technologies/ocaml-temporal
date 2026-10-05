@@ -88,4 +88,26 @@ module Handler = struct
              ~message:
                (Printf.sprintf "signal input codec raised: %s"
                   (Printexc.to_string exception_)))
+
+  (** Adapts Temporal's repeated signal payload list to the one typed input.
+      Zero payloads are what the Temporal CLI, Web UI, and other SDKs send for a
+      no-argument signal (only the OCaml client sends one [binary/null]
+      payload), so they decode as the canonical [binary/null] unit payload, as
+      workflow start input already does. A handler whose codec rejects unit
+      reports its own codec error. Multiple payloads fail non-retryably rather
+      than silently dropping data. *)
+  let dispatch_payloads handler = function
+    | [] ->
+        dispatch handler
+          { Payload.metadata = [ ("encoding", "binary/null") ]; data = Bytes.empty }
+    | [ payload ] -> dispatch handler payload
+    | _ ->
+        Error
+          (Error.make ~non_retryable:true ~category:`Workflow
+             ~message:
+               (Printf.sprintf
+                  "signal %s must contain at most one payload for its \
+                   registered OCaml handler"
+                  (name handler))
+             ())
 end
