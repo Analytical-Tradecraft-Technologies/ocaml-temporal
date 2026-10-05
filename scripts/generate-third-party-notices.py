@@ -6,13 +6,17 @@ locked Cargo graph. The permissive licences of those packages (MIT, BSD, ISC,
 Apache-2.0, Unicode-3.0, ...) require their licence texts and attributions to
 accompany binary redistribution. This script copies those texts from the
 package sources that `cargo metadata --locked` already downloaded, so it needs
-no network access and no tool beyond the Python standard library.
+no network access and no tool beyond the Python standard library. A package
+that publishes no licence file instead uses the upstream texts vendored and
+reviewed under `scripts/license-texts/crates/` for its exact version.
 
 The output is deterministic for a given Cargo graph: packages, texts, and text
 identifiers are ordered by package identity and file content only, and no
 checkout path, timestamp, or environment value is recorded. Generation fails,
 listing every offending package, when a package has neither a licence file nor
-a standard text for one of its licence choices; it never emits a partial file.
+a reviewed upstream notice, or when any text would carry a placeholder
+copyright line such as `<year> <copyright holders>`; it never emits a partial
+file.
 """
 
 from __future__ import annotations
@@ -26,7 +30,7 @@ import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any
 
 
 HEADER = "ocaml-temporal third-party notices"
@@ -70,7 +74,8 @@ class Notice:
     """One licence or attribution text attributed to one package.
 
     `label` names where the text came from (a file relative to the package
-    root, or the standard text used as a fallback) and is shown to readers;
+    root, the pinned upstream URL of a reviewed vendored text, or a standard
+    text that a reviewed entry elects) and is shown to readers;
     `text` is the normalized content that is deduplicated across packages.
     """
 
@@ -161,67 +166,173 @@ def collect_files(package: dict[str, Any]) -> list[Notice]:
     return notices
 
 
-class LicenseExpression(Protocol):
-    """Structural view of a parsed SPDX expression node from the shared
-    licence scanner (`check-cargo-licenses.py`'s `Node`): a leaf licence, or an
-    `and`/`or`/`with` combination of a left and right operand."""
-
-    kind: str
-    value: str | None
-    left: "LicenseExpression | None"
-    right: "LicenseExpression | None"
-
-
-def standard_choice(node: LicenseExpression, available: set[str]) -> list[str] | None:
-    """Pick licence identifiers satisfiable with this repository's standard texts.
-
-    An `OR` takes its first satisfiable branch, an `AND` needs both branches,
-    and a `WITH` exception is never satisfied by a plain standard text. The
-    choice depends only on the expression, so it is deterministic.
-    """
-
-    if node.kind == "license":
-        return [node.value] if node.value in available else None
-    if node.kind == "and":
-        left = standard_choice(node.left, available)
-        right = standard_choice(node.right, available)
-        return None if left is None or right is None else left + right
-    if node.kind == "or":
-        return standard_choice(node.left, available) or standard_choice(node.right, available)
-    return None
+# A copyright line that still carries a licence template's holder or year
+# placeholder, such as the SPDX MIT/BSD `Copyright (c) <year> <copyright
+# holders>`. Shipping one would discard the attribution those licences require.
+PLACEHOLDER = re.compile(
+    r"<\s*[a-z][a-z ]*(year|holder|owner|author|name)[a-z ]*>"
+    r"|[\[{]\s*(year|yyyy|fullname|owner|author|copyright holders?|name of [a-z ]+)\s*[\]}]",
+    re.IGNORECASE,
+)
+# The Apache-2.0 appendix ("How to apply the Apache License to your work")
+# contains this template line as part of the licence text itself rather than
+# as anyone's notice, so it is the one placeholder line that may appear.
+APACHE_APPENDIX = re.compile(
+    r"^\s*Copyright [\[{]yyyy[\]}] [\[{]name of copyright owner[\]}]\s*$", re.IGNORECASE
+)
+REVIEWED_NOTICES = STANDARD_TEXTS / "crates"
+REVIEWED_MANIFEST = "manifest.json"
+# Vendored texts must cite an upstream URL pinned to a full commit hash, so
+# the provenance a reviewer checked cannot move.
+IMMUTABLE_SOURCE = re.compile(r"^https://\S+/[0-9a-f]{40}/\S+$")
 
 
-def standard_notices(
-    package: dict[str, Any], expression: str, texts_dir: Path
-) -> tuple[list[Notice], str] | None:
-    """Reproduce standard licence texts for a package that ships none.
+def placeholder_lines(text: str) -> list[str]:
+    """Return the copyright lines of `text` that still contain a template placeholder."""
 
-    Some crates declare a licence in Cargo metadata but omit the file from the
-    published package. Their declared licence is honoured by reproducing its
-    standard text and naming the copyright holders recorded in Cargo metadata.
-    Returns `None` when no branch of the expression has a standard text.
-    """
-
-    available = {path.stem for path in texts_dir.glob("*.txt")}
-    choice = standard_choice(LICENSE_POLICY.Parser(expression).parse(), available)
-    if not choice:
-        return None
-    notices = [
-        Notice(f"standard {identifier} text",
-               normalize_text((texts_dir / f"{identifier}.txt").read_bytes()))
-        for identifier in dict.fromkeys(choice)
+    return [
+        line.strip()
+        for line in text.split("\n")
+        if "copyright" in line.lower()
+        and PLACEHOLDER.search(line)
+        and not APACHE_APPENDIX.match(line)
     ]
-    authors = package.get("authors") or []
-    holders = ", ".join(author for author in authors if isinstance(author, str))
-    repository = package.get("repository")
-    note = (
-        "No licence file is distributed with this package; the standard text of "
-        f"{' AND '.join(dict.fromkeys(choice))} is reproduced. Copyright holders: "
-        f"{holders or 'the package authors'}"
-        + (f" ({repository})" if isinstance(repository, str) and repository else "")
-        + "."
+
+
+@dataclass(frozen=True)
+class ReviewedNotice:
+    """Reviewed upstream texts for package versions that ship no licence file.
+
+    `license` is the expression the review was made against; it must still
+    equal each package's concluded licence, so a relicensed release cannot
+    reuse a stale review. `note` is printed under the package's inventory line.
+    """
+
+    license: str
+    notices: tuple[Notice, ...]
+    note: str
+
+
+def manifest_string(entry: dict[str, object], key: str, where: str) -> str:
+    """Read one required non-empty string field of a reviewed-notice entry."""
+
+    value = entry.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{where}: {key} must be a non-empty string")
+    return value
+
+
+def manifest_list(entry: dict[str, object], key: str, where: str) -> list[object]:
+    """Read one optional list field of a reviewed-notice entry."""
+
+    value = entry.get(key, [])
+    if not isinstance(value, list):
+        raise ValueError(f"{where}: {key} must be a list")
+    return value
+
+
+def load_reviewed_entry(
+    entry: object, where: str, directory: Path
+) -> tuple[list[tuple[str, str]], ReviewedNotice]:
+    """Validate one manifest entry and read the texts it vendors.
+
+    Every vendored file must stay below `directory`, match its recorded SHA-256
+    byte for byte, and cite the immutable upstream commit it was copied from.
+    `standard_texts` name files in the parent `license-texts` directory and are
+    meant for licences such as Apache-2.0 whose terms need no holder line; any
+    text with a placeholder copyright line is rejected. An entry with no
+    upstream file records that upstream publishes none and is accepted only
+    with an explicit `maintainer_exception`.
+    """
+
+    if not isinstance(entry, dict):
+        raise ValueError(f"{where}: entry must be an object")
+    license = manifest_string(entry, "license", where)
+    manifest_string(entry, "evidence", where)
+    packages = []
+    for package in manifest_list(entry, "packages", where):
+        if not (isinstance(package, dict) and isinstance(package.get("name"), str)
+                and isinstance(package.get("version"), str)):
+            raise ValueError(f"{where}: each package needs a string name and version")
+        packages.append((package["name"], package["version"]))
+    if not packages:
+        raise ValueError(f"{where}: packages must not be empty")
+    notices = []
+    upstream_files = 0
+    for item in manifest_list(entry, "files", where):
+        if not isinstance(item, dict):
+            raise ValueError(f"{where}: each file must be an object")
+        relative = manifest_string(item, "path", where)
+        upstream = manifest_string(item, "upstream", where)
+        digest = manifest_string(item, "sha256", where)
+        if not IMMUTABLE_SOURCE.match(upstream):
+            raise ValueError(f"{where}: upstream {upstream!r} must be pinned to a full commit hash")
+        parts = Path(relative).parts
+        path = directory.joinpath(*parts)
+        if Path(relative).is_absolute() or ".." in parts or not path.is_file():
+            raise ValueError(f"{where}: vendored file {relative!r} is missing")
+        raw = path.read_bytes()
+        if hashlib.sha256(raw).hexdigest() != digest:
+            raise ValueError(f"{where}: {relative} does not match its reviewed sha256")
+        notices.append(Notice(f"upstream {upstream}", normalize_text(raw)))
+        upstream_files += 1
+    standard = []
+    for identifier in manifest_list(entry, "standard_texts", where):
+        if not isinstance(identifier, str) or not (directory.parent / f"{identifier}.txt").is_file():
+            raise ValueError(f"{where}: no standard text for {identifier!r}")
+        text = normalize_text((directory.parent / f"{identifier}.txt").read_bytes())
+        notices.append(Notice(f"standard {identifier} text", text))
+        standard.append(identifier)
+    if not upstream_files:
+        manifest_string(entry, "maintainer_exception", where)
+    if not notices:
+        raise ValueError(f"{where}: lists no files or standard texts")
+    for notice in notices:
+        for line in placeholder_lines(notice.text):
+            raise ValueError(f"{where}: {notice.label} contains placeholder copyright line {line!r}")
+    note = "No licence file is distributed with this package; " + (
+        "reviewed upstream licence texts are reproduced"
+        if upstream_files
+        else "a maintainer-approved exception applies because upstream publishes no licence text"
     )
-    return notices, note
+    if standard:
+        note += f", with the standard {' and '.join(standard)} text that upstream only references"
+    return packages, ReviewedNotice(license, tuple(notices), note + ".")
+
+
+def load_reviewed(directory: Path) -> dict[tuple[str, str], ReviewedNotice]:
+    """Load the reviewed-notice manifest for packages that ship no licence file.
+
+    Returns a map from (package name, exact version) to the reviewed texts, so
+    any version change needs a fresh review. Every manifest problem is reported
+    together, and a package listed by two entries is an error because the
+    choice between them would be arbitrary.
+    """
+
+    path = directory / REVIEWED_MANIFEST
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"cannot read reviewed notices {path}: {exc}") from exc
+    entries = manifest.get("notices") if isinstance(manifest, dict) else None
+    if not isinstance(entries, list):
+        raise ValueError(f"{path}: expected an object with a notices list")
+    reviewed: dict[tuple[str, str], ReviewedNotice] = {}
+    errors = []
+    for index, entry in enumerate(entries):
+        where = f"{REVIEWED_MANIFEST} entry {index}"
+        try:
+            packages, notice = load_reviewed_entry(entry, where, directory)
+        except (OSError, ValueError) as exc:
+            errors.append(str(exc))
+            continue
+        for key in packages:
+            if key in reviewed:
+                errors.append(f"{where}: {key[0]} {key[1]} is reviewed twice")
+            reviewed[key] = notice
+    if errors:
+        raise ValueError("invalid reviewed notices:\n  " + "\n  ".join(errors))
+    return reviewed
 
 
 def third_party_packages(metadata: dict[str, Any]) -> list[dict[str, Any]]:
@@ -250,13 +361,18 @@ def third_party_packages(metadata: dict[str, Any]) -> list[dict[str, Any]]:
     return sorted(selected, key=lambda item: (item["name"], item["version"], item.get("source") or ""))
 
 
-def collect(metadata: dict[str, Any], texts_dir: Path = STANDARD_TEXTS) -> list[PackageNotices]:
+def collect(metadata: dict[str, Any], reviewed_dir: Path = REVIEWED_NOTICES) -> list[PackageNotices]:
     """Resolve the concluded licence and notice texts of every package.
 
-    All failures are gathered before raising so one run reports every package
-    that needs review.
+    A package's own licence files are used whenever it ships any. A package
+    that ships none needs a reviewed upstream notice for its exact version in
+    `reviewed_dir`: no licence template is ever filled in, because MIT and BSD
+    require the real copyright notice to be reproduced. Every emitted text is
+    also checked for placeholder copyright lines. All failures are gathered
+    before raising so one run reports every package that needs review.
     """
 
+    reviewed = load_reviewed(reviewed_dir)
     results = []
     errors = []
     for package in third_party_packages(metadata):
@@ -272,13 +388,28 @@ def collect(metadata: dict[str, Any], texts_dir: Path = STANDARD_TEXTS) -> list[
             continue
         fallback_note = None
         if not notices:
-            standard = standard_notices(package, concluded, texts_dir)
-            if standard is None:
+            entry = reviewed.get((package["name"], package["version"]))
+            if entry is None:
                 errors.append(
-                    f"{label}: no licence file in the package and no standard text for {concluded}"
+                    f"{label}: ships no licence file and has no reviewed upstream notice "
+                    f"in scripts/license-texts/crates/{REVIEWED_MANIFEST} ({concluded})"
                 )
                 continue
-            notices, fallback_note = standard
+            if entry.license != concluded:
+                errors.append(
+                    f"{label}: reviewed notice covers {entry.license}, but the package "
+                    f"declares {concluded}"
+                )
+                continue
+            notices, fallback_note = list(entry.notices), entry.note
+        placeholders = [
+            f"{label}: {notice.label} contains placeholder copyright line {line!r}"
+            for notice in notices
+            for line in placeholder_lines(notice.text)
+        ]
+        if placeholders:
+            errors += placeholders
+            continue
         results.append(
             PackageNotices(package["name"], package["version"], concluded, tuple(notices), fallback_note)
         )
@@ -357,12 +488,14 @@ def render(packages: list[PackageNotices], project_license: str) -> str:
     return "\n".join(lines) + "\n"
 
 
-def generate(metadata: dict[str, Any], project_license: str, texts_dir: Path = STANDARD_TEXTS) -> str:
+def generate(
+    metadata: dict[str, Any], project_license: str, reviewed_dir: Path = REVIEWED_NOTICES
+) -> str:
     """Collect and render notices for one Cargo metadata document."""
 
     if not project_license.strip():
         raise ValueError("project licence text is empty")
-    return render(collect(metadata, texts_dir), normalize_text(project_license.encode("utf-8")))
+    return render(collect(metadata, reviewed_dir), normalize_text(project_license.encode("utf-8")))
 
 
 def audit(document: str, metadata: dict[str, Any], project_license: str) -> None:
@@ -370,12 +503,17 @@ def audit(document: str, metadata: dict[str, Any], project_license: str) -> None
 
     The audit needs only metadata, not package sources: it proves the project
     licence is present, every third-party package appears exactly once in the
-    inventory, and every referenced text exists (and every text is referenced).
+    inventory, every referenced text exists (and every text is referenced), and
+    no copyright line is an unfilled licence-template placeholder.
     """
 
     lines = document.split("\n")
     if not lines or lines[0] != HEADER:
         raise ValueError("notices file does not start with the expected header")
+    placeholders = placeholder_lines(document)
+    if placeholders:
+        raise ValueError("notices file contains placeholder copyright lines: "
+                         + "; ".join(sorted(set(placeholders))))
     if normalize_text(project_license.encode("utf-8")).rstrip("\n") not in document:
         raise ValueError("notices file does not contain the project licence")
     listed: dict[tuple[str, str], list[str]] = {}
@@ -424,6 +562,9 @@ def main() -> int:
                         help="output of cargo metadata --locked --format-version 1")
     parser.add_argument("--project-license", type=Path, required=True,
                         help="this project's LICENSE file")
+    parser.add_argument("--reviewed-notices", type=Path, default=REVIEWED_NOTICES,
+                        help="directory holding the reviewed-notice manifest.json "
+                             "(default: scripts/license-texts/crates)")
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--output", type=Path, help="notices file to write")
     group.add_argument("--audit", type=Path, help="notices file to check for completeness")
@@ -432,7 +573,7 @@ def main() -> int:
         metadata = load_json(args.metadata)
         project_license = args.project_license.read_text(encoding="utf-8")
         if args.output is not None:
-            document = generate(metadata, project_license)
+            document = generate(metadata, project_license, args.reviewed_notices)
             args.output.write_bytes(document.encode("utf-8"))
             print(f"third-party notices: wrote {args.output}")
         else:

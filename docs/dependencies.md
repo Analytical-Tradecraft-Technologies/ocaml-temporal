@@ -210,16 +210,58 @@ timestamp, or environment value is recorded, and CRLF and trailing whitespace
 are normalized.
 
 Some published crates declare a license in Cargo metadata but omit the file
-(for example the OpenTelemetry, `prost-wkt`, `pbjson`, and `winapi` target
-crates). For those packages only, the generator reproduces the standard text
-from `scripts/license-texts/` (Apache-2.0, MIT, and BSD-3-Clause, taking the
-first satisfiable `OR` branch) and names the copyright holders from Cargo's
-`authors` and `repository` fields. A package with no licence file and no
-satisfiable standard text, an unconcluded license, or a missing declared
-`license_file` fails generation with every affected package listed; no partial
-file is written. The list covers the whole locked graph, including
-platform-specific and build-only packages, so it is a superset of what any
-single platform links.
+(currently the OpenTelemetry, `prost-wkt`, `pbjson`, `tonic-prost`, `jni`,
+`objc2-*`, `r-efi`, `valuable`, and `winapi-*-gnu` crates). MIT and BSD
+require the actual copyright notice to accompany binaries, so the generator
+never fills in a licence template for them. Instead each such package must
+have a reviewed entry for its exact version in
+`scripts/license-texts/crates/manifest.json`, which points at upstream texts
+vendored byte for byte under `scripts/license-texts/crates/`. An entry records
+the package names and versions, the concluded license expression it was
+reviewed against (it must still equal the package's concluded license), each
+vendored file's SHA-256 and upstream URL pinned to a full commit hash, and the
+evidence for choosing that commit. Optional `standard_texts` add a text from
+`scripts/license-texts/` (only Apache-2.0 is kept) when upstream merely names a
+license whose terms need no holder line, as for the `objc2` crates; the MIT and
+BSD templates are deliberately absent. An entry without any upstream file is
+accepted only with a `maintainer_exception` explaining the maintainer's
+approval. Generation also rejects any emitted text, including a crate's own
+file, whose copyright line still contains a template placeholder such as
+`<year> <copyright holders>` (the Apache-2.0 appendix's
+`[yyyy] [name of copyright owner]` instruction is part of that licence and is
+allowed), and the `--audit` mode rejects such a line in a finished document.
+
+A package with no licence file and no reviewed entry, an unconcluded license,
+or a missing declared `license_file` fails generation with every affected
+package listed; no partial file is written. The list covers the whole locked
+graph, including platform-specific and build-only packages, so it is a superset
+of what any single platform links.
+
+To add a reviewed notice when a Cargo update introduces a file-less package or
+version:
+
+1. Run the generator against fresh `cargo metadata --locked` output; it names
+   every package that needs review.
+2. Read the crate's `.cargo_vcs_info.json` (in the downloaded registry source)
+   for the commit and path it was published from, or, for an older crate
+   without one, find the commit that set the published version.
+3. Locate the `LICENSE*`, `COPYING*`, `NOTICE*`, or equivalent file at that
+   commit (crate directory first, then repository root) with
+   `gh api repos/<owner>/<repo>/contents/<path>?ref=<commit>`, and save its
+   exact bytes under `scripts/license-texts/crates/<source>/`. Include any
+   upstream `NOTICE` file, and for an `AND` expression the text of every part
+   (for example the protobuf `LICENSE` for `prost-wkt-types`' BSD-3-Clause
+   schemas).
+4. Add or extend the manifest entry with the file's SHA-256, its
+   `https://github.com/<owner>/<repo>/blob/<commit>/<path>` URL, and the
+   evidence. Never write a copyright holder that upstream does not state; if
+   upstream publishes no licence text, record the evidence and ask a
+   maintainer to decide on a `maintainer_exception`.
+5. Re-run the generator and `--audit`, and
+   `python3 -m unittest discover -s test/smoke -p 'test_*artifact*.py'`.
+
+Entries for versions no longer in the lock file are harmless and can be
+removed in the same change that drops the package.
 
 OCaml packages need no entry: the SDK archive contains only the installed
 `temporal-sdk` package, while the OCaml runtime, `logs`, and `yojson` are

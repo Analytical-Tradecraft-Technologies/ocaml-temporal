@@ -78,8 +78,10 @@ jobs:
           path: _build/release-ocaml-bundles
       # Every archive redistributes the statically linked Rust graph, so its
       # licence texts are copied from the locked package sources that
-      # `cargo metadata --locked` downloads. Generation fails if any package
-      # lacks a licence text; the audit then proves the file lists every
+      # `cargo metadata --locked` downloads, or for crates that publish none
+      # from the reviewed upstream texts in scripts/license-texts/crates.
+      # Generation fails if any package lacks a licence text or any text has a
+      # placeholder copyright line; the audit then proves the file lists every
       # locked package before packaging embeds it in each archive.
       - name: Generate third-party licence notices
         run: |
