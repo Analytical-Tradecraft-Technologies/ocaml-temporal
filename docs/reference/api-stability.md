@@ -63,7 +63,11 @@ package installation. The same rule then runs
    including values in nested `module M : sig ... end` declarations (for
    example `Activity.Context.heartbeat`); and
 3. fails, listing each `Temporal.<path>` it could not find, unless the witness
-   references every collected value through the `T.` (or `Temporal.`) root.
+   pins every collected value with an explicitly annotated top-level binding
+   whose body is exactly that value, such as
+   `let _scope_cancel : T.Scope.t -> (unit, T.Error.t) result = T.Scope.cancel`.
+   A bare use such as `let _ = T.Scope.cancel` does not count, because its
+   type would be inferred and a signature change could pass unnoticed.
 
 The check parses source with the compiler's own parser (`compiler-libs`, part
 of the approved OCaml compiler distribution); it never links the SDK. It

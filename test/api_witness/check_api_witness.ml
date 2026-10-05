@@ -13,10 +13,13 @@
      including those inside nested [module M : sig ... end] declarations, are
      the supported values.
 
-   The witness side is every identifier expression whose path starts with the
-   [T] or [Temporal] module, for example [T.Activity.Context.heartbeat].  Only
-   value references count; type paths, constructors, and record fields are
-   checked by the witness's own type annotations instead.
+   The witness side is every top-level binding that carries an explicit type
+   constraint and whose body is exactly an identifier rooted at the [T] or
+   [Temporal] module, for example
+   [let _heartbeat : ... = T.Activity.Context.heartbeat].  An unannotated use
+   does not count, because its inferred type would hide a signature change.
+   Type paths, constructors, and record fields are checked by the witness's
+   own type annotations instead.
 
    The program uses only the OCaml parser from [compiler-libs], through
    [Ast_iterator] hooks and [Longident.flatten], because those entry points are
@@ -116,27 +119,46 @@ let interface_values ~module_name mli =
   List.rev !values
 
 (** [witness_references witness_ml] returns the set of dotted value paths that
-    the witness mentions through the [T] or [Temporal] root, with the root
-    prefix removed so they compare directly with {!interface_values}. *)
+    the witness pins with an explicit type, with the [T] or [Temporal] root
+    removed so they compare directly with {!interface_values}. A value counts
+    only when a top-level binding carries a type constraint and its body is
+    exactly that identifier, as in [let _x : t = T.Module.value]. A mere use
+    such as [let _ = T.Module.value] or a reference inside a larger expression
+    does not count, because its type would be inferred and a signature change
+    could pass unnoticed. *)
 let witness_references witness_ml =
   let structure = parse Parse.implementation witness_ml in
   let references = Hashtbl.create 256 in
-  let iterator =
-    {
-      Ast_iterator.default_iterator with
-      expr =
-        (fun self expression ->
-          (match expression.pexp_desc with
-          | Pexp_ident { txt; _ } -> (
-              match Longident.flatten txt with
-              | ("T" | "Temporal") :: (_ :: _ :: _ as rest) ->
-                  Hashtbl.replace references (String.concat "." rest) ()
-              | _ -> ())
-          | _ -> ());
-          Ast_iterator.default_iterator.expr self expression);
-    }
+  (* Records [expression] when it is a bare [T]/[Temporal]-rooted value path. *)
+  let record_identifier expression =
+    match expression.Parsetree.pexp_desc with
+    | Pexp_ident { txt; _ } -> (
+        match Longident.flatten txt with
+        | ("T" | "Temporal") :: (_ :: _ :: _ as rest) ->
+            Hashtbl.replace references (String.concat "." rest) ()
+        | _ -> ())
+    | _ -> ()
   in
-  iterator.structure iterator structure;
+  (* Accepts the three spellings of an annotated binding: a binding
+     constraint, a constrained pattern, or a constrained body. *)
+  let annotated_body (binding : Parsetree.value_binding) =
+    match (binding.pvb_constraint, binding.pvb_pat.ppat_desc,
+           binding.pvb_expr.pexp_desc) with
+    | Some _, _, _ -> Some binding.pvb_expr
+    | None, Ppat_constraint _, _ -> Some binding.pvb_expr
+    | None, _, Pexp_constraint (body, _) -> Some body
+    | None, _, _ -> None
+  in
+  List.iter
+    (fun (item : Parsetree.structure_item) ->
+      match item.pstr_desc with
+      | Pstr_value (_, bindings) ->
+          List.iter
+            (fun binding ->
+              Option.iter record_identifier (annotated_body binding))
+            bindings
+      | _ -> ())
+    structure;
   references
 
 (** Entry point: [check_api_witness ROOT_ML PUBLIC_DIR WITNESS_ML].  Exits 0
