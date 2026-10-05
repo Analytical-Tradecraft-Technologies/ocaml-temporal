@@ -135,7 +135,7 @@ let _activity_info_namespace : T.Activity.Info.t -> string =
   T.Activity.Info.namespace
 
 let _activity_info_workflow :
-    T.Activity.Info.t -> T.Activity.Info.workflow option =
+    T.Activity.Info.t -> T.Activity.Info.workflow =
   T.Activity.Info.workflow
 
 let _activity_info_activity_id : T.Activity.Info.t -> string =

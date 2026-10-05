@@ -1026,9 +1026,8 @@ let test_contextual_heartbeat_lifecycle () =
               let module Info = Temporal.Activity.Info in
               if Info.namespace info <> "default"
                  || Info.workflow info
-                    <> Some
-                         { Info.workflow_id = "workflow-1"; run_id = "run-1";
-                           workflow_type = "test_workflow" }
+                    <> { Info.workflow_id = "workflow-1"; run_id = "run-1";
+                         workflow_type = "test_workflow" }
                  || Info.activity_id info <> "activity-1"
                  || Info.activity_type info <> "native_activity_heartbeat"
                  || Info.attempt info <> 1 || Info.is_local info

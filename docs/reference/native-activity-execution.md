@@ -239,7 +239,8 @@ callback.
 
 `Context.info` returns the attempt's task metadata as an abstract
 `Temporal.Activity.Info.t`: namespace, the scheduling workflow (ID, run ID,
-and type; `None` for a standalone activity), activity ID and type, the 1-based
+and type; standalone activities are failed by the bridge before dispatch, so
+one is always present), activity ID and type, the 1-based
 attempt, whether Core runs it as a local activity, and the first-scheduled,
 current-attempt-scheduled, and started timestamps that Core reported. The
 adapter copies these values from the validated start task, so the projection

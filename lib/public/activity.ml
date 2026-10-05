@@ -319,17 +319,15 @@ module Info = struct
   (** Returns the namespace reported by Core. *)
   let namespace (info : t) = info.namespace
 
-  (** Core sends an empty workflow execution for a standalone activity, so an
-      empty workflow ID is the absence marker. *)
+  (** Every dispatched task has a scheduling workflow: the bridge fails
+      standalone activities back to Core before dispatch, so the private
+      record always carries a validated workflow identity. *)
   let workflow (info : t) =
-    if String.equal info.workflow_id "" then None
-    else
-      Some
-        {
-          workflow_id = info.workflow_id;
-          run_id = info.workflow_run_id;
-          workflow_type = info.workflow_type;
-        }
+    {
+      workflow_id = info.workflow_id;
+      run_id = info.workflow_run_id;
+      workflow_type = info.workflow_type;
+    }
 
   (** Returns the retry-stable activity ID. *)
   let activity_id (info : t) = info.activity_id

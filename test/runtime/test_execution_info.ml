@@ -230,8 +230,8 @@ let test_workflow_info_synthetic_context () =
         (Temporal.Error.message error)
   | Ok _ -> failwith "synthetic info unexpectedly succeeded"
 
-(** Activity metadata, including exact timestamps and standalone detection,
-    is projected unchanged and survives context invalidation. *)
+(** Activity metadata, including exact timestamps and the scheduling
+    workflow, is projected unchanged and survives context invalidation. *)
 let test_activity_info () =
   let base : Temporal_base.Activity_context.info =
     {
@@ -261,7 +261,7 @@ let test_activity_info () =
    | Ok info ->
        expect "activity namespace" "default" (Info.namespace info);
        expect "activity workflow"
-         (Some { Info.workflow_id = "wf"; run_id = "run"; workflow_type = "orders" })
+         { Info.workflow_id = "wf"; run_id = "run"; workflow_type = "orders" }
          (Info.workflow info);
        expect "activity id" "charge" (Info.activity_id info);
        expect "activity type" "charge_card" (Info.activity_type info);
@@ -273,12 +273,6 @@ let test_activity_info () =
        expect "attempt scheduled seconds" (Some 20L)
          (seconds (Info.current_attempt_scheduled_time info));
        expect "started time" None (seconds (Info.started_time info)));
-  (match
-     Temporal.Activity.Context.info
-       (make { base with workflow_id = ""; workflow_run_id = ""; workflow_type = "" })
-   with
-   | Ok info -> expect "standalone workflow" None (Info.workflow info)
-   | Error error -> failwith (Temporal.Error.message error));
   match
     Temporal.Activity.Context.info
       (Temporal_base.Activity_context.unavailable ~details:[] ~heartbeat_timeout:None)

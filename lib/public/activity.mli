@@ -231,13 +231,15 @@ module Info : sig
   (** The workflow execution that scheduled this activity. *)
   type workflow = { workflow_id : string; run_id : string; workflow_type : string }
 
-  (** Returns the Temporal namespace of the scheduling workflow or, for a
-      standalone activity, of the activity itself. *)
+  (** Returns the Temporal namespace of the scheduling workflow. *)
   val namespace : t -> string
 
-  (** Returns the scheduling workflow, or [None] for a standalone activity that
-      was not scheduled by a workflow. *)
-  val workflow : t -> workflow option
+  (** Returns the workflow execution that scheduled this activity. Standalone
+      activities (scheduled without a workflow) are not supported: the bridge
+      fails such a task back to Temporal before any activity code runs, so
+      every context that reaches an implementation has a scheduling
+      workflow. *)
+  val workflow : t -> workflow
 
   (** Returns the activity ID. Temporal keeps it stable across retries of the
       same scheduled activity. *)
