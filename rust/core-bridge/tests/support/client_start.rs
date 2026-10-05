@@ -153,3 +153,53 @@ fn hung_start_keeps_the_existing_deadline_and_releases_the_request() {
     assert_eq!(probe.dropped.load(Ordering::SeqCst), 1);
     assert!(runtime.pending_starts.is_empty());
 }
+
+/// Explicit client disconnect is part of SDK shutdown and must succeed while
+/// another caller still holds a ticket whose RPC already reached the
+/// transport. The ticket is retired exactly once, the in-flight transport
+/// future is cancelled and released before disconnect returns, and a later
+/// read of the abandoned ticket is a lifecycle error (which the OCaml adapter
+/// reports as an uncertain start) rather than a fabricated outcome.
+#[test]
+fn disconnect_aborts_an_in_flight_start_and_releases_its_request() {
+    let (mut runtime, probe) = connected_runtime(Reply::Hung);
+    let request = br#"{"request_id":"stable-request-1","namespace":"default","workflow_id":"workflow-1","workflow_type":"Workflow","task_queue":"queue","input":[]}"#;
+    let ticket = runtime
+        .begin_start_workflow_json(request)
+        .expect("start ticket");
+
+    // Wait until the request is on the wire, so Temporal could have accepted
+    // it and the start outcome is genuinely uncertain at disconnect time.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while probe.requests.lock().unwrap().is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "start RPC never reached transport"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    let disconnected = runtime.disconnect_client();
+    assert!(
+        disconnected.is_ok(),
+        "disconnect must not fail on an in-flight start: {:?}",
+        disconnected.err().map(|failure| failure.message)
+    );
+    assert!(runtime.pending_starts.is_empty());
+    assert!(runtime.client.is_none());
+    assert_eq!(probe.requests.lock().unwrap().len(), 1);
+    assert_eq!(
+        probe.dropped.load(Ordering::SeqCst),
+        1,
+        "the aborted start task must be joined before disconnect returns"
+    );
+
+    let read = runtime
+        .wait_start_workflow_json(&ticket)
+        .expect_err("an abandoned ticket has no observable outcome");
+    assert_eq!(read.status, STATUS_INVALID_STATE);
+
+    // Disconnect stays idempotent, and close has no start left to release.
+    assert!(runtime.disconnect_client().is_ok());
+    assert_eq!(runtime.close(true), STATUS_OK);
+}
