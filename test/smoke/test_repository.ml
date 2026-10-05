@@ -161,8 +161,13 @@ let test_static_foreign_archives () =
     ~path:(Filename.concat source_root "scripts/build-rust-bridge.sh")
     ~needle:"scripts/render-rust-link-flags.sh";
   require_text ~path:bridge
-    ~needle:
-      "(setenv\n   OCAML_TEMPORAL_RUST_TARGET_FALLBACK\n   %{workspace_root}/rust-target";
+    ~needle:"(setenv\n   OCAML_TEMPORAL_RUST_TARGET_FALLBACK\n   ../../rust-target";
+  require_text ~path:bridge
+    ~needle:"%{dep:../../scripts/build-rust-bridge.sh}\n      ../..\n";
+  (* A vendored SDK sees the consumer's project as [%{workspace_root}], which
+     contains neither the bridge scripts nor the Rust sources (#829). *)
+  if contains ~needle:"%{workspace_root}" (read bridge) then
+    failwith "lib/core_bridge/dune must resolve SDK paths relative to itself";
   require_text
     ~path:(Filename.concat source_root "scripts/build-rust-bridge.sh")
     ~needle:"if [ -n \"${CARGO_TARGET_DIR:-}\" ]; then";

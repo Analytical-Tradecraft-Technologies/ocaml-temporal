@@ -1,3 +1,9 @@
+;; Every path in this rule is relative to this dune file, never to Dune's
+;; workspace-root variable. When the SDK is vendored (for example under
+;; [vendor/temporal] with [(vendored_dirs vendor)]), the workspace root is the
+;; consumer's project, which contains neither the bridge scripts nor the Rust
+;; sources. Dune runs the action from this directory, so [../..] is always the
+;; SDK root, whether it is the workspace itself or a vendored subdirectory.
 (rule
  (targets
   libocaml_temporal_core_bridge.a
@@ -9,7 +15,6 @@
   (env_var TEMPORAL_RUST_BRIDGE_DIR)
   (env_var TEMPORAL_RUST_BRIDGE_KEY)
   (source_tree ../../rust)
-  ../../scripts/build-rust-bridge.sh
   ../../scripts/rust-bridge-artifact.sh
   ../../scripts/copy-rust-bridge-artifacts.sh
   ../../scripts/render-rust-link-flags.sh)
@@ -18,10 +23,12 @@
   ;; Cargo's target directory is mutable, so advertise a writable sibling as a
   ;; fallback for the bridge script. An explicitly configured
   ;; [CARGO_TARGET_DIR] remains authoritative; this fallback must not make the
-  ;; Docker or native Makefile workflows build the Rust graph twice.
+  ;; Docker or native Makefile workflows build the Rust graph twice. The
+  ;; fallback stays inside the SDK's own build directory so a vendored SDK
+  ;; never writes Cargo output into the consumer's build root.
   (setenv
    OCAML_TEMPORAL_RUST_TARGET_FALLBACK
-   %{workspace_root}/rust-target
+   ../../rust-target
    (setenv
     TEMPORAL_OCAML_IMPORT_DIR
     rust-imports
@@ -30,8 +37,8 @@
      rust_ocaml_link_flags.sexp
      (run
       sh
-      %{workspace_root}/scripts/build-rust-bridge.sh
-      %{workspace_root}
+      %{dep:../../scripts/build-rust-bridge.sh}
+      ../..
       libocaml_temporal_core_bridge.a
       dllocaml_temporal_core_bridge%{ext_dll}
       rust_static_link_flags.sexp))))))

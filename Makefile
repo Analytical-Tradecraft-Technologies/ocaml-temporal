@@ -234,6 +234,16 @@ test-install:
 	$(RUN) sh test/bridge/test_relocatable_link_flags.sh .
 	$(COMPOSE_RUN) sh test/bridge/test_install.sh
 
+# Builds a scratch Dune workspace that vendors this checkout under
+# vendor/temporal (#829). It compiles the Rust bridge from source in a fresh
+# workspace, so it is opt-in rather than part of `test` or the CI matrix.
+.PHONY: test-vendored native-test-vendored
+test-vendored:
+	$(COMPOSE_RUN) sh test/smoke/test_vendored_build.sh .
+
+native-test-vendored:
+	sh test/smoke/test_vendored_build.sh .
+
 # The API witness is part of the installed-consumer regression. Keep a named
 # target so release preparation and downstream CI can request the public
 # compatibility gate without knowing the package-layout test's implementation.
