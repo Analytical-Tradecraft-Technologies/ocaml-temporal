@@ -4,6 +4,10 @@ The initial prerelease is `v0.1.0-rc.1`. OPAM records it as `0.1.0~rc.1`
 in `.release-version`, `temporal-sdk.opam`, and `temporal-sdk.opam.locked`.
 Those three files must agree with the version tag supplied to the release
 workflow; changing the Run workflow field alone does not change package metadata.
+The Rust bridge reports the SDK to Temporal as `temporal-ocaml` with the same
+version in SemVer spelling (`0.1.0-rc.1`), recorded as `SDK_VERSION` in
+`rust/core-bridge/src/abi.rs`; the preflight gate and a Rust unit test reject a
+mismatch with `.release-version`.
 
 ## Build coverage and artifact reuse
 
@@ -86,7 +90,7 @@ directly without rebuilding them. Each SDK records its exact compiler and compil
 dependency identities; incompatible environments must use matching dependencies
 or build from source. Linux assets target Debian 12/glibc, not musl/Alpine.
 
-For the next version, first update the three version files in a PR and obtain
+For the next version, first update the three version files and `SDK_VERSION` in a PR and obtain
 maintainer approval of the candidate and its evidence. Create the matching
 protected tag at the approved master commit, then dispatch the workflow. The
 tag must be protected against updates and deletion as well as unauthorized
