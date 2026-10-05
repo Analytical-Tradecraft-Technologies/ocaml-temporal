@@ -46,10 +46,14 @@ type child_workflow_resolution =
 (** A child resolver survives its start acknowledgment. Core first reports the
     assigned run ID, then later reports the terminal payload or failure. Keeping
     both pieces in one table entry prevents a successful start from being
-    mistaken for completion and gives duplicate acknowledgments a typed error. *)
+    mistaken for completion and gives duplicate acknowledgments a typed error.
+    [cancellation_requested] is the same cell the public handle's [cancel]
+    closure sets; sharing it lets the resolver accept Core's cancelled
+    resolution for a child that never reported a start acknowledgment. *)
 type child_workflow_state = {
   resolve : child_workflow_resolution;
   mutable start_run_id : string option;
+  cancellation_requested : bool ref;
 }
 
 (** Resolver retained for one external signal or cancellation command. The
@@ -733,9 +737,11 @@ let schedule_local_activity context ~name ~input ?activity_id
 let start_child_workflow context ~id ~name ~input
     ?retry_policy ?task_queue ?parent_close_policy ?(cancellation_type = Activation.Child_try_cancel) ~decode () =
   let seq = allocate_sequence context in
-  (* Keep this bit in the handle closure rather than in the pending table so a
-    repeated cancel remains idempotent even after Core has removed the child
-    state while delivering its terminal result. *)
+  (* The handle closure owns this cell so a repeated cancel remains idempotent
+    even after Core has removed the child state while delivering its terminal
+    result. The pending table entry shares the same cell so
+    [resolve_child_workflow] can recognise Core's cancelled-before-started
+    resolution. *)
   let cancellation_requested = ref false in
   (* Core removes the table entry before the resolver runs. Retain this
      terminal marker in the handle closure so a valid cancellation arriving
@@ -762,6 +768,7 @@ let start_child_workflow context ~id ~name ~input
                             ("child workflow result decoder raised: "
                             ^ Printexc.to_string exn)))));
       start_run_id = None;
+      cancellation_requested;
     };
   emit context
     (Activation.Start_child_workflow
@@ -936,6 +943,16 @@ let resolve_child_workflow_start context ~seq result =
           state.resolve (Error error);
           Ok ())
 
+(** Completes the child future with Core's terminal result. A child normally
+    needs a recorded start acknowledgment first. The one exception is a
+    cancellation the workflow itself requested: when a [Try_cancel] or
+    [Abandon] child is cancelled after [StartChildWorkflowExecutionInitiated]
+    but before [ChildWorkflowExecutionStarted], pinned Temporal Core resolves
+    it directly as cancelled without ever sending a start resolution. That
+    sequence is accepted only for a [`Cancelled] error after this handle
+    emitted [Cancel_child_workflow]; any other pre-start terminal result is
+    still a bridge defect. The decision depends only on activation contents
+    and earlier workflow commands, so it is identical under replay. *)
 let resolve_child_workflow context ~seq result =
   match Hashtbl.find_opt context.child_workflows seq with
   | None ->
@@ -943,7 +960,18 @@ let resolve_child_workflow context ~seq result =
         (bridge_error
            (Printf.sprintf "unknown or duplicate child workflow sequence %Ld" seq))
   | Some state -> (
+      let cancelled_before_start =
+        !(state.cancellation_requested)
+        &&
+        match result with
+        | Error error -> (Temporal_base.Error.view error).category = `Cancelled
+        | Ok _ -> false
+      in
       match state.start_run_id with
+      | None when cancelled_before_start ->
+          Hashtbl.remove context.child_workflows seq;
+          state.resolve result;
+          Ok ()
       | None ->
           Error
             (bridge_error

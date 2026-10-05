@@ -298,7 +298,11 @@ val resolve_local_activity_backoff :
   (unit, Temporal_base.Error.t) result
 
 (** Completes and removes the pending child workflow with this private
-    correlation sequence. Unknown and repeated numbers are bridge defects. *)
+    correlation sequence. Unknown and repeated numbers are bridge defects, as
+    is a terminal result before the start acknowledgment, except for a
+    [`Cancelled] error after the workflow requested cancellation: Core resolves
+    a [Try_cancel] or [Abandon] child cancelled between start initiation and
+    start acknowledgment that way without a separate start resolution. *)
 val resolve_child_workflow :
   t ->
   seq:int64 ->

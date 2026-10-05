@@ -1022,6 +1022,62 @@ let test_child_workflow_failures_and_sequence_ownership () =
       expect "duplicate child sequence" "bridge" (public_error_kind error)
   | _ -> failwith "duplicate child resolution was accepted"
 
+(** Regression for #810. Pinned Temporal Core resolves a [Try_cancel] child
+    that the parent cancels after start initiation but before the child-started
+    event directly as cancelled, without any start resolution. That sequence
+    must complete the child future with the typed cancellation error rather
+    than fail the workflow task. A non-cancelled terminal result before start
+    remains a bridge defect even after cancellation was requested, so only
+    Core's documented shape is accepted. *)
+let test_child_cancelled_before_start_acknowledgment () =
+  let start_command =
+    Activation.Start_child_workflow
+      {
+        task_queue = None;
+        parent_close_policy = None;
+        seq = 1L;
+        id = "default-cancel-me";
+        name = "greeting_child";
+        input = payload "Ada";
+        retry_policy = None;
+        cancellation_type = Activation.Child_try_cancel;
+      }
+  in
+  let cancel_command =
+    Activation.Cancel_child_workflow
+      { seq = 1L; reason = "cancelled by workflow" }
+  in
+  let cancelled = Execution.start default_cancelling_child_parent_workflow () in
+  expect "pre-start cancellation commands" [ start_command; cancel_command ]
+    (Execution.activate cancelled [ Activation.Start_workflow ]);
+  expect "pre-start cancellation resolves parent"
+    [ Activation.Complete_workflow (payload "cancelled") ]
+    (Execution.activate cancelled
+       [
+         Activation.Resolve_child_workflow
+           {
+             seq = 1L;
+             result =
+               Error
+                 (Temporal_base.Error.make ~category:`Cancelled
+                    ~message:"child cancelled before start" ());
+           };
+       ]);
+  let completed = Execution.start default_cancelling_child_parent_workflow () in
+  ignore (Execution.activate completed [ Activation.Start_workflow ]);
+  match
+    Execution.activate completed
+      [
+        Activation.Resolve_child_workflow
+          { seq = 1L; result = Ok (payload "too early") };
+      ]
+  with
+  | [] ->
+      let error = require_task_failure completed [] in
+      expect "cancel-requested child completed before start" "bridge"
+        (public_error_kind error)
+  | _ -> failwith "pre-start child completion was accepted after cancel"
+
 (** Ensures a conflicting second start result cannot consume the child resolver.
     The context must report a bridge error, leave the future pending, and still
     accept the legitimate terminal result that follows. *)
@@ -2140,6 +2196,7 @@ let () =
   test_child_workflow_validation ();
   test_child_workflow_id_boundary ();
   test_child_workflow_failures_and_sequence_ownership ();
+  test_child_cancelled_before_start_acknowledgment ();
   test_child_start_conflicting_result_keeps_future_pending ();
   test_activity_cancel_after_natural_completion_is_noop ();
   test_local_activity_backoff_reschedules_without_resolving ();
