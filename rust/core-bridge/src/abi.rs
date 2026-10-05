@@ -1,3 +1,4 @@
+use crate::activity_slots::SharedSlotSupplier;
 use crate::replay_bridge::{ReplayWorker, ReplayWorkerError};
 use crate::worker_bridge::{
     PollLaneError, PollLanes, ReadinessWait, WorkerBridgeError, public_poll_lane_error_message,
@@ -30,9 +31,10 @@ use temporalio_common::protos::{
     temporal::api::{common::v1 as api_common, enums::v1::VersioningBehavior},
 };
 use temporalio_sdk_core::{
-    CoreRuntime, PollerBehavior, RuntimeOptions, TokioRuntimeBuilder, WorkerConfig,
-    WorkerVersioningStrategy,
+    CoreRuntime, FixedSizeSlotSupplier, PollerBehavior, RuntimeOptions, TokioRuntimeBuilder,
+    TunerBuilder, WorkerConfig, WorkerTuner, WorkerVersioningStrategy,
 };
+use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
@@ -90,24 +92,21 @@ const MAX_LIFECYCLE_CONFIG_BYTES: usize = 64 * 1024;
 const MAX_TRANSPORT_STRING_BYTES: usize = 64 * 1024;
 /// Prevents accidental allocation of unreasonable in-process worker state.
 const MAX_WORKER_COUNT: u32 = 1_000_000;
-/// Remote-activity slots granted to Core, matched to the OCaml executor.
+/// Activity slots shared by remote and local activity tasks, matched to the
+/// OCaml executor.
 ///
 /// The OCaml worker decodes, invokes, and completes one activity callback
 /// before admitting another. Every slot beyond that lets Core accept a task
-/// from the server, which starts its start-to-close clock, only for the task to
-/// wait in the bridge queue where it can time out and where other workers on
-/// the task queue cannot take it. Keep this equal to the executor's real
-/// concurrency until activity execution becomes concurrent and configurable
-/// (#498). An asynchronously completed activity releases its slot once the
-/// callback returns `WillCompleteAsync`.
-const DEFAULT_MAX_OUTSTANDING_ACTIVITIES: usize = 1;
-/// Local-activity slots granted to Core, for the same reason as remote
-/// activities: local activities share the same serial OCaml executor. Core's
-/// unset default would otherwise be 100.
-const DEFAULT_MAX_OUTSTANDING_LOCAL_ACTIVITIES: usize = 1;
+/// from the server, which starts its timeouts, only for the task to wait in
+/// the bridge queue where it can time out and where other workers on the task
+/// queue cannot take it. Remote and local activities draw from one pool (see
+/// `activity_slots`) because they share that executor. Keep this equal to the
+/// executor's real concurrency until activity execution becomes concurrent
+/// and configurable (#498).
+const ACTIVITY_EXECUTOR_SLOTS: usize = 1;
 /// Core server-poll concurrency for remote activity tasks. Core reserves a
 /// slot before polling, so pollers beyond the slot count would only wait.
-const DEFAULT_MAX_CONCURRENT_ACTIVITY_POLLS: usize = DEFAULT_MAX_OUTSTANDING_ACTIVITIES;
+const DEFAULT_MAX_CONCURRENT_ACTIVITY_POLLS: usize = ACTIVITY_EXECUTOR_SLOTS;
 /// Temporal Core requires two workflow-task pollers whenever workflow caching
 /// is enabled. This mirrors the OCaml sender-side validation.
 const MIN_CACHED_WORKFLOW_POLLS: u32 = 2;
@@ -2519,6 +2518,14 @@ impl WorkerConfigInput {
                 message: "max_concurrent_workflow_task_polls must be at least 2 when max_cached_workflows is greater than zero".to_owned(),
             });
         }
+        // Core enforces this only for `max_outstanding_workflow_tasks`, which
+        // the tuner replaces, so the bridge keeps the cached-worker rule itself.
+        if self.max_cached_workflows > 0 && self.max_outstanding_workflow_tasks < 2 {
+            return Err(Failure {
+                status: STATUS_CONFIGURATION,
+                message: "max_outstanding_workflow_tasks must be at least 2 when max_cached_workflows is greater than zero".to_owned(),
+            });
+        }
         if self.graceful_shutdown_timeout_ms > MAX_GRACEFUL_SHUTDOWN_MS {
             return Err(Failure {
                 status: STATUS_CONFIGURATION,
@@ -2547,14 +2554,15 @@ impl WorkerConfigInput {
             .namespace(self.namespace)
             .task_queue(self.task_queue)
             .max_cached_workflows(self.max_cached_workflows as usize)
-            .max_outstanding_workflow_tasks(workflow_task_slots)
+            .tuner(worker_tuner(
+                workflow_task_slots,
+                Arc::new(Semaphore::new(ACTIVITY_EXECUTOR_SLOTS)),
+            ))
             .workflow_task_poller_behavior(PollerBehavior::SimpleMaximum(
                 self.max_concurrent_workflow_task_polls as usize,
             ))
             .graceful_shutdown_period(Duration::from_millis(self.graceful_shutdown_timeout_ms))
             .versioning_strategy(versioning_strategy)
-            .max_outstanding_activities(DEFAULT_MAX_OUTSTANDING_ACTIVITIES)
-            .max_outstanding_local_activities(DEFAULT_MAX_OUTSTANDING_LOCAL_ACTIVITIES)
             .activity_task_poller_behavior(PollerBehavior::SimpleMaximum(
                 DEFAULT_MAX_CONCURRENT_ACTIVITY_POLLS,
             ))
@@ -2565,6 +2573,23 @@ impl WorkerConfigInput {
                 message: format!("Temporal workflow worker configuration is invalid: {message}"),
             })
     }
+}
+
+/// Builds Core's slot tuner. Workflow tasks keep a fixed pool of
+/// `workflow_task_slots`; remote and local activity tasks share
+/// `activity_slots`, so together they never exceed the serial OCaml executor's
+/// capacity. Nexus tasks are not polled by this bridge and keep Core's default.
+fn worker_tuner(
+    workflow_task_slots: usize,
+    activity_slots: Arc<Semaphore>,
+) -> Arc<dyn WorkerTuner + Send + Sync> {
+    Arc::new(
+        TunerBuilder::default()
+            .workflow_slot_supplier(Arc::new(FixedSizeSlotSupplier::new(workflow_task_slots)))
+            .activity_slot_supplier(Arc::new(SharedSlotSupplier::new(activity_slots.clone())))
+            .local_activity_slot_supplier(Arc::new(SharedSlotSupplier::new(activity_slots)))
+            .build(),
+    )
 }
 
 /// Validates only bridge-owned string invariants before Core sees the value.
@@ -4363,16 +4388,35 @@ mod worker_config_tests {
         );
     }
 
-    /// Core must never be given more activity slots than the serial OCaml
-    /// executor can run (#777); surplus slots let the server start tasks
-    /// whose timeouts then expire while they wait in the bridge queue.
+    /// Remote and local activities share one slot pool sized to the serial
+    /// OCaml executor (#777). Separate per-kind pools would let a remote task
+    /// wait in the bridge queue, with its server timeouts running, behind a
+    /// slow local activity callback.
     #[test]
-    fn activity_slots_match_serial_executor() {
+    fn activity_kinds_share_executor_slots() {
+        use std::sync::Arc;
+        use tokio::sync::Semaphore;
+
         let core = config(MIN_CACHED_WORKFLOW_POLLS)
             .into_core()
             .expect("default worker configuration should be valid");
-        assert_eq!(core.max_outstanding_activities, Some(1));
-        assert_eq!(core.max_outstanding_local_activities, Some(1));
+        assert!(core.tuner.is_some());
+        assert_eq!(core.max_outstanding_activities, None);
+        assert_eq!(core.max_outstanding_local_activities, None);
+
+        let shared = Arc::new(Semaphore::new(super::ACTIVITY_EXECUTOR_SLOTS));
+        let tuner = super::worker_tuner(4, shared.clone());
+        let remote = tuner.activity_task_slot_supplier();
+        let local = tuner.local_activity_slot_supplier();
+        assert_eq!(remote.available_slots(), Some(1));
+        assert_eq!(local.available_slots(), Some(1));
+        let held = shared
+            .try_acquire()
+            .expect("one executor slot should be free");
+        assert_eq!(remote.available_slots(), Some(0));
+        assert_eq!(local.available_slots(), Some(0));
+        drop(held);
+        assert_eq!(local.available_slots(), Some(1));
     }
 
     /// Accepts the public default poller count before any runtime or network

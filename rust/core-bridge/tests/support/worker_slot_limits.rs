@@ -17,6 +17,18 @@ fn config(cache: u32, tasks: u32) -> WorkerConfigInput {
     }
 }
 
+/// Returns the workflow-task capacity Core will see. The bridge passes slot
+/// limits through a tuner (so remote and local activities can share one pool),
+/// which leaves `max_outstanding_workflow_tasks` unset.
+fn workflow_slots(core: &temporalio_sdk_core::WorkerConfig) -> Option<usize> {
+    assert_eq!(core.max_outstanding_workflow_tasks, None);
+    core.tuner
+        .as_ref()
+        .expect("bridge workers configure a slot tuner")
+        .workflow_task_slot_supplier()
+        .available_slots()
+}
+
 /// Core independently caps cache-enabled permit acquisition. Its poller
 /// balancer must see that same capacity, or idle sticky polls can reserve the
 /// permits required to poll a new workflow from the normal queue.
@@ -25,7 +37,7 @@ fn small_cache_advertises_its_effective_task_capacity() {
     for (cache, expected) in [(1, 2), (2, 2), (3, 3), (100, 100)] {
         let core = config(cache, 1_000).into_core().expect("valid worker");
         assert_eq!(core.max_cached_workflows, cache as usize);
-        assert_eq!(core.max_outstanding_workflow_tasks, Some(expected));
+        assert_eq!(workflow_slots(&core), Some(expected));
     }
 }
 
@@ -35,7 +47,7 @@ fn small_cache_advertises_its_effective_task_capacity() {
 fn explicit_smaller_and_uncached_limits_are_preserved() {
     for (cache, tasks) in [(100, 2), (0, 1), (0, 1_000), (1_000, 1_000)] {
         let core = config(cache, tasks).into_core().expect("valid worker");
-        assert_eq!(core.max_outstanding_workflow_tasks, Some(tasks as usize));
+        assert_eq!(workflow_slots(&core), Some(tasks as usize));
     }
 }
 
