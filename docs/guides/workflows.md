@@ -219,10 +219,11 @@ let greet_or_explain input =
 Exceptions are reserved for programmer defects and broken internal invariants.
 The worker boundary catches an unexpected exception and reports a structured
 failure; workflow code should not use exceptions as its ordinary branch or
-retry mechanism. In activity code, an exception escaping the callback (for
-example a `Unix.Unix_error` from a library) becomes a retryable application
-failure of type `ocaml_exception`, so the activity's retry policy still
-applies; add `ocaml_exception` to `non_retryable_error_types` to opt out. The
+retry mechanism. In activity code, an exception escaping the callback becomes
+a **non-retryable** application failure of type `ocaml_exception`: the retry
+policy does not apply, so the first raise fails the activity. Catch exceptions
+from libraries that raise on transient conditions (for example
+`Unix.Unix_error` or `Sys_error`) and return a retryable `Error` instead. The
 failure includes the OCaml backtrace when `Printexc.record_backtrace` is on.
 
 Workflow code must be deterministic during replay. Temporal may run the same

@@ -245,13 +245,14 @@ let failure_of_error (error : error_view) : Protocol.failure =
     }
 
 (** Builds the failure for an exception raised by application activity code.
-    Activity code commonly performs I/O through libraries that raise on
-    transient errors ([Unix.Unix_error], [End_of_file], [Sys_error]), so the
-    failure is retryable and subject to the activity's retry policy, as in the
-    official SDKs. The distinct [ocaml_exception] type lets a retry policy opt
-    out through [non_retryable_error_types]. The OCaml backtrace is included
-    when backtrace recording is enabled; it is bounded and must be valid UTF-8
-    to fit the protocol's strict string fields. *)
+    The SDK contract reserves exceptions for programmer defects
+    ([Match_failure], [Assert_failure], [Invalid_argument], ...); expected and
+    transient failures are returned as typed [Error] values, which keep their
+    own retryability. Retrying a defect would rerun broken code, without bound
+    under Temporal's default retry policy, so the failure is non-retryable.
+    Unlike adapter dispatch failures it has the distinct [ocaml_exception]
+    type and carries the OCaml backtrace when backtrace recording is enabled,
+    bounded and valid UTF-8 to fit the protocol's strict string fields. *)
 let callback_exception_failure (diagnostic : error_view) backtrace :
     Protocol.failure =
   Protocol.
@@ -265,7 +266,7 @@ let callback_exception_failure (diagnostic : error_view) backtrace :
         Application
           {
             type_name = "ocaml_exception";
-            non_retryable = false;
+            non_retryable = true;
             details = [];
             category = Application_category_unspecified;
             next_retry_delay = None;
@@ -1037,7 +1038,7 @@ module Make (Supervisor : SUPERVISOR) = struct
       try Printexc.raw_backtrace_to_string backtrace with _ -> ""
     in
     let diagnostic =
-      exception_error ~path:"$.implementation" ~retryable:true exception_
+      exception_error ~path:"$.implementation" exception_
     in
     reject_task_with_failure adapter ~token ~activity_type
       ~failure:(callback_exception_failure diagnostic backtrace) diagnostic

@@ -1142,9 +1142,10 @@ let test_registration_validation () =
   end
 
 (** Exceptions from application activity code are converted into a typed,
-    retired failure instead of escaping the worker loop. The failure is
-    retryable with type [ocaml_exception] so the activity's retry policy
-    applies (#822), and carries the backtrace when recording is enabled. *)
+    retired failure instead of escaping the worker loop. Exceptions are
+    programmer defects, so the failure stays non-retryable, but it is
+    identifiable as [ocaml_exception] and carries the backtrace when recording
+    is enabled (#822). *)
 let test_implementation_exception_is_retired () =
   let recording = Printexc.backtrace_status () in
   Printexc.record_backtrace true;
@@ -1174,8 +1175,8 @@ let test_implementation_exception_is_retired () =
         info = Protocol.Application { type_name; non_retryable; _ }; _ } ->
       if not (String.equal type_name "ocaml_exception") then
         failwith "activity exception used the wrong failure type";
-      if non_retryable then
-        failwith "activity exception bypassed the retry policy";
+      if not non_retryable then
+        failwith "activity exception would retry a programmer defect";
       if not (String.equal message "Failure(\"defect in activity\")") then
         failwith "activity exception lost its message";
       if String.equal stack_trace "" then
