@@ -219,13 +219,16 @@ and bridge, read the [documentation guide](../README.md) first.
   state, or nondeterministic iteration to affect commands.
 - Patch decisions belong to one workflow execution. Core's `NotifyHasPatch`
   jobs are applied before workflow fibers run; absent a known marker,
-  `Temporal.Workflow.patched` returns `not is_replaying`, retains that
-  decision, and emits a non-deprecated marker command on every call. The
-  unit-returning `Temporal.Workflow.deprecate_patch` retains the same private
-  decision state and emits a deprecated marker. The runtime does not deduplicate
-  same-mode commands or share patch state between runs, but it rejects active
-  and deprecated calls for one ID in one execution before emitting the second
-  mode. Patch IDs are durable history keys, not deployment or process state.
+  `Temporal.Workflow.patched` returns `not is_replaying`. The first answer for
+  an ID is retained for the run: a notification seeds only IDs workflow code
+  has not consulted, so it never flips a returned decision. A non-deprecated
+  marker command is emitted on every call whose decision is `true` and never
+  for a `false` replay decision. The unit-returning
+  `Temporal.Workflow.deprecate_patch` retains the same private decision state
+  and emits a deprecated marker under the same condition. The runtime does not
+  deduplicate same-mode commands or share patch state between runs, but it
+  rejects active and deprecated calls for one ID in one execution before
+  emitting the second mode. Patch IDs are durable history keys, not deployment or process state.
 - Replay-safe randomness, side effects, and workflow logging APIs remain
   required before production release. The complete [PR #348 CI
   run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29411260374) verifies
