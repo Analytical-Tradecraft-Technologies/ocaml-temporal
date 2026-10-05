@@ -59,9 +59,12 @@ val is_cancelled : t -> (bool, Error.t) result
 val check : t -> (unit, Error.t) result
 
 (** Awaits [future] while observing [scope]. A cancellation requested before
-    the future completes returns a typed [`Cancelled] error. Errors from the
-    future itself pass through unchanged. The future must belong to the same
-    workflow execution as the scope. *)
+    the future completes returns a typed [`Cancelled] error. If the scope is
+    already cancelled when [await] is called, the [`Cancelled] error is
+    returned even when [future] has already completed; that completed result
+    remains observable through {!Future.await} or {!Future.peek}. Errors from
+    the future itself pass through unchanged. The future must belong to the
+    same workflow execution as the scope. *)
 val await :
   t ->
   ('value, Error.t) Future.t ->

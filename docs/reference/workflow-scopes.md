@@ -63,10 +63,13 @@ let await_until deadline operation =
 ```
 
 `Temporal.Scope.await` first checks ownership and whether cancellation has
-already been requested. If both the operation and the private scope signal
-are ready, the operation wins because it is registered first. Otherwise the
-first deterministic scheduler completion wins. A future error passes through
-unchanged; a scope signal produces an error whose category is `Cancelled`.
+already been requested. If the scope is already cancelled, `await` returns a
+`Cancelled` error without consulting the operation, even when the operation
+has already completed. Otherwise it waits, and the first deterministic
+scheduler completion wins. `Scope.cancel` records the cancelled state and
+resolves the private scope signal together, so the signal can never already be
+ready when `await` starts its race. A future error passes through unchanged; a
+scope signal produces an error whose category is `Cancelled`.
 Registered operation hooks run as part of `Scope.cancel`; the first hook error
 is returned after all hooks have been attempted. The future must belong to the
 same workflow execution as the scope.
@@ -82,6 +85,11 @@ The call must run during the owning workflow scheduler's active turn. A
 successful cancellation is idempotent, and it wakes scope waiters. A
 cancellation request that arrives after an operation has already completed
 does not rewrite that result; its hook is simply not registered as live work.
+The completed result stays available through `Temporal.Future.await` or
+`Temporal.Future.peek` on the operation's future, but a later
+`Temporal.Scope.await` on the cancelled scope returns `Cancelled` instead of
+the value. Read a result that completed before cancellation from the future
+itself rather than through the cancelled scope.
 
 ## Completed registrations
 

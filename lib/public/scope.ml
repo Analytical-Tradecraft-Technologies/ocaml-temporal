@@ -194,10 +194,13 @@ let check scope =
 let ensure_owner scope =
   if owns_scheduler scope then Ok () else Error (ownership_error "await")
 
-(** Waits for either the operation or the scope signal. The operation is
-    registered first, so if both inputs are already ready the deterministic
-    Future race rule gives the operation precedence; a cancellation already
-    recorded in [state] wins before registration. *)
+(** Waits for either the operation or the scope signal. A cancellation
+    already recorded in [state] is returned before the race is registered,
+    even if the operation has completed. Because [cancel] records [state] and
+    resolves the signal in the same step, and nothing yields between [check]
+    and the race, the signal is never ready at registration time; the race
+    therefore only ever decides which input completes first while the fiber
+    is suspended. *)
 let await scope future =
   match ensure_owner scope with
   | Error error -> Error error

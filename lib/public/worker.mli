@@ -11,7 +11,10 @@ type registered_workflow
     can only obtain validated values through [make] or [default]. *)
 module Options : sig
   (** Worker routing mode. [No_versioning] keeps the build ID as metadata;
-      [Legacy_build_id] enables Temporal's whole-worker build-ID versioning. *)
+      [Legacy_build_id] enables Temporal's whole-worker build-ID versioning;
+      [Deployment_based] selects Temporal Core's deployment/version routing
+      for the named deployment and build, optionally with a default
+      versioning behavior for workflows that do not declare one. *)
   type versioning =
     | No_versioning
     | Legacy_build_id of string
