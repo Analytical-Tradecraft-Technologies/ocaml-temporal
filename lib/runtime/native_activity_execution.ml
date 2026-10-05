@@ -42,8 +42,8 @@ module type SUPERVISOR = sig
   val error_code : error -> string
   val error_message : error -> string
   val error_is_retryable : error -> bool
-  val async_heartbeat_error_disposition :
-    error -> Worker_policy.async_heartbeat_disposition
+  val async_operation_error_disposition :
+    error -> Worker_policy.async_operation_disposition
   val exception_is_retryable : exn -> bool
 end
 
@@ -602,11 +602,12 @@ module Make (Supervisor : SUPERVISOR) = struct
   let source_error_is_retryable source_error =
     try Supervisor.error_is_retryable source_error with _ -> false
 
-  (** Heartbeat classification distinguishes an uncertain RPC from a rejected
-      request that leaves its activity live. A faulty source classifier still
-      fails closed instead of hiding a defect. *)
-  let async_heartbeat_error_disposition source_error =
-    try Supervisor.async_heartbeat_error_disposition source_error
+  (** Async-operation classification distinguishes an uncertain RPC from a
+      rejected request that leaves its activity live, for heartbeats and
+      terminal operations alike. A faulty source classifier still fails closed
+      instead of hiding a defect. *)
+  let async_operation_error_disposition source_error =
+    try Supervisor.async_operation_error_disposition source_error
     with _ -> Worker_policy.Retired
 
   (** Exception classification is equally conservative: arbitrary exceptions
@@ -748,15 +749,35 @@ module Make (Supervisor : SUPERVISOR) = struct
     in
     Ok request
 
-  (** Maps a native outcome to one lifecycle decision shared by the adapter
-      registry and handle state machine. Terminal client operations retain
-      their conservative completion policy; heartbeat errors may retain an
-      exact request or reject it while leaving the live lease available.
-      Local preflight errors never enter this classifier. *)
+  (** Maps an adapter-local failure that never received a native answer (a
+      missing lease or a supervisor exception) to a lifecycle decision. Such
+      failures are defects or teardown races, so they retire the handle unless
+      explicitly retryable. Native typed errors use
+      [async_native_submission_error] instead. *)
   let async_submission_error operation (error : error_view) =
     let diagnostic = base_operation_error operation error in
     if error.retryable then Async_activity.Retryable_submission diagnostic
     else Async_activity.Terminal_submission diagnostic
+
+  (** Maps a typed native failure of any namespace-bound async request to the
+      base handle's submission outcome. The same disposition applies to
+      heartbeats and complete/fail/cancel because none of them consumes a Core
+      worker lease: an uncertain RPC keeps the lease ([Retryable_submission]),
+      a definitive rejection keeps the live handle ([Rejected_submission]), and
+      only token loss or an unusable graph retires it. The base handle then
+      decides whether an uncertain request must be retried exactly. *)
+  let async_native_submission_error ~name ~path source_error =
+    let disposition = async_operation_error_disposition source_error in
+    let retryable = disposition = Worker_policy.Retry_exact in
+    let diagnostic =
+      base_operation_error name
+        (supervisor_error ~path ~retryable ~error_code:Supervisor.error_code
+           ~error_message:Supervisor.error_message source_error)
+    in
+    match disposition with
+    | Worker_policy.Retry_exact -> Async_activity.Retryable_submission diagnostic
+    | Worker_policy.Rejected_live -> Async_activity.Rejected_submission diagnostic
+    | Worker_policy.Retired -> Async_activity.Terminal_submission diagnostic
 
   (** Calls the namespace-bound client only after local validation succeeds.
       The async mutex covers preparation, native submission, and registry
@@ -808,33 +829,7 @@ module Make (Supervisor : SUPERVISOR) = struct
                         match submitted with
                         | Ok () -> Ok ()
                         | Error source_error ->
-                            (match request with
-                            | Async_completion _ ->
-                                Error (async_submission_error name
-                                  (supervisor_error ~path
-                                    ~retryable:(source_error_is_retryable source_error)
-                                    ~error_code:Supervisor.error_code
-                                    ~error_message:Supervisor.error_message source_error))
-                            | Async_heartbeat _ ->
-                                let disposition =
-                                  async_heartbeat_error_disposition source_error
-                                in
-                                let retryable =
-                                  disposition = Worker_policy.Retry_exact
-                                in
-                                let diagnostic =
-                                  base_operation_error name
-                                    (supervisor_error ~path ~retryable
-                                      ~error_code:Supervisor.error_code
-                                      ~error_message:Supervisor.error_message source_error)
-                                in
-                                Error (match disposition with
-                                  | Worker_policy.Retry_exact ->
-                                      Async_activity.Retryable_submission diagnostic
-                                  | Worker_policy.Rejected_live ->
-                                      Async_activity.Rejected_submission diagnostic
-                                  | Worker_policy.Retired ->
-                                      Async_activity.Terminal_submission diagnostic))
+                            Error (async_native_submission_error ~name ~path source_error)
                       with exception_ ->
                         Error (async_submission_error name (exception_error ~path exception_))
                     in

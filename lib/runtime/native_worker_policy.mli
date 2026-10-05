@@ -15,15 +15,20 @@ val activity_completion_retryable :
 (** Returns [true] only for the bilateral retryable-completion status. Generic
     connection, readiness, worker, protocol, and closed states are false. *)
 
-type async_heartbeat_disposition = Retry_exact | Rejected_live | Retired
-(** Whether a failed heartbeat must retry the identical request, can replace a
-    definitively rejected request while retaining its live activity lease, or
-    must retire the handle after token loss or unusable native state. *)
+type async_operation_disposition = Retry_exact | Rejected_live | Retired
+(** Ownership outcome of a failed namespace-bound async activity request.
+    [Retry_exact]: the outcome is uncertain and the live lease is retained; a
+    terminal operation may only be retried byte-for-byte, while a heartbeat is
+    dropped. [Rejected_live]: the request was definitively not applied and the
+    handle stays live for a corrected or different operation. [Retired]: the
+    token is gone or the native graph is unusable. *)
 
-val async_heartbeat_disposition :
-  Temporal_core_bridge.Native_bridge.status -> async_heartbeat_disposition
-(** Classifies typed bridge statuses without reading diagnostic text.
-    [Connection] is uncertain; [Async_heartbeat_rejected] and local preflight
+val async_operation_disposition :
+  Temporal_core_bridge.Native_bridge.status -> async_operation_disposition
+(** Classifies typed bridge statuses for async heartbeats and async
+    complete/fail/cancel alike, without reading diagnostic text.
+    [Connection] is uncertain; [Async_heartbeat_rejected] (which the bridge
+    emits for every definitively rejected async request) and local preflight
     failures leave the handle live; [Invalid_state] closes a lost token. *)
 
 val shutdown_retryable : drain_failure -> bool

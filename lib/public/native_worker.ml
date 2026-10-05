@@ -185,12 +185,14 @@ module Activity_source = struct
         Worker_policy.activity_completion_retryable status
     | _ -> false
 
-  (** The namespace-bound async heartbeat is nonterminal. A rejected request
-      leaves its activity live, while an uncertain RPC retains the exact
-      request; this differs from Core worker completion ownership. *)
-  let async_heartbeat_error_disposition = function
+  (** Namespace-bound async heartbeats and complete/fail/cancel address the
+      server by task token and never consume a Core worker lease, so they do
+      not use [error_is_retryable]'s fail-closed worker-completion policy. A
+      rejected request leaves its activity live and an uncertain RPC keeps the
+      lease; only token loss or an unusable native graph retires the handle. *)
+  let async_operation_error_disposition = function
     | Native.Backend { Bridge.status; _ } ->
-        Worker_policy.async_heartbeat_disposition status
+        Worker_policy.async_operation_disposition status
     | _ -> Worker_policy.Retired
 
   (** Unexpected supervisor exceptions are defects, not evidence of a safe

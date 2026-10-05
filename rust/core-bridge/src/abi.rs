@@ -76,8 +76,10 @@ pub const STATUS_ALREADY_STARTED: Status = 12;
 /// suppresses those network outcomes, so the production bridge fails closed
 /// rather than emitting this status speculatively.
 pub const STATUS_RETRYABLE: Status = 13;
-/// A namespace-bound async heartbeat was definitively rejected without
-/// proving that its activity token is gone. The caller may correct the request.
+/// A namespace-bound async activity request (heartbeat, complete, fail, or
+/// cancel) was definitively rejected without proving that its activity token
+/// is gone. The caller may correct the request or submit a different one. The
+/// name predates terminal operations and is kept for ABI stability.
 pub const STATUS_ASYNC_HEARTBEAT_REJECTED: Status = 14;
 
 /// Maximum accepted lifecycle configuration document size.
@@ -159,10 +161,15 @@ impl AsyncActivityOperation {
     }
 }
 
-/// Recognizes RPC codes that definitively reject one heartbeat request without
-/// proving its task token is gone. Ambiguous and potentially transient codes
-/// remain Connection so the caller retains the exact request for retry.
-fn heartbeat_rpc_rejected(code: temporalio_client::tonic::Code) -> bool {
+/// Recognizes RPC codes that definitively reject one namespace-bound async
+/// activity request without proving its task token is gone.
+///
+/// The server answered these requests without applying them, so the caller
+/// may correct the request or choose a different operation (for example
+/// `fail` after a rejected `cancel` or an oversized `complete`). Ambiguous and
+/// potentially transient codes are deliberately absent: they remain
+/// Connection so a terminal request is retried byte-for-byte.
+fn async_rpc_rejected(code: temporalio_client::tonic::Code) -> bool {
     use temporalio_client::tonic::Code;
     matches!(
         code,
@@ -178,14 +185,22 @@ fn heartbeat_rpc_rejected(code: temporalio_client::tonic::Code) -> bool {
 /// Converts an asynchronous activity client error into the closed status
 /// vocabulary understood by the OCaml lease state machine.
 ///
-/// `NotFound` is a terminal outcome for a retained task token: Temporal has
-/// already completed, cancelled, timed out, or otherwise discarded that
-/// activity, so retrying the same request could never make it valid. A
-/// definitive heartbeat RPC rejection releases only that request: it cannot
-/// consume the nonterminal completion capability. Ambiguous RPC outcomes keep
-/// the generic Connection status for exact-request retry. Terminal completions
-/// retain their conservative policy. Remote diagnostic prose is discarded so
-/// server-controlled text cannot enter the stable ABI.
+/// These are namespace-bound `RespondActivityTask*ByToken` and
+/// `RecordActivityTaskHeartbeat` RPCs, not Core worker completions: Core never
+/// consumes a lease for them, and the server applies at most one terminal
+/// response per activity attempt. The classification is therefore the same
+/// for heartbeats and terminal operations:
+///
+/// - `NotFound` is terminal for the retained task token: Temporal has already
+///   completed, cancelled, timed out, or otherwise discarded that activity, so
+///   no later request can succeed. It maps to `STATUS_INVALID_STATE`.
+/// - A definitive rejection (`async_rpc_rejected`) maps to
+///   `STATUS_ASYNC_HEARTBEAT_REJECTED`; the handle and lease stay live.
+/// - Every other RPC outcome is ambiguous and maps to `STATUS_CONNECTION`;
+///   OCaml keeps the lease so a terminal request can be retried exactly.
+///
+/// Remote diagnostic prose is discarded so server-controlled text cannot enter
+/// the stable ABI.
 fn async_activity_failure(operation: AsyncActivityOperation, error: AsyncActivityError) -> Failure {
     let label = operation.label();
     match error {
@@ -193,15 +208,10 @@ fn async_activity_failure(operation: AsyncActivityOperation, error: AsyncActivit
             status: STATUS_INVALID_STATE,
             message: format!("Temporal asynchronous activity {label} is no longer active"),
         },
-        AsyncActivityError::Rpc(status)
-            if operation == AsyncActivityOperation::Heartbeat
-                && heartbeat_rpc_rejected(status.code()) =>
-        {
-            Failure {
-                status: STATUS_ASYNC_HEARTBEAT_REJECTED,
-                message: "Temporal asynchronous activity heartbeat request was rejected".to_owned(),
-            }
-        }
+        AsyncActivityError::Rpc(status) if async_rpc_rejected(status.code()) => Failure {
+            status: STATUS_ASYNC_HEARTBEAT_REJECTED,
+            message: format!("Temporal asynchronous activity {label} request was rejected"),
+        },
         AsyncActivityError::Rpc(_) => Failure {
             status: STATUS_CONNECTION,
             message: format!("Temporal asynchronous activity {label} failed"),
@@ -4261,9 +4271,8 @@ mod async_activity_error_tests {
         );
     }
 
-    /// A generic RPC failure stays Connection. The OCaml heartbeat policy may
-    /// retain its nonterminal handle, while the completion policy remains
-    /// fail-closed; Rust must not claim a bilateral completion retry lease.
+    /// A generic RPC failure stays Connection: the request may or may not have
+    /// been applied, so OCaml keeps the live handle and lease.
     #[test]
     fn heartbeat_rpc_failure_is_connection() {
         let failure = async_activity_failure(
@@ -4294,18 +4303,32 @@ mod async_activity_error_tests {
         );
     }
 
+    /// Codes that prove the server answered without applying the request.
+    const DEFINITIVE_REJECTIONS: [Code; 6] = [
+        Code::InvalidArgument,
+        Code::PermissionDenied,
+        Code::FailedPrecondition,
+        Code::OutOfRange,
+        Code::Unimplemented,
+        Code::Unauthenticated,
+    ];
+
+    /// Codes for which the server may or may not have applied the request.
+    const AMBIGUOUS_FAILURES: [Code; 7] = [
+        Code::Unavailable,
+        Code::DeadlineExceeded,
+        Code::ResourceExhausted,
+        Code::Cancelled,
+        Code::Aborted,
+        Code::Unknown,
+        Code::Internal,
+    ];
+
     /// A definitive heartbeat RPC rejection does not consume the live activity
     /// capability; the OCaml caller may correct this request or complete it.
     #[test]
     fn definitive_heartbeat_rpc_rejection_keeps_live_capability() {
-        for code in [
-            Code::InvalidArgument,
-            Code::PermissionDenied,
-            Code::FailedPrecondition,
-            Code::OutOfRange,
-            Code::Unimplemented,
-            Code::Unauthenticated,
-        ] {
+        for code in DEFINITIVE_REJECTIONS {
             let failure = async_activity_failure(
                 AsyncActivityOperation::Heartbeat,
                 AsyncActivityError::Rpc(Status::new(code, "discard this remote text")),
@@ -4318,35 +4341,41 @@ mod async_activity_error_tests {
         }
     }
 
-    /// Only heartbeats receive the rejected-but-live outcome. Completion
-    /// failures still have no bilateral proof that a terminal request was not
-    /// consumed and must remain generic Connection errors.
+    /// A definitive rejection of complete/fail/cancel (for example cancel
+    /// without a cancel request, or an oversized result) leaves the activity
+    /// live so the caller can submit a different terminal operation (#821).
     #[test]
-    fn definitive_rpc_completion_stays_connection() {
-        let failure = async_activity_failure(
-            AsyncActivityOperation::Completion,
-            AsyncActivityError::Rpc(Status::invalid_argument("discard this remote text")),
-        );
-        assert_eq!(failure.status, STATUS_CONNECTION);
+    fn definitive_completion_rpc_rejection_keeps_live_capability() {
+        for code in DEFINITIVE_REJECTIONS {
+            let failure = async_activity_failure(
+                AsyncActivityOperation::Completion,
+                AsyncActivityError::Rpc(Status::new(code, "discard this remote text")),
+            );
+            assert_eq!(failure.status, STATUS_ASYNC_HEARTBEAT_REJECTED, "{code:?}");
+            assert_eq!(
+                failure.message,
+                "Temporal asynchronous activity completion request was rejected"
+            );
+        }
     }
 
     /// Deadline, transport, and other ambiguous RPC outcomes may occur after
-    /// a heartbeat was applied, so the exact request must remain pending.
+    /// the server applied the request. They stay Connection for both
+    /// operations, so OCaml retains the lease instead of closing the handle.
     #[test]
-    fn ambiguous_heartbeat_rpc_failure_stays_connection() {
-        for code in [
-            Code::Unavailable,
-            Code::DeadlineExceeded,
-            Code::ResourceExhausted,
-            Code::Cancelled,
-            Code::Unknown,
-            Code::Internal,
+    fn ambiguous_rpc_failure_stays_connection() {
+        for operation in [
+            AsyncActivityOperation::Heartbeat,
+            AsyncActivityOperation::Completion,
         ] {
-            let failure = async_activity_failure(
-                AsyncActivityOperation::Heartbeat,
-                AsyncActivityError::Rpc(Status::new(code, "discard this remote text")),
-            );
-            assert_eq!(failure.status, STATUS_CONNECTION, "{code:?}");
+            for code in AMBIGUOUS_FAILURES {
+                let failure = async_activity_failure(
+                    operation,
+                    AsyncActivityError::Rpc(Status::new(code, "discard this remote text")),
+                );
+                assert_eq!(failure.status, STATUS_CONNECTION, "{code:?}");
+                assert!(!failure.message.contains("discard"));
+            }
         }
     }
 }

@@ -512,15 +512,18 @@ client response.
 Neither endpoint reads or retires the worker's activity-task ledger. The
 worker lease was already handed off, and the OCaml async-activity state machine
 keeps its copied token while a client operation is in flight. A successful
-terminal request retires that lease; a terminal non-retryable bridge failure
-closes the handle and removes the lease. A `NotFound` response is treated as a
-terminal inactive-handle condition because retrying cannot make that token
-valid again. Other async-client RPC failures are returned as generic
-`Connection` bridge errors. The current public worker policy is deliberately
-fail-closed: only the explicit bilateral `Retryable` status authorizes replay,
-and these async-client endpoints do not produce that status, so callers must
-not issue a different operation for the same handle after a generic RPC
-failure.
+terminal request retires that lease. A `NotFound` response maps to
+`Invalid_state`, a terminal inactive-handle condition that closes the handle
+and removes the lease, because retrying cannot make that token valid again.
+`InvalidArgument`, `PermissionDenied`, `FailedPrecondition`, `OutOfRange`,
+`Unimplemented`, and `Unauthenticated` map to `Async_heartbeat_rejected` for
+heartbeats and terminal operations alike: the request was not applied, and the
+handle and lease stay live for a corrected or different request. Every other
+RPC failure is ambiguous and maps to `Connection`; the handle and lease stay
+live, a terminal operation may be retried only with the identical request,
+and a heartbeat is dropped. These by-token RPCs are safe to repeat because the
+server accepts at most one terminal response per activity, unlike Core worker
+completions, which keep the fail-closed `Retryable`-only replay policy.
 
 The request shapes are defined by
 [`activity-async-completion.schema.json`](../schemas/bridge/activity-async-completion.schema.json)

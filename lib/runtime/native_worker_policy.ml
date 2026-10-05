@@ -4,7 +4,9 @@
     and logs network failures internally. Consequently the only status that
     can authorize a future completion retry is the dedicated bilateral
     [Retryable] category; this module deliberately fails closed for every
-    existing generic bridge status. *)
+    existing generic bridge status. Namespace-bound async activity requests
+    do not use a Core worker lease and are classified separately by
+    [async_operation_disposition]. *)
 
 type drain_failure =
   | Workflow_drain
@@ -17,16 +19,23 @@ let activity_completion_retryable = function
   | Temporal_core_bridge.Native_bridge.Retryable -> true
   | _ -> false
 
-(** The three ownership outcomes of a failed namespace-bound async heartbeat.
-    A rejected request may be replaced, while an uncertain request retains its
-    exact key and a lost token or unusable native graph retires the handle. *)
-type async_heartbeat_disposition = Retry_exact | Rejected_live | Retired
+(** The three ownership outcomes of a failed namespace-bound async activity
+    request (heartbeat, complete, fail, or cancel). These RPCs address the
+    server by task token and never consume a Core worker lease, so unlike
+    worker completions they cannot fail closed on an uncertain transport
+    result: doing so would drop a still-live activity. *)
+type async_operation_disposition = Retry_exact | Rejected_live | Retired
 
-(** Classifies a typed heartbeat result without inspecting server diagnostic
-    text. The explicit rejected status means the request was not applied but
-    does not prove that the activity token is gone. Local argument, protocol,
-    and configuration failures likewise have not crossed the RPC boundary. *)
-let async_heartbeat_disposition = function
+(** Classifies a typed async-operation result without inspecting server
+    diagnostic text. [Connection] (and the bilateral [Retryable]) means the
+    outcome is unknown: the lease stays registered and the base handle decides
+    whether the exact request must be retried (terminal operations) or may be
+    dropped (heartbeats). The explicit rejected status means the request was
+    not applied but does not prove that the activity token is gone; local
+    argument, protocol, and configuration failures likewise have not crossed
+    the RPC boundary. Every other status, including [Invalid_state] for a
+    server [NotFound], retires the handle. *)
+let async_operation_disposition = function
   | Temporal_core_bridge.Native_bridge.Connection
   | Temporal_core_bridge.Native_bridge.Retryable -> Retry_exact
   | Temporal_core_bridge.Native_bridge.Async_heartbeat_rejected

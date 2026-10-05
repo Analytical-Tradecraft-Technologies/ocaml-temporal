@@ -153,11 +153,30 @@ val implementation_async :
   ('input, 'output) t ->
   ('input, 'output) async_implementation option
 
-(** Operations on the opaque asynchronous completion capability. A local
-    codec or payload-validation error leaves the handle active, so the caller
-    may correct the data or choose a different operation. Once submitted,
-    explicitly retryable native failures permit only the identical request;
-    terminal native failures close the handle. *)
+(** Operations on the opaque asynchronous completion capability. The handle
+    may be shared between Domains; one operation is in flight at a time, and a
+    call that collides with another Domain's in-flight operation returns a
+    retryable error.
+
+    A local codec or payload-validation error leaves the handle active, so the
+    caller may correct the data or choose a different operation. After
+    submission:
+    - A transient RPC failure (for example the server is unavailable) returns
+      a retryable error ([Error.view]'s [non_retryable] is [false]) and keeps
+      the handle live. For [complete], [fail], and [cancel], only the
+      identical call may follow until it receives a definitive answer; a
+      failed [heartbeat] is forgotten and never blocks later calls.
+    - A definitive server rejection of the request (for example [cancel]
+      without a cancellation request) returns a non-retryable error but keeps
+      the handle live, so a corrected or different operation such as [fail]
+      may follow. A result above the server's blob-size limit is not such a
+      rejection: Temporal records a terminal failure for the activity and
+      acknowledges the call, so [complete] returns [Ok] and closes the
+      handle.
+    - Acceptance of [complete], [fail], or [cancel], or the server reporting
+      that the activity no longer exists, closes the handle. After an
+      uncertain terminal call, "no longer exists" can mean that call was
+      applied. *)
 module Async_handle : sig
   (** The handle type paired with one asynchronous activity output. *)
   type 'output t = 'output async_handle

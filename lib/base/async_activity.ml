@@ -6,7 +6,10 @@
     reserves a request key under [mutex], releases the lock while entering the
     supervisor, and commits the result under the lock. Consequently a second
     Domain cannot submit a conflicting terminal operation, while a transport
-    failure leaves the exact operation available for a later retry. *)
+    failure of a terminal operation leaves the exact operation available for a
+    later retry. A heartbeat is never retained: it is non-terminal and
+    superseded by the next one, so an uncertain heartbeat is reported and
+    forgotten rather than allowed to block later operations. *)
 
 (** An operation that may cross the native supervisor boundary. Payloads are
     copied before they enter this type so retrying a transport failure can
@@ -22,9 +25,11 @@ type submit_result = (unit, Error.t) result
 
 (** The adapter explicitly distinguishes preflight rejection from native
     outcomes. [Not_submitted] releases a new operation key while preserving
-    the handle; a definitive native heartbeat rejection has the same key effect
-    without claiming that no call occurred. Unresolved earlier submissions
-    retain the exact key, and terminal native outcomes close the handle. *)
+    the handle and any earlier unresolved submission. [Rejected_submission] is
+    a definitive native answer to this exact request, so it releases the key
+    even after an earlier uncertain attempt. [Retryable_submission] retains a
+    terminal operation's exact key and drops a heartbeat's.
+    [Terminal_submission] closes the handle. *)
 type submission_error =
   | Not_submitted of Error.t
   | Rejected_submission of Error.t
@@ -39,9 +44,10 @@ type lifecycle = Dormant | Handoff_pending | Active | Terminal | Closed
 
 (** The one operation currently reserved by this handle. [in_flight] is set
     while the supervisor callback runs, allowing a transport error to retain
-    the request for an explicit retry without allowing concurrent duplicates.
-    [retry_pending] preserves an earlier uncertain submission even if a later
-    retry is rejected before reaching the supervisor. *)
+    a terminal request for an explicit retry without allowing concurrent
+    duplicates. [retry_pending] marks an earlier uncertain terminal submission
+    so a later local (non-native) rejection of its retry cannot erase it.
+    Heartbeat keys are only reserved while in flight. *)
 type pending = {
   key : string;
   mutable in_flight : bool;
@@ -161,12 +167,18 @@ let begin_operation handle ~key operation =
       | Terminal -> lifecycle_error "asynchronous activity handle is terminal"
       | Active -> (
           match handle.pending with
+          | Some pending when pending.in_flight ->
+              (* Another Domain's request is still crossing the supervisor.
+                 That conflict is transient, so the caller may retry once the
+                 other request settles. *)
+              Error
+                (Error.make ~non_retryable:false ~category:`Activity
+                   ~message:
+                     "another asynchronous activity operation is in flight; retry after it settles"
+                   ())
           | Some pending when not (String.equal pending.key key) ->
               lifecycle_error
-                "a different asynchronous activity operation is already pending"
-          | Some pending when pending.in_flight ->
-              lifecycle_error
-                "the same asynchronous activity operation is already in flight"
+                "a different asynchronous activity operation is pending retry; resubmit the identical operation"
           | Some pending ->
               pending.in_flight <- true;
               Ok (pending, operation)
@@ -232,10 +244,23 @@ let operation_key operation =
 
 (** Executes one supervisor submission outside the mutex, then commits its
     result under the mutex. A successful terminal operation clears the pending
-    key and closes the handle; a retryable failure clears only [in_flight], so a
-    later call can repeat the exact operation without rerunning user code.
-    Local or definitive native rejection releases a fresh key so a corrected
-    operation can run. Neither can erase an earlier uncertain submission. *)
+    key and marks the handle terminal.
+
+    An uncertain ([Retryable_submission]) terminal operation keeps its key, so
+    only the byte-identical request may follow. The server applies at most one
+    terminal response per activity and answers a duplicate with [NotFound], so
+    the exact retry is safe; restricting it to the same bytes keeps the
+    caller's intent unambiguous. An uncertain heartbeat instead releases its
+    key: heartbeats are non-terminal and superseded by the next one, so
+    retaining a stale heartbeat would only block newer progress and the
+    terminal operation (#836).
+
+    A local rejection ([Not_submitted]) releases a fresh key but cannot erase
+    an earlier uncertain submission, because no native answer was received. A
+    definitive native rejection of the exact request ([Rejected_submission])
+    releases the key even after an earlier uncertain attempt: the server has
+    answered this request, and the live handle may submit a different terminal
+    operation (#821). *)
 let submit_operation handle ~terminal operation =
   let key = operation_key operation in
   match begin_operation handle ~key operation with
@@ -254,13 +279,21 @@ let submit_operation handle ~terminal operation =
       with_mutex handle.mutex (fun () ->
           pending.in_flight <- false;
           match result with
-          | Error (Not_submitted error | Rejected_submission error) ->
+          | Error (Not_submitted error) ->
               if not pending.retry_pending then handle.pending <- None;
               Error error
-          | Error (Retryable_submission error) ->
+          | Error (Rejected_submission error) ->
+              handle.pending <- None;
+              Error error
+          | Error (Retryable_submission error) when terminal ->
               (* Native acceptance is unresolved. Only the byte-identical
                  request may retry; local validation cannot erase that debt. *)
               pending.retry_pending <- true;
+              Error error
+          | Error (Retryable_submission error) ->
+              (* A heartbeat key is never retained past its own submission,
+                 so this request cannot carry an earlier uncertain debt. *)
+              handle.pending <- None;
               Error error
           | Error (Terminal_submission error) ->
               handle.lifecycle <- Closed;
@@ -285,8 +318,9 @@ let fail handle error = submit_operation handle ~terminal:true (Fail error)
 let cancel handle details =
   submit_operation handle ~terminal:true (Cancel details)
 
-(** Sends non-terminal progress details. A successful heartbeat clears its
-    pending key but leaves the handle active for a later terminal operation. *)
+(** Sends non-terminal progress details. Any outcome other than token loss
+    leaves the handle active with no retained heartbeat, so a failed heartbeat
+    never blocks a newer heartbeat or a terminal operation. *)
 let heartbeat handle details =
   submit_operation handle ~terminal:false (Heartbeat details)
 

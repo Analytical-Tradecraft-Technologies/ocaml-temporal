@@ -442,10 +442,18 @@ let delayed_summary =
 The handle is tied to one activity attempt and one output codec. A completion
 or failure can be submitted once; heartbeat calls keep the lease non-terminal.
 The worker first acknowledges the asynchronous handoff to Temporal Core, then
-the retained handle uses the namespace-bound client operation. If that native
-operation reports a retryable transport failure, the private adapter retains
-the byte-identical request for retry. A terminal bridge error closes the handle
-so a later call fails predictably instead of leaving worker shutdown blocked.
+the retained handle uses the namespace-bound client operation. If a
+`complete`, `fail`, or `cancel` hits a transient failure (for example the
+server is unavailable or the deadline expires), the call returns a retryable
+error and the handle stays live; retry with the identical call until it
+receives a definitive answer. If the server definitively rejects the request
+(for example a `cancel` when no cancellation was requested), the handle also
+stays live and you may call a different operation, such as `fail`. A result
+larger than the server's blob-size limit is different: Temporal fails the
+activity itself and acknowledges `complete`, which then returns `Ok`. A failed `heartbeat` is reported and forgotten: it never blocks
+a later heartbeat or the terminal call. Only acceptance of a terminal call, or
+the server reporting that the activity no longer exists, closes the handle, so
+a later call fails predictably instead of leaving worker shutdown blocked.
 
 Use `Activity.remote` or `Workflow.remote` when another worker owns the
 implementation. A remote definition keeps the name and codecs needed to
