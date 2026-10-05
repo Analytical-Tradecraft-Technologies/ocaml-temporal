@@ -55,7 +55,9 @@ end
 (** Packs a typed workflow definition for a worker registration list. [signals]
     attach scheduler handlers for matching native signal activations; [queries]
     attach synchronous read-only handlers for matching query requests; [updates]
-    attach typed non-suspending update handlers for matching update activations. *)
+    attach typed update handlers for matching update activations. An update
+    handler runs on the workflow scheduler once validation, if any, accepts
+    the request and may suspend on workflow futures; see [Temporal.Update]. *)
 val workflow :
   ?signals:Signal.Handler.t list ->
   ?queries:Query.Handler.t list ->

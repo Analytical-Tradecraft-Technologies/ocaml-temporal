@@ -17,7 +17,8 @@ type activity_registration
     constructor used by the runtime adapter. [signals] attaches typed signal
     handlers to the same workflow execution; handlers run on the deterministic
     workflow scheduler when native SignalWorkflow activations arrive. [updates]
-    attaches typed non-suspending update handlers for native DoUpdate jobs. *)
+    attaches typed update handlers for native DoUpdate jobs; a handler is
+    acknowledged after validation and may then suspend on workflow futures. *)
 val register_workflow :
   ?signals:Signal.Handler.t list ->
   ?queries:Query.Handler.t list ->
