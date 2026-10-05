@@ -703,10 +703,32 @@ let native_start_request client (request : start_request) : Client_protocol.star
     search_attributes = metadata request.search_attributes;
   }
 
+(** Builds the non-retryable bridge error for a start whose acceptance was
+    not observed. The request and workflow IDs identify the logical operation
+    so the caller can reconcile it by describing the workflow or by retrying
+    with the same explicit request ID. [reason] explains why the outcome was
+    lost when the bridge itself did not report an [Unknown] outcome. *)
+let uncertain_start_error ?reason ~request_id ~workflow_id () =
+  let suffix = match reason with None -> "" | Some reason -> ": " ^ reason in
+  Error.make ~non_retryable:true ~category:`Bridge
+    ~message:
+      (Printf.sprintf
+         "Temporal did not prove whether workflow start %S was accepted (request_id=%S)%s"
+         workflow_id request_id suffix)
+    ()
+
 (** Starts one native workflow through the asynchronous ticket path. Each
     bounded wait releases the OCaml runtime lock inside the C bridge; retrying
     [None] keeps the supervisor mailbox able to accept shutdown and other
-    lifecycle messages. *)
+    lifecycle messages.
+
+    Once a ticket has been issued the request belongs to a Rust task that may
+    already have reached Temporal. Client shutdown aborts and retires that
+    ticket, so any later lifecycle failure (closed client, closed supervisor,
+    or a bridge error such as a retired ticket) is reported as an uncertain
+    start rather than a plain shutdown error that would imply nothing was
+    sent. Before admission the start is definitely not sent and the ordinary
+    shutdown error remains accurate. *)
 let native_client_start (client : native_client) (request : start_request) :
     (start_response, Error.t) result =
   if Atomic.get client.closed then Error (bridge_error "client is shut down")
@@ -716,14 +738,26 @@ let native_client_start (client : native_client) (request : start_request) :
     | Error error -> Error (native_supervisor_error error)
     | Ok (Error error) -> Error (native_client_error error)
     | Ok (Ok ticket) ->
+        let uncertain ?reason () =
+          Error
+            (uncertain_start_error ?reason ~request_id:request.request_id
+               ~workflow_id:request.workflow_id ())
+        in
         let rec await_outcome () : (start_response, Error.t) result =
           if Atomic.get client.closed then
-            Error (bridge_error "client is shut down")
+            uncertain ~reason:"client shut down before the start outcome was observed" ()
           else
             match
               Native.perform client.supervisor
                 (Native.Client_wait_start_workflow ticket)
             with
+            | Error Native.Closed ->
+                uncertain ~reason:"client shut down before the start outcome was observed" ()
+            | Error (Native.Backend _ as error) ->
+                (* The ticket may have been retired by a concurrent disconnect
+                   after the RPC was issued; the diagnostic is preserved but
+                   the classification stays uncertain. *)
+                uncertain ~reason:(Error.message (native_supervisor_error error)) ()
             | Error error -> Error (native_supervisor_error error)
             | Ok None ->
                 (* The native wait is intentionally bounded. Yielding here is
@@ -742,13 +776,7 @@ let native_client_start (client : native_client) (request : start_request) :
           | Ok
               (Some
                  (Client_protocol.Unknown { request_id; workflow_id })) ->
-              Error
-                (Error.make ~non_retryable:true ~category:`Bridge
-                   ~message:
-                     (Printf.sprintf
-                        "Temporal did not prove whether workflow start %S was accepted (request_id=%S)"
-                        workflow_id request_id)
-                   ())
+              Error (uncertain_start_error ~request_id ~workflow_id ())
         in
         await_outcome ()
 

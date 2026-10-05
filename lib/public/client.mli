@@ -271,5 +271,12 @@ val run_id : ('input, 'output) handle -> string
 
 (** Shuts down the client graph. Repeated calls are idempotent and return the
     same cached result, including a terminal teardown error, after the first
-    shutdown request has consumed or invalidated the backend resources. *)
+    shutdown request has consumed or invalidated the backend resources.
+
+    Shutdown does not fail because another Domain or thread is still inside
+    [start]. A native start whose request was already handed to the transport
+    is aborted; that [start] call returns a non-retryable [`Bridge] error
+    stating that Temporal did not prove whether the start was accepted, with
+    the workflow and request IDs needed to reconcile it. A start that had not
+    yet been admitted returns the ordinary shut-down error. *)
 val shutdown : t -> (unit, Error.t) result

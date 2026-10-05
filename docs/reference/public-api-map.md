@@ -122,18 +122,21 @@ for those rules.
   result or a typed error. Call `Client.shutdown` when the client is no longer
   needed to release
   its native graph; shutdown is idempotent and retains a teardown failure so
-  cleanup problems are not silently discarded.
+  cleanup problems are not silently discarded. Shutdown does not wait for or
+  fail because of a concurrent `Client.start`: an in-flight native start is
+  aborted, and that caller receives a non-retryable `bridge` error saying
+  Temporal did not prove whether the start was accepted, including its
+  workflow and request IDs for reconciliation.
 - `Temporal.Worker` registers workflows, activities, and the signal, query, and
   update handlers attached to each workflow registration. It owns one
   supervisor graph, runs the poll loops, and performs idempotent shutdown.
   `Temporal.Worker.Options` provides typed, immutable resource and worker
   routing settings, including legacy build-ID and deployment-based versioning;
   see the [worker versioning reference](worker-versioning.md). A
-  successfully shut-down worker is not reusable: the mock backend reports a
-  typed `bridge` error if `Worker.run` is called again, while the native backend
-  returns without polling because its closed gate is already set. Create a new
-  worker for a new polling lifecycle rather than relying on either backend's
-  post-shutdown behavior. The interaction handler registration modes and their
+  successfully shut-down worker is not reusable: calling `Worker.run` again
+  returns a typed `bridge` error ("worker is shut down") on both the mock and
+  native backends without polling. Create a new worker for a new polling
+  lifecycle. The interaction handler registration modes and their
   current native limitations are described in the [interactive-workflow reference](interactive-workflows.md).
   The final executable remains an OCaml application; Rust is a private linked
   implementation detail.

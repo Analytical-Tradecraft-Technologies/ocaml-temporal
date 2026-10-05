@@ -767,7 +767,9 @@ let shutdown client =
       | None ->
           (* Close admission before entering native teardown. Concurrent starts
              that already passed their check are ordered by the supervisor; later
-             callers observe the closed bit and cannot enqueue new work. *)
+             callers observe the closed bit and cannot enqueue new work. A
+             native start already holding a ticket is aborted by teardown and
+             reports an uncertain outcome instead of failing this shutdown. *)
           Atomic.set client.closed true;
           let result =
             try Backend.client_shutdown client.backend with

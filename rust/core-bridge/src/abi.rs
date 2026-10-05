@@ -1983,8 +1983,18 @@ impl Runtime {
         Ok(Vec::new())
     }
 
-    /// Cancels retained history waits and drops the client after its worker
-    /// child and workflow starts are absent.
+    /// Cancels retained history waits, aborts in-flight workflow starts, and
+    /// drops the client after its worker child is absent.
+    ///
+    /// A start ticket that is still pending here has already handed its
+    /// request to a Tokio task, so Temporal may or may not have accepted it.
+    /// Disconnect is part of explicit SDK shutdown, which must not fail merely
+    /// because another caller Domain is still awaiting that ticket: the ticket
+    /// is retired exactly once by draining the registry, its task is aborted
+    /// and joined (the C stub has released the OCaml runtime lock), and the
+    /// waiting OCaml caller reports the start as outcome-unknown when it next
+    /// observes the closed client. No result for a retired ticket is ever
+    /// fabricated as accepted or rejected.
     fn disconnect_client(&mut self) -> Operation {
         if self.worker.is_some() {
             return Err(Failure {
@@ -1992,14 +2002,12 @@ impl Runtime {
                 message: "Temporal client cannot disconnect while its worker is running".to_owned(),
             });
         }
-        if !self.pending_starts.is_empty() {
-            return Err(Failure {
-                status: STATUS_INVALID_STATE,
-                message: "Temporal client cannot disconnect while workflow starts are pending"
-                    .to_owned(),
-            });
-        }
         self.pending_waits.clear();
+        // `core` is only taken by `close`, which consumes the runtime, so the
+        // waiting abort always joins every task on this owner thread and
+        // returns no deferred handles for the cleanup thread.
+        let remaining = self.abort_pending_starts(true);
+        debug_assert!(remaining.is_empty());
         self.client.take();
         Ok(Vec::new())
     }
