@@ -40,6 +40,18 @@ module type SUPERVISOR = sig
   (** Stable diagnostic for a supervisor error. Implementations must omit
       payload bytes, credentials, task tokens, and unbounded remote text. *)
   val error_message : error -> string
+
+  (** Classifies a failed [complete_workflow] without inspecting free-form
+      text. [true] asserts that the exact native lease is still outstanding,
+      so resubmitting the same retained completion cannot duplicate it. Every
+      other failure must return [false]; the adapter then never submits that
+      completion again (issue #843). *)
+  val error_is_retryable : error -> bool
+
+  (** Classifies an exception raised by [complete_workflow]. An exception is
+      an uncertain acknowledgement, so production supervisors return [false]
+      unless they define a private, explicitly transient exception category. *)
+  val exception_is_retryable : exn -> bool
 end
 
 (** Stable diagnostic exposed by this private worker loop. It is safe to log
@@ -177,13 +189,16 @@ module Make (Supervisor : SUPERVISOR) : sig
       Core without allowing a completed child to remain leased. *)
   val poll : t -> (outcome, error_view) result
 
-  (** Retries all completions whose native acknowledgement previously failed.
-      The adapter mutex remains held while this operation runs, so no new
-      activation can overtake an older lease. [Ok ()] proves that the pending
-      map is empty. [Error _] leaves the exact completion in place. The caller
-      must either retry it after an explicitly safe transient classification or
-      force-retire the native graph and then call [discard] on a terminal path;
-      it must never silently drop this completion while Rust still owns it. *)
+  (** Retries completions whose native acknowledgement previously failed with
+      an explicitly retryable classification. The adapter mutex remains held
+      while this operation runs, so no new activation can overtake an older
+      lease. [Ok ()] proves that the pending map is empty. [Error _] leaves the
+      exact completion in place. A completion whose earlier failure was not
+      classified retryable is never resubmitted: [drain] (and [poll]) return
+      its recorded error without a native call. The caller must either retry
+      after an explicitly safe transient classification or force-retire the
+      native graph and then call [discard] on a terminal path; it must never
+      silently drop this completion while Rust still owns it. *)
   val drain : t -> (unit, error_view) result
 
   (** Discards all retained completion bytes and shuts down every OCaml-owned

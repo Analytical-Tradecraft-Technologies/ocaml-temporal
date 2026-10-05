@@ -31,6 +31,16 @@ module type SUPERVISOR = sig
 
   val error_code : error -> string
   val error_message : error -> string
+
+  (* Returns [true] only when the source can prove that a failed completion
+     left the exact native lease outstanding, so resubmitting the same retained
+     completion cannot duplicate it. Every other failure is fail-closed. *)
+  val error_is_retryable : error -> bool
+
+  (* The same proof for an exception raised by [complete_workflow]. An
+     exception is normally an uncertain acknowledgement and must return
+     [false]. *)
+  val exception_is_retryable : exn -> bool
 end
 
 (** Stable diagnostics deliberately contain no payload bytes or native values. *)
@@ -139,11 +149,20 @@ type pending_result =
     }
 
 (** The protocol value is owned by this adapter until the supervisor accepts
-    it. Its binary payloads are copied before the value enters mutable state. *)
+    it. Its binary payloads are copied before the value enters mutable state.
+
+    [retry_refusal] records the first submission failure that the source did
+    not explicitly classify as retryable. Once it is [Some], the completion is
+    never submitted again: the failure may have consumed the native lease (or
+    Core may already have accepted the value), so a second attempt could
+    duplicate the completion or attach it to a later activation of the same
+    run. Later polls and drains return the recorded error unchanged, and only
+    terminal [discard] releases the entry (issue #843). *)
 type pending_completion = {
   run_id : string;
   completion : Protocol.completion;
   result : pending_result;
+  mutable retry_refusal : error_view option;
 }
 
 (** One worker-loop result. *)
@@ -675,12 +694,24 @@ module Make (Supervisor : SUPERVISOR) = struct
     }
 
   (** Distinguishes source rejection from an uncertain raised acknowledgement.
-      Both preserve the exact pending completion for retry; neither permits
-      replacement commands or re-execution of workflow code. *)
+      Both preserve the exact pending completion; neither permits replacement
+      commands or re-execution of workflow code. [retryable] carries the
+      source's explicit proof that the lease is still outstanding, without
+      which the retained completion is never resubmitted. *)
   type completion_attempt =
     | Accepted
-    | Rejected_by_supervisor of error_view
-    | Raised_by_supervisor of exn
+    | Rejected_by_supervisor of { error : error_view; retryable : bool }
+    | Raised_by_supervisor of { exception_ : exn; retryable : bool }
+
+  (** A faulty source classifier must not turn a diagnostic defect into a
+      duplicate submission. Only an explicit [true] authorizes a retry. *)
+  let source_error_is_retryable source_error =
+    try Supervisor.error_is_retryable source_error with _ -> false
+
+  (** Exception classification is equally conservative: an exception is an
+      uncertain acknowledgement unless the source explicitly proves otherwise. *)
+  let completion_exception_is_retryable exception_ =
+    try Supervisor.exception_is_retryable exception_ with _ -> false
 
   (** Calls the supervisor completion operation without losing whether an
       exception occurred. A returned source error still means that the
@@ -696,10 +727,16 @@ module Make (Supervisor : SUPERVISOR) = struct
               ~error_message:Supervisor.error_message source_error
           in
           Rejected_by_supervisor
-            (make_error ~path:"$.completion" "completion_failed"
-               (Printf.sprintf "supervisor rejected completion (%s): %s"
-                  source.code source.message))
-    with exception_ -> Raised_by_supervisor exception_
+            {
+              error =
+                make_error ~path:"$.completion" "completion_failed"
+                  (Printf.sprintf "supervisor rejected completion (%s): %s"
+                     source.code source.message);
+              retryable = source_error_is_retryable source_error;
+            }
+    with exception_ ->
+      Raised_by_supervisor
+        { exception_; retryable = completion_exception_is_retryable exception_ }
 
   (** Converts a completion exception to the stable typed error used when a
       failure-completion attempt itself cannot be acknowledged. *)
@@ -764,17 +801,35 @@ module Make (Supervisor : SUPERVISOR) = struct
              })
 
   (** Attempts one retained completion. A rejected or raised native call leaves
-      the same value in [pending], preserving the only safe retry path. *)
+      the same value in [pending]. A failure the source did not explicitly
+      classify as retryable sets [retry_refusal]; from then on this function
+      returns that recorded error without calling the supervisor, so neither a
+      later poll nor a shutdown drain can submit the completion a second time
+      (issue #843). *)
   let finish_pending adapter pending =
-    match attempt_completion adapter.supervisor pending.completion with
-    | Accepted -> accepted_pending adapter pending
-    | Rejected_by_supervisor error -> Error error
-    | Raised_by_supervisor exception_ ->
-        Error (completion_exception_error exception_)
+    match pending.retry_refusal with
+    | Some error -> Error error
+    | None -> (
+        (* Records a fail-closed refusal before reporting the failure, so the
+           entry is never resubmitted even if the caller retries [poll]. *)
+        let refuse_unless retryable error =
+          if not retryable then pending.retry_refusal <- Some error;
+          Error error
+        in
+        match attempt_completion adapter.supervisor pending.completion with
+        | Accepted -> accepted_pending adapter pending
+        | Rejected_by_supervisor { error; retryable } ->
+            refuse_unless retryable error
+        | Raised_by_supervisor { exception_; retryable } ->
+            (* Core may already have accepted this exact value. Never replace
+               it with a task failure or rerun workflow code after an
+               uncertain acknowledgement. *)
+            refuse_unless retryable (completion_exception_error exception_))
 
   (** Records a completion before its first native attempt. This ordering is
       intentional: even an exception from the native binding leaves an exact
-      owned completion available for a later poll or shutdown drain. *)
+      owned completion in [pending], where it either awaits an explicitly
+      retryable later attempt or blocks the run until terminal [discard]. *)
   let enqueue_pending adapter pending =
     if Run_map.mem pending.run_id adapter.pending then
       Error
@@ -836,6 +891,7 @@ module Make (Supervisor : SUPERVISOR) = struct
         run_id = activation.run_id;
         completion = copy_completion completion;
         result = Pending_rejected { error; remove_run };
+        retry_refusal = None;
       }
     in
     enqueue_pending adapter pending
@@ -876,7 +932,9 @@ module Make (Supervisor : SUPERVISOR) = struct
     }
 
   (** Produces a typed completion for a successfully executed activation and
-      updates the registry only after the supervisor confirms retirement. *)
+      updates the registry only after the supervisor confirms retirement. A
+      failed or raised submission keeps the exact value pending; Core may
+      already have accepted it, so it is never replaced by a task failure. *)
   let submit_completion adapter activation completion ~run_id ~activation_info =
     let pending =
       {
@@ -893,29 +951,18 @@ module Make (Supervisor : SUPERVISOR) = struct
                   activation.Protocol.jobs;
               activation_info;
             };
+        retry_refusal = None;
       }
     in
-    if Run_map.mem pending.run_id adapter.pending then
-      Error
-        (make_error ~path:"$.run_id" "duplicate_pending_completion"
-           "a workflow run already has an unacknowledged completion")
-    else begin
-      adapter.pending <- Run_map.add pending.run_id pending adapter.pending;
-      match attempt_completion adapter.supervisor pending.completion with
-      | Accepted -> accepted_pending adapter pending
-      | Rejected_by_supervisor error -> Error error
-      | Raised_by_supervisor exception_ ->
-          (* Core may already have accepted this exact value. Never replace it
-             with a task failure or rerun workflow code after an uncertain ack. *)
-          Error (completion_exception_error exception_)
-    end
+    enqueue_pending adapter pending
 
   (** A cache-eviction activation is acknowledged with a successful empty
       completion even when its workflow run has already been removed after an
-      adapter failure. This uses the retained-completion path rather than
-      the ordinary submission path: if the native completion call raises, the
-      exact empty acknowledgement remains pending for a later retry and is
-      never replaced by an invalid failure command. *)
+      adapter failure. Like every submission it uses the retained-completion
+      path: if the native completion call raises, the exact empty
+      acknowledgement remains pending (resubmitted only after an explicitly
+      retryable failure) and is never replaced by an invalid failure
+      command. *)
   let submit_eviction_acknowledgement adapter (activation : Protocol.activation)
       ~activation_info =
     let completion =
@@ -933,6 +980,7 @@ module Make (Supervisor : SUPERVISOR) = struct
               evicted = true;
               activation_info;
             };
+        retry_refusal = None;
       }
     in
     enqueue_pending adapter pending
@@ -1052,17 +1100,20 @@ module Make (Supervisor : SUPERVISOR) = struct
         ~remove_run:(Run_map.mem activation.run_id adapter.runs)
         adapter activation error
 
-  (** Retries every retained workflow completion while the adapter mutex is
-      held. Shutdown uses this operation before closing Rust so an
-      acknowledged lease is never left behind by a prior transport failure. *)
+  (** Retries retained workflow completions while the adapter mutex is held.
+      Shutdown uses this operation before closing Rust so an explicitly
+      retryable transport failure never leaves a lease behind. A completion
+      whose earlier failure was not classified retryable is not resubmitted:
+      [finish_pending] returns its recorded error, which the worker treats as a
+      terminal drain failure before force-releasing the native graph. *)
   let drain adapter : (unit, error_view) result =
     Mutex.lock adapter.mutex;
     Fun.protect
       ~finally:(fun () -> Mutex.unlock adapter.mutex)
       (fun () ->
         (* [min_binding_opt] gives retries a stable order. The loop stops on
-           the first source error, retaining that completion and every later
-           one for a subsequent drain attempt. *)
+           the first error, retaining that completion and every later one;
+           a fail-closed entry stops it without any native call. *)
         let rec loop () =
           match Run_map.min_binding_opt adapter.pending with
           | None -> Ok ()
@@ -1093,7 +1144,9 @@ module Make (Supervisor : SUPERVISOR) = struct
 
   (** Serializes one poll/execute/complete transaction. A mutex is required in
       addition to supervisor serialization because the run map and scheduler
-      state are OCaml values owned by this adapter, not by Rust. *)
+      state are OCaml values owned by this adapter, not by Rust. A retained
+      completion blocks new activations: it is retried only when its failure
+      was explicitly retryable, and otherwise reported again unchanged. *)
   let poll adapter =
     Mutex.lock adapter.mutex;
     Fun.protect

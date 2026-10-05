@@ -135,6 +135,14 @@ module Source = struct
 
   (** Returns the fixture's fixed diagnostic. *)
   let error_message error = error
+
+  (** Only the fixture's injected transient rejection is retryable, so the
+      retained-completion retry it exercises is still attempted; every other
+      failure is fail-closed like the production workflow source. *)
+  let error_is_retryable error = String.equal error "retry"
+
+  (** A raised completion is equally fail-closed. *)
+  let exception_is_retryable _ = false
 end
 
 module Worker = Adapter.Make (Source)

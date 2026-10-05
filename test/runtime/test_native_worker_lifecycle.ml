@@ -72,6 +72,13 @@ module Fake_supervisor = struct
 
   (** Exposes the source diagnostic expected by the adapter signature. *)
   let error_message error = error.message
+
+  (** The injected transport rejection leaves the fake lease in place, so the
+      fixture explicitly classifies it as retryable; a stale lease is not. *)
+  let error_is_retryable error = String.equal error.code "temporarily_unavailable"
+
+  (** A raised completion is equally fail-closed. *)
+  let exception_is_retryable _ = false
 end
 
 module Worker = Adapter.Make (Fake_supervisor)

@@ -399,17 +399,22 @@ the OCaml runtime lock while Rust waits.  The concrete supervisor is
 responsible for releasing that runtime lock in its C boundary.
 
 The private worker shutdown path calls the adapter's `drain` operation before
-closing native Core. It retries every retained completion while holding the
-same mutex and starts teardown only after the token map is empty. The public
+closing native Core. It retries retained completions while holding the same
+mutex and starts teardown only after the token map is empty. The public
 worker reopens admission only when the drain failure is explicitly classified
 as `Retryable`. Generic `Connection`, `Not_ready`, and other failures are
 fail-closed because this Core revision may already have consumed the lease;
 the native graph is cleaned up rather than blindly resubmitting the same
-completion. An explicitly retryable failure preserves the exact completion and
-the native graph for a later attempt. An admitted asynchronous handle is such a
-case: the adapter marks the outstanding-lease diagnostic retryable, so normal
-shutdown cannot force-discard the handle while user code still owns its
-completion capability.
+completion. The lease records its first non-retryable failure (including an
+async handle admission that fails after Core accepted `WillCompleteAsync`),
+and neither a later `poll`, a second `Worker.run`, nor `drain` submits that
+completion again: each returns the recorded error without a native call
+until terminal `discard` (issue #843). An explicitly retryable failure
+preserves the exact completion and the native graph for a later attempt. An
+admitted asynchronous handle is such a case: the adapter marks the
+outstanding-lease diagnostic retryable, so normal shutdown cannot
+force-discard the handle while user code still owns its completion
+capability.
 
 ### Worker-loop retry policy
 
