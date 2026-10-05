@@ -190,9 +190,9 @@ let test_static_foreign_archives () =
     ~path:(Filename.concat source_root "scripts/build-rust-bridge.sh")
     ~needle:"scripts/render-rust-link-flags.sh";
   require_text ~path:bridge
-    ~needle:"(setenv\n   OCAML_TEMPORAL_RUST_TARGET_FALLBACK\n   ../../rust-target";
+    ~needle:"(setenv\n    OCAML_TEMPORAL_RUST_TARGET_FALLBACK\n    ../../rust-target";
   require_text ~path:bridge
-    ~needle:"%{dep:../../scripts/build-rust-bridge.sh}\n      ../..\n";
+    ~needle:"%{dep:../../scripts/build-rust-bridge.sh}\n       ../..\n";
   (* A vendored SDK sees the consumer's project as [%{workspace_root}], which
      contains neither the bridge scripts nor the Rust sources (#829). *)
   if contains ~needle:"%{workspace_root}" (read bridge) then
@@ -205,6 +205,25 @@ let test_static_foreign_archives () =
     ~needle:"export CARGO_TARGET_DIR=\"$target_root\"";
   if contains ~needle:"(foreign_stubs" (read bridge) then
     failwith "lib/core_bridge/dune must not build a temporary native-stubs DLL"
+
+(** Ensures installed and opam builds link Cargo's optimized release profile
+    rather than the debug bridge (#779). The Dune rule must forward its own
+    profile, which is "release" under [opam install] and [dune build -p], to
+    the bridge script. The release profile must also keep unwinding panics:
+    the bridge contains Rust panics with [catch_unwind] at the C ABI boundary,
+    and [panic = "abort"] would silently turn them into process aborts. The
+    script's mapping from that profile to Cargo flags and output directories is
+    exercised with a stand-in Cargo by [test_rust_bridge_profile.sh]. *)
+let test_rust_bridge_profile () =
+  let source_root = Sys.getenv "TEMPORAL_SOURCE_ROOT" in
+  let bridge = Filename.concat source_root "lib/core_bridge/dune" in
+  let manifest = Filename.concat source_root "rust/Cargo.toml" in
+  require_text ~path:bridge
+    ~needle:"(setenv\n   OCAML_TEMPORAL_BUILD_PROFILE\n   %{profile}";
+  require_text ~path:manifest ~needle:"[profile.release]\n";
+  require_text ~path:manifest ~needle:"panic = \"unwind\"";
+  if contains ~needle:"panic = \"abort\"" (read manifest) then
+    failwith "rust/Cargo.toml must not abort on panic across the FFI boundary"
 
 (** Ensures the reusable mailbox remains an internal build unit rather than an
     installed sublibrary visible to [temporal-sdk] consumers. *)
@@ -282,6 +301,7 @@ let () =
   test_package_metadata ();
   test_package_maturity ();
   test_static_foreign_archives ();
+  test_rust_bridge_profile ();
   test_mailbox_is_private ();
   test_sdk_supervisor_is_private ();
   test_internal_libraries_are_package_private ();

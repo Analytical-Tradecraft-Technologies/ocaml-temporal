@@ -39,7 +39,8 @@ make_rustc() {
 run_build() {
   rm -f "$temporary_root/cargo-invoked"
   set +e
-  env TEMPORAL_RUST_BRIDGE_DIR= PATH="$fake_bin:$PATH" RUSTC="$1" \
+  env TEMPORAL_RUST_BRIDGE_DIR= OCAML_TEMPORAL_BUILD_PROFILE=dev \
+    PATH="$fake_bin:$PATH" RUSTC="$1" \
     CARGO_MARKER="$temporary_root/cargo-invoked" \
     CARGO_TARGET_DIR="$temporary_root/target" \
     sh "$workspace_root/scripts/build-rust-bridge.sh" "$workspace_root" \

@@ -79,9 +79,14 @@ NATIVE_RUST_LINT_TARGET := $(if $(strip $(TEMPORAL_RUST_BRIDGE_DIR)),,native-lin
 RUST_BRIDGE_DIR ?= $(CURDIR)/_build/rust-bridge
 RUST_BRIDGE_KEY ?=
 RUST_BRIDGE_PROFILE ?= ci
-# Apply the release configuration to toolchain checks, lint, tests and packaging
-# alike, so the tested library is the one that is subsequently published.
-RUST_PROFILE_ENV = $(if $(filter release,$(RUST_BRIDGE_PROFILE)),CARGO_PROFILE_DEV_OPT_LEVEL=3 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_DEV_DEBUG_ASSERTIONS=false CARGO_PROFILE_DEV_INCREMENTAL=false CARGO_PROFILE_TEST_OPT_LEVEL=3 CARGO_PROFILE_TEST_DEBUG=0 CARGO_PROFILE_TEST_DEBUG_ASSERTIONS=false)
+# A release bundle packages Cargo's [profile.release], the same profile that
+# Dune's release profile (opam install, dune build -p) links (#779); a ci bundle
+# packages Cargo's dev profile. Release toolchain checks, lint and tests run the
+# dev/test profiles with release code generation (optimization, no debug
+# assertions or overflow checks), so the tested semantics match the published
+# library without repeating thin LTO for every Rust integration-test binary.
+RUST_PROFILE_ENV = $(if $(filter release,$(RUST_BRIDGE_PROFILE)),CARGO_PROFILE_DEV_OPT_LEVEL=3 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_DEV_DEBUG_ASSERTIONS=false CARGO_PROFILE_DEV_OVERFLOW_CHECKS=false CARGO_PROFILE_DEV_INCREMENTAL=false CARGO_PROFILE_TEST_OPT_LEVEL=3 CARGO_PROFILE_TEST_DEBUG=0 CARGO_PROFILE_TEST_DEBUG_ASSERTIONS=false CARGO_PROFILE_TEST_OVERFLOW_CHECKS=false)
+RUST_BRIDGE_BUILD_PROFILE = $(if $(filter release,$(RUST_BRIDGE_PROFILE)),release,dev)
 # Build separately so Compose's build output goes to stderr and failures stop
 # the command. Only container stdout reaches version and Cargo metadata probes.
 COMPOSE_RUN := OCAML_IMAGE=$(OCAML_IMAGE) $(COMPOSE) --progress plain build $(SERVICE) >&2 && \
@@ -954,7 +959,7 @@ native-rust-bridge:
 	$(RUST_PROFILE_ENV) $(NATIVE_ENV) sh test/smoke/test_rust_toolchain.sh
 	$(RUST_PROFILE_ENV) $(MAKE) native-lint-rust
 	$(RUST_PROFILE_ENV) $(MAKE) native-test-rust
-	$(RUST_PROFILE_ENV) $(NATIVE_ENV) sh scripts/rust-bridge-artifact.sh pack . "$(RUST_BRIDGE_DIR)" "$(RUST_BRIDGE_KEY)"
+	$(RUST_PROFILE_ENV) $(NATIVE_ENV) OCAML_TEMPORAL_BUILD_PROFILE=$(RUST_BRIDGE_BUILD_PROFILE) sh scripts/rust-bridge-artifact.sh pack . "$(RUST_BRIDGE_DIR)" "$(RUST_BRIDGE_KEY)"
 
 rust-bridge:
 	docker build -f Dockerfile.rust-ci -t ocaml-temporal-rust-bridge:local .
