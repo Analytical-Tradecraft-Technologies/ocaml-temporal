@@ -76,6 +76,27 @@ jobs:
         with:
           pattern: ocaml-sdk-*
           path: _build/release-ocaml-bundles
+      # Every archive redistributes the statically linked Rust graph, so its
+      # licence texts are copied from the locked package sources that
+      # `cargo metadata --locked` downloads, or for crates that publish none
+      # from the reviewed upstream texts in scripts/license-texts/crates.
+      # Generation fails if any package lacks a licence text or any text has a
+      # placeholder copyright line; the audit then proves the file lists every
+      # locked package before packaging embeds it in each archive.
+      - name: Generate third-party licence notices
+        run: |
+          set -euo pipefail
+          mkdir -p _build/release-notices
+          cargo metadata --manifest-path rust/Cargo.toml --locked --format-version 1 \
+            > _build/release-notices/cargo-metadata.json
+          python3 scripts/generate-third-party-notices.py \
+            --metadata _build/release-notices/cargo-metadata.json \
+            --project-license LICENSE \
+            --output _build/release-notices/THIRD-PARTY-NOTICES.txt
+          python3 scripts/generate-third-party-notices.py \
+            --metadata _build/release-notices/cargo-metadata.json \
+            --project-license LICENSE \
+            --audit _build/release-notices/THIRD-PARTY-NOTICES.txt
       - name: Assemble and verify release assets
         run: |
           set -euo pipefail
@@ -84,14 +105,16 @@ jobs:
             --bundles _build/release-bundles \
             --ocaml-bundles _build/release-ocaml-bundles \
             --output _build/release-assets \
-            --tag "$RELEASE_TAG" --commit "$GITHUB_SHA"
+            --tag "$RELEASE_TAG" --commit "$GITHUB_SHA" \
+            --license LICENSE \
+            --notices _build/release-notices/THIRD-PARTY-NOTICES.txt
           git archive --format=tar --prefix="ocaml-temporal-${RELEASE_TAG#v}/" HEAD \
             | gzip -n > "_build/release-assets/ocaml-temporal-$RELEASE_TAG-source.tar.gz"
           python3 scripts/generate-cargo-sbom.py \
             --audit _build/release-assets/ocaml-temporal-cargo.spdx.json
           (
             cd _build/release-assets
-            sha256sum ./*.tar.gz ./*.json > SHA256SUMS
+            sha256sum ./*.tar.gz ./*.json ./*.txt > SHA256SUMS
             sha256sum --check SHA256SUMS
           )
           # Match the release preflight maturity rule: prereleases and 0.x
@@ -111,6 +134,9 @@ jobs:
           Local builds from source remain supported.
 
           See manifest.json for bridge identities and SHA256SUMS for asset digests.
+          Every archive contains LICENSE and THIRD-PARTY-NOTICES.txt, the licence
+          texts of the statically linked Rust packages; the notices are also
+          published as a separate asset.
           The SPDX document covers the Rust dependency graph; it is not a full
           application or OCaml dependency SBOM.
           EOF

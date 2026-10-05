@@ -41,6 +41,11 @@ CORE_PACKAGES = {
     "temporalio-protos",
     "temporalio-sdk-core",
 }
+# The reviewed licence of the pinned Core workspace `LICENSE.txt`. Cargo
+# metadata carries only the file path for these packages, so this constant is
+# the single conclusion shared by the policy scanner, the SBOM generator, and
+# the third-party notices generator.
+REVIEWED_CORE_LICENSE = "MIT"
 
 
 class ExpressionError(ValueError):
@@ -55,10 +60,21 @@ class Node:
     right: "Node | None" = None
 
 
-def tokenize(expression: str) -> list[str]:
-    # Cargo metadata still contains historical `MIT/Apache-2.0` spellings.
+def normalize_expression(expression: str) -> str:
+    """Rewrite Cargo's historical `MIT/Apache-2.0` spelling as SPDX `OR`.
+
+    Whitespace is also collapsed so equivalent spellings produce one string.
+    The result is not validated; parse it with `Parser` when that matters.
+    """
+
     normalized = re.sub(r"(?<=\S)\s*/\s*(?=\S)", " OR ", expression)
-    tokens = re.findall(r"\(|\)|[^\s()]+", normalized)
+    return " ".join(normalized.split())
+
+
+def tokenize(expression: str) -> list[str]:
+    """Split one licence expression into identifiers, operators, and parentheses."""
+
+    tokens = re.findall(r"\(|\)|[^\s()]+", normalize_expression(expression))
     if not tokens:
         raise ExpressionError("empty license expression")
     return tokens
@@ -148,6 +164,8 @@ def evaluate(node: Node) -> tuple[bool, str]:
 
 
 def reviewed_core_license(package: dict[str, Any]) -> bool:
+    """Recognize the exact pinned Core packages whose licence is a file."""
+
     source = package.get("source") or ""
     license_file = package.get("license_file") or ""
     return (
@@ -155,6 +173,39 @@ def reviewed_core_license(package: dict[str, Any]) -> bool:
         and source.startswith(CORE_SOURCE_PREFIX)
         and Path(license_file).name == "LICENSE.txt"
     )
+
+
+def declared_license(package: dict[str, Any]) -> str | None:
+    """Return the package's own Cargo licence expression in SPDX spelling.
+
+    `None` means the package declares no expression, or one that cannot be
+    parsed; policy approval is deliberately not considered here.
+    """
+
+    expression = package.get("license")
+    if not isinstance(expression, str):
+        return None
+    try:
+        Parser(expression).parse()
+    except ExpressionError:
+        return None
+    return normalize_expression(expression)
+
+
+def concluded_license(package: dict[str, Any]) -> str | None:
+    """Return the licence this repository concludes for one Cargo package.
+
+    A declared expression is used as-is. A package without one is concluded
+    only for the reviewed Core workspace file; every other package yields
+    `None` so callers record NOASSERTION or fail instead of guessing.
+    """
+
+    declared = declared_license(package)
+    if declared is not None:
+        return declared
+    if package.get("license") is None and reviewed_core_license(package):
+        return REVIEWED_CORE_LICENSE
+    return None
 
 
 def check(metadata: dict[str, Any], output: TextIO) -> bool:
@@ -170,7 +221,10 @@ def check(metadata: dict[str, Any], output: TextIO) -> bool:
         expression = package.get("license")
         if expression is None:
             if reviewed_core_license(package):
-                print(f"ALLOW {name} {version} MIT via pinned Core LICENSE.txt", file=output)
+                print(
+                    f"ALLOW {name} {version} {REVIEWED_CORE_LICENSE} via pinned Core LICENSE.txt",
+                    file=output,
+                )
             else:
                 print(f"DENY  {name} {version} missing-license", file=output)
                 passed = False
