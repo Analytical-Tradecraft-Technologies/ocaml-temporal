@@ -182,7 +182,10 @@ let summarize =
 ```
 
 `Temporal.Activity.Context.details` returns the ordered payloads from the
-previous attempt's heartbeat, and `heartbeat_timeout` returns the server's
+previous attempt's last recorded heartbeat (empty on a first attempt). The
+value is fixed for the whole attempt: heartbeats sent by the current attempt
+are recorded for the next attempt and never replace what `details` returns,
+matching the other Temporal SDKs. `heartbeat_timeout` returns the server's
 configured interval when one was supplied. `Context.heartbeat` and
 `Context.heartbeat_payloads` copy their payloads, validate them through the
 same strict activity JSON codec as completions, and send them through the

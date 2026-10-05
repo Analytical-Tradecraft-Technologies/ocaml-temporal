@@ -899,8 +899,20 @@ let test_contextual_heartbeat_lifecycle () =
         end;
         match Temporal.Activity.Context.heartbeat context Temporal.Codec.string
                 "progress" with
-        | Ok () -> Ok "done"
-        | Error error -> Error error)
+        | Error error -> Error error
+        | Ok () -> (
+            (* Regression for #767: this attempt's own heartbeat is recorded
+               for the next attempt and must not replace the previous
+               attempt's details, which stay stable for the whole attempt. *)
+            match Temporal.Activity.Context.details context with
+            | [ payload ]
+              when decode_output Temporal.Codec.string
+                     (protocol_payload payload)
+                   = "prior" ->
+                Ok "done"
+            | _ ->
+                failwith
+                  "heartbeat replaced the previous attempt's details"))
   in
   (* The native adapter only receives the package-private base definition.
      This assertion protects the conversion that must retain a contextual
@@ -950,7 +962,8 @@ let test_contextual_heartbeat_lifecycle () =
 (** The public context view must never expose mutable payload storage owned by
     the adapter. This test mutates the source details, a getter result, the
     heartbeat argument, and the callback's retained view in turn; every later
-    observation must still contain the original bytes and ordering. The
+    observation must still contain the original bytes and ordering. A
+    successful heartbeat must not replace the previous attempt's details. The
     timeout is checked through the public conversion as well, because a
     context's timing contract is part of the activity API rather than an
     implementation-only field. *)
@@ -1021,16 +1034,15 @@ let test_context_payloads_are_copied () =
   | [ payload ] when Bytes.equal payload.data expected_heartbeat -> ()
   | _ -> failwith "heartbeat callback retained caller-owned payload bytes"
   end;
-  (* The context stores a separate copy after a successful callback, so even
-     the callback's retained view cannot mutate the next-attempt details. *)
+  (* Neither the successful heartbeat nor mutation of the callback's retained
+     view may change the previous attempt's details (#767): they are fixed
+     for the whole attempt. *)
   begin match !callback_payloads with
   | [ payload ] -> Bytes.set payload.data 0 'Q'
   | _ -> failwith "heartbeat callback received an unexpected detail shape"
   end;
-  begin match Temporal.Activity.Context.details context with
-  | [ payload ] when Bytes.equal payload.data expected_heartbeat -> ()
-  | _ -> failwith "activity context retained mutable callback payload bytes"
-  end
+  expect_source (Temporal.Activity.Context.details context)
+    "successful heartbeat replaced the previous attempt's details"
 
 (** Heartbeat callback failures and stale contexts are ordinary typed results.
     In particular, an invalidated context must reject before entering its

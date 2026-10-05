@@ -103,9 +103,11 @@ let test_heartbeat_retry_activity_contract () =
   | Error error ->
       failwith
         ("heartbeat detail could not be decoded: " ^ Temporal_base.Error.message error));
-  let retained_details = Temporal.Activity.Context.details first_context in
-  require (List.length retained_details = 1)
-    "context did not retain the successful heartbeat detail";
+  (* The first attempt's own heartbeat must not replace the details it was
+     started with (#767); Temporal delivers it to the next attempt instead. *)
+  require
+    (Temporal.Activity.Context.details first_context = [])
+    "first attempt's heartbeat replaced its previous-attempt details";
   Temporal_base.Activity_context.invalidate first_context;
   let callback_calls_after_invalidate = List.length !first_heartbeats in
   (match
@@ -122,11 +124,13 @@ let test_heartbeat_retry_activity_contract () =
         "invalidated heartbeat context returned an unexpected message");
   require (List.length !first_heartbeats = callback_calls_after_invalidate)
     "invalidated heartbeat context entered its native callback";
+  (* Model Temporal delivering the recorded heartbeat as the retry's
+     previous-attempt details. *)
   let retained_details : Temporal_base.Payload.t list =
     List.map
-      (fun ({ Temporal.Payload.metadata; data } : Temporal.Payload.t) ->
+      (fun ({ Temporal_base.Payload.metadata; data } : Temporal_base.Payload.t) ->
         { Temporal_base.Payload.metadata; data = Bytes.copy data })
-      retained_details
+      heartbeat_details
   in
   let second_heartbeats = ref [] in
   let second_context =
