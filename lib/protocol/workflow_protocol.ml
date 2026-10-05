@@ -689,11 +689,18 @@ let timestamp path json : (timestamp, error) result =
     let value : timestamp = { seconds; nanoseconds = Int64.to_int nanos } in
     Ok value
 
-(** Decodes a normalized nonnegative protobuf duration. *)
+(** The protobuf [Duration] maximum (10,000 years). Temporal rejects commands
+    with larger durations on every workflow-task retry. *)
+let max_duration_seconds = 315_576_000_000L
+
+(** Decodes a normalized nonnegative protobuf duration no larger than the
+    protobuf maximum. *)
 let duration path json : (duration, error) result =
   let* value = timestamp path json in
   if Int64.compare value.seconds 0L < 0 then
     Error (invalid (path ^ ".seconds") "duration must not be negative")
+  else if Int64.compare value.seconds max_duration_seconds > 0 then
+    Error (invalid (path ^ ".seconds") "duration exceeds the protobuf maximum")
   else
     let duration : duration =
       { seconds = value.seconds; nanoseconds = value.nanoseconds }
@@ -2339,6 +2346,16 @@ let child_cancellation_type_string = function
 (** Decodes a nullable duration. *)
 let optional_duration path value = nullable path duration value
 
+(** Reports an explicitly zero activity close timeout. Temporal treats zero as
+    unset, so such a command either lacks any close timeout (rejected by the
+    server on every retry) or, for a local activity, expires immediately. *)
+let zero_close_timeout schedule_to_close_timeout start_to_close_timeout =
+  let is_zero = function
+    | Some ({ seconds = 0L; nanoseconds = 0 } : duration) -> true
+    | _ -> false
+  in
+  is_zero schedule_to_close_timeout || is_zero start_to_close_timeout
+
 (** Encodes a nullable duration. *)
 let optional_duration_json = function
   | None -> `Null
@@ -2416,6 +2433,8 @@ let completion_command path json =
         Error
           (invalid path
              "activity requires schedule-to-close or start-to-close timeout")
+      else if zero_close_timeout schedule_to_close_timeout start_to_close_timeout then
+        Error (invalid path "activity close timeout must be positive")
       else
         Ok
           (Schedule_activity
@@ -2485,6 +2504,8 @@ let completion_command path json =
         Error (invalid (path ^ ".attempt") "local activity attempt must be positive")
       else if Option.is_none schedule_to_close_timeout && Option.is_none start_to_close_timeout then
         Error (invalid path "local activity requires schedule-to-close or start-to-close timeout")
+      else if zero_close_timeout schedule_to_close_timeout start_to_close_timeout then
+        Error (invalid path "local activity close timeout must be positive")
       else
         Ok
           (Schedule_local_activity

@@ -302,8 +302,9 @@ val cancel : 'output handle -> (unit, Error.t) result
     Temporal run them concurrently. Optional labels make the activity command
     explicit; omitted IDs are deterministic, omitted queues use the worker's
     queue, and omitted timeouts use a 60-second start-to-close timeout because
-    Temporal requires at least one activity timeout. If input or option
-    validation fails, the returned future contains a typed error and no command
+    Temporal requires at least one activity timeout. An explicit zero
+    schedule-to-close or start-to-close timeout is an option error, because
+    Temporal would treat it as unset. If input or option validation fails, the returned future contains a typed error and no command
     is emitted. [do_not_eagerly_execute] controls whether Core may run the
     activity inline with the scheduling activation; it defaults to [false]. If
     [scope] is supplied, cancelling the scope requests cancellation of this

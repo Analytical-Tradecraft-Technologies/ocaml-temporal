@@ -541,6 +541,17 @@ let validate_optional_identifier field = function
       Error (Error.defect ~message:(field ^ " must be valid UTF-8"))
   | Some _ -> Ok ()
 
+(** Rejects close timeouts of zero before any command is emitted. Temporal
+    treats a zero duration as unset, so a zero schedule-to-close timeout with no
+    start-to-close timeout makes the server reject the command on every
+    workflow task retry, and a zero local-activity timeout expires immediately.
+    Schedule-to-start and heartbeat timeouts keep Temporal's zero-means-unset
+    meaning. *)
+let validate_close_timeout field = function
+  | Some duration when Int64.equal (Duration.to_ms duration) 0L ->
+      Error (Error.defect ~message:(field ^ " must be positive"))
+  | _ -> Ok ()
+
 (* Supplies the typed error used when a caller tries to schedule an activity
    without an active workflow execution. *)
 let outside_error () =
@@ -581,8 +592,8 @@ let check_scope = function
                ~message:"scoped activity start used outside a workflow scheduler turn"))
 
 (** Schedules an activity after validating command options and encoding input.
-    Option validation deliberately happens first: a malformed activity ID or
-    task queue must not invoke an application codec, allocate workflow state,
+    Option validation deliberately happens first: a malformed activity ID,
+    task queue, or zero close timeout must not invoke an application codec, allocate workflow state,
     or perform any user conversion before the request is rejected. The native
     runtime receives a base payload; its result decoder is converted back to
     public errors at the same boundary. *)
@@ -598,6 +609,16 @@ let start_handle_internal ?scope ?activity_id ?task_queue ?schedule_to_close_tim
       | Error error -> failed_handle error
       | Ok () -> (
       match validate_optional_identifier "task queue" task_queue with
+      | Error error -> failed_handle error
+      | Ok () -> (
+      match
+        Result.bind
+          (validate_close_timeout "schedule-to-close timeout"
+             schedule_to_close_timeout)
+          (fun () ->
+            validate_close_timeout "start-to-close timeout"
+              start_to_close_timeout)
+      with
       | Error error -> failed_handle error
       | Ok () -> (
           match Codec_private.encode_base definition.input input with
@@ -675,7 +696,7 @@ let start_handle_internal ?scope ?activity_id ?task_queue ?schedule_to_close_tim
                       {
                         future = Future_private.of_internal future;
                         cancel = request_cancel;
-                      })))))
+                      }))))))
 
 (* Public wrapper keeps the implementation-only [local] switch out of the
    published signature; local callers use the dedicated [start_local] helper. *)

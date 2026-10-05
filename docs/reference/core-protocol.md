@@ -455,8 +455,11 @@ safety ceiling rather than an invented 255-byte server policy; the server's
 identifier policy is configurable. The one intentional exception is the
 pre-start child failure `run_id` described above. Application failure `type` is
 bounded text and may be empty. Activity failure event IDs are nonnegative and
-worker identity is bounded text. Durations use nonnegative seconds plus 0
-through 999,999,999 nanoseconds;
+worker identity is bounded text. Durations use nonnegative seconds no greater
+than protobuf's 315,576,000,000-second (10,000-year) maximum plus 0 through
+999,999,999 nanoseconds; both the OCaml decoder and the Rust validator reject
+larger seconds, and an activity command's explicit schedule-to-close or
+start-to-close timeout must be nonzero because Temporal treats zero as unset;
 timestamps allow signed seconds with the same nanosecond range. Payload metadata
 and initialization header maps normalize keys lexicographically on both sides.
 Payload values preserve opaque data and metadata bytes using the canonical
