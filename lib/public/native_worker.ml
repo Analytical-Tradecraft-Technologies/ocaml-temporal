@@ -66,6 +66,12 @@ let native_error_view (error : Native.error) =
       in
       (bridge_status status, message)
   | Native.Closed -> ("closed", "native supervisor is shut down")
+  | Native.Owner_unavailable exception_ ->
+      let message =
+        try Printexc.to_string exception_
+        with _ -> "unprintable Domain spawn exception"
+      in
+      ("owner_unavailable", bounded_message message)
   | Native.Supervisor_failed exception_ ->
       let message =
         try Printexc.to_string exception_

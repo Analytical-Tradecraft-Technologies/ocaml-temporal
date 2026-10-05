@@ -17,6 +17,7 @@ module Make (Backend : Backend) = struct
     | Backend of Backend.error
     | Closed
     | Supervisor_failed of exn
+    | Owner_unavailable of exn
 
   (** Typed messages accepted by the sole owner Domain. *)
   module Request = struct
@@ -235,14 +236,15 @@ module Make (Backend : Backend) = struct
 
       [Domain.spawn] raises when the runtime's Domain limit is reached (each
       live SDK instance holds one owner Domain) or the Domain cannot be
-      allocated. That is an operational failure, so it is returned as
-      [Supervisor_failed] rather than escaping a [result]-typed API. No owner
+      allocated. That is an operational, possibly transient failure (another
+      instance may shut down), so it is returned as [Owner_unavailable] rather
+      than escaping a [result]-typed API or being reported as a defect. No owner
       exists yet, so nothing needs to be stopped. An invalid capacity remains a
       programmer error and still raises [Invalid_argument]. *)
   let create ~capacity config =
     match Mailbox.create ~capacity ~handler:(owner_handler ()) with
     | exception (Invalid_argument _ as exn) -> raise exn
-    | exception exn -> Error (Supervisor_failed exn)
+    | exception exn -> Error (Owner_unavailable exn)
     | mailbox -> (
     match Mailbox.call mailbox (Initialize config) with
     | Ok (Ok ()) ->
