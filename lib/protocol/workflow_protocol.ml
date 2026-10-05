@@ -657,8 +657,9 @@ let payload path json =
 
 (** Encodes one payload without changing metadata key or byte content. *)
 let payload_json (value : payload) =
-  (* A hash set keeps the duplicate check linear in the metadata size. *)
-  let seen = Hashtbl.create (List.length value.metadata) in
+  (* A randomly seeded hash set keeps the duplicate check linear in the
+     metadata size, even for adversarially chosen keys. *)
+  let seen = Hashtbl.create ~random:true (List.length value.metadata) in
   let rec metadata_json encoded = function
     | [] -> Ok (`Assoc (List.rev encoded))
     | (key, bytes) :: rest ->
@@ -1416,10 +1417,13 @@ let eviction_reason_string = function
 
     Header, memo, and search-attribute maps arrive from remote clients, so the
     duplicate-key check uses a hash set: an untrusted map with many entries must
-    cost linear rather than quadratic time on the supervisor Domain. *)
+    cost linear rather than quadratic time on the supervisor Domain. The table
+    is seeded randomly so that precomputed colliding keys cannot restore the
+    quadratic cost. Hashtbl draws seeds from its own domain-local generator,
+    so this does not perturb [Random]. *)
 let payload_map path = function
   | `Assoc entries ->
-      let seen = Hashtbl.create (List.length entries) in
+      let seen = Hashtbl.create ~random:true (List.length entries) in
       let rec loop decoded = function
         | [] -> Ok (List.rev decoded)
         | (key, value) :: rest ->
@@ -1438,7 +1442,7 @@ let payload_map path = function
 (** Encodes a payload map and rejects duplicate keys before canonical sorting.
     The duplicate check is linear in the number of entries. *)
 let payload_map_json path values =
-  let seen = Hashtbl.create (List.length values) in
+  let seen = Hashtbl.create ~random:true (List.length values) in
   let rec loop encoded = function
     | [] -> Ok (`Assoc (List.rev encoded))
     | (key, value) :: rest ->

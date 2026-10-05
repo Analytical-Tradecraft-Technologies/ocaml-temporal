@@ -197,7 +197,7 @@ let payload_map path = function
     OCaml's association-list representation. The duplicate check is linear in
     the number of entries. *)
 let payload_map_json path values =
-  let seen = Hashtbl.create (List.length values) in
+  let seen = Hashtbl.create ~random:true (List.length values) in
   let rec loop encoded = function
     | [] -> Ok (`Assoc encoded)
     | (key, value) :: rest ->

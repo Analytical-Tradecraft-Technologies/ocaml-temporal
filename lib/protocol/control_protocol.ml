@@ -159,7 +159,9 @@ let validate_json ?(depth = 1) ?(string_limit = max_string_bytes) value =
         if List.length entries > max_collection_items then
           Error (invalid ~path "JSON collection limit exceeded")
         else
-          let seen = Hashtbl.create (List.length entries) in
+          (* Object keys come from remote peers; a random seed prevents
+             precomputed hash collisions from making this check quadratic. *)
+          let seen = Hashtbl.create ~random:true (List.length entries) in
           List.fold_left
             (fun result (key, value) ->
               let* () = result in
