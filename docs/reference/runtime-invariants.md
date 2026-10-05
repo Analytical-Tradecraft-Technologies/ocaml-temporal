@@ -327,9 +327,16 @@ and bridge, read the [documentation guide](../README.md) first.
 - Shutdown closes both readiness signals before waking Core polls, but queued
   messages always take precedence over terminal state and are drained before a
   readiness wait reports shutdown or a fatal lane error.
+- Explicit worker shutdown never waits for OCaml after initiating Core
+  shutdown: it completes every leased or queued task itself while joining both
+  poll lanes, waits at most 90 s for the join and 30 s for Core finalization,
+  and keeps the worker owned (by the graph or by the finalizer task) until
+  `finalize_shutdown` returns. A force-completed lease is reported as
+  `Outstanding_tasks` after the worker has been released (issue #769).
 - Dispose force-fails ledger debt and queued tasks before joining the Core poll
   lanes so shutdown cannot wait for OCaml. Because a poll already in flight can
-  publish a task after that first drain, dispose joins both lanes and performs a
+  publish a task after that first drain, dispose joins both lanes (with the
+  same bounded, draining join as explicit shutdown) and performs a
   final no-producer drain before finalization; no task may remain only in a
   ready queue or ledger at the point the worker graph is released.
 

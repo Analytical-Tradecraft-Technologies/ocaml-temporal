@@ -237,8 +237,10 @@ client waits use the expected `NOT_READY` status. For a worker lane it means no
 task is queued; for a client wait it means the 100 ms owner interval elapsed
 without a terminal result. In both cases the caller or a later orchestration
 loop can resume through the supervisor mailbox.
-`OUTSTANDING_TASKS` means shutdown cannot finalize until the language side
-completes leased work.
+For live worker shutdown, `OUTSTANDING_TASKS` means a task leased to the
+language side was never completed: the bridge force-completed it, finalized
+the worker, and released it, and reports the abandoned work so the caller can
+surface it. For replay it means recorded input was not fully drained.
 
 A result has one success buffer and one error buffer. At most one owns memory:
 
@@ -603,12 +605,35 @@ spurious `UnknownActivity` completion failure, while keeping the original
 decode failure primary.
 
 Shutdown first closes ledger admission and both readiness signals, then asks
-Core to wake both polls and joins the lane tasks. Existing ready and leased
-work remains completable while the worker drains. Core finalization is refused
-until the ledger is empty, and only then consumes the worker before client and
-runtime destruction. The garbage-collection fallback cannot obtain missing
+Core to wake both polls. From that point the supervisor Domain is blocked in
+the shutdown call and OCaml has already stopped its run loop and drained its
+retained completions, so no language completion can arrive. Core, however,
+returns `ShutDown` from a poll only after every task it produced has been
+completed, so joining the lanes without completing those tasks hung forever
+(issue #769). `PollLanes::drain_and_join_for_shutdown` therefore completes each
+outstanding debt exactly once while it joins both lanes: a lease taken by
+OCaml is removed from the ledger and failed (or acknowledged empty if it was a
+pure cache eviction, which owns no workflow task); a queued handoff is removed
+and completed from its own queue message; activity cancellations and lane
+diagnostics own no debt and are dropped. It keeps draining both queues while
+the lanes run, because polls in flight and Core's follow-up evictions publish
+new tasks until each lane sees `ShutDown`. Each identity leaves the ledger
+before its Core completion is awaited, and no tombstone is written, so a
+same-run eviction that answers a failed workflow task is admitted and
+acknowledged. The drain is bounded by `WORKER_SHUTDOWN_DRAIN_TIMEOUT` (90 s,
+above one server long poll); on timeout the unjoined lanes stay owned by the
+graph, the ledger is marked as having lost a lease, and the call returns a
+worker failure so runtime close disposes the worker. Core finalization then
+runs in a Tokio task that owns the worker until `finalize_shutdown` returns,
+and the caller waits at most `WORKER_FINALIZE_TIMEOUT` (30 s); after that the
+task finishes the release in the background, so a worker is never dropped
+between the lane join and Core's `finalize_unregister`. Tasks that never
+reached OCaml are retired silently and shutdown returns `OK`; if a leased task
+had to be force-completed, the worker is still released but shutdown returns
+`OUTSTANDING_TASKS`. The garbage-collection fallback cannot obtain missing
 language completions. On the dedicated cleanup thread it force-fails
-outstanding Core tasks, joins the poll lanes, and attempts normal finalization;
+outstanding Core tasks, joins the poll lanes with the same bounded drain, and
+attempts the same bounded finalization;
 it drops an undrained worker only if finalization still fails. This preserves
 memory ownership and collector progress, while explicit supervisor shutdown
 remains the required graceful path.
