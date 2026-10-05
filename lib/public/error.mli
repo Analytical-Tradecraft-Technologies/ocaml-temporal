@@ -43,9 +43,10 @@ type t
     [non_retryable_error_types] list is matched against and what callers
     written in other Temporal SDKs see. When omitted, the lowercase category
     name ({!kind}) is sent instead. An empty string is treated as omitted.
-    Raises [Invalid_argument] if [error_type] is not valid UTF-8 or is longer
-    than 65536 bytes; such a value cannot be transmitted and indicates a
-    programming error. *)
+    Raises [Invalid_argument] if [error_type] is not valid UTF-8, contains an
+    ASCII control character, or is longer than 65536 characters once
+    JSON-escaped (a double quote or backslash counts twice); such a value
+    cannot be transmitted and indicates a programming error. *)
 val make :
   ?non_retryable:bool ->
   ?error_type:string ->
@@ -68,7 +69,10 @@ val message : t -> string
 
 (** Returns the application failure type, if any. For an error received from
     Temporal (an activity, child workflow, or workflow result) this is the type
-    of the innermost application failure in the failure chain, as set by the
+    of the first application failure found walking the failure chain from the
+    outermost layer inward (so an application failure nested under an
+    activity or child-workflow wrapper is found, while an application failure
+    wrapping another application failure reports its own type), as set by the
     code that raised it in any SDK; an OCaml error created without
     [~error_type] arrives with its category name. [None] means the failure had
     no application layer or its type was empty. *)

@@ -36,18 +36,33 @@ let copy_detail (payload : Payload.t) : Payload.t =
 (** Matches the Rust bridge's [MAX_STRING_BYTES]; see [error.mli]. *)
 let max_error_type_bytes = 65_536
 
+(** Counts the characters [value] occupies once JSON-escaped by the bridge
+    transport, whose string limit is measured on that encoded form: a double
+    quote or a backslash takes two characters; every other byte of an accepted
+    type (control characters are rejected first) takes one. *)
+let encoded_error_type_length value =
+  String.fold_left
+    (fun length character ->
+      match character with '"' | '\\' -> length + 2 | _ -> length + 1)
+    0 value
+
 (** Normalizes an optional application error type. Empty means "no type" so
     that callers forwarding a possibly-empty wire value need no special case.
     Invalid text is rejected eagerly: deferring the check to the transport
     boundary would turn a construction mistake into an unrelated completion
-    failure far from its source. *)
+    failure far from its source. Control characters are rejected because a
+    type is an identifier and because each would expand to a six-character
+    JSON escape, so a type within the byte limit could still exceed the
+    transport's encoded string limit. *)
 let normalize_error_type = function
   | None | Some "" -> None
   | Some value ->
-      if String.length value > max_error_type_bytes then
-        invalid_arg "Error.make: error_type exceeds 65536 bytes"
-      else if not (String.is_valid_utf_8 value) then
+      if not (String.is_valid_utf_8 value) then
         invalid_arg "Error.make: error_type is not valid UTF-8"
+      else if String.exists (fun c -> Char.code c < 0x20 || Char.code c = 0x7f) value
+      then invalid_arg "Error.make: error_type contains a control character"
+      else if encoded_error_type_length value > max_error_type_bytes then
+        invalid_arg "Error.make: error_type exceeds 65536 encoded characters"
       else Some value
 
 (** Creates an error with the common defaults: retryable, untyped and without

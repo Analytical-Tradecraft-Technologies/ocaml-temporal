@@ -30,17 +30,10 @@ let copy_detail (payload : Payload.t) : Payload.t =
     data = Bytes.copy payload.data;
   }
 
-(** Applies the same normalization and limits as the base error so that a type
-    accepted here can always be copied into the base representation by
-    [Error_private.to_base] without raising there. *)
-let normalize_error_type = function
-  | None | Some "" -> None
-  | Some value ->
-      if String.length value > Temporal_base.Error.max_error_type_bytes then
-        invalid_arg "Error.make: error_type exceeds 65536 bytes"
-      else if not (String.is_valid_utf_8 value) then
-        invalid_arg "Error.make: error_type is not valid UTF-8"
-      else Some value
+(** Uses the base error's normalization so a type accepted here can always be
+    copied into the base representation by [Error_private.to_base] without
+    raising there. *)
+let normalize_error_type = Temporal_base.Error.normalize_error_type
 
 (** Creates an error with the common defaults: retryable, untyped and without
     details. Detail payloads are deep-copied so later mutation of a caller's

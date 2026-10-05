@@ -52,4 +52,10 @@ let () =
   assert (rejects "\xff");
   assert (
     rejects (String.make (Temporal_base.Error.max_error_type_bytes + 1) 'x'));
-  assert (not (rejects (String.make Temporal_base.Error.max_error_type_bytes 'x')))
+  assert (not (rejects (String.make Temporal_base.Error.max_error_type_bytes 'x')));
+  (* Control characters would each become a six-character JSON escape, and
+     quotes or backslashes double, so limits apply to the encoded form. *)
+  assert (rejects "Bad\001Type");
+  assert (rejects "tab\there");
+  assert (rejects (String.make (Temporal_base.Error.max_error_type_bytes / 2 + 1) '"'));
+  assert (not (rejects (String.make (Temporal_base.Error.max_error_type_bytes / 2) '"')))
