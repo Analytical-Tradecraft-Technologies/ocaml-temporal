@@ -467,9 +467,12 @@ let failure_details failure =
       | Workflow_protocol.Canceled { details; _ } ->
           List.rev_append details reversed
       | Workflow_protocol.Activity _ | Workflow_protocol.Child_workflow _
-      | Workflow_protocol.Terminated _ ->
+      | Workflow_protocol.Terminated _ | Workflow_protocol.Server _
+      | Workflow_protocol.Nexus_operation _ | Workflow_protocol.Nexus_handler _
+      | Workflow_protocol.Absent ->
           reversed
-      | Workflow_protocol.Timeout_failure { last_heartbeat_details; _ } ->
+      | Workflow_protocol.Timeout_failure { last_heartbeat_details; _ }
+      | Workflow_protocol.Reset_workflow { last_heartbeat_details } ->
           List.rev_append last_heartbeat_details reversed
     in
     match value.cause with

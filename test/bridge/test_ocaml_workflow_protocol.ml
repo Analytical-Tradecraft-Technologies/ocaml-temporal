@@ -96,6 +96,7 @@ let test_valid_activations () =
       "child-cancellation-before-start";
       "patch-activation";
       "reset-activation";
+      "extended-failure-info";
     ]
 
 (** Proves continuation initialization metadata remains typed through the OCaml
@@ -1554,6 +1555,115 @@ let test_terminated_failure_info () =
       {|{"kind":"terminated","identity":"a","identity":"b"}|};
       Printf.sprintf {|{"kind":"terminated","identity":"%s"}|} (String.make 65_537 'i') ]
 
+(** Proves every failure-info kind the bridge previously rejected (server,
+    reset workflow, Nexus operation, Nexus handler, and an absent info) is a
+    closed, round-tripping variant, that malformed shapes still fail closed,
+    and that retryability is derived from the kind where it carries a
+    decision and from the nested cause otherwise. *)
+let test_extended_failure_info_kinds () =
+  let heartbeat : Protocol.payload =
+    { metadata = [ ("encoding", Bytes.of_string "binary/plain") ]; data = Bytes.of_string "1" }
+  in
+  let kinds : Protocol.failure_info list =
+    [
+      Server { non_retryable = true };
+      Reset_workflow { last_heartbeat_details = [ heartbeat ] };
+      Nexus_operation
+        {
+          scheduled_event_id = 8L;
+          endpoint = "payments";
+          service = "billing";
+          operation = "charge";
+          operation_id = "";
+          operation_token = "token-1";
+        };
+      Nexus_handler { type_name = "INTERNAL"; retry_behavior = Nexus_retry_retryable };
+      Absent;
+    ]
+  in
+  List.iter
+    (fun info ->
+      let completion : Protocol.completion =
+        {
+          run_id = "run-extended";
+          task_failure = None;
+          commands = [ Fail_workflow { failure = failure_with_info info } ];
+        }
+      in
+      let encoded = unwrap (Protocol.encode_completion completion) in
+      if unwrap (Protocol.decode_completion encoded) <> completion then
+        failwith "extended failure info did not round-trip")
+    kinds;
+  let with_info info =
+    {|{"run_id":"run","commands":[{"kind":"fail_workflow","failure":{"message":"m","source":"","stack_trace":"","encoded_attributes":null,"cause":null,"info":|}
+    ^ info ^ {|}}]}|}
+  in
+  List.iter
+    (fun info -> ignore (unwrap (Protocol.decode_completion (with_info info))))
+    [
+      {|{"kind":"server","non_retryable":false}|};
+      {|{"kind":"reset_workflow","last_heartbeat_details":[]}|};
+      {|{"kind":"nexus_operation","scheduled_event_id":1,"endpoint":"e","service":"s","operation":"o","operation_id":"","operation_token":""}|};
+      {|{"kind":"nexus_handler","type":"BAD_REQUEST","retry_behavior":"unspecified"}|};
+      {|{"kind":"absent"}|};
+    ];
+  List.iter
+    (fun info -> require_error (Protocol.decode_completion (with_info info)))
+    [
+      {|{"kind":"server"}|};
+      {|{"kind":"server","non_retryable":false,"extra":1}|};
+      {|{"kind":"absent","message":"m"}|};
+      {|{"kind":"nexus_handler","type":"X","retry_behavior":"sometimes"}|};
+      {|{"kind":"nexus_operation","scheduled_event_id":1,"endpoint":"e","service":"s","operation":"o","operation_token":""}|};
+      {|{"kind":"nexus_operation","scheduled_event_id":-1,"endpoint":"e","service":"s","operation":"o","operation_id":"","operation_token":""}|};
+      {|{"kind":"unknown_future_kind"}|};
+    ];
+  let non_retryable_application =
+    failure_with_info
+      (Application
+         {
+           type_name = "Permanent";
+           non_retryable = true;
+           details = [];
+           category = Application_category_unspecified;
+           next_retry_delay = None;
+         })
+  in
+  let over info cause = { (failure_with_info info) with cause = Some cause } in
+  let check label expected failure =
+    if Protocol.failure_non_retryable failure <> expected then
+      failwith (label ^ " retryability differed")
+  in
+  check "server non-retryable" true (failure_with_info (Server { non_retryable = true }));
+  check "server retryable" false
+    (over (Server { non_retryable = false }) non_retryable_application);
+  check "handler non-retryable" true
+    (failure_with_info
+       (Nexus_handler { type_name = "X"; retry_behavior = Nexus_retry_non_retryable }));
+  check "handler retryable" false
+    (over
+       (Nexus_handler { type_name = "X"; retry_behavior = Nexus_retry_retryable })
+       non_retryable_application);
+  (* An unspecified override follows the Nexus default for the handler type,
+     not the unrelated cause. *)
+  check "handler unspecified bad request" true
+    (failure_with_info
+       (Nexus_handler
+          { type_name = "BAD_REQUEST"; retry_behavior = Nexus_retry_unspecified }));
+  check "handler unspecified internal" false
+    (over
+       (Nexus_handler
+          { type_name = "INTERNAL"; retry_behavior = Nexus_retry_unspecified })
+       non_retryable_application);
+  check "handler unspecified unknown type" false
+    (over
+       (Nexus_handler { type_name = "X"; retry_behavior = Nexus_retry_unspecified })
+       non_retryable_application);
+  check "absent inherits" true (over Absent non_retryable_application);
+  check "absent alone" false (failure_with_info Absent);
+  check "reset inherits" true
+    (over (Reset_workflow { last_heartbeat_details = [] }) non_retryable_application)
+
 (** Runs one test with a stable name suitable for CI logs. *)
 let run name test =
   try
@@ -1615,6 +1725,7 @@ let () =
   run "failure field semantics" test_failure_field_semantics;
   run "application failure options" test_application_failure_options;
   run "timeout failure info" test_timeout_failure_info;
+  run "extended failure info kinds" test_extended_failure_info_kinds;
   run "failure retryability inheritance" test_failure_retryability_inheritance;
   run "recursive failure depth" test_recursive_failure_depth;
   run "initialize header keys" test_initialize_header_keys;

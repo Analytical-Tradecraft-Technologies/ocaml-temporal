@@ -56,6 +56,12 @@ type application_failure_category = Workflow_protocol.application_failure_catego
   | Application_category_unspecified
   | Application_category_benign
 
+(** Retry override attached to a Nexus handler error. *)
+type nexus_handler_retry_behavior = Workflow_protocol.nexus_handler_retry_behavior =
+  | Nexus_retry_unspecified
+  | Nexus_retry_retryable
+  | Nexus_retry_non_retryable
+
 (** Supported closed set of structured Temporal failure details. *)
 type failure_info = Workflow_protocol.failure_info =
   | Application of {
@@ -88,6 +94,21 @@ type failure_info = Workflow_protocol.failure_info =
       timeout_type : timeout_type;
       last_heartbeat_details : payload list;
     }
+  | Server of { non_retryable : bool }
+  | Reset_workflow of { last_heartbeat_details : payload list }
+  | Nexus_operation of {
+      scheduled_event_id : int64;
+      endpoint : string;
+      service : string;
+      operation : string;
+      operation_id : string;
+      operation_token : string;
+    }
+  | Nexus_handler of {
+      type_name : string;
+      retry_behavior : nexus_handler_retry_behavior;
+    }
+  | Absent
 
 (** Recursive Temporal failure shared with workflow activation semantics. *)
 type failure = Workflow_protocol.failure = {

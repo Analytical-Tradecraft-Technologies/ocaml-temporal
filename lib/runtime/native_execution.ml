@@ -172,9 +172,15 @@ let rec copy_failure (value : Protocol.failure) : Protocol.failure =
     | Protocol.Timeout_failure ({ last_heartbeat_details; _ } as info) ->
         Protocol.Timeout_failure
           { info with last_heartbeat_details = copy_payloads last_heartbeat_details }
+    | Protocol.Reset_workflow { last_heartbeat_details } ->
+        Protocol.Reset_workflow
+          { last_heartbeat_details = copy_payloads last_heartbeat_details }
     | Protocol.Activity _ as info -> info
     | Protocol.Terminated _ as info -> info
     | Protocol.Child_workflow _ as info -> info
+    | ( Protocol.Server _ | Protocol.Nexus_operation _ | Protocol.Nexus_handler _
+      | Protocol.Absent ) as info ->
+        info
   in
   Protocol.
     {
@@ -281,9 +287,13 @@ let failure_details (failure : Protocol.failure) =
       | Protocol.Application { details; _ } | Protocol.Canceled { details; _ }
         ->
           List.rev_append details reversed
-      | Protocol.Timeout_failure { last_heartbeat_details; _ } ->
+      | Protocol.Timeout_failure { last_heartbeat_details; _ }
+      | Protocol.Reset_workflow { last_heartbeat_details } ->
           List.rev_append last_heartbeat_details reversed
-      | Protocol.Activity _ | Protocol.Child_workflow _ | Protocol.Terminated _ -> reversed
+      | Protocol.Activity _ | Protocol.Child_workflow _ | Protocol.Terminated _
+      | Protocol.Server _ | Protocol.Nexus_operation _ | Protocol.Nexus_handler _
+      | Protocol.Absent ->
+          reversed
     in
     match value.cause with
     | Some cause when depth < 128 -> loop (depth + 1) reversed cause

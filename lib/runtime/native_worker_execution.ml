@@ -578,6 +578,12 @@ module Make (Supervisor : SUPERVISOR) = struct
               timeout_type;
               last_heartbeat_details = List.map copy_payload last_heartbeat_details;
             }
+      | Protocol.Reset_workflow { last_heartbeat_details } ->
+          Protocol.Reset_workflow
+            { last_heartbeat_details = List.map copy_payload last_heartbeat_details }
+      | ( Protocol.Server _ | Protocol.Nexus_operation _
+        | Protocol.Nexus_handler _ | Protocol.Absent ) as info ->
+          info
     in
     {
       message = failure.message;

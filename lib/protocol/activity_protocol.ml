@@ -29,6 +29,11 @@ type application_failure_category = Workflow.application_failure_category =
   | Application_category_unspecified
   | Application_category_benign
 
+type nexus_handler_retry_behavior = Workflow.nexus_handler_retry_behavior =
+  | Nexus_retry_unspecified
+  | Nexus_retry_retryable
+  | Nexus_retry_non_retryable
+
 type failure_info = Workflow.failure_info =
   | Application of {
       type_name : string;
@@ -60,6 +65,21 @@ type failure_info = Workflow.failure_info =
       timeout_type : timeout_type;
       last_heartbeat_details : payload list;
     }
+  | Server of { non_retryable : bool }
+  | Reset_workflow of { last_heartbeat_details : payload list }
+  | Nexus_operation of {
+      scheduled_event_id : int64;
+      endpoint : string;
+      service : string;
+      operation : string;
+      operation_id : string;
+      operation_token : string;
+    }
+  | Nexus_handler of {
+      type_name : string;
+      retry_behavior : nexus_handler_retry_behavior;
+    }
+  | Absent
 
 type failure = Workflow.failure = {
   message : string;

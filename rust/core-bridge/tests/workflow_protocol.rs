@@ -116,6 +116,7 @@ fn accepts_and_normalizes_workflow_activations() {
         "child-cancellation-before-start",
         "patch-activation",
         "reset-activation",
+        "extended-failure-info",
     ] {
         let input = fixture(&["valid", &format!("{name}.input.json")]);
         let expected = fixture(&["valid", &format!("{name}.normalized.json")]);
@@ -3784,6 +3785,276 @@ fn child_options_are_closed_and_validated() {
         assert!(
             workflow_protocol::decode_completion(&malformed).is_err(),
             "accepted {field}"
+        );
+    }
+}
+
+/// Builds one Core activity-failure activation whose cause carries
+/// `cause_info`. Wrapping the kind under test in an activity failure
+/// reproduces the reported scenario (for example, a server-generated failure
+/// for an oversized activity result) where the nested cause, not the outer
+/// wrapper, used to make the entire activation unrepresentable.
+fn activity_failure_activation_with_cause(
+    cause_info: Option<temporalio_protos::temporal::api::failure::v1::failure::FailureInfo>,
+) -> (
+    core_activation::WorkflowActivation,
+    temporalio_protos::temporal::api::failure::v1::Failure,
+) {
+    use core_activation::workflow_activation_job::Variant;
+    use temporalio_protos::coresdk::{activity_result, workflow_activation};
+    use temporalio_protos::temporal::api::{common::v1 as api_common, failure::v1 as api_failure};
+
+    let failure = api_failure::Failure {
+        message: "activity failed".to_owned(),
+        source: String::new(),
+        stack_trace: String::new(),
+        encoded_attributes: None,
+        cause: Some(Box::new(api_failure::Failure {
+            message: "cause under test".to_owned(),
+            source: "server".to_owned(),
+            stack_trace: "frame".to_owned(),
+            encoded_attributes: None,
+            cause: None,
+            failure_info: cause_info,
+        })),
+        failure_info: Some(api_failure::failure::FailureInfo::ActivityFailureInfo(
+            api_failure::ActivityFailureInfo {
+                scheduled_event_id: 5,
+                started_event_id: 6,
+                identity: "worker".to_owned(),
+                activity_type: Some(api_common::ActivityType {
+                    name: "upload".to_owned(),
+                }),
+                activity_id: "1".to_owned(),
+                retry_state: 2,
+            },
+        )),
+    };
+    let activation = core_activation::WorkflowActivation {
+        run_id: "run".to_owned(),
+        timestamp: Some(prost_wkt_types::Timestamp::default()),
+        jobs: vec![core_activation::WorkflowActivationJob {
+            variant: Some(Variant::ResolveActivity(
+                workflow_activation::ResolveActivity {
+                    seq: 1,
+                    result: Some(activity_result::ActivityResolution {
+                        status: Some(activity_result::activity_resolution::Status::Failed(
+                            activity_result::Failure {
+                                failure: Some(failure.clone()),
+                            },
+                        )),
+                    }),
+                    is_local: false,
+                },
+            )),
+        }],
+        ..Default::default()
+    };
+    (activation, failure)
+}
+
+/// Every `failure_info` arm of the pinned Core schema that the bridge used to
+/// reject, and an absent `failure_info`, must convert into a typed semantic
+/// failure instead of rejecting the activation. Each case also proves the
+/// JSON round trip and that a `FailWorkflow` command carrying the converted
+/// failure reproduces the original Core protobuf exactly.
+#[test]
+fn converts_every_core_failure_info_kind_losslessly() {
+    use temporalio_protos::temporal::api::{
+        common::v1 as api_common, enums::v1 as api_enums, failure::v1 as api_failure,
+    };
+    use workflow_protocol::{FailureInfo, NexusHandlerRetryBehavior, NexusOperationFailure};
+    type Core = api_failure::failure::FailureInfo;
+
+    #[allow(deprecated)]
+    let nexus_operation = api_failure::NexusOperationFailureInfo {
+        scheduled_event_id: 9,
+        endpoint: "endpoint".to_owned(),
+        service: "service".to_owned(),
+        operation: "operation".to_owned(),
+        operation_id: "legacy-id".to_owned(),
+        operation_token: String::new(),
+    };
+    let heartbeat = workflow_protocol::Payload {
+        metadata: [("encoding".to_owned(), b"binary/plain".to_vec())].into(),
+        data: b"progress".to_vec(),
+    };
+    let cases: Vec<(Option<Core>, FailureInfo)> = vec![
+        (
+            Some(Core::ServerFailureInfo(api_failure::ServerFailureInfo {
+                non_retryable: true,
+            })),
+            FailureInfo::Server {
+                non_retryable: true,
+            },
+        ),
+        (
+            Some(Core::ResetWorkflowFailureInfo(
+                api_failure::ResetWorkflowFailureInfo {
+                    last_heartbeat_details: Some(api_common::Payloads {
+                        payloads: vec![api_common::Payload {
+                            metadata: heartbeat.metadata.clone().into_iter().collect(),
+                            data: heartbeat.data.clone(),
+                            external_payloads: Vec::new(),
+                        }],
+                    }),
+                },
+            )),
+            FailureInfo::ResetWorkflow {
+                last_heartbeat_details: vec![heartbeat.clone()],
+            },
+        ),
+        (
+            Some(Core::ResetWorkflowFailureInfo(
+                api_failure::ResetWorkflowFailureInfo {
+                    last_heartbeat_details: None,
+                },
+            )),
+            FailureInfo::ResetWorkflow {
+                last_heartbeat_details: Vec::new(),
+            },
+        ),
+        (
+            Some(Core::NexusOperationExecutionFailureInfo(nexus_operation)),
+            FailureInfo::NexusOperation(Box::new(NexusOperationFailure {
+                scheduled_event_id: 9,
+                endpoint: "endpoint".to_owned(),
+                service: "service".to_owned(),
+                operation: "operation".to_owned(),
+                operation_id: "legacy-id".to_owned(),
+                operation_token: String::new(),
+            })),
+        ),
+        (
+            Some(Core::NexusHandlerFailureInfo(
+                api_failure::NexusHandlerFailureInfo {
+                    r#type: "INTERNAL".to_owned(),
+                    retry_behavior: api_enums::NexusHandlerErrorRetryBehavior::NonRetryable as i32,
+                },
+            )),
+            FailureInfo::NexusHandler {
+                type_name: "INTERNAL".to_owned(),
+                retry_behavior: NexusHandlerRetryBehavior::NonRetryable,
+            },
+        ),
+        (None, FailureInfo::Absent {}),
+    ];
+
+    for (core_info, expected) in cases {
+        let (activation, core_failure) = activity_failure_activation_with_cause(core_info);
+        let semantic = workflow_protocol::activation_from_core(&activation)
+            .unwrap_or_else(|error| panic!("{expected:?} rejected the activation: {error:?}"));
+        let failure = match &semantic.jobs[0] {
+            workflow_protocol::ActivationJob::ResolveActivity {
+                result: workflow_protocol::ActivityResolution::Failed { failure },
+                ..
+            } => failure.clone(),
+            job => panic!("unexpected activity job: {job:?}"),
+        };
+        let cause = failure.cause.as_deref().expect("cause must be preserved");
+        assert_eq!(cause.info, expected);
+        assert_eq!(cause.message, "cause under test");
+        assert_eq!(cause.stack_trace, "frame");
+
+        let encoded = workflow_protocol::encode_activation(&semantic).unwrap();
+        assert_eq!(
+            workflow_protocol::decode_activation(&encoded).unwrap(),
+            semantic
+        );
+
+        let completion = workflow_protocol::Completion {
+            task_failure: None,
+            run_id: "run".to_owned(),
+            commands: vec![workflow_protocol::CompletionCommand::FailWorkflow { failure }],
+        };
+        let core = workflow_protocol::completion_to_core(&completion).unwrap();
+        let Some(core_completion::workflow_activation_completion::Status::Successful(success)) =
+            core.status.as_ref()
+        else {
+            panic!("fail-workflow completion must be successful");
+        };
+        let Some(core_commands::workflow_command::Variant::FailWorkflowExecution(command)) =
+            success.commands[0].variant.as_ref()
+        else {
+            panic!("completion must map to Core's fail command");
+        };
+        assert_eq!(command.failure.as_ref(), Some(&core_failure));
+    }
+}
+
+/// Future Nexus retry-behavior numbers are rejected like every other closed
+/// Core enum, and the semantic validators accept the new closed JSON shapes
+/// while rejecting malformed ones and Nexus values that could not be
+/// represented on both sides of the JSON boundary.
+#[test]
+fn validates_extended_failure_info_kinds() {
+    use temporalio_protos::temporal::api::failure::v1 as api_failure;
+
+    let (unknown, _) = activity_failure_activation_with_cause(Some(
+        api_failure::failure::FailureInfo::NexusHandlerFailureInfo(
+            api_failure::NexusHandlerFailureInfo {
+                r#type: "INTERNAL".to_owned(),
+                retry_behavior: 99,
+            },
+        ),
+    ));
+    assert_eq!(
+        workflow_protocol::activation_from_core(&unknown)
+            .unwrap_err()
+            .code,
+        workflow_protocol::CoreConversionErrorCode::InvalidCore
+    );
+
+    let nexus = |scheduled_event_id: i64, endpoint: &str| workflow_protocol::Completion {
+        task_failure: None,
+        run_id: "run".to_owned(),
+        commands: vec![workflow_protocol::CompletionCommand::FailWorkflow {
+            failure: workflow_protocol::Failure {
+                message: "nexus failed".to_owned(),
+                source: String::new(),
+                stack_trace: String::new(),
+                encoded_attributes: None,
+                cause: None,
+                info: workflow_protocol::FailureInfo::NexusOperation(Box::new(
+                    workflow_protocol::NexusOperationFailure {
+                        scheduled_event_id,
+                        endpoint: endpoint.to_owned(),
+                        service: "service".to_owned(),
+                        operation: "operation".to_owned(),
+                        operation_id: String::new(),
+                        operation_token: "token".to_owned(),
+                    },
+                )),
+            },
+        }],
+    };
+    assert!(workflow_protocol::encode_completion(&nexus(0, "endpoint")).is_ok());
+    assert!(workflow_protocol::encode_completion(&nexus(-1, "endpoint")).is_err());
+    assert!(workflow_protocol::encode_completion(&nexus(0, &"e".repeat(65_537))).is_err());
+
+    let base = r#"{"run_id":"run","commands":[{"kind":"fail_workflow","failure":{"message":"m","source":"","stack_trace":"","encoded_attributes":null,"cause":null,"info":INFO}}]}"#;
+    for info in [
+        r#"{"kind":"server","non_retryable":false}"#,
+        r#"{"kind":"reset_workflow","last_heartbeat_details":[]}"#,
+        r#"{"kind":"nexus_operation","scheduled_event_id":1,"endpoint":"e","service":"s","operation":"o","operation_id":"","operation_token":""}"#,
+        r#"{"kind":"nexus_handler","type":"BAD_REQUEST","retry_behavior":"unspecified"}"#,
+        r#"{"kind":"absent"}"#,
+    ] {
+        workflow_protocol::decode_completion(&base.replace("INFO", info))
+            .unwrap_or_else(|error| panic!("rejected {info}: {error:?}"));
+    }
+    for info in [
+        r#"{"kind":"server"}"#,
+        r#"{"kind":"server","non_retryable":false,"extra":1}"#,
+        r#"{"kind":"absent","message":"m"}"#,
+        r#"{"kind":"nexus_handler","type":"X","retry_behavior":"sometimes"}"#,
+        r#"{"kind":"nexus_operation","scheduled_event_id":1,"endpoint":"e","service":"s","operation":"o","operation_token":""}"#,
+        r#"{"kind":"nexus_operation","scheduled_event_id":-1,"endpoint":"e","service":"s","operation":"o","operation_id":"","operation_token":""}"#,
+        r#"{"kind":"unknown_future_kind"}"#,
+    ] {
+        assert!(
+            workflow_protocol::decode_completion(&base.replace("INFO", info)).is_err(),
+            "accepted {info}"
         );
     }
 }

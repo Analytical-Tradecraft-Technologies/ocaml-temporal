@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/docs/schemas/bridge/temporal-failure.schema.json",
   "title": "Temporal failure",
-  "description": "Closed Temporal failure information carried by the workflow and activity protocols.",
+  "description": "Closed Temporal failure information carried by the workflow and activity protocols. The info union covers every failure_info arm of the pinned Core schema plus an absent info.",
   "$ref": "#/$defs/failure",
   "$defs": {
     "payload": {"$ref": "temporal-payload.schema.json"},
@@ -104,6 +104,57 @@
             "kind": {"const": "timeout"},
             "timeout_type": {"enum": ["unspecified", "start_to_close", "schedule_to_start", "schedule_to_close", "heartbeat"]},
             "last_heartbeat_details": {"type": "array", "maxItems": 201326592, "items": {"$ref": "#/$defs/payload"}}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "non_retryable"],
+          "properties": {
+            "kind": {"const": "server"},
+            "non_retryable": {"type": "boolean"}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "last_heartbeat_details"],
+          "properties": {
+            "kind": {"const": "reset_workflow"},
+            "last_heartbeat_details": {"type": "array", "maxItems": 201326592, "items": {"$ref": "#/$defs/payload"}}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "scheduled_event_id", "endpoint", "service", "operation", "operation_id", "operation_token"],
+          "properties": {
+            "kind": {"const": "nexus_operation"},
+            "scheduled_event_id": {"type": "integer", "minimum": 0, "maximum": 9223372036854775807},
+            "endpoint": {"type": "string", "maxLength": 65536},
+            "service": {"type": "string", "maxLength": 65536},
+            "operation": {"type": "string", "maxLength": 65536},
+            "operation_id": {"type": "string", "maxLength": 65536, "description": "Core's deprecated predecessor of operation_token, retained for a lossless round trip."},
+            "operation_token": {"type": "string", "maxLength": 65536}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "type", "retry_behavior"],
+          "properties": {
+            "kind": {"const": "nexus_handler"},
+            "type": {"type": "string", "maxLength": 65536},
+            "retry_behavior": {"enum": ["unspecified", "retryable", "non_retryable"]}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind"],
+          "description": "The Core failure carried no failure_info. Prost also decodes a failure_info kind added by a newer server this way.",
+          "properties": {
+            "kind": {"const": "absent"}
           }
         }
       ]
