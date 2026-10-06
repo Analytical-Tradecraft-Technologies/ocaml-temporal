@@ -106,6 +106,27 @@ let min_cached_workflow_polls = 2
 (** Maximum accepted graceful shutdown period in milliseconds. *)
 let max_graceful_shutdown_timeout_ms = 86_400_000L
 
+(** Largest explicit Tokio worker-thread count for one runtime. Mirrors
+    [MAX_RUNTIME_WORKER_THREADS] in the Rust bridge, which rejects larger
+    values again; validating here keeps an invalid count from allocating the
+    OCaml runtime owner at all. *)
+let max_runtime_worker_threads = 256
+
+(** Validates an explicit runtime worker-thread count; [None] selects the
+    bridge default and is always accepted. *)
+let validate_runtime_worker_threads = function
+  | None -> Ok ()
+  | Some count when count >= 1 && count <= max_runtime_worker_threads -> Ok ()
+  | Some count ->
+      Error
+        {
+          status = Invalid_argument;
+          message =
+            Printf.sprintf
+              "runtime worker thread count must be between 1 and %d, got %d"
+              max_runtime_worker_threads count;
+        }
+
 external check_abi_version_raw : int32 -> response
   = "ocaml_temporal_check_abi_version"
 
@@ -118,7 +139,7 @@ external response_status : response -> int = "ocaml_temporal_response_status"
 external response_value : response -> bytes = "ocaml_temporal_response_value"
 external response_error : response -> string = "ocaml_temporal_response_error"
 external response_free : response -> unit = "ocaml_temporal_response_free"
-external runtime_create_raw : unit -> runtime * response
+external runtime_create_raw : int -> runtime * response
   = "ocaml_temporal_runtime_create"
 
 external runtime_close_raw : runtime -> int = "ocaml_temporal_runtime_close"
@@ -875,20 +896,27 @@ let runtime_close runtime =
   result
 
 (** Checks the linked bridge contract once, then creates the native runtime.
-    If creation fails after allocating the OCaml owner, cleanup remains safe
-    because its native pointer is either null or explicitly closed here. *)
-let runtime_create () =
+    An invalid [worker_threads] is rejected before any allocation. If creation
+    fails after allocating the OCaml owner, cleanup remains safe because its
+    native pointer is either null or explicitly closed here. The C ABI encodes
+    the bridge default as [0]. *)
+let runtime_create ?worker_threads () =
   let result =
     bridge_call "runtime_create" (fun () ->
+        match validate_runtime_worker_threads worker_threads with
+        | Error _ as error -> error
+        | Ok () -> (
         match check_abi_version abi_version with
         | Error _ as error -> error
         | Ok () ->
-            let runtime, response = runtime_create_raw () in
+            let runtime, response =
+              runtime_create_raw (Option.value worker_threads ~default:0)
+            in
             (match decode response with
             | Ok _ -> Ok runtime
             | Error error ->
                 ignore (runtime_close runtime);
-                Error error))
+                Error error)))
   in
   let level, message, bridge_status =
     match result with

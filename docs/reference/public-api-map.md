@@ -143,6 +143,11 @@ for those rules.
   call beyond either bound is rejected before reaching Temporal with a
   retryable `bridge` error that `Client.is_at_capacity` recognizes, and the
   client stays usable.
+- `Client.create` and `Worker.create` accept `?runtime_threads` to bound the
+  worker-thread pool of the private native runtime each instance owns (#832).
+  The default is the host's available parallelism capped at 4, not one thread
+  per core; a value outside 1..256 is a typed defect returned before anything
+  is allocated. Each client and worker still owns a separate runtime.
 - `Temporal.Worker` registers workflows, activities, and the signal, query, and
   update handlers attached to each workflow registration. It owns one
   supervisor graph, runs the poll loops, and performs idempotent shutdown.

@@ -755,7 +755,7 @@ let cleanup_abandoned worker =
     [Native.create] enters [cleanup], which joins the supervisor owner Domain
     and closes all native resources before returning. Successful construction
     attaches a GC finalizer so abandoned workers still drain leases. *)
-let create ?max_cached_workflows ?(versioning = Bridge.No_versioning) ~target_url ~namespace
+let create ?max_cached_workflows ?runtime_threads ?(versioning = Bridge.No_versioning) ~target_url ~namespace
     ~identity ~task_queue ~workflows ~activities () =
   let max_cached_workflows =
     Option.value max_cached_workflows ~default:default_max_cached_workflows
@@ -796,7 +796,7 @@ let create ?max_cached_workflows ?(versioning = Bridge.No_versioning) ~target_ur
     |> Result.map_error (public_bridge_error "worker configuration")
   in
   let* supervisor =
-    Native.create ~capacity:supervisor_capacity ()
+    Native.create ?runtime_threads ~capacity:supervisor_capacity ()
     |> Result.map_error (public_native_error "native runtime creation")
   in
   let cleanup error =

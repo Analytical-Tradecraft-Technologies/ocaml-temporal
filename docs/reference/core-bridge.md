@@ -486,6 +486,30 @@ The supervisor serializes lifecycle transitions and destroys workers before
 clients and the runtime. Rust retains internal Tokio concurrency; workflow
 executions retain their separate deterministic effect schedulers.
 
+### Runtime thread budget (#832)
+
+Each runtime builds its own multi-thread Tokio executor. Tokio's default of
+one worker per core made every client and worker cost dozens of idle threads
+on a large host, so runtime creation takes an explicit worker count through
+`ocaml_temporal_core_v2_runtime_new_with_worker_threads`. `0` selects the
+bridge default, `min(available parallelism, DEFAULT_RUNTIME_WORKER_THREADS_CAP)`
+(4), falling back to one thread when parallelism cannot be queried.
+`1..=OCAML_TEMPORAL_CORE_MAX_RUNTIME_WORKER_THREADS` (256) is used unchanged,
+and a larger value returns `STATUS_INVALID_ARGUMENT` before anything is
+allocated, leaving the runtime slot null. `ocaml_temporal_core_v2_runtime_new`
+is the same call with `0`. The count is resolved before Core is built, so it
+adds no owner or release path: the Tokio pool remains owned by Core inside the
+runtime handle and is shut down by the existing runtime destruction path.
+
+OCaml exposes the bound as `?runtime_threads` on `Client.create` and
+`Worker.create`, validates the same range as a typed defect before any
+supervisor or native allocation, and passes it through
+`Sdk_supervisor.Native.create` to `Native_bridge.runtime_create`. The C stub
+maps a negative or oversized OCaml integer to `UINT32_MAX` so Rust rejects it
+rather than truncating. Each instance still owns a separate runtime, its
+cleanup thread, and its supervisor Domain; sharing one runtime across
+instances is not implemented.
+
 The implemented private supervisor owns the real runtime, one official client
 connection, and one Core worker for workflows and remote activities. Its backend protocol exposes
 typed GADT operations but never the owner-confined state, preventing a raw

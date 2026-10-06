@@ -626,6 +626,18 @@ let validate_config { target_url; namespace; identity; task_queue } =
             | None -> Ok ()
             | Some task_queue -> valid_nonempty "task queue" task_queue))
 
+(** Validates the optional public runtime thread bound (#832) before any
+    backend is selected, so [mock://] and native targets accept exactly the
+    same values and an invalid count never allocates a supervisor. *)
+let validate_runtime_threads runtime_threads =
+  match Bridge.validate_runtime_worker_threads runtime_threads with
+  | Ok () -> Ok ()
+  | Error _ ->
+      Error
+        (defect
+           (Printf.sprintf "runtime_threads must be between 1 and %d"
+              Bridge.max_runtime_worker_threads))
+
 (** Acquires the shared deterministic ledger for one mock endpoint. The
     registry lock protects the service reference count; operations on the
     returned service use its own mutex so unrelated endpoints can progress
@@ -675,10 +687,13 @@ let release_mock_service (service : mock_service) =
     Native creation first validates the endpoint, then creates the complete
     supervisor graph, connects the official Rust client, and cleans up the
     graph if any step fails. No partially connected value is published. *)
-let client_create config =
+let client_create ?runtime_threads config =
   match validate_config config with
   | Error error -> Error error
   | Ok () ->
+      match validate_runtime_threads runtime_threads with
+      | Error error -> Error error
+      | Ok () ->
       if String.starts_with ~prefix:"mock://" config.target_url then
         Ok
           (Mock_client
@@ -695,7 +710,7 @@ let client_create config =
         with
         | Error error -> Error (bridge_error (Printf.sprintf "native client configuration failed: %s" error.message))
         | Ok native_config -> (
-            match Native.create ~capacity:32 () with
+            match Native.create ?runtime_threads ~capacity:32 () with
             | Error error -> Error (native_supervisor_error error)
             | Ok supervisor -> (
                 match Native.perform supervisor (Native.Connect_client native_config) with

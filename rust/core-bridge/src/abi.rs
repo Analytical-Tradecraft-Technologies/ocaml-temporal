@@ -103,6 +103,20 @@ const MAX_LIFECYCLE_CONFIG_BYTES: usize = 64 * 1024;
 const MAX_TRANSPORT_STRING_BYTES: usize = 64 * 1024;
 /// Prevents accidental allocation of unreasonable in-process worker state.
 const MAX_WORKER_COUNT: u32 = 1_000_000;
+/// Largest explicit Tokio worker-thread count one runtime accepts (#832).
+///
+/// The Tokio pool only drives gRPC I/O and Core's state machines for one
+/// serial OCaml executor, so counts beyond this bound cannot help and are far
+/// more likely to be a unit or sign mistake. OCaml validates the same bound
+/// before calling the bridge; this copy is the defense-in-depth check.
+pub const MAX_RUNTIME_WORKER_THREADS: u32 = 256;
+/// Upper bound of the default Tokio worker-thread count (#832).
+///
+/// Tokio's own default is one worker per core, which made each client or
+/// worker cost dozens of idle threads on large hosts. Network progress for one
+/// SDK instance needs far fewer, so the bridge defaults to the smaller of the
+/// host's available parallelism and this cap.
+pub const DEFAULT_RUNTIME_WORKER_THREADS_CAP: u32 = 4;
 /// Remote-activity slots granted to Core, matched to the OCaml executor.
 ///
 /// The OCaml worker decodes, invokes, and completes one activity callback
@@ -3078,6 +3092,7 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_conformance_wait_ms(
 /// writer runs its bounded close, so no thread outlives a failed constructor.
 fn create_runtime(
     log_level: Option<diagnostics::CoreLogLevel>,
+    worker_threads: usize,
     spawn_log: impl FnOnce() -> std::io::Result<diagnostics::CoreLogWriter>,
 ) -> std::result::Result<Runtime, Failure> {
     let core_log = match log_level {
@@ -3106,7 +3121,11 @@ fn create_runtime(
             // revision; expose only its stable category.
             message: "could not configure Temporal Core runtime".to_owned(),
         })?;
-    let core = CoreRuntime::new(options, TokioRuntimeBuilder::default()).map_err(|_error| {
+    // Start from Core's own builder so its multi-thread flavor and thread-start
+    // hook are preserved; only the worker count differs from the default.
+    let mut tokio_builder = TokioRuntimeBuilder::default();
+    tokio_builder.inner.worker_threads(worker_threads);
+    let core = CoreRuntime::new(options, tokio_builder).map_err(|_error| {
         Failure {
             status: STATUS_INTERNAL,
             // Runtime construction errors can contain Core or Tokio
@@ -3118,7 +3137,62 @@ fn create_runtime(
     Runtime::new(core, core_log.map(|(_, writer)| writer))
 }
 
+/// Resolves the Tokio worker-thread count for one runtime (#832).
+///
+/// `0` selects the bridge default: the host's available parallelism capped at
+/// [`DEFAULT_RUNTIME_WORKER_THREADS_CAP`], or one thread when parallelism
+/// cannot be queried. `1..=MAX_RUNTIME_WORKER_THREADS` is used unchanged; any
+/// larger value is an invalid argument. Resolution allocates nothing, so a
+/// rejected count leaves no partially created runtime behind.
+fn runtime_worker_threads(requested: u32) -> std::result::Result<usize, Failure> {
+    let unrepresentable = || Failure {
+        status: STATUS_INVALID_ARGUMENT,
+        message: "runtime worker thread count does not fit this platform".to_owned(),
+    };
+    match requested {
+        0 => {
+            let cap = usize::try_from(DEFAULT_RUNTIME_WORKER_THREADS_CAP)
+                .map_err(|_| unrepresentable())?;
+            Ok(std::thread::available_parallelism()
+                .map_or(1, std::num::NonZeroUsize::get)
+                .min(cap))
+        }
+        1..=MAX_RUNTIME_WORKER_THREADS => usize::try_from(requested).map_err(|_| unrepresentable()),
+        _ => Err(Failure {
+            status: STATUS_INVALID_ARGUMENT,
+            message: format!(
+                "runtime worker thread count must be between 1 and \
+                 {MAX_RUNTIME_WORKER_THREADS}, or 0 for the default"
+            ),
+        }),
+    }
+}
+
+/// Create the native runtime that will own later Core clients and workers,
+/// with the bridge's default Tokio worker-thread count.
+///
+/// This is [`ocaml_temporal_core_v2_runtime_new_with_worker_threads`] with a
+/// `worker_threads` of `0`; see that function for the ownership contract.
+///
+/// # Safety
+///
+/// As for [`ocaml_temporal_core_v2_runtime_new_with_worker_threads`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ocaml_temporal_core_v2_runtime_new(
+    runtime: *mut *mut Runtime,
+    output: *mut Result,
+) -> Status {
+    // SAFETY: The pointer contracts are forwarded unchanged.
+    unsafe { ocaml_temporal_core_v2_runtime_new_with_worker_threads(0, runtime, output) }
+}
+
 /// Create the native runtime that will own later Core clients and workers.
+///
+/// `worker_threads` bounds the runtime's Tokio worker pool (#832): `0`
+/// selects the bridge default (available parallelism capped at
+/// [`DEFAULT_RUNTIME_WORKER_THREADS_CAP`]), `1..=`[`MAX_RUNTIME_WORKER_THREADS`]
+/// is used unchanged, and a larger value fails with
+/// `STATUS_INVALID_ARGUMENT` before anything is allocated.
 ///
 /// On success, `runtime` receives one owned opaque handle. The caller must
 /// eventually pass that same slot to [`ocaml_temporal_core_v2_runtime_free`].
@@ -3130,7 +3204,8 @@ fn create_runtime(
 /// [`ocaml_temporal_core_v2_check_abi_version`]. A non-null runtime slot must
 /// not already contain a live handle.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_runtime_new(
+pub unsafe extern "C" fn ocaml_temporal_core_v2_runtime_new_with_worker_threads(
+    worker_threads: u32,
     runtime: *mut *mut Runtime,
     output: *mut Result,
 ) -> Status {
@@ -3160,11 +3235,16 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_runtime_new(
     // SAFETY: Both output locations were validated above.
     unsafe {
         invoke(output, || {
+            let worker_threads = runtime_worker_threads(worker_threads)?;
             let log_level = diagnostics::core_log_level_from_env().map_err(|message| Failure {
                 status: STATUS_CONFIGURATION,
                 message,
             })?;
-            let created = create_runtime(log_level, diagnostics::CoreLogWriter::spawn_stderr)?;
+            let created = create_runtime(
+                log_level,
+                worker_threads,
+                diagnostics::CoreLogWriter::spawn_stderr,
+            )?;
             let owned = Box::into_raw(Box::new(created));
 
             // SAFETY: The runtime slot remains exclusively owned by this call
@@ -4444,9 +4524,12 @@ pub fn test_runtime_new_with_core_log_sink(
     sink: Box<dyn std::io::Write + Send>,
     capacity: usize,
 ) -> std::result::Result<(*mut Runtime, diagnostics::CoreLogQueue), String> {
-    let runtime = create_runtime(Some(diagnostics::CoreLogLevel::Warn), || {
-        diagnostics::CoreLogWriter::spawn(sink, capacity)
-    })
+    let worker_threads = runtime_worker_threads(0).map_err(|failure| failure.message)?;
+    let runtime = create_runtime(
+        Some(diagnostics::CoreLogLevel::Warn),
+        worker_threads,
+        || diagnostics::CoreLogWriter::spawn(sink, capacity),
+    )
     .map_err(|failure| failure.message)?;
     let queue = runtime
         .core_log
@@ -4454,6 +4537,26 @@ pub fn test_runtime_new_with_core_log_sink(
         .map(diagnostics::CoreLogWriter::queue)
         .ok_or_else(|| "runtime has no Core log writer".to_owned())?;
     Ok((Box::into_raw(Box::new(runtime)), queue))
+}
+
+/// Returns the number of Tokio worker threads driving a live runtime, or
+/// `None` for a null handle or one whose Core runtime was already released.
+///
+/// This is intentionally not part of the C ABI. It lets integration tests
+/// prove that the configured count reaches Tokio (#832) without counting OS
+/// threads, which is platform-specific and racy.
+///
+/// # Safety
+///
+/// `runtime` must be null or a live handle that is not used concurrently.
+#[doc(hidden)]
+pub unsafe fn test_runtime_worker_threads(runtime: *const Runtime) -> Option<usize> {
+    // SAFETY: The caller promises a null or live, unshared handle.
+    let runtime = unsafe { runtime.as_ref() }?;
+    runtime
+        .core
+        .as_ref()
+        .map(|core| core.tokio_handle().metrics().num_workers())
 }
 
 /// Returns the ABI category used for a worker error without exposing the

@@ -15,6 +15,23 @@ implementation when a later entry documents that work as complete. The
 records the current tested source, named assertions and successful CI job for
 the Temporal acceptance controllers.
 
+## 2026-10-06: Bounded Tokio worker pool per runtime (#832)
+
+Every client and worker built its Core runtime with Tokio's default of one
+worker thread per core, so a client plus a worker on a 64-core host cost
+about 135 threads. Runtime creation now resolves an explicit worker count:
+`Client.create` and `Worker.create` accept `?runtime_threads` (1 to 256,
+validated as a typed defect before anything is allocated), and the default is
+the host's available parallelism capped at 4. The count reaches Tokio through
+the new `ocaml_temporal_core_v2_runtime_new_with_worker_threads` symbol; the
+existing `ocaml_temporal_core_v2_runtime_new` keeps its signature and uses the
+default, so ABI version 2 is unchanged. Rust integration tests read the pool
+size back from Tokio's metrics for explicit counts, both range ends, and the
+default, and prove an oversized count is rejected without a handle; the C ABI
+harness covers both outcomes and an OCaml test covers bridge and public
+validation for mock and native targets. Sharing one runtime between instances
+remains future work.
+
 ## 2026-10-06: Connection failures name their cause; Core logs reach stderr (#833)
 
 Every client connection failure used to read `Temporal client connection

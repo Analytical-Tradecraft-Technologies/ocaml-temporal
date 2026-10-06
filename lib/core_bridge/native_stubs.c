@@ -458,20 +458,28 @@ CAMLprim value ocaml_temporal_conformance_wait_ms(value milliseconds) {
 
 /* Create Core/Tokio while the OCaml runtime lock is released. Rust writes only
  * C-stack storage during the blocking section; the opaque pointer and result
- * are copied into rooted custom blocks after reacquiring the lock. */
-CAMLprim value ocaml_temporal_runtime_create(value unit) {
-  CAMLparam1(unit);
+ * are copied into rooted custom blocks after reacquiring the lock.
+ * [worker_threads] is 0 for the bridge default or an explicit Tokio worker
+ * count (#832). OCaml validates the range first; a negative or oversized
+ * value still maps to UINT32_MAX so Rust rejects it instead of truncating. */
+CAMLprim value ocaml_temporal_runtime_create(value worker_threads) {
+  CAMLparam1(worker_threads);
   CAMLlocal3(runtime, response, pair);
   ocaml_temporal_core_runtime *native_runtime = NULL;
   ocaml_temporal_core_result native_result = {0};
   owned_runtime *runtime_owner;
   owned_response *response_owner;
+  intnat requested = Long_val(worker_threads);
+  uint32_t bounded_request =
+      requested < 0 || (uintnat)requested > UINT32_MAX ? UINT32_MAX
+                                                       : (uint32_t)requested;
 
   runtime = alloc_runtime();
   response = alloc_response();
 
   caml_enter_blocking_section();
-  (void)ocaml_temporal_core_v2_runtime_new(&native_runtime, &native_result);
+  (void)ocaml_temporal_core_v2_runtime_new_with_worker_threads(
+      bounded_request, &native_runtime, &native_result);
   caml_leave_blocking_section();
 
   runtime_owner = Runtime_val(runtime);

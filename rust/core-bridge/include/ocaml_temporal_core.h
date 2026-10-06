@@ -80,9 +80,26 @@ ocaml_temporal_core_status ocaml_temporal_core_v2_conformance_wait_ms(
 /*
  * Create the sole native runtime owner for one SDK instance. On success,
  * `runtime` receives an opaque handle and `output` is an empty success.
+ * Equivalent to ocaml_temporal_core_v2_runtime_new_with_worker_threads with a
+ * worker_threads value of 0 (the bridge default).
  */
 ocaml_temporal_core_status ocaml_temporal_core_v2_runtime_new(
     ocaml_temporal_core_runtime **runtime,
+    ocaml_temporal_core_result *output);
+
+/* Largest explicit Tokio worker-thread count accepted by runtime creation. */
+#define OCAML_TEMPORAL_CORE_MAX_RUNTIME_WORKER_THREADS UINT32_C(256)
+
+/*
+ * Create the runtime owner with a bounded Tokio worker pool. A worker_threads
+ * value of 0 selects the bridge default (the host's available parallelism,
+ * capped at 4); 1 through OCAML_TEMPORAL_CORE_MAX_RUNTIME_WORKER_THREADS is
+ * used unchanged; a larger value returns
+ * OCAML_TEMPORAL_CORE_STATUS_INVALID_ARGUMENT and leaves `*runtime` NULL.
+ * Ownership of a created handle is identical to ocaml_temporal_core_v2_runtime_new.
+ */
+ocaml_temporal_core_status ocaml_temporal_core_v2_runtime_new_with_worker_threads(
+    uint32_t worker_threads, ocaml_temporal_core_runtime **runtime,
     ocaml_temporal_core_result *output);
 
 /*
