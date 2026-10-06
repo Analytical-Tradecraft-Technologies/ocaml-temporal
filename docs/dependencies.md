@@ -325,6 +325,15 @@ bridge and SDK archive, re-reads each archive to confirm both files, and
 publishes the notices as a separate checksummed asset recorded in
 `manifest.json`.
 
+The release source archive also redistributes the locked Cargo graph in source
+form: `scripts/create-source-archive.sh` vendors exactly the `Cargo.lock`
+packages (each with its own licence files) so opam can build offline (see
+[Offline opam source builds](reference/package-boundary.md#offline-opam-source-builds)),
+and copies the same audited `THIRD-PARTY-NOTICES.txt` to the archive root,
+which supplies the reviewed texts for crates that publish none. Vendoring adds
+no package and changes no version, so the existing Cargo licence audit covers
+it.
+
 ## CI-only quality tools
 
 The independent quality job installs checksum-verified release artifacts with
