@@ -499,6 +499,33 @@ let decode_start definition (start : Protocol.activity_start) =
   in
   Ok (input, details, heartbeat_timeout)
 
+(** Copies the identity and scheduling facts of a start task into the
+    immutable record exposed through [Temporal.Activity.Context.info]. The
+    strict protocol decoder has already bounded every string and validated
+    timestamp fractions, so this projection cannot fail. Core's attempt is a
+    uint32, which always fits a native OCaml [int] on supported 64-bit
+    targets. *)
+let task_info (start : Protocol.activity_start) : Activity_context.info =
+  let timestamp =
+    Option.map (fun (value : Protocol.timestamp) ->
+        { Activity_context.seconds = value.seconds;
+          nanoseconds = value.nanoseconds })
+  in
+  {
+    namespace = start.workflow_namespace;
+    workflow_id = start.workflow_execution.workflow_id;
+    workflow_run_id = start.workflow_execution.run_id;
+    workflow_type = start.workflow_type;
+    activity_id = start.activity_id;
+    activity_type = start.activity_type;
+    attempt = Int64.to_int start.attempt;
+    is_local = start.is_local;
+    scheduled_time = timestamp start.scheduled_time;
+    current_attempt_scheduled_time =
+      timestamp start.current_attempt_scheduled_time;
+    started_time = timestamp start.started_time;
+  }
+
 (** Finds an executable definition by the Temporal activity type. *)
 let find_definition definitions activity_type =
   match Name_map.find_opt activity_type definitions with
@@ -635,7 +662,7 @@ module Make (Supervisor : SUPERVISOR) = struct
       each request. Contexts are invalidated by [process_start] before it
       returns, so retaining one in user code cannot submit progress for a later
       attempt. *)
-  let activity_context adapter ~token ~details ~heartbeat_timeout =
+  let activity_context adapter ~token ~info ~details ~heartbeat_timeout =
     (* The callback remains valid only for this lease. It copies the token and
        every detail before crossing to the supervisor, so a caller cannot
        mutate a heartbeat after submission. *)
@@ -688,7 +715,8 @@ module Make (Supervisor : SUPERVISOR) = struct
                      source.code source.message)
                  ())
     in
-    Activity_context.create ~heartbeat ~details ~heartbeat_timeout
+    Activity_context.create_with_info ~info ~heartbeat ~details
+      ~heartbeat_timeout
 
   (** Creates the registry without contacting native Core or invoking user code. *)
   let create ~supervisor ~activities =
@@ -1225,7 +1253,8 @@ module Make (Supervisor : SUPERVISOR) = struct
               | Error error -> reject_task adapter ~token ~activity_type error
               | Ok (input, details, heartbeat_timeout) ->
                   let context =
-                    activity_context adapter ~token ~details ~heartbeat_timeout
+                    activity_context adapter ~token ~info:(task_info start)
+                      ~details ~heartbeat_timeout
                   in
                   Fun.protect
                     ~finally:(fun () -> Activity_context.invalidate context)

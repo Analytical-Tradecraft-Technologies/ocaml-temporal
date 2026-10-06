@@ -127,6 +127,43 @@ let _activity_context_heartbeat_timeout :
     T.Activity.context -> T.Duration.t option =
   T.Activity.Context.heartbeat_timeout
 
+let _activity_context_info :
+    T.Activity.context -> (T.Activity.Info.t, T.Error.t) result =
+  T.Activity.Context.info
+
+let _activity_info_namespace : T.Activity.Info.t -> string =
+  T.Activity.Info.namespace
+
+let _activity_info_workflow :
+    T.Activity.Info.t -> T.Activity.Info.workflow =
+  T.Activity.Info.workflow
+
+let _activity_info_activity_id : T.Activity.Info.t -> string =
+  T.Activity.Info.activity_id
+
+let _activity_info_activity_type : T.Activity.Info.t -> string =
+  T.Activity.Info.activity_type
+
+let _activity_info_attempt : T.Activity.Info.t -> int = T.Activity.Info.attempt
+let _activity_info_is_local : T.Activity.Info.t -> bool = T.Activity.Info.is_local
+
+let _activity_info_scheduled_time : T.Activity.Info.t -> T.Time.t option =
+  T.Activity.Info.scheduled_time
+
+let _activity_info_current_attempt_scheduled_time :
+    T.Activity.Info.t -> T.Time.t option =
+  T.Activity.Info.current_attempt_scheduled_time
+
+let _activity_info_started_time : T.Activity.Info.t -> T.Time.t option =
+  T.Activity.Info.started_time
+
+(* Record fields of the public workflow identity are part of the contract. *)
+let _activity_info_workflow_fields
+    ({ workflow_id; run_id; workflow_type } : T.Activity.Info.workflow) =
+  ignore (workflow_id : string);
+  ignore (run_id : string);
+  ignore (workflow_type : string)
+
 let _activity_execute :
     ?scope:T.Scope.t ->
     ?activity_id:string ->
@@ -657,8 +694,53 @@ let _workflow_current_deployment_version :
     unit -> T.Workflow.deployment_version option =
   T.Workflow.current_deployment_version
 
+let _workflow_info : unit -> (T.Workflow.Info.t, T.Error.t) result =
+  T.Workflow.info
+
+let _workflow_is_replaying : unit -> bool = T.Workflow.is_replaying
+let _workflow_info_workflow_id : T.Workflow.Info.t -> string =
+  T.Workflow.Info.workflow_id
+let _workflow_info_run_id : T.Workflow.Info.t -> string = T.Workflow.Info.run_id
+
+let _workflow_info_first_execution_run_id : T.Workflow.Info.t -> string option =
+  T.Workflow.Info.first_execution_run_id
+
+let _workflow_info_workflow_type : T.Workflow.Info.t -> string =
+  T.Workflow.Info.workflow_type
+
+let _workflow_info_task_queue : T.Workflow.Info.t -> string =
+  T.Workflow.Info.task_queue
+
+let _workflow_info_attempt : T.Workflow.Info.t -> int = T.Workflow.Info.attempt
+
+let _workflow_info_parent : T.Workflow.Info.t -> T.Workflow.Info.parent option =
+  T.Workflow.Info.parent
+
+let _workflow_info_start_time : T.Workflow.Info.t -> T.Time.t option =
+  T.Workflow.Info.start_time
+
+let _workflow_info_is_replaying : T.Workflow.Info.t -> bool =
+  T.Workflow.Info.is_replaying
+
+let _workflow_info_history_length : T.Workflow.Info.t -> int =
+  T.Workflow.Info.history_length
+
+let _workflow_info_history_size_bytes : T.Workflow.Info.t -> int option =
+  T.Workflow.Info.history_size_bytes
+
+let _workflow_info_continue_as_new_suggested : T.Workflow.Info.t -> bool =
+  T.Workflow.Info.continue_as_new_suggested
+
+(* Record fields of the public parent identity are part of the contract. *)
+let _workflow_info_parent_fields
+    ({ namespace; workflow_id; run_id } : T.Workflow.Info.parent) =
+  ignore (namespace : string);
+  ignore (workflow_id : string);
+  ignore (run_id : string)
+
 let _worker_run : T.Worker.t -> (unit, T.Error.t) result = T.Worker.run
 let _worker_shutdown : T.Worker.t -> (unit, T.Error.t) result = T.Worker.shutdown
+let _worker_request_shutdown : T.Worker.t -> unit = T.Worker.request_shutdown
 
 (* The remaining small modules still participate in the public contract. *)
 let _condition_wait_until : (unit -> bool) -> (unit, T.Error.t) result =

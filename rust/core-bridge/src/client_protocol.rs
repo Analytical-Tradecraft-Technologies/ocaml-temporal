@@ -27,6 +27,7 @@ use temporalio_common::protos::temporal::api::{
         RequestCancelWorkflowExecutionRequest, ResetWorkflowExecutionRequest,
         SignalWorkflowExecutionRequest, StartWorkflowExecutionRequest,
         TerminateWorkflowExecutionRequest, UpdateWorkflowExecutionRequest,
+        UpdateWorkflowExecutionResponse,
     },
 };
 
@@ -704,19 +705,29 @@ pub fn encode_reset_response(
 }
 
 /// Strictly parses one exact-run signal request.
+///
+/// Like [`decode_start_request`], this uses the payload-aware parser: base64
+/// payload data may use the 128 MiB per-field allowance, while
+/// [`validate_signal_request`] immediately reapplies the 65,536-byte text
+/// limit to every identifier and payload metadata key. Using the generic
+/// object parser here would cap signal input at 49,152 raw bytes (issue #771).
 pub fn decode_signal_request(
     input: &str,
 ) -> Result<SignalWorkflowRequest, protocol::ProtocolError> {
-    protocol::decode_object(input)?;
+    protocol::decode_payload_object(input)?;
     let request = serde_json::from_str(input)
         .map_err(|_| protocol::ProtocolError::invalid("$", "invalid client signal request"))?;
     validate_signal_request(&request)?;
     Ok(request)
 }
 
-/// Strictly parses one exact-run output-only query request.
+/// Strictly parses one exact-run query request.
+///
+/// Query arguments are payloads, so the payload-aware parser applies the same
+/// per-field and whole-document bounds as start and signal input; the semantic
+/// validator then bounds identifiers and metadata keys as ordinary text.
 pub fn decode_query_request(input: &str) -> Result<QueryWorkflowRequest, protocol::ProtocolError> {
-    protocol::decode_object(input)?;
+    protocol::decode_payload_object(input)?;
     let request = serde_json::from_str(input)
         .map_err(|_| protocol::ProtocolError::invalid("$", "invalid client query request"))?;
     validate_query_request(&request)?;
@@ -724,10 +735,14 @@ pub fn decode_query_request(input: &str) -> Result<QueryWorkflowRequest, protoco
 }
 
 /// Strictly parses a request that starts one workflow update.
+///
+/// Update arguments use the payload-aware parser for the same reason as
+/// signal input; [`validate_update_request`] keeps every identifier and
+/// metadata key within the ordinary text limit.
 pub fn decode_update_request(
     input: &str,
 ) -> Result<UpdateWorkflowRequest, protocol::ProtocolError> {
-    protocol::decode_object(input)?;
+    protocol::decode_payload_object(input)?;
     let request = serde_json::from_str(input)
         .map_err(|_| protocol::ProtocolError::invalid("$", "invalid client update request"))?;
     validate_update_request(&request)?;
@@ -1160,51 +1175,159 @@ pub async fn query_workflow(
     })
 }
 
+/// Total time `update_workflow` may spend waiting for Temporal to report that
+/// an update was accepted. The bound keeps the supervisor's synchronous client
+/// turn finite; it spans every re-issued `UpdateWorkflowExecution` attempt, not
+/// each attempt separately.
+const UPDATE_ACCEPTANCE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Minimum pause before re-issuing an update whose response reported only the
+/// `Admitted` stage. A conforming server answers `Admitted` only when its own
+/// long poll expires, so the pause adds no latency in practice; it prevents a
+/// misbehaving server that answers immediately from driving a hot RPC loop for
+/// the whole acceptance budget.
+const UPDATE_READMISSION_PAUSE: Duration = Duration::from_millis(100);
+
 /// Starts one update through Temporal's workflow service and waits until the
 /// workflow worker has accepted it. Temporal deliberately does not allow the
 /// asynchronous `Admitted` stage for the public start-update flow; `Accepted`
 /// is the interoperable stage for a handle that will be polled separately.
+///
+/// Temporal answers a `wait_policy = Accepted` request with stage `Admitted`
+/// and no outcome when its long poll expires before a worker processes the
+/// update. An admitted update is not durable and may still be rejected, so
+/// that response must never become a handle. Like the Go and Python SDKs, the
+/// request is re-issued with the same update ID (Temporal deduplicates it)
+/// until the server reports `Accepted`, a terminal outcome (completion or
+/// validator rejection), or the shared [`UPDATE_ACCEPTANCE_TIMEOUT`] expires,
+/// which is reported as the typed `deadline_exceeded` RPC error.
 pub async fn update_workflow(
     connection: Connection,
     request: UpdateWorkflowRequest,
 ) -> Result<UpdateWorkflowResponse, ClientOperationError> {
+    update_workflow_within(connection, request, UPDATE_ACCEPTANCE_TIMEOUT).await
+}
+
+/// Implements [`update_workflow`] with an explicit total acceptance budget so
+/// tests can observe the deadline path without waiting for the production
+/// bound. Every attempt carries the remaining budget as its gRPC deadline, so
+/// a real server ends its long poll (answering `Admitted`) before the local
+/// timeout fires and the loop can decide whether time remains for a retry.
+pub(crate) async fn update_workflow_within(
+    connection: Connection,
+    request: UpdateWorkflowRequest,
+    budget: Duration,
+) -> Result<UpdateWorkflowResponse, ClientOperationError> {
     let input = payloads_to_core(&request.input).map_err(ClientOperationError::Core)?;
-    let mut service = connection.workflow_service();
-    let response = tokio::time::timeout(
-        Duration::from_secs(30),
-        service.update_workflow_execution(
-            UpdateWorkflowExecutionRequest {
-                namespace: request.namespace.clone(),
-                workflow_execution: Some(WorkflowExecution {
-                    workflow_id: request.workflow_id.clone(),
-                    run_id: request.run_id.clone(),
-                }),
-                wait_policy: Some(WaitPolicy {
-                    lifecycle_stage: UpdateWorkflowExecutionLifecycleStage::Accepted as i32,
-                }),
-                request: Some(update::v1::Request {
-                    meta: Some(update::v1::Meta {
-                        update_id: request.update_id.clone(),
-                        identity: connection.identity().to_owned(),
-                    }),
-                    input: Some(update::v1::Input {
-                        name: request.update_name,
-                        args: Some(input),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                }),
+    let rpc_request = UpdateWorkflowExecutionRequest {
+        namespace: request.namespace.clone(),
+        workflow_execution: Some(WorkflowExecution {
+            workflow_id: request.workflow_id.clone(),
+            run_id: request.run_id.clone(),
+        }),
+        wait_policy: Some(WaitPolicy {
+            lifecycle_stage: i32::from(UpdateWorkflowExecutionLifecycleStage::Accepted),
+        }),
+        request: Some(update::v1::Request {
+            meta: Some(update::v1::Meta {
+                update_id: request.update_id.clone(),
+                identity: connection.identity().to_owned(),
+            }),
+            input: Some(update::v1::Input {
+                name: request.update_name.clone(),
+                args: Some(input),
                 ..Default::default()
-            }
-            .into_request(),
-        ),
-    )
-    .await
-    .map_err(|_| ClientOperationError::Rpc {
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let deadline_exceeded = || ClientOperationError::Rpc {
         code: "deadline_exceeded".to_owned(),
-    })?
-    .map_err(map_rpc_status)?
-    .into_inner();
+    };
+    let deadline = tokio::time::Instant::now() + budget;
+    let mut service = connection.workflow_service();
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(deadline_exceeded());
+        }
+        let mut attempt = rpc_request.clone().into_request();
+        attempt.set_timeout(remaining);
+        let response =
+            tokio::time::timeout_at(deadline, service.update_workflow_execution(attempt))
+                .await
+                .map_err(|_| deadline_exceeded())?
+                .map_err(map_rpc_status)?
+                .into_inner();
+        // Validate identity on every attempt, including admitted-only ones, so
+        // a server answering for another update fails closed immediately.
+        let response_stage = response.stage;
+        let converted = update_response_from_core(&request, response)?;
+        if converted.outcome.is_some() {
+            // An outcome is final, but its stage must still be a known one so
+            // a malformed or forward-incompatible response fails closed.
+            validate_update_stage_with_outcome(response_stage)?;
+            return Ok(converted);
+        }
+        if update_stage_is_accepted(response_stage)? {
+            return Ok(converted);
+        }
+        // Admitted (or an older server's unspecified stage) without an
+        // outcome: the update is not yet durable. Re-issue it if the budget
+        // still allows one more attempt.
+        let pause_until = tokio::time::Instant::now() + UPDATE_READMISSION_PAUSE;
+        if pause_until >= deadline {
+            return Err(deadline_exceeded());
+        }
+        tokio::time::sleep_until(pause_until).await;
+    }
+}
+
+/// Classifies the lifecycle stage of an update response that carried no
+/// outcome. Returns `true` once the update is at least accepted, `false` for
+/// `Admitted` and `Unspecified` (both mean "not yet accepted" and are retried,
+/// matching the official SDKs' `stage < Accepted` loop), and a Core conversion
+/// error for `Completed` without an outcome or an unknown future stage, so an
+/// unexpected server state never becomes a handle.
+fn update_stage_is_accepted(stage: i32) -> Result<bool, ClientOperationError> {
+    match UpdateWorkflowExecutionLifecycleStage::try_from(stage) {
+        Ok(
+            UpdateWorkflowExecutionLifecycleStage::Unspecified
+            | UpdateWorkflowExecutionLifecycleStage::Admitted,
+        ) => Ok(false),
+        Ok(UpdateWorkflowExecutionLifecycleStage::Accepted) => Ok(true),
+        Ok(UpdateWorkflowExecutionLifecycleStage::Completed) => Err(ClientOperationError::Core(
+            workflow_protocol::invalid_core("Temporal completed update omitted its outcome"),
+        )),
+        Err(_) => Err(ClientOperationError::Core(workflow_protocol::invalid_core(
+            "Temporal update response used an unknown lifecycle stage",
+        ))),
+    }
+}
+
+/// Checks the lifecycle stage of an update response that carried an outcome.
+/// Any known stage is accepted (servers report `Completed`, and older ones
+/// may leave it unspecified), while an unknown numeric stage is a Core
+/// conversion error so the bridge never trusts a forward-incompatible reply.
+fn validate_update_stage_with_outcome(stage: i32) -> Result<(), ClientOperationError> {
+    UpdateWorkflowExecutionLifecycleStage::try_from(stage)
+        .map(|_| ())
+        .map_err(|_| {
+            ClientOperationError::Core(workflow_protocol::invalid_core(
+                "Temporal update response used an unknown lifecycle stage",
+            ))
+        })
+}
+
+/// Converts one `UpdateWorkflowExecution` response into the closed bridge
+/// response after checking that it names the requested update and exact run.
+/// The stage is interpreted by the caller; this function only validates
+/// identity and converts an optional outcome.
+fn update_response_from_core(
+    request: &UpdateWorkflowRequest,
+    response: UpdateWorkflowExecutionResponse,
+) -> Result<UpdateWorkflowResponse, ClientOperationError> {
     let update_ref = response.update_ref.ok_or_else(|| {
         ClientOperationError::Core(workflow_protocol::invalid_core(
             "Temporal update admission omitted update_ref",
@@ -1221,7 +1344,7 @@ pub async fn update_workflow(
         )));
     }
     let execution = ExecutionRef {
-        namespace: request.namespace,
+        namespace: request.namespace.clone(),
         workflow_id: execution.workflow_id,
         run_id: if execution.run_id.is_empty() {
             request.run_id.clone()
@@ -1268,7 +1391,7 @@ pub async fn poll_workflow_update(
                 }),
                 identity: connection.identity().to_owned(),
                 wait_policy: Some(WaitPolicy {
-                    lifecycle_stage: UpdateWorkflowExecutionLifecycleStage::Completed as i32,
+                    lifecycle_stage: i32::from(UpdateWorkflowExecutionLifecycleStage::Completed),
                 }),
             }
             .into_request(),
@@ -3099,3 +3222,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/support/client_update.rs"]
+mod update_acceptance_tests;

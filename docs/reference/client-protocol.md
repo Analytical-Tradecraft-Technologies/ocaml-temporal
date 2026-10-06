@@ -392,7 +392,17 @@ OCaml validates the signal name when `Temporal.Signal.define` constructs the
 definition and encodes the input before transport. Rust validates the exact
 identifiers, request ID, signal name, payload conversions, and closed JSON
 shape again before constructing Temporal's official
-`SignalWorkflowExecutionRequest` protobuf. The connected client's identity is
+`SignalWorkflowExecutionRequest` protobuf.
+
+Signal, query, and update requests use the same payload-aware decoder as
+workflow start input. Each decoded payload byte field may hold up to 128 MiB
+within the 192 MiB whole-document limit described in
+[the Core protocol limits](core-protocol.md), while identifiers, handler names,
+and payload metadata keys keep the 65,536-byte text limit. Rust enforces both
+bounds before the connection lookup, so an oversized request fails as a
+protocol error without issuing an RPC. Temporal Server's own blob-size limits,
+which are usually much smaller and namespace-configurable, still apply to
+requests the bridge accepts. The connected client's identity is
 used for the RPC; callers cannot provide a second identity or redirect the
 request to another namespace.
 
@@ -709,6 +719,18 @@ object when Core already has a terminal result. Poll requests contain only the
 namespace, exact execution, and update ID; poll responses contain only the
 optional outcome. OCaml rejects an outcome or execution that does not match the
 handle, so a response for another update cannot be mistaken for success.
+
+Rust asks Temporal to wait for the `Accepted` stage. When the server's long
+poll expires before a worker processes the update, Temporal answers with stage
+`Admitted` and no outcome; an admitted update is not durable and may still be
+rejected, so Rust never turns that answer into a handle. Like the Go and
+Python SDKs, it re-issues the same update ID (Temporal deduplicates it) until
+the server reports `Accepted` or a terminal outcome, pausing at least 100 ms
+between attempts. Every attempt carries the remaining budget as its gRPC
+deadline, and the whole loop is bounded by 30 seconds; when the budget expires
+first, `start_update` returns the typed `deadline_exceeded` RPC error and the
+caller may retry with the same update ID (#772). A `Completed` stage without an
+outcome or an unknown stage fails closed as a Core protocol error.
 
 The normative schemas are
 [`client-update-request.schema.json`](../schemas/bridge/client-update-request.schema.json),

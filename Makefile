@@ -55,10 +55,15 @@ OCAML_IMAGE ?= ocaml-$(OCAML_SERIES)
 OCAML_IMAGE_REFERENCE = $(or $(shell awk '$$1 == "FROM" && $$3 == "AS" && $$4 == "$(OCAML_IMAGE)" { print $$2 }' Dockerfile.dev),$(OCAML_IMAGE))
 HOST_UID ?= $(shell id -u)
 HOST_GID ?= $(shell id -g)
-# Leave Dune's worker count unchanged by default. A constrained Docker VM can
-# set `DUNE_JOBS=1` (or another small value) to avoid concurrent native linkers
-# exhausting its memory without changing the normal CI/default behavior.
-DUNE_JOBS ?=
+# Dune links many test executables concurrently, each against the large Rust
+# static library, and a default Docker Desktop VM (about 8-10 GiB) is OOM-killed
+# at Dune's automatic, per-CPU job count (#851). Local runs therefore default to
+# two Dune jobs; CI (which sets CI=true on its larger runners) keeps Dune's
+# automatic count. Override with `DUNE_JOBS=1` on a tighter VM or
+# `DUNE_JOBS=auto` to restore Dune's default; an explicitly empty value omits
+# `-j`. Every Make-owned `dune build`, `runtest`, and `exec` passes
+# DUNE_BUILD_ARGS (enforced by test/smoke/test_build_jobs_contract.sh).
+DUNE_JOBS ?= $(if $(strip $(CI)),auto,2)
 DUNE_BUILD_ARGS := $(if $(strip $(DUNE_JOBS)),-j $(DUNE_JOBS),)
 # Rust integration tests each link the Temporal Core graph into a separate test
 # executable. Serializing those links and disabling unused incremental state
@@ -66,6 +71,14 @@ DUNE_BUILD_ARGS := $(if $(strip $(DUNE_JOBS)),-j $(DUNE_JOBS),)
 # changing the test set or the production build profile.
 CARGO_BUILD_JOBS ?= 1
 CARGO_TEST_ENV := CARGO_BUILD_JOBS=$(CARGO_BUILD_JOBS) CARGO_INCREMENTAL=0
+# Cargo's own parallelism is kept for the bridge build (the staticlib has no
+# memory-heavy link step), so the serial test default above is not forwarded.
+# A CARGO_BUILD_JOBS given on the command line or in the environment is passed
+# into every Compose container (`compose run -e`), so it reaches the
+# containerized `cargo build` and every Cargo build that a Dune bridge rule
+# starts, including direct COMPOSE_RUN paths such as executable batches and
+# benchmarks, for VMs where even Rust compilation needs bounding.
+CARGO_BUILD_JOBS_RUN_FLAG := $(if $(filter environment command,$(firstword $(origin CARGO_BUILD_JOBS))),-e CARGO_BUILD_JOBS=$(CARGO_BUILD_JOBS),)
 STRUCTURED_FUZZ_CASES ?= 128
 STRUCTURED_FUZZ_SEED ?= 0x521506a1
 STRUCTURED_FUZZ_TARGET ?= fuzz_
@@ -90,7 +103,7 @@ RUST_BRIDGE_BUILD_PROFILE = $(if $(filter release,$(RUST_BRIDGE_PROFILE)),releas
 # Build separately so Compose's build output goes to stderr and failures stop
 # the command. Only container stdout reaches version and Cargo metadata probes.
 COMPOSE_RUN := OCAML_IMAGE=$(OCAML_IMAGE) $(COMPOSE) --progress plain build $(SERVICE) >&2 && \
-	OCAML_IMAGE=$(OCAML_IMAGE) $(COMPOSE) --progress quiet run --rm --user $(HOST_UID):$(HOST_GID) $(SERVICE)
+	OCAML_IMAGE=$(OCAML_IMAGE) $(COMPOSE) --progress quiet run --rm --user $(HOST_UID):$(HOST_GID) $(CARGO_BUILD_JOBS_RUN_FLAG) $(SERVICE)
 RUN := $(COMPOSE_RUN) opam exec --
 CARGO := $(COMPOSE_RUN) cargo
 CARGO_MANIFEST := rust/Cargo.toml
@@ -143,8 +156,12 @@ build:
 # Keep the examples as explicit compile targets rather than relying on Dune's
 # default alias. Every Docker and native build therefore proves that all three
 # executable applications compile against the public installed-library name.
+# test-temporal-examples-live runs the same list against the Compose stack, and
+# test/smoke/test_examples_live_contract.sh fails when an example directory is
+# missing from it.
+EXAMPLE_EXECUTABLES := examples/workflow_worker/workflow_worker.exe examples/activity_worker/activity_worker.exe examples/client/client.exe
 build-examples:
-	$(RUN) dune build $(DUNE_BUILD_ARGS) examples/workflow_worker/workflow_worker.exe examples/activity_worker/activity_worker.exe examples/client/client.exe
+	$(RUN) dune build $(DUNE_BUILD_ARGS) $(EXAMPLE_EXECUTABLES)
 
 # Emits only the locked Cargo metadata document on stdout, allowing CI to pipe
 # it into the isolated license scanner without knowing the Compose fixture path.
@@ -167,7 +184,7 @@ bench:
 	image_id=$$(docker image inspect --format '{{.Id}}' "$(TEMPORAL_COMPOSE_PROJECT)-$(SERVICE)" 2>/dev/null || true); \
 	if test -z "$$image_id"; then image_id=unavailable; fi; \
 	status=0; \
-	OCAML_IMAGE=$(OCAML_IMAGE) $(COMPOSE) --progress quiet run --rm --user $(HOST_UID):$(HOST_GID) $(SERVICE) env \
+	OCAML_IMAGE=$(OCAML_IMAGE) $(COMPOSE) --progress quiet run --rm --user $(HOST_UID):$(HOST_GID) $(CARGO_BUILD_JOBS_RUN_FLAG) $(SERVICE) env \
 		BENCH_SOURCE_COMMIT="$$source_commit" \
 		BENCH_SOURCE_DIRTY="$$source_dirty" \
 		BENCH_SDK_VERSION="$$(cat .release-version)" \
@@ -177,7 +194,7 @@ bench:
 		BENCH_DEVELOPMENT_IMAGE_ID="$$image_id" \
 		BENCH_HOST_LABEL="$(BENCH_HOST_LABEL)" \
 		BENCH_REPLAY_HISTORY="$(BENCH_REPLAY_HISTORY)" \
-		opam exec -- dune exec --profile release test/benchmark/$(BENCH_EXECUTABLE).exe -- \
+		opam exec -- dune exec $(DUNE_BUILD_ARGS) --profile release test/benchmark/$(BENCH_EXECUTABLE).exe -- \
 		--warmup "$(BENCH_WARMUP)" --samples "$(BENCH_SAMPLES)" \
 		--repetitions "$(BENCH_REPETITIONS)" --seed "$(BENCH_SEED)" \
 		>"$$tmp" || status=$$?; \
@@ -205,7 +222,7 @@ test:
 	$(MAKE) test-temporal-config
 	$(MAKE) test-temporal-worker-readiness-contract
 	$(MAKE) test-temporal-worker-stop-contract
-	$(RUN) dune runtest
+	$(RUN) dune runtest $(DUNE_BUILD_ARGS)
 	$(if $(RUST_TEST_TARGET),$(MAKE) $(RUST_TEST_TARGET))
 	$(MAKE) test-bridge
 	$(MAKE) test-install
@@ -232,12 +249,12 @@ test-bridge:
 # Requires a disposable Temporal server; the driver owns its worker processes.
 .PHONY: test-completed-queries-live
 test-completed-queries-live:
-	$(RUN) dune exec test/integration/completed_queries/regression.exe -- check $(TEMPORAL_CLIENT_TEST_URL)
+	$(RUN) dune exec $(DUNE_BUILD_ARGS) test/integration/completed_queries/regression.exe -- check $(TEMPORAL_CLIENT_TEST_URL)
 
 # Requires a disposable server and an explicit official Temporal CLI path.
 .PHONY: test-local-activity-cancellation-live
 test-local-activity-cancellation-live:
-	$(RUN) dune exec test/integration/local_activity_cancellation/regression.exe -- check $(TEMPORAL_CLIENT_TEST_URL) $(TEMPORAL_TEST_CLI)
+	$(RUN) dune exec $(DUNE_BUILD_ARGS) test/integration/local_activity_cancellation/regression.exe -- check $(TEMPORAL_CLIENT_TEST_URL) $(TEMPORAL_TEST_CLI)
 
 test-install:
 	$(RUN) sh test/bridge/test_relocatable_link_flags.sh .
@@ -285,12 +302,14 @@ test-live-acceptance-inventory-contract:
 
 test-quality-contract: check-live-acceptance-inventory test-live-acceptance-inventory-contract test-temporal-namespace-readiness
 	sh test/smoke/test_quality_contract.sh .
+	sh test/smoke/test_build_jobs_contract.sh .
 	sh test/smoke/test_opam_locked_deps.sh .
 	sh test/smoke/test_release_tag_contract.sh .
 	sh test/smoke/test_release_tag_commit_contract.sh .
 	sh test/smoke/test_prebuilt_install_tag_contract.sh .
 	sh test/smoke/test_make_docker_commands.sh .
 	sh test/smoke/test_rust_bridge_artifact.sh .
+	sh test/smoke/test_examples_live_contract.sh .
 
 test-temporal-config:
 	sh test/smoke/test_temporal_compose_config.sh
@@ -443,6 +462,7 @@ test-temporal-live-ci:
 	bash test/integration/temporal/scripts/run-with-live-diagnostics.sh patching $(MAKE) test-temporal-workflow-patching
 	bash test/integration/temporal/scripts/run-with-live-diagnostics.sh parent-child-restart $(MAKE) test-temporal-parent-child-restart
 	bash test/integration/temporal/scripts/run-with-live-diagnostics.sh child-failure-replay $(MAKE) test-temporal-parent-child-failure-replay
+	$(MAKE) test-temporal-examples-live
 
 test-temporal-diagnostics-contract:
 	bash test/integration/temporal/scripts/test-live-diagnostics-contract.sh
@@ -776,21 +796,21 @@ test-temporal-worker-restart-live: test-temporal-config
 	$(MAKE) temporal-clean
 
 test-unit:
-	$(RUN) dune runtest test/unit test/smoke
+	$(RUN) dune runtest $(DUNE_BUILD_ARGS) test/unit test/smoke
 
 # Requires a disposable server and an explicit official Temporal CLI path.
 .PHONY: test-update-outcomes-live
 test-update-outcomes-live:
-	$(RUN) dune exec test/integration/update_outcomes/regression.exe -- check $(TEMPORAL_CLIENT_TEST_URL) $(TEMPORAL_TEST_CLI)
+	$(RUN) dune exec $(DUNE_BUILD_ARGS) test/integration/update_outcomes/regression.exe -- check $(TEMPORAL_CLIENT_TEST_URL) $(TEMPORAL_TEST_CLI)
 
 test-runtime:
-	$(RUN) dune runtest test/runtime test/integration/temporal/observer
+	$(RUN) dune runtest $(DUNE_BUILD_ARGS) test/runtime test/integration/temporal/observer
 
 # Requires a disposable running Temporal server. The regression owns its worker,
 # uses a unique task queue, and terminates its workflow executions on exit.
 .PHONY: test-client-request-ids-live
 test-client-request-ids-live:
-	$(RUN) dune exec test/integration/client_request_ids/regression.exe -- check $(TEMPORAL_CLIENT_TEST_URL)
+	$(RUN) dune exec $(DUNE_BUILD_ARGS) test/integration/client_request_ids/regression.exe -- check $(TEMPORAL_CLIENT_TEST_URL)
 
 # Requires a disposable running Temporal server. One worker runs both lanes;
 # a fresh client reads the exact timer-workflow result while its activity gate
@@ -819,7 +839,7 @@ test-worker-poll-isolation-live-build:
 
 .PHONY: test-worker-poll-isolation-live-run
 test-worker-poll-isolation-live-run:
-	OCAML_IMAGE=$(OCAML_IMAGE) $(COMPOSE) --progress quiet run --rm --user $(HOST_UID):$(HOST_GID) $(SERVICE) env TEMPORAL_NAMESPACE=temporal-sdk-test TEMPORAL_POLL_ISOLATION_LOG_FILE=/workspace/test/integration/temporal/.smoke-poll-isolation.log sh scripts/run-temporal-executable.sh --build-dir=/workspace/_build/worker-poll-isolation test/integration/worker_poll_isolation/regression.exe check $(TEMPORAL_CLIENT_TEST_URL)
+	OCAML_IMAGE=$(OCAML_IMAGE) $(COMPOSE) --progress quiet run --rm --user $(HOST_UID):$(HOST_GID) $(CARGO_BUILD_JOBS_RUN_FLAG) $(SERVICE) env TEMPORAL_NAMESPACE=temporal-sdk-test TEMPORAL_POLL_ISOLATION_LOG_FILE=/workspace/test/integration/temporal/.smoke-poll-isolation.log sh scripts/run-temporal-executable.sh --build-dir=/workspace/_build/worker-poll-isolation test/integration/worker_poll_isolation/regression.exe check $(TEMPORAL_CLIENT_TEST_URL)
 
 lint:
 	$(RUN) dune build @install $(DUNE_BUILD_ARGS)
@@ -903,11 +923,11 @@ native-version-check:
 
 native-build:
 	$(NATIVE_ENV) $(NATIVE_RUN) dune build @install $(DUNE_BUILD_ARGS)
-	$(NATIVE_ENV) $(NATIVE_RUN) dune build $(DUNE_BUILD_ARGS) examples/workflow_worker/workflow_worker.exe examples/activity_worker/activity_worker.exe examples/client/client.exe
+	$(NATIVE_ENV) $(NATIVE_RUN) dune build $(DUNE_BUILD_ARGS) $(EXAMPLE_EXECUTABLES)
 	$(if $(strip $(TEMPORAL_RUST_BRIDGE_DIR)),,$(NATIVE_ENV) cargo build --manifest-path $(CARGO_MANIFEST) --locked)
 
 native-test: $(NATIVE_RUST_TEST_TARGET) native-test-install test-quality-contract
-	$(NATIVE_ENV) $(NATIVE_RUN) dune runtest
+	$(NATIVE_ENV) $(NATIVE_RUN) dune runtest $(DUNE_BUILD_ARGS)
 
 native-test-rust:
 	$(NATIVE_ENV) $(CARGO_TEST_ENV) cargo test --manifest-path $(CARGO_MANIFEST) --locked
@@ -918,7 +938,7 @@ native-test-install:
 
 native-lint: $(NATIVE_RUST_LINT_TARGET)
 	$(NATIVE_ENV) $(NATIVE_RUN) dune build @install $(DUNE_BUILD_ARGS)
-	$(NATIVE_ENV) $(NATIVE_RUN) dune build $(DUNE_BUILD_ARGS) examples/workflow_worker/workflow_worker.exe examples/activity_worker/activity_worker.exe examples/client/client.exe
+	$(NATIVE_ENV) $(NATIVE_RUN) dune build $(DUNE_BUILD_ARGS) $(EXAMPLE_EXECUTABLES)
 	sh scripts/check-format.sh
 
 native-lint-rust:
@@ -926,6 +946,39 @@ native-lint-rust:
 	$(NATIVE_ENV) cargo clippy --manifest-path $(CARGO_MANIFEST) --locked --all-targets -- -D warnings
 
 native-verify: native-version-check native-build native-lint native-test
+
+# Runs the shipped three-process example application (#798) exactly as the
+# examples guide describes: the activity worker and workflow worker as separate
+# long-lived processes on one task queue, then one-shot client runs. The
+# controller asserts the client's exact success output, its typed failure for
+# invalid input, and that both workers exit cleanly after SIGTERM. Every process
+# is bounded by a timeout, and the stack is always removed afterwards. In CI the
+# executables come from the verified smoke artifact (TEMPORAL_PREBUILT_SMOKE=1);
+# locally they are compiled first so no long-lived `dune exec` lock is held.
+.PHONY: test-temporal-examples-live test-temporal-examples-contract
+test-temporal-examples-live: test-temporal-examples-contract test-temporal-config
+	$(COMPOSE_RUN) env DUNE_JOBS="$(DUNE_JOBS)" sh scripts/build-temporal-executables.sh $(EXAMPLE_EXECUTABLES)
+	@set -eu; \
+	cleanup() { \
+		status=$$?; \
+		trap - EXIT HUP INT TERM; \
+		if [ "$$status" -ne 0 ]; then $(MAKE) temporal-logs || true; fi; \
+		$(MAKE) temporal-clean || true; \
+		exit "$$status"; \
+	}; \
+	$(MAKE) temporal-clean; \
+	trap cleanup EXIT; \
+	trap 'exit 129' HUP; \
+	trap 'exit 130' INT; \
+	trap 'exit 143' TERM; \
+	$(MAKE) temporal-start; \
+	TEMPORAL_COMPOSE_PROJECT="$(TEMPORAL_COMPOSE_PROJECT)" HOST_UID="$(HOST_UID)" HOST_GID="$(HOST_GID)" \
+		sh test/integration/temporal/scripts/run-examples-live.sh
+
+# Docker-free check that every example executable is compiled, shipped in the
+# CI smoke artifact, and started by the live examples controller.
+test-temporal-examples-contract:
+	sh test/smoke/test_examples_live_contract.sh .
 
 # Retains exact metadata histories in _build for the conformance/corpus gates.
 # The caller chooses the Compose project and owns the server lifecycle.
