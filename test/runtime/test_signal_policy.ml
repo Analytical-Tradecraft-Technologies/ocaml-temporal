@@ -202,6 +202,42 @@ let test_wrong_arity_category () =
       failwith ("wrong arity used category " ^ T.Error.kind error)
   | Ok () -> failwith "wrong arity was accepted"
 
+(** A custom decoder that reports malformed bytes with a terminal-looking
+    [`Workflow] error is still classified as [`Codec], so a malformed signal
+    fails the task instead of closing the run. The message, details, and
+    error type are preserved, and the handler is never called. *)
+let test_custom_decoder_error_is_codec () =
+  let strict =
+    T.Codec.make ~encoding:"json/plain"
+      ~encode:(fun (value : string) -> Ok (Bytes.of_string value))
+      ~decode:(fun _ ->
+        Error
+          (T.Error.make ~error_type:"BadSignal" ~category:`Workflow
+             ~message:"malformed signal bytes" ()))
+  in
+  let called = ref false in
+  let handler =
+    T.Signal.Handler.make
+      (T.Signal.define ~name:registered_name ~input:strict)
+      (fun _ ->
+        called := true;
+        Ok ())
+  in
+  let value = require (T.Codec.encode strict "anything") in
+  (match T.Signal.Handler.dispatch_payloads handler [ value ] with
+   | Error error ->
+       let view = T.Error.view error in
+       if view.category <> `Codec then
+         failwith ("custom decoder error used category " ^ T.Error.kind error);
+       if view.message <> "malformed signal bytes" then
+         failwith "custom decoder error lost its message";
+       if view.error_type <> Some "BadSignal" then
+         failwith "custom decoder error lost its error type";
+       if not view.non_retryable then
+         failwith "custom decoder error became retryable"
+   | Ok () -> failwith "custom decoder error was accepted");
+  if !called then failwith "handler ran after its decoder failed"
+
 (** Contrast: a deliberate [`Workflow] error returned by a correctly delivered
     signal's callback is an application decision and closes the run. *)
 let test_handler_business_error_closes_run () =
@@ -225,4 +261,5 @@ let () =
   test_undecodable_signal ();
   test_wrong_arity_signal ();
   test_wrong_arity_category ();
+  test_custom_decoder_error_is_codec ();
   test_handler_business_error_closes_run ()
