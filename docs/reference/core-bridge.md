@@ -175,6 +175,36 @@ under `tests/support/client_start.rs` cover recovery, request identity,
 non-retryable rejection, cancellation of a hung request, and the 64-ticket
 admission bound.
 
+Every other client RPC (wait, signal, query, cancel, terminate, reset,
+update, update poll, and visibility listing) goes through the same retrying
+`Connection` (#820). Core decides which statuses are transient (`unavailable`,
+`resource_exhausted`, `unknown`, `internal`, `aborted`, `out_of_range`,
+`data_loss`, and transport-level cancellation) and re-sends the identical
+request, so `request_id` or the update ID deduplicates a retried mutation.
+Each bounded RPC replaces Core's ten-second retry window with its own budget
+(three seconds for the signal, cancel, reset, and terminate control RPCs, ten
+for visibility, thirty for query, update acceptance, and update polling) and
+uses that budget as every attempt's gRPC deadline; the outer timeout still
+caps an attempt in flight when the budget ends. The pinned Core accepts a
+`resource_exhausted` retry using its ordinary backoff and then replaces the
+wait with a separate throttle backoff (1 s, 2 s, 4 s, ... up to 10 s, each
++/-20%) without rechecking the retry window, so the control budget is three
+seconds rather than one: one throttled re-send fits, while a throttle wait
+still pending when the budget ends is cut off by the outer timeout and
+reported as the RPC's deadline error. Terminate has no idempotency key, so
+Core re-sends it only after `resource_exhausted`; `unavailable`, a
+per-attempt `deadline_exceeded` or `cancelled`, and the outer deadline may
+follow an applied termination and are reported as
+`termination_outcome_uncertain` without a re-send. The `wait` history long poll has no
+total budget: Core measures its retry window from the start of a call, which
+would forbid retrying a long poll that failed after ten healthy seconds, so the
+wait instead allows up to thirty consecutive attempts per long poll (roughly
+two minutes of outage with Core's default backoff). Tests under
+`tests/support/client_retry.rs` cover recovery of each RPC, identical
+re-sends, non-retried rejections, the terminate restriction and its
+uncertain `unavailable` result, a throttled signal re-send inside the control
+budget, and that budget's bound on a persistent outage.
+
 The wait request names `namespace`, `workflow_id`, and one concrete `run_id`.
 There is no `follow_runs` escape hatch in the document: the operation always
 uses a close-event history long poll for that exact run, but each native call
