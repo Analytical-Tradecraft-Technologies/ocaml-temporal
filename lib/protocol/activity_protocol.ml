@@ -566,8 +566,9 @@ let decode_task input =
   | Error error -> Error (of_control_error error)
   | Ok json -> task_from_json json
 
-(** Encodes and reparses a task so typed outgoing values obey every receiver
-    invariant before crossing the native boundary. *)
+(** Encodes a task and applies the decoder's semantic rules so typed outgoing
+    values obey every receiver invariant before crossing the native boundary.
+*)
 let encode_task (value : task) =
   let* token = task_token_json "$.task_token" value.task_token in
   let* variant = task_variant_json value.variant in
@@ -575,7 +576,9 @@ let encode_task (value : task) =
   match Control.encode_payload_object json with
   | Error error -> Error (of_control_error error)
   | Ok output ->
-      let* _ = decode_task output in
+      (* The validated tree receives the decoder's semantic rules directly;
+         parsing [output] again would only repeat the payload passes. *)
+      let* _ = task_from_json json in
       Ok output
 
 (** Decodes one closed activity completion result. *)
@@ -635,7 +638,8 @@ let decode_completion input =
   | Error error -> Error (of_control_error error)
   | Ok json -> completion_from_json json
 
-(** Encodes and reparses a completion before it can be submitted to Core. *)
+(** Encodes a completion and applies the decoder's semantic rules before it
+    can be submitted to Core. *)
 let encode_completion (value : completion) =
   let* token = task_token_json "$.task_token" value.task_token in
   let* result = completion_result_json value.result in
@@ -643,7 +647,9 @@ let encode_completion (value : completion) =
   match Control.encode_payload_object json with
   | Error error -> Error (of_control_error error)
   | Ok output ->
-      let* _ = decode_completion output in
+      (* The validated tree receives the decoder's semantic rules directly;
+         parsing [output] again would only repeat the payload passes. *)
+      let* _ = completion_from_json json in
       Ok output
 
 (** Decodes a heartbeat object after closing its exact two-member shape. *)
@@ -661,8 +667,8 @@ let decode_heartbeat input =
   | Error error -> Error (of_control_error error)
   | Ok json -> heartbeat_from_json json
 
-(** Encodes and reparses a heartbeat before sending it across the native
-    boundary, so malformed metadata cannot reach Core. *)
+(** Encodes a heartbeat and applies the decoder's semantic rules before sending
+    it across the native boundary, so malformed metadata cannot reach Core. *)
 let encode_heartbeat (value : heartbeat) =
   let* token = task_token_json "$.task_token" value.task_token in
   let* details = payloads_json value.details in
@@ -670,5 +676,7 @@ let encode_heartbeat (value : heartbeat) =
   match Control.encode_payload_object json with
   | Error error -> Error (of_control_error error)
   | Ok output ->
-      let* _ = decode_heartbeat output in
+      (* The validated tree receives the decoder's semantic rules directly;
+         parsing [output] again would only repeat the payload passes. *)
+      let* _ = heartbeat_from_json json in
       Ok output

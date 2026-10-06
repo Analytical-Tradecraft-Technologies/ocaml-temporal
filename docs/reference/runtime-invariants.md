@@ -278,7 +278,7 @@ and bridge, read the [documentation guide](../README.md) first.
   rejection is accepted only for the exact activation lease that was polled.
 - The private supervisor validates native poll bytes before returning typed
   workflow or activity values to another Domain. It canonically encodes and
-  reparses typed activity completions before entering C. A workflow
+  semantically validates typed activity completions before entering C. A workflow
   completion arrives already encoded: the worker adapter runs the canonical
   encoder once and passes its bytes as an abstract
   `Encoded_workflow_completion.t`, which only that encoder can produce, so the

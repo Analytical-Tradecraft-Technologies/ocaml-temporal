@@ -47,7 +47,11 @@ performs the inverse conversion for workflow commands. The private OCaml module
 `Temporal_protocol.Workflow_protocol` implements the same model and validation
 without importing protobuf definitions.
 
-Both encoders reparse their own output before it can cross the native boundary.
+Both encoders check their own output against the receiver's rules before it can
+cross the native boundary. Rust reparses its output; OCaml applies the
+decoder's semantic rules to the validated tree and the parser's raw-text
+preflight to the serialized bytes, so payload bytes are not parsed and base64
+decoded a second time (#846).
 Both decoders reject duplicate or unknown fields, unknown variants, numeric
 range violations, non-canonical base64, invalid workflow invariants, and
 oversized values. Core fields not represented by the current semantic slice are
@@ -272,7 +276,7 @@ blocking.
 All client-operation identifiers are nonempty and NUL-free. The schemas state the
 65,536-character necessary bound, while the bilateral runtime validators apply
 the authoritative 65,536-byte UTF-8 limit, reject duplicate members, and
-reparse encoded output. JSON Schema counts Unicode characters rather than
+check encoded output against the receiver's limits. JSON Schema counts Unicode characters rather than
 encoded bytes, so schema validation alone is not a substitute for the runtime
 checks.
 
