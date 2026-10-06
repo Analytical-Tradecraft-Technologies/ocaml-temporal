@@ -19,3 +19,5 @@ module Native_worker_policy = Temporal_runtime.Native_worker_policy
 module Native_worker_owner = Temporal_runtime.Native_worker_owner
 module Native_worker_observer = Temporal_runtime.Native_worker_observer
 module Future = Temporal_future_kernel
+module Execution = Temporal_runtime.Execution
+module Test_environment = Temporal_runtime.Test_environment

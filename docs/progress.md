@@ -2871,3 +2871,29 @@ behavior is unchanged and no entry outlives its activation.
 on two threads of one Domain, checks that helper threads do not inherit a
 context, checks exception cleanup, and stress-tests the primitive with
 yielding threads.
+
+## 2026-10-06: In-process workflow test environment (#834)
+
+`mock://` never ran workflow code, so applications had no supported way to
+unit-test workflow logic without a server. The new public `Temporal.Testing`
+module fills that gap. Its engine, the private
+`Temporal_runtime.Test_environment`, starts ordinary `Execution.t` values (the
+runtime a native worker uses) and replaces Temporal Server and Core with a
+single-threaded simulator that interprets their commands: activities run when
+scheduled, with retry policies and heartbeat-detail hand-off applied in
+virtual time; timers fire on a virtual clock that jumps to the next event when
+every execution is blocked; child workflows start in the same environment and
+honor parent-close policies; external signals and cancellations, queries in
+query-only activations, validated updates, workflow cancellation and
+continue-as-new are routed as Core would. Identifiers and the randomness seed
+are deterministic counters. A workflow task failure ends the run with its
+error, and a workflow blocked with nothing scheduled is reported as a defect
+instead of hanging. `mock://` deliberately stays a plumbing-only backend:
+routing it through the engine would mean rewriting the client, backend and
+worker modules for a weaker, untyped API, while `Testing` gives typed handles
+directly. Activity timeouts, task retries, child cancellation types,
+asynchronous activities, Nexus and visibility are not simulated.
+`test/unit/test_testing.ml` covers time skipping, real and mocked activities,
+retries, error propagation, child workflows, signals, queries, updates,
+cancellation, continue-as-new, external signals, local activities and
+reproducibility; `examples/testing` tests the example application's workflow.

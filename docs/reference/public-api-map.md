@@ -14,6 +14,7 @@ where application code normally uses them.
 | Application startup and shutdown | `Temporal.Client`, `Temporal.Worker`, `Temporal.Runtime_info` | Connecting to Temporal, registering executable definitions, running the worker, and checking the linked bridge |
 | Values crossing a Temporal boundary | `Temporal.Codec`, `Temporal.Payload`, `Temporal.Error`, `Temporal.Result_syntax` | Encoding typed values, inspecting opaque payloads, representing expected failures, and composing `result` values |
 | Signals, queries, and updates | `Temporal.Signal`, `Temporal.Query`, `Temporal.Update`, `Temporal.Interaction` | Defining typed interactions, registering handlers, and testing deterministic local dispatch |
+| Application tests | `Temporal.Testing` | Running registered workflows and activities in-process with a time-skipping virtual clock, stubbing activities and child workflows, and driving signals, queries, updates, and cancellation without a Temporal Server |
 
 The same module can be used by a workflow helper and by registration code when
 its contract allows it, but the execution context still matters. In
@@ -167,6 +168,16 @@ for those rules.
   `Temporal.Interaction` is the deterministic,
   synchronous local dispatcher for tests. Native interaction delivery has a
   narrower experimental boundary; see the [interactive-workflow reference](interactive-workflows.md).
+- `Temporal.Testing` is the in-process workflow test environment. It drives
+  the same private workflow runtime as a native worker against a
+  deterministic server simulator, skipping virtual time whenever every
+  workflow is blocked on a timer or activity retry. `mock_activity` and
+  `mock_workflow` stub definitions by name; `start`, `signal`, `query`,
+  `update`, `cancel`, `skip`, and `result` drive a workflow step by step. It is
+  independent of `Client` and `Worker`, whose `mock://` target remains a
+  plumbing-only backend that never runs workflow code. The simulated
+  semantics and their limits are listed in the module documentation and the
+  [workflow guide](../guides/workflows.md#test-workflows-in-process).
 
 ## What is not public
 
