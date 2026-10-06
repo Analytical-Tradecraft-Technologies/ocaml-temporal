@@ -271,8 +271,24 @@ rejected value.
 Each line is bounded to 2,048 bytes plus the newline; longer records end with
 `...[truncated]`. Control characters, including newlines, are escaped, so a
 record cannot forge further lines. Fields are sorted by key. A failed stderr
-write is ignored, and a formatting panic is contained, so logging can never
-affect worker progress.
+write is ignored, and a formatting panic is contained.
+
+Stderr writes happen on a dedicated per-runtime writer thread, never on the
+Core thread that emitted the record. Core only places the formatted line in
+a bounded queue of 1,024 lines. If stderr is a pipe or socket whose reader is
+slow or stalled, the queue fills and further records are **dropped** rather
+than slowing Core. Once the writer catches up (or after one idle second, or at
+shutdown) it writes one summary line:
+
+```text
+ocaml-temporal core WARN ocaml_temporal_core_bridge: N Core log records dropped because the stderr writer fell behind
+```
+
+Closing a client or worker waits at most 500 ms for queued lines to be
+flushed. A writer still blocked on stderr after that is abandoned, so a stuck
+stderr can never hang shutdown. Its last queued lines are written only if
+stderr unblocks before the process exits. Logging therefore never affects
+worker progress or SDK operation latency beyond that bounded close.
 
 Unlike `Logs` events, Core records are not filtered for privacy. They can
 include workflow IDs, run IDs, task queues, activity types, and failure
@@ -309,5 +325,9 @@ cause classification, level parsing, the Core log filter, and that a Core
 record becomes one escaped, bounded line.
 `rust/core-bridge/tests/core_log_env.rs` checks that every accepted
 `OCAML_TEMPORAL_CORE_LOG` value creates a runtime and that an invalid value is
-a `configuration` error. `test/unit/test_client_worker.ml` checks that the
-cause reaches the public `Client.create` error.
+a `configuration` error. `rust/core-bridge/tests/core_log_queue.rs` blocks
+the writer with a gated sink and checks that enqueuing never blocks on a full
+queue, that drops are counted and reported in one summary line, and that
+runtime close completes while the writer is blocked.
+`test/unit/test_client_worker.ml` checks that the cause reaches the public
+`Client.create` error.

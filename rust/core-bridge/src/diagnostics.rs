@@ -8,11 +8,13 @@
 //!   closed [`ConnectionCause`] plus a bounded, sanitized chain of *local*
 //!   transport error text (DNS, TCP, TLS). Server-provided gRPC status
 //!   messages are never copied; only the status code name is.
-//! * [`core_logger`] routes Core's `tracing` records to process stderr through
-//!   [`StderrCoreLogConsumer`]. Core invokes the consumer synchronously on
-//!   whichever Tokio or caller thread emitted the record, so the consumer
-//!   never touches OCaml: it formats one bounded line and performs one
-//!   best-effort `write_all` on the locked stderr handle.
+//! * [`core_logger`] routes Core's `tracing` records to process stderr. Core
+//!   invokes the consumer ([`CoreLogQueue`]) synchronously on whichever Tokio
+//!   or caller thread emitted the record, so it never touches OCaml or
+//!   performs I/O: it formats one bounded line and offers it to a bounded
+//!   queue without blocking, dropping and counting the line when the queue is
+//!   full. A per-runtime [`CoreLogWriter`] thread drains the queue to stderr,
+//!   so a stalled stderr reader can never stall Core.
 //!
 //! The stderr level is selected per runtime by [`CORE_LOG_ENV`]; see
 //! `docs/reference/observability.md` for the operator-facing contract.
@@ -21,7 +23,11 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::io::Write;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::thread::JoinHandle;
+use std::time::Duration;
 use temporalio_client::errors::ClientConnectError;
 use temporalio_client::tonic::Code;
 use temporalio_common::telemetry::{CoreLog, CoreLogConsumer, Logger};
@@ -128,33 +134,266 @@ pub fn core_log_filter(level: CoreLogLevel) -> String {
 }
 
 /// Core `Logger` that pushes every record admitted by [`core_log_filter`] to
-/// [`StderrCoreLogConsumer`].
-pub(crate) fn core_logger(level: CoreLogLevel) -> Logger {
+/// `queue`, the producer side of one runtime's [`CoreLogWriter`].
+pub(crate) fn core_logger(level: CoreLogLevel, queue: CoreLogQueue) -> Logger {
     Logger::Push {
         filter: core_log_filter(level),
-        consumer: Arc::new(StderrCoreLogConsumer),
+        consumer: Arc::new(queue),
     }
 }
 
-/// Stateless Core log consumer writing one bounded line per record to stderr.
+/// Number of formatted Core log lines one runtime buffers between Core's
+/// emitting threads and its stderr writer thread. At the 2,048-byte line
+/// bound this caps the queue at roughly 2 MiB per runtime. Records arriving
+/// while the queue is full are dropped and counted rather than waited for.
+pub const CORE_LOG_QUEUE_CAPACITY: usize = 1024;
+
+/// Longest time runtime close waits for the Core log writer thread to flush
+/// queued lines and exit. A writer still blocked on stderr after this bound
+/// is detached (see [`CoreLogWriter`]), so a stalled stderr reader can delay
+/// runtime close by at most this duration.
+pub const CORE_LOG_CLOSE_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Longest time a drop count waits to be reported while no new record
+/// arrives. The writer also reports pending drops before each written line
+/// and once more when it shuts down.
+const CORE_LOG_DROP_REPORT_INTERVAL: Duration = Duration::from_secs(1);
+
+/// State shared by every [`CoreLogQueue`] producer and the writer thread.
+struct CoreLogShared {
+    /// Producer end of the bounded line queue. [`CoreLogWriter`] takes and
+    /// drops it on close, which disconnects the queue so the writer exits
+    /// after draining. Core may keep its subscriber, and therefore a queue
+    /// clone, alive after the runtime is gone (it stays installed as the
+    /// creating thread's default), so disconnecting cannot rely on Core
+    /// dropping its consumer. The lock is held only for a non-blocking
+    /// `try_send` or for `take`, never across I/O.
+    sender: Mutex<Option<SyncSender<String>>>,
+    /// Records rejected because the queue was full since the writer last
+    /// reported drops.
+    dropped: AtomicU64,
+}
+
+impl CoreLogShared {
+    /// Locks the sender slot, recovering from poisoning: the slot is a plain
+    /// `Option` that no panic can leave logically inconsistent.
+    fn sender(&self) -> MutexGuard<'_, Option<SyncSender<String>>> {
+        self.sender.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// Non-blocking producer side of a runtime's Core log queue, installed as
+/// Core's push-log consumer.
 ///
 /// Core calls [`CoreLogConsumer::on_log`] synchronously on the emitting
-/// thread, which may be a Tokio worker or the OCaml supervisor thread inside
-/// a blocking bridge call. The consumer therefore holds no OCaml values, takes
-/// only the standard library's stderr lock for one write, ignores write
-/// failures (a closed stderr must not affect Temporal progress), and contains
-/// any formatting panic so it cannot unwind into Core's runtime.
-#[derive(Debug)]
-pub(crate) struct StderrCoreLogConsumer;
+/// thread, which may be a Tokio worker driving network progress or the OCaml
+/// supervisor thread inside a blocking bridge call. The consumer therefore
+/// only formats one bounded line and offers it to the queue with `try_send`;
+/// it never performs I/O, never waits for queue space, holds no OCaml values,
+/// and contains any formatting panic so it cannot unwind into Core's runtime.
+#[derive(Clone)]
+pub struct CoreLogQueue {
+    shared: Arc<CoreLogShared>,
+}
 
-impl CoreLogConsumer for StderrCoreLogConsumer {
+impl CoreLogQueue {
+    /// Offers one already formatted line to the writer without blocking.
+    ///
+    /// Returns `true` when the line was queued. A full queue drops the line
+    /// and counts it for the writer's next drop report; a closed queue (the
+    /// runtime has been released) drops it silently. Either way the caller
+    /// returns immediately.
+    pub fn submit(&self, line: String) -> bool {
+        let sender = self.shared.sender();
+        let Some(sender) = sender.as_ref() else {
+            return false;
+        };
+        match sender.try_send(line) {
+            Ok(()) => true,
+            Err(TrySendError::Full(_)) => {
+                self.shared.dropped.fetch_add(1, Ordering::Relaxed);
+                false
+            }
+            Err(TrySendError::Disconnected(_)) => false,
+        }
+    }
+}
+
+/// Opaque `Debug` output; Core requires it of consumers, and the queue
+/// contents are not useful diagnostic text.
+impl std::fmt::Debug for CoreLogQueue {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("CoreLogQueue")
+    }
+}
+
+impl CoreLogConsumer for CoreLogQueue {
     fn on_log(&self, log: CoreLog) {
         let _ = catch_unwind(AssertUnwindSafe(|| {
-            let line =
-                format_core_log_line(log.level.as_str(), &log.target, &log.message, &log.fields);
-            let _ = std::io::stderr().lock().write_all(line.as_bytes());
+            self.submit(format_core_log_line(
+                log.level.as_str(),
+                &log.target,
+                &log.message,
+                &log.fields,
+            ))
         }));
     }
+}
+
+/// How [`CoreLogWriter::close`] ended the writer thread.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CoreLogWriterClose {
+    /// The writer drained the queue, exited, and was joined.
+    Joined,
+    /// The writer was still blocked in its sink when the close bound expired
+    /// and was detached; it exits on its own once that write returns.
+    Detached,
+}
+
+/// Owner of one runtime's Core log writer thread and queue.
+///
+/// Ownership and lifecycle: runtime creation spawns exactly one writer per
+/// runtime whose Core logging is enabled, and the native `Runtime` handle
+/// owns this value. Closing the runtime moves it to the runtime cleanup
+/// thread, which closes it after Core itself has been dropped so shutdown
+/// records are still written. [`CoreLogWriter::close`] (also run by `Drop`,
+/// for construction failure paths) is the single release path:
+///
+/// 1. It takes the queue sender, so the queue disconnects. Records emitted
+///    afterwards, including through a subscriber Core leaves installed on the
+///    creating thread, are discarded without blocking.
+/// 2. The writer drains the remaining lines, reports pending drops, signals
+///    completion, and returns.
+/// 3. The closer waits at most the given bound for that signal. On success
+///    it joins the (already finished) thread. On timeout the writer must be
+///    blocked in a stderr write whose reader has stalled; waiting longer could
+///    hang runtime close indefinitely, so the join handle is dropped and the
+///    thread is detached. A detached writer owns only the queue receiver,
+///    the shared drop counter, and its sink: no Core, Tokio, or OCaml state.
+///    It finishes the remaining bounded queue once the write returns, or ends
+///    with the process.
+///
+/// The writer thread never calls OCaml and contains panics from its sink.
+pub struct CoreLogWriter {
+    shared: Arc<CoreLogShared>,
+    /// Completion signal sent by the writer immediately before it returns.
+    done: Receiver<()>,
+    /// `None` once closed.
+    thread: Option<JoinHandle<()>>,
+}
+
+impl CoreLogWriter {
+    /// Spawns the writer thread for the process stderr stream.
+    pub(crate) fn spawn_stderr() -> std::io::Result<Self> {
+        Self::spawn(Box::new(std::io::stderr()), CORE_LOG_QUEUE_CAPACITY)
+    }
+
+    /// Spawns a writer thread draining a queue of `capacity` lines (at least
+    /// one) into `sink`. Write errors are ignored: a closed stderr must not
+    /// affect Temporal progress. Exposed so tests can substitute a sink.
+    pub fn spawn(sink: Box<dyn Write + Send>, capacity: usize) -> std::io::Result<Self> {
+        let (sender, receiver) = sync_channel(capacity.max(1));
+        let shared = Arc::new(CoreLogShared {
+            sender: Mutex::new(Some(sender)),
+            dropped: AtomicU64::new(0),
+        });
+        let (done_sender, done) = sync_channel(1);
+        let writer_shared = Arc::clone(&shared);
+        let thread = std::thread::Builder::new()
+            .name("ocaml-temporal-core-log".to_owned())
+            .spawn(move || {
+                let _ = catch_unwind(AssertUnwindSafe(|| {
+                    run_core_log_writer(&receiver, &writer_shared, sink)
+                }));
+                let _ = done_sender.send(());
+            })?;
+        Ok(Self {
+            shared,
+            done,
+            thread: Some(thread),
+        })
+    }
+
+    /// Returns a producer handle feeding this writer.
+    pub fn queue(&self) -> CoreLogQueue {
+        CoreLogQueue {
+            shared: Arc::clone(&self.shared),
+        }
+    }
+
+    /// Disconnects the queue and waits at most `timeout` for the writer to
+    /// flush and exit, detaching it if its sink is still blocked. See the
+    /// type documentation for the complete protocol.
+    pub fn close(mut self, timeout: Duration) -> CoreLogWriterClose {
+        self.shutdown(timeout)
+    }
+
+    /// Idempotent implementation of [`CoreLogWriter::close`].
+    fn shutdown(&mut self, timeout: Duration) -> CoreLogWriterClose {
+        drop(self.shared.sender().take());
+        let Some(thread) = self.thread.take() else {
+            return CoreLogWriterClose::Joined;
+        };
+        match self.done.recv_timeout(timeout) {
+            // A disconnected signal also means the thread has already exited.
+            Ok(()) | Err(RecvTimeoutError::Disconnected) => {
+                let _ = thread.join();
+                CoreLogWriterClose::Joined
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                drop(thread);
+                CoreLogWriterClose::Detached
+            }
+        }
+    }
+}
+
+/// Runs the bounded close protocol for owners that did not close explicitly,
+/// such as a runtime constructor that fails after spawning the writer.
+impl Drop for CoreLogWriter {
+    fn drop(&mut self) {
+        let _ = self.shutdown(CORE_LOG_CLOSE_TIMEOUT);
+    }
+}
+
+/// Writer-thread loop: writes queued lines to `sink` until the queue is
+/// disconnected and drained, reporting dropped records along the way.
+fn run_core_log_writer(
+    receiver: &Receiver<String>,
+    shared: &CoreLogShared,
+    mut sink: Box<dyn Write + Send>,
+) {
+    loop {
+        match receiver.recv_timeout(CORE_LOG_DROP_REPORT_INTERVAL) {
+            Ok(line) => {
+                report_core_log_drops(shared, &mut sink);
+                let _ = sink.write_all(line.as_bytes());
+            }
+            Err(RecvTimeoutError::Timeout) => report_core_log_drops(shared, &mut sink),
+            Err(RecvTimeoutError::Disconnected) => {
+                report_core_log_drops(shared, &mut sink);
+                return;
+            }
+        }
+    }
+}
+
+/// Writes one summary line for records dropped since the previous report,
+/// if any. The line is emitted when the writer next has work, is idle, or
+/// shuts down, so its position relative to surviving lines is approximate.
+fn report_core_log_drops(shared: &CoreLogShared, sink: &mut Box<dyn Write + Send>) {
+    let dropped = shared.dropped.swap(0, Ordering::Relaxed);
+    if dropped > 0 {
+        let _ = sink.write_all(core_log_drop_line(dropped).as_bytes());
+    }
+}
+
+/// Formats the stderr line reporting `dropped` discarded Core records.
+pub fn core_log_drop_line(dropped: u64) -> String {
+    format!(
+        "ocaml-temporal core WARN ocaml_temporal_core_bridge: {dropped} Core log records \
+         dropped because the stderr writer fell behind\n"
+    )
 }
 
 /// Formats one Core record as a single bounded stderr line.

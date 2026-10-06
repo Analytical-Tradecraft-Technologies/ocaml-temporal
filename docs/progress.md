@@ -24,11 +24,16 @@ records were discarded. The bridge now reports a closed cause (`dns`,
 escaped local transport error chain. A failed `GetSystemInfo` adds only its
 gRPC code, never server text, and Core's rejection of connection options is a
 `configuration` error. Runtime creation installs a Core push logger that
-writes one bounded, escaped stderr line per record and never calls OCaml.
-`OCAML_TEMPORAL_CORE_LOG` selects the level (default `warn`; `off` disables
-it). Rust ABI tests cover refused and DNS causes and the message bound, cause
-classification, level parsing and rejection, and line formatting. An OCaml
-unit test proves the cause reaches `Client.create`.
+formats one bounded, escaped line per record and enqueues it without
+blocking. A per-runtime writer thread drains the bounded queue to stderr, so
+a stalled stderr reader drops (and counts) records instead of stalling Core.
+Runtime close waits at most 500 ms for that writer before detaching it.
+Neither thread calls OCaml. `OCAML_TEMPORAL_CORE_LOG` selects the level
+(default `warn`; `off` disables it). Rust ABI tests cover refused and DNS
+causes and the message bound, cause classification, level parsing and
+rejection, line formatting, non-blocking enqueue, drop reporting, and runtime
+close with a blocked writer. An OCaml unit test proves the cause reaches
+`Client.create`.
 
 ## 2026-10-06: Retained completions fail closed (#843)
 
