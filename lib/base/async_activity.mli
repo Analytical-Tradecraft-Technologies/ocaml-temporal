@@ -74,8 +74,14 @@ val create :
   encode_output:('output -> (Payload.t, Error.t) result) ->
   'output handle
 
-(** Builds the callback context associated with a handle. *)
-val context : 'output handle -> 'output context
+(** Builds the callback context associated with a handle. The native adapter
+    passes the start task's [info]; contexts built without it report no task
+    metadata. *)
+val context : ?info:Activity_context.info -> 'output handle -> 'output context
+
+(** Returns the task metadata supplied to {!val-context}, if any. It stays
+    readable after the callback returns, like the synchronous context's. *)
+val info : 'output context -> Activity_context.info option
 
 (** Returns the handle retained by a callback context. *)
 val handle : 'output context -> 'output handle

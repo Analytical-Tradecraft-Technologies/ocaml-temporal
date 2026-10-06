@@ -25,6 +25,10 @@
  (libraries temporal_base))
 
 (test
+ (name test_ordered_registry)
+ (libraries temporal_base))
+
+(test
  (name test_client_request_id)
  (libraries temporal_base unix))
 

@@ -166,7 +166,8 @@ type ('input, 'output) t = {
 
 (** Creates execution state without calling user workflow code. The code starts
     only after Temporal delivers a start job, matching replay behavior. *)
-let start ?(task_queue = "default") ?(randomness_seed = "0")
+let start ?(task_queue = "default") ?(namespace = "default")
+    ?(randomness_seed = "0")
     ?(signal_handlers = []) ?(query_handlers = []) ?(update_handlers = [])
     definition input =
   let signal_handler_map : signal_handler Signal_map.t =
@@ -203,7 +204,8 @@ let start ?(task_queue = "default") ?(randomness_seed = "0")
       input;
       scheduler;
       context =
-        Workflow_context_store.create ~task_queue ~randomness_seed scheduler;
+        Workflow_context_store.create ~task_queue ~namespace ~randomness_seed
+          scheduler;
       signal_handlers = signal_handler_map;
       query_handlers = query_handler_map;
       update_handlers = update_handler_map;

@@ -212,21 +212,6 @@ module Async_handle : sig
   val heartbeat : 'output t -> Payload.t list -> (unit, Error.t) result
 end
 
-(** Access to the capability carried by an asynchronous callback context. *)
-module Async_context : sig
-  (** The context type passed to an asynchronous implementation. *)
-  type 'output t = 'output async_context
-
-  (** Returns the opaque handle that can be retained after the callback. *)
-  val handle : 'output t -> 'output Async_handle.t
-end
-
-(** Encodes and submits one typed heartbeat value for the current activity. The
-    payload is copied before crossing into the private runtime, and stale or
-    unavailable contexts return typed errors rather than retaining a released
-    task token. *)
-val heartbeat : context -> 'a Codec.t -> 'a -> (unit, Error.t) result
-
 (** Read-only identity and scheduling facts for one activity attempt, copied
     from the task Temporal delivered. The type is abstract so later releases
     can add fields compatibly. A common use is an idempotency key for
@@ -274,7 +259,50 @@ module Info : sig
   (** Returns when the server recorded this attempt as started, if Core
       reported it. *)
   val started_time : t -> Time.t option
+
+  (** Returns the effective schedule-to-close timeout of the activity, if
+      Temporal reported one. Temporal resolves defaults when the activity is
+      scheduled, so this may differ from the option the workflow passed.
+      Temporal carries nanosecond precision; a sub-millisecond remainder is
+      rounded up to the next whole millisecond, so a positive timeout is never
+      reported as zero. The result is clamped to 315,576,000,000,999 ms, the
+      largest value {!Duration.of_ms} accepts, so the protobuf maximum
+      (which would round up past it) is reported as that bound. *)
+  val schedule_to_close_timeout : t -> Duration.t option
+
+  (** Returns the effective start-to-close timeout of this attempt, if
+      Temporal reported one, rounded up to whole milliseconds like
+      {!schedule_to_close_timeout}. *)
+  val start_to_close_timeout : t -> Duration.t option
+
+  (** Returns the heartbeat timeout Temporal reported for this attempt,
+      rounded up to whole milliseconds like {!schedule_to_close_timeout}.
+      Unlike {!Context.heartbeat_timeout}, it is also available to
+      asynchronous activities. *)
+  val heartbeat_timeout : t -> Duration.t option
 end
+
+(** Access to the capability carried by an asynchronous callback context. *)
+module Async_context : sig
+  (** The context type passed to an asynchronous implementation. *)
+  type 'output t = 'output async_context
+
+  (** Returns the opaque handle that can be retained after the callback. *)
+  val handle : 'output t -> 'output Async_handle.t
+
+  (** Returns this attempt's task metadata, as {!Context.info} does for a
+      synchronous activity. Contexts created by a native worker always carry
+      it; any other context returns a typed [Defect] error. The value is
+      immutable, so external code may keep it after the callback returns, for
+      example to log which activity a later completion belongs to. *)
+  val info : 'output t -> (Info.t, Error.t) result
+end
+
+(** Encodes and submits one typed heartbeat value for the current activity. The
+    payload is copied before crossing into the private runtime, and stale or
+    unavailable contexts return typed errors rather than retaining a released
+    task token. *)
+val heartbeat : context -> 'a Codec.t -> 'a -> (unit, Error.t) result
 
 (** Operations available to a contextual activity attempt. *)
 module Context : sig

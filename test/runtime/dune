@@ -24,5 +24,6 @@
   test_random_seed_reset
   test_condition
   test_external_workflow
+  test_settle_scaling
   test_execution_info)
  (libraries temporal-sdk temporal_runtime unix))

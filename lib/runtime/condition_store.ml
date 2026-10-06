@@ -12,20 +12,25 @@ type predicate = unit -> (bool, Temporal_base.Error.t) result
 
 (** One registered predicate and its one-shot scheduler signal.  [active] is
     checked by every transition so a stale callback cannot resolve a future
-    after shutdown or after an earlier notification already settled it. *)
+    after shutdown or after an earlier notification already settled it.
+    [registration] is the waiter's node in the store's registry; it is set
+    immediately after the record is linked and is used for O(1) removal. *)
 type waiter = {
   predicate : predicate;
   resolve : (unit, Temporal_base.Error.t) Future_store.resolver;
   mutable active : bool;
+  mutable registration : waiter Temporal_base.Ordered_registry.handle option;
 }
 
-(** All condition waiters for one workflow execution.  The reversed list makes
-    registration constant-time; [List.rev] is used only for FIFO notification
-    and the small removal scans, keeping ordering explicit and deterministic. *)
+(** All condition waiters for one workflow execution, in registration order.
+    The registry makes registration and the removal of a released waiter
+    constant-time, so releasing [n] waiters in one activation is O(n) list
+    work rather than O(n{^ 2}); notification order is the explicit
+    registration order, never a hash or address order. *)
 type t = {
   scheduler : Scheduler.t;
   owner_id : int;
-  mutable waiters_rev : waiter list;
+  waiters : waiter Temporal_base.Ordered_registry.t;
   mutable closed : bool;
 }
 
@@ -34,7 +39,7 @@ let create scheduler =
   {
     scheduler;
     owner_id = Scheduler.id scheduler;
-    waiters_rev = [];
+    waiters = Temporal_base.Ordered_registry.create ();
     closed = false;
   }
 
@@ -67,20 +72,20 @@ let evaluate predicate =
            ~message:(
              "Temporal condition predicate raised: " ^ Printexc.to_string exn))
 
-(** Removes [waiter] by physical identity.  Each registration allocates a
-    fresh record, so identity is the precise token needed for one-shot cleanup
-    and cannot accidentally remove another equal predicate. *)
-let remove store waiter =
-  store.waiters_rev <-
-    List.filter (fun current -> current != waiter) store.waiters_rev
+(** Unlinks [waiter] through its own registry handle in O(1).  Each
+    registration owns a distinct handle, so this cannot remove another waiter
+    with an equal predicate. *)
+let remove waiter =
+  Option.iter Temporal_base.Ordered_registry.remove waiter.registration;
+  waiter.registration <- None
 
 (** Marks one registration inactive and queues its result exactly once.  The
     removal happens before [resolve], because resolving queues a continuation
     and user code may run again during the same activation drain. *)
-let settle store waiter result =
+let settle waiter result =
   if waiter.active then (
     waiter.active <- false;
-    remove store waiter;
+    remove waiter;
     waiter.resolve result)
 
 (** Registers a false predicate after the initial evaluation.  Registration and
@@ -98,9 +103,11 @@ let register store predicate =
       predicate;
       resolve;
       active = true;
+      registration = None;
     }
   in
-  store.waiters_rev <- waiter :: store.waiters_rev;
+  waiter.registration <-
+    Some (Temporal_base.Ordered_registry.add store.waiters waiter);
   future
 
 (** Evaluates the predicate immediately, then suspends through a scheduler-owned
@@ -125,7 +132,7 @@ let notify store =
   if store.closed then false
   else
     let queued = ref false in
-    let snapshot = List.rev store.waiters_rev in
+    let snapshot = Temporal_base.Ordered_registry.to_list store.waiters in
     List.iter
       (fun waiter ->
         if waiter.active then
@@ -133,10 +140,10 @@ let notify store =
           | Ok false -> ()
           | Ok true ->
               queued := true;
-              settle store waiter (Ok ())
+              settle waiter (Ok ())
           | Error error ->
               queued := true;
-              settle store waiter (Error error))
+              settle waiter (Error error))
       snapshot;
     !queued
 
@@ -146,5 +153,8 @@ let notify store =
 let shutdown store =
   if not store.closed then (
     store.closed <- true;
-    List.iter (fun waiter -> waiter.active <- false) store.waiters_rev;
-    store.waiters_rev <- [])
+    List.iter
+      (fun waiter ->
+        waiter.active <- false;
+        waiter.registration <- None)
+      (Temporal_base.Ordered_registry.take_all store.waiters))

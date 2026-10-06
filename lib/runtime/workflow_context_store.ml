@@ -155,6 +155,9 @@ let next_local_id = Atomic.make 0
 type t = {
   scheduler : Scheduler.t;
   task_queue : string;
+  (* Validated namespace of the worker that owns this execution. Activations
+     do not carry it, so the worker adapter supplies it at construction. *)
+  namespace : string;
   mutable start_metadata : start_metadata option;
   (* Installed once from the initialization activation; strings are
      immutable copies owned by the protocol decoder, so they can be shared. *)
@@ -203,23 +206,33 @@ type t = {
   mutable sealed : bool;
 }
 
-(** Validates the worker queue before it becomes an implicit activity option.
+(** Validates a worker-scoped name (the task queue or namespace) before it is
+    retained by an execution; [field] names the value in the diagnostic.
     Queue names cross the strict JSON boundary even when workflow code omits
     [~task_queue], so rejecting an empty, NUL-containing, oversized, or
     non-UTF-8 default at execution construction keeps configuration failures
     out of the later workflow command path. The result carries the stable
     diagnostic so worker construction can reject the same value without
     catching an exception. *)
-let validate_task_queue task_queue =
-  if String.equal task_queue "" then
-    Error "task_queue must not be empty"
-  else if String.contains task_queue '\000' then
-    Error "task_queue must not contain NUL"
-  else if String.length task_queue > 65_536 then
-    Error "task_queue exceeds 65536 bytes"
-  else if not (Temporal_base.Codec.valid_utf_8 task_queue) then
-    Error "task_queue must be valid UTF-8"
+let validate_worker_name ~field value =
+  if String.equal value "" then
+    Error (field ^ " must not be empty")
+  else if String.contains value '\000' then
+    Error (field ^ " must not contain NUL")
+  else if String.length value > 65_536 then
+    Error (field ^ " exceeds 65536 bytes")
+  else if not (Temporal_base.Codec.valid_utf_8 value) then
+    Error (field ^ " must be valid UTF-8")
   else Ok ()
+
+(** Applies the shared worker-name rules to the implicit activity queue. *)
+let validate_task_queue task_queue =
+  validate_worker_name ~field:"task_queue" task_queue
+
+(** Applies the same rules to the worker namespace before it is exposed
+    through [Temporal.Workflow.Info.namespace]. *)
+let validate_namespace namespace =
+  validate_worker_name ~field:"namespace" namespace
 
 (** Converts canonical uint64 decimal text into the generator's bit pattern.
     Zero retains the existing nonzero fallback required by xorshift. *)
@@ -252,19 +265,25 @@ let empty_activation_history =
 
 (** Creates empty activity and timer tables. The tables grow normally if a
     workflow has more than the small initial capacity. *)
-let create ?(task_queue = "default") ?(randomness_seed = "0") scheduler =
-  match validate_task_queue task_queue with
+let create ?(task_queue = "default") ?(namespace = "default")
+    ?(randomness_seed = "0") scheduler =
+  match
+    Result.bind (validate_task_queue task_queue) (fun () ->
+        validate_namespace namespace)
+  with
   | Error message ->
       (* Preserve the existing execution-construction contract for callers
          that create a runtime directly: invalid worker configuration is a
          programmer defect at this lower-level API. The worker adapter uses
-         [validate_task_queue] directly and returns a typed configuration
-         error before it publishes any execution state. *)
+         [validate_task_queue] and [validate_namespace] directly and returns
+         a typed configuration error before it publishes any execution
+         state. *)
       invalid_arg message
   | Ok () ->
       {
         scheduler;
         task_queue;
+        namespace;
         start_metadata = None;
         run_info = None;
         conditions = Condition_store.create scheduler;
@@ -398,6 +417,9 @@ let run_info context = context.run_info
 (** Returns the worker queue this execution uses as its activity default,
     which is also the queue that delivered its workflow tasks. *)
 let task_queue context = context.task_queue
+
+(** Returns the worker namespace captured at construction. *)
+let namespace context = context.namespace
 
 (** Copies a protocol identifier before retaining it in execution state or an
     emitted command. Although OCaml strings are normally immutable, callers at
