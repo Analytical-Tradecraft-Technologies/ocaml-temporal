@@ -91,6 +91,9 @@ totals throughout the documentation.
 
 Requirements: Docker with Compose v2 and GNU Make. The normal build and test
 path does not require OCaml, Dune, Rust, or Python installed on the host.
+Give the Docker VM at least 8 GiB of memory and 20 GB or more of free disk: the
+development image is about 4 GB and a full `make verify` grows the bind-mounted
+`_build` to roughly 8-9 GB.
 
 ```sh
 make build                    # build OCaml and the pinned Rust bridge
@@ -113,9 +116,13 @@ queued. Each compatibility lane publishes a tested
 [compiled OCaml SDK bundle](docs/reference/prebuilt-ocaml.md) for compatible
 downstream applications to link without rebuilding the SDK.
 
-On a memory-constrained Docker VM, bound Dune's native build concurrency with
-`make build DUNE_JOBS=1`; leaving `DUNE_JOBS` unset preserves the default
-parallelism used by CI.
+Every Dune build, test, and `dune exec` that the Makefile runs is bounded by
+`DUNE_JOBS`, because each test executable links the large Rust static library
+and parallel links can exhaust a Docker VM's memory. Local runs default to
+`DUNE_JOBS=2`, chosen for an 8 GiB VM; CI keeps Dune's automatic job count.
+Use `make verify DUNE_JOBS=1` on a smaller VM, or `DUNE_JOBS=auto` to restore
+Dune's default on a large one. An explicit `CARGO_BUILD_JOBS` also bounds the
+Rust bridge build, which otherwise uses Cargo's default parallelism.
 
 ### Install from a source checkout
 
