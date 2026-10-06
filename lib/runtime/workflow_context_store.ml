@@ -7,6 +7,25 @@ type start_metadata = {
   execution_expiration_time : Temporal_protocol.Workflow_protocol.timestamp option;
 }
 
+(** Run-stable identity reported by Core's initialization job; see the
+    interface. *)
+type run_info = {
+  workflow_id : string;
+  run_id : string;
+  workflow_type : string;
+  attempt : int;
+  first_execution_run_id : string;
+  parent : Temporal_protocol.Workflow_protocol.namespaced_workflow_execution option;
+  start_time : Temporal_protocol.Workflow_protocol.timestamp option;
+}
+
+(** History facts reported with one activation; see the interface. *)
+type activation_history = {
+  history_length : int;
+  history_size_bytes : int option;
+  continue_as_new_suggested : bool;
+}
+
 (** Function saved for each pending activity. It receives the raw payload,
     decodes it to the activity's declared output type, and completes the future
     returned to workflow code. *)
@@ -137,6 +156,9 @@ type t = {
   scheduler : Scheduler.t;
   task_queue : string;
   mutable start_metadata : start_metadata option;
+  (* Installed once from the initialization activation; strings are
+     immutable copies owned by the protocol decoder, so they can be shared. *)
+  mutable run_info : run_info option;
   conditions : Condition_store.t;
   mutable activation_timestamp :
     Temporal_protocol.Workflow_protocol.timestamp option;
@@ -146,6 +168,10 @@ type t = {
   (* Replaced before every activation. Patch decisions use this flag only when
      their ID has neither been notified nor consulted in this execution. *)
   mutable activation_is_replaying : bool;
+  (* Task-local history facts, replaced before every activation like the
+     replay flag so a later task never observes stale continue-as-new
+     advice. *)
+  mutable activation_history : activation_history;
   (* Patch decisions are execution-local durable-language state. A cached
      [false] is as significant as [true], because replay without a marker must
      continue taking the pre-patch branch for the lifetime of this run. *)
@@ -218,6 +244,12 @@ let seed_of_decimal seed =
   in
   if Int64.equal state 0L then 1L else state
 
+(** History facts used before any activation has been installed, and for
+    synthetic activations that carry no metadata. *)
+let empty_activation_history =
+  { history_length = 0; history_size_bytes = None;
+    continue_as_new_suggested = false }
+
 (** Creates empty activity and timer tables. The tables grow normally if a
     workflow has more than the small initial capacity. *)
 let create ?(task_queue = "default") ?(randomness_seed = "0") scheduler =
@@ -234,10 +266,12 @@ let create ?(task_queue = "default") ?(randomness_seed = "0") scheduler =
         scheduler;
         task_queue;
         start_metadata = None;
+        run_info = None;
         conditions = Condition_store.create scheduler;
         activation_timestamp = None;
         activation_deployment_version = None;
         activation_is_replaying = false;
+        activation_history = empty_activation_history;
         patches = Hashtbl.create 8;
         next_sequence = 0L;
         activities = Hashtbl.create 16;
@@ -344,6 +378,26 @@ let activation_deployment_version context =
     and therefore are not cleared here. *)
 let set_activation_is_replaying context is_replaying =
   context.activation_is_replaying <- is_replaying
+
+(** Returns Core's replay status for the activation currently running. *)
+let activation_is_replaying context = context.activation_is_replaying
+
+(** Replaces the task-local history facts before an activation is applied. *)
+let set_activation_history context history =
+  context.activation_history <- history
+
+(** Returns the history facts installed for the current activation. *)
+let activation_history context = context.activation_history
+
+(** Installs the run identity once initialization has been translated. *)
+let set_run_info context info = context.run_info <- info
+
+(** Returns the run identity; the record is immutable and safely shared. *)
+let run_info context = context.run_info
+
+(** Returns the worker queue this execution uses as its activity default,
+    which is also the queue that delivered its workflow tasks. *)
+let task_queue context = context.task_queue
 
 (** Copies a protocol identifier before retaining it in execution state or an
     emitted command. Although OCaml strings are normally immutable, callers at

@@ -5,17 +5,55 @@
     task tokens and supervisor handles never become OCaml values. *)
 type t
 
-(** Creates an active context after the adapter has validated all values
-    received from Temporal Core. The callback receives owned payload copies. *)
+(** An exact protobuf timestamp copied from the activity task. The adapter has
+    already validated [nanoseconds] to lie in [0, 1_000_000_000). *)
+type timestamp = { seconds : int64; nanoseconds : int }
+
+(** Immutable identity and scheduling facts Temporal Core delivered with one
+    activity attempt. [workflow_id], [workflow_run_id], and [workflow_type]
+    are empty for a standalone activity that no workflow scheduled. An absent
+    timestamp means that Core omitted the protobuf field. *)
+type info = {
+  namespace : string;
+  workflow_id : string;
+  workflow_run_id : string;
+  workflow_type : string;
+  activity_id : string;
+  activity_type : string;
+  attempt : int;
+  is_local : bool;
+  scheduled_time : timestamp option;
+  current_attempt_scheduled_time : timestamp option;
+  started_time : timestamp option;
+}
+
+(** Creates an active context without Core task metadata. Test doubles and
+    synthetic contexts use it; {!info} then returns [None]. The callback
+    receives owned payload copies. *)
 val create :
   heartbeat:(Payload.t list -> (unit, Error.t) result) ->
   details:Payload.t list ->
   heartbeat_timeout:Duration.t option ->
   t
 
-(** Creates a context for a backend that cannot submit native heartbeats. *)
+(** Creates an active context after the native adapter has validated all
+    values received from Temporal Core, retaining [info] for {!info}. *)
+val create_with_info :
+  info:info ->
+  heartbeat:(Payload.t list -> (unit, Error.t) result) ->
+  details:Payload.t list ->
+  heartbeat_timeout:Duration.t option ->
+  t
+
+(** Creates a context for a backend that cannot submit native heartbeats. It
+    carries no Core task metadata. *)
 val unavailable :
   details:Payload.t list -> heartbeat_timeout:Duration.t option -> t
+
+(** Returns the task metadata supplied when the context was created, or [None]
+    for a synthetic context. The record holds only immutable values, so it
+    remains readable after invalidation. *)
+val info : t -> info option
 
 (** Submits copied heartbeat details while the attempt is active. Success does
     not change {!details}. *)
