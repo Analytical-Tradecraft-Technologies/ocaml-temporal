@@ -38,6 +38,35 @@ uncertain result for an unavailable terminate, and a persistently unavailable
 signal returning within its budget. See
 [the Core bridge reference](reference/core-bridge.md#native-client-start-and-exact-run-wait).
 
+## 2026-10-06: Large client signal, query, and update inputs (#771)
+
+The Rust bridge decoded signal, query, and update requests with the generic
+object parser, which applies the 65,536-byte text limit to base64 payload
+data. Any input over 49,152 raw bytes was therefore rejected before the RPC,
+and OCaml reported it as a malformed client error. These requests now use the
+same payload-aware decoder as workflow start: each payload byte field may hold
+128 MiB inside the 192 MiB document limit, while identifiers, handler names,
+and metadata keys keep the 65,536-byte text limit. Rust ABI tests submit
+payloads at and above the old ceiling, at exactly 128 MiB, and one base64
+quantum above it, plus identifiers and metadata keys at and above the text
+limit, to an unconnected runtime and check which ones reach the lifecycle
+guard. An OCaml test sends payloads from the real OCaml encoders through the
+C stubs to the same guard.
+
+## 2026-10-06: Stopping a worker from a signal handler (#830)
+
+An OCaml signal handler may run on the thread blocked in `Worker.run`, so in a
+single-Domain program the natural `SIGTERM` handler calling `Worker.shutdown`
+was rejected as re-entrant and the worker never stopped. The new
+`Worker.request_shutdown` is a single atomic write that both run lanes treat
+as a stop at their next check; `run` returns `Ok ()` and the application then
+calls `Worker.shutdown` to drain and release the worker. A re-entrant
+`shutdown` still returns a defect but now posts the same request. A runtime
+model test raises a real `SIGUSR1` against a loop on the main thread, a mock
+worker test raises it from inside an activity callback, and the examples and
+the Compose smoke worker now use the handler directly instead of a watcher
+Domain.
+
 ## 2026-10-06: Retained completions fail closed (#843)
 
 The workflow and activity adapters used to resubmit every retained completion
@@ -2701,3 +2730,38 @@ the per-series replacements listed in `scripts/opam-lock-overrides.txt`
 Local validation covered the repository contract scripts and a stub-OPAM test
 of the installer; the image builds and native installs are validated by the
 hosted CI matrix.
+
+## 2026-10-06: Dispose acknowledges Core's follow-up evictions (#775)
+
+Runtime close force-fails each workflow activation OCaml still holds and
+tombstones its run ID. Core answers that failure with a same-run cache
+eviction, which the workflow poll lane used to drop as a retired duplicate, so
+the workflow poll never reported `ShutDown`: close waited out the 90 s drain
+bound and released an unfinalized worker. The lane now acknowledges a retired
+run's pure eviction with an empty completion, and dispose's own
+force-completion acknowledges leased or queued evictions empty instead of
+failing them. The ledger records each run's eviction bit when the poll lane
+admits it, so an entry admitted but not yet enqueued at the disposal snapshot
+is still acknowledged rather than failed.
+`rust/core-bridge/tests/runtime_dispose_eviction.rs` drives a
+leased activation through runtime close against a gRPC double and fails
+within 30 s without the fix.
+
+## 2026-10-06: Workflow and activity execution info (#792)
+
+`Temporal.Workflow.info ()` and `Temporal.Workflow.is_replaying ()` expose the
+run identity Core sends in the initialization job (workflow and run IDs, first
+run ID, type, attempt, parent, start time), the worker task queue, and the
+task-local replay flag, history length/size, and continue-as-new suggestion
+that the native adapter now installs before every activation alongside the
+existing clock and deployment metadata. `Temporal.Activity.Context.info`
+exposes the start task's namespace, workflow identity, activity ID/type,
+attempt, local flag, and timestamps. Both are abstract accessor modules so
+fields can be added compatibly. No bridge protocol change was needed: every
+value already crossed the private JSON boundary. The workflow namespace is not
+exposed yet because activations do not carry it and the worker adapter does
+not pass it to executions; asynchronous activity contexts do not expose info
+yet. `test/runtime/test_execution_info.ml` drives live and replayed native
+activations through the adapter and covers the detached, synthetic, and
+standalone-activity paths; the native activity adapter test checks the
+forwarded task identity.

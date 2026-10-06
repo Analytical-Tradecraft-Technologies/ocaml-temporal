@@ -1332,6 +1332,28 @@ let activate execution activation =
                 execution_expiration_time = context.workflow_execution_expiration_time })
         in
         Execution.set_start_metadata execution metadata;
+        let context = initialization.context in
+        Execution.set_run_info execution
+          (Some
+             Workflow_context_store.
+               {
+                 workflow_id = initialization.workflow_id;
+                 run_id = translated.run_id;
+                 workflow_type = initialization.workflow_type;
+                 attempt = initialization.attempt;
+                 first_execution_run_id =
+                   Option.fold ~none:"" context
+                     ~some:(fun (context : Protocol.initialize_context) ->
+                       context.first_execution_run_id);
+                 parent =
+                   Option.bind context
+                     (fun (context : Protocol.initialize_context) ->
+                       context.parent_workflow);
+                 start_time =
+                   Option.bind context
+                     (fun (context : Protocol.initialize_context) ->
+                       context.start_time);
+               });
         Ok ()
   in
   (* Install the activation's deterministic clock before entering user code.
@@ -1348,6 +1370,25 @@ let activate execution activation =
   in
   Execution.set_activation_deployment_version execution deployment_version;
   Execution.set_activation_is_replaying execution translated.is_replaying;
+  (* History facts are task-local like the replay flag: a synthetic activation
+     without metadata clears continue-as-new advice instead of keeping the
+     previous task's value. The decoder bounds the length to uint32, which
+     fits [int] on supported 64-bit targets, and the size to uint64; a size
+     beyond OCaml's native [int] range is reported as absent rather than
+     wrapped. *)
+  Execution.set_activation_history execution
+    Workflow_context_store.
+      {
+        history_length = Int64.to_int translated.history_length;
+        history_size_bytes =
+          Option.bind translated.metadata
+            (fun (metadata : Protocol.activation_metadata) ->
+              int_of_string_opt metadata.history_size_bytes);
+        continue_as_new_suggested =
+          Option.fold ~none:false translated.metadata
+            ~some:(fun (metadata : Protocol.activation_metadata) ->
+              metadata.continue_as_new_suggested);
+      };
   let commands = Execution.activate execution translated.jobs in
   let* completion =
     match Execution.task_failure execution with

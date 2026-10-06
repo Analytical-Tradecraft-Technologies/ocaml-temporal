@@ -199,12 +199,111 @@ fn take_all_outstanding_drains_workflow_and_activity_debt() {
         Ok(Admission::New)
     );
     let (workflows, activities) = ledger.take_all_outstanding();
-    assert_eq!(workflows, vec!["run-1".to_owned()]);
+    assert_eq!(workflows, vec![("run-1".to_owned(), false)]);
     assert_eq!(activities, vec![token.to_vec()]);
     assert_eq!(ledger.outstanding(), 0);
     assert!(!ledger.can_finalize()); // still Open, not Draining
     ledger.begin_draining();
     assert!(ledger.can_finalize());
+}
+
+/// The disposal snapshot reports which leased runs are pure cache evictions,
+/// so dispose acknowledges them empty instead of failing them (issue #775).
+/// An entry admitted without an eviction bit (here through the bit-less
+/// `admit_workflow`) reports `false`.
+#[test]
+fn take_all_outstanding_reports_leased_eviction_bits() {
+    let mut ledger = TaskLedger::new();
+    assert_eq!(ledger.admit_workflow("evicted-run"), Ok(Admission::New));
+    assert_eq!(
+        ledger.lease_workflow_activation("evicted-run", true),
+        Ok(())
+    );
+    assert_eq!(ledger.admit_workflow("task-run"), Ok(Admission::New));
+    assert_eq!(ledger.lease_workflow_activation("task-run", false), Ok(()));
+    assert_eq!(ledger.admit_workflow("queued-run"), Ok(Admission::New));
+
+    let (mut workflows, activities) = ledger.take_all_outstanding();
+    workflows.sort();
+    assert_eq!(
+        workflows,
+        vec![
+            ("evicted-run".to_owned(), true),
+            ("queued-run".to_owned(), false),
+            ("task-run".to_owned(), false),
+        ]
+    );
+    assert!(activities.is_empty());
+    assert!(!ledger.is_eviction_lease("evicted-run"));
+    assert_eq!(
+        ledger.admit_polled_workflow("evicted-run"),
+        Err(AdmitError::Retired)
+    );
+}
+
+/// Regression for the PR #919 review race: the workflow poll lane admits a
+/// pure eviction into the ledger and only afterwards enqueues its message. A
+/// disposal snapshot taken in that window cannot see the message in the ready
+/// queue, and its later queue entry is skipped as already completed, so the
+/// snapshot alone must report the eviction bit. Recording the bit atomically
+/// with admission makes the unleased, unqueued entry report `true`.
+#[test]
+fn take_all_outstanding_reports_eviction_bit_admitted_before_enqueue() {
+    let mut ledger = TaskLedger::new();
+    assert_eq!(
+        ledger.admit_polled_workflow_activation("admitted-eviction", true),
+        Ok(Admission::New)
+    );
+    assert_eq!(
+        ledger.admit_polled_workflow_activation("admitted-task", false),
+        Ok(Admission::New)
+    );
+    assert!(ledger.is_eviction_lease("admitted-eviction"));
+    assert!(!ledger.is_eviction_lease("admitted-task"));
+
+    // Disposal snapshots the ledger before either message is enqueued or
+    // leased.
+    ledger.begin_draining();
+    let (mut workflows, activities) = ledger.take_all_outstanding();
+    workflows.sort();
+    assert_eq!(
+        workflows,
+        vec![
+            ("admitted-eviction".to_owned(), true),
+            ("admitted-task".to_owned(), false),
+        ]
+    );
+    assert!(activities.is_empty());
+    assert!(!ledger.is_eviction_lease("admitted-eviction"));
+    assert!(ledger.can_finalize());
+}
+
+/// A duplicate admission must not reclassify the activation that already owns
+/// the run ID, and abandoning an unleased admission clears its eviction bit so
+/// the set never outgrows the outstanding workflow map.
+#[test]
+fn admission_eviction_bit_survives_duplicates_and_clears_on_abandon() {
+    let mut ledger = TaskLedger::new();
+    assert_eq!(
+        ledger.admit_polled_workflow_activation("run-1", true),
+        Ok(Admission::New)
+    );
+    assert_eq!(
+        ledger.admit_polled_workflow_activation("run-1", false),
+        Ok(Admission::Duplicate)
+    );
+    assert!(ledger.is_eviction_lease("run-1"));
+
+    ledger.abandon_workflow_admission("run-1");
+    assert_eq!(ledger.outstanding_workflows(), 0);
+    assert!(!ledger.is_eviction_lease("run-1"));
+
+    // A fresh non-eviction admission of the same run starts unclassified.
+    assert_eq!(
+        ledger.admit_polled_workflow_activation("run-1", false),
+        Ok(Admission::New)
+    );
+    assert!(!ledger.is_eviction_lease("run-1"));
 }
 
 /// A poll already in Core can finish after the first dispose drain has emptied
@@ -224,7 +323,7 @@ fn post_join_dispose_pass_harvests_late_poll_admissions() {
     // This models the first force-complete pass, which runs before the poll
     // lanes join so Core can observe shutdown without waiting for OCaml.
     let (initial_workflows, initial_activities) = ledger.take_all_outstanding();
-    assert_eq!(initial_workflows, vec!["initial-run".to_owned()]);
+    assert_eq!(initial_workflows, vec![("initial-run".to_owned(), false)]);
     assert_eq!(initial_activities, vec![initial_token.to_vec()]);
 
     // A same-identity poll racing after the snapshot is rejected before the
@@ -251,7 +350,7 @@ fn post_join_dispose_pass_harvests_late_poll_admissions() {
     );
 
     let (late_workflows, late_activities) = ledger.take_all_outstanding();
-    assert_eq!(late_workflows, vec!["late-run".to_owned()]);
+    assert_eq!(late_workflows, vec![("late-run".to_owned(), false)]);
     assert_eq!(late_activities, vec![late_token.to_vec()]);
     assert_eq!(ledger.outstanding(), 0);
     assert_eq!(
@@ -286,7 +385,10 @@ fn disposal_snapshot_queue_boundary_retires_workflow_and_activity_once() {
     // Snapshot phase: both initial identities become retired before any late
     // poll result can be reconciled.
     let (initial_workflows, initial_activities) = ledger.take_all_outstanding();
-    assert_eq!(initial_workflows, vec!["initial-dispose-run".to_owned()]);
+    assert_eq!(
+        initial_workflows,
+        vec![("initial-dispose-run".to_owned(), false)]
+    );
     assert_eq!(initial_activities, vec![initial_token.to_vec()]);
     assert_eq!(
         ledger.admit_polled_workflow("initial-dispose-run"),
