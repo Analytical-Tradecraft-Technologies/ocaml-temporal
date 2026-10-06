@@ -1180,6 +1180,15 @@ let test_native_client_configuration_boundary () =
   expect_error_message_contains "bridge" "native client configuration failed"
     (Temporal.Client.create ~target_url:"http://" ~namespace:"unit-test" ())
 
+(** A refused native connection reports its closed cause category through the
+    public error message (#833), so an unreachable endpoint is
+    distinguishable from DNS, TLS, or timeout failures. Loopback port 1 is
+    closed on every supported platform, so no Temporal Server is needed. *)
+let test_native_client_connection_cause () =
+  expect_error_message_contains "bridge" "(cause=refused)"
+    (Temporal.Client.create ~target_url:"http://127.0.0.1:1"
+       ~namespace:"unit-test" ())
+
 (** The worker task queue is required configuration and is passed through the
     private backend boundary before any worker graph is allocated. *)
 let test_worker_validation_errors () =
@@ -1347,6 +1356,7 @@ let () =
   test_client_identifier_utf_8_validation ();
   test_client_start_payload_metadata_validation ();
   test_native_client_configuration_boundary ();
+  test_native_client_connection_cause ();
   test_worker_validation_errors ();
   test_native_worker_configuration_boundary ();
   test_native_worker_requires_a_task_type ();
