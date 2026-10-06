@@ -25,5 +25,6 @@
   test_condition
   test_external_workflow
   test_settle_scaling
-  test_execution_info)
+  test_execution_info
+  test_thread_context_isolation)
  (libraries temporal-sdk temporal_runtime unix))
