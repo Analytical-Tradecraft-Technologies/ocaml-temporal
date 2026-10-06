@@ -2,10 +2,10 @@ use std::ptr;
 
 use ocaml_temporal_core_bridge::{
     Buffer, Result as AbiResult, STATUS_CONFIGURATION, STATUS_CONNECTION, STATUS_INVALID_ARGUMENT,
-    STATUS_INVALID_STATE, STATUS_OK, ocaml_temporal_core_v2_client_connect_json,
-    ocaml_temporal_core_v2_client_disconnect, ocaml_temporal_core_v2_result_free,
-    ocaml_temporal_core_v2_runtime_free, ocaml_temporal_core_v2_runtime_new,
-    ocaml_temporal_core_v2_worker_shutdown, ocaml_temporal_core_v2_worker_start_json,
+    STATUS_INVALID_STATE, STATUS_OK, ocaml_temporal_core_v3_client_connect_json,
+    ocaml_temporal_core_v3_client_disconnect, ocaml_temporal_core_v3_result_free,
+    ocaml_temporal_core_v3_runtime_free, ocaml_temporal_core_v3_runtime_new,
+    ocaml_temporal_core_v3_worker_shutdown, ocaml_temporal_core_v3_worker_start_json,
 };
 
 /// Returns initialized writable result storage matching the public C contract.
@@ -31,12 +31,12 @@ fn runtime() -> *mut ocaml_temporal_core_bridge::Runtime {
     let mut result = empty_result();
     assert_eq!(
         // SAFETY: Both output locations are writable and exclusively owned.
-        unsafe { ocaml_temporal_core_v2_runtime_new(&mut runtime, &mut result) },
+        unsafe { ocaml_temporal_core_v3_runtime_new(&mut runtime, &mut result) },
         STATUS_OK
     );
     // SAFETY: The bridge initialized `result` and this test owns it uniquely.
     assert_eq!(
-        unsafe { ocaml_temporal_core_v2_result_free(&mut result) },
+        unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
         STATUS_OK
     );
     assert!(!runtime.is_null());
@@ -49,7 +49,7 @@ fn connect(runtime: *mut ocaml_temporal_core_bridge::Runtime, config: &[u8]) -> 
     // SAFETY: The runtime is live, the byte span remains readable for the
     // complete blocking call, and the output is uniquely writable.
     unsafe {
-        ocaml_temporal_core_v2_client_connect_json(
+        ocaml_temporal_core_v3_client_connect_json(
             runtime,
             config.as_ptr(),
             config.len(),
@@ -65,7 +65,7 @@ fn start_worker(runtime: *mut ocaml_temporal_core_bridge::Runtime, config: &[u8]
     // SAFETY: The runtime, input, and result satisfy the same exclusive
     // ownership contract as `connect`.
     unsafe {
-        ocaml_temporal_core_v2_worker_start_json(
+        ocaml_temporal_core_v3_worker_start_json(
             runtime,
             config.as_ptr(),
             config.len(),
@@ -81,7 +81,7 @@ fn consume(mut result: AbiResult, expected_status: i32) -> String {
     let message = String::from_utf8(bytes(&result.error)).expect("diagnostic is UTF-8");
     // SAFETY: This helper has exclusive ownership of the initialized result.
     assert_eq!(
-        unsafe { ocaml_temporal_core_v2_result_free(&mut result) },
+        unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
         STATUS_OK
     );
     message
@@ -104,7 +104,7 @@ fn client_configuration_rejects_unknown_fields_without_echoing_them() {
     assert_eq!(message, "invalid lifecycle configuration JSON");
     // SAFETY: The runtime slot is live and uniquely owned.
     assert_eq!(
-        unsafe { ocaml_temporal_core_v2_runtime_free(&mut runtime) },
+        unsafe { ocaml_temporal_core_v3_runtime_free(&mut runtime) },
         STATUS_OK
     );
     assert!(runtime.is_null());
@@ -122,7 +122,7 @@ fn malformed_lifecycle_configuration_has_a_closed_diagnostic() {
     // SAFETY: Parsing failed before any child was published, and this test
     // retains exclusive ownership of the runtime pointer slot.
     assert_eq!(
-        unsafe { ocaml_temporal_core_v2_runtime_free(&mut runtime) },
+        unsafe { ocaml_temporal_core_v3_runtime_free(&mut runtime) },
         STATUS_OK
     );
 }
@@ -143,7 +143,7 @@ fn client_configuration_validates_url_and_identity() {
     // SAFETY: The runtime remains live because both failures occurred before
     // graph mutation, and this test exclusively owns its pointer slot.
     assert_eq!(
-        unsafe { ocaml_temporal_core_v2_runtime_free(&mut runtime) },
+        unsafe { ocaml_temporal_core_v3_runtime_free(&mut runtime) },
         STATUS_OK
     );
 }
@@ -166,7 +166,7 @@ fn connection_failure_is_structured_and_rolls_back_state() {
     // SAFETY: Failed constructors retained no child resource, and the runtime
     // slot is exclusively owned by this test.
     assert_eq!(
-        unsafe { ocaml_temporal_core_v2_runtime_free(&mut runtime) },
+        unsafe { ocaml_temporal_core_v3_runtime_free(&mut runtime) },
         STATUS_OK
     );
 }
@@ -190,7 +190,7 @@ fn worker_requires_connected_client() {
     assert!(message.contains("client is not connected"), "{message}");
     // SAFETY: No child handle was constructed; the runtime slot is exclusive.
     assert_eq!(
-        unsafe { ocaml_temporal_core_v2_runtime_free(&mut runtime) },
+        unsafe { ocaml_temporal_core_v3_runtime_free(&mut runtime) },
         STATUS_OK
     );
 }
@@ -205,21 +205,21 @@ fn repeated_child_close_is_idempotent() {
         assert_eq!(
             // SAFETY: The runtime and result are exclusively owned for the
             // duration of this synchronous operation.
-            unsafe { ocaml_temporal_core_v2_worker_shutdown(runtime, &mut result) },
+            unsafe { ocaml_temporal_core_v3_worker_shutdown(runtime, &mut result) },
             STATUS_OK
         );
         consume(result, STATUS_OK);
         let mut result = empty_result();
         assert_eq!(
             // SAFETY: The same ownership reasoning applies to client close.
-            unsafe { ocaml_temporal_core_v2_client_disconnect(runtime, &mut result) },
+            unsafe { ocaml_temporal_core_v3_client_disconnect(runtime, &mut result) },
             STATUS_OK
         );
         consume(result, STATUS_OK);
     }
     // SAFETY: The runtime slot is valid and uniquely owned.
     assert_eq!(
-        unsafe { ocaml_temporal_core_v2_runtime_free(&mut runtime) },
+        unsafe { ocaml_temporal_core_v3_runtime_free(&mut runtime) },
         STATUS_OK
     );
 }
@@ -234,7 +234,7 @@ fn lifecycle_operations_reject_null_pointers() {
         // SAFETY: This intentionally supplies a null runtime to exercise the
         // documented defensive branch.
         unsafe {
-            ocaml_temporal_core_v2_client_connect_json(
+            ocaml_temporal_core_v3_client_connect_json(
                 ptr::null_mut(),
                 config.as_ptr(),
                 config.len(),
@@ -267,23 +267,23 @@ fn real_client_worker_lifecycle() {
     for _ in 0..2 {
         let mut result = empty_result();
         // SAFETY: The graph owner and result are exclusive to this test.
-        unsafe { ocaml_temporal_core_v2_worker_shutdown(runtime, &mut result) };
+        unsafe { ocaml_temporal_core_v3_worker_shutdown(runtime, &mut result) };
         consume(result, STATUS_OK);
     }
     for _ in 0..2 {
         let mut result = empty_result();
         // SAFETY: The worker has closed and graph ownership remains exclusive.
-        unsafe { ocaml_temporal_core_v2_client_disconnect(runtime, &mut result) };
+        unsafe { ocaml_temporal_core_v3_client_disconnect(runtime, &mut result) };
         consume(result, STATUS_OK);
     }
     // SAFETY: Children are closed, though runtime close also defensively
     // guarantees reverse-order cleanup itself.
     assert_eq!(
-        unsafe { ocaml_temporal_core_v2_runtime_free(&mut runtime) },
+        unsafe { ocaml_temporal_core_v3_runtime_free(&mut runtime) },
         STATUS_OK
     );
     assert_eq!(
-        unsafe { ocaml_temporal_core_v2_runtime_free(&mut runtime) },
+        unsafe { ocaml_temporal_core_v3_runtime_free(&mut runtime) },
         STATUS_OK
     );
 }

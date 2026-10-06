@@ -35,7 +35,7 @@ module Observability = Temporal_base.Observability
 module Control_protocol = Temporal_protocol.Control_protocol
 
 (** Version requested by this binding layer. *)
-let abi_version = 2l
+let abi_version = 3l
 
 (** Private OCaml value implemented in C. It owns a Rust result allocation until
     [decode] frees it or the OCaml garbage collector runs its finalizer. *)
