@@ -4,16 +4,16 @@ use std::ptr;
 
 use ocaml_temporal_core_bridge::{
     Buffer, Result as AbiResult, STATUS_INVALID_ARGUMENT, STATUS_INVALID_STATE, STATUS_OK,
-    STATUS_PROTOCOL, ocaml_temporal_core_v3_client_begin_start_workflow_json,
-    ocaml_temporal_core_v3_client_cancel_workflow_json,
-    ocaml_temporal_core_v3_client_list_visibility_json,
-    ocaml_temporal_core_v3_client_poll_start_workflow_json,
-    ocaml_temporal_core_v3_client_query_workflow_json,
-    ocaml_temporal_core_v3_client_signal_workflow_json,
-    ocaml_temporal_core_v3_client_start_workflow_json,
-    ocaml_temporal_core_v3_client_wait_start_workflow_json,
-    ocaml_temporal_core_v3_client_wait_workflow_json, ocaml_temporal_core_v3_result_free,
-    ocaml_temporal_core_v3_runtime_free, ocaml_temporal_core_v3_runtime_new,
+    STATUS_PROTOCOL, ocaml_temporal_core_v4_client_begin_start_workflow_json,
+    ocaml_temporal_core_v4_client_cancel_workflow_json,
+    ocaml_temporal_core_v4_client_list_visibility_json,
+    ocaml_temporal_core_v4_client_poll_start_workflow_json,
+    ocaml_temporal_core_v4_client_query_workflow_json,
+    ocaml_temporal_core_v4_client_signal_workflow_json,
+    ocaml_temporal_core_v4_client_start_workflow_json,
+    ocaml_temporal_core_v4_client_wait_start_workflow_json,
+    ocaml_temporal_core_v4_client_wait_workflow_json, ocaml_temporal_core_v4_result_free,
+    ocaml_temporal_core_v4_runtime_free, ocaml_temporal_core_v4_runtime_new,
 };
 
 /// Produces writable initialized storage matching the ABI result contract.
@@ -53,7 +53,7 @@ fn client_operations_reject_null_runtime() {
     let mut result = empty_result();
     assert_eq!(
         unsafe {
-            ocaml_temporal_core_v3_client_start_workflow_json(
+            ocaml_temporal_core_v4_client_start_workflow_json(
                 ptr::null_mut(),
                 START_REQUEST.as_ptr(),
                 START_REQUEST.len(),
@@ -63,13 +63,13 @@ fn client_operations_reject_null_runtime() {
         STATUS_INVALID_ARGUMENT
     );
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
+        unsafe { ocaml_temporal_core_v4_result_free(&mut result) },
         STATUS_OK
     );
 
     assert_eq!(
         unsafe {
-            ocaml_temporal_core_v3_client_wait_workflow_json(
+            ocaml_temporal_core_v4_client_wait_workflow_json(
                 ptr::null_mut(),
                 WAIT_REQUEST.as_ptr(),
                 WAIT_REQUEST.len(),
@@ -79,13 +79,13 @@ fn client_operations_reject_null_runtime() {
         STATUS_INVALID_ARGUMENT
     );
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
+        unsafe { ocaml_temporal_core_v4_result_free(&mut result) },
         STATUS_OK
     );
 
     assert_eq!(
         unsafe {
-            ocaml_temporal_core_v3_client_list_visibility_json(
+            ocaml_temporal_core_v4_client_list_visibility_json(
                 ptr::null_mut(),
                 VISIBILITY_REQUEST.as_ptr(),
                 VISIBILITY_REQUEST.len(),
@@ -95,7 +95,7 @@ fn client_operations_reject_null_runtime() {
         STATUS_INVALID_ARGUMENT
     );
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
+        unsafe { ocaml_temporal_core_v4_result_free(&mut result) },
         STATUS_OK
     );
 }
@@ -107,17 +107,17 @@ fn client_operations_require_connected_client() {
     let mut runtime = ptr::null_mut();
     let mut result = empty_result();
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_runtime_new(&mut runtime, &mut result) },
+        unsafe { ocaml_temporal_core_v4_runtime_new(&mut runtime, &mut result) },
         STATUS_OK
     );
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
+        unsafe { ocaml_temporal_core_v4_result_free(&mut result) },
         STATUS_OK
     );
 
     assert_eq!(
         unsafe {
-            ocaml_temporal_core_v3_client_start_workflow_json(
+            ocaml_temporal_core_v4_client_start_workflow_json(
                 runtime,
                 START_REQUEST.as_ptr(),
                 START_REQUEST.len(),
@@ -128,13 +128,13 @@ fn client_operations_require_connected_client() {
     );
     assert!(!error_bytes(&result).is_empty());
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
+        unsafe { ocaml_temporal_core_v4_result_free(&mut result) },
         STATUS_OK
     );
 
     assert_eq!(
         unsafe {
-            ocaml_temporal_core_v3_client_wait_workflow_json(
+            ocaml_temporal_core_v4_client_wait_workflow_json(
                 runtime,
                 WAIT_REQUEST.as_ptr(),
                 WAIT_REQUEST.len(),
@@ -145,12 +145,12 @@ fn client_operations_require_connected_client() {
     );
     assert!(!error_bytes(&result).is_empty());
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
+        unsafe { ocaml_temporal_core_v4_result_free(&mut result) },
         STATUS_OK
     );
 
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_runtime_free(&mut runtime) },
+        unsafe { ocaml_temporal_core_v4_runtime_free(&mut runtime) },
         STATUS_OK
     );
     assert!(runtime.is_null());
@@ -164,17 +164,17 @@ fn async_start_operations_require_connected_client() {
     let mut runtime = ptr::null_mut();
     let mut result = empty_result();
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_runtime_new(&mut runtime, &mut result) },
+        unsafe { ocaml_temporal_core_v4_runtime_new(&mut runtime, &mut result) },
         STATUS_OK
     );
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
+        unsafe { ocaml_temporal_core_v4_result_free(&mut result) },
         STATUS_OK
     );
 
     assert_eq!(
         unsafe {
-            ocaml_temporal_core_v3_client_begin_start_workflow_json(
+            ocaml_temporal_core_v4_client_begin_start_workflow_json(
                 runtime,
                 START_REQUEST.as_ptr(),
                 START_REQUEST.len(),
@@ -184,12 +184,12 @@ fn async_start_operations_require_connected_client() {
         STATUS_INVALID_STATE
     );
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
+        unsafe { ocaml_temporal_core_v4_result_free(&mut result) },
         STATUS_OK
     );
     assert_eq!(
         unsafe {
-            ocaml_temporal_core_v3_client_poll_start_workflow_json(
+            ocaml_temporal_core_v4_client_poll_start_workflow_json(
                 runtime,
                 START_TICKET.as_ptr(),
                 START_TICKET.len(),
@@ -199,12 +199,12 @@ fn async_start_operations_require_connected_client() {
         STATUS_INVALID_STATE
     );
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
+        unsafe { ocaml_temporal_core_v4_result_free(&mut result) },
         STATUS_OK
     );
     assert_eq!(
         unsafe {
-            ocaml_temporal_core_v3_client_wait_start_workflow_json(
+            ocaml_temporal_core_v4_client_wait_start_workflow_json(
                 runtime,
                 START_TICKET.as_ptr(),
                 START_TICKET.len(),
@@ -214,11 +214,11 @@ fn async_start_operations_require_connected_client() {
         STATUS_INVALID_STATE
     );
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
+        unsafe { ocaml_temporal_core_v4_result_free(&mut result) },
         STATUS_OK
     );
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_runtime_free(&mut runtime) },
+        unsafe { ocaml_temporal_core_v4_runtime_free(&mut runtime) },
         STATUS_OK
     );
 }
@@ -230,16 +230,16 @@ fn client_operations_validate_json_before_state_use() {
     let mut result = empty_result();
     let malformed = b"{}";
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_runtime_new(&mut runtime, &mut result) },
+        unsafe { ocaml_temporal_core_v4_runtime_new(&mut runtime, &mut result) },
         STATUS_OK
     );
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
+        unsafe { ocaml_temporal_core_v4_result_free(&mut result) },
         STATUS_OK
     );
     assert_eq!(
         unsafe {
-            ocaml_temporal_core_v3_client_start_workflow_json(
+            ocaml_temporal_core_v4_client_start_workflow_json(
                 runtime,
                 malformed.as_ptr(),
                 malformed.len(),
@@ -249,14 +249,14 @@ fn client_operations_validate_json_before_state_use() {
         STATUS_PROTOCOL
     );
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
+        unsafe { ocaml_temporal_core_v4_result_free(&mut result) },
         STATUS_OK
     );
 
     let malformed_wait = br#"{}"#;
     assert_eq!(
         unsafe {
-            ocaml_temporal_core_v3_client_wait_workflow_json(
+            ocaml_temporal_core_v4_client_wait_workflow_json(
                 runtime,
                 malformed_wait.as_ptr(),
                 malformed_wait.len(),
@@ -266,12 +266,12 @@ fn client_operations_validate_json_before_state_use() {
         STATUS_PROTOCOL
     );
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
+        unsafe { ocaml_temporal_core_v4_result_free(&mut result) },
         STATUS_OK
     );
 
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_runtime_free(&mut runtime) },
+        unsafe { ocaml_temporal_core_v4_runtime_free(&mut runtime) },
         STATUS_OK
     );
 }
@@ -286,11 +286,11 @@ fn client_cancel_validates_json_before_state_use() {
     let mut result = empty_result();
     let malformed_cancel = br#"{}"#;
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_runtime_new(&mut runtime, &mut result) },
+        unsafe { ocaml_temporal_core_v4_runtime_new(&mut runtime, &mut result) },
         STATUS_OK
     );
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
+        unsafe { ocaml_temporal_core_v4_result_free(&mut result) },
         STATUS_OK
     );
 
@@ -298,7 +298,7 @@ fn client_cancel_validates_json_before_state_use() {
     // protocol status proves validation happened before state lookup.
     assert_eq!(
         unsafe {
-            ocaml_temporal_core_v3_client_cancel_workflow_json(
+            ocaml_temporal_core_v4_client_cancel_workflow_json(
                 runtime,
                 malformed_cancel.as_ptr(),
                 malformed_cancel.len(),
@@ -308,12 +308,12 @@ fn client_cancel_validates_json_before_state_use() {
         STATUS_PROTOCOL
     );
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
+        unsafe { ocaml_temporal_core_v4_result_free(&mut result) },
         STATUS_OK
     );
 
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_runtime_free(&mut runtime) },
+        unsafe { ocaml_temporal_core_v4_runtime_free(&mut runtime) },
         STATUS_OK
     );
     assert!(runtime.is_null());
@@ -326,17 +326,17 @@ fn client_signal_validates_json_before_state_use() {
     let mut runtime = ptr::null_mut();
     let mut result = empty_result();
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_runtime_new(&mut runtime, &mut result) },
+        unsafe { ocaml_temporal_core_v4_runtime_new(&mut runtime, &mut result) },
         STATUS_OK
     );
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
+        unsafe { ocaml_temporal_core_v4_result_free(&mut result) },
         STATUS_OK
     );
 
     assert_eq!(
         unsafe {
-            ocaml_temporal_core_v3_client_signal_workflow_json(
+            ocaml_temporal_core_v4_client_signal_workflow_json(
                 runtime,
                 br#"{}"#.as_ptr(),
                 2,
@@ -346,7 +346,7 @@ fn client_signal_validates_json_before_state_use() {
         STATUS_PROTOCOL
     );
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
+        unsafe { ocaml_temporal_core_v4_result_free(&mut result) },
         STATUS_OK
     );
 
@@ -354,7 +354,7 @@ fn client_signal_validates_json_before_state_use() {
     // this test deliberately has not connected a Temporal client.
     assert_eq!(
         unsafe {
-            ocaml_temporal_core_v3_client_signal_workflow_json(
+            ocaml_temporal_core_v4_client_signal_workflow_json(
                 runtime,
                 SIGNAL_REQUEST.as_ptr(),
                 SIGNAL_REQUEST.len(),
@@ -364,12 +364,12 @@ fn client_signal_validates_json_before_state_use() {
         STATUS_INVALID_STATE
     );
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
+        unsafe { ocaml_temporal_core_v4_result_free(&mut result) },
         STATUS_OK
     );
 
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_runtime_free(&mut runtime) },
+        unsafe { ocaml_temporal_core_v4_runtime_free(&mut runtime) },
         STATUS_OK
     );
 }
@@ -382,17 +382,17 @@ fn client_query_validates_json_before_state_use() {
     let mut runtime = ptr::null_mut();
     let mut result = empty_result();
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_runtime_new(&mut runtime, &mut result) },
+        unsafe { ocaml_temporal_core_v4_runtime_new(&mut runtime, &mut result) },
         STATUS_OK
     );
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
+        unsafe { ocaml_temporal_core_v4_result_free(&mut result) },
         STATUS_OK
     );
 
     assert_eq!(
         unsafe {
-            ocaml_temporal_core_v3_client_query_workflow_json(
+            ocaml_temporal_core_v4_client_query_workflow_json(
                 runtime,
                 br#"{}"#.as_ptr(),
                 2,
@@ -402,13 +402,13 @@ fn client_query_validates_json_before_state_use() {
         STATUS_PROTOCOL
     );
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
+        unsafe { ocaml_temporal_core_v4_result_free(&mut result) },
         STATUS_OK
     );
 
     assert_eq!(
         unsafe {
-            ocaml_temporal_core_v3_client_query_workflow_json(
+            ocaml_temporal_core_v4_client_query_workflow_json(
                 runtime,
                 QUERY_REQUEST.as_ptr(),
                 QUERY_REQUEST.len(),
@@ -418,11 +418,11 @@ fn client_query_validates_json_before_state_use() {
         STATUS_INVALID_STATE
     );
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
+        unsafe { ocaml_temporal_core_v4_result_free(&mut result) },
         STATUS_OK
     );
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_runtime_free(&mut runtime) },
+        unsafe { ocaml_temporal_core_v4_runtime_free(&mut runtime) },
         STATUS_OK
     );
 }
@@ -433,40 +433,40 @@ fn client_operations_reject_null_input_spans() {
     let mut runtime = ptr::null_mut();
     let mut result = empty_result();
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_runtime_new(&mut runtime, &mut result) },
+        unsafe { ocaml_temporal_core_v4_runtime_new(&mut runtime, &mut result) },
         STATUS_OK
     );
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
-        STATUS_OK
-    );
-
-    assert_eq!(
-        unsafe {
-            ocaml_temporal_core_v3_client_start_workflow_json(runtime, ptr::null(), 1, &mut result)
-        },
-        STATUS_INVALID_ARGUMENT
-    );
-    assert!(!error_bytes(&result).is_empty());
-    assert_eq!(
-        unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
+        unsafe { ocaml_temporal_core_v4_result_free(&mut result) },
         STATUS_OK
     );
 
     assert_eq!(
         unsafe {
-            ocaml_temporal_core_v3_client_wait_workflow_json(runtime, ptr::null(), 1, &mut result)
+            ocaml_temporal_core_v4_client_start_workflow_json(runtime, ptr::null(), 1, &mut result)
         },
         STATUS_INVALID_ARGUMENT
     );
     assert!(!error_bytes(&result).is_empty());
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
+        unsafe { ocaml_temporal_core_v4_result_free(&mut result) },
         STATUS_OK
     );
 
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_runtime_free(&mut runtime) },
+        unsafe {
+            ocaml_temporal_core_v4_client_wait_workflow_json(runtime, ptr::null(), 1, &mut result)
+        },
+        STATUS_INVALID_ARGUMENT
+    );
+    assert!(!error_bytes(&result).is_empty());
+    assert_eq!(
+        unsafe { ocaml_temporal_core_v4_result_free(&mut result) },
+        STATUS_OK
+    );
+
+    assert_eq!(
+        unsafe { ocaml_temporal_core_v4_runtime_free(&mut runtime) },
         STATUS_OK
     );
 }
@@ -478,18 +478,18 @@ fn client_operations_reject_oversized_documents() {
     let mut runtime = ptr::null_mut();
     let mut result = empty_result();
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_runtime_new(&mut runtime, &mut result) },
+        unsafe { ocaml_temporal_core_v4_runtime_new(&mut runtime, &mut result) },
         STATUS_OK
     );
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
+        unsafe { ocaml_temporal_core_v4_result_free(&mut result) },
         STATUS_OK
     );
     let oversized_len = ocaml_temporal_core_bridge::protocol::MAX_DOCUMENT_BYTES + 1;
 
     assert_eq!(
         unsafe {
-            ocaml_temporal_core_v3_client_start_workflow_json(
+            ocaml_temporal_core_v4_client_start_workflow_json(
                 runtime,
                 ptr::null(),
                 oversized_len,
@@ -500,13 +500,13 @@ fn client_operations_reject_oversized_documents() {
     );
     assert!(!error_bytes(&result).is_empty());
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
+        unsafe { ocaml_temporal_core_v4_result_free(&mut result) },
         STATUS_OK
     );
 
     assert_eq!(
         unsafe {
-            ocaml_temporal_core_v3_client_wait_workflow_json(
+            ocaml_temporal_core_v4_client_wait_workflow_json(
                 runtime,
                 ptr::null(),
                 oversized_len,
@@ -517,12 +517,12 @@ fn client_operations_reject_oversized_documents() {
     );
     assert!(!error_bytes(&result).is_empty());
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
+        unsafe { ocaml_temporal_core_v4_result_free(&mut result) },
         STATUS_OK
     );
 
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_runtime_free(&mut runtime) },
+        unsafe { ocaml_temporal_core_v4_runtime_free(&mut runtime) },
         STATUS_OK
     );
 }
@@ -534,22 +534,22 @@ fn client_operations_reject_a_freed_runtime_slot() {
     let mut runtime = ptr::null_mut();
     let mut result = empty_result();
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_runtime_new(&mut runtime, &mut result) },
+        unsafe { ocaml_temporal_core_v4_runtime_new(&mut runtime, &mut result) },
         STATUS_OK
     );
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
+        unsafe { ocaml_temporal_core_v4_result_free(&mut result) },
         STATUS_OK
     );
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_runtime_free(&mut runtime) },
+        unsafe { ocaml_temporal_core_v4_runtime_free(&mut runtime) },
         STATUS_OK
     );
     assert!(runtime.is_null());
 
     assert_eq!(
         unsafe {
-            ocaml_temporal_core_v3_client_start_workflow_json(
+            ocaml_temporal_core_v4_client_start_workflow_json(
                 runtime,
                 START_REQUEST.as_ptr(),
                 START_REQUEST.len(),
@@ -559,13 +559,13 @@ fn client_operations_reject_a_freed_runtime_slot() {
         STATUS_INVALID_ARGUMENT
     );
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
+        unsafe { ocaml_temporal_core_v4_result_free(&mut result) },
         STATUS_OK
     );
 
     assert_eq!(
         unsafe {
-            ocaml_temporal_core_v3_client_wait_workflow_json(
+            ocaml_temporal_core_v4_client_wait_workflow_json(
                 runtime,
                 WAIT_REQUEST.as_ptr(),
                 WAIT_REQUEST.len(),
@@ -575,7 +575,7 @@ fn client_operations_reject_a_freed_runtime_slot() {
         STATUS_INVALID_ARGUMENT
     );
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
+        unsafe { ocaml_temporal_core_v4_result_free(&mut result) },
         STATUS_OK
     );
 }
@@ -586,18 +586,18 @@ fn client_operations_reject_nul_identifiers() {
     let mut runtime = ptr::null_mut();
     let mut result = empty_result();
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_runtime_new(&mut runtime, &mut result) },
+        unsafe { ocaml_temporal_core_v4_runtime_new(&mut runtime, &mut result) },
         STATUS_OK
     );
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
+        unsafe { ocaml_temporal_core_v4_result_free(&mut result) },
         STATUS_OK
     );
 
     let nul_start = br#"{"request_id":"request-1","namespace":"default\u0000","workflow_id":"workflow-1","workflow_type":"smoke","task_queue":"queue","input":[]}"#;
     assert_eq!(
         unsafe {
-            ocaml_temporal_core_v3_client_start_workflow_json(
+            ocaml_temporal_core_v4_client_start_workflow_json(
                 runtime,
                 nul_start.as_ptr(),
                 nul_start.len(),
@@ -607,14 +607,14 @@ fn client_operations_reject_nul_identifiers() {
         STATUS_PROTOCOL
     );
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
+        unsafe { ocaml_temporal_core_v4_result_free(&mut result) },
         STATUS_OK
     );
 
     let nul_wait = br#"{"namespace":"default","workflow_id":"workflow-1","run_id":"run-\u00001"}"#;
     assert_eq!(
         unsafe {
-            ocaml_temporal_core_v3_client_wait_workflow_json(
+            ocaml_temporal_core_v4_client_wait_workflow_json(
                 runtime,
                 nul_wait.as_ptr(),
                 nul_wait.len(),
@@ -624,12 +624,12 @@ fn client_operations_reject_nul_identifiers() {
         STATUS_PROTOCOL
     );
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
+        unsafe { ocaml_temporal_core_v4_result_free(&mut result) },
         STATUS_OK
     );
 
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_runtime_free(&mut runtime) },
+        unsafe { ocaml_temporal_core_v4_runtime_free(&mut runtime) },
         STATUS_OK
     );
 }

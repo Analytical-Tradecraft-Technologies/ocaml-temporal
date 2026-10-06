@@ -170,8 +170,13 @@ type wait_response = { execution : execution; outcome : outcome }
 type client_error =
   | Already_started of { workflow_id : string; existing_run_id : string option }
   | Rpc of { code : string }
+  | Query_failed of { message : string }
   | Protocol of { code : string }
-(** Closed error body returned by a native client operation. *)
+(** Closed error body returned by a native client operation. [Rpc] carries a
+    gRPC status code name and never server text. [Query_failed] is returned
+    only by a query whose workflow handler failed (or whose query name the
+    worker did not know); [message] is the handler's message, at most 4,096
+    bytes, valid UTF-8, NUL-free, and possibly empty. *)
 
 type start_outcome =
   | Accepted of start_response
@@ -301,4 +306,8 @@ val decode_signal_error : string -> (client_error, error) result
 
 val decode_query_error : string -> (client_error, error) result
 (** Decodes a query error and rejects the start-only [already_started]
-    category. *)
+    category. This is the only decoder that accepts [Query_failed]. *)
+
+val decode_update_error : string -> (client_error, error) result
+(** Decodes an update admission or poll error, rejecting the start-only
+    [already_started] and query-only [query_failed] categories. *)

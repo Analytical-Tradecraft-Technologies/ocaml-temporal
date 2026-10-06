@@ -355,6 +355,55 @@ let test_signal_protocol () =
   | Protocol.Rpc { code = "unavailable" } -> ()
   | _ -> failwith "signal RPC error was not typed")
 
+(** Issue #823: a failed query handler is a distinct, query-only error kind
+    whose bounded message survives decoding; every other operation, a
+    malformed message, and an extra member are rejected. *)
+let test_query_failed_error () =
+  let document = {|{"kind":"query_failed","message":"no handler for \"state\""}|} in
+  (match unwrap (Protocol.decode_query_error document) with
+  | Protocol.Query_failed { message = {|no handler for "state"|} } -> ()
+  | _ -> failwith "query handler failure was not typed");
+  (match
+     unwrap (Protocol.decode_query_error {|{"kind":"query_failed","message":""}|})
+   with
+  | Protocol.Query_failed { message = "" } -> ()
+  | _ -> failwith "empty query handler message was rejected");
+  let at_limit = String.make 4096 'x' in
+  (match
+     unwrap
+       (Protocol.decode_query_error
+          (Printf.sprintf {|{"kind":"query_failed","message":"%s"}|} at_limit))
+   with
+  | Protocol.Query_failed { message } when String.equal message at_limit -> ()
+  | _ -> failwith "query handler message at the limit was rejected");
+  (* The encoder validates the message too, and a start outcome can never
+     carry a query-only failure. *)
+  require_error
+    (Protocol.encode_start_outcome
+       (Protocol.Rejected (Protocol.Query_failed { message = "x" })));
+  List.iter
+    (fun document -> require_error (Protocol.decode_query_error document))
+    [
+      Printf.sprintf {|{"kind":"query_failed","message":"%s"}|}
+        (String.make 4097 'x');
+      {|{"kind":"query_failed","message":"nul\u0000byte"}|};
+      "{\"kind\":\"query_failed\",\"message\":\"\xff\"}";
+      {|{"kind":"query_failed"}|};
+      {|{"kind":"query_failed","message":1}|};
+      {|{"kind":"query_failed","message":"x","code":"invalid_argument"}|};
+    ];
+  require_error (Protocol.decode_signal_error document);
+  require_error (Protocol.decode_cancel_error document);
+  require_error (Protocol.decode_reset_error document);
+  require_error (Protocol.decode_update_error document);
+  require_error (Protocol.decode_wait_error ~request:execution document);
+  require_error (Protocol.decode_start_error ~request:start_request document);
+  match
+    unwrap (Protocol.decode_update_error {|{"kind":"rpc","code":"not_found"}|})
+  with
+  | Protocol.Rpc { code = "not_found" } -> ()
+  | _ -> failwith "update RPC error was not typed"
+
 (** Checks the output-only query request/response contract and rejects the
     start-only error category before any native operation is attempted. *)
 let test_query_protocol () =
@@ -378,11 +427,12 @@ let test_query_protocol () =
   require_error
     (Protocol.decode_query_error
        {|{"kind":"already_started","workflow_id":"workflow-1","existing_run_id":null}|});
-  match
-    unwrap (Protocol.decode_query_error {|{"kind":"rpc","code":"failed_precondition"}|})
-  with
+  (match
+     unwrap (Protocol.decode_query_error {|{"kind":"rpc","code":"failed_precondition"}|})
+   with
   | Protocol.Rpc { code = "failed_precondition" } -> ()
-  | _ -> failwith "query rejection was not typed as failed_precondition"
+  | _ -> failwith "query rejection was not typed as failed_precondition");
+  test_query_failed_error ()
 
 (** Visibility pages use an exact row schema and preserve opaque continuation
     tokens without allowing unknown fields or malformed rows through. *)

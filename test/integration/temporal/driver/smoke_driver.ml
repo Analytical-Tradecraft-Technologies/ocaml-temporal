@@ -386,14 +386,13 @@ let cancel_workflow handle =
         ~duration_ms:(elapsed_ms started) ();
       Error error
 
-(** Identifies the one public bridge diagnostic for which the termination
-    acknowledgement is deliberately uncertain. The public client contract says
-    that the server may have accepted this request, so the caller must reconcile
-    it through [wait] rather than retrying a non-idempotent command. *)
+(** Identifies the one public bridge classification for which the
+    termination acknowledgement is deliberately uncertain. The public client
+    contract says that the server may have accepted this request, so the
+    caller must reconcile it through [wait] rather than retrying a
+    non-idempotent command. *)
 let is_uncertain_termination error =
-  String.equal (Error.kind error) "bridge"
-  && String.equal (Error.message error)
-       "Temporal client RPC failed: termination_outcome_uncertain"
+  Client.rpc_status error = Some `Termination_outcome_uncertain
 
 (** Sends an exact-run termination request and records its acknowledgement
     metadata. A documented uncertain bridge response is accepted here because
@@ -541,8 +540,9 @@ let update_missing_handler handle =
         (Error.defect
            ~message:"unknown update was reported as accepted")
 
-(** Confirms the live server rejects an unknown query handler with the
-    documented invalid-argument boundary. Accepting any error here would let a
+(** Confirms the live server reports an unknown query handler as the typed,
+    non-retryable query handler failure (issue #823) rather than a generic
+    invalid-argument RPC error. Accepting any error here would let a
     connection, timeout, or protocol failure masquerade as a correct handler
     rejection. *)
 let query_missing_handler handle =
@@ -550,9 +550,10 @@ let query_missing_handler handle =
   | Error error ->
       let view = Error.view error in
       if
-        String.equal (Error.kind error) "bridge"
-        && String.equal view.message
-             "Temporal client RPC failed: invalid_argument"
+        Client.is_query_failed error
+        && view.category = `Workflow
+        && Client.rpc_status error = None
+        && not (String.equal view.message "")
       then Ok ()
       else
         Error
