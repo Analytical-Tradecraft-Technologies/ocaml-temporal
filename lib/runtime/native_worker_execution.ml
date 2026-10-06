@@ -483,6 +483,16 @@ let validate_task_queue task_queue =
       Error
         (make_error ~path:"$.task_queue" "invalid_configuration" message)
 
+(** Validates the worker namespace with the same predicate as
+    [Workflow_context_store.create], for the same reason as
+    [validate_task_queue]: an invalid value is reported at worker
+    construction rather than as an activation-time [Invalid_argument]. *)
+let validate_namespace namespace =
+  match Workflow_context_store.validate_namespace namespace with
+  | Ok () -> Ok ()
+  | Error message ->
+      Error (make_error ~path:"$.namespace" "invalid_configuration" message)
+
 (** Finds one registered workflow by its Temporal type name. *)
 let find_definition definitions workflow_type =
   match Run_map.find_opt workflow_type definitions with
@@ -498,7 +508,7 @@ let find_definition definitions workflow_type =
     invariant that all calls pass through the adapter mutex. *)
 module Make (Supervisor : SUPERVISOR) = struct
   (** Mutable state owned by one adapter instance. [supervisor], [task_queue],
-      and [definitions] are immutable after construction; [runs] and
+      [namespace], and [definitions] are immutable after construction; [runs] and
       [pending] are changed only while [mutex] is held, so workflow execution
       state cannot race with completion retries or shutdown draining. *)
   type adapter_state = {
@@ -508,6 +518,9 @@ module Make (Supervisor : SUPERVISOR) = struct
     (* Validated default activity queue copied into each new execution context;
        it is immutable for the lifetime of this worker. *)
     task_queue : string;
+    (* Validated worker namespace copied into each new execution context so
+       [Temporal.Workflow.info] can report it; activations do not carry it. *)
+    namespace : string;
     (* Existential workflow definitions, built and validated before the state
        record is published. *)
     definitions : registered_definition Run_map.t;
@@ -543,14 +556,16 @@ module Make (Supervisor : SUPERVISOR) = struct
       empty, NUL-containing, oversized, or non-UTF-8 defaults fail as a typed
       configuration result rather than breaking the first workflow activation.
       No supervisor operation or workflow implementation runs on this path. *)
-  let create ?on_activation ?on_completion ?(task_queue = "default") ~supervisor
-      ~workflows () =
+  let create ?on_activation ?on_completion ?(task_queue = "default")
+      ?(namespace = "default") ~supervisor ~workflows () =
     let* () = validate_task_queue task_queue in
+    let* () = validate_namespace namespace in
     let* definitions = build_definitions workflows in
     Ok
       {
         supervisor;
         task_queue;
+        namespace;
         definitions;
         runs = Run_map.empty;
         pending = Run_map.empty;
@@ -1050,6 +1065,7 @@ module Make (Supervisor : SUPERVISOR) = struct
                               | Ok input ->
                                   let execution =
                                     Execution.start ~task_queue:adapter.task_queue
+                                      ~namespace:adapter.namespace
                                       ~randomness_seed:init.randomness_seed
                                       ~signal_handlers ~query_handlers
                                       ~update_handlers definition input
