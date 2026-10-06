@@ -123,7 +123,7 @@ let history cli address handle =
   match Unix.close_process_in input, document with
   | Unix.WEXITED 0, Ok document ->
       Ok Yojson.Basic.Util.(document |> member "events" |> to_list)
-  | Unix.WEXITED 0, Error message -> Error ("unparseable history: " ^ message)
+  | Unix.WEXITED 0, Error message -> Error ("unparsable history: " ^ message)
   | status, _ -> Error ("history fetch " ^ describe_status status)
 
 (** Selects durable event kinds without depending on timestamps or event IDs. *)
