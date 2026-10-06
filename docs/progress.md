@@ -32,6 +32,26 @@ from this commit compiled with `dune build -p temporal-sdk` under a macOS
 `sandbox-exec` policy matching opam's (network and writes outside the build
 directory denied, nonexistent `CARGO_HOME`).
 
+## 2026-10-06: Connection failures name their cause; Core logs reach stderr (#833)
+
+Every client connection failure used to read `Temporal client connection
+failed`, and the runtime was created without a Core logger, so Core's own
+records were discarded. The bridge now reports a closed cause (`dns`,
+`refused`, `tls`, `timeout`, `unauthenticated`, ...) plus the bounded,
+escaped local transport error chain. A failed `GetSystemInfo` adds only its
+gRPC code, never server text, and Core's rejection of connection options is a
+`configuration` error. Runtime creation installs a Core push logger that
+formats one bounded, escaped line per record and enqueues it without
+blocking. A per-runtime writer thread drains the bounded queue to stderr, so
+a stalled stderr reader drops (and counts) records instead of stalling Core.
+Runtime close waits at most 500 ms for that writer before detaching it.
+Neither thread calls OCaml. `OCAML_TEMPORAL_CORE_LOG` selects the level
+(default `warn`; `off` disables it). Rust ABI tests cover refused and DNS
+causes and the message bound, cause classification, level parsing and
+rejection, line formatting, non-blocking enqueue, drop reporting, and runtime
+close with a blocked writer. An OCaml unit test proves the cause reaches
+`Client.create`.
+
 ## 2026-10-06: Linear-time future settlement (#847)
 
 Settling one future no longer scans every other pending registration. The
