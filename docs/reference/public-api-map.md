@@ -109,8 +109,9 @@ for those rules.
   that successor. The client also sends typed signals and output-only or
   exactly-one-input queries. `Client.query_with_input` encodes the typed query
   argument before transport; the client lists bounded visibility results and
-  waits for typed terminal outcomes. `Client.start_update` admits one typed
-  workflow update and returns an opaque handle; `Client.wait_update` polls that
+  waits for typed terminal outcomes. `Client.start_update` waits until Temporal
+  accepts one typed workflow update and returns an opaque handle;
+  `Client.wait_update` polls that
   exact update until it has a typed outcome, while `Client.update_id` exposes
   the server-correlated update ID for diagnostics and retry bookkeeping.
   `Client.follow`
