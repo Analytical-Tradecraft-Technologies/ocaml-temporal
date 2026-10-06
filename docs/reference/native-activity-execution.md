@@ -237,6 +237,20 @@ supervisor mailbox. The mailbox serializes heartbeats with polling,
 completion, and shutdown; an arbitrary Rust thread never calls an OCaml
 callback.
 
+`Context.info` returns the attempt's task metadata as an abstract
+`Temporal.Activity.Info.t`: namespace, the scheduling workflow (ID, run ID,
+and type; standalone activities are failed by the bridge before dispatch, so
+one is always present), activity ID and type, the 1-based
+attempt, whether Core runs it as a local activity, and the first-scheduled,
+current-attempt-scheduled, and started timestamps that Core reported. The
+adapter copies these values from the validated start task, so the projection
+cannot fail; a context from a backend without a Temporal task, such as the
+in-process test backend, returns a typed defect instead. Combining the
+workflow and activity IDs (plus the attempt when each retry must be distinct)
+gives the standard idempotency key for at-least-once side effects. The
+metadata is immutable and stays readable after the attempt ends. Asynchronous
+activity contexts do not expose it yet.
+
 Before constructing the context, the adapter validates the server timeout: it
 rejects negative, sub-millisecond, or out-of-range values instead of rounding
 or overflowing them. An accepted timeout is therefore exposed as an exact

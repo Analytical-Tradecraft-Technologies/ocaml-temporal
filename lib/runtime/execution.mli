@@ -118,6 +118,15 @@ val set_activation_deployment_version :
     workflow fibers are processed. *)
 val set_activation_is_replaying : ('input, 'output) t -> bool -> unit
 
+(** Installs Core's task-local history facts for the activation currently
+    being dispatched. *)
+val set_activation_history :
+  ('input, 'output) t -> Workflow_context_store.activation_history -> unit
+
+(** Installs the run identity from the initialization activation. *)
+val set_run_info :
+  ('input, 'output) t -> Workflow_context_store.run_info option -> unit
+
 (** Releases paused fibers and pending operation tables for this execution.
     Idempotent. Call when removing a run from a worker registry if a terminal
     or eviction path has not already shut the execution down. *)
