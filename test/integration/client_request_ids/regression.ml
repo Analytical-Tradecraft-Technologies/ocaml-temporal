@@ -75,6 +75,54 @@ let expect label expected actual =
   if expected <> actual then
     failwith (Printf.sprintf "%s: expected %d, got %d" label expected actual)
 
+(** Waits for [handle]'s exact run and reports whether it was terminated. *)
+let terminated handle =
+  match Client.wait handle with
+  | Ok (Client.Terminated _) -> true
+  | Ok _ | Error _ -> false
+
+(** Exercises the three workflow ID conflict policies (#933) against a running
+    execution created by [start]: [`Fail] returns the typed already-started
+    error naming the running run, [`Use_existing] attaches to it with
+    [started = false], and [`Terminate_existing] terminates it and returns a
+    new run. A request-ID retry of the creating start returns that run even
+    under [`Terminate_existing]. [track] registers every handle for cleanup. *)
+let check_id_conflict_policies ~start ~track client queue =
+  let original = start ~request_id:"conflict-policy-original" "-policy" in
+  if not (Client.started original) then failwith "new start was not marked started";
+  let again ?id_conflict_policy ?request_id input =
+    Client.start client ?id_conflict_policy ?request_id ~workflow
+      ~task_queue:queue ~id:(Client.workflow_id original) ~input () in
+  List.iter (fun id_conflict_policy ->
+    match again ?id_conflict_policy 1 with
+    | Ok _ -> failwith "fail policy started a duplicate run"
+    | Error error ->
+        if Error.error_type error <> Some "WorkflowExecutionAlreadyStarted" then
+          failwith ("unexpected fail-policy error: " ^ Error.message error);
+        match Client.already_started error with
+        | Some { Client.run_id; _ } when run_id = Client.run_id original -> ()
+        | Some _ | None -> failwith "already-started error lost the running run")
+    [None; Some `Fail];
+  let attached = track (get (again ~id_conflict_policy:`Use_existing 2)) in
+  if Client.started attached then failwith "use_existing reported a new run";
+  if Client.run_id attached <> Client.run_id original then
+    failwith "use_existing returned a different run";
+  expect "use_existing attaches to running state" 0
+    (get (Client.query attached ~query));
+  let retried = track (get (again ~id_conflict_policy:`Terminate_existing
+    ~request_id:"conflict-policy-original" 0)) in
+  if Client.run_id retried <> Client.run_id original then
+    failwith "request-ID retry was not deduplicated before the conflict policy";
+  let replacement = track (get (again ~id_conflict_policy:`Terminate_existing 3)) in
+  if not (Client.started replacement) then
+    failwith "terminate_existing did not report a new run";
+  if Client.run_id replacement = Client.run_id original then
+    failwith "terminate_existing reused the running run";
+  if not (terminated original) then
+    failwith "terminate_existing left the previous run open";
+  expect "terminate_existing starts the new run" 3
+    (get (Client.query replacement ~query))
+
 (** Verifies starts and both message APIs, plus caller-owned retry IDs. *)
 let check address =
   let queue = Temporal_base.Client_request_id.create () in
@@ -102,6 +150,10 @@ let check address =
           let same = get (Client.start b ~request_id:"explicit-start" ~workflow
             ~task_queue:queue ~id:(Client.workflow_id retry) ~input:0 ()) in
           if Client.run_id retry <> Client.run_id same then failwith "start retry changed run";
+          check_id_conflict_policies
+            ~start:(fun ~request_id suffix -> start ~request_id a suffix)
+            ~track:(fun handle -> handles := handle :: !handles; handle)
+            b queue;
           List.iter (fun operation ->
             let handle = start a ("-" ^ operation) in
             expect (operation ^ " first") 1 (child address operation handle 1 "-");

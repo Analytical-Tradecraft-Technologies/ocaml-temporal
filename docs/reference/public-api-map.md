@@ -113,7 +113,12 @@ for those rules.
 - `Temporal.Client` starts typed workflow executions, optionally attaching
   validated `memo` and `search_attributes` payloads. A caller-owned
   `request_id` makes an uncertain start safe to retry as the same logical
-  request. The client retains the exact workflow/run identity, rebuilds a
+  request. `?id_conflict_policy` (`` `Fail `` by default, `` `Use_existing ``,
+  or `` `Terminate_existing ``) chooses what happens when the workflow ID
+  already has a running execution: a typed already-started error whose
+  existing run `Client.already_started` returns, a handle for the running
+  execution (`Client.started` is `false`), or termination of that execution
+  and a new run. The client retains the exact workflow/run identity, rebuilds a
   typed handle for a `Continued_as_new` successor with `Client.follow`,
   requests exact-run cancellation, reset, or termination. `Client.reset`
   stops an exact run at a workflow-task event boundary and returns a new

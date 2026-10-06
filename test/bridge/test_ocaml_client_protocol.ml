@@ -90,6 +90,7 @@ let start_request : Protocol.start_request =
     input = [];
     memo = [];
     search_attributes = [];
+    id_conflict_policy = Protocol.Fail;
   }
 
 (** The canonical payload wrapper for the bytes [ok]. *)
@@ -432,13 +433,13 @@ let test_async_start_protocol () =
   require_error
     (Protocol.decode_start_ticket ~request:start_request {|{"ticket":""}|});
   let accepted_json =
-    {|{"kind":"accepted","execution":{"namespace":"default","workflow_id":"workflow-1","run_id":"run-2"}}|}
+    {|{"kind":"accepted","execution":{"namespace":"default","workflow_id":"workflow-1","run_id":"run-2"},"started":true}|}
   in
   let accepted =
     unwrap (Protocol.decode_start_outcome ~request:start_request accepted_json)
   in
   (match accepted with
-  | Protocol.Accepted { execution = { run_id = "run-2"; _ } } -> ()
+  | Protocol.Accepted { execution = { run_id = "run-2"; _ }; started = true } -> ()
   | _ -> failwith "accepted start outcome changed shape");
   let rejected_json =
     {|{"kind":"rejected","error":{"kind":"already_started","workflow_id":"workflow-1","existing_run_id":"run-existing"}}|}
@@ -475,7 +476,7 @@ let test_async_start_protocol () =
        {|{"kind":"unknown","request_id":"other-request","workflow_id":"workflow-1"}|});
   require_error
     (Protocol.decode_start_outcome ~request:start_request
-       {|{"kind":"accepted","execution":{"namespace":"other","workflow_id":"workflow-1","run_id":"run-2"}}|});
+       {|{"kind":"accepted","execution":{"namespace":"other","workflow_id":"workflow-1","run_id":"run-2"},"started":true}|});
   require_error
     (Protocol.decode_start_outcome ~request:start_request
        {|{"kind":"rejected","error":{"kind":"already_started","workflow_id":"other-workflow","existing_run_id":null}}|})
@@ -484,7 +485,7 @@ let test_async_start_protocol () =
     the JSON foundation or the operation-specific decoder. *)
 let test_closed_response_shape () =
   let valid =
-    {|{"execution":{"namespace":"default","workflow_id":"workflow-1","run_id":"run-1"}}|}
+    {|{"execution":{"namespace":"default","workflow_id":"workflow-1","run_id":"run-1"},"started":true}|}
   in
   ignore (unwrap (Protocol.decode_start_response ~request:start_request valid));
   require_error
@@ -492,7 +493,7 @@ let test_closed_response_shape () =
        {|{"execution":{"namespace":"default","workflow_id":"workflow-1","run_id":"run-1"},"extra":true}|});
   check_error_path "nested execution duplicate" "$.execution"
     (Protocol.decode_start_response ~request:start_request
-       {|{"execution":{"namespace":"default","workflow_id":"workflow-1","run_id":"run-1","run_id":"run-2"}}|});
+       {|{"execution":{"namespace":"default","workflow_id":"workflow-1","run_id":"run-1","run_id":"run-2"},"started":true}|});
   require_error
     (Protocol.decode_wait_response ~request:execution
        {|{"execution":{"namespace":"default","workflow_id":"workflow-1","run_id":"run-1"},"outcome":{"kind":"cancelled","details":[],"extra":true}}|})
@@ -501,7 +502,7 @@ let test_closed_response_shape () =
     even when their JSON shape and identifiers are individually valid. *)
 let test_response_execution_correlation () =
   let response =
-    {|{"execution":{"namespace":"default","workflow_id":"other-workflow","run_id":"run-1"}}|}
+    {|{"execution":{"namespace":"default","workflow_id":"other-workflow","run_id":"run-1"},"started":true}|}
   in
   require_error (Protocol.decode_start_response ~request:start_request response);
   let wait_response =
@@ -571,6 +572,68 @@ let test_operation_error_correlation () =
   require_error
     (Protocol.decode_wait_error ~request:execution already_started)
 
+(** Checks the explicit conflict-policy wire names and the [started] flag:
+    every request carries its policy, [started = false] is accepted only for
+    a [Use_existing] request (where it names the existing run), and both the
+    synchronous response and asynchronous outcome require the member. *)
+let test_id_conflict_policy_protocol () =
+  List.iter
+    (fun (policy, name) ->
+      let encoded =
+        unwrap
+          (Protocol.encode_start_request
+             { start_request with id_conflict_policy = policy })
+      in
+      require_fragment "conflict policy"
+        ({|"id_conflict_policy":"|} ^ name ^ {|"|})
+        encoded)
+    [
+      (Protocol.Fail, "fail");
+      (Protocol.Use_existing, "use_existing");
+      (Protocol.Terminate_existing, "terminate_existing");
+    ];
+  let use_existing =
+    { start_request with id_conflict_policy = Protocol.Use_existing }
+  in
+  let existing_response =
+    {|{"execution":{"namespace":"default","workflow_id":"workflow-1","run_id":"run-existing"},"started":false}|}
+  in
+  (match
+     unwrap (Protocol.decode_start_response ~request:use_existing existing_response)
+   with
+  | { execution = { run_id = "run-existing"; _ }; started = false } -> ()
+  | _ -> failwith "use_existing response lost the existing run");
+  require_error
+    (Protocol.decode_start_response ~request:start_request existing_response);
+  require_error
+    (Protocol.decode_start_response
+       ~request:{ start_request with id_conflict_policy = Protocol.Terminate_existing }
+       existing_response);
+  require_error
+    (Protocol.decode_start_response ~request:use_existing
+       {|{"execution":{"namespace":"default","workflow_id":"workflow-1","run_id":"run-1"}}|});
+  require_error
+    (Protocol.decode_start_response ~request:use_existing
+       {|{"execution":{"namespace":"default","workflow_id":"workflow-1","run_id":"run-1"},"started":"no"}|});
+  let existing_outcome =
+    {|{"kind":"accepted","execution":{"namespace":"default","workflow_id":"workflow-1","run_id":"run-existing"},"started":false}|}
+  in
+  let decoded =
+    unwrap (Protocol.decode_start_outcome ~request:use_existing existing_outcome)
+  in
+  (match decoded with
+  | Protocol.Accepted { execution = { run_id = "run-existing"; _ }; started = false }
+    ->
+      ()
+  | _ -> failwith "use_existing outcome lost the existing run");
+  require_fragment "encoded started flag" {|"started":false|}
+    (unwrap (Protocol.encode_start_outcome decoded));
+  require_error
+    (Protocol.decode_start_outcome ~request:start_request existing_outcome);
+  require_error
+    (Protocol.decode_start_outcome ~request:use_existing
+       {|{"kind":"accepted","execution":{"namespace":"default","workflow_id":"workflow-1","run_id":"run-1"}}|})
+
 (** Runs one protocol test with a stable CI-visible name. *)
 let run name test =
   try
@@ -593,6 +656,7 @@ let () =
   run "client query protocol" test_query_protocol;
   run "client visibility protocol" test_visibility_protocol;
   run "client asynchronous starts" test_async_start_protocol;
+  run "client id conflict policy" test_id_conflict_policy_protocol;
   run "client closed response shape" test_closed_response_shape;
   run "client response correlation" test_response_execution_correlation;
   run "client structured errors" test_client_errors;

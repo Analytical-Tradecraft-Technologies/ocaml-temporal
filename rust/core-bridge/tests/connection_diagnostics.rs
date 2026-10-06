@@ -12,9 +12,9 @@ use ocaml_temporal_core_bridge::diagnostics::{
     classify_chain, core_log_filter, format_core_log_line, parse_core_log_level,
 };
 use ocaml_temporal_core_bridge::{
-    Result as AbiResult, STATUS_CONNECTION, STATUS_OK, ocaml_temporal_core_v2_client_connect_json,
-    ocaml_temporal_core_v2_result_free, ocaml_temporal_core_v2_runtime_free,
-    ocaml_temporal_core_v2_runtime_new,
+    Result as AbiResult, STATUS_CONNECTION, STATUS_OK, ocaml_temporal_core_v3_client_connect_json,
+    ocaml_temporal_core_v3_result_free, ocaml_temporal_core_v3_runtime_free,
+    ocaml_temporal_core_v3_runtime_new,
 };
 
 /// Length of the constant message prefix plus the longest cause spelling and
@@ -26,11 +26,11 @@ fn runtime() -> *mut ocaml_temporal_core_bridge::Runtime {
     let mut runtime = ptr::null_mut();
     let mut result = AbiResult::default();
     // SAFETY: Both output locations are writable and exclusively owned.
-    let status = unsafe { ocaml_temporal_core_v2_runtime_new(&mut runtime, &mut result) };
+    let status = unsafe { ocaml_temporal_core_v3_runtime_new(&mut runtime, &mut result) };
     assert_eq!(status, STATUS_OK);
     // SAFETY: The bridge initialized `result` and this test owns it uniquely.
     assert_eq!(
-        unsafe { ocaml_temporal_core_v2_result_free(&mut result) },
+        unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
         STATUS_OK
     );
     runtime
@@ -45,7 +45,7 @@ fn connect_failure(target_url: &str) -> (i32, String) {
     // SAFETY: The runtime is live, the input span stays readable for the
     // blocking call, and the result is uniquely writable.
     let status = unsafe {
-        ocaml_temporal_core_v2_client_connect_json(
+        ocaml_temporal_core_v3_client_connect_json(
             runtime,
             config.as_ptr(),
             config.len(),
@@ -58,8 +58,8 @@ fn connect_failure(target_url: &str) -> (i32, String) {
     let message = String::from_utf8(message.to_vec()).expect("diagnostic is UTF-8");
     // SAFETY: The result and runtime are released exactly once by their owner.
     unsafe {
-        assert_eq!(ocaml_temporal_core_v2_result_free(&mut result), STATUS_OK);
-        assert_eq!(ocaml_temporal_core_v2_runtime_free(&mut runtime), STATUS_OK);
+        assert_eq!(ocaml_temporal_core_v3_result_free(&mut result), STATUS_OK);
+        assert_eq!(ocaml_temporal_core_v3_runtime_free(&mut runtime), STATUS_OK);
     }
     (status, message)
 }

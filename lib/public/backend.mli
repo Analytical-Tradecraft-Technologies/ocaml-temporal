@@ -33,12 +33,18 @@ type start_request = {
   input : Payload.t;
   memo : (string * Payload.t) list;
   search_attributes : (string * Payload.t) list;
+  (* What to do when [workflow_id] already has an open run; see
+     [Client.id_conflict_policy]. Part of the mock's request-ID fingerprint. *)
+  id_conflict_policy : [ `Fail | `Use_existing | `Terminate_existing ];
 }
 
-(** The server-issued identity returned by a successful start. *)
+(** The server-issued identity returned by a successful start. [started] is
+    [false] only when a [`Use_existing] start returned a run that another
+    request created; [run_id] then names that existing run. *)
 type start_response = {
   workflow_id : string;
   run_id : string;
+  started : bool;
 }
 
 (** The exact execution selected by a client wait. *)
@@ -232,6 +238,16 @@ val client_wait : client -> wait_request -> (terminal_result, Error.t) result
     native client's bounded pending-start or pending-wait registry is full.
     [Client.is_at_capacity] recognizes it. *)
 val client_at_capacity_error_type : string
+
+(** The [Error.error_type] (["WorkflowExecutionAlreadyStarted"]) of the
+    non-retryable [`Workflow] error returned when a [`Fail] start finds an open
+    run with the same workflow ID. *)
+val already_started_error_type : string
+
+(** Returns the [(namespace, workflow_id, run_id)] of the open run attached to
+    an already-started error by either transport, or [None] for any other
+    error or when Temporal did not report the existing run. *)
+val already_started_execution : Error.t -> (string * string * string) option
 
 (** Converts a private supervisor failure into the public error vocabulary.
     Exposed in this private interface so bridge tests can verify that a full

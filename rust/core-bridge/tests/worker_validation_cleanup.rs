@@ -18,10 +18,10 @@ use std::time::Duration;
 
 use ocaml_temporal_core_bridge::{
     Buffer, Result as AbiResult, STATUS_OK, STATUS_WORKER,
-    ocaml_temporal_core_v2_client_connect_json, ocaml_temporal_core_v2_client_disconnect,
-    ocaml_temporal_core_v2_result_free, ocaml_temporal_core_v2_runtime_free,
-    ocaml_temporal_core_v2_runtime_new, ocaml_temporal_core_v2_worker_shutdown,
-    ocaml_temporal_core_v2_worker_start_json,
+    ocaml_temporal_core_v3_client_connect_json, ocaml_temporal_core_v3_client_disconnect,
+    ocaml_temporal_core_v3_result_free, ocaml_temporal_core_v3_runtime_free,
+    ocaml_temporal_core_v3_runtime_new, ocaml_temporal_core_v3_worker_shutdown,
+    ocaml_temporal_core_v3_worker_start_json,
 };
 
 /// Upper bound for one failed `Worker.create` round trip. The fixed path takes
@@ -118,7 +118,7 @@ fn consume(mut result: AbiResult, expected_status: i32) -> String {
     assert_eq!(result.status, expected_status, "{message}");
     // SAFETY: This helper has exclusive ownership of the initialized result.
     assert_eq!(
-        unsafe { ocaml_temporal_core_v2_result_free(&mut result) },
+        unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
         STATUS_OK
     );
     message
@@ -153,7 +153,7 @@ fn start_worker_bounded(
         // SAFETY: This thread exclusively owns the live runtime for the call,
         // the static configuration stays readable, and the output is unique.
         unsafe {
-            ocaml_temporal_core_v2_worker_start_json(
+            ocaml_temporal_core_v3_worker_start_json(
                 owned.0,
                 config.as_ptr(),
                 config.len(),
@@ -190,7 +190,7 @@ fn failed_namespace_validation_releases_worker_without_hanging() {
     let mut runtime = ptr::null_mut();
     let mut result = AbiResult::default();
     // SAFETY: Both output locations are writable and exclusively owned.
-    unsafe { ocaml_temporal_core_v2_runtime_new(&mut runtime, &mut result) };
+    unsafe { ocaml_temporal_core_v3_runtime_new(&mut runtime, &mut result) };
     consume(result, STATUS_OK);
 
     let client = format!(r#"{{"target_url":"http://{address}","identity":"validation-test"}}"#);
@@ -198,7 +198,7 @@ fn failed_namespace_validation_releases_worker_without_hanging() {
     // SAFETY: The runtime is live and exclusively owned; the input remains
     // readable for the full blocking call.
     unsafe {
-        ocaml_temporal_core_v2_client_connect_json(
+        ocaml_temporal_core_v3_client_connect_json(
             runtime,
             client.as_ptr(),
             client.len(),
@@ -219,18 +219,18 @@ fn failed_namespace_validation_releases_worker_without_hanging() {
     // No worker was published, so shutdown is the idempotent absent case.
     let mut result = AbiResult::default();
     // SAFETY: The runtime is live and exclusively owned by this thread again.
-    unsafe { ocaml_temporal_core_v2_worker_shutdown(runtime, &mut result) };
+    unsafe { ocaml_temporal_core_v3_worker_shutdown(runtime, &mut result) };
     consume(result, STATUS_OK);
 
     // The client survives validation failure, so it is still disconnectable.
     let mut result = AbiResult::default();
     // SAFETY: Same exclusive runtime ownership as above.
-    unsafe { ocaml_temporal_core_v2_client_disconnect(runtime, &mut result) };
+    unsafe { ocaml_temporal_core_v3_client_disconnect(runtime, &mut result) };
     consume(result, STATUS_OK);
 
     // SAFETY: Children are closed and the slot is exclusively owned.
     assert_eq!(
-        unsafe { ocaml_temporal_core_v2_runtime_free(&mut runtime) },
+        unsafe { ocaml_temporal_core_v3_runtime_free(&mut runtime) },
         STATUS_OK
     );
     assert!(runtime.is_null());
