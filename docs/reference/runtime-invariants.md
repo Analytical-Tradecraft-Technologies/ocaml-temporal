@@ -401,7 +401,14 @@ and bridge, read the [documentation guide](../README.md) first.
   publish a task after that first drain, dispose joins both lanes (with the
   same bounded, draining join as explicit shutdown) and performs a
   final no-producer drain before finalization; no task may remain only in a
-  ready queue or ledger at the point the worker graph is released.
+  ready queue or ledger at the point the worker graph is released. Dispose
+  acknowledges a pure cache eviction empty rather than failing it (the ledger
+  records each run's eviction bit atomically with its admission, before the
+  poll lane enqueues the activation, so no ready-queue reconciliation is
+  needed), and the
+  workflow poll lane acknowledges Core's same-run eviction for a run disposal
+  already retired instead of dropping it; otherwise the workflow poll never
+  reports `ShutDown` and the lane join waits out its bound (issue #775).
 
 ## Native activation translation
 
