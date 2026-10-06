@@ -916,9 +916,37 @@ cooperative Eio/Lwt scheduler fiber. `Temporal.Worker.shutdown` is idempotent
 and drains retryable completions before releasing the native graph. Call it
 from any other Domain or system thread, including a sibling thread on the
 Domain running `Temporal.Worker.run`; concurrent callers all wait for the same
-teardown and return its cached result. A call from inside one of the worker's
-own workflow or activity callbacks returns a defect `Error` instead of
-deadlocking, and the worker keeps running.
+teardown and return its cached result. A call from the thread running
+`Temporal.Worker.run`, such as one of the worker's own workflow or activity
+callbacks, cannot wait for its own loop: it returns a defect `Error` instead of
+deadlocking, but first requests a stop so `run` returns, after which a further
+`shutdown` completes teardown.
+
+To stop a worker from a `SIGTERM` or `SIGINT` handler, call
+`Temporal.Worker.request_shutdown` there. It is a single atomic write with no
+lock, I/O, or native call, so it is safe whichever Domain or thread the OCaml
+runtime uses to run the handler, including the thread blocked in
+`Temporal.Worker.run` in a single-Domain program. `run` then returns `Ok ()`
+once each lane finishes its current task, and the application calls
+`Temporal.Worker.shutdown` to drain and release the worker. Do not call the
+blocking `shutdown` from the handler itself.
+
+```ocaml
+let serve worker =
+  let stop _signal = Temporal.Worker.request_shutdown worker in
+  let previous_term = Sys.signal Sys.sigterm (Sys.Signal_handle stop) in
+  let previous_int = Sys.signal Sys.sigint (Sys.Signal_handle stop) in
+  (* Signal handlers are process-global: restore the previous ones so a later
+     signal is not swallowed by this already shut-down worker. *)
+  Fun.protect
+    ~finally:(fun () ->
+      Sys.set_signal Sys.sigterm previous_term;
+      Sys.set_signal Sys.sigint previous_int)
+    (fun () ->
+      let run_result = Temporal.Worker.run worker in
+      let shutdown_result = Temporal.Worker.shutdown worker in
+      Result.bind run_result (fun () -> shutdown_result))
+```
 
 Both `Temporal.Worker.create` and `Temporal.Client.create` accept an optional
 `~identity`, which Temporal records in history events and task-queue poller

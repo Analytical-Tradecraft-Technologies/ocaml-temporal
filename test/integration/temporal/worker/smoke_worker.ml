@@ -142,45 +142,20 @@ let clear_ready_before_start path =
            (Printf.sprintf "cannot remove stale worker readiness marker %s: %s"
               path (Printexc.to_string exception_)))
 
-(** Runs the blocking worker loop while a small control Domain translates
-    Compose's SIGTERM/SIGINT into the public shutdown operation. Signal handlers
-    only flip atomics; all SDK and native calls stay outside the signal context,
-    so teardown cannot interrupt a mutex or a JSON/FFI conversion halfway
-    through. *)
+(** Runs the blocking worker loop on this thread and translates Compose's
+    SIGTERM/SIGINT into [Worker.request_shutdown] directly from the signal
+    handler, with no control Domain (#830). That call is a single atomic write,
+    so it is safe even when the runtime runs the handler on this same thread
+    while it is inside [Worker.run]; all blocking SDK and native work happens in
+    the [Worker.shutdown] call after [run] returns. *)
 let run_with_signal_shutdown worker =
-  let stop_requested = Atomic.make false in
-  let watcher_finished = Atomic.make false in
-  let request_shutdown _signal = Atomic.set stop_requested true in
+  let request_shutdown _signal = Worker.request_shutdown worker in
   let previous_term = Sys.signal Sys.sigterm (Sys.Signal_handle request_shutdown) in
   let previous_int = Sys.signal Sys.sigint (Sys.Signal_handle request_shutdown) in
-  let watcher =
-    Domain.spawn (fun () ->
-        while not (Atomic.get watcher_finished) do
-          if Atomic.get stop_requested then begin
-            (* A bounded native wait lets this call join the worker loop rather
-               than terminating the process while Core still owns a lease. A
-               transient retryable drain error must not end the watcher: doing
-               so would leave [Worker.run] alive after the signal and make the
-               host-side stop wait until Compose forcibly kills the process. *)
-            let shutdown_result =
-              try Worker.shutdown worker with _ ->
-                Error
-                  (Error.defect
-                     ~message:"worker shutdown watcher raised an exception")
-            in
-            match shutdown_result with
-            | Ok () -> Atomic.set watcher_finished true
-            | Error _ -> Unix.sleepf 0.05
-          end
-          else Unix.sleepf 0.05
-        done)
-  in
   let run_result =
     try
       phase "worker_run" "begin";
-      Fun.protect
-        ~finally:(fun () -> Atomic.set watcher_finished true)
-        (fun () -> Worker.run worker)
+      Worker.run worker
     with exception_ ->
       Error
         (Error.defect
@@ -188,11 +163,21 @@ let run_with_signal_shutdown worker =
              (Printf.sprintf "worker run raised: %s"
                 (Printexc.to_string exception_)))
   in
-  Domain.join watcher;
   Sys.set_signal Sys.sigterm previous_term;
   Sys.set_signal Sys.sigint previous_int;
   phase "worker_shutdown" "begin";
-  let shutdown_result = Worker.shutdown worker in
+  (* A transient, retryable completion-drain error leaves the worker open, so
+     retry briefly before reporting it. A terminal error is cached and returns
+     immediately, so the bound only limits the transient case. *)
+  let rec shutdown_with_retry attempts =
+    match Worker.shutdown worker with
+    | Ok () -> Ok ()
+    | Error _ when attempts > 1 ->
+        Unix.sleepf 0.05;
+        shutdown_with_retry (attempts - 1)
+    | Error _ as error -> error
+  in
+  let shutdown_result = shutdown_with_retry 100 in
   phase "worker_run"
     (match run_result with Ok () -> "stopped" | Error _ -> "error");
   phase "worker_shutdown"

@@ -166,32 +166,20 @@ module Lifecycle = struct
                 (Printexc.to_string exception_)))
 
   (** Runs a worker until it is stopped, translating [SIGINT] and [SIGTERM]
-      into the public idempotent shutdown call. Signal handlers only set an
-      atomic flag; a dedicated Domain performs all SDK work outside signal
-      context, then the final shutdown call closes the supervisor-owned native
+      into [Temporal.Worker.request_shutdown]. That call is only an atomic
+      write, so it is safe in a signal handler even when the runtime runs the
+      handler on this thread, which is also the thread blocked in
+      [Temporal.Worker.run] (#830). Once [run] returns, the final shutdown call
+      drains outstanding completions and closes the supervisor-owned native
       graph exactly once. *)
   let run_worker worker =
-    let stop_requested = Atomic.make false in
-    let watcher_finished = Atomic.make false in
-    let request_stop _signal = Atomic.set stop_requested true in
+    let request_stop _signal = Temporal.Worker.request_shutdown worker in
     let previous_term =
       Sys.signal Sys.sigterm (Sys.Signal_handle request_stop)
     in
     let previous_int = Sys.signal Sys.sigint (Sys.Signal_handle request_stop) in
-    let watcher =
-      Domain.spawn (fun () ->
-          while not (Atomic.get watcher_finished) do
-            if Atomic.get stop_requested then begin
-              ignore (Temporal.Worker.shutdown worker);
-              Atomic.set watcher_finished true
-            end
-            else Unix.sleepf 0.05
-          done)
-    in
     Fun.protect
       ~finally:(fun () ->
-        Atomic.set watcher_finished true;
-        Domain.join watcher;
         Sys.set_signal Sys.sigterm previous_term;
         Sys.set_signal Sys.sigint previous_int)
       (fun () ->

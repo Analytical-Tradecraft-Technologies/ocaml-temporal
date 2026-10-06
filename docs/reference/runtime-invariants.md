@@ -382,7 +382,13 @@ and bridge, read the [documentation guide](../README.md) first.
   the system thread (Domain plus `Thread.id`), so a sibling thread on a lane's
   Domain is an ordinary caller. The public wrapper checks this before
   acquiring its shutdown mutex to avoid a deadlock against a concurrent
-  shutdown that holds that mutex while waiting for the loop.
+  shutdown that holds that mutex while waiting for the loop. That rejected
+  call, and `Worker.request_shutdown`, set a separate sticky stop-request
+  atomic that both lanes observe like the shutdown flag but that never admits
+  teardown, so the loop returns and a later `shutdown` (from any thread,
+  including the one that ran the loop) performs the drain and native release.
+  Setting it is the only lifecycle operation that is safe inside an OCaml
+  signal handler: it takes no lock and makes no native call (#830).
 - Each Rust poll lane owns one mutex-protected pending count. Producers hold
   that mutex while publishing a queue message and its wake notification;
   the supervisor holds it while receiving and decrementing. A wake is never

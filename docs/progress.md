@@ -30,6 +30,20 @@ budget for 50,000-wide fan-outs, and `test/unit/test_ordered_registry.ml`
 covers the registry contract; focused unit and runtime suites passed locally
 on OCaml 5.4.1.
 
+## 2026-10-06: Stopping a worker from a signal handler (#830)
+
+An OCaml signal handler may run on the thread blocked in `Worker.run`, so in a
+single-Domain program the natural `SIGTERM` handler calling `Worker.shutdown`
+was rejected as re-entrant and the worker never stopped. The new
+`Worker.request_shutdown` is a single atomic write that both run lanes treat
+as a stop at their next check; `run` returns `Ok ()` and the application then
+calls `Worker.shutdown` to drain and release the worker. A re-entrant
+`shutdown` still returns a defect but now posts the same request. A runtime
+model test raises a real `SIGUSR1` against a loop on the main thread, a mock
+worker test raises it from inside an activity callback, and the examples and
+the Compose smoke worker now use the handler directly instead of a watcher
+Domain.
+
 ## 2026-10-06: Retained completions fail closed (#843)
 
 The workflow and activity adapters used to resubmit every retained completion
