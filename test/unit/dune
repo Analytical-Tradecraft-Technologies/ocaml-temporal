@@ -39,3 +39,7 @@
 (test
  (name test_example_failures)
  (libraries temporal-sdk temporal_sdk_examples_common))
+
+(test
+ (name test_testing)
+ (libraries temporal-sdk unix))

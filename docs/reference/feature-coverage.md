@@ -12,7 +12,8 @@ tracks the support decision; this audit does not decide that policy.
 
 - **Implemented**: the source provides the public API or private mechanism.
 - **Focused-tested**: deterministic OCaml/Rust/C tests or source contracts
-  exercise the mechanism without a server. Mock client tests do not run workflows.
+  exercise the mechanism without a server. Mock client tests do not run workflows;
+  `Temporal.Testing` runs them in-process against a server simulator.
 - **Live-tested**: a named assertion passed against real Temporal Server and
   PostgreSQL. This applies only to the tested source, pins, topology and scenarios.
 - **Supported**: an explicit release policy commits to a scope and compatibility
@@ -42,6 +43,7 @@ added after the audited baseline; historical milestone evidence remains in
 | Client operations | Start/wait/follow/cancel/terminate/reset, signals, queries, update handles, bounded visibility listing and shutdown are implemented. | Start/wait/follow/cancel/terminate and named interactions are live-tested. Reset/visibility conformance, deadlines and reconciliation races remain unqualified. A control RPC acknowledgement is not worker execution or terminal completion. |
 | Continue-as-new and patching | Explicit successor handles; `patched` decisions and `deprecate_patch` markers with mixed-mode protection. | Live successor following and marker-free to active, active to deprecated, deprecated to removed patch histories. Broader history compatibility and migration automation remain open. |
 | External operations | Workflow signal/cancellation commands preserve exact workflow/run identity and typed acknowledgement/failure. | Live signal delivery, signal rejection for a confirmed completed target, external cancellation and wrong-run cancellation rejection. Missing targets, completed-target cancellation and retry/replay combinations remain unqualified. |
+| In-process test environment | `Temporal.Testing` drives the real execution runtime with a deterministic simulator: zero-time activities with retry policies and heartbeat-detail hand-off, virtual-time timers, child workflows with parent-close policies, external signals/cancellation, queries, validated updates, cancellation and continue-as-new. | Not a live feature. Activity timeouts, task retries, child cancellation types, asynchronous activities, Nexus and visibility are not simulated. |
 | Worker versioning and metadata | Legacy build-ID and deployment-based Core options, task-local deployment identity, start memo/search attributes, search-attribute upserts and activity priority/fairness fields are implemented and focused-tested. | No dedicated live routing, deployment rollout or fairness qualification. `make test-temporal-start-metadata-live`, added after the audited baseline, checks start memo/search attributes, continue-as-new and an official-CLI start across worker replacement; see [start metadata](workflow-start-metadata.md). Search-attribute upserts and priority metadata are not live-qualified. |
 
 Focused tests are under [`test/unit/`](../../test/unit/),

@@ -25,6 +25,7 @@ module Result_syntax = T.Result_syntax
 module Runtime_info = T.Runtime_info
 module Scope = T.Scope
 module Signal = T.Signal
+module Testing = T.Testing
 module Time = T.Time
 module Update = T.Update
 module Worker = T.Worker
@@ -963,3 +964,98 @@ let _workflow_cancel_external_workflow :
 let _workflow_upsert_search_attributes :
     (string * T.Payload.t) list -> unit =
   T.Workflow.upsert_search_attributes
+
+(* In-process, time-skipping workflow test environment. *)
+let _testing_workflow :
+    ?signals:T.Signal.Handler.t list ->
+    ?queries:T.Query.Handler.t list ->
+    ?updates:T.Update.Handler.t list ->
+    ('input, 'output) T.Workflow.t -> T.Testing.registered_workflow =
+  T.Testing.workflow
+
+let _testing_mock_workflow :
+    ?signals:T.Signal.Handler.t list ->
+    ?queries:T.Query.Handler.t list ->
+    ?updates:T.Update.Handler.t list ->
+    ('input, 'output) T.Workflow.t ->
+    ('input -> ('output, T.Error.t) result) ->
+    T.Testing.registered_workflow =
+  T.Testing.mock_workflow
+
+let _testing_activity :
+    ('input, 'output) T.Activity.t -> T.Testing.registered_activity =
+  T.Testing.activity
+
+let _testing_mock_activity :
+    ('input, 'output) T.Activity.t ->
+    ('input -> ('output, T.Error.t) result) ->
+    T.Testing.registered_activity =
+  T.Testing.mock_activity
+
+let _testing_create :
+    ?namespace:string ->
+    ?task_queue:string ->
+    ?start_time:T.Time.t ->
+    ?max_activity_attempts:int ->
+    workflows:T.Testing.registered_workflow list ->
+    activities:T.Testing.registered_activity list ->
+    unit -> (T.Testing.t, T.Error.t) result =
+  T.Testing.create
+
+let _testing_shutdown : T.Testing.t -> unit = T.Testing.shutdown
+let _testing_now : T.Testing.t -> T.Time.t = T.Testing.now
+
+let _testing_skip : T.Testing.t -> T.Duration.t -> (unit, T.Error.t) result =
+  T.Testing.skip
+
+let _testing_start :
+    ?id:string ->
+    T.Testing.t ->
+    ('input, 'output) T.Workflow.t ->
+    'input -> (('input, 'output) T.Testing.handle, T.Error.t) result =
+  T.Testing.start
+
+let _testing_result :
+    ?timeout:T.Duration.t ->
+    ('input, 'output) T.Testing.handle -> ('output, T.Error.t) result =
+  T.Testing.result
+
+let _testing_execute :
+    ?id:string ->
+    ?timeout:T.Duration.t ->
+    T.Testing.t ->
+    ('input, 'output) T.Workflow.t -> 'input -> ('output, T.Error.t) result =
+  T.Testing.execute
+
+let _testing_signal :
+    ('input, 'output) T.Testing.handle ->
+    'signal T.Signal.t -> 'signal -> (unit, T.Error.t) result =
+  T.Testing.signal
+
+let _testing_query :
+    ('input, 'output) T.Testing.handle ->
+    'query T.Query.t -> ('query, T.Error.t) result =
+  T.Testing.query
+
+let _testing_query_with_input :
+    ('input, 'output) T.Testing.handle ->
+    ('query_input, 'query) T.Query.typed ->
+    'query_input -> ('query, T.Error.t) result =
+  T.Testing.query_with_input
+
+let _testing_update :
+    ?timeout:T.Duration.t ->
+    ('input, 'output) T.Testing.handle ->
+    ('update_input, 'update_output) T.Update.t ->
+    'update_input -> ('update_output, T.Error.t) result =
+  T.Testing.update
+
+let _testing_cancel :
+    ('input, 'output) T.Testing.handle -> (unit, T.Error.t) result =
+  T.Testing.cancel
+
+let _testing_workflow_id : ('input, 'output) T.Testing.handle -> string =
+  T.Testing.workflow_id
+
+let _testing_run_id : ('input, 'output) T.Testing.handle -> string =
+  T.Testing.run_id
