@@ -29,7 +29,7 @@ let cancellation_error () =
   Error.make ~category:`Cancelled ~message:"workflow scope cancelled" ()
 
 (** Constructs the defect used when a scope operation is attempted from an
-    unrelated Domain or outside its workflow scheduler. *)
+    unrelated Domain or thread, or outside its workflow scheduler. *)
 let ownership_error operation =
   Error.defect
     ~message:("Temporal.Scope." ^ operation ^ " used outside its owning workflow scheduler")
@@ -70,16 +70,16 @@ let create () =
     stale as soon as its scheduler has been shut down, including when teardown
     is requested from inside the scheduler's final drain. The short-circuit
     keeps the liveness callback from reading scheduler state on a foreign
-    Domain. *)
+    Domain or thread. *)
 let owns_scheduler scope =
   Temporal_sdk_kernel.Future_store.current_owner_matches scope.owner_id
   && scope.callbacks_live ()
 
 (** Records cancellation and signals waiters through the owning scheduler.
     An active scope cannot be cancelled between scheduler runs or from another
-    Domain: doing so would mutate state without a queue turn that can resume
-    its waiters. The ownership check happens before reading [state], so even a
-    repeated call cannot race an owner-domain cancellation. *)
+    Domain or thread: doing so would mutate state without a queue turn that
+    can resume its waiters. The ownership check happens before reading
+    [state], so even a repeated call cannot race an owner-thread cancellation. *)
 let cancel scope =
   if not (owns_scheduler scope) then Error (ownership_error "cancel")
   else
