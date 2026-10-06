@@ -1,6 +1,7 @@
 (** Tests for the read-only execution metadata exposed by
     [Temporal.Workflow.info], [Temporal.Workflow.is_replaying], and
-    [Temporal.Activity.Context.info] (#792).
+    [Temporal.Activity.Context.info], and
+    [Temporal.Activity.Async_context.info] (#792).
 
     Workflow scenarios drive real protocol activations through
     [Native_execution.activate], the same adapter the native worker uses, so
@@ -8,8 +9,8 @@
     task-local history facts and the replay flag are replaced on every
     activation, and that live and replayed executions observe the same
     identity. Activity scenarios exercise the public projection of the private
-    task metadata, including timestamp conversion and the synthetic-context
-    defect. *)
+    task metadata, including timestamp and timeout conversion and the
+    synthetic-context defects. *)
 
 module Protocol = Temporal_protocol.Workflow_protocol
 module Execution = Temporal_runtime.Execution
@@ -92,6 +93,7 @@ let initialize : Protocol.activation_job =
     assertions run after the workflow fiber has returned. *)
 type observation = {
   identity : string * string * string option * string * string * int;
+  namespace : string;
   parent : Temporal.Workflow.Info.parent option;
   start_time : (int64 * int) option;
   snapshot_replaying : bool;
@@ -115,6 +117,7 @@ let observe () =
             Info.workflow_type info,
             Info.task_queue info,
             Info.attempt info );
+        namespace = Info.namespace info;
         parent = Info.parent info;
         start_time =
           Option.map
@@ -150,7 +153,10 @@ let run ~replaying =
                  observations := observe () :: !observations;
                  Ok ()))
   in
-  let execution = Execution.start ~task_queue:"info-queue" definition () in
+  let execution =
+    Execution.start ~task_queue:"info-queue" ~namespace:"info-namespace"
+      definition ()
+  in
   let first =
     unwrap "start"
       (Native_execution.activate execution
@@ -186,6 +192,8 @@ let test_workflow_info () =
     in
     expect "identity" identity before.identity;
     expect "identity after timer" identity after.identity;
+    expect "namespace" "info-namespace" before.namespace;
+    expect "namespace after timer" "info-namespace" after.namespace;
     expect "parent"
       (Some
          { Temporal.Workflow.Info.namespace = "parents"; workflow_id = "parent-1";
@@ -246,6 +254,9 @@ let test_activity_info () =
       scheduled_time = Some { seconds = 10L; nanoseconds = 5 };
       current_attempt_scheduled_time = Some { seconds = 20L; nanoseconds = 0 };
       started_time = None;
+      schedule_to_close_timeout = Some (Temporal_base.Duration.of_ms 90_000L);
+      start_to_close_timeout = Some (Temporal_base.Duration.of_ms 30_001L);
+      task_heartbeat_timeout = None;
     }
   in
   let make info =
@@ -272,7 +283,13 @@ let test_activity_info () =
          (Option.map Temporal.Time.nanoseconds (Info.scheduled_time info));
        expect "attempt scheduled seconds" (Some 20L)
          (seconds (Info.current_attempt_scheduled_time info));
-       expect "started time" None (seconds (Info.started_time info)));
+       expect "started time" None (seconds (Info.started_time info));
+       let ms = Option.map Temporal.Duration.to_ms in
+       expect "schedule-to-close timeout" (Some 90_000L)
+         (ms (Info.schedule_to_close_timeout info));
+       expect "start-to-close timeout" (Some 30_001L)
+         (ms (Info.start_to_close_timeout info));
+       expect "heartbeat timeout" None (ms (Info.heartbeat_timeout info)));
   match
     Temporal.Activity.Context.info
       (Temporal_base.Activity_context.unavailable ~details:[] ~heartbeat_timeout:None)
@@ -280,9 +297,96 @@ let test_activity_info () =
   | Error error -> expect "synthetic activity kind" "defect" (Temporal.Error.kind error)
   | Ok _ -> failwith "synthetic activity info unexpectedly succeeded"
 
+(** The public timeout accessors clamp a private value above the public
+    [Duration.t] maximum (here the rounded-up protobuf maximum) instead of
+    raising, so metadata access stays total for every producer of the
+    private record. *)
+let test_activity_info_clamps_timeouts () =
+  let above = Temporal_base.Duration.of_ms 315_576_000_001_000L in
+  let base : Temporal_base.Activity_context.info =
+    {
+      namespace = "default";
+      workflow_id = "wf";
+      workflow_run_id = "run";
+      workflow_type = "orders";
+      activity_id = "charge";
+      activity_type = "charge_card";
+      attempt = 1;
+      is_local = false;
+      scheduled_time = None;
+      current_attempt_scheduled_time = None;
+      started_time = None;
+      schedule_to_close_timeout = Some above;
+      start_to_close_timeout = Some above;
+      task_heartbeat_timeout = Some above;
+    }
+  in
+  let context =
+    Temporal_base.Activity_context.create_with_info ~info:base
+      ~heartbeat:(fun _ -> Ok ()) ~details:[] ~heartbeat_timeout:None
+  in
+  let module Info = Temporal.Activity.Info in
+  let ms = Option.map Temporal.Duration.to_ms in
+  let expected = Some 315_576_000_000_999L in
+  match Temporal.Activity.Context.info context with
+  | Error error -> failwith (Temporal.Error.message error)
+  | Ok info ->
+      expect "clamped schedule-to-close" expected
+        (ms (Info.schedule_to_close_timeout info));
+      expect "clamped start-to-close" expected
+        (ms (Info.start_to_close_timeout info));
+      expect "clamped heartbeat" expected (ms (Info.heartbeat_timeout info))
+
+(** An asynchronous context carries the metadata it was built with, and one
+    built without a Core task reports a defect rather than empty values. The
+    native adapter path is covered by [test_native_async_activity]. *)
+let test_async_context_info () =
+  let handle () =
+    Temporal_base.Async_activity.create
+      ~submit:(fun _ -> Ok ())
+      ~encode_output:(fun () -> Ok (Temporal_base.Payload.unit_null ()))
+  in
+  let info : Temporal_base.Activity_context.info =
+    {
+      namespace = "async-namespace";
+      workflow_id = "wf";
+      workflow_run_id = "run";
+      workflow_type = "orders";
+      activity_id = "ship";
+      activity_type = "ship_order";
+      attempt = 1;
+      is_local = false;
+      scheduled_time = None;
+      current_attempt_scheduled_time = None;
+      started_time = None;
+      schedule_to_close_timeout = None;
+      start_to_close_timeout = None;
+      task_heartbeat_timeout = Some (Temporal_base.Duration.of_ms 2_000L);
+    }
+  in
+  let module Info = Temporal.Activity.Info in
+  (match
+     Temporal.Activity.Async_context.info
+       (Temporal_base.Async_activity.context ~info (handle ()))
+   with
+   | Error error -> failwith (Temporal.Error.message error)
+   | Ok info ->
+       expect "async namespace" "async-namespace" (Info.namespace info);
+       expect "async activity id" "ship" (Info.activity_id info);
+       expect "async heartbeat timeout" (Some 2_000L)
+         (Option.map Temporal.Duration.to_ms (Info.heartbeat_timeout info)));
+  match
+    Temporal.Activity.Async_context.info
+      (Temporal_base.Async_activity.context (handle ()))
+  with
+  | Error error -> expect "synthetic async kind" "defect" (Temporal.Error.kind error)
+  | Ok _ -> failwith "synthetic async info unexpectedly succeeded"
+
 (** Runs every execution-info scenario as one dune test executable. *)
 let () =
   test_workflow_info ();
   test_workflow_info_outside_workflow ();
   test_workflow_info_synthetic_context ();
-  test_activity_info ()
+  test_activity_info ();
+  test_activity_info_clamps_timeouts ();
+  test_async_context_info ()
