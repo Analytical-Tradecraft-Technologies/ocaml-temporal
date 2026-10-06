@@ -11,15 +11,20 @@ type _ Effect.t += Abort_workflow : 'value Effect.t
     try/with wrappers; the deep handler treats it like shutdown. *)
 exception Workflow_aborted
 
-(** State for one workflow scheduler. [pending] counts futures without results,
-    and [teardowns] stores one removable cleanup token for each pending future.
-    Settling a future removes its token so completed values are not retained by
-    a long-lived workflow scheduler. *)
+(** One pending future's shutdown cleanup.  [removed] is set exactly once,
+    either when the future settles or when shutdown runs [action], so a token
+    drained by shutdown can no longer run after its future settled during an
+    earlier teardown action. *)
 type teardown_token = {
   mutable removed : bool;
   action : unit -> unit;
 }
 
+(** State for one workflow scheduler. [pending] counts futures without results,
+    and [teardowns] stores one removable cleanup token for each pending future
+    in creation order.  Settling a future unlinks its token in O(1), so
+    completed values are not retained by a long-lived workflow scheduler and
+    settling [n] futures costs O(n) rather than O(n{^ 2}). *)
 type t = {
   id : int;
   queue : runnable Queue.t;
@@ -28,7 +33,7 @@ type t = {
   mutable active : bool;
   mutable pending : int;
   mutable failures : exn list;
-  mutable teardowns : teardown_token list;
+  teardowns : teardown_token Temporal_base.Ordered_registry.t;
   mutable abort_requested : bool;
 }
 
@@ -48,7 +53,7 @@ let create () =
     active = true;
     pending = 0;
     failures = [];
-    teardowns = [];
+    teardowns = Temporal_base.Ordered_registry.create ();
     abort_requested = false;
   }
 
@@ -82,15 +87,16 @@ let owner scheduler =
     ~on_settled:(fun () -> scheduler.pending <- scheduler.pending - 1)
     ~register_teardown:(fun teardown ->
       let token = { removed = false; action = teardown } in
-      scheduler.teardowns <- token :: scheduler.teardowns;
-      (* Physical identity is safe here because every registration allocates a
-         fresh token. The linear scan keeps shutdown order explicit while
-         releasing the completed future's closure immediately. *)
+      let handle =
+        Temporal_base.Ordered_registry.add scheduler.teardowns token
+      in
+      (* Unlinking the registry node is O(1) and drops the registry's
+         reference to the completed future's closure immediately, while the
+         registry keeps shutdown order equal to creation order. *)
       fun () ->
         if not token.removed then (
           token.removed <- true;
-          scheduler.teardowns <-
-            List.filter (fun current -> current != token) scheduler.teardowns))
+          Temporal_base.Ordered_registry.remove handle))
 
 (** Rejects new future allocation after shutdown, when no continuation could be
     safely resumed. *)
@@ -210,13 +216,17 @@ let run_label scheduler =
 let shutdown scheduler =
   if scheduler.active then (
     scheduler.active <- false;
+    (* Snapshot in creation order, as before: a teardown action may settle a
+       later future (through a discontinued fiber's cleanup), which marks its
+       token removed so it is skipped here. Registrations made during this
+       loop are dropped without running, matching the previous ledger reset. *)
     List.iter
       (fun token ->
         if not token.removed then (
           token.removed <- true;
           token.action ()))
-      (List.rev scheduler.teardowns);
-    scheduler.teardowns <- [];
+      (Temporal_base.Ordered_registry.take_all scheduler.teardowns);
+    Temporal_base.Ordered_registry.clear scheduler.teardowns;
     if not scheduler.running then
       while not (Queue.is_empty scheduler.queue) do
         let (Runnable (_, thunk)) = Queue.pop scheduler.queue in
