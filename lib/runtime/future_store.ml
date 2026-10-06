@@ -29,10 +29,16 @@ type ('value, 'error) waiter =
   (('value, 'error) result, unit) Effect.Deep.continuation
 
 (** Holds paused fibers and mapping callbacks while a result is unavailable.
-    Lists are reversed so adding a new entry is constant time. *)
+    [waiters] is reversed so adding a paused fiber is constant time; waiters
+    are never removed individually.  [observers] are kept in an ordered
+    registry because a subscription may be cancelled before the result
+    arrives (for example the losing side of a race against a long-lived
+    future); the registry makes that unsubscription O(1) while delivery still
+    follows registration order. *)
 type ('value, 'error) pending = {
   mutable waiters : ('value, 'error) waiter list;
-  mutable observers : (('value, 'error) result -> unit) option ref list;
+  observers :
+    (('value, 'error) result -> unit) option ref Temporal_base.Ordered_registry.t;
 }
 
 (** [Closed] means the workflow ended before this future received a result and
@@ -94,8 +100,9 @@ let teardown promise () =
       promise.owner.on_settled ();
       let waiters = List.rev pending.waiters in
       pending.waiters <- [];
-      List.iter (fun observer -> observer := None) pending.observers;
-      pending.observers <- [];
+      List.iter
+        (fun observer -> observer := None)
+        (Temporal_base.Ordered_registry.take_all pending.observers);
       List.iter
         (fun continuation ->
           try Effect.Deep.discontinue continuation Scheduler_shutdown
@@ -107,7 +114,13 @@ let teardown promise () =
     the future immediately sees it as ready. *)
 let create ~owner ~outside_error =
   let promise =
-    { owner; outside_error; state = Pending { waiters = []; observers = [] } }
+    {
+      owner;
+      outside_error;
+      state =
+        Pending
+          { waiters = []; observers = Temporal_base.Ordered_registry.create () };
+    }
   in
   owner.on_create ();
   (* Settled futures no longer need a shutdown callback. Removing the
@@ -144,9 +157,8 @@ let create ~owner ~outside_error =
                 observer := None;
                 if owner.callbacks_live () then
                   Option.iter (fun callback -> callback result) callback))
-          (List.rev pending.observers);
-        pending.waiters <- [];
-        pending.observers <- []
+          (Temporal_base.Ordered_registry.take_all pending.observers);
+        pending.waiters <- []
   in
   (promise, resolve)
 
@@ -220,7 +232,8 @@ let add_waiter promise continuation =
     when the owner shuts down become no-ops after runtime teardown. Public
     derived wrappers use the same liveness signal to avoid scheduling work
     from these skipped callbacks. The returned owner-only removal action also
-    unlinks pending list storage and suppresses callbacks already queued. *)
+    unlinks pending registry storage in O(1) and suppresses callbacks already
+    queued. *)
 let subscribe promise observer =
   let token = ref (Some observer) in
   let deliver result () =
@@ -229,16 +242,21 @@ let subscribe promise observer =
     if promise.owner.callbacks_live () then
       Option.iter (fun callback -> callback result) callback
   in
-  (match promise.state with
-  | Pending pending -> pending.observers <- token :: pending.observers
-  | Ready result -> promise.owner.enqueue (deliver result)
-  | Closed -> promise.owner.enqueue (deliver (Error (promise.outside_error ()))));
-  fun () ->
-    token := None;
+  let registration =
     match promise.state with
     | Pending pending ->
-        pending.observers <- List.filter (fun current -> current != token) pending.observers
-    | Ready _ | Closed -> ()
+        Some (Temporal_base.Ordered_registry.add pending.observers token)
+    | Ready result ->
+        promise.owner.enqueue (deliver result);
+        None
+    | Closed ->
+        promise.owner.enqueue (deliver (Error (promise.outside_error ())));
+        None
+  in
+  fun () ->
+    token := None;
+    (* A no-op once resolution or teardown has drained the registry. *)
+    Option.iter Temporal_base.Ordered_registry.remove registration
 
 (** Registers an observer whose lifetime ends at delivery or owner teardown. *)
 let observe promise observer =

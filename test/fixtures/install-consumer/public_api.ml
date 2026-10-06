@@ -157,6 +157,21 @@ let _activity_info_current_attempt_scheduled_time :
 let _activity_info_started_time : T.Activity.Info.t -> T.Time.t option =
   T.Activity.Info.started_time
 
+let _activity_info_schedule_to_close_timeout :
+    T.Activity.Info.t -> T.Duration.t option =
+  T.Activity.Info.schedule_to_close_timeout
+
+let _activity_info_start_to_close_timeout :
+    T.Activity.Info.t -> T.Duration.t option =
+  T.Activity.Info.start_to_close_timeout
+
+let _activity_info_heartbeat_timeout : T.Activity.Info.t -> T.Duration.t option =
+  T.Activity.Info.heartbeat_timeout
+
+let _activity_async_context_info :
+    unit T.Activity.async_context -> (T.Activity.Info.t, T.Error.t) result =
+  T.Activity.Async_context.info
+
 (* Record fields of the public workflow identity are part of the contract. *)
 let _activity_info_workflow_fields
     ({ workflow_id; run_id; workflow_type } : T.Activity.Info.workflow) =
@@ -707,6 +722,9 @@ let _workflow_info_first_execution_run_id : T.Workflow.Info.t -> string option =
 
 let _workflow_info_workflow_type : T.Workflow.Info.t -> string =
   T.Workflow.Info.workflow_type
+
+let _workflow_info_namespace : T.Workflow.Info.t -> string =
+  T.Workflow.Info.namespace
 
 let _workflow_info_task_queue : T.Workflow.Info.t -> string =
   T.Workflow.Info.task_queue

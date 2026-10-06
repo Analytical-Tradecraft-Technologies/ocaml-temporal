@@ -32,6 +32,21 @@ target, and its self-test proves that omissions are rejected. The suites
 compiled locally with OCaml 5.4.1; their first live results come from the
 pull request's Linux CI job.
 
+## 2026-10-06: Linear-time future settlement (#847)
+
+Settling one future no longer scans every other pending registration. The
+scheduler's teardown ledger, condition waiters, scope cancellation hooks, and
+both runtime and derived future observers now use
+`Temporal_base.Ordered_registry`, an intrusive doubly linked list with O(1)
+append and removal whose traversals follow explicit registration order (no
+hashing). Settling `n` pending futures, releasing `n` condition waiters, or
+unlinking `n` completed scoped operations is therefore O(n) rather than
+O(n²). Resume, teardown, hook, and callback order are unchanged.
+`test/runtime/test_settle_scaling.ml` checks that order and a generous CPU
+budget for 50,000-wide fan-outs, and `test/unit/test_ordered_registry.ml`
+covers the registry contract; focused unit and runtime suites passed locally
+on OCaml 5.4.1.
+
 ## 2026-10-06: Large client signal, query, and update inputs (#771)
 
 The Rust bridge decoded signal, query, and update requests with the generic
@@ -2759,3 +2774,23 @@ yet. `test/runtime/test_execution_info.ml` drives live and replayed native
 activations through the adapter and covers the detached, synthetic, and
 standalone-activity paths; the native activity adapter test checks the
 forwarded task identity.
+
+## 2026-10-06: Remaining execution info (#792)
+
+`Temporal.Workflow.Info.namespace` reports the worker namespace: Core
+activations do not carry it, so the native worker passes its validated
+namespace to `Native_worker_execution.create`, which copies it into every
+execution context (and rejects a malformed value as typed configuration at
+`$.namespace`). `Temporal.Activity.Async_context.info` gives asynchronous
+callbacks the same `Activity.Info.t` as synchronous ones, and `Activity.Info`
+now reports the schedule-to-close, start-to-close, and heartbeat timeouts.
+Timeouts are rounded up to whole milliseconds so the conversion is total and
+adds no task-rejection path for sub-millisecond values; asynchronous
+definitions also skip the synchronous context's exact heartbeat-interval
+check, and the protobuf maximum is clamped to the largest public
+`Duration.t`. Server
+continue-as-new suggestion reasons are still not exposed: they are decoded
+but translating them into the execution context requires the native
+activation adapter, which is being changed by concurrent work.
+`test/runtime/test_execution_info.ml`, the async adapter test, and the native
+worker adapter test cover the new values.
