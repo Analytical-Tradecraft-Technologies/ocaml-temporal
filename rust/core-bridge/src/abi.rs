@@ -4,7 +4,7 @@ use crate::worker_bridge::{
     WORKER_FINALIZE_TIMEOUT, WORKER_SHUTDOWN_DRAIN_TIMEOUT, WorkerBridgeError,
     public_poll_lane_error_message, public_worker_error_message,
 };
-use crate::{activity_protocol, client_protocol, workflow_protocol};
+use crate::{activity_protocol, client_protocol, diagnostics, workflow_protocol};
 use serde::Deserialize;
 use std::collections::{HashMap, hash_map::Entry};
 use std::future::Future;
@@ -30,6 +30,7 @@ use temporalio_common::protos::{
     TaskToken,
     temporal::api::{common::v1 as api_common, enums::v1::VersioningBehavior},
 };
+use temporalio_common::telemetry::TelemetryOptions;
 use temporalio_sdk_core::{
     CoreRuntime, PollerBehavior, RuntimeOptions, TokioRuntimeBuilder, WorkerConfig,
     WorkerVersioningStrategy,
@@ -360,6 +361,10 @@ pub struct Runtime {
     pending_starts: HashMap<String, PendingStart>,
     pending_waits: HashMap<client_protocol::WaitWorkflowRequest, PendingWait>,
     cleanup: std::sync::mpsc::Sender<RuntimeCleanup>,
+    /// Writer thread draining Core's log queue to stderr, absent when Core
+    /// logging is `off`. Close transfers it to the cleanup thread, which
+    /// closes it after Core is dropped; see [`diagnostics::CoreLogWriter`].
+    core_log: Option<diagnostics::CoreLogWriter>,
 }
 
 /// One exact-run history observation, polled only by its runtime owner.
@@ -430,6 +435,10 @@ struct RuntimeCleanup {
     /// non-blocking OCaml finalizer transfers these handles here instead of
     /// dropping them on the caller thread, which would detach the tasks.
     pending_start_tasks: Vec<JoinHandle<()>>,
+    /// Core log writer, closed only after Core has been dropped so its
+    /// shutdown records are flushed. Its bounded close detaches a writer
+    /// blocked on stderr instead of delaying runtime close indefinitely.
+    core_log: Option<diagnostics::CoreLogWriter>,
     completed: Option<SyncSender<Status>>,
 }
 
@@ -505,7 +514,10 @@ enum WorkerVersioningInput {
 impl Runtime {
     /// Starts the cleanup thread before exposing a handle, so every successful
     /// runtime allocation already has a non-blocking GC fallback path.
-    fn new(core: CoreRuntime) -> std::result::Result<Self, Failure> {
+    fn new(
+        core: CoreRuntime,
+        core_log: Option<diagnostics::CoreLogWriter>,
+    ) -> std::result::Result<Self, Failure> {
         let (cleanup, receiver) = channel();
         std::thread::Builder::new()
             .name("ocaml-temporal-runtime-cleanup".to_owned())
@@ -526,6 +538,7 @@ impl Runtime {
             pending_starts: HashMap::new(),
             pending_waits: HashMap::new(),
             cleanup,
+            core_log,
         })
     }
 
@@ -562,12 +575,21 @@ impl Runtime {
         let connection = core
             .tokio_handle()
             .block_on(Connection::connect(options))
-            .map_err(|_error| Failure {
-                status: STATUS_CONNECTION,
-                // Core's connection error can contain gRPC status details or
-                // server-provided text.  Only the closed ABI category may
-                // cross into OCaml; detailed diagnostics stay inside Rust.
-                message: "Temporal client connection failed".to_owned(),
+            .map_err(|error| {
+                // Core's error text can contain server-provided gRPC status
+                // messages or configured header values. Only a closed cause
+                // plus bounded, sanitized local transport detail crosses into
+                // OCaml (#833); see `diagnostics::describe_connect_error`.
+                match diagnostics::describe_connect_error(&error) {
+                    diagnostics::ConnectFailure::Configuration => Failure {
+                        status: STATUS_CONFIGURATION,
+                        message: "Temporal Core rejected the client connection options".to_owned(),
+                    },
+                    diagnostics::ConnectFailure::Connection { cause, detail } => Failure {
+                        status: STATUS_CONNECTION,
+                        message: diagnostics::connection_failure_message(cause, &detail),
+                    },
+                }
             })?;
         self.client = Some(connection);
         Ok(Vec::new())
@@ -2174,6 +2196,7 @@ impl Runtime {
             worker: self.worker.take(),
             replay_worker: self.replay_worker.take(),
             pending_start_tasks,
+            core_log: self.core_log.take(),
             completed,
         };
 
@@ -2189,6 +2212,7 @@ impl Runtime {
                 message.replay_worker,
                 message.pending_start_tasks,
             );
+            drop(message.core_log);
             RUNTIMES_CLEANED.fetch_add(1, Ordering::Release);
             return STATUS_INTERNAL;
         }
@@ -2223,6 +2247,7 @@ fn run_runtime_cleanup(receiver: Receiver<RuntimeCleanup>) {
         worker,
         replay_worker,
         pending_start_tasks,
+        core_log,
         completed,
     } = message;
     let status = if catch_unwind(AssertUnwindSafe(|| {
@@ -2234,6 +2259,13 @@ fn run_runtime_cleanup(receiver: Receiver<RuntimeCleanup>) {
     } else {
         STATUS_PANIC
     };
+    // Core is gone, so no further records reach this runtime's queue except
+    // through a stale subscriber, which the close disconnects. The close
+    // flushes queued shutdown records but waits at most
+    // `CORE_LOG_CLOSE_TIMEOUT`, detaching a writer blocked on stderr.
+    if let Some(core_log) = core_log {
+        let _ = core_log.close(diagnostics::CORE_LOG_CLOSE_TIMEOUT);
+    }
     // Release publishes completion after Core's destructor has returned. The
     // matching Acquire load is used only by the isolated ownership test.
     RUNTIMES_CLEANED.fetch_add(1, Ordering::Release);
@@ -3036,6 +3068,56 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_conformance_wait_ms(
     }
 }
 
+/// Builds Core and the runtime owner, forwarding Core's own log records at
+/// `log_level` (none when `off`) instead of discarding them (#833).
+///
+/// `spawn_log` creates the writer thread only when logging is enabled. The
+/// Core consumer merely formats and enqueues without blocking; the writer
+/// performs the stderr I/O and never calls OCaml (see
+/// [`diagnostics::CoreLogWriter`]). If a later step fails, dropping the
+/// writer runs its bounded close, so no thread outlives a failed constructor.
+fn create_runtime(
+    log_level: Option<diagnostics::CoreLogLevel>,
+    spawn_log: impl FnOnce() -> std::io::Result<diagnostics::CoreLogWriter>,
+) -> std::result::Result<Runtime, Failure> {
+    let core_log = match log_level {
+        Some(level) => {
+            let writer = spawn_log().map_err(|error| Failure {
+                status: STATUS_INTERNAL,
+                message: format!("could not start Temporal Core log writer thread: {error}"),
+            })?;
+            Some((level, writer))
+        }
+        None => None,
+    };
+    let telemetry = TelemetryOptions::builder()
+        .maybe_logging(
+            core_log
+                .as_ref()
+                .map(|(level, writer)| diagnostics::core_logger(*level, writer.queue())),
+        )
+        .build();
+    let options = RuntimeOptions::builder()
+        .telemetry_options(telemetry)
+        .build()
+        .map_err(|_message| Failure {
+            status: STATUS_INTERNAL,
+            // Core runtime-option validation may change with the linked Core
+            // revision; expose only its stable category.
+            message: "could not configure Temporal Core runtime".to_owned(),
+        })?;
+    let core = CoreRuntime::new(options, TokioRuntimeBuilder::default()).map_err(|_error| {
+        Failure {
+            status: STATUS_INTERNAL,
+            // Runtime construction errors can contain Core or Tokio
+            // diagnostics. Keep the C result a closed category just like
+            // worker construction and poll failures.
+            message: "could not create Temporal Core runtime".to_owned(),
+        }
+    })?;
+    Runtime::new(core, core_log.map(|(_, writer)| writer))
+}
+
 /// Create the native runtime that will own later Core clients and workers.
 ///
 /// On success, `runtime` receives one owned opaque handle. The caller must
@@ -3078,25 +3160,12 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_runtime_new(
     // SAFETY: Both output locations were validated above.
     unsafe {
         invoke(output, || {
-            let options = RuntimeOptions::builder()
-                .build()
-                .map_err(|_message| Failure {
-                    status: STATUS_INTERNAL,
-                    // Core runtime-option validation may change with the
-                    // linked Core revision; expose only its stable category.
-                    message: "could not configure Temporal Core runtime".to_owned(),
-                })?;
-            let core =
-                CoreRuntime::new(options, TokioRuntimeBuilder::default()).map_err(|_error| {
-                    Failure {
-                        status: STATUS_INTERNAL,
-                        // Runtime construction errors can contain Core or Tokio
-                        // diagnostics. Keep the C result a closed category just
-                        // like worker construction and poll failures.
-                        message: "could not create Temporal Core runtime".to_owned(),
-                    }
-                })?;
-            let owned = Box::into_raw(Box::new(Runtime::new(core)?));
+            let log_level = diagnostics::core_log_level_from_env().map_err(|message| Failure {
+                status: STATUS_CONFIGURATION,
+                message,
+            })?;
+            let created = create_runtime(log_level, diagnostics::CoreLogWriter::spawn_stderr)?;
+            let owned = Box::into_raw(Box::new(created));
 
             // SAFETY: The runtime slot remains exclusively owned by this call
             // until it returns and was validated before invoking the closure.
@@ -4361,6 +4430,30 @@ pub fn test_runtime_cleanup_counts() -> (u64, u64) {
         RUNTIMES_CREATED.load(Ordering::Acquire),
         RUNTIMES_CLEANED.load(Ordering::Acquire),
     )
+}
+
+/// Creates a runtime whose Core log writer drains into `sink` instead of
+/// stderr, returning the owned handle and a producer for its log queue.
+///
+/// This is intentionally not part of the C ABI. It lets integration tests
+/// block the writer deterministically and prove that runtime close still
+/// completes. The handle must be released with
+/// [`ocaml_temporal_core_v2_runtime_free`].
+#[doc(hidden)]
+pub fn test_runtime_new_with_core_log_sink(
+    sink: Box<dyn std::io::Write + Send>,
+    capacity: usize,
+) -> std::result::Result<(*mut Runtime, diagnostics::CoreLogQueue), String> {
+    let runtime = create_runtime(Some(diagnostics::CoreLogLevel::Warn), || {
+        diagnostics::CoreLogWriter::spawn(sink, capacity)
+    })
+    .map_err(|failure| failure.message)?;
+    let queue = runtime
+        .core_log
+        .as_ref()
+        .map(diagnostics::CoreLogWriter::queue)
+        .ok_or_else(|| "runtime has no Core log writer".to_owned())?;
+    Ok((Box::into_raw(Box::new(runtime)), queue))
 }
 
 /// Returns the ABI category used for a worker error without exposing the
