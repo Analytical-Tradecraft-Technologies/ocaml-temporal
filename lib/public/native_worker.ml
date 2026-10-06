@@ -315,6 +315,14 @@ type t = {
           loop skips polling it (#805). The combined readiness wait never
           wakes for that idle lane, so it needs no special case there. *)
   closed : bool Atomic.t;
+  stop_requested : bool Atomic.t;
+      (** Sticky, non-blocking request for the run loop to return (#830). It
+          is separate from [closed] because it does not admit teardown: the
+          loop exits, but drain and native release still belong to a later
+          [shutdown], whose [closed] compare-and-set must still succeed. Only
+          [request_stop] writes it, with a single [Atomic.set], so a signal
+          handler may set it on any Domain, including the run loop's own
+          thread. *)
   shutdown_retryable : bool Atomic.t;
       (** [true] while terminal native shutdown has not returned. Adapter maps
           and continuations must remain retained until that call returns [Ok] or
@@ -335,8 +343,9 @@ type t = {
           callback that would wait for its own lane while still admitting a
           sibling system thread on the same Domain (#763). *)
 }
-(** Native worker lifecycle state. The atomic flag is the only state observed by
-    the polling lanes from [shutdown]. Each adapter protects its own maps; the
+(** Native worker lifecycle state. The [closed] and [stop_requested] atomics
+    are the only state observed by the polling lanes from [shutdown] and
+    [request_stop]. Each adapter protects its own maps; the
     lifecycle mutex prevents their drain from overlapping either execution
     lane. [shutdown_retryable] distinguishes a failed adapter drain (where the
     native graph is still usable) from a native teardown failure (where
@@ -451,6 +460,18 @@ let retry_pending worker ~workflow_lane =
     [run_mutex] with the runtime lock released while the lane exits. *)
 let is_execution_thread worker = Owner.is_execution_thread worker.owner
 
+(** Asks the run loop to return at its next stop check without waiting for it
+    (#830). This is one [Atomic.set] on a preallocated cell: it takes no lock,
+    performs no I/O, and does not touch the supervisor, so it is safe from an
+    OCaml signal handler running at a safe point on any Domain, including the
+    workflow lane's own thread. Teardown is deliberately not started here; the
+    caller runs [shutdown] after [run] returns. *)
+let request_stop worker = Atomic.set worker.stop_requested true
+
+(** The lanes' stop predicate: an admitted shutdown or a stop request. *)
+let stop_observed worker =
+  Atomic.get worker.closed || Atomic.get worker.stop_requested
+
 (** Runs workflow execution on this Domain and capacity-one activity execution
     on a dedicated Domain. Both adapters continue to use the same serialized
     supervisor mailbox. [run_mutex] remains held until the activity Domain is
@@ -475,7 +496,7 @@ let run worker =
           let result =
             try
               Worker_loop.run
-                ~closed:(fun () -> Atomic.get worker.closed)
+                ~closed:(fun () -> stop_observed worker)
                 ~poll_workflow:(fun () -> poll_workflow worker)
                 ~poll_activity:(fun () ->
                   Owner.enter_activity worker.owner;
@@ -549,9 +570,11 @@ let schedule_terminal_cleanup worker =
     preserves the original adapter error without retaining Tokio/Core resources
     behind a worker value that can no longer be retried. An execution-thread
     admission defect is the exception: no teardown has started, so it remains
-    retryable for a later call from any other thread. *)
+    retryable for a later call from any other thread. That call also posts a
+    stop request so the loop returns and the same thread, or any other, can
+    then complete shutdown (#830). *)
 let shutdown worker =
-  if is_execution_thread worker then
+  if is_execution_thread worker then begin
       (* A call from a lane's own thread cannot wait for [run_mutex] without
          deadlocking the loop that is making the call. Leave the private graph
          open and mark this admission failure retryable: the public wrapper
@@ -564,7 +587,10 @@ let shutdown worker =
          could only undo a [true] published by a concurrent [shutdown] on
          another thread -- clearing the stop request and stranding the loop,
          which then holds [run_mutex] forever and deadlocks that caller. The
-         policy fixes the action to [Leave_unchanged] for exactly this reason. *)
+         policy fixes the action to [Leave_unchanged] for exactly this reason.
+         The separate [stop_requested] flag is only ever set to [true], so
+         posting it here cannot undo another caller's request (#830). *)
+      request_stop worker;
       let closed_action, shutdown_retryable =
         Worker_policy.reentrant_same_domain_shutdown
       in
@@ -576,7 +602,9 @@ let shutdown worker =
         (Base_error.defect
            ~message:
              "cannot shut down a worker from inside its own run loop thread; \
-              that would deadlock the run mutex")
+              a stop was requested instead, so call shutdown again after run \
+              returns")
+  end
   else
       if Atomic.compare_and_set worker.closed false true then begin
         Mutex.lock worker.run_mutex;
@@ -800,6 +828,7 @@ let create ?max_cached_workflows ?(versioning = Bridge.No_versioning) ~target_ur
         activities;
         workflow_tasks;
         closed = Atomic.make false;
+        stop_requested = Atomic.make false;
         shutdown_retryable = Atomic.make false;
         terminal_cleanup_pending = Atomic.make false;
         terminal_cleanup_scheduled = Atomic.make false;
