@@ -297,6 +297,46 @@ let test_activity_info () =
   | Error error -> expect "synthetic activity kind" "defect" (Temporal.Error.kind error)
   | Ok _ -> failwith "synthetic activity info unexpectedly succeeded"
 
+(** The public timeout accessors clamp a private value above the public
+    [Duration.t] maximum (here the rounded-up protobuf maximum) instead of
+    raising, so metadata access stays total for every producer of the
+    private record. *)
+let test_activity_info_clamps_timeouts () =
+  let above = Temporal_base.Duration.of_ms 315_576_000_001_000L in
+  let base : Temporal_base.Activity_context.info =
+    {
+      namespace = "default";
+      workflow_id = "wf";
+      workflow_run_id = "run";
+      workflow_type = "orders";
+      activity_id = "charge";
+      activity_type = "charge_card";
+      attempt = 1;
+      is_local = false;
+      scheduled_time = None;
+      current_attempt_scheduled_time = None;
+      started_time = None;
+      schedule_to_close_timeout = Some above;
+      start_to_close_timeout = Some above;
+      task_heartbeat_timeout = Some above;
+    }
+  in
+  let context =
+    Temporal_base.Activity_context.create_with_info ~info:base
+      ~heartbeat:(fun _ -> Ok ()) ~details:[] ~heartbeat_timeout:None
+  in
+  let module Info = Temporal.Activity.Info in
+  let ms = Option.map Temporal.Duration.to_ms in
+  let expected = Some 315_576_000_000_999L in
+  match Temporal.Activity.Context.info context with
+  | Error error -> failwith (Temporal.Error.message error)
+  | Ok info ->
+      expect "clamped schedule-to-close" expected
+        (ms (Info.schedule_to_close_timeout info));
+      expect "clamped start-to-close" expected
+        (ms (Info.start_to_close_timeout info));
+      expect "clamped heartbeat" expected (ms (Info.heartbeat_timeout info))
+
 (** An asynchronous context carries the metadata it was built with, and one
     built without a Core task reports a defect rather than empty values. The
     native adapter path is covered by [test_native_async_activity]. *)
@@ -348,4 +388,5 @@ let () =
   test_workflow_info_outside_workflow ();
   test_workflow_info_synthetic_context ();
   test_activity_info ();
+  test_activity_info_clamps_timeouts ();
   test_async_context_info ()

@@ -482,14 +482,26 @@ let decode_input definition arguments =
   | Ok input -> Ok input
   | Error error -> Error (application_error ~path:"$.variant.input" error)
 
-(** Converts all callback inputs before dispatch. Callers must route any
-    conversion error through [reject_task]: a wire-valid task already owns a
-    native completion lease even when its heartbeat context is unsupported. *)
-let decode_start definition (start : Protocol.activity_start) =
+(** Converts the callback input and heartbeat details shared by both
+    definition styles. Callers must route any conversion error through
+    [reject_task]: a wire-valid task already owns a native completion lease
+    even when its heartbeat context is unsupported. *)
+let decode_payloads definition (start : Protocol.activity_start) =
   let* input = decode_input definition start.input in
   let* details =
     runtime_payloads "$.variant.heartbeat_details" start.heartbeat_details
   in
+  Ok (input, details)
+
+(** Converts all synchronous callback inputs before dispatch, including the
+    exact heartbeat interval behind [Temporal.Activity.Context.heartbeat_timeout].
+    Asynchronous definitions use [decode_payloads] instead: they have no
+    synchronous heartbeat context, so a sub-millisecond timeout that
+    [runtime_duration] cannot represent exactly must not reject their task;
+    [task_info] exposes it rounded up through [Async_context.info]. Error
+    routing is the same as for [decode_payloads]. *)
+let decode_start definition (start : Protocol.activity_start) =
+  let* input, details = decode_payloads definition start in
   let* heartbeat_timeout =
     match start.heartbeat_timeout with
     | None -> Ok None
@@ -506,10 +518,15 @@ let decode_start definition (start : Protocol.activity_start) =
     intervals because heartbeat throttling depends on the exact value, this
     conversion is total: metadata exposure must never add a task-rejection
     path. Rounding up keeps a positive timeout positive (zero would read as
-    "already expired"). The strict decoder bounds seconds to the protobuf
-    duration range and nanoseconds to [0, 1e9); the clamp and saturation
-    below only make the function total should that invariant ever change. *)
+    "already expired"). The result is clamped to 315,576,000,000,999 ms, the
+    largest whole-millisecond protobuf duration and the maximum accepted by
+    [Temporal.Duration.of_ms]: rounding up the valid protobuf maximum
+    (315,576,000,000 s plus 999,999,999 ns) would otherwise exceed it by one
+    millisecond. The strict decoder bounds seconds to the protobuf duration
+    range and nanoseconds to [0, 1e9); the clamps and saturation below only
+    make the function total should that invariant ever change. *)
 let info_duration (duration : Protocol.duration) =
+  let maximum_ms = 315_576_000_000_999L in
   let seconds = Int64.max 0L duration.seconds in
   let nanoseconds = max 0 (min 999_999_999 duration.nanoseconds) in
   let fraction_ms = Int64.of_int ((nanoseconds + 999_999) / 1_000_000) in
@@ -520,7 +537,7 @@ let info_duration (duration : Protocol.duration) =
     if Int64.compare seconds maximum_seconds > 0 then Int64.max_int
     else Int64.add (Int64.mul seconds 1_000L) fraction_ms
   in
-  Temporal_base.Duration.of_ms milliseconds
+  Temporal_base.Duration.of_ms (Int64.min milliseconds maximum_ms)
 
 (** Copies the identity and scheduling facts of a start task into the
     immutable record exposed through [Temporal.Activity.Context.info]. The
@@ -1143,9 +1160,11 @@ module Make (Supervisor : SUPERVISOR) = struct
       (start : Protocol.activity_start) =
     let activity_type = Some start.activity_type in
     let process () =
-      match decode_start definition start with
+      (* [decode_payloads], not [decode_start]: the exact heartbeat interval
+         is only needed by synchronous contexts. *)
+      match decode_payloads definition start with
       | Error error -> reject_task adapter ~token ~activity_type error
-      | Ok (input, _details, _heartbeat_timeout) ->
+      | Ok (input, _details) ->
           (match Definition.implementation definition with
           | None ->
               reject_task adapter ~token ~activity_type

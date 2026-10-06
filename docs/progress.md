@@ -2722,7 +2722,10 @@ execution context (and rejects a malformed value as typed configuration at
 callbacks the same `Activity.Info.t` as synchronous ones, and `Activity.Info`
 now reports the schedule-to-close, start-to-close, and heartbeat timeouts.
 Timeouts are rounded up to whole milliseconds so the conversion is total and
-adds no task-rejection path for sub-millisecond values. Server
+adds no task-rejection path for sub-millisecond values; asynchronous
+definitions also skip the synchronous context's exact heartbeat-interval
+check, and the protobuf maximum is clamped to the largest public
+`Duration.t`. Server
 continue-as-new suggestion reasons are still not exposed: they are decoded
 but translating them into the execution context requires the native
 activation adapter, which is being changed by concurrent work.

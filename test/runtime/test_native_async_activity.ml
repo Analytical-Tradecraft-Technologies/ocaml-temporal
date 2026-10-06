@@ -1136,8 +1136,10 @@ let test_async_failure () =
 
 (** An asynchronous callback reads the start task's metadata through
     [Async_context.info], including the effective timeouts. Sub-millisecond
-    schedule-to-close and start-to-close values are rounded up instead of
-    rejecting the task, so exposing them adds no new failure path (#792). *)
+    timeouts are rounded up instead of rejecting the task, so exposing them
+    adds no new failure path (#792). This includes a 500 microsecond heartbeat
+    timeout: only synchronous contexts need its exact value, so the async
+    path must not apply that check. *)
 let test_async_context_info () =
   let supervisor = fake_supervisor () in
   let observed = ref None in
@@ -1165,7 +1167,7 @@ let test_async_context_info () =
                 attempt = 2L;
                 schedule_to_close_timeout = Some { seconds = 60L; nanoseconds = 1 };
                 start_to_close_timeout = Some { seconds = 0L; nanoseconds = 500_000 };
-                heartbeat_timeout = Some { seconds = 3L; nanoseconds = 0 };
+                heartbeat_timeout = Some { seconds = 0L; nanoseconds = 500_000 };
               };
         }
     | _ -> failwith "fixture did not build a start task"
@@ -1197,8 +1199,68 @@ let test_async_context_info () =
         failwith "schedule-to-close timeout was not rounded up";
       if ms (Info.start_to_close_timeout info) <> Some 1L then
         failwith "sub-millisecond start-to-close timeout was not rounded up";
-      if ms (Info.heartbeat_timeout info) <> Some 3_000L then
-        failwith "heartbeat timeout did not match"
+      if ms (Info.heartbeat_timeout info) <> Some 1L then
+        failwith "sub-millisecond heartbeat timeout was not rounded up"
+
+(** The largest valid protobuf duration (315,576,000,000 s plus 999,999,999 ns)
+    rounds up one millisecond past the public [Duration.t] maximum. Every
+    timeout accessor must clamp it to 315,576,000,000,999 ms instead of
+    raising [Invalid_argument] from [Duration.of_ms]. *)
+let test_async_context_info_maximum_timeouts () =
+  let supervisor = fake_supervisor () in
+  let observed = ref None in
+  let activity =
+    Temporal.Activity.define_async ~name:"async_info_max"
+      ~input:Temporal.Codec.unit ~output:Temporal.Codec.unit
+      (fun context () ->
+        observed := Some (Temporal.Activity.Async_context.info context);
+        Temporal.Activity.Completed ())
+  in
+  let token = Bytes.of_string "async-info-max-token" in
+  let task =
+    start_task ~token ~activity_type:"async_info_max"
+      ~input:[ encode_input Temporal.Codec.unit () ]
+  in
+  let maximum : Protocol.duration =
+    { seconds = 315_576_000_000L; nanoseconds = 999_999_999 }
+  in
+  let task =
+    match task.variant with
+    | Protocol.Start start ->
+        {
+          task with
+          variant =
+            Protocol.Start
+              {
+                start with
+                schedule_to_close_timeout = Some maximum;
+                start_to_close_timeout = Some maximum;
+                heartbeat_timeout = Some maximum;
+              };
+        }
+    | _ -> failwith "fixture did not build a start task"
+  in
+  enqueue supervisor task;
+  let worker = worker supervisor [ Adapter.register_async activity ] in
+  begin
+    match Worker.poll worker with
+    | Ok (Raw_adapter.Completed { kind = Raw_adapter.Succeeded; _ }) -> ()
+    | _ -> failwith "maximum-timeout async activity did not complete"
+  end;
+  let module Info = Temporal.Activity.Info in
+  let expected = Some 315_576_000_000_999L in
+  let ms = Option.map Temporal.Duration.to_ms in
+  match !observed with
+  | None -> failwith "maximum-timeout async callback did not run"
+  | Some (Error error) ->
+      failwith ("async context info failed: " ^ Temporal.Error.message error)
+  | Some (Ok info) ->
+      if ms (Info.schedule_to_close_timeout info) <> expected then
+        failwith "maximum schedule-to-close timeout was not clamped";
+      if ms (Info.start_to_close_timeout info) <> expected then
+        failwith "maximum start-to-close timeout was not clamped";
+      if ms (Info.heartbeat_timeout info) <> expected then
+        failwith "maximum heartbeat timeout was not clamped"
 
 (** [drain] refuses to claim shutdown while an async capability remains, while
     [discard] closes the retained handle only after terminal native cleanup. *)
@@ -1727,6 +1789,7 @@ let () =
   test_async_heartbeat_and_cancel ();
   test_async_failure ();
   test_async_context_info ();
+  test_async_context_info_maximum_timeouts ();
   test_async_drain_and_discard ();
   test_stale_handle_rejected ();
   test_completion_racing_handoff_is_retryable ();

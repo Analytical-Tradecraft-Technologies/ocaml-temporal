@@ -246,9 +246,11 @@ current-attempt-scheduled, and started timestamps that Core reported, and the
 effective schedule-to-close, start-to-close, and heartbeat timeouts. Core
 carries timeouts with nanosecond precision while `Temporal.Duration.t` holds
 whole milliseconds, so a sub-millisecond remainder is rounded up: a positive
-timeout never reads as zero, and the conversion is total, so exposing
-timeouts adds no task-rejection path (the separately validated
-`Context.heartbeat_timeout` keeps its existing rule). The adapter copies these
+timeout never reads as zero. The rounded value is clamped to
+315,576,000,000,999 ms, the `Duration.of_ms` maximum, because rounding the
+protobuf maximum up would exceed it by one millisecond. The conversion is
+total, so exposing timeouts adds no task-rejection path (the separately
+validated `Context.heartbeat_timeout` keeps its existing rule). The adapter copies these
 values from the validated start task, so the projection cannot fail; a context from a backend without a Temporal task, such as the
 in-process test backend, returns a typed defect instead. Combining the
 workflow and activity IDs (plus the attempt when each retry must be distinct)
@@ -258,15 +260,18 @@ metadata is immutable and stays readable after the attempt ends.
 because the value is immutable, external code may keep it alongside the
 retained handle.
 
-Before constructing the context, the adapter validates the server timeout: it
-rejects negative, sub-millisecond, or out-of-range values instead of rounding
-or overflowing them. An accepted timeout is therefore exposed as an exact
-whole-millisecond `Duration.t`.
+Before constructing a synchronous context, the adapter validates the server
+heartbeat timeout: it rejects negative, sub-millisecond, or out-of-range
+values instead of rounding or overflowing them. An accepted timeout is
+therefore exposed as an exact whole-millisecond `Duration.t`. Asynchronous
+definitions have no synchronous heartbeat context and skip this exact
+conversion, so a sub-millisecond heartbeat timeout does not reject their task;
+`Async_context.info` reports it rounded up like the other timeouts.
 
 Heartbeat-context conversion failures follow the same task-rejection path as
 input codec failures, for both synchronous and asynchronous definitions. For
 example, binary heartbeat metadata which cannot be represented by runtime
-strings, or a sub-millisecond timeout, produces a bounded non-retryable failure
+strings, or (for synchronous definitions) a sub-millisecond timeout, produces a bounded non-retryable failure
 for the exact leased token without invoking the callback. The adapter retains
 that validated failure until native acknowledgement, so a transient submission
 failure remains visible to polling and shutdown drain. Once acknowledged,

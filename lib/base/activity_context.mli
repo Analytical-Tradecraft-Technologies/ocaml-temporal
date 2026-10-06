@@ -6,7 +6,8 @@
 type t
 
 (** An exact protobuf timestamp copied from the activity task. The adapter has
-    already validated [nanoseconds] to lie in [0, 1_000_000_000). *)
+    already validated [nanoseconds] to lie in 0 inclusive to 1_000_000_000
+    exclusive. *)
 type timestamp = { seconds : int64; nanoseconds : int }
 
 (** Immutable identity and scheduling facts Temporal Core delivered with one
@@ -38,7 +39,7 @@ type info = {
 }
 
 (** Creates an active context without Core task metadata. Test doubles and
-    synthetic contexts use it; {!info} then returns [None]. The callback
+    synthetic contexts use it; {!val-info} then returns [None]. The callback
     receives owned payload copies. *)
 val create :
   heartbeat:(Payload.t list -> (unit, Error.t) result) ->
@@ -47,7 +48,7 @@ val create :
   t
 
 (** Creates an active context after the native adapter has validated all
-    values received from Temporal Core, retaining [info] for {!info}. *)
+    values received from Temporal Core, retaining [info] for {!val-info}. *)
 val create_with_info :
   info:info ->
   heartbeat:(Payload.t list -> (unit, Error.t) result) ->

@@ -674,8 +674,10 @@ let test_invalid_failure_completion_retry () =
     failwith "replacement retry reran the activity, retained its lease, or polled later work"
 
 (** Wire-valid context values which the runtime cannot represent must fail only
-    their own task. Exercise both callback styles, immediate acknowledgement,
-    and transport retry through poll and drain before running unrelated work. *)
+    their own task. Exercise both callback styles (a sub-millisecond heartbeat
+    timeout is unrepresentable only for synchronous ones), immediate
+    acknowledgement, and transport retry through poll and drain before running
+    unrelated work. *)
 let test_unrepresentable_context_retires_lease () =
   List.iter
     (fun async ->
@@ -797,7 +799,11 @@ let test_unrepresentable_context_retires_lease () =
               | Ok () when !(supervisor.leased) = [] && Atomic.get good_calls = 1 -> ()
               | _ -> failwith "context rejection left unaccounted completion debt")
             [ false; true ])
-        [ true; false ])
+        (* A sub-millisecond heartbeat timeout only fails synchronous
+           definitions, whose context exposes the exact interval.
+           Asynchronous callbacks accept it and report it rounded up through
+           [Async_context.info]; test_native_async_activity covers that. *)
+        (if async then [ true ] else [ true; false ]))
     [ false; true ]
 
 (** An unknown activity type is acknowledged with a typed non-retryable failure,

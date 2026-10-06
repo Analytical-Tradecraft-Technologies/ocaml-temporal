@@ -340,10 +340,20 @@ module Info = struct
   (** Returns the server start time of this attempt. *)
   let started_time (info : t) = time info.started_time
 
-  (** Re-wraps a private millisecond duration in the public type. *)
+  (** The largest value [Duration.of_ms] accepts: the protobuf duration
+      maximum truncated to whole milliseconds. *)
+  let maximum_duration_ms = 315_576_000_000_999L
+
+  (** Re-wraps a private millisecond duration in the public type. The value is
+      clamped to [maximum_duration_ms] rather than passed through unchecked:
+      rounding the valid protobuf maximum up to whole milliseconds exceeds the
+      public bound by one, and metadata access must not raise. The native
+      adapter already clamps, so this only keeps the accessor total for any
+      other producer of the private record. *)
   let duration =
     Option.map (fun duration ->
-        Duration.of_ms (Temporal_base.Duration.to_ms duration))
+        Duration.of_ms
+          (Int64.min (Temporal_base.Duration.to_ms duration) maximum_duration_ms))
 
   (** Returns the effective schedule-to-close timeout. *)
   let schedule_to_close_timeout (info : t) =

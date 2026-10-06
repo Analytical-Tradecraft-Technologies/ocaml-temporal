@@ -206,7 +206,7 @@ end
 (** Read-only identity and scheduling facts for one activity attempt, copied
     from the task Temporal delivered. The type is abstract so later releases
     can add fields compatibly. A common use is an idempotency key for
-    at-least-once side effects, for example combining {!Info.workflow},
+    at-least-once side effects, for example combining {!Info.val-workflow},
     {!Info.activity_id}, and, when each retry must be distinct,
     {!Info.attempt}. *)
 module Info : sig
@@ -256,7 +256,9 @@ module Info : sig
       scheduled, so this may differ from the option the workflow passed.
       Temporal carries nanosecond precision; a sub-millisecond remainder is
       rounded up to the next whole millisecond, so a positive timeout is never
-      reported as zero. *)
+      reported as zero. The result is clamped to 315,576,000,000,999 ms, the
+      largest value {!Duration.of_ms} accepts, so the protobuf maximum
+      (which would round up past it) is reported as that bound. *)
   val schedule_to_close_timeout : t -> Duration.t option
 
   (** Returns the effective start-to-close timeout of this attempt, if

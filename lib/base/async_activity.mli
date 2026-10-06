@@ -75,7 +75,7 @@ val create :
     metadata. *)
 val context : ?info:Activity_context.info -> 'output handle -> 'output context
 
-(** Returns the task metadata supplied to {!context}, if any. It stays
+(** Returns the task metadata supplied to {!val-context}, if any. It stays
     readable after the callback returns, like the synchronous context's. *)
 val info : 'output context -> Activity_context.info option
 
