@@ -165,6 +165,54 @@ fallback Cargo directory did not escape into the consumer's build root. It
 compiles the Rust bridge in a fresh workspace, so it is an opt-in check rather
 than part of `make test` or the per-commit CI matrix.
 
+## Offline opam source builds
+
+opam runs package builds in a sandbox that denies network access, so a source
+build cannot let Cargo download the locked crates or the pinned Temporal Core
+Git revision (#778). Each GitHub release therefore publishes
+`ocaml-temporal-<tag>-source.tar.gz`, produced by
+`scripts/create-source-archive.sh`: the committed tree plus
+
+- `rust/vendor.tar`, the `cargo vendor --locked --versioned-dirs` output for
+  exactly the `rust/Cargo.lock` graph, including Temporal Core;
+- `rust/vendor-config.toml`, the matching Cargo source replacement for
+  crates.io and the Temporal Core Git source, pointing at the relative
+  directory `vendor`; and
+- `THIRD-PARTY-NOTICES.txt`, the audited licence texts of the redistributed
+  Rust packages.
+
+When both `rust/` files are present, `scripts/build-rust-bridge.sh` unpacks
+the archive afresh into `vendored-sources/` below the Cargo target directory,
+copies the replacement to `vendored-sources/.cargo/config.toml`, and runs every
+Cargo command with `--frozen --config <that file>` and
+`CARGO_NET_OFFLINE=true`. Cargo then verifies each crate against its vendored
+checksums and fails instead of contacting the network if anything is missing.
+If only one of the two files is present the archive is incomplete and the build
+fails before Cargo runs. A Git checkout has neither file and keeps the normal
+`--locked` build, which fetches on first use.
+
+The crates stay in an uncompressed tar file rather than an unpacked `vendor/`
+directory because Dune's `source_tree` dependency omits directories whose
+names begin with `.` or `_`. Many crates publish such directories (for example
+`.github`), and Cargo's checksum verification would reject the incomplete
+copy that Dune hands to the bridge rule.
+
+To install a release from source inside the sandbox:
+
+```sh
+curl -LO https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/releases/download/<tag>/ocaml-temporal-<tag>-source.tar.gz
+# check the file against the release's SHA256SUMS, then:
+tar -xzf ocaml-temporal-<tag>-source.tar.gz
+opam install ./ocaml-temporal-<version>
+```
+
+An opam-repository package uses the same archive as its `url` with the
+published SHA-256. The archive needs no Rust download, but the build still
+needs the Rust toolchain and `protoc` that `conf-rust-2024` and `conf-protoc`
+require. Running `opam install .` from a Git checkout still needs network
+access for Cargo, so it works only where the build may reach the network;
+installing a release archive is the supported sandboxed path.
+
 ## Regression evidence
 
 The installed-package smoke test is deliberately run against a fresh consumer

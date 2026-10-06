@@ -15,6 +15,23 @@ implementation when a later entry documents that work as complete. The
 records the current tested source, named assertions and successful CI job for
 the Temporal acceptance controllers.
 
+## 2026-10-06: Offline opam builds from the release source archive (#778)
+
+opam's build sandbox denies network access, so `cargo build --locked` could
+not fetch the locked crates or the pinned Temporal Core Git revision during
+`opam install`. The release source archive is now produced by
+`scripts/create-source-archive.sh`, which adds the `cargo vendor --locked`
+output as `rust/vendor.tar`, the matching source replacement as
+`rust/vendor-config.toml`, and the audited third-party notices. When both
+files are present `scripts/build-rust-bridge.sh` unpacks the crates into the
+Cargo target directory and runs Cargo with `--frozen` and
+`CARGO_NET_OFFLINE=true`; Git checkouts keep the normal `--locked` build.
+`test/smoke/test_rust_bridge_offline.sh` proves both modes and the rejection of
+an incomplete archive with a stand-in Cargo. An archive built by the script
+from this commit compiled with `dune build -p temporal-sdk` under a macOS
+`sandbox-exec` policy matching opam's (network and writes outside the build
+directory denied, nonexistent `CARGO_HOME`).
+
 ## 2026-10-06: Retained completions fail closed (#843)
 
 The workflow and activity adapters used to resubmit every retained completion

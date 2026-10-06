@@ -108,8 +108,11 @@ jobs:
             --tag "$RELEASE_TAG" --commit "$GITHUB_SHA" \
             --license LICENSE \
             --notices _build/release-notices/THIRD-PARTY-NOTICES.txt
-          git archive --format=tar --prefix="ocaml-temporal-${RELEASE_TAG#v}/" HEAD \
-            | gzip -n > "_build/release-assets/ocaml-temporal-$RELEASE_TAG-source.tar.gz"
+          # The source archive vendors the locked Cargo graph so opam can build
+          # it inside its network-denying build sandbox (#778).
+          sh scripts/create-source-archive.sh . "$RELEASE_TAG" \
+            "_build/release-assets/ocaml-temporal-$RELEASE_TAG-source.tar.gz" \
+            _build/release-notices/THIRD-PARTY-NOTICES.txt
           python3 scripts/generate-cargo-sbom.py \
             --audit _build/release-assets/ocaml-temporal-cargo.spdx.json
           (
