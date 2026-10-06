@@ -78,8 +78,10 @@ supervisor Domain that owns the runtime:
    has reached end-of-input. `Try_poll_replay_workflow` then converts the
    activation to the normal typed OCaml workflow protocol and retains its
    completion lease.
-4. `Complete_replay_workflow` encodes the typed completion and submits it for
-   the exact retained run. If OCaml cannot decode a handoff, the supervisor
+4. `Complete_replay_workflow` submits the canonical bytes of an
+   `Encoded_workflow_completion.t`, produced once by the worker adapter's
+   encoder, for the exact retained run; the supervisor does not encode the
+   completion again. If OCaml cannot decode a handoff, the supervisor
    sends the untouched document to `Reject_replay_workflow` so Core's debt is
    retired rather than stranded.
 5. `Finish_replay_input` closes the feeder. After all activations are completed

@@ -12,8 +12,20 @@ The adapter consumes the typed operations below:
 
 ```text
 try_poll_workflow : supervisor -> (activation option, error) result
-complete_workflow : supervisor -> completion -> (unit, error) result
+complete_workflow :
+  supervisor -> completion:completion -> Encoded_workflow_completion.t ->
+  (unit, error) result
 ```
+
+`complete_workflow` receives the canonical bytes from the completion's single
+encoder pass (`Encoded_workflow_completion.t`, which only that encoder can
+produce) and submits exactly those bytes; it never encodes the completion
+again (issue #846). The labelled `completion` is the typed value those bytes
+were encoded from. It is passed read-only so fake sources, integration
+controllers, and the cold-replay benchmark can inspect submitted commands
+without parsing JSON a second time; the production supervisor ignores it.
+Because `completion` may alias workflow-owned payload buffers, only the
+encoded bytes are a snapshot and authoritative.
 
 The concrete `Sdk_supervisor.Native` module instantiates this signature with
 operations on its owner Domain. The public worker loop also uses one private,
@@ -72,13 +84,16 @@ The adapter owns only OCaml values:
   definition;
 - a mutable map from Temporal run ID to its matching typed `Execution.t`;
 - a mutable map of workflow completions whose native acknowledgement has not
-  yet been proven, with every mutable payload buffer copied into adapter-owned
-  storage;
+  yet been proven, each held as the immutable canonical JSON produced by its
+  single encoder pass (`Encoded_workflow_completion.t`) beside the typed
+  completion it was encoded from. A retry resubmits those bytes unchanged, so
+  later mutation of a workflow-owned payload buffer cannot alter what is
+  sent; the typed value is kept only to pass to the source read-only;
 - one mutex that serializes polling, execution, and completion submission.
 
 No native pointer, Rust future, or continuation is stored in the maps. The
-pending completion map owns copied semantic payload bytes until the supervisor
-confirms acknowledgement and then releases them with the ordinary OCaml value
+pending completion map owns those immutable completion bytes until the
+supervisor confirms acknowledgement and then releases them with the ordinary OCaml value
 lifetime. The Rust ledger remains the authority for the native lease until
 Core accepts or rejects that completion. The mutex protects OCaml scheduler
 state in addition to the supervisor's own owner-Domain serialization, so two
@@ -105,9 +120,13 @@ already been accepted.
 2. A typed activation is validated again by
    `Native_execution.translate_activation`. This applies the same semantic
    checks for identifiers, sequence relationships, and payload shape to fake
-   supervisors and future alternate sources. It is not a second JSON
-   round-trip; JSON syntax and encoding metadata have already been checked by
-   the native supervisor's protocol adapter.
+   supervisors and future alternate sources. JSON syntax and encoding
+   metadata have already been checked by the native supervisor's protocol
+   adapter. The activation is translated exactly once per poll: the private
+   `translated_activation` record it returns is used for observer metadata
+   and registry lookup and is then passed to
+   `Native_execution.activate_translated`, which does not translate or
+   validate it again (issue #846).
 3. A first job must be exactly one `Initialize_workflow`. Its workflow type is
    looked up in the immutable registration map. Duplicate run IDs, unknown
    workflow types, remote-only definitions, and invalid input argument counts
@@ -120,18 +139,24 @@ already been accepted.
 5. A typed `Execution.t` is inserted under the run ID before activation jobs
    run. The existing deterministic scheduler applies jobs in order and emits
    commands in creation order.
-6. `Native_execution` converts the command batch to a checked semantic
-   completion. Activity commands retain their complete Core fields and child
+6. `Native_execution` converts the command batch to a semantic completion
+   and runs the canonical encoder over it exactly once. That pass is the
+   completion's validation, and its output bytes are returned with the typed
+   value. Activity commands retain their complete Core fields and child
    starts retain their workflow identity, input payload, and optional retry
    policy before submission. Core child options that the current OCaml runtime
    does not expose stay at
    explicit defaults. When Core later sends a child start acknowledgment, the
    adapter stores the returned run ID and keeps the parent future pending; a
    separate terminal child resolution then completes that future.
-7. The completion is copied into an adapter-owned pending record before it is
-   submitted through the same supervisor. The supervisor canonical-encodes
-   and semantically validates the completion, checks its leased run ID against Rust's ledger,
-   and retires that lease only after Core accepts it. The run entry is removed
+7. The encoded bytes are stored in an adapter-owned pending record before
+   they are submitted through the same supervisor. The supervisor copies them
+   into the C call without encoding the completion again; Rust checks the
+   leased run ID against its ledger and retires that lease only after Core
+   accepts it. A failure completion or eviction acknowledgement built by the
+   adapter is encoded once by the adapter in the same way. If the encoder
+   rejects such a completion, nothing is submitted and the entry fails closed
+   with `completion_failed`, as a non-retryable supervisor rejection does. The run entry is removed
    only after the supervisor confirms completion retirement. Terminal commands
    shut down fibers and pending operations but retain final workflow-local
    state for inline queries. Core owns cache lifetime: its cache-removal
@@ -186,11 +211,11 @@ That path always reaches `runtime_close`, even if Core reports outstanding
 tasks while its graceful worker step runs; runtime disposal force-retires those
 native leases and releases Tokio/Core. The original adapter error remains the
 public result, while any native cleanup diagnostic is logged. The pending map
-still owns copied bytes until the caller's result records either
+still owns the encoded completion bytes until the caller's result records either
 acknowledgement or this terminal failure. If `Native.shutdown` returns
 `Error`, that result is still release-complete by contract and the adapter maps
 are then discarded. If it raises before returning, the worker keeps the maps,
-marks terminal cleanup pending, and schedules a detached retry; no copied
+marks terminal cleanup pending, and schedules a detached retry; no retained
 completion is discarded merely because the public worker has closed admission.
 
 Malformed JSON is rejected below this module by the supervisor's protocol
@@ -335,8 +360,8 @@ verify:
 `test/runtime/test_native_worker_lifecycle.ml` is a separate focused regression
 file for the shutdown-sensitive path. It rejects the same completion twice:
 the initial poll fails, the first drain fails, and the second drain succeeds.
-The workflow implementation runs once, the copied completion is submitted
-once, and the fake native lease remains present until that final acknowledgement.
+The workflow implementation runs once, the retained completion bytes are
+accepted once, and the fake native lease remains present until that final acknowledgement.
 This is the contract that lets public worker shutdown retry a transient
 completion transport failure safely.
 

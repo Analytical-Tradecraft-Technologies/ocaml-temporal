@@ -117,11 +117,6 @@ module Native : sig
         rejection: a replay must fail rather than skip history it could not
         check. *)
 
-    val encode_workflow_completion :
-      Temporal_protocol.Workflow_protocol.completion ->
-      (bytes, Temporal_core_bridge.Native_bridge.error) result
-    (** Canonically serializes and reparses one workflow completion. *)
-
     val decode_activity_task :
       bytes ->
       ( Temporal_protocol.Activity_protocol.task,
@@ -416,8 +411,10 @@ module Native : sig
     | Wait_replay_workflow : unit operation
         (** Waits for replay readiness without consuming an activation. *)
     | Complete_replay_workflow :
-        Temporal_protocol.Workflow_protocol.completion -> unit operation
-        (** Completes one previously leased replay activation. *)
+        Temporal_protocol.Encoded_workflow_completion.t -> unit operation
+        (** Completes one previously leased replay activation with the
+            canonical bytes from the completion's single encoder pass. The
+            supervisor does not encode it again. *)
     | Reject_replay_workflow : bytes -> unit operation
         (** Retires a replay activation rejected by OCaml semantic decoding. *)
     | Finalize_replay : unit operation
@@ -433,8 +430,12 @@ module Native : sig
             bridge releases the OCaml runtime lock while this bounded wait is in
             progress, so it never blocks an OCaml workflow scheduler. *)
     | Complete_workflow :
-        Temporal_protocol.Workflow_protocol.completion -> unit operation
-        (** Validates and submits one typed workflow completion. *)
+        Temporal_protocol.Encoded_workflow_completion.t -> unit operation
+        (** Submits one workflow completion as the canonical bytes from its
+            single encoder pass. The value can only be built by
+            [Encoded_workflow_completion.encode], so it is already validated;
+            the supervisor copies it into the C call without encoding it
+            again (issue #846). *)
     | Try_poll_activity :
         Temporal_protocol.Activity_protocol.task option operation
         (** Takes and validates one already-ready remote activity task. [None]
