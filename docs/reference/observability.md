@@ -224,6 +224,78 @@ OCaml worker adapter repeats the check before reporting or returning an error.
 The private diagnostic text is discarded because this logging policy has no
 path that is allowed to expose it.
 
+Client connection failures are the one deliberate exception (#833). A
+`connection` bridge error from `Client.create` or `Worker.create` reads
+`Temporal client connection failed (cause=<cause>): <detail>`. `<cause>` is a
+closed category: `dns`, `refused`, `reset`, `timeout`, `tls`,
+`unauthenticated`, `permission_denied`, `unavailable`, or `other`. `<detail>`
+is the local transport error chain from the resolver, socket, HTTP/2, and TLS
+layers, for example
+`transport error: tcp connect error: Connection refused (os error 61)`. It is
+capped at 512 bytes with a visible `...[truncated]` marker, and control
+characters are escaped so it is always one line. When the server answers the
+initial `GetSystemInfo` call with an error, only its gRPC code name is
+included (`GetSystemInfo returned unauthenticated`); the server's status
+message is never copied. Core's own rejection of connection options (URI,
+headers, TLS settings) is a `configuration` error with a constant message.
+
+## Temporal Core logs
+
+Temporal Core, the Rust engine behind the native worker and client, emits its
+own log records: poll and RPC retries, worker initialization and shutdown
+progress, nondeterminism details, and similar. These are written to the
+process's **stderr**, one line per record:
+
+```text
+ocaml-temporal core WARN temporalio_sdk_core::worker: <message> key=value ...
+```
+
+They do not go through `Logs`. Core emits them synchronously on its own Tokio
+threads, and the bridge must never call OCaml from those threads, so the sink
+is a fixed stderr writer rather than an OCaml reporter.
+
+The `OCAML_TEMPORAL_CORE_LOG` environment variable selects the most verbose
+level that is written. It is read once when each native runtime is created,
+that is, by each `Client.create` or `Worker.create` against a real server:
+
+| Value | Effect |
+|---|---|
+| unset or empty | `warn` (default) |
+| `off` (or `none`) | Core records are discarded |
+| `error`, `warn`, `info`, `debug`, `trace` | Temporal crates are logged at that level; third-party transport crates (tonic, hyper, h2, rustls) are capped at `warn` |
+
+Values are case-insensitive. Any other value makes runtime creation fail with
+a `configuration` bridge error that names the variable without echoing the
+rejected value.
+
+Each line is bounded to 2,048 bytes plus the newline; longer records end with
+`...[truncated]`. Control characters, including newlines, are escaped, so a
+record cannot forge further lines. Fields are sorted by key. A failed stderr
+write is ignored, and a formatting panic is contained.
+
+Stderr writes happen on a dedicated per-runtime writer thread, never on the
+Core thread that emitted the record. Core only places the formatted line in
+a bounded queue of 1,024 lines. If stderr is a pipe or socket whose reader is
+slow or stalled, the queue fills and further records are **dropped** rather
+than slowing Core. Once the writer catches up (or after one idle second, or at
+shutdown) it writes one summary line:
+
+```text
+ocaml-temporal core WARN ocaml_temporal_core_bridge: N Core log records dropped because the stderr writer fell behind
+```
+
+Closing a client or worker waits at most 500 ms for queued lines to be
+flushed. A writer still blocked on stderr after that is abandoned, so a stuck
+stderr can never hang shutdown. Its last queued lines are written only if
+stderr unblocks before the process exits. Logging therefore never affects
+worker progress or SDK operation latency beyond that bounded close.
+
+Unlike `Logs` events, Core records are not filtered for privacy. They can
+include workflow IDs, run IDs, task queues, activity types, and failure
+messages that come from workflow code or from the server, and `debug` or
+`trace` records can describe activations in detail. Set
+`OCAML_TEMPORAL_CORE_LOG=off` where that is unacceptable.
+
 Every SDK report passes through one exception shield. If an application
 reporter or formatter raises, the SDK discards that record and returns the
 same `result`, commands, or exception it would have produced without logging.
@@ -245,3 +317,17 @@ JSON in message text and rendered tags. It also verifies that a reporter
 exception cannot change a bridge result or workflow command batch. Run it with
 `dune exec ./test/observability/test_logging.exe` or use the broader Makefile
 test target.
+
+`rust/core-bridge/tests/connection_diagnostics.rs` connects to a closed
+loopback port and to an unresolvable `.invalid` host and checks the `refused`
+and `dns` causes, the transport detail, and the message bound. It also checks
+cause classification, level parsing, the Core log filter, and that a Core
+record becomes one escaped, bounded line.
+`rust/core-bridge/tests/core_log_env.rs` checks that every accepted
+`OCAML_TEMPORAL_CORE_LOG` value creates a runtime and that an invalid value is
+a `configuration` error. `rust/core-bridge/tests/core_log_queue.rs` blocks
+the writer with a gated sink and checks that enqueuing never blocks on a full
+queue, that drops are counted and reported in one summary line, and that
+runtime close completes while the writer is blocked.
+`test/unit/test_client_worker.ml` checks that the cause reaches the public
+`Client.create` error.

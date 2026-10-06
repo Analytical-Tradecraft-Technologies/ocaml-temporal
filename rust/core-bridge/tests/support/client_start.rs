@@ -42,7 +42,7 @@ impl Drop for RpcDrop {
 fn connected_runtime(reply: Reply) -> (Runtime, Arc<Probe>) {
     let options = RuntimeOptions::builder().build().expect("runtime options");
     let core = CoreRuntime::new(options, TokioRuntimeBuilder::default()).expect("Core runtime");
-    let mut runtime = Runtime::new(core).expect("runtime cleanup thread");
+    let mut runtime = Runtime::new(core, None).expect("runtime cleanup thread");
     let probe = Arc::new(Probe::default());
     let observed = Arc::clone(&probe);
     let service = CallbackBasedGrpcService {

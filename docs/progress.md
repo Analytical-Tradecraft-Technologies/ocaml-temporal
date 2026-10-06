@@ -36,6 +36,26 @@ to 0.62 s. Protocol tests compare the new decoder with an independent
 re-encoding reference for RFC 4648 vectors, every length from 0 to 300 bytes,
 an exhaustive set of four-symbol groups, and malformed wrappers.
 
+## 2026-10-06: Connection failures name their cause; Core logs reach stderr (#833)
+
+Every client connection failure used to read `Temporal client connection
+failed`, and the runtime was created without a Core logger, so Core's own
+records were discarded. The bridge now reports a closed cause (`dns`,
+`refused`, `tls`, `timeout`, `unauthenticated`, ...) plus the bounded,
+escaped local transport error chain. A failed `GetSystemInfo` adds only its
+gRPC code, never server text, and Core's rejection of connection options is a
+`configuration` error. Runtime creation installs a Core push logger that
+formats one bounded, escaped line per record and enqueues it without
+blocking. A per-runtime writer thread drains the bounded queue to stderr, so
+a stalled stderr reader drops (and counts) records instead of stalling Core.
+Runtime close waits at most 500 ms for that writer before detaching it.
+Neither thread calls OCaml. `OCAML_TEMPORAL_CORE_LOG` selects the level
+(default `warn`; `off` disables it). Rust ABI tests cover refused and DNS
+causes and the message bound, cause classification, level parsing and
+rejection, line formatting, non-blocking enqueue, drop reporting, and runtime
+close with a blocked writer. An OCaml unit test proves the cause reaches
+`Client.create`.
+
 ## 2026-10-06: Linear-time future settlement (#847)
 
 Settling one future no longer scans every other pending registration. The
@@ -2798,3 +2818,22 @@ but translating them into the execution context requires the native
 activation adapter, which is being changed by concurrent work.
 `test/runtime/test_execution_info.ml`, the async adapter test, and the native
 worker adapter test cover the new values.
+
+## 2026-10-06: Thread-keyed workflow context (#765)
+
+The current workflow context, the scheduler owner id that guards
+`Future.await`, condition waits and scope operations, and the read-only query
+marker were stored in `Domain.DLS`, which every system thread of a Domain
+shares. Two workers whose `run` loops share a Domain could therefore record
+commands into each other's execution or restore a stale context. These
+bindings now use the private `Thread_binding` slot: a Domain-local atomic cell
+holding an immutable map from `Thread.id` to the bound value. Reads take no
+lock and skip the thread lookup when nothing is bound on the Domain; writes
+use a compare-and-set retry that only sibling threads of the same Domain can
+contend on. Each entry exists only inside its `with_value` extent and is
+restored on the installing thread even on an exception, so single-thread
+behavior is unchanged and no entry outlives its activation.
+`test/runtime/test_thread_context_isolation.ml` forces interleaved activations
+on two threads of one Domain, checks that helper threads do not inherit a
+context, checks exception cleanup, and stress-tests the primitive with
+yielding threads.

@@ -16,7 +16,7 @@ fn runtime() -> Runtime {
         .expect("default Temporal Core runtime options");
     let core = CoreRuntime::new(options, TokioRuntimeBuilder::default())
         .expect("default Temporal Core runtime");
-    Runtime::new(core).expect("runtime cleanup thread starts")
+    Runtime::new(core, None).expect("runtime cleanup thread starts")
 }
 
 /// Adds an in-memory client connection without contacting Temporal Server.

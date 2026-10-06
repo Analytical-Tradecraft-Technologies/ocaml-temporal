@@ -54,7 +54,7 @@ let closed_error () =
     ~message:"Temporal condition wait used after workflow execution ended"
 
 (** Checks both scheduler ownership and liveness before mutable store state is
-    read.  The Domain-local owner check prevents a different workflow from
+    read.  The thread-local owner check prevents a different workflow from
     awaiting a condition merely because its scheduler is also running. *)
 let owns_scheduler store =
   Future_store.current_owner_matches store.owner_id
