@@ -519,8 +519,11 @@ On success Rust returns:
 ```
 
 The result list is preserved through the bridge and the public adapter accepts
-exactly one payload for the output codec. A server-side `query_rejected` value
-(the run is closed) is the `rpc` code `failed_precondition`; an RPC failure or
+exactly one payload for the output codec. The request sets
+`query_reject_condition` to `NONE`, so Temporal answers queries against a closed
+run (a worker replays it) instead of rejecting them; a server-side
+`query_rejected` value, which that condition should never produce, is still
+mapped to the `rpc` code `failed_precondition`; an RPC failure or
 a malformed response is likewise a typed client error, and server diagnostic
 text does not cross the JSON boundary. The one exception is a failed query
 handler (issue #823). Temporal reports it, and a query name the worker has no

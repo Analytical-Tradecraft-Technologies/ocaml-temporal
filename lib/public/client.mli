@@ -264,9 +264,12 @@ val signal :
     Temporal query failures and codec failures are returned as typed [Error.t]
     values. When the workflow's query handler fails, or the worker has no
     handler registered under the query's name, the error is recognized by
-    [is_query_failed] and carries the handler's message. A query against a
-    closed run is rejected with [rpc_status] [Some `Failed_precondition]. Use
-    [query_with_input] when the query accepts one typed argument. *)
+    [is_query_failed] and carries the handler's message. The SDK asks Temporal
+    not to reject queries by workflow status, so a run that has already
+    completed can still be queried, as long as a worker can replay it.
+    [rpc_status] is [Some `Failed_precondition] only when Temporal itself
+    reports the query as rejected. Use [query_with_input] when the query
+    accepts one typed argument. *)
 val query :
   ('workflow_input, 'workflow_output) handle ->
   query:'query Query.t ->
