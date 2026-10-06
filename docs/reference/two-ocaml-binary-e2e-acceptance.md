@@ -139,9 +139,10 @@ remains available for unit tests. The worker's native poll, bounded readiness,
 completion, and typed registration loop is covered by focused tests; the
 Compose acceptance supplies the first real-server verification layer.
 
-During teardown, the worker's small test-process control Domain translates
-Compose's SIGTERM into `Temporal.Worker.shutdown`; the signal handler itself
-only sets an atomic flag. The 30-second worker stop grace period gives the
+During teardown, the worker's signal handler translates Compose's SIGTERM
+into `Temporal.Worker.request_shutdown`, which only sets an atomic flag; once
+`Temporal.Worker.run` returns on the main thread, the worker calls
+`Temporal.Worker.shutdown`. The 30-second worker stop grace period gives the
 bounded native waits time to leave their poll loop before the container is
 removed. This is test-process lifecycle code, not a second worker supervisor.
 
