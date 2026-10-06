@@ -143,8 +143,12 @@ build:
 # Keep the examples as explicit compile targets rather than relying on Dune's
 # default alias. Every Docker and native build therefore proves that all three
 # executable applications compile against the public installed-library name.
+# test-temporal-examples-live runs the same list against the Compose stack, and
+# test/smoke/test_examples_live_contract.sh fails when an example directory is
+# missing from it.
+EXAMPLE_EXECUTABLES := examples/workflow_worker/workflow_worker.exe examples/activity_worker/activity_worker.exe examples/client/client.exe
 build-examples:
-	$(RUN) dune build $(DUNE_BUILD_ARGS) examples/workflow_worker/workflow_worker.exe examples/activity_worker/activity_worker.exe examples/client/client.exe
+	$(RUN) dune build $(DUNE_BUILD_ARGS) $(EXAMPLE_EXECUTABLES)
 
 # Emits only the locked Cargo metadata document on stdout, allowing CI to pipe
 # it into the isolated license scanner without knowing the Compose fixture path.
@@ -291,6 +295,7 @@ test-quality-contract: check-live-acceptance-inventory test-live-acceptance-inve
 	sh test/smoke/test_prebuilt_install_tag_contract.sh .
 	sh test/smoke/test_make_docker_commands.sh .
 	sh test/smoke/test_rust_bridge_artifact.sh .
+	sh test/smoke/test_examples_live_contract.sh .
 
 test-temporal-config:
 	sh test/smoke/test_temporal_compose_config.sh
@@ -443,6 +448,7 @@ test-temporal-live-ci:
 	bash test/integration/temporal/scripts/run-with-live-diagnostics.sh patching $(MAKE) test-temporal-workflow-patching
 	bash test/integration/temporal/scripts/run-with-live-diagnostics.sh parent-child-restart $(MAKE) test-temporal-parent-child-restart
 	bash test/integration/temporal/scripts/run-with-live-diagnostics.sh child-failure-replay $(MAKE) test-temporal-parent-child-failure-replay
+	$(MAKE) test-temporal-examples-live
 
 test-temporal-diagnostics-contract:
 	bash test/integration/temporal/scripts/test-live-diagnostics-contract.sh
@@ -913,7 +919,7 @@ native-version-check:
 
 native-build:
 	$(NATIVE_ENV) $(NATIVE_RUN) dune build @install $(DUNE_BUILD_ARGS)
-	$(NATIVE_ENV) $(NATIVE_RUN) dune build $(DUNE_BUILD_ARGS) examples/workflow_worker/workflow_worker.exe examples/activity_worker/activity_worker.exe examples/client/client.exe
+	$(NATIVE_ENV) $(NATIVE_RUN) dune build $(DUNE_BUILD_ARGS) $(EXAMPLE_EXECUTABLES)
 	$(if $(strip $(TEMPORAL_RUST_BRIDGE_DIR)),,$(NATIVE_ENV) cargo build --manifest-path $(CARGO_MANIFEST) --locked)
 
 native-test: $(NATIVE_RUST_TEST_TARGET) native-test-install test-quality-contract
@@ -928,7 +934,7 @@ native-test-install:
 
 native-lint: $(NATIVE_RUST_LINT_TARGET)
 	$(NATIVE_ENV) $(NATIVE_RUN) dune build @install $(DUNE_BUILD_ARGS)
-	$(NATIVE_ENV) $(NATIVE_RUN) dune build $(DUNE_BUILD_ARGS) examples/workflow_worker/workflow_worker.exe examples/activity_worker/activity_worker.exe examples/client/client.exe
+	$(NATIVE_ENV) $(NATIVE_RUN) dune build $(DUNE_BUILD_ARGS) $(EXAMPLE_EXECUTABLES)
 	sh scripts/check-format.sh
 
 native-lint-rust:
@@ -936,6 +942,39 @@ native-lint-rust:
 	$(NATIVE_ENV) cargo clippy --manifest-path $(CARGO_MANIFEST) --locked --all-targets -- -D warnings
 
 native-verify: native-version-check native-build native-lint native-test
+
+# Runs the shipped three-process example application (#798) exactly as the
+# examples guide describes: the activity worker and workflow worker as separate
+# long-lived processes on one task queue, then one-shot client runs. The
+# controller asserts the client's exact success output, its typed failure for
+# invalid input, and that both workers exit cleanly after SIGTERM. Every process
+# is bounded by a timeout, and the stack is always removed afterwards. In CI the
+# executables come from the verified smoke artifact (TEMPORAL_PREBUILT_SMOKE=1);
+# locally they are compiled first so no long-lived `dune exec` lock is held.
+.PHONY: test-temporal-examples-live test-temporal-examples-contract
+test-temporal-examples-live: test-temporal-examples-contract test-temporal-config
+	$(COMPOSE_RUN) env DUNE_JOBS="$(DUNE_JOBS)" sh scripts/build-temporal-executables.sh $(EXAMPLE_EXECUTABLES)
+	@set -eu; \
+	cleanup() { \
+		status=$$?; \
+		trap - EXIT HUP INT TERM; \
+		if [ "$$status" -ne 0 ]; then $(MAKE) temporal-logs || true; fi; \
+		$(MAKE) temporal-clean || true; \
+		exit "$$status"; \
+	}; \
+	$(MAKE) temporal-clean; \
+	trap cleanup EXIT; \
+	trap 'exit 129' HUP; \
+	trap 'exit 130' INT; \
+	trap 'exit 143' TERM; \
+	$(MAKE) temporal-start; \
+	TEMPORAL_COMPOSE_PROJECT="$(TEMPORAL_COMPOSE_PROJECT)" HOST_UID="$(HOST_UID)" HOST_GID="$(HOST_GID)" \
+		sh test/integration/temporal/scripts/run-examples-live.sh
+
+# Docker-free check that every example executable is compiled, shipped in the
+# CI smoke artifact, and started by the live examples controller.
+test-temporal-examples-contract:
+	sh test/smoke/test_examples_live_contract.sh .
 
 # Retains exact metadata histories in _build for the conformance/corpus gates.
 # The caller chooses the Compose project and owns the server lifecycle.

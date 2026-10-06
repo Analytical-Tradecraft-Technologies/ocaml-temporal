@@ -7,6 +7,29 @@ type start_metadata = {
   execution_expiration_time : Temporal_protocol.Workflow_protocol.timestamp option;
 }
 
+(** Run-stable identity copied from Core's initialization job and the
+    activation that carried it. [first_execution_run_id] is empty when Core
+    omitted the initialization context. [parent] is [None] for a top-level
+    workflow. [start_time] is the server's run start time when reported. *)
+type run_info = {
+  workflow_id : string;
+  run_id : string;
+  workflow_type : string;
+  attempt : int;
+  first_execution_run_id : string;
+  parent : Temporal_protocol.Workflow_protocol.namespaced_workflow_execution option;
+  start_time : Temporal_protocol.Workflow_protocol.timestamp option;
+}
+
+(** History facts reported with one activation. [history_size_bytes] is
+    [None] when the activation carried no metadata, and
+    [continue_as_new_suggested] is then [false]. *)
+type activation_history = {
+  history_length : int;
+  history_size_bytes : int option;
+  continue_as_new_suggested : bool;
+}
+
 (** The activities, timers, and commands belonging to one workflow execution.
     The runtime temporarily makes this context current while running that
     workflow's OCaml code. *)
@@ -85,6 +108,28 @@ val activation_deployment_version : t -> (string * string) option
 (** Records whether Core is replaying history for the activation about to run.
     This must be installed before patch notifications and workflow dispatch. *)
 val set_activation_is_replaying : t -> bool -> unit
+
+(** Returns the replay status installed for the current activation; [false]
+    before any activation has been installed. *)
+val activation_is_replaying : t -> bool
+
+(** Replaces the task-local history facts for the activation about to run.
+    The native adapter calls this before dispatching jobs. *)
+val set_activation_history : t -> activation_history -> unit
+
+(** Returns the history facts installed for the current activation. *)
+val activation_history : t -> activation_history
+
+(** Installs the run identity before workflow code runs. Later activations
+    omit initialization and retain the same value. *)
+val set_run_info : t -> run_info option -> unit
+
+(** Returns the run identity, or [None] for a synthetic execution that never
+    received an initialization activation. *)
+val run_info : t -> run_info option
+
+(** Returns the validated worker task queue that owns this execution. *)
+val task_queue : t -> string
 
 (** Records authoritative history evidence that [patch_id] is present for this
     execution. The evidence seeds only an ID that workflow code has not yet

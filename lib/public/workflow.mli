@@ -137,6 +137,77 @@ type start_metadata = {
     workflow, or in a synthetic execution lacking metadata, returns a defect. *)
 val start_metadata : unit -> (start_metadata, Error.t) result
 
+(** Read-only metadata about the workflow run executing the caller. Values
+    come only from Temporal's activations, never from the host clock or
+    process state, so a replay observes the same identity. The type is
+    abstract so later releases can add fields compatibly.
+
+    Identity fields are fixed for the run. History fields and {!is_replaying}
+    describe the activation that was current when {!info} was called; call
+    {!info} again after a suspension to observe newer values. *)
+module Info : sig
+  (** A snapshot of run identity and current-activation history facts. *)
+  type t
+
+  (** Identity of the workflow that started this run as a child. *)
+  type parent = { namespace : string; workflow_id : string; run_id : string }
+
+  (** Returns the workflow ID shared by every run of this execution chain. *)
+  val workflow_id : t -> string
+
+  (** Returns the ID of this run. *)
+  val run_id : t -> string
+
+  (** Returns the run ID of the first run in this continue-as-new, retry, or
+      cron chain, or [None] when Temporal did not report it. *)
+  val first_execution_run_id : t -> string option
+
+  (** Returns the registered workflow type name. *)
+  val workflow_type : t -> string
+
+  (** Returns the worker task queue that delivers this run's workflow tasks. *)
+  val task_queue : t -> string
+
+  (** Returns the 1-based workflow retry attempt of this run. *)
+  val attempt : t -> int
+
+  (** Returns the parent workflow, or [None] for a top-level workflow. *)
+  val parent : t -> parent option
+
+  (** Returns when the server started this run, if Temporal reported it. *)
+  val start_time : t -> Time.t option
+
+  (** Returns whether Temporal was replaying history for the activation
+      current when this snapshot was taken. See {!val-is_replaying}. *)
+  val is_replaying : t -> bool
+
+  (** Returns the number of history events Temporal reported with the
+      activation current when this snapshot was taken. *)
+  val history_length : t -> int
+
+  (** Returns the history size in bytes reported with that activation, or
+      [None] when the activation carried no size. *)
+  val history_size_bytes : t -> int option
+
+  (** Returns whether the server suggested continuing as new with that
+      activation, typically because history is growing large. Workflows that
+      run indefinitely should check it at a safe point and call
+      {!continue_as_new}. *)
+  val continue_as_new_suggested : t -> bool
+end
+
+(** Returns metadata for the current workflow run. Calling it outside workflow
+    execution, or in a synthetic execution that never received Temporal's
+    initialization activation, returns a typed defect. *)
+val info : unit -> (Info.t, Error.t) result
+
+(** Returns [true] while the current activation replays existing history and
+    [false] for new progress or outside workflow execution. Use it only for
+    side effects that are not part of workflow state, such as suppressing
+    duplicate log lines; branching workflow commands on it breaks
+    determinism. *)
+val is_replaying : unit -> bool
+
 (** Returns whether workflow code should take the new branch identified by
     [id]. On a new execution the first call returns [true] and records a patch
     marker; replay returns [true] only when Core reports that marker, otherwise

@@ -85,9 +85,19 @@ val run : t -> (unit, Temporal_base.Error.t) result
     Domain as a lane is not an execution thread and may wait for shutdown. *)
 val is_execution_thread : t -> bool
 
+(** Asks an active or future [run] to return [Ok ()] at its next stop check,
+    without waiting and without releasing anything (#830). The request is
+    sticky. It is a single atomic write, so an OCaml signal handler may call it
+    from any Domain or thread, including the run loop's own thread. The caller
+    must still call [shutdown] once [run] has returned to drain completions and
+    release the native graph. *)
+val request_stop : t -> unit
+
 (** Requests stop, waits for an active run loop to leave the adapter, and then
     releases the supervisor's worker, client, and Rust runtime graph exactly
-    once. Repeated calls are idempotent. *)
+    once. Repeated calls are idempotent. A call from an execution thread
+    cannot wait for its own loop: it posts [request_stop] and returns a
+    retryable defect without starting teardown. *)
 val shutdown : t -> (unit, Temporal_base.Error.t) result
 
 (** Returns [true] only when the most recent shutdown failure occurred while
