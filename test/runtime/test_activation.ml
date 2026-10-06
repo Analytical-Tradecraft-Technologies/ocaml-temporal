@@ -1235,6 +1235,10 @@ let test_local_activity_backoff_reschedules_without_resolving () =
    with
   | Ok () -> ()
   | Error error -> failwith ("local backoff was rejected: " ^ public_error_message error));
+  (* The timer is queued scheduler work (#809), not a job-pass command. *)
+  expect "local backoff timer emitted during the job pass" []
+    (Workflow_context_store.take_commands context);
+  ignore (Scheduler.run scheduler);
   expect "local backoff starts timer"
     [ Activation.Start_timer { seq = 2L; milliseconds = 2_500L } ]
     (Workflow_context_store.take_commands context);
@@ -1244,6 +1248,9 @@ let test_local_activity_backoff_reschedules_without_resolving () =
   (match Workflow_context_store.fire_timer context ~seq:2L with
   | Ok () -> ()
   | Error error -> failwith ("local backoff timer failed: " ^ public_error_message error));
+  expect "local backoff retry emitted during the job pass" []
+    (Workflow_context_store.take_commands context);
+  ignore (Scheduler.run scheduler);
   expect "local backoff reschedules activity"
     [ Activation.Schedule_local_activity
         {

@@ -5,7 +5,7 @@ set -eu
 # the compiler version is exact, and that compiler can build the locked Rust
 # bridge into the archive consumed by the OCaml build. It is a compatibility
 # check, not a replacement for the bridge tests or the broader verification.
-expected_rust_version=1.98.1
+expected_rust_version=1.99.0
 
 # rust/rust-toolchain.toml is what contributors and IDEs running cargo inside
 # rust/ use. Supported gates select the toolchain explicitly, so without this

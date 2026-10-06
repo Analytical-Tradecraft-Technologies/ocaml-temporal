@@ -278,8 +278,10 @@ and
 Both OCaml and Rust reject unknown or duplicate fields and validate the
 acknowledgement before it crosses the FFI boundary. Focused mock, supervisor,
 OCaml bridge, and Rust protocol tests cover the exact-run request, terminal
-mapping, and validation failures; live acceptance of this operator path remains
-the next evidence boundary.
+mapping, and validation failures. The live baseline driver terminates a
+readiness-marked exact run and requires `wait` to report `Terminated` with the
+expected terminal metadata; termination reason and race coverage remain
+incomplete.
 
 ## Reset one exact run from a workflow-task boundary
 

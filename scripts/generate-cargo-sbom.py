@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import sys
 from pathlib import Path
@@ -17,6 +18,36 @@ from typing import Any
 
 
 NAMESPACE = "https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/sbom/cargo"
+CORE_LICENSE_COMMENT = (
+    "Cargo metadata declares no license expression for this package; the "
+    "concluded license is the reviewed pinned Temporal Core LICENSE.txt "
+    "(see docs/dependencies.md)."
+)
+
+
+def load_license_policy() -> Any:
+    """Import the Cargo licence scanner so both tools share one conclusion.
+
+    The scanner's file name contains hyphens, so it is loaded by path. It is a
+    sibling of this script in every checkout and CI container mount. The
+    module is registered before execution because its dataclasses resolve
+    their defining module through `sys.modules`.
+    """
+
+    name = "check_cargo_licenses"
+    if name in sys.modules:
+        return sys.modules[name]
+    path = Path(__file__).with_name("check-cargo-licenses.py")
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load Cargo license policy from {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+LICENSE_POLICY = load_license_policy()
 
 
 def document_namespace(document: dict[str, Any]) -> str:
@@ -115,16 +146,24 @@ def make_document(metadata: dict[str, Any]) -> dict[str, Any]:
         version = package.get("version")
         if not all(isinstance(value, str) and value for value in (package_id, name, version)):
             raise ValueError("Cargo package is missing id, name, or version")
-        normalized.append(
-            {
-                "SPDXID": package_spdx_id(package, workspace_root),
-                "name": name,
-                "versionInfo": version,
-                "licenseConcluded": package.get("license") or "NOASSERTION",
-                "downloadLocation": package.get("source") or "NOASSERTION",
-                "filesAnalyzed": False,
-            }
-        )
+        # SPDX 2.3 separates what the package states (licenseDeclared) from
+        # what the SBOM author concludes after review (licenseConcluded). The
+        # pinned Core crates state only a licence file, so their declaration
+        # stays NOASSERTION while the reviewed conclusion is recorded.
+        declared = LICENSE_POLICY.declared_license(package)
+        concluded = LICENSE_POLICY.concluded_license(package)
+        entry = {
+            "SPDXID": package_spdx_id(package, workspace_root),
+            "name": name,
+            "versionInfo": version,
+            "licenseConcluded": concluded or "NOASSERTION",
+            "licenseDeclared": declared or "NOASSERTION",
+            "downloadLocation": package.get("source") or "NOASSERTION",
+            "filesAnalyzed": False,
+        }
+        if declared is None and concluded is not None:
+            entry["licenseComments"] = CORE_LICENSE_COMMENT
+        normalized.append(entry)
     normalized.sort(key=lambda item: (item["name"], item["versionInfo"], item["SPDXID"]))
     document = {
         "spdxVersion": "SPDX-2.3",
@@ -175,6 +214,13 @@ def audit_document(document: dict[str, Any]) -> None:
             raise ValueError(f"duplicate SBOM package identifier: {identifier}")
         if package.get("filesAnalyzed") is not False:
             raise ValueError(f"SBOM package {identifier} must set filesAnalyzed to false")
+        # Every package in the locked graph has a reviewed licence (#787), so
+        # an unconcluded package means the generator or policy regressed.
+        concluded = package.get("licenseConcluded")
+        if not isinstance(concluded, str) or concluded in ("", "NOASSERTION", "NONE"):
+            raise ValueError(f"SBOM package {identifier} has no concluded license")
+        if not isinstance(package.get("licenseDeclared"), str) or not package["licenseDeclared"]:
+            raise ValueError(f"SBOM package {identifier} is missing licenseDeclared")
         ids.add(identifier)
         sort_keys.append((name, version, identifier))
     if sort_keys != sorted(sort_keys):

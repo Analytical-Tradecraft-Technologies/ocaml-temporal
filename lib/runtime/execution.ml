@@ -394,6 +394,8 @@ let process_job execution = function
       | Error error -> fail execution error)
   | Resolve_local_activity_backoff
       { seq; attempt; backoff_milliseconds; original_schedule_time } -> (
+      (* Validated here; the retry timer is queued scheduler work so its
+         command follows those of fibers woken by earlier jobs (#809). *)
       match
         Workflow_context_store.resolve_local_activity_backoff execution.context
           ~seq ~attempt ~backoff_milliseconds ~original_schedule_time

@@ -340,11 +340,11 @@ jobs:
       matrix: ${{ fromJSON(needs.changes.outputs.native) }}
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/_build/rust
-      RUSTUP_TOOLCHAIN: 1.98.1-aarch64-apple-darwin
+      RUSTUP_TOOLCHAIN: 1.99.0-aarch64-apple-darwin
       NATIVE_OCAML_VERSION: ${{ matrix.ocaml }}
       OCAML_ARTIFACT_COMMIT: ${{ github.sha }}
       RUST_BRIDGE_PROFILE: ${{ inputs.bridge-profile || 'ci' }}
-      NATIVE_RUST_VERSION: 1.98.1
+      NATIVE_RUST_VERSION: 1.99.0
       NATIVE_ARCH: arm64
       NATIVE_RUST_HOST: aarch64-apple-darwin
       TEMPORAL_RUST_BRIDGE_DIR: ${{ github.workspace }}/_build/rust-bridge
@@ -407,11 +407,11 @@ jobs:
       matrix: ${{ fromJSON(needs.changes.outputs.native) }}
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/_build/rust
-      RUSTUP_TOOLCHAIN: 1.98.1-x86_64-pc-windows-gnu
+      RUSTUP_TOOLCHAIN: 1.99.0-x86_64-pc-windows-gnu
       NATIVE_OCAML_VERSION: ${{ matrix.ocaml }}
       OCAML_ARTIFACT_COMMIT: ${{ github.sha }}
       RUST_BRIDGE_PROFILE: ${{ inputs.bridge-profile || 'ci' }}
-      NATIVE_RUST_VERSION: 1.98.1
+      NATIVE_RUST_VERSION: 1.99.0
       NATIVE_ARCH: amd64
       NATIVE_RUST_HOST: x86_64-pc-windows-gnu
       TEMPORAL_RUST_BRIDGE_DIR: ${{ github.workspace }}/_build/rust-bridge

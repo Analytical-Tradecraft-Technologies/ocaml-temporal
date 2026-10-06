@@ -30,6 +30,24 @@ private context, async-handle, and future types under their public names.
 Verified locally with odoc 3.2.1 on OCaml 5.4.1; the quick-start snippets
 type-check against the library.
 
+## 2026-10-06: Retained completions fail closed (#843)
+
+The workflow and activity adapters used to resubmit every retained completion
+on the next poll or shutdown drain, regardless of how the earlier attempt
+failed; the retryable classification only decided what happened when the
+resubmission failed again. Each retained entry now records its first failure
+that the source did not explicitly classify as retryable, and later polls and
+drains return that error without calling the supervisor, so a non-retryable
+failure followed by `Worker.shutdown` or a second `Worker.run` can no longer
+submit the same completion twice. The workflow source signature gained the
+same `error_is_retryable`/`exception_is_retryable` classifiers as the activity
+source; production returns `false` because the bridge has no retryable
+workflow-completion status. Runtime tests prove that a non-retryable typed
+rejection, an unclassified exception, and a lost acknowledgement are each
+submitted exactly once across poll, poll, and drain, block later tasks, and
+are released only by `discard`, while explicitly retryable failures still
+retry without rerunning user code.
+
 ## 2026-10-06: One unrepresentable activity task no longer stops the worker (#801)
 
 An activity task the bridge cannot represent (a standalone activity with no
