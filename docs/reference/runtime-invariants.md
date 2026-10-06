@@ -278,7 +278,11 @@ and bridge, read the [documentation guide](../README.md) first.
   rejection is accepted only for the exact activation lease that was polled.
 - The private supervisor validates native poll bytes before returning typed
   workflow or activity values to another Domain. It canonically encodes and
-  semantically validates typed completions before entering C.
+  semantically validates typed activity completions before entering C. A workflow
+  completion arrives already encoded: the worker adapter runs the canonical
+  encoder once and passes its bytes as an abstract
+  `Encoded_workflow_completion.t`, which only that encoder can produce, so the
+  supervisor copies them into C without a second encode.
 - An activity `Start` (remote or local) creates one Core completion debt. A `Cancel` poll
   is an update to that same token: it is handed to the OCaml activity adapter
   while the token remains tracked, but it never acquires a second completion
@@ -431,7 +435,9 @@ and bridge, read the [documentation guide](../README.md) first.
   supervisor. It owns no Rust handle, performs no I/O, and does not block a
   workflow scheduler.
 - A typed activation is revalidated with the canonical protocol encoder before
-  any execution state is touched. Sequence numbers, identifiers, payloads,
+  any execution state is touched, once per activation: the worker passes the
+  private translation result to `activate_translated` instead of translating
+  again. Sequence numbers, identifiers, payloads,
   timestamps, ordering, and closed-object invariants therefore have one
   validation path for JSON input and programmatic OCaml values.
 - A rejected activation job is side-effect free: malformed child-resolution

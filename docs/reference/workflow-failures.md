@@ -70,7 +70,7 @@ failed status at the activation-aware Core boundary.
 
 A failed task shuts down its unsafe OCaml generation immediately: pending
 updates, continuations, local state, and every buffered command are discarded.
-The run-map ownership record and copied completion remain until acknowledgement;
+The run-map ownership record and retained completion bytes remain until acknowledgement;
 Core's subsequent eviction/initialization reconstructs a fresh execution.
 Native conversion/decode rejection already uses Core task failure and keeps its
 existing exact-document lease rules.

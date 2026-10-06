@@ -1,7 +1,7 @@
 (** Regression tests for retryable workflow-completion ownership.
 
     A workflow may finish executing before Core acknowledges its completion.
-    The adapter must retain the copied completion, avoid rerunning user code,
+    The adapter must retain the encoded completion, avoid rerunning user code,
     and leave the run lease outstanding until a later drain succeeds. This
     focused fake rejects two consecutive completion attempts so the test covers
     both the poll retry path and a failed shutdown-style drain before the final
@@ -25,6 +25,23 @@ type fake_supervisor = {
   (* Number of deliberately rejected completion attempts remaining. *)
   completion_rejections : int ref;
 }
+
+(** Returns the typed completion a fake supervisor received after proving
+    that it is exactly the value the submitted bytes were encoded from, so
+    fixtures can assert on typed commands while still checking what was
+    actually submitted. Re-encoding here is test-only; the adapter never
+    encodes a completion twice. *)
+let submitted_completion ~completion encoded =
+  match Protocol.encode_completion completion with
+  | Ok expected
+    when String.equal expected
+           (Temporal_protocol.Encoded_workflow_completion.to_string encoded) ->
+      completion
+  | Ok _ -> failwith "typed completion does not match the submitted bytes"
+  | Error error ->
+      failwith
+        ("submitted completion does not re-encode: "
+        ^ (Protocol.error_view error).message)
 
 (** Allocates an empty semantic queue and lease ledger. *)
 let fake_supervisor () =
@@ -51,7 +68,8 @@ module Fake_supervisor = struct
 
   (** Rejects the configured number of attempts before acknowledging the exact
       run ID. A rejection leaves the lease in place for adapter retry. *)
-  let complete_workflow supervisor (completion : Protocol.completion) =
+  let complete_workflow supervisor ~completion encoded =
+    let completion = submitted_completion ~completion encoded in
     if !(supervisor.completion_rejections) > 0 then begin
       decr supervisor.completion_rejections;
       Error

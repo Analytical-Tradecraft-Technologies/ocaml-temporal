@@ -50,9 +50,12 @@ module Source = struct
       (Native.perform source.native Native.Try_poll_replay_workflow)
 
   (** Records results only after Core has acknowledged the completion lease. *)
-  let complete_workflow source (completion : Protocol.completion) =
+  let complete_workflow source ~(completion : Protocol.completion) encoded =
+    (* The adapter passes the typed completion beside the canonical bytes it
+       was encoded into, so commands are inspected without parsing JSON;
+       only the bytes are submitted. *)
     if completion.task_failure <> None then failwith "initial signals failed their task";
-    let result = Native.perform source.native (Native.Complete_replay_workflow completion) in
+    let result = Native.perform source.native (Native.Complete_replay_workflow encoded) in
     Result.iter (fun () ->
       List.iter (function
         | Protocol.Complete_workflow { result = Some payload } ->

@@ -163,6 +163,10 @@ type fake_supervisor = {
      lets retry tests compare the retained command value with the later
      acknowledgement without granting the fake source ownership of it. *)
   attempts : Protocol.completion list ref;
+  (* The exact canonical bytes of every completion attempt, newest first.
+     Retry tests compare these to prove a retained completion is resubmitted
+     byte for byte rather than re-encoded. *)
+  submitted : string list ref;
   (* Optional source error returned by the next poll, modelling a lower-layer
      semantic rejection whose lease has already been retired. *)
   poll_error : source_error option ref;
@@ -191,6 +195,7 @@ let fake_supervisor () =
     leased = Hashtbl.create 8;
     completions = ref [];
     attempts = ref [];
+    submitted = ref [];
     poll_error = ref None;
     rejected_poll_count = ref 0;
     reject_next_completion = ref false;
@@ -198,6 +203,23 @@ let fake_supervisor () =
     raise_next_completion = ref false;
     accept_then_raise = ref false;
   }
+
+(** Returns the typed completion a fake supervisor received after proving
+    that it is exactly the value the submitted bytes were encoded from, so
+    fixtures can assert on typed commands while still checking what was
+    actually submitted. Re-encoding here is test-only; the adapter never
+    encodes a completion twice. *)
+let submitted_completion ~completion encoded =
+  match Protocol.encode_completion completion with
+  | Ok expected
+    when String.equal expected
+           (Temporal_protocol.Encoded_workflow_completion.to_string encoded) ->
+      completion
+  | Ok _ -> failwith "typed completion does not match the submitted bytes"
+  | Error error ->
+      failwith
+        ("submitted completion does not re-encode: "
+        ^ (Protocol.error_view error).message)
 
 (** The only exception the fake source classifies as a retryable completion
     failure. Every other exception is an uncertain acknowledgement. *)
@@ -224,8 +246,13 @@ module Fake_supervisor = struct
           Ok (Some activation)
 
   (** Accepts one completion only for an active run ID, then removes that lease
-      and records the immutable semantic completion for assertions. *)
-  let complete_workflow supervisor (completion : Protocol.completion) =
+      and records both its exact bytes and its decoded semantic value for
+      assertions. *)
+  let complete_workflow supervisor ~completion encoded =
+    supervisor.submitted :=
+      Temporal_protocol.Encoded_workflow_completion.to_string encoded
+      :: !(supervisor.submitted);
+    let completion = submitted_completion ~completion encoded in
     supervisor.attempts := completion :: !(supervisor.attempts);
     if !(supervisor.raise_next_completion) then begin
       supervisor.raise_next_completion := false;
@@ -2903,6 +2930,81 @@ let test_non_retryable_completion_is_never_resubmitted () =
   | Ok () -> ()
   | Error error -> failwith ("discard left a retained completion: " ^ error.code)
 
+(** Issue #846: the worker submits the canonical bytes from the completion's
+    single encoder pass. The bytes the source receives must be exactly what
+    [Workflow_protocol.encode_completion] produces for that completion (the
+    document the supervisor used to build by encoding it a second time), so
+    the wire format is unchanged. A retryable rejection must then resubmit the
+    physically identical string: the retained completion is never re-encoded,
+    and the workflow is not re-run. *)
+let test_submitted_completion_is_encoded_once () =
+  let calls = ref 0 in
+  (* Every byte value, so canonical base64 padding and the full alphabet are
+     both exercised in the payload carried by the activity command. *)
+  let argument = Bytes.init (32 * 1024 + 2) (fun index -> Char.chr (index land 0xff)) in
+  let activity =
+    Temporal.Activity.remote ~name:"native_worker_single_encode_activity"
+      ~input:Temporal.Codec.bytes ~output:Temporal.Codec.unit
+  in
+  let workflow =
+    Temporal.Workflow.define ~name:"native_worker_single_encode"
+      ~input:Temporal.Codec.unit ~output:Temporal.Codec.unit (fun () ->
+        incr calls;
+        Temporal.Activity.execute activity (Bytes.copy argument))
+  in
+  let supervisor = fake_supervisor () in
+  let run_id = "run-single-encode" in
+  let worker = worker supervisor [ Adapter.register workflow ] in
+  enqueue supervisor
+    (activation ~run_id [ initialize ~run_id ~workflow_type:"native_worker_single_encode" ]);
+  supervisor.reject_next_completion := true;
+  begin match Worker.poll worker with
+  | Error { code = "completion_failed"; _ } -> ()
+  | Error error -> failwith ("single-encode rejection returned " ^ error.code)
+  | Ok _ -> failwith "rejected single-encode completion was acknowledged"
+  end;
+  expect_completed ~terminal:false (Result.get_ok (Worker.poll worker));
+  let first, retried =
+    match !(supervisor.submitted) with
+    | [ retried; first ] -> (first, retried)
+    | _ -> failwith "expected exactly one rejected and one accepted submission"
+  in
+  if retried != first then
+    failwith "retained completion was re-encoded instead of resubmitted";
+  if !calls <> 1 then failwith "completion retry re-ran workflow code";
+  let completion = latest_completion supervisor in
+  begin match Protocol.encode_completion completion with
+  | Ok expected when String.equal expected first -> ()
+  | Ok _ -> failwith "submitted bytes differ from the canonical completion encoding"
+  | Error _ -> failwith "submitted completion does not re-encode"
+  end;
+  match completion.commands with
+  | [ Protocol.Schedule_activity { arguments = [ payload ]; _ } ]
+    when Bytes.equal payload.data argument ->
+      ()
+  | _ -> failwith "submitted activity command lost its payload bytes"
+
+(** An adapter-built failure completion is encoded once, by the adapter, and
+    submitted as canonical bytes. The unknown-run path never creates an
+    execution, so this covers [retire_with_failure] independently of
+    [Native_execution]. *)
+let test_failure_completion_is_canonical () =
+  let supervisor = fake_supervisor () in
+  let worker = worker supervisor [] in
+  let run_id = "run-unknown-single-encode" in
+  enqueue supervisor
+    (activation ~run_id [ Protocol.Fire_timer { seq = 1L } ]);
+  begin match Worker.poll worker with
+  | Ok (Adapter.Rejected { lease_retired = true; _ }) -> ()
+  | _ -> failwith "unknown run was not retired with a failure completion"
+  end;
+  match !(supervisor.submitted) with
+  | [ submitted ] -> (
+      match Protocol.encode_completion (latest_completion supervisor) with
+      | Ok expected when String.equal expected submitted -> ()
+      | _ -> failwith "failure completion bytes are not the canonical encoding")
+  | _ -> failwith "expected exactly one failure completion submission"
+
 (** An accepted update may mutate state and buffer commands before raising.
     Neither those commands nor its speculative acceptance may reach history;
     ordinary typed update rejection is covered by the separate update tests. *)
@@ -3040,6 +3142,8 @@ let () =
   test_terminated_child_recovery ();
   test_accepted_completion_exception_never_reexecutes ();
   test_non_retryable_completion_is_never_resubmitted ();
+  test_submitted_completion_is_encoded_once ();
+  test_failure_completion_is_canonical ();
   test_defect_discards_commands_and_reconstructs ();
   test_output_encoder_failure_is_task_failure ();
   test_deliberate_application_failure_remains_terminal ();
