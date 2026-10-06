@@ -130,10 +130,10 @@ module Workflow_source = struct
     Native.perform supervisor Native.Try_poll_workflow
 
   (** Submits one workflow completion, already encoded once by the adapter,
-      through the supervisor mailbox.
-  *)
-  let complete_workflow supervisor completion =
-    Native.perform supervisor (Native.Complete_workflow completion)
+      through the supervisor mailbox. Only the encoded bytes are submitted; the
+      typed [completion] exists for test sources and is ignored here. *)
+  let complete_workflow supervisor ~completion:_ encoded =
+    Native.perform supervisor (Native.Complete_workflow encoded)
 
   (** Returns the stable classification used in adapter diagnostics. *)
   let error_code error = fst (native_error_view error)

@@ -26,19 +26,21 @@ type fake_supervisor = {
   completion_rejections : int ref;
 }
 
-(** Decodes the canonical bytes a fake supervisor received, exactly as Rust
-    would, so fixtures assert on what was actually submitted. The adapter
-    only submits values built by the canonical encoder, so a decode failure
-    is a defect in the code under test. *)
-let submitted_completion encoded =
-  match
-    Protocol.decode_completion
-      (Temporal_protocol.Encoded_workflow_completion.to_string encoded)
-  with
-  | Ok completion -> completion
+(** Returns the typed completion a fake supervisor received after proving
+    that it is exactly the value the submitted bytes were encoded from, so
+    fixtures can assert on typed commands while still checking what was
+    actually submitted. Re-encoding here is test-only; the adapter never
+    encodes a completion twice. *)
+let submitted_completion ~completion encoded =
+  match Protocol.encode_completion completion with
+  | Ok expected
+    when String.equal expected
+           (Temporal_protocol.Encoded_workflow_completion.to_string encoded) ->
+      completion
+  | Ok _ -> failwith "typed completion does not match the submitted bytes"
   | Error error ->
       failwith
-        ("submitted completion did not decode: "
+        ("submitted completion does not re-encode: "
         ^ (Protocol.error_view error).message)
 
 (** Allocates an empty semantic queue and lease ledger. *)
@@ -66,8 +68,8 @@ module Fake_supervisor = struct
 
   (** Rejects the configured number of attempts before acknowledging the exact
       run ID. A rejection leaves the lease in place for adapter retry. *)
-  let complete_workflow supervisor encoded =
-    let completion = submitted_completion encoded in
+  let complete_workflow supervisor ~completion encoded =
+    let completion = submitted_completion ~completion encoded in
     if !(supervisor.completion_rejections) > 0 then begin
       decr supervisor.completion_rejections;
       Error

@@ -204,19 +204,21 @@ let fake_supervisor () =
     accept_then_raise = ref false;
   }
 
-(** Decodes the canonical bytes a fake supervisor received, exactly as Rust
-    would, so fixtures assert on what was actually submitted. The adapter
-    only submits values built by the canonical encoder, so a decode failure
-    is a defect in the code under test. *)
-let submitted_completion encoded =
-  match
-    Protocol.decode_completion
-      (Temporal_protocol.Encoded_workflow_completion.to_string encoded)
-  with
-  | Ok completion -> completion
+(** Returns the typed completion a fake supervisor received after proving
+    that it is exactly the value the submitted bytes were encoded from, so
+    fixtures can assert on typed commands while still checking what was
+    actually submitted. Re-encoding here is test-only; the adapter never
+    encodes a completion twice. *)
+let submitted_completion ~completion encoded =
+  match Protocol.encode_completion completion with
+  | Ok expected
+    when String.equal expected
+           (Temporal_protocol.Encoded_workflow_completion.to_string encoded) ->
+      completion
+  | Ok _ -> failwith "typed completion does not match the submitted bytes"
   | Error error ->
       failwith
-        ("submitted completion did not decode: "
+        ("submitted completion does not re-encode: "
         ^ (Protocol.error_view error).message)
 
 (** The only exception the fake source classifies as a retryable completion
@@ -246,11 +248,11 @@ module Fake_supervisor = struct
   (** Accepts one completion only for an active run ID, then removes that lease
       and records both its exact bytes and its decoded semantic value for
       assertions. *)
-  let complete_workflow supervisor encoded =
+  let complete_workflow supervisor ~completion encoded =
     supervisor.submitted :=
       Temporal_protocol.Encoded_workflow_completion.to_string encoded
       :: !(supervisor.submitted);
-    let completion = submitted_completion encoded in
+    let completion = submitted_completion ~completion encoded in
     supervisor.attempts := completion :: !(supervisor.attempts);
     if !(supervisor.raise_next_completion) then begin
       supervisor.raise_next_completion := false;

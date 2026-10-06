@@ -373,7 +373,7 @@ operations. It exposes a typed GADT rather than raw JSON bytes:
 | --- | --- |
 | `Try_poll_workflow` | `Workflow_protocol.activation option`; `None` means the workflow lane was empty at that instant |
 | `Wait_workflow` | bounded native readiness wait; it does not consume an activation and releases the OCaml runtime lock |
-| `Complete_workflow completion` | canonical strict JSON is generated and reparsed before the native completion call |
+| `Complete_workflow encoded` | an `Encoded_workflow_completion.t` holding the canonical JSON from the worker adapter's single encoder pass; the supervisor copies those bytes into the native completion call without encoding or reparsing them, and Rust strictly decodes them |
 | `Try_poll_activity` | `Activity_protocol.task option`; `None` means the activity lane was empty at that instant |
 | `Wait_activity` | bounded native readiness wait; it does not consume an activity task and releases the OCaml runtime lock |
 | `Wait_any` | bounded native readiness wait that any queued workflow activation or activity task ends; it consumes nothing and releases the OCaml runtime lock |

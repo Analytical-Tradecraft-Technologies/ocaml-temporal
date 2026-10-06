@@ -84,17 +84,10 @@ module Source = struct
 
   (** Rejects workflow/task failures and retains the terminal result only after
       Core accepted the completion for its exact leased run. *)
-  let complete_workflow source encoded =
-    (* The adapter submits canonical bytes from one encoder pass; decode
-       them as Rust would to inspect the commands that were submitted. *)
-    let completion =
-      match
-        Protocol.decode_completion
-          (Temporal_protocol.Encoded_workflow_completion.to_string encoded)
-      with
-      | Ok completion -> completion
-      | Error _ -> failwith "submitted completion did not decode"
-    in
+  let complete_workflow source ~(completion : Protocol.completion) encoded =
+    (* The adapter passes the typed completion beside the canonical bytes it
+       was encoded into, so commands are inspected without parsing JSON;
+       only the bytes are submitted. *)
     if completion.task_failure <> None then
       failwith "cold replay failed its workflow task";
     let result =

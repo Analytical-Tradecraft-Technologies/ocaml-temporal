@@ -31,9 +31,18 @@ module type SUPERVISOR = sig
       completion's run ID. The adapter has already validated the completion
       while encoding it, so the supervisor passes these bytes on without
       encoding them again (issue #846). A retried submission is given the same
-      value, byte for byte. *)
+      value, byte for byte.
+
+      [completion] is the typed value those bytes were encoded from, supplied
+      read-only so a test or benchmark source can inspect the submitted
+      commands without parsing the JSON a second time. The encoded value is
+      authoritative: a source must submit only its bytes and must never
+      re-encode or mutate [completion]. [completion] may alias payload buffers
+      owned by workflow code, so unlike the bytes it is not a snapshot. The
+      production supervisor ignores it. *)
   val complete_workflow :
     t ->
+    completion:Temporal_protocol.Workflow_protocol.completion ->
     Temporal_protocol.Encoded_workflow_completion.t ->
     (unit, error) result
 

@@ -30,7 +30,10 @@ C unchanged. Retained completions are now those immutable bytes, so the
 payload deep copy is gone and a retry resubmits the identical string; an
 adapter-built completion the encoder rejects fails closed without a native
 call, as before. All validation is kept, and the wire bytes are unchanged.
-Runtime tests check that submitted bytes equal the canonical encoding of the
+The adapter's `complete_workflow` source operation also receives the typed
+completion read-only (`~completion`), so test sources and the cold-replay
+benchmark inspect commands without decoding the submitted JSON inside the
+measured path; the production supervisor ignores it. Runtime tests check that submitted bytes equal the canonical encoding of the
 completion, that a retryable rejection resubmits the physically identical
 string without rerunning the workflow, and that the retained bytes do not
 change when a typed payload buffer is mutated afterwards. On a scratch

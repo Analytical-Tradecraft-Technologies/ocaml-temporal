@@ -12,8 +12,20 @@ The adapter consumes the typed operations below:
 
 ```text
 try_poll_workflow : supervisor -> (activation option, error) result
-complete_workflow : supervisor -> completion -> (unit, error) result
+complete_workflow :
+  supervisor -> completion:completion -> Encoded_workflow_completion.t ->
+  (unit, error) result
 ```
+
+`complete_workflow` receives the canonical bytes from the completion's single
+encoder pass (`Encoded_workflow_completion.t`, which only that encoder can
+produce) and submits exactly those bytes; it never encodes the completion
+again (issue #846). The labelled `completion` is the typed value those bytes
+were encoded from. It is passed read-only so fake sources, integration
+controllers, and the cold-replay benchmark can inspect submitted commands
+without parsing JSON a second time; the production supervisor ignores it.
+Because `completion` may alias workflow-owned payload buffers, only the
+encoded bytes are a snapshot and authoritative.
 
 The concrete `Sdk_supervisor.Native` module instantiates this signature with
 operations on its owner Domain. The public worker loop also uses one private,
@@ -70,8 +82,10 @@ The adapter owns only OCaml values:
 - a mutable map from Temporal run ID to its matching typed `Execution.t`;
 - a mutable map of workflow completions whose native acknowledgement has not
   yet been proven, each held as the immutable canonical JSON produced by its
-  single encoder pass (`Encoded_workflow_completion.t`), so no workflow-owned
-  payload buffer is retained;
+  single encoder pass (`Encoded_workflow_completion.t`) beside the typed
+  completion it was encoded from. A retry resubmits those bytes unchanged, so
+  later mutation of a workflow-owned payload buffer cannot alter what is
+  sent; the typed value is kept only to pass to the source read-only;
 - one mutex that serializes polling, execution, and completion submission.
 
 No native pointer, Rust future, or continuation is stored in the maps. The

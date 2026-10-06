@@ -28,8 +28,11 @@ module type SUPERVISOR = sig
   val try_poll_workflow :
     t -> (Protocol.activation option, error) result
 
+  (* [completion] is the read-only typed source of the encoded bytes, for
+     inspection by test sources; the bytes are authoritative. *)
   val complete_workflow :
-    t -> Encoded_completion.t -> (unit, error) result
+    t -> completion:Protocol.completion -> Encoded_completion.t ->
+    (unit, error) result
 
   val error_code : error -> string
   val error_message : error -> string
@@ -155,6 +158,8 @@ type pending_result =
     [submission] holds the canonical bytes from the completion's single
     encoder pass (issue #846). They are an immutable snapshot, so retaining
     them needs no payload copy and a retry resubmits exactly the same bytes.
+    The typed completion is kept beside them only so the source can inspect
+    it without decoding; it is never encoded again.
     [Error] records a completion the encoder rejected: it can never be
     submitted, so its first attempt fails closed exactly as a non-retryable
     supervisor rejection did when the supervisor ran the encoder.
@@ -168,7 +173,7 @@ type pending_result =
     terminal [discard] releases the entry (issue #843). *)
 type pending_completion = {
   run_id : string;
-  submission : (Encoded_completion.t, error_view) result;
+  submission : (Native_execution.encoded_completion, error_view) result;
   result : pending_result;
   mutable retry_refusal : error_view option;
 }
@@ -590,9 +595,10 @@ module Make (Supervisor : SUPERVISOR) = struct
   (** Calls the supervisor completion operation without losing whether an
       exception occurred. A returned source error still means that the
       supervisor completed the call normally but did not acknowledge it. *)
-  let attempt_completion supervisor encoded =
+  let attempt_completion supervisor
+      ({ completion; encoded } : Native_execution.encoded_completion) =
     try
-      match Supervisor.complete_workflow supervisor encoded with
+      match Supervisor.complete_workflow supervisor ~completion encoded with
       | Ok () -> Accepted
       | Error source_error ->
           let source =
@@ -698,8 +704,8 @@ module Make (Supervisor : SUPERVISOR) = struct
                still held; failing closed matches the earlier behavior, when
                the supervisor's own encode rejected it non-retryably. *)
             refuse_unless false error
-        | Ok encoded ->
-        match attempt_completion adapter.supervisor encoded with
+        | Ok submission ->
+        match attempt_completion adapter.supervisor submission with
         | Accepted -> accepted_pending adapter pending
         | Rejected_by_supervisor { error; retryable } ->
             refuse_unless retryable error
@@ -761,7 +767,7 @@ module Make (Supervisor : SUPERVISOR) = struct
       encoder; [finish_pending] fails it closed without a native call. *)
   let encode_submission completion =
     match Encoded_completion.encode completion with
-    | Ok encoded -> Ok encoded
+    | Ok encoded -> Ok { Native_execution.completion; encoded }
     | Error error ->
         let view = Protocol.error_view error in
         Error
@@ -842,7 +848,7 @@ module Make (Supervisor : SUPERVISOR) = struct
     let pending =
       {
         run_id;
-        submission = Ok checked.encoded;
+        submission = Ok checked;
         result =
           Pending_completed
             {
