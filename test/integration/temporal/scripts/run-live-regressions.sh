@@ -51,12 +51,15 @@ compose() {
 
 # Runs one bounded command in the development image on the Compose network as
 # the invoking user, so bind-mounted outputs keep host ownership. HOME points
-# at a writable directory because the numeric user has no passwd entry.
+# at a writable directory because the numeric user has no passwd entry, and
+# OPAMROOT stays pinned to the image's switch because the image entrypoint
+# (`opam exec --`) would otherwise look for an uninitialised root under HOME.
 in_dev() {
   seconds=$1
   shift
   compose run --rm --no-deps -T \
     --user "${HOST_UID:-$(id -u)}:${HOST_GID:-$(id -g)}" --env HOME=/tmp \
+    --env OPAMROOT=/home/opam/.opam \
     dev timeout --signal=TERM --kill-after=10s "$seconds" "$@"
 }
 
