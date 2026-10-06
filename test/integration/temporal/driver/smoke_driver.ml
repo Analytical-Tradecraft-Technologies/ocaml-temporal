@@ -794,8 +794,9 @@ let run () =
            accepted in one activation before this exact run is cancelled; the
            timer keeps the execution outstanding. The child-start-failure
            parent is started only after that top-level cancellation run is
-           submitted, so its duplicate child ID must be rejected by Temporal
-           rather than succeeding as an ordinary child. The heartbeat workflow is also already outstanding here, so its retry
+           submitted, and its result is awaited before the run is cancelled,
+           so its duplicate child ID must be rejected by Temporal rather than
+           succeeding as an ordinary child. The heartbeat workflow is also already outstanding here, so its retry
            runs concurrently with the other live server work instead of being
            mistaken for a sequential local callback. The timeout workflow is
            deliberately started only after the heartbeat workflow has reached
@@ -940,6 +941,20 @@ let run () =
         in
         let* () =
           wait_for_cancellation_ready cancellation_ready_file cancellation_token
+        in
+        (* The duplicate child ID is only held while the cancellation run is
+           open, so the parent must have observed Temporal's start rejection
+           before that run is cancelled. Waiting here removes the race in
+           which the cancellation completes before the parent's first
+           workflow task issues StartChildWorkflowExecution, letting the
+           "duplicate" child start normally. The parent completes as soon as
+           the start fails, so this wait never depends on the cancellation. *)
+        let* child_start_failure_result =
+          wait_workflow child_start_failure_handle
+        in
+        let* () =
+          require_completed "smoke.parent_observes_child_start_failure"
+            "SMOKE:CHILD:START_FAILED" (Ok child_start_failure_result)
         in
         let* () = cancel_workflow cancellation_handle in
         (* Reuse the marker file for a distinct direct-termination target only
@@ -1106,13 +1121,6 @@ let run () =
         let* () =
           require_completed "smoke.parent_retries_child"
             "SMOKE:CHILD_RETRY:ATTEMPT:2" (Ok child_retry_result)
-        in
-        let* child_start_failure_result =
-          wait_workflow child_start_failure_handle
-        in
-        let* () =
-          require_completed "smoke.parent_observes_child_start_failure"
-            "SMOKE:CHILD:START_FAILED" (Ok child_start_failure_result)
         in
         let* parent_result = wait_workflow parent_handle in
         let* () =

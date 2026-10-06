@@ -45,7 +45,10 @@ polls keep the preferred lane from observing both lanes idle. If its sibling is
 busy or owns the native wait, a lane yields locally for 10 ms and then retries
 its nonblocking `try_poll_*` operation. This prevents an idle lane
 from repeatedly occupying the sole supervisor owner during work on the other
-lane. Rust poll-lane failures are also reported by `try_poll_*` when no task is
+lane. The busy check is a snapshot taken after the lane's own poll: a sibling
+that becomes busy between that decision and the native wait simply queues its
+poll behind the wait, which `Wait_any` ends as soon as that task is ready.
+Rust poll-lane failures are also reported by `try_poll_*` when no task is
 queued, so local yields cannot conceal a fatal producer error. Native
 readiness remains the both-idle steady-state path. The C boundary releases the
 OCaml runtime lock during its 100 ms native wait, after which the supervisor
