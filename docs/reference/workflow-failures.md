@@ -11,6 +11,8 @@ complete the same workflow ID and run ID. Applications must no longer use
 | Workflow body returns `Error.make ~category:Workflow ...` | Terminal workflow failure; preserves `non_retryable` and details |
 | Workflow propagates an expected activity, child, cancellation, or timeout error | Existing terminal failure/cancellation semantics remain |
 | Unexpected body/scheduler/signal exception, or a propagated `Defect`, `Bridge`, or `Codec` error | Failed workflow task, no commands |
+| Signal with no registered handler, an undecodable signal payload, or more than one signal payload | Failed workflow task, no commands; the run waits for a compatible worker, reset, or termination ([fail-closed signal policy](interactive-workflows.md#unknown-and-undecodable-signals)) |
+| Signal handler returns a typed non-task error such as `Workflow` | Terminal workflow failure |
 | Workflow result encoder returns an error or raises | Failed workflow task, regardless of the encoder's error category |
 | `Workflow.continue_as_new` input encoder returns an error | Failed workflow task, no continue-as-new command |
 | Missing workflow registration, malformed activation, invalid resolver state, adapter exception before submission | Failed workflow task, no commands |

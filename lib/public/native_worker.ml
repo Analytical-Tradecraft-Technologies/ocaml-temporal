@@ -232,8 +232,9 @@ type activity_registration = Activity_adapter.registered_activity
 
 (** Converts one public signal handler into a private scheduler callback.
     [Signal.Handler.dispatch_payloads] owns the payload-arity policy: zero
-    payloads decode as unit and multiple payloads fail the workflow
-    non-retryably instead of silently changing the input. *)
+    payloads decode as unit and multiple payloads are a [`Codec] error, which
+    fails the workflow task (the v1 fail-closed signal policy, #811) instead
+    of silently changing the input or closing the run. *)
 let runtime_signal_handler (handler : Signal.Handler.t) =
   let name = Signal.Handler.name handler in
   Workflow_adapter.make_signal_handler ~name ~dispatch:(fun signal ->

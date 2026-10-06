@@ -94,9 +94,17 @@ module Handler = struct
       #819) this SDK's client and external signals send for a no-argument
       signal, so they decode as the canonical [binary/null] unit payload, as
       workflow start input already does. Older OCaml senders' single
-      [binary/null] payload still decodes through the one-payload case. A handler whose codec rejects unit
-      reports its own codec error. Multiple payloads fail non-retryably rather
-      than silently dropping data. *)
+      [binary/null] payload still decodes through the one-payload case. A
+      handler whose codec rejects unit reports its own codec error.
+
+      Multiple payloads are a payload-shape mismatch with the registered codec,
+      so they are reported in the [`Codec] category rather than silently
+      dropping data. Under the v1 fail-closed signal policy (#811) the worker
+      runtime classifies [`Codec] as a workflow-task failure, exactly like an
+      undecodable payload or a signal with no registered handler: the signal
+      stays in history, the run stays open, and it makes no progress until a
+      compatible worker replays it or the run is reset or terminated. It never
+      closes the run as Failed. *)
   let dispatch_payloads handler = function
     | [] ->
         dispatch handler
@@ -104,7 +112,7 @@ module Handler = struct
     | [ payload ] -> dispatch handler payload
     | _ ->
         Error
-          (Error.make ~non_retryable:true ~category:`Workflow
+          (Error.make ~non_retryable:true ~category:`Codec
              ~message:
                (Printf.sprintf
                   "signal %s must contain at most one payload for its \
