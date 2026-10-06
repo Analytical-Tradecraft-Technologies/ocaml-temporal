@@ -137,6 +137,12 @@ run:
 opam install --with-test .
 ```
 
+Cargo downloads the locked Rust dependencies during that build, so installing
+from a Git checkout needs network access, which opam's default build sandbox
+denies. Each release's `ocaml-temporal-<tag>-source.tar.gz` asset vendors those
+dependencies and builds offline inside the sandbox; see
+[Offline opam source builds](docs/reference/package-boundary.md#offline-opam-source-builds).
+
 The OPAM metadata depends on `conf-rust-2024` and `conf-protoc`, so dependency
 resolution checks that `cargo`, a compiler supporting Rust edition 2024, and
 `protoc` are available before Dune builds the private native bridge. Cargo
