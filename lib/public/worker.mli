@@ -94,19 +94,18 @@ type t
     SDKs, computed once when the worker is created so pollers from different
     processes are distinguishable in Temporal.
 
-    [runtime_threads] bounds the worker-thread pool of the private native
-    runtime this worker owns, which drives its network I/O and Temporal Core
-    state machines. When omitted it is the host's available parallelism
-    capped at 4, rather than one thread per core. Workflow and activity code
-    never runs on these threads. Each worker and each client owns its own
-    runtime, so the bound applies per instance. It must be between 1 and 256;
-    any other value returns a typed defect before anything is allocated, for
-    every target including [mock://]. *)
+    [io_threads] is an upper bound on the background threads this worker
+    uses for network I/O and server communication; the SDK may use fewer.
+    When omitted it is the host's available parallelism capped at 4.
+    Workflow and activity code never runs on these threads. Each worker and
+    each client has its own threads, so the bound applies per instance. It
+    must be between 1 and 256; any other value returns a typed defect before
+    anything is allocated, for every target including [mock://]. *)
 val create :
   ?identity:string ->
   ?options:Options.t ->
   ?max_cached_workflows:int ->
-  ?runtime_threads:int ->
+  ?io_threads:int ->
   target_url:string ->
   namespace:string ->
   task_queue:string ->

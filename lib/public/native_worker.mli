@@ -60,11 +60,12 @@ type t
     bound, while a small positive bound makes Core cache eviction observable
     through the worker's empty-completion path. [versioning] selects
     Temporal's worker routing strategy; omitting it preserves the unversioned
-    behavior. [runtime_threads] bounds the native runtime's Tokio worker
-    pool; omitting it selects the bridge default. *)
+    behavior. [io_threads] is the public network-thread bound, mapped
+    to the native runtime's Tokio worker pool; omitting it selects the bridge
+    default. *)
 val create :
   ?max_cached_workflows:int ->
-  ?runtime_threads:int ->
+  ?io_threads:int ->
   ?versioning:Temporal_sdk_kernel.Bridge.worker_versioning ->
   target_url:string ->
   namespace:string ->

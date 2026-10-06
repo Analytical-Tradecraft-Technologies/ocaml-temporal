@@ -217,17 +217,18 @@ type client
 (** An opaque worker backend instance owned by one public [Worker.t]. *)
 type worker
 
-(** Returns a defect unless an explicit runtime thread bound is between [1]
+(** Returns a defect unless an explicit [io_threads] bound is between [1]
     and the bridge maximum; [None] is always valid. *)
-val validate_runtime_threads : int option -> (unit, Error.t) result
+val validate_io_threads : int option -> (unit, Error.t) result
 
 (** Creates a client transport after validating its configuration. The
     deterministic [mock://] ledger is test-only; HTTP(S) creates and connects
     one private supervisor graph before publishing the client value.
-    [runtime_threads] bounds the native runtime's Tokio worker pool and is
-    validated for every target. *)
+    [io_threads] is the public network-thread bound; the native backend
+    maps it to the private runtime's Tokio worker pool. It is validated for
+    every target. *)
 val client_create :
-  ?runtime_threads:int -> config -> (client, Error.t) result
+  ?io_threads:int -> config -> (client, Error.t) result
 
 (** Starts one workflow after validating the request in the backend boundary. *)
 val client_start : client -> start_request -> (start_response, Error.t) result

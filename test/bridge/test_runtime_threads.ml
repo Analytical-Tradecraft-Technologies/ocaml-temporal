@@ -21,13 +21,13 @@ let expect_invalid_argument label = function
       failwith (Printf.sprintf "%s: unexpected error %s" label message)
   | Ok _ -> failwith (Printf.sprintf "%s: invalid count was accepted" label)
 
-(** Asserts that a public call returned a [`Defect] naming [runtime_threads]. *)
+(** Asserts that a public call returned a [`Defect] naming [io_threads]. *)
 let expect_defect label = function
   | Error error ->
       let view = Temporal.Error.view error in
       if view.category <> `Defect then
         failwith (Printf.sprintf "%s: expected defect, got %s" label view.message);
-      assert (String.starts_with ~prefix:"runtime_threads must be" view.message)
+      assert (String.starts_with ~prefix:"io_threads must be" view.message)
   | Ok _ -> failwith (Printf.sprintf "%s: invalid count was accepted" label)
 
 (** Out-of-range counts used by every rejection case. *)
@@ -65,9 +65,9 @@ let workflow =
   Temporal.Workflow.define ~name:"unit.runtime-threads"
     ~input:Temporal.Codec.unit ~output:Temporal.Codec.unit (fun () -> Ok ())
 
-(** Creates a mock or native worker with [runtime_threads]. *)
-let create_worker ~target_url runtime_threads =
-  Temporal.Worker.create ?runtime_threads ~target_url ~namespace:"unit-test"
+(** Creates a mock or native worker with [io_threads]. *)
+let create_worker ~target_url io_threads =
+  Temporal.Worker.create ?io_threads ~target_url ~namespace:"unit-test"
     ~task_queue:"unit-test"
     ~workflows:[ Temporal.Worker.workflow workflow ]
     ~activities:[] ()
@@ -78,7 +78,7 @@ let create_worker ~target_url runtime_threads =
 let test_public_validation () =
   let client =
     match
-      Temporal.Client.create ~runtime_threads:2 ~target_url:"mock://threads"
+      Temporal.Client.create ~io_threads:2 ~target_url:"mock://threads"
         ~namespace:"unit-test" ()
     with
     | Ok client -> client
@@ -98,7 +98,7 @@ let test_public_validation () =
       List.iter
         (fun count ->
           expect_defect "client"
-            (Temporal.Client.create ~runtime_threads:count ~target_url
+            (Temporal.Client.create ~io_threads:count ~target_url
                ~namespace:"unit-test" ());
           expect_defect "worker" (create_worker ~target_url (Some count)))
         invalid_counts)

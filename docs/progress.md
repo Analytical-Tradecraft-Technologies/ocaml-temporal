@@ -20,7 +20,7 @@ the Temporal acceptance controllers.
 Every client and worker built its Core runtime with Tokio's default of one
 worker thread per core, so a client plus a worker on a 64-core host cost
 about 135 threads. Runtime creation now resolves an explicit worker count:
-`Client.create` and `Worker.create` accept `?runtime_threads` (1 to 256,
+`Client.create` and `Worker.create` accept `?io_threads` (1 to 256,
 validated as a typed defect before anything is allocated), and the default is
 the host's available parallelism capped at 4. The count reaches Tokio through
 the new `ocaml_temporal_core_v2_runtime_new_with_worker_threads` symbol; the
@@ -29,8 +29,11 @@ default, so ABI version 2 is unchanged. Rust integration tests read the pool
 size back from Tokio's metrics for explicit counts, both range ends, and the
 default, and prove an oversized count is rejected without a handle; the C ABI
 harness covers both outcomes and an OCaml test covers bridge and public
-validation for mock and native targets. Sharing one runtime between instances
-remains future work.
+validation for mock and native targets. The public argument is named
+`io_threads` and documented only as an upper bound on network and
+server-communication threads, so applications are not coupled to the private
+Tokio executor; the Tokio mapping is recorded in `docs/reference/core-bridge.md`.
+Sharing one runtime between instances remains future work.
 
 ## 2026-10-06: Connection failures name their cause; Core logs reach stderr (#833)
 

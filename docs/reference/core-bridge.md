@@ -501,9 +501,12 @@ is the same call with `0`. The count is resolved before Core is built, so it
 adds no owner or release path: the Tokio pool remains owned by Core inside the
 runtime handle and is shut down by the existing runtime destruction path.
 
-OCaml exposes the bound as `?runtime_threads` on `Client.create` and
-`Worker.create`, validates the same range as a typed defect before any
-supervisor or native allocation, and passes it through
+OCaml exposes the bound as the implementation-neutral `?io_threads` on
+`Client.create` and `Worker.create`: the public documentation promises only an
+upper bound on network and server-communication threads, so the Tokio mapping
+stays private and could change without a public API migration. The SDK
+validates the same range as a typed defect before any supervisor or native
+allocation, and passes it through
 `Sdk_supervisor.Native.create` to `Native_bridge.runtime_create`. The C stub
 maps a negative or oversized OCaml integer to `UINT32_MAX` so Rust rejects it
 rather than truncating. Each instance still owns a separate runtime, its

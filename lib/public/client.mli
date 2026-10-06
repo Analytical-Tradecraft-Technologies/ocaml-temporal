@@ -73,12 +73,13 @@ type visibility_page = {
     Temporal SDKs, computed once when the client is created; host names are
     sanitized to printable ASCII and bounded so the default is always valid.
 
-    [runtime_threads] bounds the worker-thread pool of the private native
-    runtime this client owns. When omitted it is the host's available
-    parallelism capped at 4, rather than one thread per core. Each client and
-    each worker owns its own runtime, so the bound applies per instance. It
-    must be between 1 and 256; any other value returns a typed defect before
-    anything is allocated, for every target including [mock://].
+    [io_threads] is an upper bound on the background threads this client
+    uses for network I/O and server communication; the SDK may use fewer.
+    When omitted it is the host's available parallelism capped at 4. Each
+    client and each worker has its own threads, so the bound applies per
+    instance. It must be between 1 and 256; any other value returns a typed
+    defect before anything is allocated, for every target including
+    [mock://].
 
     A [mock://] target selects an in-memory ledger for testing client plumbing
     only. It runs no workflow code: [wait] echoes the encoded start input back
@@ -88,7 +89,7 @@ type visibility_page = {
     Server to observe real workflow results. *)
 val create :
   ?identity:string ->
-  ?runtime_threads:int ->
+  ?io_threads:int ->
   target_url:string ->
   namespace:string ->
   unit ->

@@ -607,7 +607,7 @@ let _interaction_update :
    these are the operations an installed consumer must be able to compose. *)
 let _client_create :
     ?identity:string ->
-    ?runtime_threads:int ->
+    ?io_threads:int ->
     target_url:string ->
     namespace:string ->
     unit -> (T.Client.t, T.Error.t) result =
@@ -698,7 +698,7 @@ let _worker_create :
     ?identity:string ->
     ?options:T.Worker.Options.t ->
     ?max_cached_workflows:int ->
-    ?runtime_threads:int ->
+    ?io_threads:int ->
     target_url:string ->
     namespace:string ->
     task_queue:string ->
