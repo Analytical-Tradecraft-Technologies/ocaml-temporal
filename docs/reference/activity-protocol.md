@@ -93,8 +93,10 @@ Semantic validation then enforces:
 - the same bounded recursive structured failure and payload semantics used by
   workflow activations and completions.
 
-The OCaml encoders reparse their own output through the corresponding strict
-decoders. The Rust bridge validates completion and heartbeat JSON again at the
+The OCaml encoders apply the corresponding strict decoders' semantic rules to
+the validated JSON tree, and the strict parser's tree and raw-text limits to
+the serialized bytes, without parsing their own output again (#846). The Rust
+bridge validates completion and heartbeat JSON again at the
 worker ABI, so a value accepted by one language still crosses a second
 validation boundary before reaching Core.
 

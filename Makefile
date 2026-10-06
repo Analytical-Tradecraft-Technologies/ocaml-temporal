@@ -135,9 +135,12 @@ BENCH_COLD_REPORT ?= _build/benchmarks/core-cold-replay.json
 BENCH_COLD_WARMUP ?= 1
 BENCH_COLD_SAMPLES ?= 10
 BENCH_COLD_REPETITIONS ?= 3
+BENCH_PAYLOAD_REPORT ?= _build/benchmarks/payload-codec.json
+BENCH_PAYLOAD_WARMUP ?= 5
+BENCH_PAYLOAD_SAMPLES ?= 50
 
 .PHONY: test-temporal-live-ci test-temporal-diagnostics-contract
-.PHONY: bench bench-activation bench-activation-warm bench-activation-cold
+.PHONY: bench bench-activation bench-activation-warm bench-activation-cold bench-payload-codec
 .NOTPARALLEL: bench-activation
 .PHONY: version-check build build-examples docs cargo-metadata test test-unit test-runtime test-rust test-bridge test-install test-api release-preflight release-tag-check test-quality-contract test-temporal-config test-temporal-worker-readiness-contract test-temporal-worker-stop-contract test-temporal-worker-crash-recovery-contract test-temporal-worker-cache-eviction-contract test-core-lifecycle-integration temporal-start temporal-start-worker temporal-run-driver temporal-inspect-smoke temporal-stop-worker test-temporal-two-binary test-temporal-integration test-temporal-worker-restart test-temporal-worker-restart-contract test-temporal-worker-restart-live test-temporal-worker-crash-recovery test-temporal-worker-cache-eviction test-temporal-worker-cache-eviction-live test-temporal-workflow-patching test-temporal-workflow-patching-contract test-temporal-workflow-patching-live test-temporal-parent-child-restart test-temporal-parent-child-restart-contract test-temporal-parent-child-restart-live test-temporal-parent-child-failure-replay test-temporal-parent-child-failure-replay-contract test-temporal-parent-child-failure-replay-live temporal-health temporal-status temporal-logs temporal-stop temporal-clean lint lint-rust fmt quality quality-tool-version-check quality-rust quality-spelling license-check audit clean verify check native-version-check native-build native-test native-test-rust native-test-install native-lint native-lint-rust native-verify
 version-check:
@@ -217,6 +220,12 @@ bench-activation-cold:
 	$(MAKE) bench BENCH_EXECUTABLE=bench_cold_replay BENCH_REPORT="$(BENCH_COLD_REPORT)" \
 		BENCH_WARMUP="$(BENCH_COLD_WARMUP)" BENCH_SAMPLES="$(BENCH_COLD_SAMPLES)" \
 		BENCH_REPETITIONS="$(BENCH_COLD_REPETITIONS)"
+
+# Payload-heavy codec throughput for #846: one sample is one 2 MiB activation
+# decode plus validation re-encode and one 2 MiB completion encode/decode.
+bench-payload-codec:
+	$(MAKE) bench BENCH_EXECUTABLE=bench_payload_codec BENCH_REPORT="$(BENCH_PAYLOAD_REPORT)" \
+		BENCH_WARMUP="$(BENCH_PAYLOAD_WARMUP)" BENCH_SAMPLES="$(BENCH_PAYLOAD_SAMPLES)"
 
 test:
 	$(MAKE) test-temporal-config

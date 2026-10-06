@@ -61,7 +61,24 @@ time. One cold sample is **one complete history replay**, whereas one warm
 sample is **one timer-firing activation**; their throughput rates are different
 units and should not be compared as if they were interchangeable.
 
-Both baselines admit work synchronously at concurrency one. Pending-attempt
+The **payload-codec** suite for [#846] measures OCaml-side payload throughput
+through the private workflow protocol:
+
+```sh
+make bench-payload-codec BENCH_PAYLOAD_WARMUP=5 BENCH_PAYLOAD_SAMPLES=50 \
+  BENCH_HOST_LABEL='machine/CPU/RAM description'
+```
+
+One sample decodes one activation carrying a 2 MiB activity result
+(about 2.8 MB of JSON), re-encodes the decoded value as the runtime's
+activation validation does, then encodes and decodes one completion that
+schedules an activity with a 2 MiB argument, and checks both payloads. The
+document is built before the timed phases. Rust, Core, FFI, the supervisor,
+and the network are excluded. The report defaults to
+`_build/benchmarks/payload-codec.json`; set `BENCH_PAYLOAD_REPORT` to keep it
+elsewhere.
+
+All three baselines admit work synchronously at concurrency one. Pending-attempt
 backlog at the harness admission boundary is zero by construction; internal
 Core queues are not measured. `saturation_observation` is `not_exercised`.
 These fields limit interpretation; they are not evidence of load capacity or
@@ -99,3 +116,4 @@ metrics.
 [#526]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/526
 [#527]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/527
 [#528]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/528
+[#846]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/846
