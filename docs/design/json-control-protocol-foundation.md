@@ -50,7 +50,13 @@ Normalized output is UTF-8 JSON with no insignificant whitespace. Envelope
 fields have a fixed order, body keys are sorted recursively by Unicode code
 point order, and integers use their shortest decimal form. Outgoing typed values
 are semantically checked, serialized, then passed through the same strict parser
-before bytes are returned.
+before bytes are returned. Payload-bearing semantic objects are the exception
+(#846): their tree receives the parser's tree validation, their serialized
+bytes its raw-text preflight, and their semantic decoder runs on the validated
+tree, so multi-megabyte payloads are not parsed and base64 decoded twice. A
+payload wrapper that is already parsed is decoded in place from its base64
+string, and canonical base64 is enforced directly (alphabet, terminal padding,
+zero unused bits) rather than by re-encoding the decoded bytes.
 
 ## Verification
 

@@ -60,3 +60,19 @@
  (name check_report)
  (modules check_report)
  (libraries yojson))
+
+(test
+ (name bench_payload_codec)
+ (modules bench_payload_codec)
+ (libraries benchmark_harness temporal_protocol)
+ (action
+  (setenv BENCH_SOURCE_COMMIT test-commit
+   (setenv BENCH_SOURCE_DIRTY false
+    (setenv BENCH_SDK_VERSION test-version
+     (setenv BENCH_CORE_REVISION test-core
+      (setenv BENCH_DUNE_PROFILE dev
+       (setenv BENCH_BASE_IMAGE_REFERENCE test-image
+        (setenv BENCH_DEVELOPMENT_IMAGE_ID unavailable
+         (pipe-stdout
+          (run %{test} --warmup 1 --samples 3 --repetitions 1 --seed 1)
+          (run %{exe:check_report.exe} payload-codec 3)))))))))))
