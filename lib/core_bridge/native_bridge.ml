@@ -45,6 +45,11 @@ type response
     SDK supervisor may use or close it; workflow code never sees this type. *)
 type runtime
 
+(** Opaque owner of one Core runtime shared by several [runtime] graphs
+    (#832). Each attached graph holds its own native reference to the shared
+    Core, so closing this value never frees Core under a live graph. *)
+type shared_runtime
+
 (** Validated client connection settings. The concrete JSON representation is
     private so callers cannot bypass sender-side checks. *)
 type client_config = {
@@ -143,6 +148,15 @@ external runtime_create_raw : int -> runtime * response
   = "ocaml_temporal_runtime_create"
 
 external runtime_close_raw : runtime -> int = "ocaml_temporal_runtime_close"
+
+external shared_runtime_create_raw : int -> shared_runtime * response
+  = "ocaml_temporal_shared_runtime_create"
+
+external runtime_attach_raw : shared_runtime -> runtime * response
+  = "ocaml_temporal_runtime_attach"
+
+external shared_runtime_close_raw : shared_runtime -> int
+  = "ocaml_temporal_shared_runtime_close"
 
 external client_connect_raw : runtime -> bytes -> response
   = "ocaml_temporal_client_connect"
@@ -926,3 +940,67 @@ let runtime_create ?worker_threads () =
   in
   Observability.report ~src:Observability.Source.lifecycle level ~tags message;
   result
+
+(** Reports one shared-runtime lifecycle transition on the lifecycle source,
+    mirroring [runtime_create] and [runtime_close]. *)
+let report_shared_lifecycle ~operation ~ok_message ~error_message result =
+  let level, message, bridge_status =
+    match result with
+    | Ok _ -> (Logs.Info, ok_message, None)
+    | Error error -> (Logs.Error, error_message, Some (status_name error.status))
+  in
+  let tags = Observability.tags ~operation ?bridge_status () in
+  Observability.report ~src:Observability.Source.lifecycle level ~tags message;
+  result
+
+(** Releases the shared handle's Core reference. Repeating it is safe; Core
+    is destroyed before this returns only when no attached graph remains. *)
+let shared_runtime_close shared =
+  bridge_call "shared_runtime_close" (fun () ->
+      match shared_runtime_close_raw shared with
+      | 0 -> Ok ()
+      | code ->
+          Error
+            {
+              status = status code;
+              message = "Temporal Core shared runtime close failed";
+            })
+  |> report_shared_lifecycle ~operation:"shared_runtime_close"
+       ~ok_message:"shared runtime closed"
+       ~error_message:"shared runtime shutdown failed"
+
+(** Checks the bridge contract, then creates one shareable Core runtime. The
+    thread-count contract and failure cleanup match [runtime_create]. *)
+let shared_runtime_create ?worker_threads () =
+  bridge_call "shared_runtime_create" (fun () ->
+      match validate_runtime_worker_threads worker_threads with
+      | Error _ as error -> error
+      | Ok () -> (
+          match check_abi_version abi_version with
+          | Error _ as error -> error
+          | Ok () -> (
+              let shared, response =
+                shared_runtime_create_raw (Option.value worker_threads ~default:0)
+              in
+              match decode response with
+              | Ok _ -> Ok shared
+              | Error error ->
+                  ignore (shared_runtime_close shared);
+                  Error error)))
+  |> report_shared_lifecycle ~operation:"shared_runtime_create"
+       ~ok_message:"shared runtime initialized"
+       ~error_message:"shared runtime initialization failed"
+
+(** Creates one graph on [shared]'s Core. A failed attach closes the
+    (necessarily empty) graph owner before returning. *)
+let runtime_attach shared =
+  bridge_call "runtime_attach" (fun () ->
+      let runtime, response = runtime_attach_raw shared in
+      match decode response with
+      | Ok _ -> Ok runtime
+      | Error error ->
+          ignore (runtime_close runtime);
+          Error error)
+  |> report_shared_lifecycle ~operation:"runtime_attach"
+       ~ok_message:"runtime attached to shared runtime"
+       ~error_message:"runtime attach failed"

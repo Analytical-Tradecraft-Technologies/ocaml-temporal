@@ -28,7 +28,7 @@ opam exec -- dune build @install
 # module fails the package-boundary gate before publication. The comparison is
 # intentionally source-based: the installed tree contains generated aliases,
 # while the checked-in root is the maintainer-owned list.
-expected_public_modules='Activity Child_workflow Client Codec Condition Duration Error Future Interaction Payload Query Result_syntax Runtime_info Scope Time Signal Testing Update Worker Workflow Workflow_context'
+expected_public_modules='Activity Child_workflow Client Codec Condition Duration Error Future Interaction Payload Query Result_syntax Runtime Runtime_info Scope Time Signal Testing Update Worker Workflow Workflow_context'
 actual_public_modules=$(sed -n 's/^module \([A-Za-z0-9_]*\) = .*/\1/p' \
   "$root/lib/public/temporal.ml" | tr '\n' ' ' | sed 's/[[:space:]]*$//')
 if [ "$actual_public_modules" != "$expected_public_modules" ]; then

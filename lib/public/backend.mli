@@ -227,14 +227,34 @@ type worker
     and the bridge maximum; [None] is always valid. *)
 val validate_io_threads : int option -> (unit, Error.t) result
 
+(** Returns a defect when both [io_threads] and [runtime] are given (#832);
+    the shared runtime already fixes its own thread bound. *)
+val validate_runtime_source :
+  io_threads:int option ->
+  runtime:Temporal_sdk_kernel.Shared_runtime.t option ->
+  (unit, Error.t) result
+
+(** Reserves one attachment on an optional shared runtime, or returns a
+    defect if it was shut down. The caller must hand the lease to exactly one
+    owner ([Native.create], which then releases it, or a mock value) or
+    release it itself. *)
+val acquire_runtime_lease :
+  Temporal_sdk_kernel.Shared_runtime.t option ->
+  (Temporal_sdk_kernel.Shared_runtime.lease option, Error.t) result
+
 (** Creates a client transport after validating its configuration. The
     deterministic [mock://] ledger is test-only; HTTP(S) creates and connects
     one private supervisor graph before publishing the client value.
     [io_threads] is the public network-thread bound; the native backend
     maps it to the private runtime's Tokio worker pool. It is validated for
-    every target. *)
+    every target. With [runtime] (exclusive with [io_threads]) the client is
+    attached to that shared runtime until [client_shutdown]: a native
+    client's supervisor owns the lease, a mock client holds it itself. *)
 val client_create :
-  ?io_threads:int -> config -> (client, Error.t) result
+  ?io_threads:int ->
+  ?runtime:Temporal_sdk_kernel.Shared_runtime.t ->
+  config ->
+  (client, Error.t) result
 
 (** Starts one workflow after validating the request in the backend boundary. *)
 val client_start : client -> start_request -> (start_response, Error.t) result
@@ -314,8 +334,12 @@ val client_shutdown : client -> (unit, Error.t) result
 (** Creates a deterministic worker test seam and records the task queue and
     names registered by the OCaml registry. The queue and names are retained
     here so tests exercise the same admission inputs that the native adapter
-    will validate, even though its activation protocol is different. *)
+    will validate, even though its activation protocol is different. With
+    [runtime], the mock worker holds an attachment lease on it (released by
+    its first [worker_shutdown]) so runtime ordering behaves as for a native
+    worker; a shut-down runtime is a defect. *)
 val worker_create :
+  ?runtime:Temporal_sdk_kernel.Shared_runtime.t ->
   config ->
   workflow_names:string list ->
   activity_names:string list ->

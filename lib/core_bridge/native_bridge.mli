@@ -29,6 +29,12 @@ type error = {
     instance. It is intentionally abstract and never enters the public API. *)
 type runtime
 
+(** Private owner of one Core runtime (Tokio executor) that several [runtime]
+    graphs can share (#832). Each graph created by {!runtime_attach} holds
+    its own native reference to that Core, so closing this value never frees
+    Core under a live graph; Core is destroyed by whichever releases last. *)
+type shared_runtime
+
 (** Validated settings for one official Temporal client connection. The JSON
     representation and concrete fields remain private so callers cannot bypass
     sender-side transport validation. *)
@@ -295,3 +301,22 @@ val client_disconnect : runtime -> (unit, error) result
     remain useful for deterministic diagnostics but are not required for
     leak-free defensive cleanup. *)
 val runtime_close : runtime -> (unit, error) result
+
+(** Creates a Core runtime that several graphs can share, after the same ABI
+    check and [worker_threads] validation as {!runtime_create}. The value
+    holds no client or worker. *)
+val shared_runtime_create :
+  ?worker_threads:int -> unit -> (shared_runtime, error) result
+
+(** Creates one graph (used and closed exactly like a {!runtime_create}
+    graph) that runs on [shared]'s Core instead of building its own. A closed
+    [shared] returns [Invalid_argument]. Callers must not close [shared]
+    concurrently with this call; the C borrow gate makes such a race return
+    an error rather than a use-after-free. *)
+val runtime_attach : shared_runtime -> (runtime, error) result
+
+(** Releases [shared]'s Core reference, waiting with the OCaml runtime lock
+    released. Core is destroyed before this returns only if no attached graph
+    remains; otherwise the last graph's {!runtime_close} destroys it.
+    Repeating the call is safe. *)
+val shared_runtime_close : shared_runtime -> (unit, error) result

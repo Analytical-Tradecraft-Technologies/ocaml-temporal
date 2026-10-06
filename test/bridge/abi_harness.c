@@ -202,5 +202,45 @@ int main(void) {
   assert(ocaml_temporal_core_v3_runtime_free(NULL) ==
          OCAML_TEMPORAL_CORE_STATUS_INVALID_ARGUMENT);
 
+  /* A shared Core runtime (#832): two graphs attach to it, the shared handle
+   * may be released before them, and every slot is cleared exactly once. */
+  {
+    ocaml_temporal_core_shared_runtime *shared = NULL;
+    ocaml_temporal_core_runtime *first = NULL;
+    ocaml_temporal_core_runtime *second = NULL;
+
+    assert(ocaml_temporal_core_v3_shared_runtime_new(1, &shared, &result) ==
+           OCAML_TEMPORAL_CORE_STATUS_OK);
+    assert(ocaml_temporal_core_v3_result_free(&result) ==
+           OCAML_TEMPORAL_CORE_STATUS_OK);
+    assert(ocaml_temporal_core_v3_runtime_new_attached(shared, &first,
+                                                       &result) ==
+           OCAML_TEMPORAL_CORE_STATUS_OK);
+    assert(ocaml_temporal_core_v3_result_free(&result) ==
+           OCAML_TEMPORAL_CORE_STATUS_OK);
+    assert(ocaml_temporal_core_v3_runtime_new_attached(shared, &second,
+                                                       &result) ==
+           OCAML_TEMPORAL_CORE_STATUS_OK);
+    assert(ocaml_temporal_core_v3_result_free(&result) ==
+           OCAML_TEMPORAL_CORE_STATUS_OK);
+    assert(ocaml_temporal_core_v3_shared_runtime_free(&shared) ==
+           OCAML_TEMPORAL_CORE_STATUS_OK);
+    assert(shared == NULL);
+    assert(ocaml_temporal_core_v3_shared_runtime_free(&shared) ==
+           OCAML_TEMPORAL_CORE_STATUS_OK);
+    assert(ocaml_temporal_core_v3_runtime_free(&first) ==
+           OCAML_TEMPORAL_CORE_STATUS_OK);
+    assert(ocaml_temporal_core_v3_runtime_free(&second) ==
+           OCAML_TEMPORAL_CORE_STATUS_OK);
+    assert(ocaml_temporal_core_v3_runtime_new_attached(NULL, &first,
+                                                       &result) ==
+           OCAML_TEMPORAL_CORE_STATUS_INVALID_ARGUMENT);
+    assert(first == NULL);
+    assert(ocaml_temporal_core_v3_result_free(&result) ==
+           OCAML_TEMPORAL_CORE_STATUS_OK);
+    assert(ocaml_temporal_core_v3_shared_runtime_dispose(NULL) ==
+           OCAML_TEMPORAL_CORE_STATUS_INVALID_ARGUMENT);
+  }
+
   return 0;
 }

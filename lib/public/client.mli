@@ -94,6 +94,14 @@ type visibility_page = {
     defect before anything is allocated, for every target including
     [mock://].
 
+    [runtime] instead runs the client on a shared {!Runtime.t}, whose
+    background threads it shares with every other client and worker
+    attached to it. The client stays attached until {!shutdown} has
+    returned, and {!Runtime.shutdown} fails while it is. Passing both
+    [runtime] and [io_threads] is a typed defect (set the bound on
+    {!Runtime.create}), and so is a runtime that was already shut down.
+    A [mock://] client attaches too, so ordering errors match every target.
+
     A [mock://] target selects an in-memory ledger for testing client plumbing
     only. It runs no workflow code: [wait] echoes the encoded start input back
     as the output, completing only when the workflow's output codec can
@@ -103,6 +111,7 @@ type visibility_page = {
 val create :
   ?identity:string ->
   ?io_threads:int ->
+  ?runtime:Runtime.t ->
   target_url:string ->
   namespace:string ->
   unit ->

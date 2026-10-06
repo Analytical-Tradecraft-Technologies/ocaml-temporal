@@ -514,8 +514,9 @@ stable ABI.
 
 The reserved runtime, client, and worker types are opaque references to
 Rust-owned SDK state, not OS handles and not public OCaml values. Only the
-runtime pointer crosses the current C ABI; client and worker state are fields
-within that Rust runtime:
+runtime pointer (and, for an application-shared Core, the shared-runtime
+pointer described under [Shared runtime](#shared-runtime-832)) crosses the
+current C ABI; client and worker state are fields within that Rust runtime:
 
 - a runtime owns Tokio and shared Core infrastructure;
 - a client owns one cluster connection and its authentication/configuration;
@@ -554,8 +555,67 @@ allocation, and passes it through
 `Sdk_supervisor.Native.create` to `Native_bridge.runtime_create`. The C stub
 maps a negative or oversized OCaml integer to `UINT32_MAX` so Rust rejects it
 rather than truncating. Each instance still owns a separate runtime, its
-cleanup thread, and its supervisor Domain; sharing one runtime across
-instances is not implemented.
+cleanup thread, and its supervisor Domain unless it is attached to a shared
+runtime (below).
+
+### Shared runtime (#832)
+
+Several SDK instances can share one Core runtime, and so one Tokio pool,
+through an explicit, application-owned value. The native graph is split at
+one seam: Core moves out of the per-instance graph into a reference-counted
+`SharedCore` (Core plus its optional log writer), and every holder owns one
+`Arc` reference to it.
+
+- `ocaml_temporal_core_v3_shared_runtime_new(worker_threads, &shared, out)`
+  builds one `SharedCore` behind an opaque `SharedRuntime` handle that owns
+  one reference and its own cleanup thread. It carries no client or worker.
+- `ocaml_temporal_core_v3_runtime_new_attached(shared, &runtime, out)`
+  creates an ordinary instance graph (one client, one worker, its own cleanup
+  thread, released by `runtime_free`/`runtime_dispose`) that holds a cloned
+  reference instead of building its own Core. A null `shared` is
+  `INVALID_ARGUMENT`; concurrent attaches on one live handle are permitted.
+- `ocaml_temporal_core_v3_shared_runtime_free` releases the handle's
+  reference and waits; `..._shared_runtime_dispose` is the non-waiting GC
+  fallback. Both clear the slot first and are idempotent on a null slot.
+
+Ownership rules. Each graph still has exactly one owner (its supervisor's
+owner Domain) and one release path; supervisors never share mutable native
+state, so "one supervisor actor per SDK instance owns its graph" still holds,
+with Core moved out of the graph. Core is destroyed exactly once, by
+whichever holder drops the last reference, in any order: releasing the
+shared handle first never frees Core under a live graph, it only defers
+destruction to that graph's `runtime_free`. Every holder drops its reference
+on a plain OS thread (a cleanup thread, or an OCaml thread with the runtime
+lock released), never on a Tokio worker, where dropping a Tokio runtime
+panics. Field order in `SharedCore` drops Core before closing the log writer,
+so Core's shutdown records are still flushed. A Core worker finalizer that
+was detached after a bounded timeout ends when the last reference is dropped,
+which for a shared runtime is the shared runtime's release rather than the
+graph's.
+
+The OCaml side adds a stricter, typed ordering rule on top of that memory
+safety. `Sdk_shared_runtime` (private) owns the `Native_bridge.shared_runtime`
+custom block, whose C owner has the same counted-borrow gate and malloc'd
+layout as the per-instance runtime owner. Each attachment is a lease acquired
+before any graph exists; `Sdk_supervisor.Native.create ?runtime:lease` takes
+ownership of the lease, releases it if creation fails, and otherwise releases
+it in backend shutdown only after `runtime_close` has returned. `shutdown`
+refuses with `Still_attached n` while any lease is outstanding and otherwise
+holds its mutex across the native free, so every `Ok` return happens after
+Core and its threads are gone. The public `Temporal.Runtime` maps that refusal
+to a `Defect`. If an instance is abandoned without shutdown its lease stays
+held, so `Runtime.shutdown` keeps refusing; the Rust references still
+guarantee Core is never freed early.
+
+Tests: `rust/core-bridge/tests/shared_runtime.rs` proves two attached graphs
+share one Core and Tokio pool and run independent replay workers, that
+releasing the shared handle first leaves graphs usable, and the invalid
+argument paths; `shared_runtime_cleanup.rs` (its own process) proves Core is
+destroyed exactly once by the last holder in both orders and through the GC
+fallback; the C harness covers the symbols under ASan/UBSan; and
+`test/bridge/test_shared_runtime.ml` covers the bridge, the lease ledger, two
+real supervisors on one runtime, the public ordering errors with `mock://`
+and refused `http://` targets, and a Linux thread-count leak check.
 
 The implemented private supervisor owns the real runtime, one official client
 connection, and one Core worker for workflows and remote activities. Its backend protocol exposes
@@ -823,8 +883,11 @@ already failed, Rust uses its defensive synchronous fallback to reclaim the
 graph on the caller thread rather than leak it. In either case the finalizer
 itself never invokes OCaml runtime operations. Both paths clear the handle
 before transfer and are idempotent; exactly one path can own the native graph.
-Cleanup finalizes worker, drops client, then drops Core even when callers did
-not explicitly close the children.
+Cleanup finalizes worker, drops client, then drops the graph's Core reference
+even when callers did not explicitly close the children; Core itself is
+destroyed there unless a shared runtime or another attached graph still holds
+it. A shared-runtime handle has the same two paths (`shared_runtime_free` and
+the finalizer's `shared_runtime_dispose`) and its own cleanup thread.
 
 ## Verification
 

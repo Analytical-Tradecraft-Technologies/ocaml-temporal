@@ -5,6 +5,7 @@
 
 module Bridge = Temporal_core_bridge.Native_bridge
 module Supervisor = Sdk_supervisor.Native
+module Shared_runtime = Sdk_shared_runtime
 module Client_protocol = Temporal_protocol.Client_protocol
 module Workflow_protocol = Temporal_protocol.Workflow_protocol
 module Failure_diagnostic = Temporal_protocol.Failure_diagnostic

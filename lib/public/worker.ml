@@ -302,10 +302,13 @@ let resolve_options options max_cached_workflows =
       Options.make ~max_cached_workflows ()
   | None, None -> Ok Options.default
 
-let create ?identity ?options ?max_cached_workflows ?io_threads
+let create ?identity ?options ?max_cached_workflows ?io_threads ?runtime
     ~target_url
     ~namespace ~task_queue ~workflows ~activities () =
   match Backend.validate_io_threads io_threads with
+  | Error error -> Error error
+  | Ok () ->
+  match Backend.validate_runtime_source ~io_threads ~runtime with
   | Error error -> Error error
   | Ok () ->
   match resolve_options options max_cached_workflows with
@@ -397,8 +400,8 @@ let create ?identity ?options ?max_cached_workflows ?io_threads
                               shutdown_mutex = Mutex.create ();
                               shutdown_result = None;
                             })
-                          (Backend.worker_create config ~workflow_names
-                             ~activity_names)
+                          (Backend.worker_create ?runtime config
+                             ~workflow_names ~activity_names)
                       else
                         let native_workflows =
                           Name_map.bindings workflows
@@ -427,7 +430,7 @@ let create ?identity ?options ?max_cached_workflows ?io_threads
                         let native_result =
                           Native_worker.create
                             ?max_cached_workflows:effective_max_cached_workflows
-                            ?io_threads
+                            ?io_threads ?runtime
                             ~versioning:native_versioning ~target_url
                             ~namespace ~identity
                             ~task_queue ~workflows:native_workflows

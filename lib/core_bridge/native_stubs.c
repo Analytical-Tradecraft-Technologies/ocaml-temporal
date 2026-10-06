@@ -494,6 +494,194 @@ CAMLprim value ocaml_temporal_runtime_create(value worker_threads) {
   CAMLreturn(pair);
 }
 
+/* Owner of one shared Core runtime handle (#832). It has the same counted
+ * borrow protocol and the same malloc'd, non-relocatable layout as
+ * [owned_runtime], for the same reasons: attaching a graph borrows the
+ * pointer across a released-lock window, and close must not free it under
+ * that borrow. The OCaml layer already refuses to close while any graph is
+ * attached; this gate is the defensive memory-safety barrier beneath it. */
+typedef struct owned_shared_runtime {
+  _Atomic(ocaml_temporal_core_shared_runtime *) shared;
+  atomic_uint active_calls;
+  atomic_int closing;
+} owned_shared_runtime;
+
+/* Extract the stable owner pointer; see [Runtime_val]. */
+static owned_shared_runtime *Shared_runtime_val(value shared) {
+  return *(owned_shared_runtime **)Data_custom_val(shared);
+}
+
+/* Admit one borrow of the shared pointer, or report it closed; mirrors
+ * [acquire_runtime]. */
+static int acquire_shared_runtime(owned_shared_runtime *owned,
+                                  ocaml_temporal_core_shared_runtime **shared) {
+  atomic_fetch_add_explicit(&owned->active_calls, 1, memory_order_seq_cst);
+  if (atomic_load_explicit(&owned->closing, memory_order_seq_cst) != 0) {
+    atomic_fetch_sub_explicit(&owned->active_calls, 1, memory_order_seq_cst);
+    *shared = NULL;
+    return 0;
+  }
+  *shared = atomic_load_explicit(&owned->shared, memory_order_seq_cst);
+  if (*shared == NULL) {
+    atomic_fetch_sub_explicit(&owned->active_calls, 1, memory_order_seq_cst);
+    return 0;
+  }
+  return 1;
+}
+
+/* Mark the owner closed, detach its pointer, and wait (touching only C
+ * atomics) until every admitted borrow has finished. The caller then owns
+ * the returned pointer exclusively. */
+static ocaml_temporal_core_shared_runtime *
+detach_shared_runtime(owned_shared_runtime *owned) {
+  ocaml_temporal_core_shared_runtime *shared;
+  atomic_store_explicit(&owned->closing, 1, memory_order_seq_cst);
+  shared = atomic_exchange_explicit(&owned->shared, NULL, memory_order_seq_cst);
+  while (atomic_load_explicit(&owned->active_calls, memory_order_seq_cst) != 0) {
+    runtime_thread_yield();
+  }
+  return shared;
+}
+
+/* GC fallback for a shared runtime that was never explicitly shut down. Like
+ * [finalize_runtime] it calls no OCaml runtime API; the Rust dispose hands the
+ * (possibly last) Core reference to a cleanup thread without waiting. Graphs
+ * still attached keep their own Core references, so this never frees Core
+ * under them. */
+static void finalize_shared_runtime(value shared) {
+  owned_shared_runtime *owned = Shared_runtime_val(shared);
+  ocaml_temporal_core_shared_runtime *native_shared;
+
+  if (owned == NULL) {
+    return;
+  }
+  native_shared = detach_shared_runtime(owned);
+  if (native_shared != NULL) {
+    (void)ocaml_temporal_core_v3_shared_runtime_dispose(&native_shared);
+  }
+  free(owned);
+}
+
+/* Shared runtimes are identity resources, like [runtime_operations]. */
+static struct custom_operations shared_runtime_operations = {
+    .identifier = "org.ocaml-temporal.native-shared-runtime.v1",
+    .finalize = finalize_shared_runtime,
+    .compare = custom_compare_default,
+    .hash = custom_hash_default,
+    .serialize = custom_serialize_default,
+    .deserialize = custom_deserialize_default,
+    .compare_ext = custom_compare_ext_default,
+    .fixed_length = NULL,
+};
+
+/* Allocate a null-initialized shared owner before entering native code; see
+ * [alloc_runtime] for the NULL-inner-pointer finalizer contract. */
+static value alloc_shared_runtime(void) {
+  CAMLparam0();
+  CAMLlocal1(shared);
+  owned_shared_runtime *owned;
+
+  shared = caml_alloc_custom(&shared_runtime_operations,
+                             sizeof(owned_shared_runtime *),
+                             sizeof(owned_shared_runtime), 1);
+  *(owned_shared_runtime **)Data_custom_val(shared) = NULL;
+
+  owned = malloc(sizeof(owned_shared_runtime));
+  if (owned == NULL) {
+    caml_raise_out_of_memory();
+  }
+  atomic_init(&owned->shared, NULL);
+  atomic_init(&owned->active_calls, 0);
+  atomic_init(&owned->closing, 0);
+  *(owned_shared_runtime **)Data_custom_val(shared) = owned;
+
+  CAMLreturn(shared);
+}
+
+/* Create a shared Core runtime with the OCaml runtime lock released. The
+ * thread-count mapping is identical to [ocaml_temporal_runtime_create]. */
+CAMLprim value ocaml_temporal_shared_runtime_create(value worker_threads) {
+  CAMLparam1(worker_threads);
+  CAMLlocal3(shared, response, pair);
+  ocaml_temporal_core_shared_runtime *native_shared = NULL;
+  ocaml_temporal_core_result native_result = {0};
+  intnat requested = Long_val(worker_threads);
+  uint32_t bounded_request =
+      requested < 0 || (uintnat)requested > UINT32_MAX ? UINT32_MAX
+                                                       : (uint32_t)requested;
+
+  shared = alloc_shared_runtime();
+  response = alloc_response();
+
+  caml_enter_blocking_section();
+  (void)ocaml_temporal_core_v3_shared_runtime_new(bounded_request,
+                                                  &native_shared,
+                                                  &native_result);
+  caml_leave_blocking_section();
+
+  atomic_store_explicit(&Shared_runtime_val(shared)->shared, native_shared,
+                        memory_order_release);
+  Response_val(response)->result = native_result;
+
+  pair = caml_alloc_tuple(2);
+  Store_field(pair, 0, shared);
+  Store_field(pair, 1, response);
+  CAMLreturn(pair);
+}
+
+/* Create one runtime graph attached to a shared Core runtime. The shared
+ * pointer is borrowed through its gate for the whole native call, so a
+ * concurrent close waits rather than freeing it; a closed owner passes NULL
+ * and Rust returns its typed invalid-argument status. The new graph is an
+ * ordinary [owned_runtime] with the usual finalizer and close path. */
+CAMLprim value ocaml_temporal_runtime_attach(value shared) {
+  CAMLparam1(shared);
+  CAMLlocal3(runtime, response, pair);
+  owned_shared_runtime *shared_owner = Shared_runtime_val(shared);
+  ocaml_temporal_core_shared_runtime *native_shared = NULL;
+  ocaml_temporal_core_runtime *native_runtime = NULL;
+  ocaml_temporal_core_result native_result = {0};
+  int admitted;
+
+  runtime = alloc_runtime();
+  response = alloc_response();
+
+  admitted = acquire_shared_runtime(shared_owner, &native_shared);
+  caml_enter_blocking_section();
+  (void)ocaml_temporal_core_v3_runtime_new_attached(
+      native_shared, &native_runtime, &native_result);
+  if (admitted) {
+    atomic_fetch_sub_explicit(&shared_owner->active_calls, 1,
+                              memory_order_seq_cst);
+  }
+  caml_leave_blocking_section();
+
+  atomic_store_explicit(&Runtime_val(runtime)->runtime, native_runtime,
+                        memory_order_release);
+  Response_val(response)->result = native_result;
+
+  pair = caml_alloc_tuple(2);
+  Store_field(pair, 0, runtime);
+  Store_field(pair, 1, response);
+  CAMLreturn(pair);
+}
+
+/* Release the shared handle: reject new borrows, detach, wait for admitted
+ * attaches, then let Rust drop the handle's Core reference, all outside the
+ * OCaml runtime lock. A second close observes NULL and is a no-op. */
+CAMLprim value ocaml_temporal_shared_runtime_close(value shared) {
+  CAMLparam1(shared);
+  owned_shared_runtime *owned = Shared_runtime_val(shared);
+  ocaml_temporal_core_shared_runtime *native_shared;
+  ocaml_temporal_core_status status;
+
+  caml_enter_blocking_section();
+  native_shared = detach_shared_runtime(owned);
+  status = ocaml_temporal_core_v3_shared_runtime_free(&native_shared);
+  caml_leave_blocking_section();
+  CAMLreturn(Val_int(status));
+}
+
 /* Connect the official client using a strict JSON configuration while the
  * OCaml runtime lock is available to other Domains. */
 CAMLprim value ocaml_temporal_client_connect(value runtime, value input) {

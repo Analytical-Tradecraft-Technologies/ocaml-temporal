@@ -17,6 +17,7 @@ module Interaction = Interaction
 module Payload = Payload
 module Query = Query
 module Result_syntax = Result_syntax
+module Runtime = Runtime
 module Runtime_info = Runtime_info
 module Scope = Scope
 module Time = Time
