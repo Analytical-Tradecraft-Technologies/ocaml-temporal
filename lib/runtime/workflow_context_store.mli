@@ -40,9 +40,13 @@ type 'a local
 
 (** Creates an empty context whose futures use [scheduler]. [task_queue] is the
     deterministic default used by activities that do not override their queue;
-    a worker supplies its own queue when it creates an execution. *)
+    a worker supplies its own queue when it creates an execution. [namespace]
+    is the worker's Temporal namespace, reported by [Temporal.Workflow.info];
+    both default to ["default"] and are checked by {!validate_task_queue} and
+    {!validate_namespace}, raising [Invalid_argument] on a defect. *)
 val create :
   ?task_queue:string ->
+  ?namespace:string ->
   ?randomness_seed:string ->
   Scheduler.t ->
   t
@@ -53,6 +57,10 @@ val create :
     result to reject invalid configuration before accepting a worker; direct
     [create] callers still receive [Invalid_argument] for the same defect. *)
 val validate_task_queue : string -> (unit, string) result
+
+(** Checks a worker namespace with the same rules as {!validate_task_queue},
+    so the worker adapter can reject it as typed configuration. *)
+val validate_namespace : string -> (unit, string) result
 
 (** Returns the context installed on the current OCaml Domain, if any. *)
 val current : unit -> t option
@@ -130,6 +138,11 @@ val run_info : t -> run_info option
 
 (** Returns the validated worker task queue that owns this execution. *)
 val task_queue : t -> string
+
+(** Returns the validated namespace of the worker that owns this execution.
+    Core activations do not carry the namespace, so it is worker
+    configuration fixed for the execution's lifetime. *)
+val namespace : t -> string
 
 (** Records authoritative history evidence that [patch_id] is present for this
     execution. The evidence seeds only an ID that workflow code has not yet

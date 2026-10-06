@@ -16,8 +16,11 @@ type t = {
   mutable state : state;
   (* Hooks are kept by the owning scheduler and invoked in registration order
      when this scope is cancelled.  They are the bridge from cooperative OCaml
-     observation to real Temporal cancellation commands. *)
-  mutable cancel_hooks : (unit -> (unit, Error.t) result) option ref list;
+     observation to real Temporal cancellation commands.  The ordered
+     registry lets a completed operation unlink its hook in O(1), so a wide
+     fan-out of scoped operations does not settle in quadratic time. *)
+  cancel_hooks :
+    (unit -> (unit, Error.t) result) option ref Temporal_base.Ordered_registry.t;
 }
 
 (** Constructs the stable public error returned when a scope has been
@@ -59,7 +62,7 @@ let create () =
             (fun () ->
               Temporal_sdk_kernel.Future_store.callbacks_live cancellation_base);
           state = Active;
-          cancel_hooks = [];
+          cancel_hooks = Temporal_base.Ordered_registry.create ();
         }
 
 (** Checks whether the current scheduler is the one that owns [scope] and is
@@ -88,8 +91,7 @@ let cancel scope =
         (* Seal the hook list before invoking user-owned closures.  If a hook
            re-enters [cancel], it therefore observes the already-cancelled
            state and cannot run this list twice. *)
-        let hooks = List.rev scope.cancel_hooks in
-        scope.cancel_hooks <- [];
+        let hooks = Temporal_base.Ordered_registry.take_all scope.cancel_hooks in
         let first_error =
           List.fold_left
             (fun first_error hook ->
@@ -145,16 +147,20 @@ let on_cancel ?until scope hook =
     | Active ->
         let token = ref None in
         let subscription = ref None in
+        (* Link the (still empty) token now so [detach] can unlink it in O(1);
+           cancellation cannot run between these lines because both happen in
+           one owner-scheduler turn. *)
+        let registration =
+          Temporal_base.Ordered_registry.add scope.cancel_hooks token
+        in
         (* Either completion or cancellation releases both registration sides. *)
         let detach () =
           token := None;
-          scope.cancel_hooks <-
-            List.filter (fun current -> current != token) scope.cancel_hooks;
+          Temporal_base.Ordered_registry.remove registration;
           Option.iter (fun remove -> remove ()) !subscription;
           subscription := None
         in
         token := Some (fun () -> detach (); invoke ());
-        scope.cancel_hooks <- token :: scope.cancel_hooks;
         Option.iter
           (fun future ->
             let remove = Temporal_sdk_kernel.Future.subscribe future (fun _ -> detach ()) in

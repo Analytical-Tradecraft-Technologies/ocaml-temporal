@@ -14,6 +14,9 @@ type info = {
   scheduled_time : timestamp option;
   current_attempt_scheduled_time : timestamp option;
   started_time : timestamp option;
+  schedule_to_close_timeout : Duration.t option;
+  start_to_close_timeout : Duration.t option;
+  task_heartbeat_timeout : Duration.t option;
 }
 
 (** Lifetime-checked state shared by one activity implementation and its
