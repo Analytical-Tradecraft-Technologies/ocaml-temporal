@@ -122,6 +122,29 @@ async fn force_fail_undeliverable_workflow(worker: &Worker, run_id: &str, reason
     let _ = worker.complete_workflow_activation(completion).await;
 }
 
+/// Completes one workflow activation that runtime disposal retires on OCaml's
+/// behalf.
+///
+/// A pure cache eviction owns no workflow task, so Core accepts only an empty
+/// acknowledgement for it; failing it would leave the eviction outstanding and
+/// keep the workflow poll from ever reporting `ShutDown` (issue #775). Every
+/// other activation is failed, exactly as an undeliverable admission is. Core
+/// errors are ignored because disposal cannot retry them.
+async fn complete_workflow_for_dispose(
+    worker: &Worker,
+    run_id: &str,
+    eviction_only: bool,
+    reason: &'static str,
+) {
+    if eviction_only {
+        let _ = worker
+            .complete_workflow_activation(WorkflowActivationCompletion::empty(run_id))
+            .await;
+    } else {
+        force_fail_undeliverable_workflow(worker, run_id, reason).await;
+    }
+}
+
 /// Fails one Core activity task that the bridge will never hand to OCaml.
 ///
 /// Used only for undeliverable *start* (or malformed) tasks that would
@@ -1551,25 +1574,38 @@ impl PollLanes {
     /// Best-effort Core completion for every task still owned by this worker.
     ///
     /// Used by runtime dispose/free when OCaml cannot finish leased work. The
-    /// method drains ready queues, force-fails each undelivered task, then
-    /// force-fails every remaining ledger entry so [`Self::finalize`] is not
-    /// blocked by outstanding completion debt. Dispose calls it once before
-    /// joining the poll lanes and once after both joins, because a poll already
-    /// in flight can publish a task between those two points. Errors from Core
-    /// are ignored: dispose must still release the process graph.
+    /// method completes every ledger entry and every queued handoff exactly
+    /// once so [`Self::finalize`] is not blocked by outstanding completion
+    /// debt. Dispose calls it once before joining the poll lanes and once
+    /// after both joins, because a poll already in flight can publish a task
+    /// between those two points. Errors from Core are ignored: dispose must
+    /// still release the process graph.
+    ///
+    /// A pure cache eviction is acknowledged with an empty completion and
+    /// every other activation is failed (see
+    /// [`complete_workflow_for_dispose`]). For a ledger entry the eviction
+    /// bit comes from the ledger itself, which records it in the same
+    /// critical section that admits the run (see
+    /// [`TaskLedger::admit_polled_workflow_activation`]). The snapshot is
+    /// therefore correct even for an entry the workflow lane admitted but has
+    /// not yet enqueued, whose message a queue drain could not observe and
+    /// whose later queue entry is skipped as already completed (issue #775).
+    /// A queued activation admitted after the snapshot carries its own bit.
     pub async fn force_complete_outstanding_for_dispose(&mut self) {
         // Complete ledger debt first so Core can finish poll loops that are
         // blocked waiting for outstanding-task permits during shutdown.
-        let (workflow_ids, activity_tokens) = self
+        let (workflows, activity_tokens) = self
             .ledger
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .take_all_outstanding();
-        let mut completed_workflow_ids: HashSet<String> = workflow_ids.iter().cloned().collect();
-        for run_id in &workflow_ids {
-            force_fail_undeliverable_workflow(
+        let mut completed_workflow_ids: HashSet<String> =
+            workflows.iter().map(|(run_id, _)| run_id.clone()).collect();
+        for (run_id, eviction_only) in &workflows {
+            complete_workflow_for_dispose(
                 self.worker.as_ref(),
                 run_id,
+                *eviction_only,
                 "runtime dispose retired outstanding workflow lease",
             )
             .await;
@@ -1585,25 +1621,33 @@ impl PollLanes {
             .await;
         }
 
+        // Drain the ready queue, including activations a poll lane published
+        // while the ledger debt above was being completed.
+        let mut queued_workflows: Vec<(String, bool)> = Vec::new();
         while let Some(ready) = self.workflow_signal.take(&mut self.workflow_ready) {
             if let Ok(activation) = ready {
-                // Already force-failed above if the run was still in the
-                // ledger; a second completion for the same run_id is unsafe.
-                // Retire before awaiting Core so a same-identity poll that
-                // races this queue drain is rejected rather than admitted as
-                // a new obligation for the post-join pass.
-                if Self::claim_dispose_workflow_identity(
-                    &self.ledger,
-                    &mut completed_workflow_ids,
-                    &activation.run_id,
-                ) {
-                    force_fail_undeliverable_workflow(
-                        self.worker.as_ref(),
-                        &activation.run_id,
-                        "runtime dispose drained undelivered workflow activation",
-                    )
-                    .await;
-                }
+                let eviction_only = activation.is_only_eviction();
+                queued_workflows.push((activation.run_id, eviction_only));
+            }
+        }
+        for (run_id, eviction_only) in queued_workflows {
+            // Already completed above if the run was still in the ledger; a
+            // second completion for the same run_id is unsafe. Retire before
+            // awaiting Core so a same-identity poll that races this queue
+            // drain is rejected rather than admitted as a new obligation for
+            // the post-join pass.
+            if Self::claim_dispose_workflow_identity(
+                &self.ledger,
+                &mut completed_workflow_ids,
+                &run_id,
+            ) {
+                complete_workflow_for_dispose(
+                    self.worker.as_ref(),
+                    &run_id,
+                    eviction_only,
+                    "runtime dispose drained undelivered workflow activation",
+                )
+                .await;
             }
         }
         while let Some(ready) = self.activity_signal.take(&mut self.activity_ready) {
@@ -2097,7 +2141,7 @@ async fn run_workflow_lane(
         let admission = ledger
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .admit_polled_workflow(&activation.run_id);
+            .admit_polled_workflow_activation(&activation.run_id, activation.is_only_eviction());
         match admission {
             Ok(Admission::New) => {
                 let run_id = activation.run_id.clone();
@@ -2133,10 +2177,26 @@ async fn run_workflow_lane(
                     return;
                 }
             }
+            Err(AdmitError::Retired) if activation.is_only_eviction() => {
+                // Disposal already completed this run's previous activation,
+                // and Core answers a failed workflow task with a cache
+                // eviction for the same run. That eviction is a fresh Core
+                // debt, not a duplicate of the retired one: Core keeps at
+                // most one activation outstanding per run, so it cannot
+                // publish it until the disposal completion was accepted.
+                // Dropping it would keep the workflow poll from ever
+                // reporting `ShutDown` and wedge the dispose lane join
+                // (issue #775). Acknowledge it with the only completion Core
+                // accepts for an eviction; it never enters the ledger, so no
+                // later pass can complete it again.
+                let completion = WorkflowActivationCompletion::empty(activation.run_id);
+                let _ = worker.complete_workflow_activation(completion).await;
+            }
             Err(error @ AdmitError::Retired) => {
-                // Disposal already force-failed this identity. A second poll
-                // with the same run ID is therefore diagnostic only: dropping
-                // it is safer than sending a duplicate Core completion.
+                // Disposal already force-failed this identity, and this is not
+                // Core's follow-up eviction. A second poll with the same run
+                // ID is therefore diagnostic only: dropping it is safer than
+                // sending a duplicate Core completion.
                 ledger
                     .lock()
                     .unwrap_or_else(|error| error.into_inner())
@@ -2421,13 +2481,18 @@ pub struct TaskLedger {
     /// tombstones, these are bounded by the identities seen in one disposal
     /// window and are cleared after all producers stop.
     retired_activities: HashSet<Vec<u8>>,
-    /// Leased workflow identities whose activation contained only a cache
-    /// eviction. Shutdown must acknowledge an abandoned eviction with an empty
-    /// completion: Core has no workflow task to fail for it, and a failure
-    /// completion would leave the eviction outstanding. Membership is written
-    /// at every lease and removed whenever the workflow entry leaves the
-    /// ledger, so it never outgrows the outstanding workflow map.
-    eviction_leases: HashSet<String>,
+    /// Outstanding workflow identities whose activation contained only a cache
+    /// eviction, whether still queued or already leased to OCaml. Shutdown
+    /// must acknowledge an abandoned eviction with an empty completion: Core
+    /// has no workflow task to fail for it, and a failure completion would
+    /// leave the eviction outstanding. The bit is written in the same critical
+    /// section that admits the workflow entry (see
+    /// [`Self::admit_polled_workflow_activation`]), so a disposal snapshot
+    /// taken after admission but before the poll lane enqueues the message
+    /// still classifies the entry correctly. Membership is removed whenever
+    /// the workflow entry leaves the ledger, so it never outgrows the
+    /// outstanding workflow map.
+    eviction_activations: HashSet<String>,
     /// Test-only trace of whether each rejected run was still recorded in the
     /// ledger at the instant its rejection failure was handed to Core. The
     /// reject path must retire the lease *before* that completion, because the
@@ -2463,7 +2528,7 @@ impl TaskLedger {
             lost_poll_lease: false,
             retired_workflows: HashSet::new(),
             retired_activities: HashSet::new(),
-            eviction_leases: HashSet::new(),
+            eviction_activations: HashSet::new(),
             #[cfg(test)]
             reject_completion_probes: Vec::new(),
             #[cfg(test)]
@@ -2505,7 +2570,7 @@ impl TaskLedger {
     /// Records one workflow activation before its delivery to OCaml.
     pub fn admit_workflow(&mut self, run_id: &str) -> Result<Admission, AdmitError> {
         self.ensure_open()?;
-        self.record_workflow(run_id)
+        self.record_workflow(run_id, false)
     }
 
     /// Records a task returned by a Core poll already in flight at shutdown.
@@ -2516,11 +2581,37 @@ impl TaskLedger {
     /// be able to harvest that late identity.
     #[doc(hidden)]
     pub fn admit_polled_workflow(&mut self, run_id: &str) -> Result<Admission, AdmitError> {
-        self.record_workflow(run_id)
+        self.record_workflow(run_id, false)
+    }
+
+    /// Records a polled workflow activation together with whether it is a pure
+    /// cache eviction.
+    ///
+    /// This is the workflow poll lane's admission. The eviction bit is stored
+    /// atomically with the new ledger entry, before the lane enqueues the
+    /// activation for OCaml, so [`Self::take_all_outstanding`] reports the
+    /// correct completion shape even for an admission whose message is not
+    /// yet visible in the ready queue. Like [`Self::admit_polled_workflow`],
+    /// it bypasses the open-phase check.
+    #[doc(hidden)]
+    pub fn admit_polled_workflow_activation(
+        &mut self,
+        run_id: &str,
+        eviction_only: bool,
+    ) -> Result<Admission, AdmitError> {
+        self.record_workflow(run_id, eviction_only)
     }
 
     /// Applies workflow identity rules after admission-phase handling.
-    fn record_workflow(&mut self, run_id: &str) -> Result<Admission, AdmitError> {
+    ///
+    /// The eviction bit is recorded only for a new entry; a duplicate must not
+    /// overwrite the classification of the activation that already owns the
+    /// identity.
+    fn record_workflow(
+        &mut self,
+        run_id: &str,
+        eviction_only: bool,
+    ) -> Result<Admission, AdmitError> {
         if run_id.is_empty() || run_id.len() > MAX_RUN_ID_BYTES {
             return Err(AdmitError::InvalidIdentity);
         }
@@ -2530,6 +2621,11 @@ impl TaskLedger {
         match self.workflows.entry(run_id.to_owned()) {
             Entry::Vacant(entry) => {
                 entry.insert(false);
+                if eviction_only {
+                    self.eviction_activations.insert(run_id.to_owned());
+                } else {
+                    self.eviction_activations.remove(run_id);
+                }
                 Ok(Admission::New)
             }
             Entry::Occupied(_) => Ok(Admission::Duplicate),
@@ -2615,6 +2711,10 @@ impl TaskLedger {
     /// This is the supervisor handoff used by [`PollLanes::try_take_workflow`].
     /// The eviction bit lets worker shutdown choose the only completion Core
     /// accepts for an abandoned lease (see [`Self::take_leased_for_shutdown`]).
+    /// The poll lane already recorded the same bit at admission (see
+    /// [`Self::admit_polled_workflow_activation`]); restating it from the
+    /// dequeued activation keeps the lease authoritative for callers that
+    /// admitted without one.
     pub fn lease_workflow_activation(
         &mut self,
         run_id: &str,
@@ -2622,17 +2722,17 @@ impl TaskLedger {
     ) -> Result<(), CompleteError> {
         self.lease_workflow(run_id)?;
         if eviction_only {
-            self.eviction_leases.insert(run_id.to_owned());
+            self.eviction_activations.insert(run_id.to_owned());
         } else {
-            self.eviction_leases.remove(run_id);
+            self.eviction_activations.remove(run_id);
         }
         Ok(())
     }
 
-    /// Reports whether the leased workflow `run_id` was handed to OCaml as a
-    /// pure cache eviction.
+    /// Reports whether the outstanding workflow `run_id` (queued or leased to
+    /// OCaml) is a pure cache eviction.
     pub fn is_eviction_lease(&self, run_id: &str) -> bool {
-        self.eviction_leases.contains(run_id)
+        self.eviction_activations.contains(run_id)
     }
 
     /// Removes a workflow admission that will never be leased to OCaml.
@@ -2644,6 +2744,7 @@ impl TaskLedger {
         // Only unleased admissions may be dropped; a true lease must survive.
         if let Some(false) = self.workflows.get(run_id) {
             self.workflows.remove(run_id);
+            self.eviction_activations.remove(run_id);
         }
     }
 
@@ -2711,7 +2812,7 @@ impl TaskLedger {
         match self.workflows.get(run_id) {
             Some(true) => {
                 self.workflows.remove(run_id);
-                self.eviction_leases.remove(run_id);
+                self.eviction_activations.remove(run_id);
                 Ok(())
             }
             Some(false) => Err(CompleteError::NotLeased),
@@ -2753,7 +2854,7 @@ impl TaskLedger {
     /// Restores the eviction bit of a lease that
     /// [`Self::restore_rejected_workflow_completion`] just restored.
     pub fn restore_eviction_lease(&mut self, run_id: &str) {
-        self.eviction_leases.insert(run_id.to_owned());
+        self.eviction_activations.insert(run_id.to_owned());
     }
 
     /// Verifies that a workflow completion is authorized without mutating it.
@@ -2840,7 +2941,7 @@ impl TaskLedger {
     /// Unconditionally removes one workflow identity during dispose cleanup.
     pub fn force_remove_workflow(&mut self, run_id: &str) {
         self.workflows.remove(run_id);
-        self.eviction_leases.remove(run_id);
+        self.eviction_activations.remove(run_id);
     }
 
     /// Unconditionally removes one activity token during dispose cleanup.
@@ -2854,7 +2955,7 @@ impl TaskLedger {
     /// late-poll admission window without holding a lock across I/O.
     pub fn retire_workflow_for_dispose(&mut self, run_id: &str) {
         self.workflows.remove(run_id);
-        self.eviction_leases.remove(run_id);
+        self.eviction_activations.remove(run_id);
         self.retired_workflows.insert(run_id.to_owned());
     }
 
@@ -2875,11 +2976,28 @@ impl TaskLedger {
         self.retired_activities.clear();
     }
 
-    /// Takes every outstanding identity so dispose can force-fail each once.
-    pub fn take_all_outstanding(&mut self) -> (Vec<String>, Vec<Vec<u8>>) {
-        let workflows: Vec<String> = self.workflows.drain().map(|(run_id, _)| run_id).collect();
-        self.eviction_leases.clear();
-        self.retired_workflows.extend(workflows.iter().cloned());
+    /// Takes every outstanding identity so dispose can complete each once.
+    ///
+    /// Each workflow is returned with its eviction bit. The bit is recorded at
+    /// admission (see [`Self::admit_polled_workflow_activation`]), so it is
+    /// correct for leased entries, for queued entries, and for entries the
+    /// poll lane has admitted but not yet enqueued; the caller never has to
+    /// reconcile it against the ready queue. Every returned identity is
+    /// tombstoned so a concurrent poll of the same
+    /// identity cannot be admitted as a second debt while disposal completes
+    /// it.
+    pub fn take_all_outstanding(&mut self) -> (Vec<(String, bool)>, Vec<Vec<u8>>) {
+        let workflows: Vec<(String, bool)> = self
+            .workflows
+            .drain()
+            .map(|(run_id, _)| {
+                let eviction_only = self.eviction_activations.contains(&run_id);
+                (run_id, eviction_only)
+            })
+            .collect();
+        self.eviction_activations.clear();
+        self.retired_workflows
+            .extend(workflows.iter().map(|(run_id, _)| run_id.clone()));
         let activities: Vec<Vec<u8>> = self
             .activities
             .drain()
@@ -2897,7 +3015,7 @@ impl TaskLedger {
     /// any identity published after this snapshot.
     pub fn take_all_outstanding_for_replay(&mut self) -> (Vec<String>, Vec<Vec<u8>>) {
         let workflows = self.workflows.drain().map(|(run_id, _)| run_id).collect();
-        self.eviction_leases.clear();
+        self.eviction_activations.clear();
         let activities = self
             .activities
             .drain()
@@ -2928,7 +3046,7 @@ impl TaskLedger {
             .into_iter()
             .map(|run_id| {
                 self.workflows.remove(&run_id);
-                let eviction_only = self.eviction_leases.remove(&run_id);
+                let eviction_only = self.eviction_activations.remove(&run_id);
                 (run_id, eviction_only)
             })
             .collect();

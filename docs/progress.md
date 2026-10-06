@@ -30,6 +30,21 @@ budget for 50,000-wide fan-outs, and `test/unit/test_ordered_registry.ml`
 covers the registry contract; focused unit and runtime suites passed locally
 on OCaml 5.4.1.
 
+## 2026-10-06: Large client signal, query, and update inputs (#771)
+
+The Rust bridge decoded signal, query, and update requests with the generic
+object parser, which applies the 65,536-byte text limit to base64 payload
+data. Any input over 49,152 raw bytes was therefore rejected before the RPC,
+and OCaml reported it as a malformed client error. These requests now use the
+same payload-aware decoder as workflow start: each payload byte field may hold
+128 MiB inside the 192 MiB document limit, while identifiers, handler names,
+and metadata keys keep the 65,536-byte text limit. Rust ABI tests submit
+payloads at and above the old ceiling, at exactly 128 MiB, and one base64
+quantum above it, plus identifiers and metadata keys at and above the text
+limit, to an unconnected runtime and check which ones reach the lifecycle
+guard. An OCaml test sends payloads from the real OCaml encoders through the
+C stubs to the same guard.
+
 ## 2026-10-06: Stopping a worker from a signal handler (#830)
 
 An OCaml signal handler may run on the thread blocked in `Worker.run`, so in a
@@ -2707,6 +2722,22 @@ the per-series replacements listed in `scripts/opam-lock-overrides.txt`
 Local validation covered the repository contract scripts and a stub-OPAM test
 of the installer; the image builds and native installs are validated by the
 hosted CI matrix.
+
+## 2026-10-06: Dispose acknowledges Core's follow-up evictions (#775)
+
+Runtime close force-fails each workflow activation OCaml still holds and
+tombstones its run ID. Core answers that failure with a same-run cache
+eviction, which the workflow poll lane used to drop as a retired duplicate, so
+the workflow poll never reported `ShutDown`: close waited out the 90 s drain
+bound and released an unfinalized worker. The lane now acknowledges a retired
+run's pure eviction with an empty completion, and dispose's own
+force-completion acknowledges leased or queued evictions empty instead of
+failing them. The ledger records each run's eviction bit when the poll lane
+admits it, so an entry admitted but not yet enqueued at the disposal snapshot
+is still acknowledged rather than failed.
+`rust/core-bridge/tests/runtime_dispose_eviction.rs` drives a
+leased activation through runtime close against a gRPC double and fails
+within 30 s without the fix.
 
 ## 2026-10-06: Workflow and activity execution info (#792)
 

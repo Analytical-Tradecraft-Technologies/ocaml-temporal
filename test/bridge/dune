@@ -56,3 +56,7 @@
 (test
  (name test_failure_diagnostic)
  (libraries temporal_protocol))
+
+(test
+ (name test_client_input_limits)
+ (libraries temporal_core_bridge temporal_protocol))
