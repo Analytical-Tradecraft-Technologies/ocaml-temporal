@@ -2797,3 +2797,22 @@ but translating them into the execution context requires the native
 activation adapter, which is being changed by concurrent work.
 `test/runtime/test_execution_info.ml`, the async adapter test, and the native
 worker adapter test cover the new values.
+
+## 2026-10-06: Thread-keyed workflow context (#765)
+
+The current workflow context, the scheduler owner id that guards
+`Future.await`, condition waits and scope operations, and the read-only query
+marker were stored in `Domain.DLS`, which every system thread of a Domain
+shares. Two workers whose `run` loops share a Domain could therefore record
+commands into each other's execution or restore a stale context. These
+bindings now use the private `Thread_binding` slot: a Domain-local atomic cell
+holding an immutable map from `Thread.id` to the bound value. Reads take no
+lock and skip the thread lookup when nothing is bound on the Domain; writes
+use a compare-and-set retry that only sibling threads of the same Domain can
+contend on. Each entry exists only inside its `with_value` extent and is
+restored on the installing thread even on an exception, so single-thread
+behavior is unchanged and no entry outlives its activation.
+`test/runtime/test_thread_context_isolation.ml` forces interleaved activations
+on two threads of one Domain, checks that helper threads do not inherit a
+context, checks exception cleanup, and stress-tests the primitive with
+yielding threads.

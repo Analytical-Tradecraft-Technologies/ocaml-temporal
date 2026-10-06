@@ -65,25 +65,28 @@ type ('left, 'right) race = Left of 'left | Right of 'right
 type _ Effect.t +=
   | Await : ('value, 'error) t -> ('value, 'error) result Effect.t
 
-(** Domain-local id of the scheduler fiber currently running on this Domain.
+(** Id of the scheduler whose drain the calling system thread is running.
     [await] requires this to match the future's owner so a fiber cannot park on
     another workflow's pending future merely because that other scheduler is
-    running somewhere else. *)
-let current_owner_id_key = Domain.DLS.new_key (fun () -> (None : int option))
+    running somewhere else. The binding is keyed per system thread, not per
+    Domain, because workers hosted on sibling threads of one Domain may
+    interleave their drains (#765). *)
+let current_owner_id = Thread_binding.create ()
 
-(** Publishes or clears the active owner id for the duration of one fiber. *)
+(** Publishes or clears the active owner id for the duration of one drain on
+    the calling thread, restoring the previous id even if [action] raises. *)
 let with_current_owner_id id action =
-  let previous = Domain.DLS.get current_owner_id_key in
-  Domain.DLS.set current_owner_id_key id;
-  Fun.protect
-    ~finally:(fun () -> Domain.DLS.set current_owner_id_key previous)
-    action
+  Thread_binding.with_value current_owner_id id action
 
-(** True when this Domain is currently running the scheduler with [id]. *)
+(** True when the calling thread is currently running the scheduler with [id]. *)
 let current_owner_matches id =
-  match Domain.DLS.get current_owner_id_key with
+  match Thread_binding.get current_owner_id with
   | Some current -> current = id
   | None -> false
+
+(** Number of threads on the calling Domain with a published owner id; used by
+    tests to prove that drains leave no binding behind. *)
+let bound_owner_count () = Thread_binding.bound_count current_owner_id
 
 (** Internal exception used only to release a paused fiber during shutdown. It
     is caught inside this module and never becomes a workflow error. *)
@@ -195,13 +198,13 @@ let enqueue promise = promise.owner.enqueue
 (** Returns a ready result, or pauses only when called from the active fiber of
     the scheduler that owns this future. [is_running] alone is insufficient:
     another Domain may be running a different scheduler whose [is_running] is
-    true while this Domain is not that owner. *)
+    true while this thread is not that owner. *)
 let await promise =
   match promise.state with
   | Ready result -> result
   | Closed -> Error (promise.outside_error ())
   | Pending _ -> (
-      match Domain.DLS.get current_owner_id_key with
+      match Thread_binding.get current_owner_id with
       | Some id
         when id = promise.owner.id && promise.owner.is_running () ->
           Effect.perform (Await promise)
