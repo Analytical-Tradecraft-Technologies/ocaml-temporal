@@ -6,6 +6,8 @@
 mod abi;
 pub mod activity_protocol;
 mod client_protocol;
+#[doc(hidden)]
+pub mod diagnostics;
 pub mod protocol;
 mod replay_bridge;
 #[doc(hidden)]

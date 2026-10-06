@@ -222,6 +222,53 @@ returns only `invalid lifecycle configuration JSON`; Serde's syntax, location,
 and unknown-field details are kept inside Rust so application-controlled input
 cannot become a diagnostic at the C/OCaml boundary.
 
+Client connection failures are the documented exception (#833). Because a
+constant message made DNS, refused, TLS, and timeout failures
+indistinguishable, `STATUS_CONNECTION` from client connect carries a closed
+cause category plus the bounded (512-byte), control-character-escaped local
+transport error chain. A failed `GetSystemInfo` contributes only its gRPC code
+name, never the server's status message. Core's own rejection of connection
+options maps to `STATUS_CONFIGURATION` with a constant message, because that
+text may echo configured headers. `rust/core-bridge/src/diagnostics.rs` owns
+this reduction; the message format is described in
+[observability](observability.md).
+
+Runtime creation configures Core telemetry with a push logger at the level
+selected by `OCAML_TEMPORAL_CORE_LOG` (default `warn`, `off` disables it).
+Core invokes the consumer synchronously on whichever thread emitted the
+record, including Tokio workers driving network progress and the supervisor
+thread inside a blocking bridge call, so the consumer performs no I/O. It
+formats one bounded line and offers it to a bounded queue
+(`CORE_LOG_QUEUE_CAPACITY`, 1,024 lines) with a non-blocking `try_send`. When
+the queue is full the line is dropped and counted, never waited for. The
+consumer holds no OCaml value, never calls back into OCaml, and contains
+formatting panics.
+
+Each runtime with logging enabled owns exactly one Core log writer thread
+(`diagnostics::CoreLogWriter`), spawned before Core and stored in the runtime
+handle. The writer drains the queue to stderr, ignores write errors, contains
+sink panics, and never calls OCaml. Before the next line, after one idle
+second, and at shutdown it writes one `N Core log records dropped` summary
+for any drops. Its single release path runs on the runtime cleanup thread
+after Core has been dropped, so Core's shutdown records are still flushed.
+That path disconnects the queue, waits up to `CORE_LOG_CLOSE_TIMEOUT`
+(500 ms) for the writer to drain and exit, and then joins it. A writer still
+blocked in a stderr write after that bound means the stderr reader has
+stalled. Waiting longer could hang runtime close indefinitely, so the thread
+is detached instead. A detached writer owns only the queue receiver, the drop
+counter, and stderr: no Core, Tokio, or OCaml state. It exits once its write
+returns, or ends with the process. A stalled stderr therefore delays runtime
+close by at most the bound. If runtime construction fails after the writer
+was spawned, dropping it runs the same bounded close.
+
+Core also installs the subscriber as the thread-local default on the thread
+that creates the runtime (the owning supervisor thread). That guard is removed
+only if the runtime is dropped on the same thread; otherwise it stays with
+that thread and keeps one reference to the consumer. Because the writer's
+close takes the queue sender explicitly, rather than waiting for Core to drop
+its consumer, records reaching such a stale subscriber are discarded without
+blocking.
+
 All client-operation identifiers are nonempty and NUL-free. The schemas state the
 65,536-character necessary bound, while the bilateral runtime validators apply
 the authoritative 65,536-byte UTF-8 limit, reject duplicate members, and

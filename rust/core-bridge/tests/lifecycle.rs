@@ -156,7 +156,12 @@ fn connection_failure_is_structured_and_rolls_back_state() {
     let config = br#"{"target_url":"http://127.0.0.1:1","identity":"worker"}"#;
     for _ in 0..2 {
         let message = consume(connect(runtime, config), STATUS_CONNECTION);
-        assert_eq!(message, "Temporal client connection failed");
+        // The closed cause and transport detail are covered in
+        // `connection_diagnostics.rs`; this test owns the rollback contract.
+        assert!(
+            message.starts_with("Temporal client connection failed (cause=refused)"),
+            "{message}"
+        );
     }
     // SAFETY: Failed constructors retained no child resource, and the runtime
     // slot is exclusively owned by this test.
