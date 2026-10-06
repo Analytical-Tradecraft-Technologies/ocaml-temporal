@@ -111,14 +111,17 @@ stages workflow-to-workflow signal, update, cancellation, child-start failure,
 termination, external cancellation, and the timeout-retry workflows for 26
 top-level starts and waits. It starts the child-start-failure parent immediately
 after the long-running cancellation workflow so the duplicate workflow ID is
-already accepted when the child command is issued. Once the heartbeat-retry
+already accepted when the child command is issued, and it waits for that
+parent's `SMOKE:CHILD:START_FAILED` result before cancelling the ID holder, so
+the cancellation cannot free the ID before the child command is processed. Once the heartbeat-retry
 workflow has completed, it starts the timeout-retry workflow, then the
 heartbeat-timeout retry workflow and waits for those separate results. The
 cancellation scenario waits for the
 `smoke.cancellation_ready` activity marker after the long-running workflow has
-issued its durable-timer and marker commands in one activation, then
-acknowledges cancellation for `two-binary-long-running-cancellation` before
-the first terminal wait. Seven must complete with exact payloads, one must
+issued its durable-timer and marker commands in one activation. The driver's
+first terminal wait is then the child-start-failure parent's result; only after
+it does the driver acknowledge cancellation for
+`two-binary-long-running-cancellation`, before any other terminal wait. Seven must complete with exact payloads, one must
 propagate a typed child failure, one must return `SMOKE:CHILD:CANCELLED` after
 child cancellation, one must return a typed non-retryable workflow failure,
 and the cancelled execution
@@ -445,8 +448,9 @@ The driver must:
    its first terminal wait. After the heartbeat-retry result is terminal, start
    `smoke.activity_timeout_retry` with its own distinct workflow ID;
 3. retain the ten public workflow handles returned by `start`;
-4. call `Temporal.Client.cancel` on the exact long-running handle and require
-   its positive acknowledgement before waiting for any terminal result;
+4. wait for the child-start-failure parent's terminal result, then call
+   `Temporal.Client.cancel` on the exact long-running handle and require its
+   positive acknowledgement before waiting for any other terminal result;
 5. wait for each handle's terminal result through the public client API; and
 6. decode and compare the seven successful results, require the child-failure
    result to be a typed non-retryable child-workflow failure, require the
