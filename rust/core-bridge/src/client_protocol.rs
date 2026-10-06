@@ -16,7 +16,9 @@ use temporalio_client::grpc::WorkflowService;
 use temporalio_client::tonic::{Code, IntoRequest, Status};
 use temporalio_common::protos::temporal::api::{
     common::v1::{Memo, Payloads, SearchAttributes, WorkflowExecution, WorkflowType},
-    enums::v1::{HistoryEventFilterType, UpdateWorkflowExecutionLifecycleStage},
+    enums::v1::{
+        HistoryEventFilterType, UpdateWorkflowExecutionLifecycleStage, WorkflowIdConflictPolicy,
+    },
     history::v1::{HistoryEvent, history_event::Attributes},
     query::v1::WorkflowQuery,
     taskqueue::v1::TaskQueue,
@@ -57,6 +59,40 @@ pub struct MetadataField {
     pub value: workflow_protocol::Payload,
 }
 
+/// What Temporal does when a start names a workflow ID whose current run is
+/// still open.
+///
+/// The variants mirror Temporal's `WorkflowIdConflictPolicy` without the
+/// `UNSPECIFIED` value: the bridge always sends an explicit policy so the
+/// behaviour cannot silently depend on a server-side default. The JSON
+/// spelling is the snake-case variant name.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdConflictPolicy {
+    /// Reject the start with `WorkflowExecutionAlreadyStarted`, which the
+    /// bridge reports as the closed `already_started` error. This is the
+    /// default when an older request document omits the field.
+    #[default]
+    Fail,
+    /// Return the running execution instead of starting another one. The
+    /// response then names the existing run with `started = false`.
+    UseExisting,
+    /// Terminate the running execution and start a new run.
+    TerminateExisting,
+}
+
+impl IdConflictPolicy {
+    /// Converts the closed bridge value into the protobuf enum number.
+    fn to_core(self) -> i32 {
+        let policy = match self {
+            Self::Fail => WorkflowIdConflictPolicy::Fail,
+            Self::UseExisting => WorkflowIdConflictPolicy::UseExisting,
+            Self::TerminateExisting => WorkflowIdConflictPolicy::TerminateExisting,
+        };
+        i32::from(policy)
+    }
+}
+
 /// Request to start one workflow execution with raw Temporal payloads.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -85,14 +121,25 @@ pub struct StartWorkflowRequest {
     /// Optional indexed search attributes copied to Temporal's start request.
     #[serde(default)]
     pub search_attributes: Vec<MetadataField>,
+    /// Behaviour when the workflow ID already has an open run. The OCaml
+    /// encoder always sends it; an omitted field means [`IdConflictPolicy::Fail`].
+    /// It participates in request equality, so retrying a pending request ID
+    /// with a different policy is rejected rather than aliased.
+    #[serde(default)]
+    pub id_conflict_policy: IdConflictPolicy,
 }
 
 /// Successful result returned by the start operation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StartWorkflowResponse {
-    /// Execution allocated by Temporal Server.
+    /// Execution allocated by Temporal Server, or the existing open execution
+    /// returned under [`IdConflictPolicy::UseExisting`].
     pub execution: ExecutionRef,
+    /// Temporal's `StartWorkflowExecutionResponse.started`: `true` when this
+    /// request created the run (including a deduplicated retry of the same
+    /// request ID), `false` when `UseExisting` returned another start's run.
+    pub started: bool,
 }
 
 /// Opaque ticket returned while an asynchronous start is still in flight.
@@ -501,10 +548,12 @@ pub(crate) enum ClientErrorDocument {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum StartWorkflowOutcomeDocument {
-    /// The server allocated a concrete run.
+    /// The server allocated a concrete run or returned an existing one.
     Accepted {
         /// Exact execution returned by Temporal.
         execution: ExecutionRef,
+        /// Whether this request created the run; see [`StartWorkflowResponse`].
+        started: bool,
     },
     /// The start was rejected with a structured, privacy-safe error body.
     Rejected {
@@ -550,7 +599,7 @@ fn validate_start_outcome_document(
     document: &StartWorkflowOutcomeDocument,
 ) -> Result<(), protocol::ProtocolError> {
     match document {
-        StartWorkflowOutcomeDocument::Accepted { execution } => {
+        StartWorkflowOutcomeDocument::Accepted { execution, .. } => {
             validate_execution(execution, "$.execution")?
         }
         StartWorkflowOutcomeDocument::Rejected { error } => match error {
@@ -1446,6 +1495,7 @@ pub(crate) fn encode_start_outcome(
     let document = match outcome {
         StartWorkflowOutcome::Accepted(response) => StartWorkflowOutcomeDocument::Accepted {
             execution: response.execution.clone(),
+            started: response.started,
         },
         StartWorkflowOutcome::Rejected(error) => StartWorkflowOutcomeDocument::Rejected {
             error: error_document(error),
@@ -1512,8 +1562,10 @@ pub async fn start_workflow(
                 search_attributes,
                 identity: connection.identity().to_owned(),
                 request_id: request.request_id,
-                // All other start policies intentionally use server defaults;
-                // metadata is the only optional field in this protocol slice.
+                // Always explicit: an UNSPECIFIED policy would defer to the
+                // server default, which the public API documents as `Fail`.
+                workflow_id_conflict_policy: request.id_conflict_policy.to_core(),
+                // All other start policies intentionally use server defaults.
                 ..Default::default()
             }
             .into_request(),
@@ -1530,6 +1582,11 @@ pub async fn start_workflow(
     }
     .into_inner();
 
+    // Only USE_EXISTING can succeed without creating a run. Servers that
+    // predate `started` leave it false, so the other policies (whose success
+    // proves this logical request created the run, possibly as a request-ID
+    // deduplicated retry) report a new run regardless of the field.
+    let started = response.started || request.id_conflict_policy != IdConflictPolicy::UseExisting;
     let run_id = response.run_id;
     if run_id.is_empty() {
         return Err(ClientOperationError::Core(workflow_protocol::invalid_core(
@@ -1546,7 +1603,7 @@ pub async fn start_workflow(
             "Temporal start response had invalid execution identity",
         ))
     })?;
-    Ok(StartWorkflowResponse { execution })
+    Ok(StartWorkflowResponse { execution, started })
 }
 
 /// Waits for the exact run named by `request`, never following successors.
@@ -2366,6 +2423,55 @@ mod tests {
         changed.task_queue = original.task_queue.clone();
         changed.input[0].data.push(0);
         assert!(!same_start_request(&original, &changed));
+
+        let mut changed_policy = original.clone();
+        changed_policy.id_conflict_policy = IdConflictPolicy::UseExisting;
+        assert!(!same_start_request(&original, &changed_policy));
+    }
+
+    #[test]
+    /// The conflict policy uses closed snake-case names, defaults to `Fail`
+    /// when omitted, and maps to Temporal's non-`UNSPECIFIED` enum numbers.
+    fn start_request_id_conflict_policy_is_closed_and_explicit() {
+        let omitted = decode_start_request(&start_json()).expect("start request decodes");
+        assert_eq!(omitted.id_conflict_policy, IdConflictPolicy::Fail);
+
+        for (name, policy, core) in [
+            (
+                "fail",
+                IdConflictPolicy::Fail,
+                WorkflowIdConflictPolicy::Fail,
+            ),
+            (
+                "use_existing",
+                IdConflictPolicy::UseExisting,
+                WorkflowIdConflictPolicy::UseExisting,
+            ),
+            (
+                "terminate_existing",
+                IdConflictPolicy::TerminateExisting,
+                WorkflowIdConflictPolicy::TerminateExisting,
+            ),
+        ] {
+            let mut json: serde_json::Value =
+                serde_json::from_str(&start_json()).expect("fixture is JSON");
+            json["id_conflict_policy"] = serde_json::json!(name);
+            let request = decode_start_request(&json.to_string()).expect("policy decodes");
+            assert_eq!(request.id_conflict_policy, policy);
+            assert_eq!(policy.to_core(), i32::from(core));
+        }
+
+        for invalid in [
+            serde_json::json!("unspecified"),
+            serde_json::json!("FAIL"),
+            serde_json::json!(1),
+            serde_json::Value::Null,
+        ] {
+            let mut json: serde_json::Value =
+                serde_json::from_str(&start_json()).expect("fixture is JSON");
+            json["id_conflict_policy"] = invalid;
+            assert!(decode_start_request(&json.to_string()).is_err());
+        }
     }
 
     #[test]
@@ -2389,10 +2495,11 @@ mod tests {
                 workflow_id: "workflow-1".to_owned(),
                 run_id: "run-1".to_owned(),
             },
+            started: true,
         });
         assert_eq!(
             encode_start_outcome(&accepted).expect("accepted outcome encodes"),
-            r#"{"kind":"accepted","execution":{"namespace":"default","workflow_id":"workflow-1","run_id":"run-1"}}"#
+            r#"{"kind":"accepted","execution":{"namespace":"default","workflow_id":"workflow-1","run_id":"run-1"},"started":true}"#
         );
 
         let rejected = ClientOperationError::Rpc {

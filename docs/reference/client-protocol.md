@@ -55,7 +55,8 @@ The OCaml side sends one closed object:
         "data": "eyJ0ZXh0IjoiSGkifQ=="
       }
     }
-  ]
+  ],
+  "id_conflict_policy": "fail"
 }
 ```
 
@@ -77,9 +78,18 @@ continue-as-new, and external signals.
 
 Rust validates every identifier, rejects NUL bytes, rejects duplicate or
 unknown members, validates payloads, and then calls Core's raw
-`WorkflowService::start_workflow_execution`. The first slice deliberately
-uses Temporal Server's documented defaults for optional start policies; it does
-not invent OCaml-side defaults. The public `Temporal.Client.start` function
+`WorkflowService::start_workflow_execution`. Optional start policies use
+Temporal Server's documented defaults, with one exception:
+`id_conflict_policy` (`fail`, `use_existing`, or `terminate_existing`) is
+always sent as an explicit `WorkflowIdConflictPolicy` value, never
+`UNSPECIFIED`. The OCaml encoder always emits it from
+`Client.start ?id_conflict_policy` (default `` `Fail ``); Rust treats an
+omitted member as `fail`. It is part of the pending-request equality check, so
+retrying a pending `request_id` with a different policy is rejected. Temporal's
+request-ID deduplication runs before the conflict policy, so a retry of the
+start that created the open run returns that run under every policy. The
+workflow ID reuse policy for closed runs is not exposed and keeps the server
+default. The public `Temporal.Client.start` function
 accepts an optional `request_id`. When it is supplied, that caller-owned value
 is sent unchanged to Temporal; callers should reuse it when retrying a start
 whose outcome is uncertain. When it is omitted, the adapter allocates one fresh
@@ -96,8 +106,12 @@ reused for unrelated workflow starts.
 The deterministic `mock://` backend retains successful explicit start IDs
 with their request fields and original run identity. An identical retry
 returns that run before workflow-ID conflict checks; changed request data
-under the same ID is rejected. For a new request ID, the mock rejects a start
-while that workflow ID has a running execution and accepts a new run after the
+under the same ID (including a different conflict policy) is rejected. For a
+new request ID facing a running execution, the mock follows the conflict
+policy: `` `Fail `` returns the same typed already-started error as the native
+client, `` `Use_existing `` returns the running execution with
+`started = false`, and `` `Terminate_existing `` marks the running execution
+terminated before starting a new run. A new run is always accepted after the
 current execution closes. Old exact-run handles remain addressable through
 the mock's retained run history.
 
@@ -115,10 +129,18 @@ On success Rust returns:
     "namespace": "default",
     "workflow_id": "summarize-1",
     "run_id": "server-assigned-run-id"
-  }
+  },
+  "started": true
 }
 ```
 
+`started` mirrors `StartWorkflowExecutionResponse.started`. It is `false` only
+when a `use_existing` start returned the running execution created by another
+request; the execution then names that existing run, which becomes the
+handle's run ID and `Client.started` value. Servers that predate the field
+leave it false, so Rust reports `true` for every successful `fail` or
+`terminate_existing` start (their success proves this request created the run),
+and OCaml rejects `started: false` for those policies as a protocol defect.
 OCaml checks that the returned namespace and workflow ID still match the
 request before exposing the run ID. The complete shape is documented by
 [`client-start-request.schema.json`](../schemas/bridge/client-start-request.schema.json)
@@ -149,7 +171,7 @@ When the RPC is terminal, the ticket is retired and Rust returns one of these
 closed values:
 
 ```json
-{"kind":"accepted","execution":{"namespace":"default","workflow_id":"summarize-1","run_id":"run-1"}}
+{"kind":"accepted","execution":{"namespace":"default","workflow_id":"summarize-1","run_id":"run-1"},"started":true}
 ```
 
 ```json
@@ -764,6 +786,14 @@ If the optional detail is malformed, the error remains `already_started` but
 its `existing_run_id` is `null`. This keeps the status category and JSON body
 consistent with the same identifier validation used for OCaml-originated
 requests.
+
+The public adapter turns `already_started` into a non-retryable `workflow`
+`Error.t` whose `error_type` is `WorkflowExecutionAlreadyStarted`. When
+`existing_run_id` is present, the error carries one JSON detail payload
+(`encoding` = `json/plain`, `ocaml-temporal-detail` = `already_started`) with
+the client namespace, workflow ID, and run ID, which
+`Client.already_started` returns as a typed `Client.execution` for
+`Client.follow` (#837). The mock backend builds the same error.
 
 The OCaml protocol exposes an abstract `error` and a small `error_view` with a
 code, JSON path, and safe message. Payload bytes and raw input documents never

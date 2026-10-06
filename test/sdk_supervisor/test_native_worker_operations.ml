@@ -214,6 +214,7 @@ let test_client_protocol_adapter () =
       input = [];
       memo = [];
       search_attributes = [];
+      id_conflict_policy = Client.Fail;
     }
   in
   let wait_request : Client.wait_request =
@@ -242,7 +243,7 @@ let test_client_protocol_adapter () =
     }
   in
   let start_json =
-    {|{"execution":{"namespace":"default","workflow_id":"workflow-1","run_id":"run-2"}}|}
+    {|{"execution":{"namespace":"default","workflow_id":"workflow-1","run_id":"run-2"},"started":true}|}
   in
   let wait_json =
     {|{"execution":{"namespace":"default","workflow_id":"workflow-1","run_id":"run-1"},"outcome":{"kind":"cancelled","details":[]}}|}
@@ -299,7 +300,7 @@ let test_client_protocol_adapter () =
      Supervisor.Protocol_adapter.decode_client_start_result start_request
        (Ok (Bytes.of_string start_json))
    with
-  | Ok (Ok { Client.execution = { run_id = "run-2"; _ } }) -> ()
+  | Ok (Ok { Client.execution = { run_id = "run-2"; _ }; started = true }) -> ()
   | _ -> failwith "valid start response was not typed");
   let start_ticket =
     match
@@ -318,13 +319,13 @@ let test_client_protocol_adapter () =
   if not (contains_substring (Bytes.to_string ticket_bytes) "ticket-1") then
     failwith "typed start ticket was not encoded";
   let accepted_outcome_json =
-    {|{"kind":"accepted","execution":{"namespace":"default","workflow_id":"workflow-1","run_id":"run-2"}}|}
+    {|{"kind":"accepted","execution":{"namespace":"default","workflow_id":"workflow-1","run_id":"run-2"},"started":true}|}
   in
   (match
      Supervisor.Protocol_adapter.decode_client_start_outcome start_ticket
        (Ok (Bytes.of_string accepted_outcome_json))
    with
-  | Ok (Some (Client.Accepted { execution = { run_id = "run-2"; _ } })) -> ()
+  | Ok (Some (Client.Accepted { execution = { run_id = "run-2"; _ }; started = true })) -> ()
   | _ -> failwith "valid asynchronous start outcome was not typed");
   (match
      Supervisor.Protocol_adapter.decode_client_start_outcome start_ticket
@@ -428,7 +429,7 @@ let test_client_protocol_adapter () =
      Supervisor.Protocol_adapter.decode_client_start_result start_request
        (Ok
           (Bytes.of_string
-             {|{"execution":{"namespace":"other","workflow_id":"workflow-1","run_id":"run-2"}}|}))
+             {|{"execution":{"namespace":"other","workflow_id":"workflow-1","run_id":"run-2"},"started":true}|}))
    with
   | Error { Bridge.status = Protocol; _ } -> ()
   | _ -> failwith "mismatched start response was accepted");
@@ -529,6 +530,7 @@ let test_native_client_lifecycle_guards () =
       input = [];
       memo = [];
       search_attributes = [];
+      id_conflict_policy = Client.Fail;
     }
   in
   let wait_request : Client.wait_request =

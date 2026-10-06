@@ -617,12 +617,21 @@ let _client_start :
     ?request_id:string ->
     ?memo:(string * T.Payload.t) list ->
     ?search_attributes:(string * T.Payload.t) list ->
+    ?id_conflict_policy:T.Client.id_conflict_policy ->
     workflow:('input, 'output) T.Workflow.t ->
     task_queue:string ->
     id:string ->
     input:'input ->
     unit -> (('input, 'output) T.Client.handle, T.Error.t) result =
   T.Client.start
+
+(* The conflict policy is a closed polymorphic variant, so an exhaustive
+   match here breaks if a constructor is added or renamed. *)
+let _client_id_conflict_policy_name : T.Client.id_conflict_policy -> string =
+  function
+  | `Fail -> "fail"
+  | `Use_existing -> "use_existing"
+  | `Terminate_existing -> "terminate_existing"
 
 let _client_follow :
     T.Client.t ->
@@ -679,6 +688,9 @@ let _client_workflow_id :
   T.Client.workflow_id
 
 let _client_run_id : ('input, 'output) T.Client.handle -> string = T.Client.run_id
+let _client_started : ('input, 'output) T.Client.handle -> bool = T.Client.started
+let _client_already_started : T.Error.t -> T.Client.execution option =
+  T.Client.already_started
 let _client_is_at_capacity : T.Error.t -> bool = T.Client.is_at_capacity
 let _client_shutdown : T.Client.t -> (unit, T.Error.t) result = T.Client.shutdown
 

@@ -8,8 +8,11 @@ make test-client-request-ids-live RUN='opam exec --' \
 ```
 
 The test starts and reaps its own worker on a unique task queue. It checks
-conflicting starts from two native clients, signals and updates from separate
-client processes, and intentional deduplication of explicitly supplied IDs.
+conflicting starts from two native clients, the three workflow ID conflict
+policies (`` `Fail `` with its typed existing run, `` `Use_existing ``, and
+`` `Terminate_existing ``, including request-ID deduplication taking
+precedence), signals and updates from separate client processes, and
+intentional deduplication of explicitly supplied IDs.
 It terminates all created workflows, including after an assertion failure.
 Use a test server with the `default` namespace; no other services are required.
 

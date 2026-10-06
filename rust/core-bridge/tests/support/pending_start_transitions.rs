@@ -67,6 +67,7 @@ fn request() -> Arc<client_protocol::StartWorkflowRequest> {
         input: Vec::new(),
         memo: Vec::new(),
         search_attributes: Vec::new(),
+        id_conflict_policy: client_protocol::IdConflictPolicy::Fail,
     })
 }
 
@@ -78,6 +79,7 @@ fn response() -> client_protocol::StartWorkflowResponse {
             workflow_id: "workflow-1".to_owned(),
             run_id: "run-1".to_owned(),
         },
+        started: true,
     }
 }
 
