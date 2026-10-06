@@ -235,6 +235,113 @@ let current_deployment_version () =
         (Temporal_sdk_kernel.Workflow_context_store.activation_deployment_version
            context)
 
+module Info = struct
+  (** Run identity paired with the activation facts and task queue captured
+      when [info] was called. Every field is immutable. *)
+  type t = {
+    run : Temporal_sdk_kernel.Workflow_context_store.run_info;
+    task_queue : string;
+    is_replaying : bool;
+    history : Temporal_sdk_kernel.Workflow_context_store.activation_history;
+  }
+
+  (** Parent identity; see the interface. *)
+  type parent = { namespace : string; workflow_id : string; run_id : string }
+
+  (** Returns the workflow ID. *)
+  let workflow_id info = info.run.workflow_id
+
+  (** Returns this run's ID. *)
+  let run_id info = info.run.run_id
+
+  (** Core reports an absent chain origin as an empty string. *)
+  let first_execution_run_id info =
+    match info.run.first_execution_run_id with
+    | "" -> None
+    | run_id -> Some run_id
+
+  (** Returns the workflow type name. *)
+  let workflow_type info = info.run.workflow_type
+
+  (** Returns the worker task queue. *)
+  let task_queue info = info.task_queue
+
+  (** Returns the workflow retry attempt. *)
+  let attempt info = info.run.attempt
+
+  (** Projects the private protocol record into the public parent type. *)
+  let parent info =
+    Option.map
+      (fun (parent :
+             Temporal_sdk_kernel.Workflow_protocol.namespaced_workflow_execution) ->
+        {
+          namespace = parent.namespace;
+          workflow_id = parent.workflow_id;
+          run_id = parent.run_id;
+        })
+      info.run.parent
+
+  (** Converts a timestamp the protocol decoder already range-checked; a
+      failure would be a violated internal invariant. *)
+  let start_time info =
+    Option.map
+      (fun (time : Temporal_sdk_kernel.Workflow_protocol.timestamp) ->
+        match Time.of_unix ~seconds:time.seconds ~nanoseconds:time.nanoseconds with
+        | Ok time -> time
+        | Error _ ->
+            invalid_arg "workflow start time escaped protocol validation")
+      info.run.start_time
+
+  (** Returns the snapshot's replay flag. *)
+  let is_replaying info = info.is_replaying
+
+  (** Returns the snapshot's history event count. *)
+  let history_length info = info.history.history_length
+
+  (** Returns the snapshot's history size, when reported. *)
+  let history_size_bytes info = info.history.history_size_bytes
+
+  (** Returns the snapshot's continue-as-new suggestion. *)
+  let continue_as_new_suggested info = info.history.continue_as_new_suggested
+end
+
+(** Snapshots run identity together with the current activation's facts. The
+    values were installed by the native adapter from Core's activation before
+    workflow code ran, so no host state is consulted. *)
+let info () =
+  match Temporal_sdk_kernel.Workflow_context_store.current () with
+  | None ->
+      Error
+        (Error.defect
+           ~message:"Temporal.Workflow.info used outside a workflow execution")
+  | Some context -> (
+      match Temporal_sdk_kernel.Workflow_context_store.run_info context with
+      | None ->
+          Error
+            (Error.defect
+               ~message:"Temporal.Workflow.info is unavailable for this execution")
+      | Some run ->
+          Ok
+            {
+              Info.run;
+              task_queue =
+                Temporal_sdk_kernel.Workflow_context_store.task_queue context;
+              is_replaying =
+                Temporal_sdk_kernel.Workflow_context_store.activation_is_replaying
+                  context;
+              history =
+                Temporal_sdk_kernel.Workflow_context_store.activation_history
+                  context;
+            })
+
+(** Reads the replay flag installed for the current activation; detached code
+    is never replaying. *)
+let is_replaying () =
+  match Temporal_sdk_kernel.Workflow_context_store.current () with
+  | None -> false
+  | Some context ->
+      Temporal_sdk_kernel.Workflow_context_store.activation_is_replaying context
+
 (** Validates and snapshots a patch ID before consulting workflow state. The
     copy prevents a caller-created mutable string from changing the hash-table
     key or emitted command after this call returns. *)

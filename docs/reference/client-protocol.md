@@ -710,6 +710,18 @@ namespace, exact execution, and update ID; poll responses contain only the
 optional outcome. OCaml rejects an outcome or execution that does not match the
 handle, so a response for another update cannot be mistaken for success.
 
+Rust asks Temporal to wait for the `Accepted` stage. When the server's long
+poll expires before a worker processes the update, Temporal answers with stage
+`Admitted` and no outcome; an admitted update is not durable and may still be
+rejected, so Rust never turns that answer into a handle. Like the Go and
+Python SDKs, it re-issues the same update ID (Temporal deduplicates it) until
+the server reports `Accepted` or a terminal outcome, pausing at least 100 ms
+between attempts. Every attempt carries the remaining budget as its gRPC
+deadline, and the whole loop is bounded by 30 seconds; when the budget expires
+first, `start_update` returns the typed `deadline_exceeded` RPC error and the
+caller may retry with the same update ID (#772). A `Completed` stage without an
+outcome or an unknown stage fails closed as a Core protocol error.
+
 The normative schemas are
 [`client-update-request.schema.json`](../schemas/bridge/client-update-request.schema.json),
 [`client-update-response.schema.json`](../schemas/bridge/client-update-response.schema.json),

@@ -196,6 +196,11 @@ type t = {
   (* This atomic gate records shutdown admission without holding a lock while
      backend polling blocks, allowing repeated shutdown calls to be harmless. *)
   closed : bool Atomic.t;
+  (* Sticky, non-blocking stop request posted by [request_shutdown] (#830).
+     Unlike [closed] it does not admit teardown; it only makes [run] return so
+     the caller can then run [shutdown]. Written only by one [Atomic.set], so it
+     is safe from a signal handler on any Domain. *)
+  stop_requested : bool Atomic.t;
   (* Serializes the first teardown with later callers that need the cached
      result, matching [Client.shutdown]. *)
   shutdown_mutex : Mutex.t;
@@ -385,6 +390,7 @@ let create ?identity ?options ?max_cached_workflows
                               workflows;
                               activities;
                               closed = Atomic.make false;
+                              stop_requested = Atomic.make false;
                               shutdown_mutex = Mutex.create ();
                               shutdown_result = None;
                             })
@@ -431,6 +437,7 @@ let create ?identity ?options ?max_cached_workflows
                               workflows;
                               activities;
                               closed = Atomic.make false;
+                              stop_requested = Atomic.make false;
                               shutdown_mutex = Mutex.create ();
                               shutdown_result = None;
                             })
@@ -570,6 +577,10 @@ let run_mock worker backend =
        so observing shutdown on one stream cannot discard work on the other. *)
     let rec loop workflow_shutdown activity_shutdown =
       if workflow_shutdown && activity_shutdown then Ok ()
+      else if Atomic.get worker.stop_requested then
+        (* A stop request ends polling between tasks, like the native loop's
+           stop check; every task taken so far has already been completed. *)
+        Ok ()
       else
         let workflow_result =
           if workflow_shutdown then Ok Backend.Shutdown
@@ -618,6 +629,17 @@ let run worker =
     | Native_backend backend ->
         Native_worker.run backend |> Result.map_error Error_private.of_base
 
+(** Asks [run] to return without waiting for it (#830). The function performs
+    only atomic writes to cells allocated with the worker: no lock, I/O,
+    logging, or supervisor message. That makes it safe to call from an OCaml
+    signal handler, which runs at a safe point of whichever thread the runtime
+    picks, possibly the run loop's own thread inside a workflow activation. *)
+let request_shutdown worker =
+  Atomic.set worker.stop_requested true;
+  match worker.backend with
+  | Native_backend backend -> Native_worker.request_stop backend
+  | Mock_backend _ -> ()
+
 (** Shuts down the backend once and remembers that no new poll may be admitted.
 
     The execution-thread check deliberately precedes [shutdown_mutex] (#764).
@@ -633,12 +655,19 @@ let shutdown worker =
     match worker.backend with
     | Native_backend backend -> Native_worker.is_execution_thread backend
     | Mock_backend _ -> false
-  then
+  then begin
+    (* This thread cannot wait for its own loop, but it can ask that loop to
+       return. An OCaml signal handler that runs on the run loop's thread lands
+       here too, so posting the request lets a natural SIGTERM handler stop the
+       worker (#830); the caller completes teardown after [run] returns. *)
+    request_shutdown worker;
     Error
       (Error.defect
          ~message:
            "cannot shut down a worker from inside its own workflow or activity \
-            execution thread; call shutdown from another thread")
+            execution thread; a stop was requested instead, so call shutdown \
+            again after run returns")
+  end
   else begin
   Mutex.lock worker.shutdown_mutex;
   Fun.protect
