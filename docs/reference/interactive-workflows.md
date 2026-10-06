@@ -60,10 +60,13 @@ The native public handler accepts one payload. An activation with zero
 payloads, which the Temporal CLI, Web UI, and other SDKs send for a
 no-argument signal, is decoded as the canonical `binary/null` unit payload, the
 same rule used for workflow start input; a handler whose codec rejects unit
-reports its decode error. An activation with multiple payloads is completed as
-a non-retryable workflow failure instead of dropping data or choosing an
-arbitrary element. A signal with no
-matching handler follows the same fail-closed path. Identity and headers are
+reports its decode error. An activation with multiple payloads is reported as
+a `Codec` error instead of dropping data or choosing an arbitrary element.
+
+Signal delivery is deliberately fail-closed in v1 (see
+[unknown and undecodable signals](#unknown-and-undecodable-signals)): a signal
+with no matching handler, a payload that fails to decode, and a payload list
+with more than one element all fail the **workflow task**, not the run. Identity and headers are
 validated and retained by the runtime, but the first public handler API exposes
 only the typed payload; a later API can add those metadata fields without
 changing the transport contract.
@@ -375,9 +378,10 @@ The first native signal-handler slice is implemented. `Worker.workflow` carries
 its handler list into the private runtime registration, and each
 `SignalWorkflow` activation is validated before the matching callback is queued
 on the execution scheduler. The handler sees exactly one decoded payload in the
-public API; malformed arity, a missing name, a codec failure, or a callback
-error produces a typed non-retryable workflow failure. The handler's ordinary
-workflow commands are returned in that activation's completion.
+public API. A missing name, malformed arity, or a codec failure fails the
+workflow task under the fail-closed policy below; a typed error returned by the
+callback keeps its own classification. The handler's ordinary workflow commands
+are returned in that activation's completion.
 
 The supervisor remains the sole owner of the Rust handle graph, and native
 readiness is observed through its scheduler-safe boundary. Rust never calls an
@@ -397,3 +401,34 @@ interaction work is:
 - live update validator-rejection, deadline, retry, and replay/eviction
   scenarios beyond the verified admission, completion, and unknown-update
   rejection paths.
+
+### Unknown and undecodable signals
+
+The v1 policy is fail-closed. Any client that can signal the namespace can
+record a signal in a run's history, and the SDK will not silently drop one it
+cannot apply:
+
+| Signal delivered to a native worker | Outcome |
+| --- | --- |
+| No handler registered under the signal's name | Failed workflow task (`Defect`), no commands |
+| Payload the handler's codec cannot decode, including zero payloads for a non-unit codec | Failed workflow task (`Codec`), callback not run |
+| More than one payload | Failed workflow task (`Codec`), callback not run |
+| Callback raises or returns a `Defect`, `Bridge`, or `Codec` error | Failed workflow task |
+| Callback returns any other typed error, such as a `Workflow` error | Terminal workflow failure; the run closes as Failed |
+
+A failed task discards that activation's commands and leaves the run open,
+with a bounded diagnostic (an unknown signal's name is quoted up to 256 bytes)
+in the workflow-task failure. Because the signal is already in history, every
+replay fails the same way, so the run makes no progress until a worker with a
+matching handler and codec is deployed, or an operator resets the run to an
+event before the signal or terminates it. Treat a mistyped signal name or a
+payload sent with another encoding as a deployment incident: the
+`workflow_signal_unhandled` and `workflow_task_failed` events (see
+[observability](observability.md)) identify it.
+
+Fail-closed is chosen over dropping or buffering because a worker that
+silently ignores a signal another worker version applies would let the two
+diverge on replay, and because the typed handler API has no channel for a
+signal it cannot type. Wrong arity is classified with decode failures rather
+than as a terminal workflow failure so that a malformed sender can never close
+a run that a corrected worker could still complete.

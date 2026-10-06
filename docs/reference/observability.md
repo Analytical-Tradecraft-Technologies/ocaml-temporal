@@ -131,7 +131,12 @@ Interaction events distinguish admission from handler completion. A matching
 signal emits `workflow_signal_received` when it is queued on the owning
 scheduler and `workflow_signal_handled` only after the handler returns `Ok ()`.
 An absent signal handler emits `workflow_signal_unhandled` and fails the
-workflow task, leaving the run open. A signal handler error emits
+workflow task, leaving the run open. An undecodable payload or more than one
+payload emits `workflow_signal_received` and then fails the task through a
+`Codec` error (`workflow_task_failed`), without `workflow_signal_handled`. This is the
+deliberate fail-closed signal policy described in
+[interactive workflows](interactive-workflows.md#unknown-and-undecodable-signals).
+A signal handler error emits
 `workflow_failed` for a terminal workflow error or `workflow_task_failed`
 for a task failure, without a successful handled event. Queries are
 synchronous and do not fail the workflow: `workflow_query_completed` means

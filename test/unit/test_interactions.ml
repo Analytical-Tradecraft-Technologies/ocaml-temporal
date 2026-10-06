@@ -115,7 +115,9 @@ let test_typed_query_arguments () =
     Temporal CLI, Web UI, and other SDKs send a no-argument signal with zero
     payloads, which must reach a unit handler instead of failing the workflow.
     A non-unit handler reports its codec error for zero payloads, and repeated
-    payloads are rejected non-retryably without invoking the callback. *)
+    payloads are rejected as a non-retryable codec error without invoking the
+    callback; the worker runtime turns that codec error into a workflow-task
+    failure under the fail-closed signal policy (#811). *)
 let test_signal_payload_arity () =
   let calls = ref 0 in
   let unit_signal = Temporal.Signal.define ~name:"wake" ~input:Temporal.Codec.unit in
@@ -131,7 +133,9 @@ let test_signal_payload_arity () =
   (match Temporal.Signal.Handler.dispatch_payloads unit_handler [ null; null ] with
   | Error error ->
       if not (Temporal.Error.view error).non_retryable then
-        failwith "repeated signal payloads were retryable"
+        failwith "repeated signal payloads were retryable";
+      if Temporal.Error.kind error <> "codec" then
+        failwith "repeated signal payloads were not a codec error"
   | Ok () -> failwith "repeated signal payloads were accepted");
   if !calls <> 2 then failwith "repeated signal payloads invoked the callback";
   let string_signal =
