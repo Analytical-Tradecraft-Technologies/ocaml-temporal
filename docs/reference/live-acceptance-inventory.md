@@ -13,6 +13,7 @@ Extracted from the `temporal-integration` job in
 
 - `make test-temporal-examples-live`
 - `make test-temporal-integration`
+- `make test-temporal-live-regressions`
 - `make test-temporal-parent-child-failure-replay`
 - `make test-temporal-parent-child-restart`
 - `make test-temporal-start-metadata-live`

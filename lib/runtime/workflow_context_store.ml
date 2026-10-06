@@ -321,21 +321,25 @@ let set_start_metadata context value =
     the value observed by another handler or later activation. *)
 let start_metadata context = Option.map copy_start_metadata context.start_metadata
 
-(** Stores the currently running workflow separately on each OCaml Domain, so
-    workflow code running on different Domains cannot see the wrong context. *)
-let current_key = Domain.DLS.new_key (fun () -> None)
-let current () = Domain.DLS.get current_key
+(** Stores the currently running workflow separately for each system thread
+    of each OCaml Domain. Keying by Domain alone is insufficient: workers hosted
+    on sibling threads of one Domain may interleave activations, and a shared
+    slot would let one record commands in the other's execution (#765). *)
+let current_binding = Thread_binding.create ()
+
+(** Reads the calling thread's installed workflow context. *)
+let current () = Thread_binding.get current_binding
 
 (** Marks the synchronous query callback allowed to read immutable observations
     of its own live execution. This is separate from the scheduler owner marker:
     queries must never gain permission to mutate scopes or resume fibers. *)
-let query_read_key = Domain.DLS.new_key (fun () -> None)
+let query_read_binding = Thread_binding.create ()
 
 (** Accepts a scope status read only in the marked query for its owning live
-    execution. Both dynamic bindings are Domain-local, and the sealed check
+    execution. Both dynamic bindings are thread-local, and the sealed check
     rejects a scope retained after terminal workflow completion. *)
 let query_read_owner_matches owner_id =
-  match (Domain.DLS.get query_read_key, current ()) with
+  match (Thread_binding.get query_read_binding, current ()) with
   | Some query_context, Some current_context
     when query_context == current_context
          && not query_context.sealed
@@ -347,7 +351,7 @@ let query_read_owner_matches owner_id =
     though a synchronous query may read that scope's status. Reject a nested
     query marker as well as a paused or sealed scheduler before allocation. *)
 let in_owner_turn context =
-  match (Domain.DLS.get query_read_key, current ()) with
+  match (Thread_binding.get query_read_binding, current ()) with
   | None, Some current_context when current_context == context ->
       not context.sealed
       && Scheduler.is_active context.scheduler
@@ -584,32 +588,32 @@ let upsert_search_attributes context search_attributes =
     Activation.Upsert_search_attributes { search_attributes = copied }
     :: context.commands_rev
 
-(** Makes [context] current while [action] runs, then restores the previous
-    value even if [action] raises. This prevents later code on the same Domain
-    from mistakenly appearing to run inside a workflow. *)
+(** Makes [context] current on the calling thread while [action] runs, then
+    restores the previous value even if [action] raises. This prevents later
+    code on the same thread from mistakenly appearing to run inside a workflow,
+    and code on any other thread from observing this context at all. *)
 let with_context context action =
-  let previous = current () in
-  Domain.DLS.set current_key (Some context);
-  Fun.protect ~finally:(fun () -> Domain.DLS.set current_key previous) action
+  Thread_binding.with_value current_binding (Some context) action
 
-(** Runs a query with its execution context and a Domain-local status-read
+(** Runs a query with its execution context and a thread-local status-read
     marker. The marker is restored even when the handler raises; unlike a
     scheduler owner turn it grants no cancellation or future permissions. *)
 let with_read_only_query context action =
   with_context context (fun () ->
-      let previous = Domain.DLS.get query_read_key in
-      Domain.DLS.set query_read_key (Some context);
-      Fun.protect
-        ~finally:(fun () -> Domain.DLS.set query_read_key previous)
-        (fun () -> with_randomness_disabled context action))
+      Thread_binding.with_value query_read_binding (Some context) (fun () ->
+          with_randomness_disabled context action))
 
-(** Runs infrastructure code with no workflow installed, then restores the
-    previous context. This prevents re-entrant callbacks such as application
-    log reporters from mutating deterministic workflow state. *)
+(** Runs infrastructure code with no workflow installed on the calling thread,
+    then restores the previous context. This prevents re-entrant callbacks such
+    as application log reporters from mutating deterministic workflow state. *)
 let without_context action =
-  let previous = current () in
-  Domain.DLS.set current_key None;
-  Fun.protect ~finally:(fun () -> Domain.DLS.set current_key previous) action
+  Thread_binding.with_value current_binding None action
+
+(** Counts threads on the calling Domain that hold a context or query-read
+    binding, so tests can prove that every extent removed its entry. *)
+let bound_thread_count () =
+  Thread_binding.bound_count current_binding
+  + Thread_binding.bound_count query_read_binding
 
 (** Builds the error returned when code waits for a workflow future from the
     wrong scheduler or after workflow execution has ended. *)

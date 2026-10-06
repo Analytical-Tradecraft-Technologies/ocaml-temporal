@@ -58,7 +58,7 @@ let create () =
   }
 
 (** Returns the stable identity assigned to this workflow scheduler.  Runtime
-    stores use it with the Domain-local owner marker to reject cross-workflow
+    stores use it with the thread-local owner marker to reject cross-workflow
     waits before they retain a continuation. *)
 let id scheduler = scheduler.id
 
@@ -106,7 +106,7 @@ let promise scheduler ~outside_error =
 
 (** Handles the private [Await] effect by saving the paused workflow fiber on
     its future. Effects not owned by this scheduler continue to an outer
-    handler. The Domain-local owner id is published by [run] for the whole
+    handler. The thread-local owner id is published by [run] for the whole
     drain so resumed fibers still see the correct owner after an await. *)
 let handle scheduler thunk =
   Effect.Deep.match_with thunk ()
@@ -153,7 +153,7 @@ let spawn scheduler thunk =
 
 (** Runs queued work until the queue is empty, including fibers added by future
     completions during the run. An uncaught exception is reported before
-    [Blocked] or [Complete]. Publishes this scheduler as the Domain-local owner
+    [Blocked] or [Complete]. Publishes this scheduler as the thread-local owner
     for the entire drain so [Future_store.await] accepts parking only on this
     execution's futures, including after a fiber resumes from a prior await.
     [on_idle] checks synchronous predicates after all runnable work, while the

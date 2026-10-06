@@ -42,6 +42,23 @@ carrying a 2 MiB activity result in and a 2 MiB activity input out took a
 median of 6.39 s before and 3.19 s after, measured on the codec that was
 current before #923.
 
+## 2026-10-06: Fixed-bug live regressions run in CI (#795)
+
+The live regression executables for client request IDs (#545), update
+admission outcomes (#546), completed-workflow queries (#548), local activity
+retry cancellation (#567) and split workflow/activity workers (#805) were
+neither compiled nor run by CI. They are now in the prebuilt smoke artifact,
+and `make test-temporal-live-ci` runs them through
+`make test-temporal-live-regressions` against a fresh Compose stack. That
+target registers the fixtures' `default` namespace, copies the pinned
+admin-tools CLI for the two suites that inspect or delete their own
+executions, and bounds every process. A Docker-free contract, part of
+`make test-quality-contract`, requires every `test/integration/*/regression.exe`
+to be in the artifact list and run by a recipe reachable from the CI live
+target, and its self-test proves that omissions are rejected. The suites
+compiled locally with OCaml 5.4.1; their first live results come from the
+pull request's Linux CI job.
+
 ## 2026-10-06: Connection failures name their cause; Core logs reach stderr (#833)
 
 Every client connection failure used to read `Temporal client connection
@@ -2824,3 +2841,22 @@ but translating them into the execution context requires the native
 activation adapter, which is being changed by concurrent work.
 `test/runtime/test_execution_info.ml`, the async adapter test, and the native
 worker adapter test cover the new values.
+
+## 2026-10-06: Thread-keyed workflow context (#765)
+
+The current workflow context, the scheduler owner id that guards
+`Future.await`, condition waits and scope operations, and the read-only query
+marker were stored in `Domain.DLS`, which every system thread of a Domain
+shares. Two workers whose `run` loops share a Domain could therefore record
+commands into each other's execution or restore a stale context. These
+bindings now use the private `Thread_binding` slot: a Domain-local atomic cell
+holding an immutable map from `Thread.id` to the bound value. Reads take no
+lock and skip the thread lookup when nothing is bound on the Domain; writes
+use a compare-and-set retry that only sibling threads of the same Domain can
+contend on. Each entry exists only inside its `with_value` extent and is
+restored on the installing thread even on an exception, so single-thread
+behavior is unchanged and no entry outlives its activation.
+`test/runtime/test_thread_context_isolation.ml` forces interleaved activations
+on two threads of one Domain, checks that helper threads do not inherit a
+context, checks exception cleanup, and stress-tests the primitive with
+yielding threads.

@@ -13,3 +13,7 @@ checks an unknown query returns an error without invalidating later queries.
 It replaces the worker and repeats the successful queries, proving a fresh process can replay a
 completed execution and answer from its reconstructed final state. All worker
 processes are stopped and reaped by the fixture.
+
+CI runs this suite against the Compose Temporal/PostgreSQL stack through
+`make test-temporal-live-regressions`, which `make test-temporal-live-ci`
+invokes. That target supplies the `default` namespace.
