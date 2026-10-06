@@ -56,6 +56,17 @@
 
 (rule
  (alias runtest)
+ (deps
+  ../../scripts/build-rust-bridge.sh
+  ../../scripts/copy-rust-bridge-artifacts.sh
+  ../../scripts/render-rust-link-flags.sh
+  ../../rust/Cargo.toml
+  test_rust_bridge_offline.sh)
+ (action
+  (run sh %{dep:test_rust_bridge_offline.sh} %{workspace_root})))
+
+(rule
+ (alias runtest)
  (deps source_contract_helpers.sh test_source_contract_helpers.sh)
  (action
   (run sh %{dep:test_source_contract_helpers.sh} %{workspace_root})))

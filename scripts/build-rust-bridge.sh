@@ -104,11 +104,53 @@ if ! rust_version_at_least "$actual_rust_version" "$required_rust_version"; then
   exit 1
 fi
 
+# Select where Cargo's dependency sources come from (#778). A release source
+# archive (scripts/create-source-archive.sh) ships every locked crate, including
+# the pinned Temporal Core Git checkout, as rust/vendor.tar together with the
+# matching source-replacement configuration rust/vendor-config.toml. opam's
+# build sandbox denies network access, so that build must never contact a
+# registry or Git host: Cargo runs with --frozen (--locked plus --offline) and
+# CARGO_NET_OFFLINE, and the replacement routes crates.io and the Git source to
+# the extracted directory source, whose per-file checksums Cargo verifies.
+#
+# The crates stay archived because Dune's source_tree dependency omits
+# directories whose names start with "." or "_", and many crates package such
+# directories (for example .github), so a copied vendor tree would fail Cargo's
+# checksum verification. The archive is unpacked afresh into the writable
+# Cargo target directory on every run so no stale crate survives a source
+# update. Development checkouts have neither file and keep fetching the locked
+# graph normally with --locked.
+vendor_archive=$workspace_root/rust/vendor.tar
+vendor_config=$workspace_root/rust/vendor-config.toml
+if [ -f "$vendor_archive" ] || [ -f "$vendor_config" ]; then
+  if [ ! -f "$vendor_archive" ] || [ ! -f "$vendor_config" ]; then
+    echo "an offline source build needs both rust/vendor.tar and rust/vendor-config.toml; the source archive is incomplete" >&2
+    exit 1
+  fi
+  # Shell tools use the MSYS spelling of the target directory; Cargo receives
+  # the caller's spelling, which is relative or native on every platform.
+  vendor_root=$artifact_root/vendored-sources
+  rm -rf "$vendor_root"
+  mkdir -p "$vendor_root/.cargo"
+  tar -xf "$vendor_archive" -C "$vendor_root"
+  if [ ! -d "$vendor_root/vendor" ]; then
+    echo "rust/vendor.tar does not contain the vendor directory" >&2
+    exit 1
+  fi
+  # Cargo resolves the relative directory = "vendor" entry against the parent
+  # of this .cargo directory, which is the extracted vendor_root.
+  cp "$vendor_config" "$vendor_root/.cargo/config.toml"
+  export CARGO_NET_OFFLINE=true
+  set -- --frozen --config "$target_root/vendored-sources/.cargo/config.toml"
+else
+  set -- --locked
+fi
+
 cargo build \
   --manifest-path "$workspace_root/rust/Cargo.toml" \
   --package ocaml-temporal-core-bridge \
   --profile "$cargo_profile" \
-  --locked
+  "$@"
 
 native_link_output=$(mktemp)
 trap 'rm -f "$native_link_output"' EXIT HUP INT TERM
@@ -117,7 +159,7 @@ if ! CARGO_TERM_COLOR=never cargo rustc \
   --manifest-path "$workspace_root/rust/Cargo.toml" \
   --package ocaml-temporal-core-bridge \
   --profile "$cargo_profile" \
-  --locked \
+  "$@" \
   --lib \
   --crate-type staticlib \
   -- \

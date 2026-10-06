@@ -22,7 +22,16 @@ let await label predicate =
 let idle_workflow () = Ok Loop.Not_ready
 
 (** A blocked activity must not prevent unrelated workflow progress. A second
-    activity is queued but cannot enter while the first holds the sole slot. *)
+    activity is queued but cannot enter while the first holds the sole slot.
+
+    Every workflow poll first waits until the activity callback has entered.
+    The loop decides whether an idle lane takes the native wait from a sibling
+    busy snapshot taken after that lane's poll, so this ordering guarantees the
+    snapshot sees the activity lane busy and [native_wait] must be [false]. If
+    the workflow lane could poll before the activity Domain started, the loop
+    could legitimately claim the wait token from an idle snapshot and the
+    activity could enter before [wait_for_lane] ran, failing the assertion
+    without any scheduler defect. *)
 let test_blocked_activity_does_not_block_workflow_or_overadmit () =
   let closed = Atomic.make false in
   let first_entered = Atomic.make false in
@@ -31,7 +40,8 @@ let test_blocked_activity_does_not_block_workflow_or_overadmit () =
   let second_entered = Atomic.make false in
   let activity_polls = Atomic.make 0 in
   let poll_workflow () =
-    if Atomic.get first_entered && not (Atomic.get workflow_progressed) then begin
+    await "first activity admission" (fun () -> Atomic.get first_entered);
+    if not (Atomic.get workflow_progressed) then begin
       Atomic.set workflow_progressed true;
       Ok Loop.Progress
     end
@@ -51,14 +61,11 @@ let test_blocked_activity_does_not_block_workflow_or_overadmit () =
   in
   let wait_for_lane ~workflow_lane ~native_wait =
     if workflow_lane then begin
-      if Atomic.get first_entered then begin
-        if native_wait then
-          failwith "idle workflow used the owner while an activity was busy";
-      end;
-      if Atomic.get workflow_progressed then
-        await "second activity completion" (fun () -> Atomic.get closed)
-      else
-        await "first activity admission" (fun () -> Atomic.get first_entered);
+      (* Every workflow poll returned after the activity lane became busy, and
+         that lane stays busy until shutdown, so no wait here is a native one. *)
+      if native_wait then
+        failwith "idle workflow used the owner while an activity was busy";
+      await "second activity completion" (fun () -> Atomic.get closed);
       Ok ()
     end
     else failwith "activity lane waited despite a queued task"
