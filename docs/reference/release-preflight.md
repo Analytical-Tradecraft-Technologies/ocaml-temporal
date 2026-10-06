@@ -88,7 +88,8 @@ Open **Actions → Release → Run workflow**, select `master`, and enter the sa
    the single live smoke job, quality/security scans, and dependency audits.
 3. Generate and audit `THIRD-PARTY-NOTICES.txt` from the locked Cargo graph,
    validate all bridge and OCaml SDK bundles, add `LICENSE` and the notices to
-   every archive, archive the exact source commit, audit the Cargo SPDX SBOM,
+   every archive, archive the exact source commit with its vendored Cargo
+   sources and notices, audit the Cargo SPDX SBOM,
    and generate the release manifest and asset checksums.
 4. Fetch and verify the remote tag again before creating the draft and before
    publishing it. The workflow never creates or moves the protected tag.
@@ -96,7 +97,8 @@ Open **Actions → Release → Run workflow**, select `master`, and enter the sa
    has a prerelease suffix. No manual asset upload is required.
 
 The release contains four compiler-independent Rust bridge archives, sixteen
-compiled OCaml SDK archives, source, `manifest.json`, the Cargo SBOM, the
+compiled OCaml SDK archives, an offline-buildable source archive for
+[`opam install`](package-boundary.md#offline-opam-source-builds), `manifest.json`, the Cargo SBOM, the
 third-party notices, and `SHA256SUMS`. Each bridge and SDK archive carries
 `LICENSE` and `THIRD-PARTY-NOTICES.txt` at its root, so redistributing any one
 archive keeps the licence texts of the statically linked Rust packages with it
