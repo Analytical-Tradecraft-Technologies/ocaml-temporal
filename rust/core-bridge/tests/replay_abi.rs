@@ -3,16 +3,16 @@ use std::ptr;
 use ocaml_temporal_core_bridge::{
     ABI_VERSION, Buffer, Result as AbiResult, Runtime, STATUS_INVALID_ARGUMENT,
     STATUS_INVALID_STATE, STATUS_NOT_READY, STATUS_OK, STATUS_OUTSTANDING_TASKS, STATUS_PANIC,
-    STATUS_PROTOCOL, ocaml_temporal_core_v2_replay_worker_complete_workflow_json,
-    ocaml_temporal_core_v2_replay_worker_dispose,
-    ocaml_temporal_core_v2_replay_worker_feed_history_json,
-    ocaml_temporal_core_v2_replay_worker_finalize,
-    ocaml_temporal_core_v2_replay_worker_finish_input,
-    ocaml_temporal_core_v2_replay_worker_reject_workflow_json,
-    ocaml_temporal_core_v2_replay_worker_start_json,
-    ocaml_temporal_core_v2_replay_worker_try_poll_workflow,
-    ocaml_temporal_core_v2_replay_worker_wait_workflow, ocaml_temporal_core_v2_result_free,
-    ocaml_temporal_core_v2_runtime_free, ocaml_temporal_core_v2_runtime_new, test_invoke_panic,
+    STATUS_PROTOCOL, ocaml_temporal_core_v3_replay_worker_complete_workflow_json,
+    ocaml_temporal_core_v3_replay_worker_dispose,
+    ocaml_temporal_core_v3_replay_worker_feed_history_json,
+    ocaml_temporal_core_v3_replay_worker_finalize,
+    ocaml_temporal_core_v3_replay_worker_finish_input,
+    ocaml_temporal_core_v3_replay_worker_reject_workflow_json,
+    ocaml_temporal_core_v3_replay_worker_start_json,
+    ocaml_temporal_core_v3_replay_worker_try_poll_workflow,
+    ocaml_temporal_core_v3_replay_worker_wait_workflow, ocaml_temporal_core_v3_result_free,
+    ocaml_temporal_core_v3_runtime_free, ocaml_temporal_core_v3_runtime_new, test_invoke_panic,
 };
 
 #[path = "support/replay_fixture.rs"]
@@ -29,7 +29,7 @@ fn empty_result() -> AbiResult {
 fn assert_status(result: &mut AbiResult, expected: i32) {
     assert_eq!(result.status, expected);
     assert_eq!(
-        unsafe { ocaml_temporal_core_v2_result_free(result) },
+        unsafe { ocaml_temporal_core_v3_result_free(result) },
         STATUS_OK
     );
 }
@@ -50,18 +50,18 @@ fn buffer_bytes(buffer: &Buffer) -> Vec<u8> {
 
 /// Creates a runtime and starts its workflow-only replay worker for an ABI
 /// test. The returned pointer remains exclusively owned by the caller until
-/// it is passed to `ocaml_temporal_core_v2_runtime_free`.
+/// it is passed to `ocaml_temporal_core_v3_runtime_free`.
 fn new_replay_runtime() -> *mut Runtime {
     let mut runtime = ptr::null_mut();
     let mut result = empty_result();
     assert_eq!(
-        unsafe { ocaml_temporal_core_v2_runtime_new(&mut runtime, &mut result) },
+        unsafe { ocaml_temporal_core_v3_runtime_new(&mut runtime, &mut result) },
         STATUS_OK
     );
     assert_status(&mut result, STATUS_OK);
     assert_eq!(
         unsafe {
-            ocaml_temporal_core_v2_replay_worker_start_json(
+            ocaml_temporal_core_v3_replay_worker_start_json(
                 runtime,
                 worker_config().as_ptr(),
                 worker_config().len(),
@@ -81,7 +81,7 @@ fn poll_replay_activation(runtime: *mut Runtime) -> Vec<u8> {
     for _ in 0..20 {
         let mut result = empty_result();
         let wait_status =
-            unsafe { ocaml_temporal_core_v2_replay_worker_wait_workflow(runtime, &mut result) };
+            unsafe { ocaml_temporal_core_v3_replay_worker_wait_workflow(runtime, &mut result) };
         match wait_status {
             STATUS_OK | STATUS_NOT_READY => assert_status(&mut result, wait_status),
             status => {
@@ -91,7 +91,7 @@ fn poll_replay_activation(runtime: *mut Runtime) -> Vec<u8> {
         }
 
         let status =
-            unsafe { ocaml_temporal_core_v2_replay_worker_try_poll_workflow(runtime, &mut result) };
+            unsafe { ocaml_temporal_core_v3_replay_worker_try_poll_workflow(runtime, &mut result) };
         match status {
             STATUS_OK => {
                 let value = buffer_bytes(&result.value);
@@ -116,7 +116,7 @@ fn finalize_after_natural_shutdown(runtime: *mut Runtime) {
     for _ in 0..20 {
         let mut wait_result = empty_result();
         let wait_status = unsafe {
-            ocaml_temporal_core_v2_replay_worker_wait_workflow(runtime, &mut wait_result)
+            ocaml_temporal_core_v3_replay_worker_wait_workflow(runtime, &mut wait_result)
         };
         match wait_status {
             STATUS_OK | STATUS_NOT_READY => assert_status(&mut wait_result, wait_status),
@@ -128,7 +128,7 @@ fn finalize_after_natural_shutdown(runtime: *mut Runtime) {
 
         let mut finalize_result = empty_result();
         let finalize_status =
-            unsafe { ocaml_temporal_core_v2_replay_worker_finalize(runtime, &mut finalize_result) };
+            unsafe { ocaml_temporal_core_v3_replay_worker_finalize(runtime, &mut finalize_result) };
         match finalize_status {
             STATUS_OK => {
                 assert_status(&mut finalize_result, STATUS_OK);
@@ -165,7 +165,7 @@ fn complete_follow_up_eviction(runtime: *mut Runtime) {
     let mut result = empty_result();
     assert_eq!(
         unsafe {
-            ocaml_temporal_core_v2_replay_worker_complete_workflow_json(
+            ocaml_temporal_core_v3_replay_worker_complete_workflow_json(
                 runtime,
                 completion.as_ptr(),
                 completion.len(),
@@ -198,47 +198,47 @@ fn replay_exports_reject_null_runtime_handles() {
             assert_status(&mut result, STATUS_INVALID_ARGUMENT);
         }};
     }
-    check!(ocaml_temporal_core_v2_replay_worker_start_json(
+    check!(ocaml_temporal_core_v3_replay_worker_start_json(
         ptr::null_mut(),
         worker_config().as_ptr(),
         worker_config().len(),
         &mut result
     ));
-    check!(ocaml_temporal_core_v2_replay_worker_feed_history_json(
+    check!(ocaml_temporal_core_v3_replay_worker_feed_history_json(
         ptr::null_mut(),
         history.as_ptr(),
         history.len(),
         &mut result
     ));
-    check!(ocaml_temporal_core_v2_replay_worker_finish_input(
+    check!(ocaml_temporal_core_v3_replay_worker_finish_input(
         ptr::null_mut(),
         &mut result
     ));
-    check!(ocaml_temporal_core_v2_replay_worker_try_poll_workflow(
+    check!(ocaml_temporal_core_v3_replay_worker_try_poll_workflow(
         ptr::null_mut(),
         &mut result
     ));
-    check!(ocaml_temporal_core_v2_replay_worker_wait_workflow(
+    check!(ocaml_temporal_core_v3_replay_worker_wait_workflow(
         ptr::null_mut(),
         &mut result
     ));
-    check!(ocaml_temporal_core_v2_replay_worker_complete_workflow_json(
-        ptr::null_mut(),
-        completion.as_ptr(),
-        completion.len(),
-        &mut result
-    ));
-    check!(ocaml_temporal_core_v2_replay_worker_reject_workflow_json(
+    check!(ocaml_temporal_core_v3_replay_worker_complete_workflow_json(
         ptr::null_mut(),
         completion.as_ptr(),
         completion.len(),
         &mut result
     ));
-    check!(ocaml_temporal_core_v2_replay_worker_finalize(
+    check!(ocaml_temporal_core_v3_replay_worker_reject_workflow_json(
+        ptr::null_mut(),
+        completion.as_ptr(),
+        completion.len(),
+        &mut result
+    ));
+    check!(ocaml_temporal_core_v3_replay_worker_finalize(
         ptr::null_mut(),
         &mut result
     ));
-    check!(ocaml_temporal_core_v2_replay_worker_dispose(
+    check!(ocaml_temporal_core_v3_replay_worker_dispose(
         ptr::null_mut(),
         &mut result
     ));
@@ -252,14 +252,14 @@ fn malformed_replay_documents_are_rejected_without_state_leaks() {
     let mut runtime = ptr::null_mut();
     let mut result = empty_result();
     assert_eq!(
-        unsafe { ocaml_temporal_core_v2_runtime_new(&mut runtime, &mut result) },
+        unsafe { ocaml_temporal_core_v3_runtime_new(&mut runtime, &mut result) },
         STATUS_OK
     );
     assert_status(&mut result, STATUS_OK);
 
     assert_eq!(
         unsafe {
-            ocaml_temporal_core_v2_replay_worker_start_json(
+            ocaml_temporal_core_v3_replay_worker_start_json(
                 runtime,
                 worker_config().as_ptr(),
                 worker_config().len(),
@@ -274,7 +274,7 @@ fn malformed_replay_documents_are_rejected_without_state_leaks() {
         br#"{"workflow_id":"run","history":{"encoding":"base64","data":"not canonical"}}"#;
     assert_eq!(
         unsafe {
-            ocaml_temporal_core_v2_replay_worker_feed_history_json(
+            ocaml_temporal_core_v3_replay_worker_feed_history_json(
                 runtime,
                 malformed_history.as_ptr(),
                 malformed_history.len(),
@@ -288,7 +288,7 @@ fn malformed_replay_documents_are_rejected_without_state_leaks() {
     let malformed_completion = br#"{"run_id":"run","commands":[{"kind":"unknown"}]}"#;
     assert_eq!(
         unsafe {
-            ocaml_temporal_core_v2_replay_worker_complete_workflow_json(
+            ocaml_temporal_core_v3_replay_worker_complete_workflow_json(
                 runtime,
                 malformed_completion.as_ptr(),
                 malformed_completion.len(),
@@ -301,7 +301,7 @@ fn malformed_replay_documents_are_rejected_without_state_leaks() {
 
     assert_eq!(
         unsafe {
-            ocaml_temporal_core_v2_replay_worker_reject_workflow_json(
+            ocaml_temporal_core_v3_replay_worker_reject_workflow_json(
                 runtime,
                 malformed_completion.as_ptr(),
                 malformed_completion.len(),
@@ -313,13 +313,13 @@ fn malformed_replay_documents_are_rejected_without_state_leaks() {
     assert_status(&mut result, STATUS_PROTOCOL);
 
     assert_eq!(
-        unsafe { ocaml_temporal_core_v2_replay_worker_dispose(runtime, &mut result) },
+        unsafe { ocaml_temporal_core_v3_replay_worker_dispose(runtime, &mut result) },
         STATUS_OK
     );
     assert_status(&mut result, STATUS_OK);
 
     assert_eq!(
-        unsafe { ocaml_temporal_core_v2_runtime_free(&mut runtime) },
+        unsafe { ocaml_temporal_core_v3_runtime_free(&mut runtime) },
         STATUS_OK
     );
 }
@@ -331,7 +331,7 @@ fn replay_lifecycle_requires_a_started_worker() {
     let mut runtime = ptr::null_mut();
     let mut result = empty_result();
     assert_eq!(
-        unsafe { ocaml_temporal_core_v2_runtime_new(&mut runtime, &mut result) },
+        unsafe { ocaml_temporal_core_v3_runtime_new(&mut runtime, &mut result) },
         STATUS_OK
     );
     assert_status(&mut result, STATUS_OK);
@@ -339,13 +339,13 @@ fn replay_lifecycle_requires_a_started_worker() {
     for operation in ["try_poll", "wait", "finalize"] {
         let status = match operation {
             "try_poll" => unsafe {
-                ocaml_temporal_core_v2_replay_worker_try_poll_workflow(runtime, &mut result)
+                ocaml_temporal_core_v3_replay_worker_try_poll_workflow(runtime, &mut result)
             },
             "wait" => unsafe {
-                ocaml_temporal_core_v2_replay_worker_wait_workflow(runtime, &mut result)
+                ocaml_temporal_core_v3_replay_worker_wait_workflow(runtime, &mut result)
             },
             "finalize" => unsafe {
-                ocaml_temporal_core_v2_replay_worker_finalize(runtime, &mut result)
+                ocaml_temporal_core_v3_replay_worker_finalize(runtime, &mut result)
             },
             _ => unreachable!(),
         };
@@ -356,18 +356,18 @@ fn replay_lifecycle_requires_a_started_worker() {
     // Input closure is intentionally idempotent even when no worker exists;
     // this makes supervisor shutdown safe after a partially failed start.
     assert_eq!(
-        unsafe { ocaml_temporal_core_v2_replay_worker_finish_input(runtime, &mut result) },
+        unsafe { ocaml_temporal_core_v3_replay_worker_finish_input(runtime, &mut result) },
         STATUS_OK
     );
     assert_status(&mut result, STATUS_OK);
     assert_eq!(
-        unsafe { ocaml_temporal_core_v2_replay_worker_dispose(runtime, &mut result) },
+        unsafe { ocaml_temporal_core_v3_replay_worker_dispose(runtime, &mut result) },
         STATUS_OK
     );
     assert_status(&mut result, STATUS_OK);
 
     assert_eq!(
-        unsafe { ocaml_temporal_core_v2_runtime_free(&mut runtime) },
+        unsafe { ocaml_temporal_core_v3_runtime_free(&mut runtime) },
         STATUS_OK
     );
 }
@@ -383,7 +383,7 @@ fn replay_abi_rejects_invalid_history_and_closed_feeder() {
         br#"{"workflow_id":"run","history":{"encoding":"base64","data":"not canonical"}}"#;
     assert_eq!(
         unsafe {
-            ocaml_temporal_core_v2_replay_worker_feed_history_json(
+            ocaml_temporal_core_v3_replay_worker_feed_history_json(
                 runtime,
                 malformed.as_ptr(),
                 malformed.len(),
@@ -397,7 +397,7 @@ fn replay_abi_rejects_invalid_history_and_closed_feeder() {
     let document = replay_fixture::complete_history_document("workflow-replay-test");
     assert_eq!(
         unsafe {
-            ocaml_temporal_core_v2_replay_worker_feed_history_json(
+            ocaml_temporal_core_v3_replay_worker_feed_history_json(
                 runtime,
                 document.as_ptr(),
                 document.len(),
@@ -409,13 +409,13 @@ fn replay_abi_rejects_invalid_history_and_closed_feeder() {
     assert_status(&mut result, STATUS_OK);
 
     assert_eq!(
-        unsafe { ocaml_temporal_core_v2_replay_worker_finish_input(runtime, &mut result) },
+        unsafe { ocaml_temporal_core_v3_replay_worker_finish_input(runtime, &mut result) },
         STATUS_OK
     );
     assert_status(&mut result, STATUS_OK);
     assert_eq!(
         unsafe {
-            ocaml_temporal_core_v2_replay_worker_feed_history_json(
+            ocaml_temporal_core_v3_replay_worker_feed_history_json(
                 runtime,
                 document.as_ptr(),
                 document.len(),
@@ -428,18 +428,18 @@ fn replay_abi_rejects_invalid_history_and_closed_feeder() {
     // Repeating finish is intentionally harmless even after the feeder has
     // already been closed, which keeps shutdown cleanup idempotent.
     assert_eq!(
-        unsafe { ocaml_temporal_core_v2_replay_worker_finish_input(runtime, &mut result) },
+        unsafe { ocaml_temporal_core_v3_replay_worker_finish_input(runtime, &mut result) },
         STATUS_OK
     );
     assert_status(&mut result, STATUS_OK);
 
     assert_eq!(
-        unsafe { ocaml_temporal_core_v2_replay_worker_dispose(runtime, &mut result) },
+        unsafe { ocaml_temporal_core_v3_replay_worker_dispose(runtime, &mut result) },
         STATUS_OK
     );
     assert_status(&mut result, STATUS_OK);
     assert_eq!(
-        unsafe { ocaml_temporal_core_v2_runtime_free(&mut runtime) },
+        unsafe { ocaml_temporal_core_v3_runtime_free(&mut runtime) },
         STATUS_OK
     );
 }
@@ -454,7 +454,7 @@ fn replay_abi_requires_drain_before_finalize_and_disposes_owned_worker() {
     let document = replay_fixture::complete_history_document("workflow-replay-test");
     assert_eq!(
         unsafe {
-            ocaml_temporal_core_v2_replay_worker_feed_history_json(
+            ocaml_temporal_core_v3_replay_worker_feed_history_json(
                 runtime,
                 document.as_ptr(),
                 document.len(),
@@ -465,23 +465,23 @@ fn replay_abi_requires_drain_before_finalize_and_disposes_owned_worker() {
     );
     assert_status(&mut result, STATUS_OK);
     assert_eq!(
-        unsafe { ocaml_temporal_core_v2_replay_worker_finish_input(runtime, &mut result) },
+        unsafe { ocaml_temporal_core_v3_replay_worker_finish_input(runtime, &mut result) },
         STATUS_OK
     );
     assert_status(&mut result, STATUS_OK);
 
     assert_eq!(
-        unsafe { ocaml_temporal_core_v2_replay_worker_finalize(runtime, &mut result) },
+        unsafe { ocaml_temporal_core_v3_replay_worker_finalize(runtime, &mut result) },
         STATUS_OUTSTANDING_TASKS
     );
     assert_status(&mut result, STATUS_OUTSTANDING_TASKS);
     assert_eq!(
-        unsafe { ocaml_temporal_core_v2_replay_worker_dispose(runtime, &mut result) },
+        unsafe { ocaml_temporal_core_v3_replay_worker_dispose(runtime, &mut result) },
         STATUS_OK
     );
     assert_status(&mut result, STATUS_OK);
     assert_eq!(
-        unsafe { ocaml_temporal_core_v2_runtime_free(&mut runtime) },
+        unsafe { ocaml_temporal_core_v3_runtime_free(&mut runtime) },
         STATUS_OK
     );
 }
@@ -498,7 +498,7 @@ fn replay_abi_disposes_a_leased_activation_without_core_failure() {
     let document = replay_fixture::complete_history_document("workflow-replay-test");
     assert_eq!(
         unsafe {
-            ocaml_temporal_core_v2_replay_worker_feed_history_json(
+            ocaml_temporal_core_v3_replay_worker_feed_history_json(
                 runtime,
                 document.as_ptr(),
                 document.len(),
@@ -513,12 +513,12 @@ fn replay_abi_disposes_a_leased_activation_without_core_failure() {
     // relying on a scheduler race between Core and the shutdown request.
     let _activation = poll_replay_activation(runtime);
     assert_eq!(
-        unsafe { ocaml_temporal_core_v2_replay_worker_dispose(runtime, &mut result) },
+        unsafe { ocaml_temporal_core_v3_replay_worker_dispose(runtime, &mut result) },
         STATUS_OK
     );
     assert_status(&mut result, STATUS_OK);
     assert_eq!(
-        unsafe { ocaml_temporal_core_v2_runtime_free(&mut runtime) },
+        unsafe { ocaml_temporal_core_v3_runtime_free(&mut runtime) },
         STATUS_OK
     );
 }
@@ -537,7 +537,7 @@ fn replay_abi_retains_lease_after_malformed_completion() {
     let document = replay_fixture::complete_history_document("workflow-replay-test");
     assert_eq!(
         unsafe {
-            ocaml_temporal_core_v2_replay_worker_feed_history_json(
+            ocaml_temporal_core_v3_replay_worker_feed_history_json(
                 runtime,
                 document.as_ptr(),
                 document.len(),
@@ -548,7 +548,7 @@ fn replay_abi_retains_lease_after_malformed_completion() {
     );
     assert_status(&mut result, STATUS_OK);
     assert_eq!(
-        unsafe { ocaml_temporal_core_v2_replay_worker_finish_input(runtime, &mut result) },
+        unsafe { ocaml_temporal_core_v3_replay_worker_finish_input(runtime, &mut result) },
         STATUS_OK
     );
     assert_status(&mut result, STATUS_OK);
@@ -565,7 +565,7 @@ fn replay_abi_retains_lease_after_malformed_completion() {
     .to_string();
     assert_eq!(
         unsafe {
-            ocaml_temporal_core_v2_replay_worker_complete_workflow_json(
+            ocaml_temporal_core_v3_replay_worker_complete_workflow_json(
                 runtime,
                 malformed.as_ptr(),
                 malformed.len(),
@@ -584,7 +584,7 @@ fn replay_abi_retains_lease_after_malformed_completion() {
     assert_status(&mut result, STATUS_PANIC);
 
     assert_eq!(
-        unsafe { ocaml_temporal_core_v2_replay_worker_finalize(runtime, &mut result) },
+        unsafe { ocaml_temporal_core_v3_replay_worker_finalize(runtime, &mut result) },
         STATUS_OUTSTANDING_TASKS
     );
     assert_status(&mut result, STATUS_OUTSTANDING_TASKS);
@@ -597,7 +597,7 @@ fn replay_abi_retains_lease_after_malformed_completion() {
     .expect("valid completion should encode");
     assert_eq!(
         unsafe {
-            ocaml_temporal_core_v2_replay_worker_complete_workflow_json(
+            ocaml_temporal_core_v3_replay_worker_complete_workflow_json(
                 runtime,
                 completion.as_ptr(),
                 completion.len(),
@@ -609,7 +609,7 @@ fn replay_abi_retains_lease_after_malformed_completion() {
     assert_status(&mut result, STATUS_OK);
     assert_eq!(
         unsafe {
-            ocaml_temporal_core_v2_replay_worker_complete_workflow_json(
+            ocaml_temporal_core_v3_replay_worker_complete_workflow_json(
                 runtime,
                 completion.as_ptr(),
                 completion.len(),
@@ -623,7 +623,7 @@ fn replay_abi_retains_lease_after_malformed_completion() {
     complete_follow_up_eviction(runtime);
     finalize_after_natural_shutdown(runtime);
     assert_eq!(
-        unsafe { ocaml_temporal_core_v2_runtime_free(&mut runtime) },
+        unsafe { ocaml_temporal_core_v3_runtime_free(&mut runtime) },
         STATUS_OK
     );
     assert!(runtime.is_null());
@@ -646,7 +646,7 @@ fn replay_abi_rejects_only_semantically_matching_lease() {
     let document = replay_fixture::open_workflow_task_document("workflow-replay-test");
     assert_eq!(
         unsafe {
-            ocaml_temporal_core_v2_replay_worker_feed_history_json(
+            ocaml_temporal_core_v3_replay_worker_feed_history_json(
                 runtime,
                 document.as_ptr(),
                 document.len(),
@@ -693,7 +693,7 @@ fn replay_abi_rejects_only_semantically_matching_lease() {
     .to_string();
     assert_eq!(
         unsafe {
-            ocaml_temporal_core_v2_replay_worker_feed_history_json(
+            ocaml_temporal_core_v3_replay_worker_feed_history_json(
                 runtime,
                 second_document.as_ptr(),
                 second_document.len(),
@@ -713,7 +713,7 @@ fn replay_abi_rejects_only_semantically_matching_lease() {
         serde_json::to_string(&mismatched).expect("mismatched activation should encode");
     assert_eq!(
         unsafe {
-            ocaml_temporal_core_v2_replay_worker_reject_workflow_json(
+            ocaml_temporal_core_v3_replay_worker_reject_workflow_json(
                 runtime,
                 mismatched.as_ptr(),
                 mismatched.len(),
@@ -729,7 +729,7 @@ fn replay_abi_rejects_only_semantically_matching_lease() {
     // are accepted by Rust's retained-lease comparison.
     assert_eq!(
         unsafe {
-            ocaml_temporal_core_v2_replay_worker_reject_workflow_json(
+            ocaml_temporal_core_v3_replay_worker_reject_workflow_json(
                 runtime,
                 pretty.as_ptr(),
                 pretty.len(),
@@ -760,7 +760,7 @@ fn replay_abi_rejects_only_semantically_matching_lease() {
     .expect("unrelated workflow completion should encode");
     assert_eq!(
         unsafe {
-            ocaml_temporal_core_v2_replay_worker_complete_workflow_json(
+            ocaml_temporal_core_v3_replay_worker_complete_workflow_json(
                 runtime,
                 completion.as_ptr(),
                 completion.len(),
@@ -773,13 +773,13 @@ fn replay_abi_rejects_only_semantically_matching_lease() {
     complete_follow_up_eviction(runtime);
 
     assert_eq!(
-        unsafe { ocaml_temporal_core_v2_replay_worker_finish_input(runtime, &mut result) },
+        unsafe { ocaml_temporal_core_v3_replay_worker_finish_input(runtime, &mut result) },
         STATUS_OK
     );
     assert_status(&mut result, STATUS_OK);
     finalize_after_natural_shutdown(runtime);
     assert_eq!(
-        unsafe { ocaml_temporal_core_v2_runtime_free(&mut runtime) },
+        unsafe { ocaml_temporal_core_v3_runtime_free(&mut runtime) },
         STATUS_OK
     );
 }
@@ -791,13 +791,13 @@ fn replay_abi_waits_for_natural_shutdown_before_finalizing() {
     let mut runtime = new_replay_runtime();
     let mut result = empty_result();
     assert_eq!(
-        unsafe { ocaml_temporal_core_v2_replay_worker_finish_input(runtime, &mut result) },
+        unsafe { ocaml_temporal_core_v3_replay_worker_finish_input(runtime, &mut result) },
         STATUS_OK
     );
     assert_status(&mut result, STATUS_OK);
     finalize_after_natural_shutdown(runtime);
     assert_eq!(
-        unsafe { ocaml_temporal_core_v2_runtime_free(&mut runtime) },
+        unsafe { ocaml_temporal_core_v3_runtime_free(&mut runtime) },
         STATUS_OK
     );
 }
@@ -805,7 +805,7 @@ fn replay_abi_waits_for_natural_shutdown_before_finalizing() {
 #[test]
 /// Confirms the replay tests target the same ABI contract as the OCaml header.
 fn replay_abi_tests_use_the_current_contract() {
-    assert_eq!(ABI_VERSION, 2);
+    assert_eq!(ABI_VERSION, 3);
 }
 
 /// Replays retained live task-failure and deliberate-failure histories through
@@ -871,7 +871,7 @@ fn replay_live_workflow_task_failure_histories() {
         let mut result = empty_result();
         assert_eq!(
             unsafe {
-                ocaml_temporal_core_v2_replay_worker_feed_history_json(
+                ocaml_temporal_core_v3_replay_worker_feed_history_json(
                     runtime,
                     document.as_ptr(),
                     document.len(),
@@ -882,7 +882,7 @@ fn replay_live_workflow_task_failure_histories() {
         );
         assert_status(&mut result, STATUS_OK);
         assert_eq!(
-            unsafe { ocaml_temporal_core_v2_replay_worker_finish_input(runtime, &mut result) },
+            unsafe { ocaml_temporal_core_v3_replay_worker_finish_input(runtime, &mut result) },
             STATUS_OK
         );
         assert_status(&mut result, STATUS_OK);
@@ -967,7 +967,7 @@ fn replay_live_workflow_task_failure_histories() {
             let completion = workflow_protocol::encode_completion(&completion).unwrap();
             assert_eq!(
                 unsafe {
-                    ocaml_temporal_core_v2_replay_worker_complete_workflow_json(
+                    ocaml_temporal_core_v3_replay_worker_complete_workflow_json(
                         runtime,
                         completion.as_ptr(),
                         completion.len(),
@@ -986,7 +986,7 @@ fn replay_live_workflow_task_failure_histories() {
         assert!(evicted, "{name} replay did not finish");
         finalize_after_natural_shutdown(runtime);
         assert_eq!(
-            unsafe { ocaml_temporal_core_v2_runtime_free(&mut runtime) },
+            unsafe { ocaml_temporal_core_v3_runtime_free(&mut runtime) },
             STATUS_OK
         );
     }

@@ -278,7 +278,7 @@ and bridge, read the [documentation guide](../README.md) first.
   rejection is accepted only for the exact activation lease that was polled.
 - The private supervisor validates native poll bytes before returning typed
   workflow or activity values to another Domain. It canonically encodes and
-  reparses typed completions before entering C.
+  semantically validates typed completions before entering C.
 - An activity `Start` (remote or local) creates one Core completion debt. A `Cancel` poll
   is an update to that same token: it is handed to the OCaml activity adapter
   while the token remains tracked, but it never acquires a second completion
@@ -321,7 +321,7 @@ and bridge, read the [documentation guide](../README.md) first.
   rejection) acknowledges it with an empty completion instead. Failing an
   eviction leaves it outstanding in release Core and panics debug Core
   (issue #814).
-- Native `Not_ready` is represented as `Ok None`. ABI version 2 also exposes
+- Native `Not_ready` is represented as `Ok None`. ABI version 3 also exposes
   bounded `Wait_workflow`, `Wait_activity`, and combined `Wait_any` readiness
   operations. Only the
   owner-Domain supervisor may invoke them; the C boundary releases the OCaml

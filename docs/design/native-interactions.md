@@ -187,7 +187,8 @@ discard extra payloads.
 
 The current public signal definition accepts one typed input. The native public
 handler (`Signal.Handler.dispatch_payloads`) decodes one payload normally and
-returns a typed, non-retryable workflow error for multiple payloads. Zero
+returns a typed, non-retryable `Codec` error for multiple payloads, which fails
+the workflow task rather than the run (the v1 fail-closed signal policy, #811). Zero
 payloads are decoded as the canonical `binary/null` unit payload, matching
 workflow start input: the Temporal CLI, Web UI, and other SDKs send a
 no-argument signal with no payloads, and rejecting it would let any sender

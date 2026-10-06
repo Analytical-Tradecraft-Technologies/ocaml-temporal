@@ -215,16 +215,19 @@ val decode_task : string -> (task, error) result
 (** Strictly decodes and validates one activity-task document. *)
 
 val encode_task : task -> (string, error) result
-(** Validates, normalizes, and semantically reparses an outgoing task. *)
+(** Validates, normalizes, and serializes an outgoing task, then applies the
+    decoder's semantic rules to the validated value. *)
 
 val decode_completion : string -> (completion, error) result
 (** Strictly decodes and validates one activity-completion document. *)
 
 val encode_completion : completion -> (string, error) result
-(** Validates, normalizes, and semantically reparses an outgoing completion. *)
+(** Validates, normalizes, and serializes an outgoing completion, then applies the
+    decoder's semantic rules to the validated value. *)
 
 val decode_heartbeat : string -> (heartbeat, error) result
 (** Strictly decodes and validates one activity heartbeat document. *)
 
 val encode_heartbeat : heartbeat -> (string, error) result
-(** Validates, normalizes, and semantically reparses an outgoing heartbeat. *)
+(** Validates, normalizes, and serializes an outgoing heartbeat, then applies the
+    decoder's semantic rules to the validated value. *)

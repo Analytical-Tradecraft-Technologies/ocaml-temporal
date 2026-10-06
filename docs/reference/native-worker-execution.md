@@ -130,7 +130,7 @@ already been accepted.
    separate terminal child resolution then completes that future.
 7. The completion is copied into an adapter-owned pending record before it is
    submitted through the same supervisor. The supervisor canonical-encodes
-   and reparses the completion, checks its leased run ID against Rust's ledger,
+   and semantically validates the completion, checks its leased run ID against Rust's ledger,
    and retires that lease only after Core accepts it. The run entry is removed
    only after the supervisor confirms completion retirement. Terminal commands
    shut down fibers and pending operations but retain final workflow-local

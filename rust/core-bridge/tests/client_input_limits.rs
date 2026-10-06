@@ -19,10 +19,10 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use ocaml_temporal_core_bridge::{
     Result as AbiResult, Runtime, STATUS_INVALID_STATE, STATUS_OK, STATUS_PROTOCOL, Status,
-    ocaml_temporal_core_v2_client_query_workflow_json,
-    ocaml_temporal_core_v2_client_signal_workflow_json,
-    ocaml_temporal_core_v2_client_update_workflow_json, ocaml_temporal_core_v2_result_free,
-    ocaml_temporal_core_v2_runtime_free, ocaml_temporal_core_v2_runtime_new,
+    ocaml_temporal_core_v3_client_query_workflow_json,
+    ocaml_temporal_core_v3_client_signal_workflow_json,
+    ocaml_temporal_core_v3_client_update_workflow_json, ocaml_temporal_core_v3_result_free,
+    ocaml_temporal_core_v3_runtime_free, ocaml_temporal_core_v3_runtime_new,
     protocol::{MAX_PAYLOAD_BYTES, MAX_STRING_BYTES},
 };
 
@@ -36,11 +36,11 @@ const MAX_PAYLOAD_BASE64_BYTES: usize = MAX_PAYLOAD_BYTES.div_ceil(3) * 4;
 /// The client operations whose payload-carrying requests share this bound.
 #[derive(Clone, Copy, Debug)]
 enum Operation {
-    /// `ocaml_temporal_core_v2_client_signal_workflow_json`.
+    /// `ocaml_temporal_core_v3_client_signal_workflow_json`.
     Signal,
-    /// `ocaml_temporal_core_v2_client_query_workflow_json`.
+    /// `ocaml_temporal_core_v3_client_query_workflow_json`.
     Query,
-    /// `ocaml_temporal_core_v2_client_update_workflow_json`.
+    /// `ocaml_temporal_core_v3_client_update_workflow_json`.
     Update,
 }
 
@@ -57,11 +57,11 @@ impl UnconnectedRuntime {
         let mut runtime = ptr::null_mut();
         let mut result = AbiResult::default();
         assert_eq!(
-            unsafe { ocaml_temporal_core_v2_runtime_new(&mut runtime, &mut result) },
+            unsafe { ocaml_temporal_core_v3_runtime_new(&mut runtime, &mut result) },
             STATUS_OK
         );
         assert_eq!(
-            unsafe { ocaml_temporal_core_v2_result_free(&mut result) },
+            unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
             STATUS_OK
         );
         Self(runtime)
@@ -75,19 +75,19 @@ impl UnconnectedRuntime {
         // and `result` is initialized writable storage freed immediately below.
         let status = unsafe {
             match operation {
-                Operation::Signal => ocaml_temporal_core_v2_client_signal_workflow_json(
+                Operation::Signal => ocaml_temporal_core_v3_client_signal_workflow_json(
                     self.0,
                     document.as_ptr(),
                     document.len(),
                     &mut result,
                 ),
-                Operation::Query => ocaml_temporal_core_v2_client_query_workflow_json(
+                Operation::Query => ocaml_temporal_core_v3_client_query_workflow_json(
                     self.0,
                     document.as_ptr(),
                     document.len(),
                     &mut result,
                 ),
-                Operation::Update => ocaml_temporal_core_v2_client_update_workflow_json(
+                Operation::Update => ocaml_temporal_core_v3_client_update_workflow_json(
                     self.0,
                     document.as_ptr(),
                     document.len(),
@@ -96,7 +96,7 @@ impl UnconnectedRuntime {
             }
         };
         assert_eq!(
-            unsafe { ocaml_temporal_core_v2_result_free(&mut result) },
+            unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
             STATUS_OK
         );
         status
@@ -107,7 +107,7 @@ impl Drop for UnconnectedRuntime {
     /// Frees the runtime slot exactly once.
     fn drop(&mut self) {
         assert_eq!(
-            unsafe { ocaml_temporal_core_v2_runtime_free(&mut self.0) },
+            unsafe { ocaml_temporal_core_v3_runtime_free(&mut self.0) },
             STATUS_OK
         );
     }

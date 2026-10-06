@@ -63,6 +63,11 @@ Hello, Ada Lovelace!
 Next: review the Temporal result for Ada Lovelace.
 ```
 
+`examples/testing/example_workflow_test.ml` unit-tests the same workflow
+in-process with `Temporal.Testing`, once with the real activity and once with
+a stub, and needs no Temporal Server. It runs with the other unit tests
+(`dune test`).
+
 The broader SDK acceptance evidence comes from `make test-temporal-integration`,
 whose dedicated smoke worker and driver exercise many more Temporal features.
 
