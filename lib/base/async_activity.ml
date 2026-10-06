@@ -74,8 +74,12 @@ type 'output handle = {
 }
 
 (** The short-lived callback context from which an activity obtains its
-    attempt-scoped completion capability. *)
-type 'output context = { handle : 'output handle }
+    attempt-scoped completion capability. [info] is the immutable task
+    metadata, absent for a context built without a Core task. *)
+type 'output context = {
+  handle : 'output handle;
+  info : Activity_context.info option;
+}
 
 (** The callback's immediate outcome. [Will_complete_async] transfers the
     handle to external code, so the callback must not later use that same
@@ -116,7 +120,10 @@ let create ~submit ~encode_output =
   }
 
 (** Builds the callback context for a newly created attempt-scoped handle. *)
-let context handle = { handle }
+let context ?info handle = { handle; info }
+
+(** The metadata is immutable, so it is shared without copying or locking. *)
+let info context = context.info
 
 (** Wraps a handle for the activity callback without copying the capability. *)
 let handle context = context.handle

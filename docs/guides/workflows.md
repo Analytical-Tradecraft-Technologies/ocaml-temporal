@@ -820,8 +820,9 @@ let rec drain queue =
 ```
 
 The same snapshot carries the run's identity (workflow ID, run ID, first run
-ID of the chain, type, task queue, retry attempt, parent, and start time), all
-taken from Temporal's activations rather than host state. Identity is fixed
+ID of the chain, type, namespace, task queue, retry attempt, parent, and start
+time), taken from Temporal's activations and the worker's own configuration
+(the namespace and task queue) rather than host state. Identity is fixed
 for the run; history facts and `Info.is_replaying` describe the activation
 current when `info` was called, so call it again after a suspension.
 `Temporal.Workflow.is_replaying ()` is the shorthand for side effects outside

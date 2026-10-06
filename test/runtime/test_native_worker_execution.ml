@@ -2688,6 +2688,54 @@ let test_task_queue_validation () =
   expect_invalid "oversized" (String.make 65_537 'x');
   expect_invalid "UTF-8" (String.make 1 (Char.chr 0xff))
 
+(** The adapter rejects a malformed namespace as typed configuration, like
+    the task queue, rather than deferring the defect to the first activation. *)
+let test_namespace_validation () =
+  let supervisor = fake_supervisor () in
+  match Worker.create ~supervisor ~namespace:"bad\000namespace" ~workflows:[] () with
+  | Error { code = "invalid_configuration"; path = "$.namespace"; message }
+    when not (String.equal message "") -> ()
+  | Error error ->
+      failwith
+        (Printf.sprintf "namespace returned %s at %s" error.code error.path)
+  | Ok _ -> failwith "NUL-containing namespace was accepted"
+
+(** Core activations do not carry the namespace, so the adapter copies its
+    configured namespace into every execution for [Temporal.Workflow.info]
+    (#792). *)
+let test_namespace_reaches_workflow_info () =
+  let supervisor = fake_supervisor () in
+  let observed = ref None in
+  let workflow =
+    Temporal.Workflow.define ~name:"native_worker_namespace"
+      ~input:Temporal.Codec.unit ~output:Temporal.Codec.unit (fun () ->
+        observed :=
+          Some
+            (Result.map
+               (fun info ->
+                 ( Temporal.Workflow.Info.namespace info,
+                   Temporal.Workflow.Info.task_queue info ))
+               (Temporal.Workflow.info ()));
+        Ok ())
+  in
+  enqueue supervisor
+    (activation ~run_id:"run-namespace"
+       [ initialize ~run_id:"run-namespace" ~workflow_type:"native_worker_namespace" ]);
+  let worker =
+    match
+      Worker.create ~supervisor ~namespace:"payments" ~task_queue:"orders"
+        ~workflows:[ Adapter.register workflow ] ()
+    with
+    | Ok worker -> worker
+    | Error error -> failwith ("worker creation failed: " ^ error.message)
+  in
+  expect_completed ~terminal:true (Result.get_ok (Worker.poll worker));
+  match !observed with
+  | Some (Ok ("payments", "orders")) -> ()
+  | Some (Ok _) -> failwith "workflow observed the wrong namespace or queue"
+  | Some (Error error) -> failwith (Temporal.Error.message error)
+  | None -> failwith "namespace workflow did not run"
+
 (** A body exception discards a timer buffered in that same task. Retrying a
     failed acknowledgement preserves its exact value and never invokes code
     again; a corrected registration can initialize the same run from scratch. *)
@@ -3039,4 +3087,6 @@ let () =
   test_unknown_run_retires_lease ();
   test_malformed_activation_error_is_typed ();
   test_registration_validation ();
-  test_task_queue_validation ()
+  test_task_queue_validation ();
+  test_namespace_validation ();
+  test_namespace_reaches_workflow_info ()
