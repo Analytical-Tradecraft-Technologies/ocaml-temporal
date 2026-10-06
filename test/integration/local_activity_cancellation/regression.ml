@@ -92,32 +92,79 @@ let spawn address queue log = Unix.create_process Sys.executable_name
 (** Stops and reaps only the worker created by this fixture. *)
 let stop pid = Unix.kill pid Sys.sigterm; ignore (Unix.waitpid [] pid)
 
-(** Fetches this execution's history through the official CLI without a shell. *)
+(** Deadline for one CLI invocation: a fresh dial plus one history read. The CLI
+    reports an expired [--command-timeout] only as "program interrupted", and
+    the original 5 seconds was exceeded on a loaded CI runner. The fixture's
+    120-second alarm and the controller's outer timeout still bound the run. *)
+let cli_timeout = "30s"
+
+(** Names a CLI exit status for failure diagnostics. *)
+let describe_status = function
+  | Unix.WEXITED code -> Printf.sprintf "exited with status %d" code
+  | Unix.WSIGNALED signal -> Printf.sprintf "killed by signal %d" signal
+  | Unix.WSTOPPED signal -> Printf.sprintf "stopped by signal %d" signal
+
+(** Fetches this execution's history through the official CLI without a shell.
+    A failed invocation is an [Error] naming its exit status rather than an
+    exception from cleanup, so callers decide whether the read may be retried.
+    The CLI's own diagnostic goes to the inherited standard error. *)
 let history cli address handle =
-  let args = [|cli; "--address"; address; "--command-timeout"; "5s";
+  let args = [|cli; "--address"; address; "--command-timeout"; cli_timeout;
     "workflow"; "show"; "--workflow-id"; Client.workflow_id handle;
     "--run-id"; Client.run_id handle; "--output"; "json"|] in
   let input = Unix.open_process_args_in cli args in
-  let document = Fun.protect
-    ~finally:(fun () -> match Unix.close_process_in input with
-      | Unix.WEXITED 0 -> () | _ -> failwith "history fetch failed")
-    (fun () -> Yojson.Basic.from_channel input) in
-  Yojson.Basic.Util.(document |> member "events" |> to_list)
+  let document = match Yojson.Basic.from_channel input with
+    | document -> Ok document
+    | exception Yojson.Json_error message -> Error message
+    | exception exn ->
+        (* An alarm or other defect still reaps the child before propagating. *)
+        ignore (Unix.close_process_in input);
+        raise exn in
+  match Unix.close_process_in input, document with
+  | Unix.WEXITED 0, Ok document ->
+      Ok Yojson.Basic.Util.(document |> member "events" |> to_list)
+  | Unix.WEXITED 0, Error message -> Error ("unparseable history: " ^ message)
+  | status, _ -> Error ("history fetch " ^ describe_status status)
 
 (** Selects durable event kinds without depending on timestamps or event IDs. *)
 let events kind history = List.filter (fun event ->
   Yojson.Basic.Util.(event |> member "eventType" |> to_string) = kind) history
 
-(** Waits for server evidence of the retry timer, avoiding signal timing races. *)
-let rec await_backoff cli address handle remaining =
-  let recorded = history cli address handle in
-  if events "EVENT_TYPE_TIMER_STARTED" recorded <> [] then ()
-  else if remaining = 0 then failwith "local retry never created a durable timer"
-  else (Unix.sleepf 0.05; await_backoff cli address handle (remaining - 1))
+(** Waits for server evidence of the retry timer, avoiding signal timing races.
+    Polling is observation rather than assertion, so a failed read is reported
+    and retried until the deadline (seconds) expires. *)
+let await_backoff cli address handle ~seconds =
+  let deadline = Unix.gettimeofday () +. seconds in
+  let rec poll () =
+    let result = history cli address handle in
+    match result with
+    | Ok recorded when events "EVENT_TYPE_TIMER_STARTED" recorded <> [] -> ()
+    | Ok _ | Error _ when Unix.gettimeofday () < deadline ->
+        Result.iter_error (Printf.eprintf "%s: %s; retrying\n%!"
+          (Client.workflow_id handle)) result;
+        Unix.sleepf 0.05;
+        poll ()
+    | Ok _ -> failwith "local retry never created a durable timer"
+    | Error message -> failwith ("awaiting the retry timer: " ^ message) in
+  poll ()
+
+(** Reads a completed execution's history. Completed history is immutable, so
+    retrying a failed read tolerates transport failures without weakening any
+    assertion made about the events themselves. *)
+let completed_history cli address handle =
+  let rec fetch attempts =
+    match history cli address handle with
+    | Ok recorded -> recorded
+    | Error message when attempts > 1 ->
+        Printf.eprintf "%s: %s; retrying\n%!" (Client.workflow_id handle) message;
+        Unix.sleepf 0.5;
+        fetch (attempts - 1)
+    | Error message -> failwith ("reading completed history: " ^ message) in
+  fetch 3
 
 (** Requires a cancelled retry timer, one failed attempt marker, and completion. *)
 let verify_history cli address handle =
-  let recorded = history cli address handle in
+  let recorded = completed_history cli address handle in
   let one kind = match events kind recorded with
     | [event] -> event | _ -> failwith ("expected exactly one " ^ kind) in
   let started = one "EVENT_TYPE_TIMER_STARTED" in
@@ -164,7 +211,7 @@ let check address cli =
           let handle = get (Client.start client ~workflow ~task_queue:queue
             ~id:(queue ^ "-" ^ name) ~input:name ()) in
           handles := handle :: !handles;
-          await_backoff cli cli_address handle 200;
+          await_backoff cli cli_address handle ~seconds:60.0;
           get (Client.signal handle ~signal:cancel_signal ~input:());
           (match get (Client.wait handle) with
           | Client.Completed "cancelled" -> () | _ -> failwith "cancellation did not settle");
