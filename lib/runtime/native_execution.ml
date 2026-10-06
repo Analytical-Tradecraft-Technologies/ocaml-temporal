@@ -10,6 +10,7 @@
 
 module Protocol = Temporal_protocol.Workflow_protocol
 module Failure_diagnostic = Temporal_protocol.Failure_diagnostic
+module Encoded_completion = Temporal_protocol.Encoded_workflow_completion
 
 (** Result-bind notation keeps every boundary conversion on the typed error
     path; no protocol or runtime input is handled with an exception. *)
@@ -49,8 +50,21 @@ type translated_activation = {
   cancellation_reason : string option;
   cache_removal : cache_removal option;
   jobs : Activation.job list;
+  source : Protocol.activation;
 }
-(** A protocol activation after its jobs have been converted to runtime jobs. *)
+(** A protocol activation after its jobs have been converted to runtime jobs.
+    [source] is the validated activation the record was built from; it is kept
+    by reference (no copy) so [activate_translated] can check query answers
+    against it without translating or validating the activation again. *)
+
+type encoded_completion = {
+  completion : Protocol.completion;
+  encoded : Encoded_completion.t;
+}
+(** A checked completion together with the canonical bytes its single encoder
+    pass produced. [completion] still aliases payload buffers owned by the
+    execution; [encoded] is an immutable snapshot and is what a worker submits
+    and retains. *)
 
 (** Copies a translation error into its stable public diagnostic shape. *)
 let error_view (error : error) : error_view =
@@ -675,7 +689,9 @@ let runtime_job path = function
 
 (** Validates one activation through the canonical semantic codec. This keeps
     direct OCaml construction subject to the same closed-object, payload-size,
-    timestamp, and ordering rules as Rust input. *)
+    timestamp, and ordering rules as Rust input. It runs once per
+    [translate_activation] call, and the worker translates each activation
+    once. *)
 let validate_activation value =
   match Protocol.encode_activation value with
   | Ok _ -> Ok ()
@@ -707,6 +723,7 @@ let translate_activation (value : Protocol.activation) =
             cancellation_reason = !cancellation_reason;
             cache_removal = !cache_removal;
             jobs = List.rev reversed;
+            source = value;
           }
     | job :: rest ->
         let path = Printf.sprintf "$.jobs[%d]" index in
@@ -1234,10 +1251,12 @@ let command_to_protocol command =
   | Activation.Cancel_workflow_execution ->
       Ok Protocol.Cancel_workflow_execution
 
-(** Converts an ordered command list and lets the canonical protocol encoder
-    re-check terminal ordering, run-id bounds, payload limits, and all nested
-    fields before returning it to the bridge. *)
-let completion_of_commands ~run_id commands =
+(** Converts an ordered command list into a completion and runs the canonical
+    protocol encoder over it exactly once. The encoder re-checks terminal
+    ordering, run-id bounds, payload limits, and all nested fields; its output
+    is kept so the worker can submit those same bytes instead of encoding the
+    completion a second time in the supervisor (issue #846). *)
+let encoded_completion_of_commands ~run_id commands =
   let rec loop reversed = function
     | [] -> Ok (List.rev reversed)
     | command :: rest ->
@@ -1246,9 +1265,17 @@ let completion_of_commands ~run_id commands =
   in
   let* commands = loop [] commands in
   let completion = Protocol.{ run_id; task_failure = None; commands } in
-  match Protocol.encode_completion completion with
-  | Ok _ -> Ok completion
+  match Encoded_completion.encode completion with
+  | Ok encoded -> Ok { completion; encoded }
   | Error error -> Error (protocol_error error)
+
+(** Typed projection of [encoded_completion_of_commands] for callers that do
+    not submit the bytes. The validation is identical; only the canonical
+    document is dropped. *)
+let completion_of_commands ~run_id commands =
+  Result.map
+    (fun (checked : encoded_completion) -> checked.completion)
+    (encoded_completion_of_commands ~run_id commands)
 
 (** Checks that query answers belong to the activation being acknowledged.
 
@@ -1303,12 +1330,18 @@ let validate_completion_for_activation activation completion =
          "query completion identifiers must exactly match the activation")
   else Ok ()
 
-(** Applies one protocol activation to a pre-created deterministic execution.
-    Initialization data remains available from [translate_activation] for the
-    caller that constructs the typed [Execution.t]; this function only feeds the
-    runtime jobs and translates its resulting command batch. *)
-let activate execution activation =
-  let* translated = translate_activation activation in
+(** Applies one already translated activation to a pre-created deterministic
+    execution. Initialization data remains available from [translate_activation]
+    for the caller that constructs the typed [Execution.t]; this function only
+    feeds the runtime jobs and translates its resulting command batch.
+
+    Taking the translation rather than the protocol value is what lets the
+    native worker translate (and therefore validate) each activation once: it
+    already needs the translation for registry lookup and observer metadata
+    before it can choose an execution (issue #846). [translated_activation] is
+    private, so the argument can only have come from [translate_activation]. *)
+let activate_translated execution (translated : translated_activation) =
+  let activation = translated.source in
   let* () =
     match translated.initialization with
     | None -> Ok ()
@@ -1390,22 +1423,37 @@ let activate execution activation =
               metadata.continue_as_new_suggested);
       };
   let commands = Execution.activate execution translated.jobs in
-  let* completion =
+  (* The single canonical encoder pass for this completion. Its checks run
+     before the query and eviction checks below, in the same order as before
+     the encoded bytes were retained. *)
+  let* checked =
     match Execution.task_failure execution with
-    | None -> completion_of_commands ~run_id:translated.run_id commands
+    | None -> encoded_completion_of_commands ~run_id:translated.run_id commands
     | Some error ->
         let* failure = protocol_failure "$.task_failure" error in
         let completion = Protocol.{
           run_id = translated.run_id; commands = []; task_failure = Some failure
         } in
-        let* _ = Protocol.encode_completion completion |> Result.map_error protocol_error in
-        Ok completion
+        let* encoded =
+          Encoded_completion.encode completion |> Result.map_error protocol_error
+        in
+        Ok { completion; encoded }
   in
-  let* () = validate_completion_for_activation activation completion in
+  let* () = validate_completion_for_activation activation checked.completion in
   match translated.cache_removal with
-  | Some _ when completion.commands <> [] ->
+  | Some _ when checked.completion.commands <> [] ->
       Error
         (invalid "$.commands"
            "cache eviction must acknowledge the activation with no workflow \
             commands")
-  | _ -> Ok completion
+  | _ -> Ok checked
+
+(** Translates and applies one protocol activation, returning only the typed
+    completion. This is the convenience form for callers that hold a protocol
+    value and do not submit bytes; it performs exactly one translation and one
+    completion encode, like the worker path. *)
+let activate execution activation =
+  let* translated = translate_activation activation in
+  Result.map
+    (fun (checked : encoded_completion) -> checked.completion)
+    (activate_translated execution translated)

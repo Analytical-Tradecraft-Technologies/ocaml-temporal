@@ -117,7 +117,10 @@ module Source = struct
       Ok (Some activation)
 
   (** A rejected completion leaves its lease available for the retained retry. *)
-  let complete_workflow source (completion : Protocol.completion) =
+  let complete_workflow source ~(completion : Protocol.completion) _encoded =
+    (* This in-memory source has no native peer to receive the canonical
+       bytes; it inspects the typed completion the adapter passes beside
+       them. *)
     if source.reject_next then begin
       source.reject_next <- false;
       Error "retry"
