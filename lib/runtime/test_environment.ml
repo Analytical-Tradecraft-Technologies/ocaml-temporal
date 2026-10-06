@@ -229,6 +229,34 @@ let register kind ~name_of ~override_of ~value_of items =
       else Ok (Name_map.add name (value_of item) map))
     (Ok Name_map.empty) items
 
+(** Rejects a workflow registration that names two signal, query, or update
+    handlers alike. [Execution.start] treats such a list as a programming error
+    and raises, so checking here keeps [create] the single place where a bad
+    registration surfaces, as a typed defect, exactly as the worker's own
+    registration path does before any execution exists. *)
+let validate_handler_names (Workflow
+    { definition; signal_handlers; query_handlers; update_handlers; _ }) =
+  let check kind names =
+    let rec loop seen = function
+      | [] -> Ok ()
+      | name :: rest ->
+          if List.mem name seen then
+            Error
+              (defect
+                 (Printf.sprintf "duplicate %s handler %S in workflow %s" kind
+                    name (Definition.name definition)))
+          else loop (name :: seen) rest
+    in
+    loop [] names
+  in
+  let* () =
+    check "signal" (List.map Execution.signal_handler_name signal_handlers)
+  in
+  let* () =
+    check "query" (List.map Execution.query_handler_name query_handlers)
+  in
+  check "update" (List.map Execution.update_handler_name update_handlers)
+
 let create ?(namespace = "default") ?(task_queue = "temporal-testing")
     ?(start_time_ms = default_start_time_ms) ?(max_activity_attempts = 10)
     ~workflows ~activities () =
@@ -249,6 +277,11 @@ let create ?(namespace = "default") ?(task_queue = "temporal-testing")
     if max_activity_attempts < 1 then
       Error (defect "max_activity_attempts must be positive")
     else Ok ()
+  in
+  let* () =
+    List.fold_left
+      (fun acc workflow -> Result.bind acc (fun () -> validate_handler_names workflow))
+      (Ok ()) workflows
   in
   let* workflows =
     register "workflow"

@@ -563,6 +563,29 @@ let test_registration_rules () =
       T.Testing.shutdown environment;
       failwith "duplicate workflow registration was accepted"
   | Error error -> expect_contains "duplicate" ~needle:"duplicate" (T.Error.message error));
+  (* Two handlers with one signal name are a typed defect from [create],
+     never an exception from the first start. *)
+  (match
+     T.Testing.create
+       ~workflows:
+         [
+           T.Testing.workflow cart_workflow
+             ~signals:
+               [
+                 T.Signal.Handler.make add_item_signal add_item;
+                 T.Signal.Handler.make add_item_signal add_item;
+               ];
+         ]
+       ~activities:[] ()
+   with
+  | Ok environment ->
+      T.Testing.shutdown environment;
+      failwith "duplicate signal handler was accepted"
+  | Error error ->
+      if (T.Error.view error).category <> `Defect then
+        failwith "duplicate signal handler was not a defect";
+      expect_contains "duplicate handler" ~needle:"duplicate signal handler"
+        (T.Error.message error));
   with_environment ~workflows:[ cart_registration ] ~activities:[]
     (fun environment ->
       ignore (ok "start" (T.Testing.start ~id:"same" environment cart_workflow ()));
