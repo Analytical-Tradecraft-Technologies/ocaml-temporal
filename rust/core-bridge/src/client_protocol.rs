@@ -3578,5 +3578,7 @@ mod update_acceptance_tests;
 #[cfg(test)]
 #[path = "../tests/support/client_retry.rs"]
 mod client_retry_tests;
+
+#[cfg(test)]
 #[path = "../tests/support/client_errors.rs"]
 mod client_error_tests;
