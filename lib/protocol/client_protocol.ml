@@ -130,6 +130,7 @@ type wait_response = { execution : execution; outcome : outcome }
 type client_error =
   | Already_started of { workflow_id : string; existing_run_id : string option }
   | Rpc of { code : string }
+  | Query_failed of { message : string }
   | Protocol of { code : string }
 
 type start_outcome =
@@ -847,6 +848,23 @@ let client_error_code kind path value =
   if List.mem value allowed then Ok value
   else Error (invalid ~path "unknown client error code")
 
+(** Largest query handler failure message, in bytes, accepted from Rust. It
+    mirrors [MAX_QUERY_FAILURE_MESSAGE_BYTES] in the bridge, which truncates
+    the handler's message to this bound before encoding it. *)
+let max_query_failure_message_bytes = 4_096
+
+(** Validates a query handler failure message: bounded, valid UTF-8, and
+    NUL-free like every other protocol string. The message may be empty
+    because a handler may fail without one. *)
+let query_failure_message path value =
+  if String.length value > max_query_failure_message_bytes then
+    Error (invalid ~path "query failure message exceeds its limit")
+  else if not (String.is_valid_utf_8 value) then
+    Error (invalid ~path "query failure message is not valid UTF-8")
+  else if String.contains value '\000' then
+    Error (invalid ~path "query failure message contains a NUL byte")
+  else Ok value
+
 (** Builds one closed client-error object for tests and for callers that need
     to persist a terminal asynchronous outcome. The native bridge normally
     emits this document, but validating the OCaml encoder too keeps both sides
@@ -872,6 +890,11 @@ let encode_client_error_json path = function
   | Rpc { code } ->
       let* code = client_error_code "rpc" (path ^ ".code") code in
       Ok (`Assoc [ ("kind", json_string "rpc"); ("code", json_string code) ])
+  | Query_failed { message } ->
+      let* message = query_failure_message (path ^ ".message") message in
+      Ok
+        (`Assoc
+          [ ("kind", json_string "query_failed"); ("message", json_string message) ])
   | Protocol { code } ->
       let* code = client_error_code "protocol" (path ^ ".code") code in
       Ok
@@ -925,7 +948,23 @@ let decode_client_error input =
       let* code = client_error_code kind "$.code" code in
       if String.equal kind "rpc" then Ok (Rpc { code })
       else Ok (Protocol { code })
+  | "query_failed" ->
+      let* entries = exact_object path [ "kind"; "message" ] json in
+      let* message_json = field path "message" entries in
+      let* message = string "$.message" message_json in
+      let* message = query_failure_message "$.message" message in
+      Ok (Query_failed { message })
   | _ -> Error (invalid ~path:"$.kind" "unknown client error kind")
+
+(** Rejects the query-only [Query_failed] kind for an operation named by
+    [operation]. Only a query RPC can report a failed query handler, so the
+    kind on any other operation is a bridge defect, not a server answer. *)
+let reject_query_failed operation = function
+  | Query_failed _ ->
+      Error
+        (invalid ~path:"$.kind"
+           ("query_failed is not a valid " ^ operation ^ " error"))
+  | (Already_started _ | Rpc _ | Protocol _) as error -> Ok error
 
 (** Checks that an error body is valid for a workflow-start operation. The
     [already_started] identity is correlated with the request so a malformed
@@ -938,6 +977,7 @@ let validate_start_error (request : start_request) = function
         Error
           (invalid ~path:"$.workflow_id"
              "already-started error names a different workflow ID")
+  | Query_failed _ as error -> reject_query_failed "start" error
   | (Rpc _ | Protocol _) as error -> Ok error
 
 (** Serializes one terminal asynchronous-start outcome. [Unknown] is kept as a
@@ -954,6 +994,7 @@ let encode_start_outcome = function
             ("started", `Bool started);
           ])
   | Rejected error ->
+      let* error = reject_query_failed "start" error in
       let* error = encode_client_error_json "$.error" error in
       encode_object
         (`Assoc [ ("kind", json_string "rejected"); ("error", error) ])
@@ -1031,6 +1072,7 @@ let validate_wait_error (_request : wait_request) = function
       Error
         (invalid ~path:"$.kind"
            "already_started is not a valid exact-run wait error")
+  | Query_failed _ as error -> reject_query_failed "exact-run wait" error
   | (Rpc _ | Protocol _) as error -> Ok error
 
 (** Decodes a start failure and correlates any existing-run identity with the
@@ -1054,6 +1096,7 @@ let decode_cancel_error input =
       Error
         (invalid ~path:"$.kind"
            "already_started is not a valid cancellation error")
+  | Query_failed _ -> reject_query_failed "cancellation" error
   | (Rpc _ | Protocol _) -> Ok error
 
 (** Reset shares the cancellation RPC error vocabulary but has its own public
@@ -1069,11 +1112,13 @@ let decode_signal_error input =
       Error
         (invalid ~path:"$.kind"
            "already_started is not a valid signal error")
+  | Query_failed _ -> reject_query_failed "signal" error
   | (Rpc _ | Protocol _) -> Ok error
 
 (** Decodes a query failure while rejecting the start-only conflict category.
     Query rejection is reported as a stable RPC/protocol error; it cannot
-    carry an [Already_started] workflow identity. *)
+    carry an [Already_started] workflow identity. A failed query handler is
+    the query-only [Query_failed] kind. *)
 let decode_query_error input =
   let* error = decode_client_error input in
   match error with
@@ -1081,4 +1126,17 @@ let decode_query_error input =
       Error
         (invalid ~path:"$.kind"
            "already_started is not a valid query error")
+  | (Rpc _ | Query_failed _ | Protocol _) -> Ok error
+
+(** Decodes an update admission or poll failure. Update RPCs share the query
+    error vocabulary except for [Query_failed]: an update validator rejection
+    is a completed outcome, never a query handler failure. *)
+let decode_update_error input =
+  let* error = decode_client_error input in
+  match error with
+  | Already_started _ ->
+      Error
+        (invalid ~path:"$.kind"
+           "already_started is not a valid update error")
+  | Query_failed _ -> reject_query_failed "update" error
   | (Rpc _ | Protocol _) -> Ok error

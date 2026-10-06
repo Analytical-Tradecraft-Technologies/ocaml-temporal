@@ -50,6 +50,11 @@
  (libraries temporal-sdk temporal_sdk_kernel))
 
 (test
+ (name test_client_rpc_errors)
+ (flags (:standard -I lib/public/.temporal.objs/byte))
+ (libraries temporal-sdk temporal_sdk_kernel))
+
+(test
  (name test_ocaml_client_update_protocol)
  (libraries temporal_protocol))
 

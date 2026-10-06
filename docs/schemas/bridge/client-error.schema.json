@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/docs/schemas/bridge/client-error.schema.json",
   "title": "OCaml Temporal native client error body",
-  "description": "Closed JSON error body returned in the ABI error buffer for client start and wait operations. Server diagnostic text is deliberately not copied.",
+  "description": "Closed JSON error body returned in the ABI error buffer for client operations. Server diagnostic text is deliberately not copied; the only free text is a failed query handler's own bounded message. already_started is start-only and query_failed is query-only.",
   "oneOf": [
     {
       "type": "object",
@@ -39,8 +39,23 @@
             "internal",
             "unavailable",
             "data_loss",
-            "unauthenticated"
+            "unauthenticated",
+            "termination_outcome_uncertain"
           ]
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "message"],
+      "properties": {
+        "kind": {"const": "query_failed"},
+        "message": {
+          "description": "The workflow query handler's failure message, truncated to 4096 UTF-8 bytes at a character boundary; NUL is replaced by U+FFFD. May be empty.",
+          "type": "string",
+          "maxLength": 4096,
+          "pattern": "^[^\\u0000]*$"
         }
       }
     },

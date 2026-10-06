@@ -19,11 +19,35 @@ let read () = Result.bind (Workflow_context.Local.get final_value) (function
   | Some value -> Ok value
   | None -> Error (Error.defect ~message:"completed workflow lost its local state"))
 
+(** A registered query whose handler always returns a business error, so the
+    client must see Temporal's query failure rather than a malformed request
+    (issue #823). *)
+let refusing_query = Query.define ~name:"refusing" ~output:Codec.string
+let refusal = "this query is refused by its handler"
+let refuse () = Error (Error.make ~category:`Workflow ~message:refusal ())
+
+(** Signal sent only after completion, which Temporal rejects as NotFound. *)
+let late_signal = Signal.define ~name:"late" ~input:Codec.string
+
+(** Requires the typed, non-retryable query handler failure of issue #823 and
+    returns its message. *)
+let expect_query_failed label = function
+  | Ok _ -> failwith (label ^ " unexpectedly succeeded")
+  | Error error ->
+      let view = Error.view error in
+      if not (Client.is_query_failed error && view.non_retryable
+              && view.category = `Workflow
+              && view.error_type = Some "QueryFailed") then
+        failwith (Printf.sprintf "%s was not a typed query failure: %s %S"
+          label (Error.kind error) view.message);
+      view.message
+
 (** Runs the fixture worker on its own unique task queue. *)
 let worker address queue =
   let worker = get (Worker.create ~target_url:address ~namespace:"default"
     ~task_queue:queue ~activities:[] ~workflows:[Worker.workflow workflow
-      ~queries:[Query.Handler.make query read]] ()) in
+      ~queries:[Query.Handler.make query read;
+                Query.Handler.make refusing_query refuse]] ()) in
   get (Worker.run worker)
 
 (** Spawns a separate worker process so replacement has no shared OCaml state. *)
@@ -54,9 +78,23 @@ let check address =
             failwith "completed query returned the wrong state"
         done;
         let missing = Query.define ~name:"missing" ~output:Codec.string in
-        (match Client.query handle ~query:missing with
-        | Error _ -> ()
-        | Ok _ -> failwith "missing completed query unexpectedly succeeded");
+        if expect_query_failed "missing completed query"
+             (Client.query handle ~query:missing) = "" then
+          failwith "missing query failure lost its diagnostic";
+        let message = expect_query_failed "refusing completed query"
+          (Client.query handle ~query:refusing_query) in
+        if not (String.equal message refusal) then
+          failwith (Printf.sprintf "query failure lost the handler message: %S"
+            message);
+        (* A signal to the closed run is a permanent NotFound, not a
+           retryable transport failure. *)
+        (match Client.signal handle ~signal:late_signal ~input:"late" with
+        | Ok () -> failwith "signal to a completed run unexpectedly succeeded"
+        | Error error ->
+            if not (Client.rpc_status error = Some `Not_found
+                    && (Error.view error).non_retryable) then
+              failwith ("signal to a completed run was not a typed NotFound: "
+                ^ Error.message error));
         if get (Client.query handle ~query) <> expected then
           failwith "failed query invalidated the completed execution";
         Option.iter stop !worker_pid;

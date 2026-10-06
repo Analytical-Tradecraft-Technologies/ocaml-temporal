@@ -514,9 +514,26 @@ pub enum ClientOperationError {
         /// Lowercase tonic status code name.
         code: String,
     },
+    /// The workflow's query handler failed, or the worker reported the query
+    /// name as unknown. Temporal answers such a query with `InvalidArgument`
+    /// plus a `QueryFailedFailure` status detail; only that detail
+    /// distinguishes it from a malformed request. Unlike other RPC failures,
+    /// the handler's message is kept, because it is the application's answer
+    /// to its own caller rather than server prose; it is bounded by
+    /// [`bounded_query_failure_message`].
+    QueryFailed {
+        /// Bounded, NUL-free handler failure message; may be empty.
+        message: String,
+    },
     /// Core returned an event or payload outside this closed semantic slice.
     Core(workflow_protocol::CoreConversionError),
 }
+
+/// Largest query handler failure message, in UTF-8 bytes, that crosses the
+/// bridge. A handler controls its own message, so the bound keeps one failed
+/// query from producing an arbitrarily large error buffer; a longer message is
+/// truncated at a character boundary. OCaml enforces the same limit.
+pub(crate) const MAX_QUERY_FAILURE_MESSAGE_BYTES: usize = 4_096;
 
 /// Closed JSON body used when a start call reports `AlreadyStarted`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -533,6 +550,12 @@ pub(crate) enum ClientErrorDocument {
     Rpc {
         /// Lowercase tonic status code name.
         code: String,
+    },
+    /// Query handler failure with its bounded message; see
+    /// [`ClientOperationError::QueryFailed`].
+    QueryFailed {
+        /// Bounded, NUL-free handler failure message.
+        message: String,
     },
     /// Stable category for a Core event that cannot cross the semantic bridge.
     Protocol {
@@ -581,6 +604,9 @@ fn error_document(error: &ClientOperationError) -> ClientErrorDocument {
             existing_run_id: existing_run_id.clone(),
         },
         ClientOperationError::Rpc { code } => ClientErrorDocument::Rpc { code: code.clone() },
+        ClientOperationError::QueryFailed { message } => ClientErrorDocument::QueryFailed {
+            message: message.clone(),
+        },
         ClientOperationError::Core(conversion) => ClientErrorDocument::Protocol {
             code: match conversion.code {
                 workflow_protocol::CoreConversionErrorCode::Unsupported => {
@@ -614,6 +640,13 @@ fn validate_start_outcome_document(
             }
             ClientErrorDocument::Rpc { code } => validate_identifier(code, "$.error.code")?,
             ClientErrorDocument::Protocol { code } => validate_identifier(code, "$.error.code")?,
+            // A query handler failure can never reject a workflow start.
+            ClientErrorDocument::QueryFailed { .. } => {
+                return Err(protocol::ProtocolError::invalid(
+                    "$.error.kind",
+                    "query_failed is not a valid start rejection",
+                ));
+            }
         },
         StartWorkflowOutcomeDocument::Unknown {
             request_id,
@@ -630,9 +663,10 @@ impl ClientOperationError {
     /// Encodes a privacy-safe structured error body for the ABI error buffer.
     pub(crate) fn to_json(&self) -> String {
         let document = error_document(self);
-        // All variants contain validated identifiers or a bounded tonic code;
-        // serialization cannot fail.  Keep a defensive fallback that cannot
-        // expose a Rust panic through the ABI if a future variant changes.
+        // All variants contain validated identifiers, a bounded tonic code,
+        // or a bounded query failure message; serialization cannot fail.  Keep
+        // a defensive fallback that cannot expose a Rust panic through the ABI
+        // if a future variant changes.
         serde_json::to_string(&document)
             .unwrap_or_else(|_| "{\"kind\":\"rpc\",\"code\":\"internal\"}".to_owned())
     }
@@ -646,7 +680,9 @@ impl ClientOperationError {
     /// the server supplied the conflicting workflow identity.
     pub(crate) fn uncertain_start(&self) -> bool {
         match self {
-            Self::AlreadyStarted { .. } => false,
+            // `QueryFailed` is only produced by the query operation; it is
+            // listed so the match stays exhaustive and terminal.
+            Self::AlreadyStarted { .. } | Self::QueryFailed { .. } => false,
             Self::Core(_) => true,
             Self::Rpc { code } => matches!(
                 code.as_str(),
@@ -1206,7 +1242,7 @@ pub async fn query_workflow(
     )
     .await
     {
-        Ok(result) => result.map_err(map_rpc_status)?.into_inner(),
+        Ok(result) => result.map_err(map_query_status)?.into_inner(),
         Err(_) => {
             return Err(ClientOperationError::Rpc {
                 code: "deadline_exceeded".to_owned(),
@@ -1833,6 +1869,73 @@ fn map_start_status(workflow_id: &str, status: Status) -> ClientOperationError {
     } else {
         map_rpc_status(status)
     }
+}
+
+/// Maps a query RPC failure, recognizing Temporal's query handler failure.
+///
+/// Temporal reports a failed query handler (or a query name the worker does
+/// not know) as `InvalidArgument` with a `QueryFailedFailure` status detail and
+/// the handler's message as the status message. The detail, not the code,
+/// identifies it: a malformed request is also `InvalidArgument` but carries no
+/// such detail, and an old server that omits the detail is indistinguishable
+/// from one, so it stays a plain RPC error. When the detail carries the full
+/// failure, its message is preferred because it is what the handler raised;
+/// otherwise the status message (the server's copy of it) is used.
+fn map_query_status(status: Status) -> ClientOperationError {
+    if status.code() == Code::InvalidArgument
+        && let Some(detail) = query_failed_detail(status.details())
+    {
+        let message = match detail.failure {
+            Some(failure) if !failure.message.is_empty() => failure.message,
+            _ => status.message().to_owned(),
+        };
+        return ClientOperationError::QueryFailed {
+            message: bounded_query_failure_message(&message),
+        };
+    }
+    map_rpc_status(status)
+}
+
+/// Fully qualified `Any` type URL of Temporal's query failure status detail.
+const QUERY_FAILED_TYPE_URL: &str =
+    "type.googleapis.com/temporal.api.errordetails.v1.QueryFailedFailure";
+
+/// Decodes the `QueryFailedFailure` status detail from encoded
+/// `google.rpc.Status` bytes. Core's generic `decode_status_detail` ignores
+/// the `Any` type URL, and protobuf decoding is lenient enough that an
+/// unrelated detail (for example a `BadRequest`) could decode as this message,
+/// so the type URL is checked first. Malformed bytes are treated as absent.
+fn query_failed_detail(
+    details: &[u8],
+) -> Option<temporalio_common::protos::temporal::api::errordetails::v1::QueryFailedFailure> {
+    use prost::Message;
+    let status = temporalio_common::protos::google::rpc::Status::decode(details).ok()?;
+    let detail = status.details.first()?;
+    if detail.type_url != QUERY_FAILED_TYPE_URL {
+        return None;
+    }
+    Message::decode(detail.value.as_slice()).ok()
+}
+
+/// Makes a handler-controlled message safe for the closed error document:
+/// NUL, which the bilateral string contract rejects, becomes U+FFFD, and the
+/// result is truncated at a character boundary to at most
+/// [`MAX_QUERY_FAILURE_MESSAGE_BYTES`] bytes. Other control characters are
+/// left to JSON escaping.
+pub(crate) fn bounded_query_failure_message(message: &str) -> String {
+    let mut bounded = String::with_capacity(message.len().min(MAX_QUERY_FAILURE_MESSAGE_BYTES));
+    for character in message.chars() {
+        let character = if character == '\0' {
+            char::REPLACEMENT_CHARACTER
+        } else {
+            character
+        };
+        if bounded.len() + character.len_utf8() > MAX_QUERY_FAILURE_MESSAGE_BYTES {
+            break;
+        }
+        bounded.push(character);
+    }
+    bounded
 }
 
 /// Maps a non-start RPC failure without inventing start-specific semantics.
@@ -3333,3 +3436,7 @@ mod tests {
 #[cfg(test)]
 #[path = "../tests/support/client_update.rs"]
 mod update_acceptance_tests;
+
+#[cfg(test)]
+#[path = "../tests/support/client_errors.rs"]
+mod client_error_tests;

@@ -321,7 +321,7 @@ and bridge, read the [documentation guide](../README.md) first.
   rejection) acknowledges it with an empty completion instead. Failing an
   eviction leaves it outstanding in release Core and panics debug Core
   (issue #814).
-- Native `Not_ready` is represented as `Ok None`. ABI version 3 also exposes
+- Native `Not_ready` is represented as `Ok None`. ABI version 4 also exposes
   bounded `Wait_workflow`, `Wait_activity`, and combined `Wait_any` readiness
   operations. Only the
   owner-Domain supervisor may invoke them; the C boundary releases the OCaml

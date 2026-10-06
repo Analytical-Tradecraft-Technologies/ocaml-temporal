@@ -534,7 +534,10 @@ module Protocol_adapter = struct
       versa. *)
   let client_error_status = function
     | Client.Already_started _ -> Bridge.Already_started
-    | Client.Rpc _ -> Bridge.Connection
+    | Client.Rpc _ | Client.Query_failed _ ->
+        (* A failed query handler arrives as an RPC status, so Rust reports
+           it with the RPC status; the JSON kind carries the distinction. *)
+        Bridge.Connection
     | Client.Protocol _ -> Bridge.Protocol
 
   (** Decodes and status-checks one structured start failure. Statuses outside
@@ -793,7 +796,7 @@ module Protocol_adapter = struct
   let decode_client_update_failure native_error =
     match native_error.Bridge.status with
     | Connection | Protocol -> (
-        match Client.decode_query_error native_error.message with
+        match Client.decode_update_error native_error.message with
         | Error error -> malformed_client_error "client update" error
         | Ok client_error ->
             if native_error.Bridge.status = client_error_status client_error then

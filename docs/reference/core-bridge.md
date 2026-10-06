@@ -13,7 +13,7 @@ background threads.
 
 ## Version and symbols
 
-ABI version 3 uses only symbols beginning with `ocaml_temporal_core_v3_`.
+ABI version 4 uses only symbols beginning with `ocaml_temporal_core_v4_`.
 Before using the bridge, OCaml asks Rust which ABI version it implements and
 checks that it matches `OCAML_TEMPORAL_CORE_ABI_VERSION`. The bridge represents
 the Rust runtime with one opaque handle. Client connection and worker state are
@@ -38,6 +38,14 @@ a bump, either mixed pairing would pass negotiation and then fail every
 `Client.start` with a protocol error. Renaming the symbol prefix to
 `ocaml_temporal_core_v3_` together with the constant makes a stale archive or
 stale OCaml object fail at link time or during startup negotiation instead.
+
+Version 4 is intentionally incompatible with version 3. The closed client
+error document gained a `query_failed` kind that carries the bounded message
+of a workflow query handler failure (issue #823). A version 3 OCaml decoder
+rejects that kind as unknown, so a stale OCaml object paired with a version 4
+archive would turn every query handler failure into a protocol error, and a
+version 3 archive never emits it. The symbol prefix therefore moves to
+`ocaml_temporal_core_v4_` together with the constant.
 
 The canonical header is
 `rust/core-bridge/include/ocaml_temporal_core.h`. Both Rust and C compile-time
@@ -321,7 +329,7 @@ A result has one success buffer and one error buffer. At most one owns memory:
 
 Rust owns both allocations. The caller may copy their bytes but must never
 mutate or directly free their fields. It must call
-`ocaml_temporal_core_v3_result_free` exactly once after consuming an initialized
+`ocaml_temporal_core_v4_result_free` exactly once after consuming an initialized
 result. That function clears the object, so accidentally calling it again on
 the same object is safe. Copying a live result structure creates no new
 ownership; freeing both copies is invalid.
@@ -333,7 +341,7 @@ result when passed to another operation. Free the previous result first.
 
 The private C stubs allocate an OCaml custom block before entering Rust. That
 block is the sole owner of the ABI result and has a finalizer which calls
-`ocaml_temporal_core_v3_result_free`. The OCaml wrapper also uses
+`ocaml_temporal_core_v4_result_free`. The OCaml wrapper also uses
 `Fun.protect` to release the result deterministically after copying its bytes.
 This gives every path two compatible safeguards: normal operation frees
 immediately, while an OCaml allocation failure or other exception leaves a
@@ -427,7 +435,7 @@ and cannot retire the real lease. The malformed-byte case is defensive:
 successful Rust poll encoding cannot produce malformed JSON, but both language
 decoders and both rejection entry points still validate it.
 
-`Sdk_supervisor.Native` is the private OCaml adapter for these ABI version 3
+`Sdk_supervisor.Native` is the private OCaml adapter for these ABI version 4
 operations. It exposes a typed GADT rather than raw JSON bytes:
 
 | Supervisor operation | Result and boundary behavior |
@@ -641,7 +649,7 @@ and no long Core poll occupies the supervisor Domain. Keeping the lanes
 independent prevents an idle activity poll from delaying workflow completion,
 or vice versa.
 
-ABI version 3 includes private readiness-wait symbols for the two independent
+ABI version 4 includes private readiness-wait symbols for the two independent
 poll lanes and one combined wait over both. The supervisor may invoke them
 only from the owner-domain mailbox handler; the C boundary releases the OCaml
 runtime lock while Rust waits and reacquires it before returning. Callers must

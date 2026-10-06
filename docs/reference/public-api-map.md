@@ -148,7 +148,15 @@ for those rules.
   most 64 starts in flight and waits on at most 64 distinct runs at once; a
   call beyond either bound is rejected before reaching Temporal with a
   retryable `bridge` error that `Client.is_at_capacity` recognizes, and the
-  client stays usable.
+  client stays usable. A Temporal RPC failure is classified by
+  `Client.rpc_status` (one variant per gRPC status, plus
+  `` `Termination_outcome_uncertain ``); the same error carries a stable
+  PascalCase `Error.error_type` such as `"NotFound"` and is `non_retryable`
+  exactly for permanent conditions (invalid argument, not found, already
+  exists, failed precondition, permission denied, unauthenticated,
+  unimplemented, uncertain termination). A failed workflow query handler is a
+  non-retryable `workflow` error with type `"QueryFailed"` and the handler's
+  bounded message, recognized by `Client.is_query_failed`.
 - `Temporal.Worker` registers workflows, activities, and the signal, query, and
   update handlers attached to each workflow registration. It owns one
   supervisor graph, runs the poll loops, and performs idempotent shutdown.
