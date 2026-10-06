@@ -1,3 +1,7 @@
+test/integration/client_request_ids/regression.exe
+test/integration/completed_queries/regression.exe
+test/integration/local_activity_cancellation/regression.exe
+test/integration/split_worker_task_types/regression.exe
 test/integration/temporal/driver/cache_eviction_driver.exe
 test/integration/temporal/driver/parent_child_restart_driver.exe
 test/integration/temporal/driver/restart_driver.exe
@@ -15,4 +19,5 @@ test/integration/temporal/worker/cache_eviction_worker.exe
 test/integration/temporal/worker/parent_child_restart_worker.exe
 test/integration/temporal/worker/smoke_worker.exe
 test/integration/test_core_lifecycle.exe
+test/integration/update_outcomes/regression.exe
 test/integration/worker_poll_isolation/regression.exe

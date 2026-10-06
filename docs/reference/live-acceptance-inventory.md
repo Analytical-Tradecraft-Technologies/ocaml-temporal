@@ -12,6 +12,7 @@ Extracted from the `temporal-integration` job in
 [Makefile](../../Makefile) when present and sorted independently of run order.
 
 - `make test-temporal-integration`
+- `make test-temporal-live-regressions`
 - `make test-temporal-parent-child-failure-replay`
 - `make test-temporal-parent-child-restart`
 - `make test-temporal-start-metadata-live`

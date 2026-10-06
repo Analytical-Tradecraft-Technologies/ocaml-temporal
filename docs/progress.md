@@ -15,6 +15,23 @@ implementation when a later entry documents that work as complete. The
 records the current tested source, named assertions and successful CI job for
 the Temporal acceptance controllers.
 
+## 2026-10-06: Fixed-bug live regressions run in CI (#795)
+
+The live regression executables for client request IDs (#545), update
+admission outcomes (#546), completed-workflow queries (#548), local activity
+retry cancellation (#567) and split workflow/activity workers (#805) were
+neither compiled nor run by CI. They are now in the prebuilt smoke artifact,
+and `make test-temporal-live-ci` runs them through
+`make test-temporal-live-regressions` against a fresh Compose stack. That
+target registers the fixtures' `default` namespace, copies the pinned
+admin-tools CLI for the two suites that inspect or delete their own
+executions, and bounds every process. A Docker-free contract, part of
+`make test-quality-contract`, requires every `test/integration/*/regression.exe`
+to be in the artifact list and run by a recipe reachable from the CI live
+target, and its self-test proves that omissions are rejected. The suites
+compiled locally with OCaml 5.4.1; their first live results come from the
+pull request's Linux CI job.
+
 ## 2026-10-06: Retained completions fail closed (#843)
 
 The workflow and activity adapters used to resubmit every retained completion
