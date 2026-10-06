@@ -1,4 +1,4 @@
-(** Opt-in live #805 regression for the split-worker deployment shape shipped
+(** Live #805 regression for the split-worker deployment shape shipped
     in [examples/]. A workflow-only worker and an activity-only worker share
     one fresh task queue. Before #805 the workflow-only worker also polled
     activity tasks and failed them non-retryably as unregistered, so most
@@ -7,7 +7,8 @@
     Run against a disposable Temporal Server only:
     [dune exec test/integration/split_worker_task_types/regression.exe -- check
     http://127.0.0.1:7233]. [TEMPORAL_NAMESPACE] defaults to
-    [temporal-sdk-test]. *)
+    [temporal-sdk-test]. CI runs it through
+    [make test-temporal-live-regressions]. *)
 open Temporal
 
 (** Converts the public result boundary into a short fixture failure. *)
