@@ -2693,6 +2693,22 @@ Local validation covered the repository contract scripts and a stub-OPAM test
 of the installer; the image builds and native installs are validated by the
 hosted CI matrix.
 
+## 2026-10-06: Dispose acknowledges Core's follow-up evictions (#775)
+
+Runtime close force-fails each workflow activation OCaml still holds and
+tombstones its run ID. Core answers that failure with a same-run cache
+eviction, which the workflow poll lane used to drop as a retired duplicate, so
+the workflow poll never reported `ShutDown`: close waited out the 90 s drain
+bound and released an unfinalized worker. The lane now acknowledges a retired
+run's pure eviction with an empty completion, and dispose's own
+force-completion acknowledges leased or queued evictions empty instead of
+failing them. The ledger records each run's eviction bit when the poll lane
+admits it, so an entry admitted but not yet enqueued at the disposal snapshot
+is still acknowledged rather than failed.
+`rust/core-bridge/tests/runtime_dispose_eviction.rs` drives a
+leased activation through runtime close against a gRPC double and fails
+within 30 s without the fix.
+
 ## 2026-10-06: Workflow and activity execution info (#792)
 
 `Temporal.Workflow.info ()` and `Temporal.Workflow.is_replaying ()` expose the
