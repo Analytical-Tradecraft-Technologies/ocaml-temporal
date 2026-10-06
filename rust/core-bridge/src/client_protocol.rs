@@ -868,18 +868,40 @@ fn wait_retry_options() -> RetryOptions {
     }
 }
 
+/// Total budget of one control-plane RPC (signal, cancel, reset, terminate),
+/// including Core's retries (#820).
+///
+/// These acknowledgements run synchronously on the supervisor's owner Domain,
+/// so the budget keeps a stalled or unavailable server from holding it. It is
+/// three seconds rather than one so that the `resource_exhausted` retry Core
+/// performs actually happens: Core waits its throttle backoff of 1 s +/-20%
+/// (at most 1.2 s) before the second attempt, which a one-second budget
+/// usually cut off with `deadline_exceeded`. Three seconds leaves room for
+/// that wait, the re-sent attempt, and several fast `unavailable` retries; a
+/// second consecutive `resource_exhausted` (a further 2 s +/-20% wait) does
+/// not fit and ends in the caller's deadline error.
+const CONTROL_RPC_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// Wraps one bounded client RPC message for Core's retrying `Connection`.
 ///
 /// Every client RPC except the history long poll has a fixed total budget that
 /// keeps the supervisor's synchronous turn finite. Core's default retry window
 /// (ten seconds) is unrelated to those budgets, so it is replaced by Core's
 /// default backoff limited to `budget`: Core stops scheduling retries once the
-/// budget is spent and returns the last transport status (for example
-/// `unavailable`) instead of letting the caller's outer timeout discard it.
-/// The same budget is the gRPC deadline of each transport attempt, so the
-/// server also abandons work the client will no longer wait for. Callers keep
-/// their outer `tokio::time::timeout`, which still caps an attempt that is in
-/// flight when the budget expires.
+/// next backoff would end after the budget and returns the last transport
+/// status (for example `unavailable`) instead of letting the caller's outer
+/// timeout discard it. The same budget is the gRPC deadline of each transport
+/// attempt, so the server also abandons work the client will no longer wait
+/// for. Callers keep their outer `tokio::time::timeout`, which still caps the
+/// call when the budget expires while an attempt is in flight or while Core is
+/// sleeping a `resource_exhausted` throttle delay; that cap yields the
+/// caller's deadline error instead of a transport status.
+///
+/// The throttle delay is not covered by the retry window: the pinned Core
+/// accepts a `resource_exhausted` retry using its ordinary backoff (about
+/// 100 ms at first) and only then lengthens the wait to its separate throttle
+/// backoff (1 s, then 2 s, 4 s, ... up to 10 s, each +/-20%) without
+/// rechecking the window. [`CONTROL_RPC_TIMEOUT`] is sized for that.
 ///
 /// Which status codes are retried is Core's decision (`unavailable`,
 /// `resource_exhausted`, `unknown`, `internal`, `aborted`, `out_of_range`,
@@ -902,17 +924,37 @@ fn budgeted_request<T>(message: T, budget: Duration) -> Request<T> {
 /// Reports whether a failed `TerminateWorkflowExecution` attempt must be
 /// returned instead of retried.
 ///
-/// Terminate has no idempotency key. Only `unavailable` (almost always a call
-/// that never reached a healthy server) and `resource_exhausted` (the server's
-/// rate limiter rejected it before processing) are retried. Statuses such as
-/// `unknown` or `internal` can be produced after the server applied the
-/// termination, when a blind re-send would turn that success into a
-/// misleading `not_found`. The residual case, an `unavailable` reported after
-/// the server applied the first attempt, can likewise surface as `not_found`
-/// from the retry; callers reconcile it with `wait`, as for
+/// Terminate has no idempotency key, so Core may re-send it only after a
+/// status proving that the server did not apply the first attempt:
+/// `resource_exhausted`, which Temporal's rate limiters and admission checks
+/// return before the command is processed. Every other status is returned at
+/// once. In particular `unavailable` is not retried: besides a refused
+/// connection it is also what the transport reports when the connection
+/// drops after the server applied the termination but before the
+/// acknowledgement arrived, and a blind re-send of that applied termination
+/// would report a misleading `not_found` for the already terminated run.
+/// [`terminate_status_error`] reports such an ambiguous status as
 /// `termination_outcome_uncertain`.
 fn terminate_retry_forbidden(status: &Status) -> bool {
-    !matches!(status.code(), Code::Unavailable | Code::ResourceExhausted)
+    status.code() != Code::ResourceExhausted
+}
+
+/// Converts a terminate failure into the typed bridge error.
+///
+/// `unavailable`, `deadline_exceeded`, and `cancelled` can be reported after
+/// the server applied the termination (a dropped connection, or the
+/// per-attempt gRPC deadline expiring while the acknowledgement was in
+/// flight), and the RPC has no idempotency key that would make a re-send
+/// equivalent. They therefore become `termination_outcome_uncertain`, the
+/// same result as the outer deadline, which callers reconcile with `wait`.
+/// Every other status keeps its stable gRPC code.
+fn terminate_status_error(status: Status) -> ClientOperationError {
+    match status.code() {
+        Code::Unavailable | Code::DeadlineExceeded | Code::Cancelled => ClientOperationError::Rpc {
+            code: "termination_outcome_uncertain".to_owned(),
+        },
+        _ => map_rpc_status(status),
+    }
 }
 
 /// Builds a budgeted terminate request (see [`budgeted_request`]) whose Core
@@ -1012,7 +1054,6 @@ pub async fn cancel_workflow(
     // wait. Bound it so a stalled server cannot hold the owner Domain mailbox
     // forever; callers can retry the same request ID when the outcome is
     // uncertain.
-    const CONTROL_RPC_TIMEOUT: Duration = Duration::from_secs(1);
     let mut service = connection.clone();
     let request = RequestCancelWorkflowExecutionRequest {
         namespace: request.namespace,
@@ -1050,7 +1091,6 @@ pub async fn reset_workflow(
     connection: Connection,
     request: ResetWorkflowRequest,
 ) -> Result<ResetWorkflowResponse, ClientOperationError> {
-    const CONTROL_RPC_TIMEOUT: Duration = Duration::from_secs(1);
     let mut service = connection.clone();
     let namespace = request.namespace.clone();
     let workflow_id = request.workflow_id.clone();
@@ -1114,7 +1154,6 @@ pub async fn terminate_workflow(
     connection: Connection,
     request: TerminateWorkflowRequest,
 ) -> Result<TerminateWorkflowResponse, ClientOperationError> {
-    const CONTROL_RPC_TIMEOUT: Duration = Duration::from_secs(1);
     let mut service = connection.clone();
     let request = TerminateWorkflowExecutionRequest {
         namespace: request.namespace,
@@ -1133,7 +1172,7 @@ pub async fn terminate_workflow(
     .await
     {
         Ok(result) => {
-            result.map_err(map_rpc_status)?;
+            result.map_err(terminate_status_error)?;
         }
         Err(_) => {
             return Err(ClientOperationError::Rpc {
@@ -1159,7 +1198,6 @@ pub async fn signal_workflow(
     // for workflow code to process the message. Keep the owner Domain
     // responsive when the server is unavailable; callers can retry the same
     // request ID after an uncertain timeout.
-    const CONTROL_RPC_TIMEOUT: Duration = Duration::from_secs(1);
     let payloads = payloads_to_core(&request.input).map_err(ClientOperationError::Core)?;
     let mut service = connection.clone();
     let request = SignalWorkflowExecutionRequest {

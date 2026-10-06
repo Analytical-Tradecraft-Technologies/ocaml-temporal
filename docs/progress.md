@@ -22,14 +22,20 @@ client RPC called the raw `workflow_service()` stub, so `Client.wait` failed
 about a second after the Temporal Server stopped. Wait, signal, query, cancel,
 terminate, reset, update, update polling, and visibility listing now use the
 retrying connection. Bounded RPCs fit Core's retry window and each attempt's
-gRPC deadline inside their existing budgets, terminate retries only
-`unavailable` and `resource_exhausted` because it has no idempotency key, and
-the history long poll allows thirty consecutive attempts per poll. Callback
-transport tests in `rust/core-bridge/tests/support/client_retry.rs` prove
-recovery after one `unavailable` reply for each RPC with byte-identical
-re-sends, no retry of `not_found`/`invalid_argument` or of ambiguous terminate
-statuses, and a persistently unavailable signal returning within its
-one-second budget. See
+gRPC deadline inside their budgets; the control-RPC budget grew from one to
+three seconds so that Core's 1 s +/-20% throttle wait before re-sending after
+`resource_exhausted` fits. Terminate has no idempotency key, so it is re-sent
+only after `resource_exhausted` and reports `unavailable` as
+`termination_outcome_uncertain` instead of risking a misleading `not_found`
+from a blind re-send. The history long poll allows thirty consecutive attempts
+per poll. Callback transport tests in
+`rust/core-bridge/tests/support/client_retry.rs` prove recovery after one
+`unavailable` reply for each idempotent RPC with byte-identical re-sends, a
+signal and a terminate delivered after one `resource_exhausted` inside the
+control budget (the signal case fails with the old one-second budget), no
+retry of `not_found`/`invalid_argument` or of ambiguous terminate statuses, an
+uncertain result for an unavailable terminate, and a persistently unavailable
+signal returning within its budget. See
 [the Core bridge reference](reference/core-bridge.md#native-client-start-and-exact-run-wait).
 
 ## 2026-10-06: Retained completions fail closed (#843)

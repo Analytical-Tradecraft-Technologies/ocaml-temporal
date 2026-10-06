@@ -258,9 +258,9 @@ fn signal_does_not_retry_a_definitive_rejection() {
     assert_eq!(probe.count(), 1);
 }
 
-/// A server that stays unavailable is retried only within the one-second
-/// control budget, and the caller receives the transport status rather than a
-/// synthetic deadline.
+/// A server that stays unavailable is retried only within the control budget,
+/// and the caller receives the transport status (or, for an attempt still in
+/// flight when the budget ends, a synthetic deadline).
 #[test]
 fn persistent_signal_failure_stays_within_the_control_budget() {
     let (core, connection, probe) = scripted_connection(
@@ -271,7 +271,10 @@ fn persistent_signal_failure_stays_within_the_control_budget() {
     let started = Instant::now();
     let result = signal(&core, connection);
     let elapsed = started.elapsed();
-    assert!(elapsed < Duration::from_millis(1500), "took {elapsed:?}");
+    assert!(
+        elapsed < CONTROL_RPC_TIMEOUT + Duration::from_millis(500),
+        "took {elapsed:?}"
+    );
     let error = result.expect_err("an unavailable server cannot acknowledge");
     assert!(
         error
@@ -285,6 +288,29 @@ fn persistent_signal_failure_stays_within_the_control_budget() {
         "unexpected error {error:?}"
     );
     assert!(probe.count() > 1, "Core must retry inside the budget");
+}
+
+/// Core waits its separate throttle backoff (1 s +/-20%) before re-sending
+/// after `resource_exhausted`. The control budget must leave room for that
+/// wait, so a signal rejected once by the server's rate limiter is delivered
+/// by the second attempt instead of ending in `deadline_exceeded`.
+#[test]
+fn signal_retries_resource_exhausted_within_the_control_budget() {
+    let (core, connection, probe) = scripted_connection(
+        1,
+        Code::ResourceExhausted,
+        SignalWorkflowExecutionResponse::default().encode_to_vec(),
+    );
+    let started = Instant::now();
+    let response = signal(&core, connection).expect("signal acknowledged after throttling");
+    let elapsed = started.elapsed();
+    assert!(response.acknowledged);
+    assert_eq!(probe.count(), 2);
+    probe.assert_identical_attempts("SignalWorkflowExecution");
+    // The re-send really waited for the throttle backoff, which is why a
+    // one-second budget was not enough.
+    assert!(elapsed >= Duration::from_millis(750), "took {elapsed:?}");
+    assert!(elapsed < CONTROL_RPC_TIMEOUT, "took {elapsed:?}");
 }
 
 /// Queries are read-only and are retried like any other transient failure.
@@ -373,12 +399,13 @@ fn reset_retries_a_transient_failure() {
     probe.assert_identical_attempts("ResetWorkflowExecution");
 }
 
-/// Terminate retries a call the transport could not deliver.
+/// Terminate is re-sent after `resource_exhausted`, which the server returns
+/// before processing the command, and the re-send fits the control budget.
 #[test]
-fn terminate_retries_unavailable() {
+fn terminate_retries_resource_exhausted() {
     let (core, connection, probe) = scripted_connection(
         1,
-        Code::Unavailable,
+        Code::ResourceExhausted,
         TerminateWorkflowExecutionResponse::default().encode_to_vec(),
     );
     assert!(
@@ -390,9 +417,27 @@ fn terminate_retries_unavailable() {
     probe.assert_identical_attempts("TerminateWorkflowExecution");
 }
 
-/// Terminate has no idempotency key, so a status the server may report after
-/// applying the termination is returned rather than blindly re-sent, even
-/// though Core would retry it for an idempotent call.
+/// `unavailable` can mean the connection dropped after the server applied the
+/// termination. Terminate has no idempotency key, so the request is not
+/// re-sent (a re-send would report `not_found` for the run it just
+/// terminated) and the caller is told the outcome is uncertain.
+#[test]
+fn terminate_reports_unavailable_as_uncertain_without_resending() {
+    let (core, connection, probe) = scripted_connection(
+        1,
+        Code::Unavailable,
+        TerminateWorkflowExecutionResponse::default().encode_to_vec(),
+    );
+    assert_rpc_code(
+        terminate(&core, connection),
+        "termination_outcome_uncertain",
+    );
+    assert_eq!(probe.count(), 1, "unavailable must not be re-sent");
+}
+
+/// Other statuses the server may report after applying the termination are
+/// returned rather than blindly re-sent, even though Core would retry them
+/// for an idempotent call.
 #[test]
 fn terminate_does_not_retry_ambiguous_failures() {
     for code in [Code::Unknown, Code::Internal, Code::Aborted] {
@@ -406,15 +451,47 @@ fn terminate_does_not_retry_ambiguous_failures() {
     }
 }
 
-/// The predicate behind the terminate restriction admits exactly the statuses
-/// that mean the server did not process the call.
+/// A definitive answer keeps its code: `not_found` on the first and only
+/// attempt really means the exact run is absent or already closed.
+#[test]
+fn terminate_reports_a_first_attempt_not_found() {
+    let (core, connection, probe) = scripted_connection(
+        1,
+        Code::NotFound,
+        TerminateWorkflowExecutionResponse::default().encode_to_vec(),
+    );
+    assert_rpc_code(terminate(&core, connection), "not_found");
+    assert_eq!(probe.count(), 1);
+}
+
+/// The terminate retry predicate admits only the status that proves the
+/// server did not process the call, and the error mapping marks the statuses
+/// that may follow an applied termination as uncertain.
 #[test]
 fn terminate_retry_classification() {
-    assert!(!terminate_retry_forbidden(&Status::unavailable("x")));
     assert!(!terminate_retry_forbidden(&Status::resource_exhausted("x")));
+    assert!(terminate_retry_forbidden(&Status::unavailable("x")));
     assert!(terminate_retry_forbidden(&Status::unknown("x")));
     assert!(terminate_retry_forbidden(&Status::internal("x")));
     assert!(terminate_retry_forbidden(&Status::not_found("x")));
+    for status in [
+        Status::unavailable("x"),
+        Status::deadline_exceeded("x"),
+        Status::cancelled("x"),
+    ] {
+        assert_eq!(
+            terminate_status_error(status),
+            ClientOperationError::Rpc {
+                code: "termination_outcome_uncertain".to_owned()
+            }
+        );
+    }
+    assert_eq!(
+        terminate_status_error(Status::not_found("x")),
+        ClientOperationError::Rpc {
+            code: "not_found".to_owned()
+        }
+    );
 }
 
 /// Visibility listing is read-only and is retried.
