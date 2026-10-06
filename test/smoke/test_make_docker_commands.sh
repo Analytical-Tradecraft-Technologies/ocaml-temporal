@@ -53,16 +53,16 @@ cat >"$temporary_root/rustc" <<'SH'
 #!/bin/sh
 set -eu
 [ "$*" = --version ]
-printf '%s\n' 'rustc 1.98.1 (fixture)'
+printf '%s\n' 'rustc 1.99.0 (fixture)'
 SH
 chmod +x "$temporary_root/rustc"
 PROBE_OUTPUT=$(printf '5.5.1\r') PROBE_STATUS=0 PATH="$temporary_root:$PATH" \
   make --no-print-directory -f "$source_root/Makefile" native-version-check \
-  NATIVE_OCAML_VERSION=5.5.1 NATIVE_RUST_VERSION=1.98.1 \
+  NATIVE_OCAML_VERSION=5.5.1 NATIVE_RUST_VERSION=1.99.0 \
   NATIVE_ARCH= NATIVE_RUST_HOST= NATIVE_RUN="sh '$temporary_root/compiler.sh'"
 if PROBE_OUTPUT=$(printf '5.5.0\r') PROBE_STATUS=0 PATH="$temporary_root:$PATH" \
   make --no-print-directory -f "$source_root/Makefile" native-version-check \
-  NATIVE_OCAML_VERSION=5.5.1 NATIVE_RUST_VERSION=1.98.1 \
+  NATIVE_OCAML_VERSION=5.5.1 NATIVE_RUST_VERSION=1.99.0 \
   NATIVE_ARCH= NATIVE_RUST_HOST= NATIVE_RUN="sh '$temporary_root/compiler.sh'" \
   >"$temporary_root/log" 2>&1; then
   echo 'native-version-check accepted another patch release' >&2

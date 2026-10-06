@@ -47,6 +47,16 @@ All live controllers use a real Temporal Server and own fixture cleanup.
 | `test-temporal-parent-child-restart` | Exact parent and child histories, linkage, nonterminal prefixes after removal, both generation-two replay observations, then successful completion | [parent/child controller][parent-controller], [parent/child contract][parent-contract] |
 | `test-temporal-parent-child-failure-replay` | Both runs replay before the child fails non-retryably; child and parent failure events retain exact linkage; parent returns `SMOKE:PARENT:CHILD:FAILURE_RECOVERED` | [failure controller][failure-controller], [failure contract][failure-contract], [definitions][definitions] |
 
+Two live controllers were added to the Build workflow after the audited
+baseline, so the successful runs above do not cover them. Their assertion
+boundaries are defined by their own references, and the
+[generated inventory](live-acceptance-inventory.md) tracks their membership:
+
+| Make target | Assertion boundary | Reference |
+| --- | --- | --- |
+| `test-temporal-start-metadata-live` | Five exact active runs carry memo, search-attribute, combined, continued and official-CLI start metadata; workflow snapshots match before and after worker replacement | [start metadata](workflow-start-metadata.md) |
+| `test-temporal-task-failure-live` | Body, encoder and missing-registration defects leave exact runs with durable workflow-task failures; a corrected worker replays and completes them, and typed business failures keep their retryability flags | [workflow failures](workflow-failures.md) |
+
 The [child-failure acceptance reference](child-failure-replay-acceptance.md)
 records the original PR #361 evidence. Its status is live-tested, not pending a
 first run. Broader child failure, cache-pressure, repeated restart, and recovery
@@ -94,9 +104,10 @@ already running OCaml callback. Worker shutdown drains owned work through its
 lifecycle path. The stop-marker checks and focused lifecycle tests do not prove
 a bound on application callback duration or Kubernetes termination behavior.
 
-Reset, bounded visibility listing, worker deployment routing, memo/search
-attributes and priority metadata have implemented/focused-tested surfaces but
-no dedicated live qualification in this inventory. The private replay feeder
+Reset, bounded visibility listing, worker deployment routing, search-attribute
+upserts and priority metadata have implemented/focused-tested surfaces but no
+dedicated live qualification. Start memo/search attributes have the post-baseline
+start-metadata controller described above. The private replay feeder
 is not a public history replay tool. Authentication configuration, cross-version
 history corpora, release delivery and operational/load qualification remain
 tracked work; consult [feature coverage](feature-coverage.md) and the

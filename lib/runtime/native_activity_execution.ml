@@ -146,10 +146,20 @@ type lease = {
   activity_type : string option;
   completion : Protocol.completion;
   accepted_result : accepted_result;
+  mutable retry_refusal : error_view option;
 }
 (** One completion that has not yet been proven accepted by native Core. The
     [token] is always an owned copy and [completion] contains another owned copy
-    of that same token. *)
+    of that same token.
+
+    [retry_refusal] records the first failure that was not explicitly
+    classified as retryable. Once it is [Some], the completion is never
+    submitted again: pinned Core removes the activity from its outstanding set
+    before suppressing completion transport errors, and an uncertain or
+    post-acceptance failure may already have retired the lease, so a second
+    submission could duplicate it. Later polls and drains return the recorded
+    error unchanged and only terminal [discard] releases the lease
+    (issue #843). *)
 
 (** An async lease is the capability retained after Core accepts
     [WillCompleteAsync]. It is deliberately kept in a separate map from worker
@@ -884,8 +894,9 @@ module Make (Supervisor : SUPERVISOR) = struct
       completion, so no caller can submit through it while this publication is
       in progress. The native completion lease is removed only after both the
       registry insertion and lifecycle activation succeed; an unexpected
-      activation failure therefore leaves the accepted completion visible for
-      recovery instead of orphaning its handle. *)
+      activation failure therefore leaves the accepted completion visible to
+      drain diagnostics and terminal [discard] (which closes its handle)
+      instead of orphaning it; the lease is never resubmitted. *)
   let admit_async_lease adapter ~token handle =
     Mutex.lock adapter.async_mutex;
     let admission =
@@ -919,17 +930,22 @@ module Make (Supervisor : SUPERVISOR) = struct
               (application_error ~path:"$.async_handle.activate"
                  activation_error))
 
-  (** Submits one pending lease and removes it only after native Core accepts
-      the exact copied token. Rejections leave it in the map for the next poll.
-  *)
-  let finish_lease adapter lease : (outcome, error_view) result =
+  (** Submits one pending lease exactly once and removes it only after native
+      Core accepts the exact copied token. Every failure leaves it in the map;
+      a failure that is not explicitly retryable also sets [retry_refusal].
+      Callers must use [finish_lease], which honours that refusal. *)
+  let submit_lease adapter lease : (outcome, error_view) result =
+    (* Records a fail-closed refusal before reporting the failure. *)
+    let refuse_unless_retryable (error : error_view) =
+      if not error.retryable then lease.retry_refusal <- Some error;
+      Error error
+    in
     match attempt_completion adapter.supervisor lease.completion with
-    | Rejected_by_supervisor error -> Error error
+    | Rejected_by_supervisor error -> refuse_unless_retryable error
     | Raised_by_supervisor exception_ ->
-        let retryable =
-          completion_exception_is_retryable exception_
-        in
-        Error (completion_exception_error ~retryable exception_)
+        let retryable = completion_exception_is_retryable exception_ in
+        refuse_unless_retryable
+          (completion_exception_error ~retryable exception_)
     | Accepted ->
         begin match lease.accepted_result with
         | Completed_result { kind; cancellation_details } ->
@@ -955,7 +971,11 @@ module Make (Supervisor : SUPERVISOR) = struct
                  })
         | Async_handoff handle ->
             (match admit_async_lease adapter ~token:lease.token handle with
-            | Error error -> Error error
+            | Error error ->
+                (* Core has already accepted [WillCompleteAsync], so the lease
+                   is retained only as a diagnostic owner of the handle until
+                   terminal [discard]; it must never be submitted again. *)
+                refuse_unless_retryable { error with retryable = false }
             | Ok () ->
                 adapter.leases <- Token_map.remove lease.token adapter.leases;
                 report Logs.Debug ~operation:"activity_async_handoff_accepted" ();
@@ -967,6 +987,15 @@ module Make (Supervisor : SUPERVISOR) = struct
                        cancellation_details = None;
                      }))
         end
+
+  (** Submits a pending lease unless an earlier failure refused its retry.
+      Once [retry_refusal] is set this returns the recorded error without
+      calling the supervisor, so neither a later poll, a second worker run, nor
+      a shutdown drain can submit the completion again (issue #843). *)
+  let finish_lease adapter lease : (outcome, error_view) result =
+    match lease.retry_refusal with
+    | Some error -> Error error
+    | None -> submit_lease adapter lease
 
   (** Validates, records, and submits one completion. Invalid application data
       becomes a bounded failure before anything is retained for transport retry.
@@ -1000,7 +1029,15 @@ module Make (Supervisor : SUPERVISOR) = struct
           let* () = validate_completion fallback in
           Ok (fallback, Rejected_result error)
     in
-    let lease = { token; activity_type; completion; accepted_result } in
+    let lease =
+      {
+        token;
+        activity_type;
+        completion;
+        accepted_result;
+        retry_refusal = None;
+      }
+    in
     match add_lease adapter lease with
     | Error error ->
         (* A duplicate token means this completion was never admitted. Close a
@@ -1280,17 +1317,20 @@ module Make (Supervisor : SUPERVISOR) = struct
       | Protocol.Start start -> process_start adapter token start
       | Cancel cancel -> process_cancel adapter token cancel
 
-  (** Retries every retained activity completion while the adapter mutex is
-      held. Native worker shutdown calls this before closing Rust so a
-      temporary completion transport failure cannot become an outstanding
-      task-token lease. *)
+  (** Retries retained activity completions while the adapter mutex is held.
+      Native worker shutdown calls this before closing Rust so an explicitly
+      retryable completion transport failure cannot become an outstanding
+      task-token lease. A lease whose earlier failure was not retryable is not
+      resubmitted; [finish_lease] returns its recorded non-retryable error, so
+      shutdown takes the terminal force-release path. *)
   let drain adapter : (unit, error_view) result =
     Mutex.lock adapter.mutex;
     Fun.protect
       ~finally:(fun () -> Mutex.unlock adapter.mutex)
       (fun () ->
         (* Retry the smallest token first for deterministic shutdown behavior;
-           stop at the first failure and retain that lease for the next drain. *)
+           stop at the first failure and retain that lease. A fail-closed lease
+           stops the loop without any native call. *)
         let rec loop () =
           match Token_map.min_binding_opt adapter.leases with
           | None -> Ok ()
@@ -1348,9 +1388,11 @@ module Make (Supervisor : SUPERVISOR) = struct
             adapter.async_leases <- Token_map.empty))
 
   (** Serializes pending-completion retry, native polling, implementation
-      execution, and completion submission. The mutex covers the complete
-      transaction, including the user implementation, so the map cannot race
-      with another poll and no token can be dispatched twice. *)
+      execution, and completion submission. A retained lease blocks new tasks
+      and is resubmitted only after an explicitly retryable failure. The mutex
+      covers the complete transaction, including the user implementation, so
+      the map cannot race with another poll and no token can be dispatched
+      twice. *)
   let poll adapter =
     Mutex.lock adapter.mutex;
     Fun.protect

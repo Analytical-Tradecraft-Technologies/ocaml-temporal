@@ -164,13 +164,18 @@ and its ownership record is removed after acknowledgement. `poll` returns
 `Ok (Rejected ...)` only after that completion has been accepted, and marks
 `lease_retired = true`. If the native completion operation fails, `poll` returns
 an error and leaves the exact completion in the pending map without claiming
-retirement. The production source marks it retryable only when the bridge
-returns the explicit `Retryable` status, which is reserved for a future
-Core/client path that proves the lease was not consumed. Generic `Connection`,
-`Not_ready`, and `Worker` statuses are not retryable: the pinned Core
-completion API removes the task before internally logging/suppressing network
-failures, so blindly submitting the same completion could duplicate it. A
-retry never reruns the workflow implementation. `drain` retries a retained
+retirement. The adapter's source signature classifies each failure through
+`error_is_retryable`/`exception_is_retryable`, and the production workflow
+source returns `false` for both: the bridge defines its `Retryable` status
+only for activity completion, pinned Core reports only deterministic
+validation failures from `complete_workflow_activation`, and a lifecycle,
+mailbox, or lost-acknowledgement failure cannot prove that the run's lease is
+still outstanding. Resubmitting after such a failure could duplicate the
+completion or, once Core has issued the run's next activation, attach it to
+that activation. The first non-retryable failure is therefore recorded on the
+pending entry, and from then on neither `poll` nor `drain` calls the
+supervisor for it again; both return the recorded error (issue #843). A retry
+never reruns the workflow implementation. `drain` retries a retained
 completion only while that explicit classification remains true; otherwise it
 returns a terminal error and leaves the worker closed. Before returning that
 terminal error, the worker invokes the supervisor's `Native.shutdown` path.
