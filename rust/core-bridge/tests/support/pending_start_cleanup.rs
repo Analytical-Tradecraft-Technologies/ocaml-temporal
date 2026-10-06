@@ -76,6 +76,7 @@ fn client_temporal_response() -> client_protocol::StartWorkflowResponse {
             workflow_id: "workflow".to_owned(),
             run_id: "run".to_owned(),
         },
+        started: true,
     }
 }
 
@@ -112,6 +113,7 @@ fn nonblocking_close_joins_aborted_start_tasks_before_core_drop() {
                 input: Vec::new(),
                 memo: Vec::new(),
                 search_attributes: Vec::new(),
+                id_conflict_policy: client_protocol::IdConflictPolicy::Fail,
             }),
             receiver,
             task,
@@ -169,6 +171,7 @@ fn nonblocking_close_joins_after_terminal_result_publication() {
                 input: Vec::new(),
                 memo: Vec::new(),
                 search_attributes: Vec::new(),
+                id_conflict_policy: client_protocol::IdConflictPolicy::Fail,
             }),
             receiver,
             task,

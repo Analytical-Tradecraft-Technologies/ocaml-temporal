@@ -669,7 +669,8 @@ let test_signal_workflow_translation_and_activation () =
   in
   begin match completion.commands, completion.task_failure with
   | [], Some { message; _ }
-    when String.equal message "unhandled workflow signal: order_updated" -> ()
+    when String.starts_with ~prefix:"unhandled workflow signal: order_updated "
+           message -> ()
   | _ -> failwith "unhandled signal did not fail only the workflow task"
   end
 

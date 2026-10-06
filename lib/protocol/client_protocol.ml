@@ -16,6 +16,9 @@ type execution = { namespace : string; workflow_id : string; run_id : string }
     map is constructed and encoding remains deterministic after sorting. *)
 type metadata_field = { key : string; value : payload }
 
+(** Temporal's open-run conflict policy without its [UNSPECIFIED] value. *)
+type id_conflict_policy = Fail | Use_existing | Terminate_existing
+
 type start_request = {
   request_id : string;
   namespace : string;
@@ -25,9 +28,11 @@ type start_request = {
   input : payload list;
   memo : metadata_field list;
   search_attributes : metadata_field list;
+  id_conflict_policy : id_conflict_policy;
 }
 
-type start_response = { execution : execution }
+(** [started] mirrors Temporal's [StartWorkflowExecutionResponse.started]. *)
+type start_response = { execution : execution; started : bool }
 type start_ticket = { request : start_request; ticket : string }
 type wait_request = execution
 
@@ -297,6 +302,13 @@ let encode_start_request (value : start_request) =
   in
   let* memo = encode_metadata "$.memo" value.memo in
   let* search_attributes = encode_metadata "$.search_attributes" value.search_attributes in
+  (* Always explicit so the Rust adapter never falls back to a server default. *)
+  let id_conflict_policy =
+    match value.id_conflict_policy with
+    | Fail -> "fail"
+    | Use_existing -> "use_existing"
+    | Terminate_existing -> "terminate_existing"
+  in
   encode_object
       (`Assoc
       [
@@ -308,6 +320,7 @@ let encode_start_request (value : start_request) =
         ("input", input);
         ("memo", memo);
         ("search_attributes", search_attributes);
+        ("id_conflict_policy", json_string id_conflict_policy);
       ])
 
 (** Serializes the opaque native capability used by asynchronous start polls.
@@ -357,18 +370,33 @@ let validate_execution_matches path ~namespace ~workflow_id ?run_id
              "response run ID does not match the requested execution")
     | Some _ | None -> Ok ()
 
+(** Rejects [started = false] unless the request asked for [Use_existing]:
+    under the other policies a successful start always created its run, so a
+    contradictory response is an adapter defect rather than an existing run
+    the caller never agreed to attach to. *)
+let validate_started (request : start_request) started =
+  match (request.id_conflict_policy, started) with
+  | Use_existing, _ | (Fail | Terminate_existing), true -> Ok ()
+  | (Fail | Terminate_existing), false ->
+      Error
+        (invalid ~path:"$.started"
+           "only a use_existing start may return an existing run")
+
 (** Parses a successful start document and correlates its execution with the
     request that produced it before exposing the server-assigned run. *)
 let decode_start_response ~(request : start_request) input =
   let* json = decode_object input in
-  let* entries = exact_object "$" [ "execution" ] json in
+  let* entries = exact_object "$" [ "execution"; "started" ] json in
   let* execution_json = field "$" "execution" entries in
   let* execution = decode_execution "$.execution" execution_json in
   let* () =
     validate_execution_matches "$.execution" ~namespace:request.namespace
       ~workflow_id:request.workflow_id execution
   in
-  Ok ({ execution } : start_response)
+  let* started_json = field "$" "started" entries in
+  let* started = bool "$.started" started_json in
+  let* () = validate_started request started in
+  Ok ({ execution; started } : start_response)
 
 let encode_wait_request (value : wait_request) =
   let* () = validate_identifier "$.namespace" value.namespace in
@@ -916,11 +944,15 @@ let validate_start_error (request : start_request) = function
     first-class value instead of being encoded as a transport error, because a
     transport failure can occur after Temporal accepted the request. *)
 let encode_start_outcome = function
-  | Accepted { execution } ->
+  | Accepted { execution; started } ->
       let* execution = encode_execution "$.execution" execution in
       encode_object
         (`Assoc
-          [ ("kind", json_string "accepted"); ("execution", execution) ])
+          [
+            ("kind", json_string "accepted");
+            ("execution", execution);
+            ("started", `Bool started);
+          ])
   | Rejected error ->
       let* error = encode_client_error_json "$.error" error in
       encode_object
@@ -951,14 +983,17 @@ let decode_start_outcome ~(request : start_request) input =
   let* kind = string "$.kind" kind_json in
   match kind with
   | "accepted" ->
-      let* entries = exact_object path [ "kind"; "execution" ] json in
+      let* entries = exact_object path [ "kind"; "execution"; "started" ] json in
       let* execution_json = field path "execution" entries in
       let* execution = decode_execution "$.execution" execution_json in
       let* () =
         validate_execution_matches "$.execution" ~namespace:request.namespace
           ~workflow_id:request.workflow_id execution
       in
-      Ok (Accepted { execution })
+      let* started_json = field path "started" entries in
+      let* started = bool "$.started" started_json in
+      let* () = validate_started request started in
+      Ok (Accepted { execution; started })
   | "rejected" ->
       let* entries = exact_object path [ "kind"; "error" ] json in
       let* error_json = field path "error" entries in

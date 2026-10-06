@@ -39,7 +39,7 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 /// Version of the native ABI implemented by this crate.
-pub const ABI_VERSION: u32 = 2;
+pub const ABI_VERSION: u32 = 3;
 
 /// Fixed-width status type shared with the C header.
 pub type Status = i32;
@@ -277,7 +277,7 @@ where
 /// Byte allocation owned by the Rust bridge.
 ///
 /// Callers must treat this as an opaque field of [`Result`] and release it
-/// only through [`ocaml_temporal_core_v2_result_free`].
+/// only through [`ocaml_temporal_core_v3_result_free`].
 #[repr(C)]
 #[derive(Debug, PartialEq, Eq)]
 pub struct Buffer {
@@ -2972,14 +2972,14 @@ unsafe fn free_buffer(buffer: &mut Buffer) {
     *buffer = Buffer::default();
 }
 
-/// Negotiate ABI version 2.
+/// Negotiate ABI version 3.
 ///
 /// # Safety
 ///
 /// `output` must be null or point to writable storage for one [`Result`]. It
 /// must not contain live bridge-owned allocations when this function starts.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_check_abi_version(
+pub unsafe extern "C" fn ocaml_temporal_core_v3_check_abi_version(
     requested_version: u32,
     output: *mut Result,
 ) -> Status {
@@ -3010,9 +3010,9 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_check_abi_version(
 ///
 /// When `input_len` is nonzero, `input` must point to that many readable bytes.
 /// `output` follows the same contract as
-/// [`ocaml_temporal_core_v2_check_abi_version`] and must not overlap `input`.
+/// [`ocaml_temporal_core_v3_check_abi_version`] and must not overlap `input`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_echo(
+pub unsafe extern "C" fn ocaml_temporal_core_v3_echo(
     input: *const u8,
     input_len: usize,
     output: *mut Result,
@@ -3047,9 +3047,9 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_echo(
 /// # Safety
 ///
 /// `output` follows the same contract as
-/// [`ocaml_temporal_core_v2_check_abi_version`].
+/// [`ocaml_temporal_core_v3_check_abi_version`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_conformance_wait_ms(
+pub unsafe extern "C" fn ocaml_temporal_core_v3_conformance_wait_ms(
     milliseconds: u32,
     output: *mut Result,
 ) -> Status {
@@ -3121,16 +3121,16 @@ fn create_runtime(
 /// Create the native runtime that will own later Core clients and workers.
 ///
 /// On success, `runtime` receives one owned opaque handle. The caller must
-/// eventually pass that same slot to [`ocaml_temporal_core_v2_runtime_free`].
+/// eventually pass that same slot to [`ocaml_temporal_core_v3_runtime_free`].
 ///
 /// # Safety
 ///
 /// `runtime` must be null or point to writable storage for one runtime pointer.
 /// `output` follows the result contract of
-/// [`ocaml_temporal_core_v2_check_abi_version`]. A non-null runtime slot must
+/// [`ocaml_temporal_core_v3_check_abi_version`]. A non-null runtime slot must
 /// not already contain a live handle.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_runtime_new(
+pub unsafe extern "C" fn ocaml_temporal_core_v3_runtime_new(
     runtime: *mut *mut Runtime,
     output: *mut Result,
 ) -> Status {
@@ -3182,11 +3182,11 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_runtime_new(
 /// # Safety
 ///
 /// `runtime` must be a live handle created by
-/// [`ocaml_temporal_core_v2_runtime_new`] and exclusively owned for this call.
+/// [`ocaml_temporal_core_v3_runtime_new`] and exclusively owned for this call.
 /// `input` follows [`decode_config`]'s byte-span contract, while `output`
-/// follows [`ocaml_temporal_core_v2_check_abi_version`]'s result contract.
+/// follows [`ocaml_temporal_core_v3_check_abi_version`]'s result contract.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_client_connect_json(
+pub unsafe extern "C" fn ocaml_temporal_core_v3_client_connect_json(
     runtime: *mut Runtime,
     input: *const u8,
     input_len: usize,
@@ -3218,7 +3218,7 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_client_connect_json(
 /// span is borrowed only for this synchronous call and `output` follows the
 /// standard initialized-result contract.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_client_start_workflow_json(
+pub unsafe extern "C" fn ocaml_temporal_core_v3_client_start_workflow_json(
     runtime: *mut Runtime,
     input: *const u8,
     input_len: usize,
@@ -3250,7 +3250,7 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_client_start_workflow_json(
 /// is borrowed only for this synchronous call and `output` follows the normal
 /// initialized-result contract.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_client_cancel_workflow_json(
+pub unsafe extern "C" fn ocaml_temporal_core_v3_client_cancel_workflow_json(
     runtime: *mut Runtime,
     input: *const u8,
     input_len: usize,
@@ -3281,7 +3281,7 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_client_cancel_workflow_json(
 /// the input before releasing the OCaml runtime lock and owns the returned
 /// allocation through the normal result-release function.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_client_terminate_workflow_json(
+pub unsafe extern "C" fn ocaml_temporal_core_v3_client_terminate_workflow_json(
     runtime: *mut Runtime,
     input: *const u8,
     input_len: usize,
@@ -3313,7 +3313,7 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_client_terminate_workflow_json(
 /// is borrowed only for this synchronous call and `output` follows the normal
 /// initialized-result contract.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_client_reset_workflow_json(
+pub unsafe extern "C" fn ocaml_temporal_core_v3_client_reset_workflow_json(
     runtime: *mut Runtime,
     input: *const u8,
     input_len: usize,
@@ -3345,7 +3345,7 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_client_reset_workflow_json(
 /// is borrowed only for this synchronous call and `output` follows the normal
 /// initialized-result contract.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_client_signal_workflow_json(
+pub unsafe extern "C" fn ocaml_temporal_core_v3_client_signal_workflow_json(
     runtime: *mut Runtime,
     input: *const u8,
     input_len: usize,
@@ -3377,7 +3377,7 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_client_signal_workflow_json(
 /// is borrowed only for this synchronous call and `output` follows the normal
 /// initialized-result contract.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_client_query_workflow_json(
+pub unsafe extern "C" fn ocaml_temporal_core_v3_client_query_workflow_json(
     runtime: *mut Runtime,
     input: *const u8,
     input_len: usize,
@@ -3405,7 +3405,7 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_client_query_workflow_json(
 /// must remain readable for this synchronous call and `output` must point to
 /// writable result storage owned by the caller.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_client_update_workflow_json(
+pub unsafe extern "C" fn ocaml_temporal_core_v3_client_update_workflow_json(
     runtime: *mut Runtime,
     input: *const u8,
     input_len: usize,
@@ -3433,7 +3433,7 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_client_update_workflow_json(
 /// must remain readable for this synchronous call and `output` must point to
 /// writable result storage owned by the caller.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_client_poll_update_workflow_json(
+pub unsafe extern "C" fn ocaml_temporal_core_v3_client_poll_update_workflow_json(
     runtime: *mut Runtime,
     input: *const u8,
     input_len: usize,
@@ -3464,7 +3464,7 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_client_poll_update_workflow_json
 /// The caller owns the returned result and must release it with the matching
 /// bridge free function, even when the status reports an error.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_client_list_visibility_json(
+pub unsafe extern "C" fn ocaml_temporal_core_v3_client_list_visibility_json(
     runtime: *mut Runtime,
     input: *const u8,
     input_len: usize,
@@ -3497,7 +3497,7 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_client_list_visibility_json(
 /// is borrowed only for this admission call and `output` follows the standard
 /// initialized-result contract.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_client_begin_start_workflow_json(
+pub unsafe extern "C" fn ocaml_temporal_core_v3_client_begin_start_workflow_json(
     runtime: *mut Runtime,
     input: *const u8,
     input_len: usize,
@@ -3527,9 +3527,9 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_client_begin_start_workflow_json
 /// # Safety
 ///
 /// The runtime, input, and output contracts match
-/// [`ocaml_temporal_core_v2_client_begin_start_workflow_json`].
+/// [`ocaml_temporal_core_v3_client_begin_start_workflow_json`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_client_poll_start_workflow_json(
+pub unsafe extern "C" fn ocaml_temporal_core_v3_client_poll_start_workflow_json(
     runtime: *mut Runtime,
     input: *const u8,
     input_len: usize,
@@ -3559,9 +3559,9 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_client_poll_start_workflow_json(
 /// # Safety
 ///
 /// The runtime, input, and output contracts match
-/// [`ocaml_temporal_core_v2_client_begin_start_workflow_json`].
+/// [`ocaml_temporal_core_v3_client_begin_start_workflow_json`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_client_wait_start_workflow_json(
+pub unsafe extern "C" fn ocaml_temporal_core_v3_client_wait_start_workflow_json(
     runtime: *mut Runtime,
     input: *const u8,
     input_len: usize,
@@ -3593,7 +3593,7 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_client_wait_start_workflow_json(
 /// span is borrowed only for this synchronous call and `output` follows the
 /// standard initialized-result contract.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_client_wait_workflow_json(
+pub unsafe extern "C" fn ocaml_temporal_core_v3_client_wait_workflow_json(
     runtime: *mut Runtime,
     input: *const u8,
     input_len: usize,
@@ -3619,9 +3619,9 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_client_wait_workflow_json(
 /// # Safety
 ///
 /// The runtime, input, and output contracts match
-/// [`ocaml_temporal_core_v2_client_connect_json`].
+/// [`ocaml_temporal_core_v3_client_connect_json`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_worker_start_json(
+pub unsafe extern "C" fn ocaml_temporal_core_v3_worker_start_json(
     runtime: *mut Runtime,
     input: *const u8,
     input_len: usize,
@@ -3648,9 +3648,9 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_worker_start_json(
 /// # Safety
 ///
 /// The runtime, input, and output contracts match
-/// [`ocaml_temporal_core_v2_worker_start_json`].
+/// [`ocaml_temporal_core_v3_worker_start_json`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_replay_worker_start_json(
+pub unsafe extern "C" fn ocaml_temporal_core_v3_replay_worker_start_json(
     runtime: *mut Runtime,
     input: *const u8,
     input_len: usize,
@@ -3675,7 +3675,7 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_replay_worker_start_json(
 /// The runtime and output contracts match the workflow poll operation. The
 /// input span is borrowed only for this synchronous call.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_replay_worker_feed_history_json(
+pub unsafe extern "C" fn ocaml_temporal_core_v3_replay_worker_feed_history_json(
     runtime: *mut Runtime,
     input: *const u8,
     input_len: usize,
@@ -3702,7 +3702,7 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_replay_worker_feed_history_json(
 /// `runtime` must be a live exclusively owned runtime handle and `output` must
 /// satisfy the standard initialized-result contract.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_replay_worker_finish_input(
+pub unsafe extern "C" fn ocaml_temporal_core_v3_replay_worker_finish_input(
     runtime: *mut Runtime,
     output: *mut Result,
 ) -> Status {
@@ -3726,7 +3726,7 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_replay_worker_finish_input(
 /// `runtime` must be a live exclusively owned runtime handle and `output` must
 /// satisfy the standard initialized-result contract.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_replay_worker_try_poll_workflow(
+pub unsafe extern "C" fn ocaml_temporal_core_v3_replay_worker_try_poll_workflow(
     runtime: *mut Runtime,
     output: *mut Result,
 ) -> Status {
@@ -3751,7 +3751,7 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_replay_worker_try_poll_workflow(
 /// `runtime` must be a live exclusively owned runtime handle and `output` must
 /// satisfy the standard initialized-result contract.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_replay_worker_wait_workflow(
+pub unsafe extern "C" fn ocaml_temporal_core_v3_replay_worker_wait_workflow(
     runtime: *mut Runtime,
     output: *mut Result,
 ) -> Status {
@@ -3773,9 +3773,9 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_replay_worker_wait_workflow(
 /// # Safety
 ///
 /// The runtime, input, and output contracts match
-/// [`ocaml_temporal_core_v2_worker_complete_workflow_json`].
+/// [`ocaml_temporal_core_v3_worker_complete_workflow_json`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_replay_worker_complete_workflow_json(
+pub unsafe extern "C" fn ocaml_temporal_core_v3_replay_worker_complete_workflow_json(
     runtime: *mut Runtime,
     input: *const u8,
     input_len: usize,
@@ -3800,9 +3800,9 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_replay_worker_complete_workflow_
 /// # Safety
 ///
 /// The runtime, input, and output contracts match
-/// [`ocaml_temporal_core_v2_worker_reject_workflow_json`].
+/// [`ocaml_temporal_core_v3_worker_reject_workflow_json`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_replay_worker_reject_workflow_json(
+pub unsafe extern "C" fn ocaml_temporal_core_v3_replay_worker_reject_workflow_json(
     runtime: *mut Runtime,
     input: *const u8,
     input_len: usize,
@@ -3830,7 +3830,7 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_replay_worker_reject_workflow_js
 /// `runtime` must be a live exclusively owned runtime handle and `output` must
 /// satisfy the standard initialized-result contract.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_replay_worker_finalize(
+pub unsafe extern "C" fn ocaml_temporal_core_v3_replay_worker_finalize(
     runtime: *mut Runtime,
     output: *mut Result,
 ) -> Status {
@@ -3857,7 +3857,7 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_replay_worker_finalize(
 /// `runtime` must be a live exclusively owned runtime handle and `output` must
 /// satisfy the standard initialized-result contract.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_replay_worker_dispose(
+pub unsafe extern "C" fn ocaml_temporal_core_v3_replay_worker_dispose(
     runtime: *mut Runtime,
     output: *mut Result,
 ) -> Status {
@@ -3881,7 +3881,7 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_replay_worker_dispose(
 /// `runtime` must be a live exclusively owned runtime handle and `output`
 /// must satisfy the standard initialized-result contract.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_worker_try_poll_workflow(
+pub unsafe extern "C" fn ocaml_temporal_core_v3_worker_try_poll_workflow(
     runtime: *mut Runtime,
     output: *mut Result,
 ) -> Status {
@@ -3909,7 +3909,7 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_worker_try_poll_workflow(
 /// `runtime` must be a live exclusively owned runtime handle and `output` must
 /// satisfy the standard initialized-result contract.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_worker_wait_workflow(
+pub unsafe extern "C" fn ocaml_temporal_core_v3_worker_wait_workflow(
     runtime: *mut Runtime,
     output: *mut Result,
 ) -> Status {
@@ -3933,7 +3933,7 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_worker_wait_workflow(
 /// The runtime and output contracts match the workflow poll operation. A
 /// nonzero input length requires that many readable bytes for this call.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_worker_complete_workflow_json(
+pub unsafe extern "C" fn ocaml_temporal_core_v3_worker_complete_workflow_json(
     runtime: *mut Runtime,
     input: *const u8,
     input_len: usize,
@@ -3963,7 +3963,7 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_worker_complete_workflow_json(
 /// The runtime and output contracts match the workflow poll operation. A
 /// nonzero input length requires that many readable bytes for this call.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_worker_reject_workflow_json(
+pub unsafe extern "C" fn ocaml_temporal_core_v3_worker_reject_workflow_json(
     runtime: *mut Runtime,
     input: *const u8,
     input_len: usize,
@@ -3990,7 +3990,7 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_worker_reject_workflow_json(
 /// `runtime` must be a live exclusively owned runtime handle and `output`
 /// must satisfy the standard initialized-result contract.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_worker_try_poll_activity(
+pub unsafe extern "C" fn ocaml_temporal_core_v3_worker_try_poll_activity(
     runtime: *mut Runtime,
     output: *mut Result,
 ) -> Status {
@@ -4018,7 +4018,7 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_worker_try_poll_activity(
 /// `runtime` must be a live exclusively owned runtime handle and `output` must
 /// satisfy the standard initialized-result contract.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_worker_wait_activity(
+pub unsafe extern "C" fn ocaml_temporal_core_v3_worker_wait_activity(
     runtime: *mut Runtime,
     output: *mut Result,
 ) -> Status {
@@ -4046,7 +4046,7 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_worker_wait_activity(
 /// `runtime` must be a live exclusively owned runtime handle and `output` must
 /// satisfy the standard initialized-result contract.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_worker_wait_any(
+pub unsafe extern "C" fn ocaml_temporal_core_v3_worker_wait_any(
     runtime: *mut Runtime,
     output: *mut Result,
 ) -> Status {
@@ -4076,7 +4076,7 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_worker_wait_any(
 /// `runtime` must be a live exclusively owned runtime handle and `output` must
 /// satisfy the standard initialized-result contract.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_worker_wait_activity_completion_retry_backoff(
+pub unsafe extern "C" fn ocaml_temporal_core_v3_worker_wait_activity_completion_retry_backoff(
     runtime: *mut Runtime,
     output: *mut Result,
 ) -> Status {
@@ -4100,7 +4100,7 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_worker_wait_activity_completion_
 /// The runtime and output contracts match the activity poll operation. A
 /// nonzero input length requires that many readable bytes for this call.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_worker_complete_activity_json(
+pub unsafe extern "C" fn ocaml_temporal_core_v3_worker_complete_activity_json(
     runtime: *mut Runtime,
     input: *const u8,
     input_len: usize,
@@ -4132,7 +4132,7 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_worker_complete_activity_json(
 /// The runtime and output contracts match the activity poll operation. A
 /// nonzero input length requires that many readable bytes for this call.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_worker_record_activity_heartbeat_json(
+pub unsafe extern "C" fn ocaml_temporal_core_v3_worker_record_activity_heartbeat_json(
     runtime: *mut Runtime,
     input: *const u8,
     input_len: usize,
@@ -4162,7 +4162,7 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_worker_record_activity_heartbeat
 /// The runtime and output contracts match the activity poll operation. A
 /// nonzero input length requires that many readable bytes for this call.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_client_complete_async_activity_json(
+pub unsafe extern "C" fn ocaml_temporal_core_v3_client_complete_async_activity_json(
     runtime: *mut Runtime,
     input: *const u8,
     input_len: usize,
@@ -4190,7 +4190,7 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_client_complete_async_activity_j
 /// The runtime and output contracts match the activity poll operation. A
 /// nonzero input length requires that many readable bytes for this call.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_client_record_async_activity_heartbeat_json(
+pub unsafe extern "C" fn ocaml_temporal_core_v3_client_record_async_activity_heartbeat_json(
     runtime: *mut Runtime,
     input: *const u8,
     input_len: usize,
@@ -4221,7 +4221,7 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_client_record_async_activity_hea
 /// The runtime and output contracts match the activity poll operation. A
 /// nonzero input length requires that many readable bytes for this call.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_worker_reject_activity_json(
+pub unsafe extern "C" fn ocaml_temporal_core_v3_worker_reject_activity_json(
     runtime: *mut Runtime,
     input: *const u8,
     input_len: usize,
@@ -4250,7 +4250,7 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_worker_reject_activity_json(
 /// `runtime` must be a live exclusively owned runtime handle. `output` follows
 /// the standard initialized-result contract.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_worker_shutdown(
+pub unsafe extern "C" fn ocaml_temporal_core_v3_worker_shutdown(
     runtime: *mut Runtime,
     output: *mut Result,
 ) -> Status {
@@ -4275,9 +4275,9 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_worker_shutdown(
 ///
 /// # Safety
 ///
-/// The pointer contracts match [`ocaml_temporal_core_v2_worker_shutdown`].
+/// The pointer contracts match [`ocaml_temporal_core_v3_worker_shutdown`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_client_disconnect(
+pub unsafe extern "C" fn ocaml_temporal_core_v3_client_disconnect(
     runtime: *mut Runtime,
     output: *mut Result,
 ) -> Status {
@@ -4304,10 +4304,10 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_client_disconnect(
 /// # Safety
 ///
 /// `runtime` must be null or point to a slot initialized by
-/// [`ocaml_temporal_core_v2_runtime_new`]. The slot must not be accessed
+/// [`ocaml_temporal_core_v3_runtime_new`]. The slot must not be accessed
 /// concurrently, and all future child handles must be closed first.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_runtime_free(runtime: *mut *mut Runtime) -> Status {
+pub unsafe extern "C" fn ocaml_temporal_core_v3_runtime_free(runtime: *mut *mut Runtime) -> Status {
     if runtime.is_null() {
         return STATUS_INVALID_ARGUMENT;
     }
@@ -4336,15 +4336,15 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_runtime_free(runtime: *mut *mut 
 /// Transfer a runtime to its cleanup thread without waiting for destruction.
 ///
 /// This is reserved for the OCaml custom-block finalizer. Normal supervisor
-/// shutdown uses [`ocaml_temporal_core_v2_runtime_free`] and waits while the
+/// shutdown uses [`ocaml_temporal_core_v3_runtime_free`] and waits while the
 /// OCaml runtime lock is released.
 ///
 /// # Safety
 ///
 /// `runtime` has the same exclusive slot contract as
-/// [`ocaml_temporal_core_v2_runtime_free`].
+/// [`ocaml_temporal_core_v3_runtime_free`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_runtime_dispose(
+pub unsafe extern "C" fn ocaml_temporal_core_v3_runtime_dispose(
     runtime: *mut *mut Runtime,
 ) -> Status {
     if runtime.is_null() {
@@ -4380,7 +4380,7 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_runtime_dispose(
 /// `result` must be null or point to a result initialized by this ABI. The
 /// caller must not mutate its pointer or length fields.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_result_free(result: *mut Result) -> Status {
+pub unsafe extern "C" fn ocaml_temporal_core_v3_result_free(result: *mut Result) -> Status {
     if result.is_null() {
         return STATUS_INVALID_ARGUMENT;
     }
@@ -4412,7 +4412,7 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_result_free(result: *mut Result)
 /// # Safety
 ///
 /// `output` follows the same contract as
-/// [`ocaml_temporal_core_v2_check_abi_version`].
+/// [`ocaml_temporal_core_v3_check_abi_version`].
 #[doc(hidden)]
 pub unsafe fn test_invoke_panic(output: *mut Result) -> Status {
     // SAFETY: The pointer contract is forwarded unchanged to `invoke`.
@@ -4438,7 +4438,7 @@ pub fn test_runtime_cleanup_counts() -> (u64, u64) {
 /// This is intentionally not part of the C ABI. It lets integration tests
 /// block the writer deterministically and prove that runtime close still
 /// completes. The handle must be released with
-/// [`ocaml_temporal_core_v2_runtime_free`].
+/// [`ocaml_temporal_core_v3_runtime_free`].
 #[doc(hidden)]
 pub fn test_runtime_new_with_core_log_sink(
     sink: Box<dyn std::io::Write + Send>,

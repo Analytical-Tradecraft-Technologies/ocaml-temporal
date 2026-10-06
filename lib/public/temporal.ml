@@ -30,6 +30,7 @@ module Runtime_info = Runtime_info
 module Scope = Scope
 module Time = Time
 module Signal = Signal
+module Testing = Testing
 module Update = Update
 module Worker = Worker
 module Workflow = Workflow

@@ -17,6 +17,7 @@ boundary honestly:
 
 | Target | What it is useful for today |
 | --- | --- |
+| `Temporal.Testing` | Unit tests of workflow logic: runs registered workflows, activities (real or stubbed), timers, child workflows, signals, queries, updates, and continue-as-new in-process with a time-skipping virtual clock. See [Test workflows in-process](#test-workflows-in-process). |
 | `mock://...` | Fast in-memory checks of client and worker plumbing: request validation, registration, codecs, and handle lifecycle. It is **not** a workflow test environment; see below. |
 | `http://...` or `https://...` | The OCaml-owned native client/worker path backed by Rust Temporal Core. The current native command slice handles activity, timer, terminal, cancellation, cache, and two-stage child-resolution paths. It is covered by focused bridge and adapter tests. |
 | Live Compose acceptance | Real PostgreSQL and Temporal Server validation with two separate OCaml binaries: a public worker and a public client driver. It asserts a fan-out activity result, a timer-then-activity result, and a parent awaiting a timer-owning child workflow. |
@@ -35,14 +36,14 @@ and `Workflow.upsert_search_attributes` raise `Invalid_argument`), and a
 client return typed errors. A `mock://` test that appears to pass therefore
 says nothing about workflow logic.
 
-To test workflow code, run a worker with an `http://` or `https://` target
-against a real Temporal Server, such as a local development server or the
-repository's PostgreSQL Compose stack (`make test-temporal-integration`). The
-SDK's own timer, activity, child, replay, cancellation, and future-combinator
-tests use a private runtime harness under `test/runtime`; it is not part of the
-installed `temporal-sdk` API. The live Compose target proves the listed paths
-through a real Temporal Server; it does not yet cover every failure, recovery,
-or child-workflow scenario.
+To unit-test workflow code, use `Temporal.Testing`, described in [Test
+workflows in-process](#test-workflows-in-process): it runs the same workflow
+runtime as a native worker without a server. For end-to-end confidence, run a
+worker with an `http://` or `https://` target against a real Temporal Server,
+such as a local development server or the repository's PostgreSQL Compose
+stack (`make test-temporal-integration`). The live Compose target proves the
+listed paths through a real Temporal Server; it does not yet cover every
+failure, recovery, or child-workflow scenario.
 
 ## The direct-style model
 
@@ -1099,6 +1100,77 @@ Plain dynamically loaded bytecode (`ocamlfind ocamlc -package temporal-sdk
 plugins (`.cmxs`) are also unsupported. The design reasons are recorded in the
 [Core bridge reference](../reference/core-bridge.md#supported-link-modes).
 
+## Test workflows in-process
+
+`Temporal.Testing` is the supported way to unit-test workflow logic. It runs
+registered workflows on the same private scheduler and command runtime that a
+native worker uses, and replaces Temporal Server and Core with a small
+deterministic simulator: activities run when they are scheduled, child
+workflows start in the same environment, signals and cancellations are routed
+between workflows, and timers fire in **virtual time**. Whenever every
+workflow is blocked on a timer or an activity retry, `Testing.result` jumps
+the clock to the next one, so a workflow that sleeps for a week finishes
+immediately and `Workflow.now` observes the skipped time.
+
+```ocaml
+let test_summarize () =
+  let open Temporal.Result_syntax in
+  let* env =
+    Temporal.Testing.create
+      ~workflows:[ Temporal.Testing.workflow summarize_workflow ]
+      ~activities:
+        [ Temporal.Testing.mock_activity summarize (fun document ->
+              Ok ("summary of " ^ document)) ]
+      ()
+  in
+  Fun.protect
+    ~finally:(fun () -> Temporal.Testing.shutdown env)
+    (fun () -> Temporal.Testing.execute env summarize_workflow "document")
+```
+
+Register definitions with `Testing.workflow` and `Testing.activity`, which
+take the same definitions and handlers as `Temporal.Worker`.
+`Testing.mock_activity` and `Testing.mock_workflow` register a stub under an
+existing definition's name and codecs and replace any other registration of
+that name, so a test can reuse an application's registration list and swap
+out the activities that perform I/O or a child implemented by another
+worker. A remote reference or asynchronous activity registered with
+`Testing.activity` cannot run in-process and fails with a message asking for
+a mock.
+
+For interactive workflows, start the workflow and drive it step by step:
+
+```ocaml
+let* handle = Temporal.Testing.start env cart_workflow () in
+let* () = Temporal.Testing.signal handle add_item "apple" in
+let* count = Temporal.Testing.update handle add_item_update "pear" in
+let* latest = Temporal.Testing.query handle latest_item in
+let* () = Temporal.Testing.skip env (Temporal.Duration.of_ms 60_000L) in
+Temporal.Testing.result handle
+```
+
+`start`, `signal`, and `cancel` run the workflow until it is blocked without
+moving the clock; `skip` advances it by an exact amount, which exposes
+intermediate states; `result` and `update` skip time as needed and accept a
+virtual `?timeout`. A workflow blocked with nothing scheduled, such as one
+waiting for a signal no one sends, makes `result` return a defect rather
+than hang. Activity retry policies are honored with backoff in virtual time;
+an unlimited policy, including the server default, is capped by
+`create ?max_activity_attempts` (default 10). Workflow IDs, run IDs, and the
+`Workflow.random_int` seed are deterministic counters and the clock starts at
+2024-01-01T00:00:00Z unless `?start_time` is given, so repeated runs observe
+identical values.
+
+The simulator is not a server. Activities take zero virtual time and their
+timeouts are not enforced; a workflow task failure (an exception or a
+`Defect`, `Codec`, or `Bridge` error) ends the run with that error instead of
+being retried; child cancellation types are not distinguished; and
+asynchronous activities, Nexus, visibility, memos, and workflow ID reuse
+policies are not simulated. An environment must be used from one system
+thread. [`examples/testing`](../../examples/testing/example_workflow_test.ml)
+tests the example application's workflow this way, with both its real and a
+stubbed activity.
+
 ## 10. Validate locally
 
 From the repository root, the focused Make targets are:
@@ -1111,7 +1183,7 @@ make test-temporal-integration
 ```
 
 The first two use deterministic test seams and do not require a running
-server. The integration target starts a fresh PostgreSQL and Temporal Server
+server; `make test-unit` includes the `Temporal.Testing` suite. The integration target starts a fresh PostgreSQL and Temporal Server
 Compose project, checks the schemas and frontend, runs the OCaml-owned Core
 lifecycle executable, then runs a public worker and a separate public driver.
 The worker executes registered workflows and activities. The driver is a

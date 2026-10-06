@@ -27,6 +27,11 @@
       "description": "Named payloads copied to Temporal indexed search attributes.",
       "items": {"$ref": "metadata-field.schema.json"},
       "uniqueItems": true
+    },
+    "id_conflict_policy": {
+      "enum": ["fail", "use_existing", "terminate_existing"],
+      "default": "fail",
+      "description": "Temporal WorkflowIdConflictPolicy applied when workflow_id already has an open run. Always sent explicitly by the OCaml encoder; an omitted member means fail."
     }
   }
 }

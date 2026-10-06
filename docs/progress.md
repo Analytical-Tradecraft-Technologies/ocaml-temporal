@@ -30,6 +30,37 @@ private context, async-handle, and future types under their public names.
 Verified locally with odoc 3.2.1 on OCaml 5.4.1; the quick-start snippets
 type-check against the library.
 
+## 2026-10-06: Workflow ID conflict policies for Client.start; bridge ABI v3 (#933)
+
+`Temporal.Client.start` accepts `?id_conflict_policy` (`` `Fail ``,
+`` `Use_existing ``, `` `Terminate_existing ``; default `` `Fail ``). The
+policy is always sent as an explicit
+`StartWorkflowExecutionRequest.workflow_id_conflict_policy`, never
+`UNSPECIFIED`, and takes part in the pending request-ID equality check. Start
+responses and outcomes now carry Temporal's `started` flag, exposed as
+`Client.started`. A `` `Fail `` conflict returns a non-retryable `` `Workflow ``
+error with type `WorkflowExecutionAlreadyStarted`, and
+`Client.already_started` recovers the running execution from it.
+
+The start request, response and outcome schemas changed incompatibly in both
+directions, so the bridge ABI moved from 2 to 3: `ABI_VERSION`, the C header
+constant, `Native_bridge.abi_version` and the `ocaml_temporal_core_v3_` symbol
+prefix change together, and a stale Rust archive or OCaml object now fails at
+link time or during startup negotiation rather than on every start.
+
+Evidence: protocol round-trip and strictness tests in
+`test/bridge/test_ocaml_client_protocol.ml`, Rust client-start protocol tests,
+deterministic `mock://` backend tests for all three policies in
+`test/unit/test_client_worker.ml`, and the Rust, C harness and OCaml ABI
+negotiation tests for version 3. The live client request-ID regression
+(`test/integration/client_request_ids/regression.ml`) covers `` `Fail `` (typed
+already-started error naming the running run), `` `Use_existing `` (same run,
+`started = false`), `` `Terminate_existing `` (previous run terminated, new run
+started) and request-ID deduplication taking precedence over the policy. It
+passed locally against a Temporal 1.32 development server with Temporal Core
+`95e97686a079dcfe6c42e3254b2f3f5e3d97408f`; CI runs it against the Compose
+stack's Temporal Server 1.32.0 with PostgreSQL 18.6.
+
 ## 2026-10-06: Fewer payload passes in the OCaml protocol codec (#846)
 
 Payload bytes used to be serialized, reparsed, and base64 re-encoded several
@@ -2886,3 +2917,29 @@ behavior is unchanged and no entry outlives its activation.
 on two threads of one Domain, checks that helper threads do not inherit a
 context, checks exception cleanup, and stress-tests the primitive with
 yielding threads.
+
+## 2026-10-06: In-process workflow test environment (#834)
+
+`mock://` never ran workflow code, so applications had no supported way to
+unit-test workflow logic without a server. The new public `Temporal.Testing`
+module fills that gap. Its engine, the private
+`Temporal_runtime.Test_environment`, starts ordinary `Execution.t` values (the
+runtime a native worker uses) and replaces Temporal Server and Core with a
+single-threaded simulator that interprets their commands: activities run when
+scheduled, with retry policies and heartbeat-detail hand-off applied in
+virtual time; timers fire on a virtual clock that jumps to the next event when
+every execution is blocked; child workflows start in the same environment and
+honor parent-close policies; external signals and cancellations, queries in
+query-only activations, validated updates, workflow cancellation and
+continue-as-new are routed as Core would. Identifiers and the randomness seed
+are deterministic counters. A workflow task failure ends the run with its
+error, and a workflow blocked with nothing scheduled is reported as a defect
+instead of hanging. `mock://` deliberately stays a plumbing-only backend:
+routing it through the engine would mean rewriting the client, backend and
+worker modules for a weaker, untyped API, while `Testing` gives typed handles
+directly. Activity timeouts, task retries, child cancellation types,
+asynchronous activities, Nexus and visibility are not simulated.
+`test/unit/test_testing.ml` covers time skipping, real and mocked activities,
+retries, error propagation, child workflows, signals, queries, updates,
+cancellation, continue-as-new, external signals, local activities and
+reproducibility; `examples/testing` tests the example application's workflow.

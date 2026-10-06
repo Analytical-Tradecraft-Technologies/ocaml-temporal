@@ -48,6 +48,19 @@ type 'output terminal_result =
       (** The run continued as new; the caller decides whether to wait on the
           returned successor identity. *)
 
+(** What [start] does when its workflow ID already has an open (running) run.
+    The policy never affects a closed run: Temporal's default reuse policy
+    lets a new start reuse the ID of a completed, failed, or terminated run.
+
+    - [`Fail]: the start returns the typed already-started error described
+      at {!val-already_started} and leaves the running workflow untouched.
+    - [`Use_existing]: the start returns a handle for the running workflow
+      instead of creating one; {!val-started} is [false] and {!val-run_id} is the
+      existing run's ID. Suited to idempotent "start or attach" orchestration.
+    - [`Terminate_existing]: Temporal terminates the running workflow and
+      starts a new run; the returned handle names the new run. *)
+type id_conflict_policy = [ `Fail | `Use_existing | `Terminate_existing ]
+
 (** One execution row returned by the Temporal visibility service. *)
 type visibility_execution = {
   workflow_id : string;
@@ -101,6 +114,15 @@ val create :
     omitted, the SDK allocates a fresh request ID for this call. Do not reuse
     one ID for unrelated workflow starts.
 
+    [id_conflict_policy] (default [`Fail]) chooses what happens when [id]
+    already has an open run; see {!type-id_conflict_policy}. The SDK always sends
+    the policy explicitly rather than relying on the server default. Request
+    ID deduplication takes precedence: a retry with the same [request_id] as
+    the start that created the open run returns that run as newly started
+    under every policy, so a retried [`Terminate_existing] start never
+    terminates the run it created. Retrying a still-pending request ID with
+    a different policy is rejected rather than treated as the same start.
+
     [memo] attaches named payloads visible when describing the execution.
     [search_attributes] attaches named indexed payloads used by visibility
     queries. Keys in both collections are non-empty, valid UTF-8, NUL-free, at
@@ -128,6 +150,7 @@ val start :
   ?request_id:string ->
   ?memo:(string * Payload.t) list ->
   ?search_attributes:(string * Payload.t) list ->
+  ?id_conflict_policy:id_conflict_policy ->
   workflow:('input, 'output) Workflow.t ->
   task_queue:string ->
   id:string ->
@@ -291,6 +314,25 @@ val workflow_id : ('input, 'output) handle -> string
 
 (** Returns the server-issued run ID supplied to [start]. *)
 val run_id : ('input, 'output) handle -> string
+
+(** Returns [true] when the [start] call that produced [handle] created its
+    run, including a request-ID deduplicated retry of that same start.
+    Returns [false] when a [`Use_existing] start attached to a run created by
+    another start, and for every handle built by [follow]. *)
+val started : ('input, 'output) handle -> bool
+
+(** Returns the open run that made a [`Fail] start fail, or [None] for any
+    other error.
+
+    That start error has category [`Workflow], is non-retryable, and has
+    [Error.error_type] [Some "WorkflowExecutionAlreadyStarted"], Temporal's
+    name for this failure; test the type to recognize the conflict even in
+    the rare case where Temporal did not report the existing run ID, in which
+    case this function also returns [None]. The returned execution can be
+    passed to [follow] with the same client to wait on, signal, or query the
+    running workflow. The identity travels as one JSON detail payload of the
+    error, so it survives if the error is forwarded unchanged. *)
+val already_started : Error.t -> execution option
 
 (** Returns [true] when [error] means the native client refused a [start] or
     [wait] because its bounded set of in-flight operations was full (64 starts
