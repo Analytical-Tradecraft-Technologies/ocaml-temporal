@@ -34,5 +34,10 @@ Verified on 2026-09-21 with OCaml 5.4.1, pinned Core
 1.32.0 using a native SQLite development server. All three histories contained
 one `core_local_activity` marker, one retry timer, cancellation of that timer,
 and workflow completion. Fresh-worker queries reconstructed the cancelled
-result without another activity invocation. This is focused native evidence;
-the Docker/PostgreSQL and platform matrices remain separate gates.
+result without another activity invocation. That run is focused native
+evidence; the platform matrices remain separate gates.
+
+CI runs this suite against the Compose Temporal/PostgreSQL stack through
+`make test-temporal-live-regressions`, which `make test-temporal-live-ci`
+invokes. That target supplies the `default` namespace and the pinned
+admin-tools CLI.
