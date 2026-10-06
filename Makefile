@@ -55,10 +55,15 @@ OCAML_IMAGE ?= ocaml-$(OCAML_SERIES)
 OCAML_IMAGE_REFERENCE = $(or $(shell awk '$$1 == "FROM" && $$3 == "AS" && $$4 == "$(OCAML_IMAGE)" { print $$2 }' Dockerfile.dev),$(OCAML_IMAGE))
 HOST_UID ?= $(shell id -u)
 HOST_GID ?= $(shell id -g)
-# Leave Dune's worker count unchanged by default. A constrained Docker VM can
-# set `DUNE_JOBS=1` (or another small value) to avoid concurrent native linkers
-# exhausting its memory without changing the normal CI/default behavior.
-DUNE_JOBS ?=
+# Dune links many test executables concurrently, each against the large Rust
+# static library, and a default Docker Desktop VM (about 8-10 GiB) is OOM-killed
+# at Dune's automatic, per-CPU job count (#851). Local runs therefore default to
+# two Dune jobs; CI (which sets CI=true on its larger runners) keeps Dune's
+# automatic count. Override with `DUNE_JOBS=1` on a tighter VM or
+# `DUNE_JOBS=auto` to restore Dune's default; an explicitly empty value omits
+# `-j`. Every Make-owned `dune build`, `runtest`, and `exec` passes
+# DUNE_BUILD_ARGS (enforced by test/smoke/test_build_jobs_contract.sh).
+DUNE_JOBS ?= $(if $(strip $(CI)),auto,2)
 DUNE_BUILD_ARGS := $(if $(strip $(DUNE_JOBS)),-j $(DUNE_JOBS),)
 # Rust integration tests each link the Temporal Core graph into a separate test
 # executable. Serializing those links and disabling unused incremental state
@@ -66,6 +71,14 @@ DUNE_BUILD_ARGS := $(if $(strip $(DUNE_JOBS)),-j $(DUNE_JOBS),)
 # changing the test set or the production build profile.
 CARGO_BUILD_JOBS ?= 1
 CARGO_TEST_ENV := CARGO_BUILD_JOBS=$(CARGO_BUILD_JOBS) CARGO_INCREMENTAL=0
+# Cargo's own parallelism is kept for the bridge build (the staticlib has no
+# memory-heavy link step), so the serial test default above is not forwarded.
+# A CARGO_BUILD_JOBS given on the command line or in the environment is passed
+# into every Compose container (`compose run -e`), so it reaches the
+# containerized `cargo build` and every Cargo build that a Dune bridge rule
+# starts, including direct COMPOSE_RUN paths such as executable batches and
+# benchmarks, for VMs where even Rust compilation needs bounding.
+CARGO_BUILD_JOBS_RUN_FLAG := $(if $(filter environment command,$(firstword $(origin CARGO_BUILD_JOBS))),-e CARGO_BUILD_JOBS=$(CARGO_BUILD_JOBS),)
 STRUCTURED_FUZZ_CASES ?= 128
 STRUCTURED_FUZZ_SEED ?= 0x521506a1
 STRUCTURED_FUZZ_TARGET ?= fuzz_
@@ -90,7 +103,7 @@ RUST_BRIDGE_BUILD_PROFILE = $(if $(filter release,$(RUST_BRIDGE_PROFILE)),releas
 # Build separately so Compose's build output goes to stderr and failures stop
 # the command. Only container stdout reaches version and Cargo metadata probes.
 COMPOSE_RUN := OCAML_IMAGE=$(OCAML_IMAGE) $(COMPOSE) --progress plain build $(SERVICE) >&2 && \
-	OCAML_IMAGE=$(OCAML_IMAGE) $(COMPOSE) --progress quiet run --rm --user $(HOST_UID):$(HOST_GID) $(SERVICE)
+	OCAML_IMAGE=$(OCAML_IMAGE) $(COMPOSE) --progress quiet run --rm --user $(HOST_UID):$(HOST_GID) $(CARGO_BUILD_JOBS_RUN_FLAG) $(SERVICE)
 RUN := $(COMPOSE_RUN) opam exec --
 CARGO := $(COMPOSE_RUN) cargo
 CARGO_MANIFEST := rust/Cargo.toml
@@ -171,7 +184,7 @@ bench:
 	image_id=$$(docker image inspect --format '{{.Id}}' "$(TEMPORAL_COMPOSE_PROJECT)-$(SERVICE)" 2>/dev/null || true); \
 	if test -z "$$image_id"; then image_id=unavailable; fi; \
 	status=0; \
-	OCAML_IMAGE=$(OCAML_IMAGE) $(COMPOSE) --progress quiet run --rm --user $(HOST_UID):$(HOST_GID) $(SERVICE) env \
+	OCAML_IMAGE=$(OCAML_IMAGE) $(COMPOSE) --progress quiet run --rm --user $(HOST_UID):$(HOST_GID) $(CARGO_BUILD_JOBS_RUN_FLAG) $(SERVICE) env \
 		BENCH_SOURCE_COMMIT="$$source_commit" \
 		BENCH_SOURCE_DIRTY="$$source_dirty" \
 		BENCH_SDK_VERSION="$$(cat .release-version)" \
@@ -181,7 +194,7 @@ bench:
 		BENCH_DEVELOPMENT_IMAGE_ID="$$image_id" \
 		BENCH_HOST_LABEL="$(BENCH_HOST_LABEL)" \
 		BENCH_REPLAY_HISTORY="$(BENCH_REPLAY_HISTORY)" \
-		opam exec -- dune exec --profile release test/benchmark/$(BENCH_EXECUTABLE).exe -- \
+		opam exec -- dune exec $(DUNE_BUILD_ARGS) --profile release test/benchmark/$(BENCH_EXECUTABLE).exe -- \
 		--warmup "$(BENCH_WARMUP)" --samples "$(BENCH_SAMPLES)" \
 		--repetitions "$(BENCH_REPETITIONS)" --seed "$(BENCH_SEED)" \
 		>"$$tmp" || status=$$?; \
@@ -209,7 +222,7 @@ test:
 	$(MAKE) test-temporal-config
 	$(MAKE) test-temporal-worker-readiness-contract
 	$(MAKE) test-temporal-worker-stop-contract
-	$(RUN) dune runtest
+	$(RUN) dune runtest $(DUNE_BUILD_ARGS)
 	$(if $(RUST_TEST_TARGET),$(MAKE) $(RUST_TEST_TARGET))
 	$(MAKE) test-bridge
 	$(MAKE) test-install
@@ -236,12 +249,12 @@ test-bridge:
 # Requires a disposable Temporal server; the driver owns its worker processes.
 .PHONY: test-completed-queries-live
 test-completed-queries-live:
-	$(RUN) dune exec test/integration/completed_queries/regression.exe -- check $(TEMPORAL_CLIENT_TEST_URL)
+	$(RUN) dune exec $(DUNE_BUILD_ARGS) test/integration/completed_queries/regression.exe -- check $(TEMPORAL_CLIENT_TEST_URL)
 
 # Requires a disposable server and an explicit official Temporal CLI path.
 .PHONY: test-local-activity-cancellation-live
 test-local-activity-cancellation-live:
-	$(RUN) dune exec test/integration/local_activity_cancellation/regression.exe -- check $(TEMPORAL_CLIENT_TEST_URL) $(TEMPORAL_TEST_CLI)
+	$(RUN) dune exec $(DUNE_BUILD_ARGS) test/integration/local_activity_cancellation/regression.exe -- check $(TEMPORAL_CLIENT_TEST_URL) $(TEMPORAL_TEST_CLI)
 
 test-install:
 	$(RUN) sh test/bridge/test_relocatable_link_flags.sh .
@@ -289,6 +302,7 @@ test-live-acceptance-inventory-contract:
 
 test-quality-contract: check-live-acceptance-inventory test-live-acceptance-inventory-contract test-temporal-namespace-readiness
 	sh test/smoke/test_quality_contract.sh .
+	sh test/smoke/test_build_jobs_contract.sh .
 	sh test/smoke/test_opam_locked_deps.sh .
 	sh test/smoke/test_release_tag_contract.sh .
 	sh test/smoke/test_release_tag_commit_contract.sh .
@@ -782,21 +796,21 @@ test-temporal-worker-restart-live: test-temporal-config
 	$(MAKE) temporal-clean
 
 test-unit:
-	$(RUN) dune runtest test/unit test/smoke
+	$(RUN) dune runtest $(DUNE_BUILD_ARGS) test/unit test/smoke
 
 # Requires a disposable server and an explicit official Temporal CLI path.
 .PHONY: test-update-outcomes-live
 test-update-outcomes-live:
-	$(RUN) dune exec test/integration/update_outcomes/regression.exe -- check $(TEMPORAL_CLIENT_TEST_URL) $(TEMPORAL_TEST_CLI)
+	$(RUN) dune exec $(DUNE_BUILD_ARGS) test/integration/update_outcomes/regression.exe -- check $(TEMPORAL_CLIENT_TEST_URL) $(TEMPORAL_TEST_CLI)
 
 test-runtime:
-	$(RUN) dune runtest test/runtime test/integration/temporal/observer
+	$(RUN) dune runtest $(DUNE_BUILD_ARGS) test/runtime test/integration/temporal/observer
 
 # Requires a disposable running Temporal server. The regression owns its worker,
 # uses a unique task queue, and terminates its workflow executions on exit.
 .PHONY: test-client-request-ids-live
 test-client-request-ids-live:
-	$(RUN) dune exec test/integration/client_request_ids/regression.exe -- check $(TEMPORAL_CLIENT_TEST_URL)
+	$(RUN) dune exec $(DUNE_BUILD_ARGS) test/integration/client_request_ids/regression.exe -- check $(TEMPORAL_CLIENT_TEST_URL)
 
 # Requires a disposable running Temporal server. One worker runs both lanes;
 # a fresh client reads the exact timer-workflow result while its activity gate
@@ -825,7 +839,7 @@ test-worker-poll-isolation-live-build:
 
 .PHONY: test-worker-poll-isolation-live-run
 test-worker-poll-isolation-live-run:
-	OCAML_IMAGE=$(OCAML_IMAGE) $(COMPOSE) --progress quiet run --rm --user $(HOST_UID):$(HOST_GID) $(SERVICE) env TEMPORAL_NAMESPACE=temporal-sdk-test TEMPORAL_POLL_ISOLATION_LOG_FILE=/workspace/test/integration/temporal/.smoke-poll-isolation.log sh scripts/run-temporal-executable.sh --build-dir=/workspace/_build/worker-poll-isolation test/integration/worker_poll_isolation/regression.exe check $(TEMPORAL_CLIENT_TEST_URL)
+	OCAML_IMAGE=$(OCAML_IMAGE) $(COMPOSE) --progress quiet run --rm --user $(HOST_UID):$(HOST_GID) $(CARGO_BUILD_JOBS_RUN_FLAG) $(SERVICE) env TEMPORAL_NAMESPACE=temporal-sdk-test TEMPORAL_POLL_ISOLATION_LOG_FILE=/workspace/test/integration/temporal/.smoke-poll-isolation.log sh scripts/run-temporal-executable.sh --build-dir=/workspace/_build/worker-poll-isolation test/integration/worker_poll_isolation/regression.exe check $(TEMPORAL_CLIENT_TEST_URL)
 
 lint:
 	$(RUN) dune build @install $(DUNE_BUILD_ARGS)
@@ -923,7 +937,7 @@ native-build:
 	$(if $(strip $(TEMPORAL_RUST_BRIDGE_DIR)),,$(NATIVE_ENV) cargo build --manifest-path $(CARGO_MANIFEST) --locked)
 
 native-test: $(NATIVE_RUST_TEST_TARGET) native-test-install test-quality-contract
-	$(NATIVE_ENV) $(NATIVE_RUN) dune runtest
+	$(NATIVE_ENV) $(NATIVE_RUN) dune runtest $(DUNE_BUILD_ARGS)
 
 native-test-rust:
 	$(NATIVE_ENV) $(CARGO_TEST_ENV) cargo test --manifest-path $(CARGO_MANIFEST) --locked
