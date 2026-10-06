@@ -3,6 +3,7 @@ module Bridge = Temporal_core_bridge.Native_bridge
 module Client = Temporal_protocol.Client_protocol
 module Workflow = Temporal_protocol.Workflow_protocol
 module Activity = Temporal_protocol.Activity_protocol
+module Encoded_completion = Temporal_protocol.Encoded_workflow_completion
 
 (** Requires two structural values to be equal and identifies the violated
     native-worker contract if they differ. *)
@@ -161,11 +162,13 @@ let test_protocol_serialization () =
   let workflow_completion : Workflow.completion =
     { run_id = "run-1"; task_failure = None; commands = [] }
   in
+  (* Workflow completions are encoded once, before they enter the supervisor
+     mailbox; the supervisor copies exactly these bytes into the C call. *)
   expect "workflow completion JSON"
     (Bytes.of_string {|{"commands":[],"run_id":"run-1"}|})
-    (require_bridge
-       (Supervisor.Protocol_adapter.encode_workflow_completion
-          workflow_completion));
+    (match Encoded_completion.encode workflow_completion with
+    | Ok encoded -> Encoded_completion.to_bytes encoded
+    | Error _ -> failwith "valid workflow completion was not encoded");
   let activity_completion : Activity.completion =
     { task_token = Bytes.of_string "\000\001\002"; result = Will_complete_async }
   in
@@ -192,12 +195,13 @@ let test_protocol_failures_are_typed () =
   let invalid_completion : Workflow.completion =
     { run_id = ""; task_failure = None; commands = [] }
   in
-  match
-    Supervisor.Protocol_adapter.encode_workflow_completion invalid_completion
-  with
-  | Error { Bridge.status = Protocol; message } ->
-      if String.length message = 0 then failwith "empty completion protocol error"
-  | _ -> failwith "invalid workflow completion was not a protocol error"
+  (* An invalid outgoing completion is rejected by the single encoder pass, so
+     no value exists that could be handed to [Complete_workflow]. *)
+  match Encoded_completion.encode invalid_completion with
+  | Error error ->
+      if String.length (Workflow.error_view error).message = 0 then
+        failwith "empty completion protocol error"
+  | Ok _ -> failwith "invalid workflow completion was encoded"
 
 (** Exercises the typed client adapter without a Temporal server. The native
     result shapes below model the already-owned bytes returned by the private
@@ -474,14 +478,19 @@ let test_native_lifecycle_guards () =
   let invalid_completion : Workflow.completion =
     { run_id = ""; task_failure = None; commands = [] }
   in
-  (match
-     Supervisor.perform supervisor
-       (Supervisor.Complete_workflow invalid_completion)
-   with
-  | Error (Supervisor.Backend { Bridge.status = Protocol; _ }) -> ()
-  | _ -> failwith "invalid completion reached the native worker");
-  let workflow_completion : Workflow.completion =
-    { run_id = "run-1"; task_failure = None; commands = [] }
+  (* The encoder is the only constructor of a submittable completion, so an
+     invalid one cannot reach the native worker at all. *)
+  (match Encoded_completion.encode invalid_completion with
+  | Error _ -> ()
+  | Ok _ -> failwith "invalid completion was encoded for the native worker");
+  let workflow_completion =
+    match
+      Encoded_completion.encode
+        ({ run_id = "run-1"; task_failure = None; commands = [] }
+          : Workflow.completion)
+    with
+    | Ok encoded -> encoded
+    | Error _ -> failwith "valid workflow completion was not encoded"
   in
   (match
      Supervisor.perform supervisor

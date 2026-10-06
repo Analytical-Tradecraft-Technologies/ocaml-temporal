@@ -1,7 +1,7 @@
 (** Regression tests for retryable workflow-completion ownership.
 
     A workflow may finish executing before Core acknowledges its completion.
-    The adapter must retain the copied completion, avoid rerunning user code,
+    The adapter must retain the encoded completion, avoid rerunning user code,
     and leave the run lease outstanding until a later drain succeeds. This
     focused fake rejects two consecutive completion attempts so the test covers
     both the poll retry path and a failed shutdown-style drain before the final
@@ -25,6 +25,21 @@ type fake_supervisor = {
   (* Number of deliberately rejected completion attempts remaining. *)
   completion_rejections : int ref;
 }
+
+(** Decodes the canonical bytes a fake supervisor received, exactly as Rust
+    would, so fixtures assert on what was actually submitted. The adapter
+    only submits values built by the canonical encoder, so a decode failure
+    is a defect in the code under test. *)
+let submitted_completion encoded =
+  match
+    Protocol.decode_completion
+      (Temporal_protocol.Encoded_workflow_completion.to_string encoded)
+  with
+  | Ok completion -> completion
+  | Error error ->
+      failwith
+        ("submitted completion did not decode: "
+        ^ (Protocol.error_view error).message)
 
 (** Allocates an empty semantic queue and lease ledger. *)
 let fake_supervisor () =
@@ -51,7 +66,8 @@ module Fake_supervisor = struct
 
   (** Rejects the configured number of attempts before acknowledging the exact
       run ID. A rejection leaves the lease in place for adapter retry. *)
-  let complete_workflow supervisor (completion : Protocol.completion) =
+  let complete_workflow supervisor encoded =
+    let completion = submitted_completion encoded in
     if !(supervisor.completion_rejections) > 0 then begin
       decr supervisor.completion_rejections;
       Error

@@ -2004,6 +2004,77 @@ let test_unknown_sequence_becomes_failure () =
       ()
   | _ -> failwith "unknown sequence did not become a protocol failure"
 
+(** Issue #846: [activate_translated] consumes one translation and encodes its
+    completion once, returning those canonical bytes. The bytes must equal what
+    [Workflow_protocol.encode_completion] produces for the typed completion
+    (the document the supervisor used to build by encoding a second time), the
+    [activate] convenience path must agree with it, and the bytes must be a
+    snapshot that later mutation of the typed completion's payload buffers
+    cannot change. *)
+let test_activate_translated_encodes_once () =
+  (* Every byte value, so the canonical base64 output covers padding and the
+     full alphabet rather than only ASCII text. *)
+  let output = Bytes.init (64 * 1024 + 1) (fun index -> Char.chr (index land 0xff)) in
+  let workflow =
+    Temporal_base.Definition.make ~name:"native_single_encode"
+      ~input:Temporal_base.Codec.unit ~output:Temporal_base.Codec.bytes
+      ~implementation:(Some (fun () -> Ok (Bytes.copy output)))
+  in
+  let start =
+    activation
+      [
+        Protocol.Initialize_workflow
+          {
+            workflow_id = "workflow-single-encode";
+            workflow_type = "native_single_encode";
+            arguments = [];
+            randomness_seed = "1";
+            attempt = 1;
+            context = None;
+          };
+      ]
+  in
+  let translated =
+    unwrap "single-encode translation" (Native_execution.translate_activation start)
+  in
+  if translated.source != start then
+    failwith "translation did not retain its source activation by reference";
+  let checked =
+    unwrap "single-encode activation"
+      (Native_execution.activate_translated (Execution.start workflow ()) translated)
+  in
+  let submitted =
+    Temporal_protocol.Encoded_workflow_completion.to_string checked.encoded
+  in
+  (match Protocol.encode_completion checked.completion with
+  | Ok expected when String.equal expected submitted -> ()
+  | Ok _ -> failwith "retained completion bytes differ from the canonical encoder"
+  | Error _ -> failwith "checked completion no longer encodes");
+  (* The convenience path translates and activates once more on a fresh
+     execution; it must produce the same completion, hence the same bytes. *)
+  let typed =
+    unwrap "convenience activation" (Native_execution.activate (Execution.start workflow ()) start)
+  in
+  if typed <> checked.completion then
+    failwith "activate and activate_translated produced different completions";
+  (match checked.completion.commands with
+  | [ Protocol.Complete_workflow { result = Some payload } ] ->
+      if not (Bytes.equal payload.data output) then
+        failwith "completion payload changed during translation";
+      Bytes.fill payload.data 0 (Bytes.length payload.data) 'Z'
+  | _ -> failwith "single-encode workflow did not complete with its payload");
+  if
+    not
+      (String.equal submitted
+         (Temporal_protocol.Encoded_workflow_completion.to_string checked.encoded))
+  then failwith "mutating a typed payload changed the retained completion bytes";
+  match Protocol.decode_completion submitted with
+  | Ok
+      { commands = [ Protocol.Complete_workflow { result = Some payload } ]; _ }
+    when Bytes.equal payload.data output ->
+      ()
+  | _ -> failwith "retained completion bytes do not decode to the original payload"
+
 (** Runs every native-execution translation assertion. *)
 let () =
   test_start_metadata_snapshot ();
@@ -2033,4 +2104,5 @@ let () =
   test_command_order_and_validation ();
   test_activity_command_translation_and_validation ();
   test_duplicate_sequence_rejected ();
-  test_unknown_sequence_becomes_failure ()
+  test_unknown_sequence_becomes_failure ();
+  test_activate_translated_encodes_once ()

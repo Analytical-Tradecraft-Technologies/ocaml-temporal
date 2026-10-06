@@ -15,6 +15,30 @@ implementation when a later entry documents that work as complete. The
 records the current tested source, named assertions and successful CI job for
 the Temporal acceptance controllers.
 
+## 2026-10-06: One translation and one completion encode per workflow task (#846)
+
+The native workflow worker used to translate (and so canonically re-encode)
+each activation twice, once for registry lookup and again inside
+`Native_execution.activate`, and to encode each completion twice, once as
+validation in `Native_execution` and again in the supervisor before the C
+call. The worker now passes the private `translated_activation` (which keeps
+its source activation) to `Native_execution.activate_translated`, and the
+completion's single encoder pass produces an abstract
+`Temporal_protocol.Encoded_workflow_completion.t` that the adapter retains
+and the supervisor's `Complete_workflow`/`Complete_replay_workflow` copy into
+C unchanged. Retained completions are now those immutable bytes, so the
+payload deep copy is gone and a retry resubmits the identical string; an
+adapter-built completion the encoder rejects fails closed without a native
+call, as before. All validation is kept, and the wire bytes are unchanged.
+Runtime tests check that submitted bytes equal the canonical encoding of the
+completion, that a retryable rejection resubmits the physically identical
+string without rerunning the workflow, and that the retained bytes do not
+change when a typed payload buffer is mutated afterwards. On a scratch
+harness (OCaml 5.4.1, Apple M4 Pro, release profile), ten activations each
+carrying a 2 MiB activity result in and a 2 MiB activity input out took a
+median of 6.39 s before and 3.19 s after, measured on the codec that was
+current before #923.
+
 ## 2026-10-06: Stopping a worker from a signal handler (#830)
 
 An OCaml signal handler may run on the thread blocked in `Worker.run`, so in a

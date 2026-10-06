@@ -129,7 +129,8 @@ module Workflow_source = struct
   let try_poll_workflow supervisor =
     Native.perform supervisor Native.Try_poll_workflow
 
-  (** Submits one semantic workflow completion through the supervisor mailbox.
+  (** Submits one workflow completion, already encoded once by the adapter,
+      through the supervisor mailbox.
   *)
   let complete_workflow supervisor completion =
     Native.perform supervisor (Native.Complete_workflow completion)

@@ -3,15 +3,17 @@
 
     Rust/Core ownership and semantic JSON validation live below this module in
     the supervisor. This module therefore receives typed activations, resolves
-    each run ID to an existentially typed [Execution.t], and sends typed
-    completions back through the same supervisor. The registry is mutable only
-    behind one mutex; it is never shared with workflow fibers or native code. *)
+    each run ID to an existentially typed [Execution.t], and sends each
+    completion back through the same supervisor as the canonical bytes from
+    its single encoder pass. The registry is mutable only behind one mutex; it
+    is never shared with workflow fibers or native code. *)
 
 module Protocol = Temporal_protocol.Workflow_protocol
 module Definition = Temporal_base.Definition
 module Codec = Temporal_base.Codec
 module Base_error = Temporal_base.Error
 module Observability = Temporal_base.Observability
+module Encoded_completion = Temporal_protocol.Encoded_workflow_completion
 
 (** Result-bind notation keeps all expected boundary failures on typed paths. *)
 let ( let* ) = Result.bind
@@ -27,7 +29,7 @@ module type SUPERVISOR = sig
     t -> (Protocol.activation option, error) result
 
   val complete_workflow :
-    t -> Protocol.completion -> (unit, error) result
+    t -> Encoded_completion.t -> (unit, error) result
 
   val error_code : error -> string
   val error_message : error -> string
@@ -148,8 +150,14 @@ type pending_result =
       remove_run : bool;
     }
 
-(** The protocol value is owned by this adapter until the supervisor accepts
-    it. Its binary payloads are copied before the value enters mutable state.
+(** The completion is owned by this adapter until the supervisor accepts it.
+
+    [submission] holds the canonical bytes from the completion's single
+    encoder pass (issue #846). They are an immutable snapshot, so retaining
+    them needs no payload copy and a retry resubmits exactly the same bytes.
+    [Error] records a completion the encoder rejected: it can never be
+    submitted, so its first attempt fails closed exactly as a non-retryable
+    supervisor rejection did when the supervisor ran the encoder.
 
     [retry_refusal] records the first submission failure that the source did
     not explicitly classify as retryable. Once it is [Some], the completion is
@@ -160,7 +168,7 @@ type pending_result =
     terminal [discard] releases the entry (issue #843). *)
 type pending_completion = {
   run_id : string;
-  completion : Protocol.completion;
+  submission : (Encoded_completion.t, error_view) result;
   result : pending_result;
   mutable retry_refusal : error_view option;
 }
@@ -516,8 +524,8 @@ module Make (Supervisor : SUPERVISOR) = struct
        continuations are already shut down. Adapter failures also remove runs
        after their failure completion is acknowledged. *)
     mutable runs : run Run_map.t;
-    (* Owned copies of completions whose source acknowledgement failed. The
-       value remains here until the exact same completion is accepted. *)
+    (* Canonical bytes of completions whose source acknowledgement failed. The
+       value remains here until the exact same bytes are accepted. *)
     mutable pending : pending_completion Run_map.t;
     (* Serializes all access to [runs], [pending], and the source operation so
        another Domain cannot overtake an activation or retry a completion. *)
@@ -559,140 +567,6 @@ module Make (Supervisor : SUPERVISOR) = struct
         on_completion;
       }
 
-  (** Copies a payload without retaining a mutable buffer owned by an earlier
-      execution step. Metadata keys are immutable strings; metadata and body
-      bytes are the only mutable protocol values. *)
-  let copy_payload (payload : Protocol.payload) : Protocol.payload =
-    {
-      metadata =
-        List.map (fun (key, value) -> (key, Bytes.copy value)) payload.metadata;
-      data = Bytes.copy payload.data;
-    }
-
-  (** Copies a failure recursively, including nested causes and detail
-      payloads. Failure text is immutable, while every payload buffer is owned
-      by the retained completion. *)
-  let rec copy_failure (failure : Protocol.failure) : Protocol.failure =
-    let info =
-      match failure.info with
-      | Protocol.Application
-          { type_name; non_retryable; details; category; next_retry_delay } ->
-          Protocol.Application
-            {
-              type_name;
-              non_retryable;
-              details = List.map copy_payload details;
-              category;
-              next_retry_delay;
-            }
-      | Protocol.Canceled { details; identity } ->
-          Protocol.Canceled
-            { details = List.map copy_payload details; identity }
-      | Protocol.Activity _ as info -> info
-      | Protocol.Terminated _ as info -> info
-      | Protocol.Child_workflow _ as info -> info
-      | Protocol.Timeout_failure { timeout_type; last_heartbeat_details } ->
-          Protocol.Timeout_failure
-            {
-              timeout_type;
-              last_heartbeat_details = List.map copy_payload last_heartbeat_details;
-            }
-      | Protocol.Reset_workflow { last_heartbeat_details } ->
-          Protocol.Reset_workflow
-            { last_heartbeat_details = List.map copy_payload last_heartbeat_details }
-      | ( Protocol.Server _ | Protocol.Nexus_operation _
-        | Protocol.Nexus_handler _ | Protocol.Absent ) as info ->
-          info
-    in
-    {
-      message = failure.message;
-      source = failure.source;
-      stack_trace = failure.stack_trace;
-      encoded_attributes = Option.map copy_payload failure.encoded_attributes;
-      cause = Option.map copy_failure failure.cause;
-      info;
-    }
-
-  (** Copies every payload-bearing command in a workflow completion. Keeping
-      this operation explicit makes the ownership boundary auditable without a
-      JSON round trip or an alias to a workflow implementation's buffer. *)
-  let copy_completion (completion : Protocol.completion) : Protocol.completion =
-    (* Commands without payload-bearing fields are returned unchanged; every
-       command that can retain mutable bytes is copied before it enters
-       [pending]. *)
-    let copy_command = function
-      | Protocol.Schedule_activity command ->
-          Protocol.Schedule_activity
-            {
-              command with
-              arguments = List.map copy_payload command.arguments;
-            }
-      | Protocol.Schedule_local_activity command ->
-          Protocol.Schedule_local_activity
-            {
-              command with
-              arguments = List.map copy_payload command.arguments;
-            }
-      | Protocol.Complete_workflow { result } ->
-          Protocol.Complete_workflow { result = Option.map copy_payload result }
-      | Protocol.Fail_workflow { failure } ->
-          Protocol.Fail_workflow { failure = copy_failure failure }
-      | Protocol.Continue_as_new command ->
-          Protocol.Continue_as_new
-            { command with input = List.map copy_payload command.input }
-      | Protocol.Start_child_workflow command ->
-          Protocol.Start_child_workflow
-            { command with input = List.map copy_payload command.input }
-      | Protocol.Signal_external_workflow command ->
-          Protocol.Signal_external_workflow
-            {
-              command with
-              input = List.map copy_payload command.input;
-              headers =
-                List.map (fun (key, payload) -> (key, copy_payload payload))
-                  command.headers;
-            }
-      | Protocol.Query_result { query_id; result } ->
-          let result =
-            match result with
-            | Protocol.Query_succeeded payload ->
-                Protocol.Query_succeeded (copy_payload payload)
-            | Protocol.Query_failed failure -> Protocol.Query_failed (copy_failure failure)
-          in
-          Protocol.Query_result { query_id; result }
-      | Protocol.Update_response { protocol_instance_id; response } ->
-          let response =
-            match response with
-            | Protocol.Update_accepted -> Protocol.Update_accepted
-            | Protocol.Update_rejected failure ->
-                Protocol.Update_rejected (copy_failure failure)
-            | Protocol.Update_completed payload ->
-                Protocol.Update_completed (copy_payload payload)
-          in
-          Protocol.Update_response { protocol_instance_id; response }
-      | Protocol.Cancel_child_workflow _ as command -> command
-      | Protocol.Request_cancel_external_workflow _ as command -> command
-      | Protocol.Request_cancel_activity _ as command -> command
-      | Protocol.Request_cancel_local_activity _ as command -> command
-      | Protocol.Start_timer _ as command -> command
-      | Protocol.Cancel_timer _ as command -> command
-      | Protocol.Set_patch_marker _ as command -> command
-      | Protocol.Upsert_search_attributes { search_attributes } ->
-          Protocol.Upsert_search_attributes
-            {
-              search_attributes =
-                List.map
-                  (fun (key, payload) -> (key, copy_payload payload))
-                  search_attributes;
-            }
-      | Protocol.Cancel_workflow_execution as command -> command
-    in
-    {
-      run_id = completion.run_id;
-      task_failure = Option.map copy_failure completion.task_failure;
-      commands = List.map copy_command completion.commands;
-    }
-
   (** Distinguishes source rejection from an uncertain raised acknowledgement.
       Both preserve the exact pending completion; neither permits replacement
       commands or re-execution of workflow code. [retryable] carries the
@@ -716,9 +590,9 @@ module Make (Supervisor : SUPERVISOR) = struct
   (** Calls the supervisor completion operation without losing whether an
       exception occurred. A returned source error still means that the
       supervisor completed the call normally but did not acknowledge it. *)
-  let attempt_completion supervisor completion =
+  let attempt_completion supervisor encoded =
     try
-      match Supervisor.complete_workflow supervisor completion with
+      match Supervisor.complete_workflow supervisor encoded with
       | Ok () -> Accepted
       | Error source_error ->
           let source =
@@ -771,8 +645,9 @@ module Make (Supervisor : SUPERVISOR) = struct
           report Logs.Warning ~operation:"workflow_completion_diagnostic_failed" ())
 
   (** Applies bookkeeping only after the supervisor acknowledges a retained
-      completion. The copied completion is released here, while a successfully
-      completed run keeps its final query state until Core eviction. *)
+      completion. The retained completion bytes are released here, while a
+      successfully completed run keeps its final query state until Core
+      eviction. *)
   let accepted_pending adapter pending =
     adapter.pending <- Run_map.remove pending.run_id adapter.pending;
     match pending.result with
@@ -816,7 +691,15 @@ module Make (Supervisor : SUPERVISOR) = struct
           if not retryable then pending.retry_refusal <- Some error;
           Error error
         in
-        match attempt_completion adapter.supervisor pending.completion with
+        match pending.submission with
+        | Error error ->
+            (* The encoder rejected this completion, so no bytes exist to
+               submit. Nothing reached the supervisor and the native lease is
+               still held; failing closed matches the earlier behavior, when
+               the supervisor's own encode rejected it non-retryably. *)
+            refuse_unless false error
+        | Ok encoded ->
+        match attempt_completion adapter.supervisor encoded with
         | Accepted -> accepted_pending adapter pending
         | Rejected_by_supervisor { error; retryable } ->
             refuse_unless retryable error
@@ -871,6 +754,21 @@ module Make (Supervisor : SUPERVISOR) = struct
     | None ->
         Protocol.{ run_id = activation.run_id; commands = []; task_failure = Some failure }
 
+  (** Runs the canonical encoder once over a completion built by this adapter
+      (a failure or an eviction acknowledgement). An encoder rejection becomes
+      the same [completion_failed] diagnostic, at the same path, that a
+      non-retryable supervisor rejection produced when the supervisor ran the
+      encoder; [finish_pending] fails it closed without a native call. *)
+  let encode_submission completion =
+    match Encoded_completion.encode completion with
+    | Ok encoded -> Ok encoded
+    | Error error ->
+        let view = Protocol.error_view error in
+        Error
+          (make_error ~path:"$.completion" "completion_failed"
+             (Printf.sprintf "workflow completion encoding failed: %s at %s: %s"
+                view.code view.path view.message))
+
   (** Encodes and submits an adapter-level failure. A successful submission is
       the lease-retirement proof for the activation; a failed submission
       preserves a source error rather than claiming the lease was retired.
@@ -889,7 +787,7 @@ module Make (Supervisor : SUPERVISOR) = struct
     let pending =
       {
         run_id = activation.run_id;
-        completion = copy_completion completion;
+        submission = encode_submission completion;
         result = Pending_rejected { error; remove_run };
         retry_refusal = None;
       }
@@ -931,15 +829,20 @@ module Make (Supervisor : SUPERVISOR) = struct
           translated.cache_removal;
     }
 
-  (** Produces a typed completion for a successfully executed activation and
-      updates the registry only after the supervisor confirms retirement. A
-      failed or raised submission keeps the exact value pending; Core may
-      already have accepted it, so it is never replaced by a task failure. *)
-  let submit_completion adapter activation completion ~run_id ~activation_info =
+  (** Submits the checked completion of a successfully executed activation and
+      updates the registry only after the supervisor confirms retirement. The
+      bytes produced by [Native_execution]'s single encoder pass are retained
+      and submitted as they are; the typed value is read only for bookkeeping.
+      A failed or raised submission keeps the exact bytes pending; Core may
+      already have accepted them, so they are never replaced by a task
+      failure. *)
+  let submit_completion adapter activation
+      (checked : Native_execution.encoded_completion) ~run_id ~activation_info =
+    let completion = checked.completion in
     let pending =
       {
         run_id;
-        completion = copy_completion completion;
+        submission = Ok checked.encoded;
         result =
           Pending_completed
             {
@@ -971,7 +874,7 @@ module Make (Supervisor : SUPERVISOR) = struct
     let pending =
       {
         run_id = activation.run_id;
-        completion = copy_completion completion;
+        submission = encode_submission completion;
         result =
           Pending_completed
             {
@@ -1059,7 +962,8 @@ module Make (Supervisor : SUPERVISOR) = struct
                                     Run_map.add activation.run_id run adapter.runs;
                                   begin
                                     match
-                                      Native_execution.activate execution activation
+                                      Native_execution.activate_translated execution
+                                        translated
                                     with
                                     | Error error ->
                                         retire_with_failure ~remove_run:true adapter
@@ -1077,7 +981,9 @@ module Make (Supervisor : SUPERVISOR) = struct
                           (make_error ~path:"$.run_id" "unknown_run_id"
                              "activation does not identify a registered running workflow")
                     | Some (Run { execution; _ }) ->
-                        (match Native_execution.activate execution activation with
+                        (match
+                           Native_execution.activate_translated execution translated
+                         with
                         | Error error ->
                             let remove_run =
                               Option.is_none (query_only_ids activation)
@@ -1127,7 +1033,7 @@ module Make (Supervisor : SUPERVISOR) = struct
   (** Discards OCaml-owned executions and retained completion bytes after the
       native graph has been force-released by terminal worker shutdown. This
       path never calls the supervisor: the Rust runtime has already retired its
-      leases, and retrying a copied completion would risk a duplicate. Each
+      leases, and retrying a retained completion would risk a duplicate. Each
       execution is explicitly shut down so paused workflow continuations and
       scheduler state do not wait for a later garbage collection cycle. *)
   let discard adapter =

@@ -26,12 +26,15 @@ module type SUPERVISOR = sig
     t ->
     (Temporal_protocol.Workflow_protocol.activation option, error) result
 
-  (** Submits one complete semantic activation result. The supervisor performs
-      canonical validation and retires the exact native lease identified by
-      [completion.run_id]. *)
+  (** Submits one complete activation result as the canonical bytes from its
+      single encoder pass, and retires the exact native lease named by the
+      completion's run ID. The adapter has already validated the completion
+      while encoding it, so the supervisor passes these bytes on without
+      encoding them again (issue #846). A retried submission is given the same
+      value, byte for byte. *)
   val complete_workflow :
     t ->
-    Temporal_protocol.Workflow_protocol.completion ->
+    Temporal_protocol.Encoded_workflow_completion.t ->
     (unit, error) result
 
   (** Stable, bounded classification for a supervisor error. *)

@@ -117,7 +117,17 @@ module Source = struct
       Ok (Some activation)
 
   (** A rejected completion leaves its lease available for the retained retry. *)
-  let complete_workflow source (completion : Protocol.completion) =
+  let complete_workflow source encoded =
+    (* The adapter submits canonical bytes from one encoder pass; decode
+       them as Rust would to inspect the commands that were submitted. *)
+    let completion =
+      match
+        Protocol.decode_completion
+          (Temporal_protocol.Encoded_workflow_completion.to_string encoded)
+      with
+      | Ok completion -> completion
+      | Error _ -> failwith "submitted completion did not decode"
+    in
     if source.reject_next then begin
       source.reject_next <- false;
       Error "retry"
