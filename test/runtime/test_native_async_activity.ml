@@ -1134,6 +1134,72 @@ let test_async_failure () =
     | _ -> failwith "async failure did not submit one failed completion"
   end
 
+(** An asynchronous callback reads the start task's metadata through
+    [Async_context.info], including the effective timeouts. Sub-millisecond
+    schedule-to-close and start-to-close values are rounded up instead of
+    rejecting the task, so exposing them adds no new failure path (#792). *)
+let test_async_context_info () =
+  let supervisor = fake_supervisor () in
+  let observed = ref None in
+  let activity =
+    Temporal.Activity.define_async ~name:"async_info"
+      ~input:Temporal.Codec.unit ~output:Temporal.Codec.unit
+      (fun context () ->
+        observed := Some (Temporal.Activity.Async_context.info context);
+        Temporal.Activity.Completed ())
+  in
+  let token = Bytes.of_string "async-info-token" in
+  let task =
+    start_task ~token ~activity_type:"async_info"
+      ~input:[ encode_input Temporal.Codec.unit () ]
+  in
+  let task =
+    match task.variant with
+    | Protocol.Start start ->
+        {
+          task with
+          variant =
+            Protocol.Start
+              {
+                start with
+                attempt = 2L;
+                schedule_to_close_timeout = Some { seconds = 60L; nanoseconds = 1 };
+                start_to_close_timeout = Some { seconds = 0L; nanoseconds = 500_000 };
+                heartbeat_timeout = Some { seconds = 3L; nanoseconds = 0 };
+              };
+        }
+    | _ -> failwith "fixture did not build a start task"
+  in
+  enqueue supervisor task;
+  let worker = worker supervisor [ Adapter.register_async activity ] in
+  begin
+    match Worker.poll worker with
+    | Ok (Raw_adapter.Completed { kind = Raw_adapter.Succeeded; _ }) -> ()
+    | _ -> failwith "async info activity did not complete synchronously"
+  end;
+  let module Info = Temporal.Activity.Info in
+  let ms = Option.map Temporal.Duration.to_ms in
+  match !observed with
+  | None -> failwith "async info callback did not run"
+  | Some (Error error) ->
+      failwith ("async context info failed: " ^ Temporal.Error.message error)
+  | Some (Ok info) ->
+      if Info.namespace info <> "default" then failwith "async info namespace";
+      if Info.workflow info
+         <> { Info.workflow_id = "async-workflow-1"; run_id = "async-run-1";
+              workflow_type = "async_test_workflow" }
+      then failwith "async info workflow";
+      if Info.activity_id info <> "async-activity-1" then failwith "async info id";
+      if Info.activity_type info <> "async_info" then failwith "async info type";
+      if Info.attempt info <> 2 then failwith "async info attempt";
+      if Info.is_local info then failwith "async info locality";
+      if ms (Info.schedule_to_close_timeout info) <> Some 60_001L then
+        failwith "schedule-to-close timeout was not rounded up";
+      if ms (Info.start_to_close_timeout info) <> Some 1L then
+        failwith "sub-millisecond start-to-close timeout was not rounded up";
+      if ms (Info.heartbeat_timeout info) <> Some 3_000L then
+        failwith "heartbeat timeout did not match"
+
 (** [drain] refuses to claim shutdown while an async capability remains, while
     [discard] closes the retained handle only after terminal native cleanup. *)
 let test_async_drain_and_discard () =
@@ -1660,6 +1726,7 @@ let () =
   test_async_not_found_heartbeat_closes_handle ();
   test_async_heartbeat_and_cancel ();
   test_async_failure ();
+  test_async_context_info ();
   test_async_drain_and_discard ();
   test_stale_handle_rejected ();
   test_completion_racing_handoff_is_retryable ();

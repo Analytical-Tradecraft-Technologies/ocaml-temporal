@@ -241,15 +241,22 @@ callback.
 `Temporal.Activity.Info.t`: namespace, the scheduling workflow (ID, run ID,
 and type; standalone activities are failed by the bridge before dispatch, so
 one is always present), activity ID and type, the 1-based
-attempt, whether Core runs it as a local activity, and the first-scheduled,
-current-attempt-scheduled, and started timestamps that Core reported. The
-adapter copies these values from the validated start task, so the projection
-cannot fail; a context from a backend without a Temporal task, such as the
+attempt, whether Core runs it as a local activity, the first-scheduled,
+current-attempt-scheduled, and started timestamps that Core reported, and the
+effective schedule-to-close, start-to-close, and heartbeat timeouts. Core
+carries timeouts with nanosecond precision while `Temporal.Duration.t` holds
+whole milliseconds, so a sub-millisecond remainder is rounded up: a positive
+timeout never reads as zero, and the conversion is total, so exposing
+timeouts adds no task-rejection path (the separately validated
+`Context.heartbeat_timeout` keeps its existing rule). The adapter copies these
+values from the validated start task, so the projection cannot fail; a context from a backend without a Temporal task, such as the
 in-process test backend, returns a typed defect instead. Combining the
 workflow and activity IDs (plus the attempt when each retry must be distinct)
 gives the standard idempotency key for at-least-once side effects. The
-metadata is immutable and stays readable after the attempt ends. Asynchronous
-activity contexts do not expose it yet.
+metadata is immutable and stays readable after the attempt ends.
+`Async_context.info` returns the same metadata to an asynchronous callback;
+because the value is immutable, external code may keep it alongside the
+retained handle.
 
 Before constructing the context, the adapter validates the server timeout: it
 rejects negative, sub-millisecond, or out-of-range values instead of rounding

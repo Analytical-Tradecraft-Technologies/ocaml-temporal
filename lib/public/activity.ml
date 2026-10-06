@@ -284,29 +284,6 @@ module Async_handle = struct
     |> Result.map_error Error_private.of_base
 end
 
-(** Accessors for the attempt-scoped asynchronous context. *)
-module Async_context = struct
-  type 'output t = 'output async_context
-
-  (** Returns the retained completion capability. *)
-  let handle context = Temporal_base.Async_activity.handle context
-end
-
-(** Encodes and submits one typed heartbeat value for the current activity. *)
-let heartbeat (context : context) (codec : 'a Codec.t) (value : 'a) =
-  match Codec.encode codec value with
-  | Error error -> Error error
-  | Ok ({ Payload.metadata; data } : Payload.t) ->
-      let payload : Temporal_base.Payload.t =
-        {
-          Temporal_base.Payload.metadata =
-            List.map (fun (key, value) -> (key, value)) metadata;
-          data = Bytes.copy data;
-        }
-      in
-      Temporal_base.Activity_context.heartbeat context [ payload ]
-      |> Result.map_error Error_private.of_base
-
 (** Public projection of the private activity task metadata. The private
     record already holds immutable, validated values, so accessors only
     convert representations. *)
@@ -362,7 +339,57 @@ module Info = struct
 
   (** Returns the server start time of this attempt. *)
   let started_time (info : t) = time info.started_time
+
+  (** Re-wraps a private millisecond duration in the public type. *)
+  let duration =
+    Option.map (fun duration ->
+        Duration.of_ms (Temporal_base.Duration.to_ms duration))
+
+  (** Returns the effective schedule-to-close timeout. *)
+  let schedule_to_close_timeout (info : t) =
+    duration info.schedule_to_close_timeout
+
+  (** Returns the effective start-to-close timeout. *)
+  let start_to_close_timeout (info : t) = duration info.start_to_close_timeout
+
+  (** Returns the effective heartbeat timeout. *)
+  let heartbeat_timeout (info : t) = duration info.task_heartbeat_timeout
 end
+
+(** Accessors for the attempt-scoped asynchronous context. *)
+module Async_context = struct
+  type 'output t = 'output async_context
+
+  (** Returns the retained completion capability. *)
+  let handle context = Temporal_base.Async_activity.handle context
+
+  (** Returns the start task's metadata, or a defect for a context built
+      without a Temporal task. *)
+  let info context =
+    match Temporal_base.Async_activity.info context with
+    | Some info -> Ok info
+    | None ->
+        Error
+          (Error.defect
+             ~message:
+               "Temporal.Activity.Async_context.info is unavailable for this \
+                activity context")
+end
+
+(** Encodes and submits one typed heartbeat value for the current activity. *)
+let heartbeat (context : context) (codec : 'a Codec.t) (value : 'a) =
+  match Codec.encode codec value with
+  | Error error -> Error error
+  | Ok ({ Payload.metadata; data } : Payload.t) ->
+      let payload : Temporal_base.Payload.t =
+        {
+          Temporal_base.Payload.metadata =
+            List.map (fun (key, value) -> (key, value)) metadata;
+          data = Bytes.copy data;
+        }
+      in
+      Temporal_base.Activity_context.heartbeat context [ payload ]
+      |> Result.map_error Error_private.of_base
 
 (** Safe operations exposed to contextual activity implementations. *)
 module Context = struct

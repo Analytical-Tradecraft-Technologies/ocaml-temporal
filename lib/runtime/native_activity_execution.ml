@@ -499,12 +499,35 @@ let decode_start definition (start : Protocol.activity_start) =
   in
   Ok (input, details, heartbeat_timeout)
 
+(** Converts a task timeout to whole milliseconds for
+    [Temporal.Activity.Info], rounding a sub-millisecond remainder up.
+
+    Unlike [runtime_duration], which rejects sub-millisecond heartbeat
+    intervals because heartbeat throttling depends on the exact value, this
+    conversion is total: metadata exposure must never add a task-rejection
+    path. Rounding up keeps a positive timeout positive (zero would read as
+    "already expired"). The strict decoder bounds seconds to the protobuf
+    duration range and nanoseconds to [0, 1e9); the clamp and saturation
+    below only make the function total should that invariant ever change. *)
+let info_duration (duration : Protocol.duration) =
+  let seconds = Int64.max 0L duration.seconds in
+  let nanoseconds = max 0 (min 999_999_999 duration.nanoseconds) in
+  let fraction_ms = Int64.of_int ((nanoseconds + 999_999) / 1_000_000) in
+  (* [fraction_ms] is at most 1000, so any [seconds] below this bound keeps
+     [seconds * 1000 + fraction_ms] within [Int64.max_int]. *)
+  let maximum_seconds = Int64.pred (Int64.div Int64.max_int 1_000L) in
+  let milliseconds =
+    if Int64.compare seconds maximum_seconds > 0 then Int64.max_int
+    else Int64.add (Int64.mul seconds 1_000L) fraction_ms
+  in
+  Temporal_base.Duration.of_ms milliseconds
+
 (** Copies the identity and scheduling facts of a start task into the
     immutable record exposed through [Temporal.Activity.Context.info]. The
     strict protocol decoder has already bounded every string and validated
-    timestamp fractions, so this projection cannot fail. Core's attempt is a
-    uint32, which always fits a native OCaml [int] on supported 64-bit
-    targets. *)
+    timestamp fractions, and [info_duration] is total, so this projection
+    cannot fail. Core's attempt is a uint32, which always fits a native OCaml
+    [int] on supported 64-bit targets. *)
 let task_info (start : Protocol.activity_start) : Activity_context.info =
   let timestamp =
     Option.map (fun (value : Protocol.timestamp) ->
@@ -524,6 +547,10 @@ let task_info (start : Protocol.activity_start) : Activity_context.info =
     current_attempt_scheduled_time =
       timestamp start.current_attempt_scheduled_time;
     started_time = timestamp start.started_time;
+    schedule_to_close_timeout =
+      Option.map info_duration start.schedule_to_close_timeout;
+    start_to_close_timeout = Option.map info_duration start.start_to_close_timeout;
+    task_heartbeat_timeout = Option.map info_duration start.heartbeat_timeout;
   }
 
 (** Finds an executable definition by the Temporal activity type. *)
@@ -1135,7 +1162,9 @@ module Make (Supervisor : SUPERVISOR) = struct
                   ~submit:(submit_async_operation adapter ~token)
                   ~encode_output
               in
-              let context = Async_activity.context handle in
+              let context =
+                Async_activity.context ~info:(task_info start) handle
+              in
               let context_handle = Async_activity.handle context in
               (* External code may retain this handle and retry the retryable
                  "not active yet" error while the handoff is outstanding

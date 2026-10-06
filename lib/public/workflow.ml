@@ -240,6 +240,7 @@ module Info = struct
       when [info] was called. Every field is immutable. *)
   type t = {
     run : Temporal_sdk_kernel.Workflow_context_store.run_info;
+    namespace : string;
     task_queue : string;
     is_replaying : bool;
     history : Temporal_sdk_kernel.Workflow_context_store.activation_history;
@@ -262,6 +263,9 @@ module Info = struct
 
   (** Returns the workflow type name. *)
   let workflow_type info = info.run.workflow_type
+
+  (** Returns the worker namespace captured when the execution was created. *)
+  let namespace (info : t) = info.namespace
 
   (** Returns the worker task queue. *)
   let task_queue info = info.task_queue
@@ -324,6 +328,8 @@ let info () =
           Ok
             {
               Info.run;
+              namespace =
+                Temporal_sdk_kernel.Workflow_context_store.namespace context;
               task_queue =
                 Temporal_sdk_kernel.Workflow_context_store.task_queue context;
               is_replaying =
