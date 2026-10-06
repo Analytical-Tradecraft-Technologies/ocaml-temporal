@@ -309,7 +309,7 @@ update-live-acceptance-inventory:
 test-live-acceptance-inventory-contract:
 	sh test/smoke/test_live_acceptance_inventory_contract.sh .
 
-test-quality-contract: check-live-acceptance-inventory test-live-acceptance-inventory-contract test-temporal-namespace-readiness
+test-quality-contract: check-live-acceptance-inventory test-live-acceptance-inventory-contract test-temporal-namespace-readiness test-temporal-live-regressions-contract
 	sh test/smoke/test_quality_contract.sh .
 	sh test/smoke/test_build_jobs_contract.sh .
 	sh test/smoke/test_opam_locked_deps.sh .
@@ -462,8 +462,10 @@ temporal-clean:
 # CI uses the same controllers as local acceptance, each with a bounded log
 # wrapper. A failed scenario stops the suite; workflow finalizers upload all
 # snapshots already captured, including the deliberate collector regressions.
+# The fixed-bug regression suites run first and print their own logs instead.
 test-temporal-live-ci:
 	$(MAKE) test-temporal-diagnostics-contract
+	$(MAKE) test-temporal-live-regressions
 	bash test/integration/temporal/scripts/run-with-live-diagnostics.sh integration $(MAKE) test-temporal-integration
 	bash test/integration/temporal/scripts/run-with-live-diagnostics.sh restart $(MAKE) test-temporal-worker-restart
 	bash test/integration/temporal/scripts/run-with-live-diagnostics.sh crash $(MAKE) test-temporal-worker-crash-recovery
@@ -475,6 +477,47 @@ test-temporal-live-ci:
 
 test-temporal-diagnostics-contract:
 	bash test/integration/temporal/scripts/test-live-diagnostics-contract.sh
+
+# Fixed-bug live regressions (#545, #546, #548, #567, #805) that each own their
+# workers and a unique task queue. Most have a per-suite test-*-live target
+# that runs one suite against any disposable server; this list is what CI
+# executes (#795). Every entry must also be in scripts/ci-smoke-executables.txt,
+# and test/smoke/test_live_regressions_contract.sh fails when a regression
+# executable under test/integration is neither here nor otherwise run by CI.
+LIVE_REGRESSION_EXECUTABLES := test/integration/client_request_ids/regression.exe test/integration/completed_queries/regression.exe test/integration/local_activity_cancellation/regression.exe test/integration/split_worker_task_types/regression.exe test/integration/update_outcomes/regression.exe
+# Seconds for each regression process; the suites normally finish in seconds.
+LIVE_REGRESSION_TIMEOUT_SECONDS ?= 180
+
+# Runs LIVE_REGRESSION_EXECUTABLES against a fresh Compose stack. The
+# controller registers the fixtures' `default` namespace, supplies the pinned
+# admin-tools CLI, bounds every process, and runs all suites before failing.
+# In CI the executables come from the verified smoke artifact
+# (TEMPORAL_PREBUILT_SMOKE=1); locally they are compiled first.
+.PHONY: test-temporal-live-regressions test-temporal-live-regressions-contract
+test-temporal-live-regressions: test-temporal-live-regressions-contract test-temporal-config
+	$(COMPOSE_RUN) env DUNE_JOBS="$(DUNE_JOBS)" sh scripts/build-temporal-executables.sh $(LIVE_REGRESSION_EXECUTABLES)
+	@set -eu; \
+	cleanup() { \
+		status=$$?; \
+		trap - EXIT HUP INT TERM; \
+		if [ "$$status" -ne 0 ]; then $(MAKE) temporal-logs || true; fi; \
+		$(MAKE) temporal-clean || true; \
+		exit "$$status"; \
+	}; \
+	$(MAKE) temporal-clean; \
+	trap cleanup EXIT; \
+	trap 'exit 129' HUP; \
+	trap 'exit 130' INT; \
+	trap 'exit 143' TERM; \
+	$(MAKE) temporal-start; \
+	TEMPORAL_COMPOSE_PROJECT="$(TEMPORAL_COMPOSE_PROJECT)" OCAML_IMAGE="$(OCAML_IMAGE)" HOST_UID="$(HOST_UID)" HOST_GID="$(HOST_GID)" \
+		LIVE_REGRESSION_TIMEOUT_SECONDS="$(LIVE_REGRESSION_TIMEOUT_SECONDS)" \
+		sh test/integration/temporal/scripts/run-live-regressions.sh $(LIVE_REGRESSION_EXECUTABLES)
+
+# Docker-free check that every live regression executable is compiled into the
+# CI smoke artifact and executed by a recipe reachable from test-temporal-live-ci.
+test-temporal-live-regressions-contract:
+	sh test/smoke/test_live_regressions_contract.sh .
 
 test-temporal-integration: test-temporal-config
 	@set -eu; \

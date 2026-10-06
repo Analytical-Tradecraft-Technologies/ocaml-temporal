@@ -36,6 +36,23 @@ to 0.62 s. Protocol tests compare the new decoder with an independent
 re-encoding reference for RFC 4648 vectors, every length from 0 to 300 bytes,
 an exhaustive set of four-symbol groups, and malformed wrappers.
 
+## 2026-10-06: Fixed-bug live regressions run in CI (#795)
+
+The live regression executables for client request IDs (#545), update
+admission outcomes (#546), completed-workflow queries (#548), local activity
+retry cancellation (#567) and split workflow/activity workers (#805) were
+neither compiled nor run by CI. They are now in the prebuilt smoke artifact,
+and `make test-temporal-live-ci` runs them through
+`make test-temporal-live-regressions` against a fresh Compose stack. That
+target registers the fixtures' `default` namespace, copies the pinned
+admin-tools CLI for the two suites that inspect or delete their own
+executions, and bounds every process. A Docker-free contract, part of
+`make test-quality-contract`, requires every `test/integration/*/regression.exe`
+to be in the artifact list and run by a recipe reachable from the CI live
+target, and its self-test proves that omissions are rejected. The suites
+compiled locally with OCaml 5.4.1; their first live results come from the
+pull request's Linux CI job.
+
 ## 2026-10-06: Connection failures name their cause; Core logs reach stderr (#833)
 
 Every client connection failure used to read `Temporal client connection
