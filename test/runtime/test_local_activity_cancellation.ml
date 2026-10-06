@@ -13,9 +13,18 @@ let get = function
 let expect label expected actual =
   if expected <> actual then failwith label
 
-(** Creates one pending local operation without registering an activity worker. *)
+(** Creates one pending local operation without registering an activity worker.
+    [action] receives a [drain] function that runs the queued scheduler work
+    standing in for the activation's fiber pass; backoff timers and retries are
+    emitted only there (#809). *)
 let with_activity ~is_replaying policy action =
-  let context = Context.create (Scheduler.create ()) in
+  let scheduler = Scheduler.create () in
+  let context = Context.create scheduler in
+  let drain () =
+    match Context.with_context context (fun () -> Scheduler.run scheduler) with
+    | Scheduler.Failed exn -> raise exn
+    | Scheduler.Complete | Scheduler.Blocked -> ()
+  in
   Context.set_activation_is_replaying context is_replaying;
   Fun.protect ~finally:(fun () -> Context.shutdown context) (fun () ->
       let future, cancel =
@@ -24,7 +33,7 @@ let with_activity ~is_replaying policy action =
           ~cancellation_type:policy ~decode:(fun payload -> Ok payload) ()
       in
       ignore (Context.take_commands context);
-      action context future (fun () ->
+      action context future drain (fun () ->
           Context.with_context context (fun () -> get (cancel ()))))
 
 (** Models the completion that transfers a long retry delay from Core to OCaml. *)
@@ -42,20 +51,23 @@ let expect_cancelled future =
 
 (** A cancel preceding the backoff job prevents even a retry timer being created. *)
 let before_backoff ~is_replaying policy =
-  with_activity ~is_replaying policy (fun context future cancel ->
+  with_activity ~is_replaying policy (fun context future drain cancel ->
       cancel ();
       expect "initial cancel command" [Activation.Request_cancel_local_activity { seq = 1L }]
         (Context.take_commands context);
       backoff context;
       expect_cancelled future;
+      drain ();
       expect "cancelled backoff scheduled work" [] (Context.take_commands context);
       cancel ();
       expect "repeated cancellation emitted work" [] (Context.take_commands context))
 
 (** A cancel during backoff removes the timer and resolves exactly once. *)
 let during_backoff ~is_replaying policy =
-  with_activity ~is_replaying policy (fun context future cancel ->
+  with_activity ~is_replaying policy (fun context future drain cancel ->
       backoff context;
+      expect "backoff timer emitted during the job pass" [] (Context.take_commands context);
+      drain ();
       expect "backoff timer" [Activation.Start_timer { seq = 2L; milliseconds = 60_000L }]
         (Context.take_commands context);
       cancel ();
@@ -70,14 +82,53 @@ let during_backoff ~is_replaying policy =
          still be rejected, and must never revive the cancelled operation. *)
       (match Context.fire_timer context ~seq:2L with
       | Error _ -> () | Ok () -> failwith "cancelled timer remained registered");
+      drain ();
       expect "cancelled timer rescheduled activity" [] (Context.take_commands context))
+
+(** A cancel between Core's backoff job and the queued timer work settles the
+    operation and leaves the queued work with nothing to emit. *)
+let before_timer_work ~is_replaying policy =
+  with_activity ~is_replaying policy (fun context future drain cancel ->
+      backoff context;
+      (match Context.resolve_local_activity_backoff context ~seq:1L ~attempt:3L
+               ~backoff_milliseconds:60_000L ~original_schedule_time:None with
+      | Error _ -> () | Ok () -> failwith "duplicate queued backoff was accepted");
+      cancel ();
+      expect_cancelled future;
+      expect "queued backoff cancellation"
+        [Activation.Request_cancel_local_activity { seq = 1L }]
+        (Context.take_commands context);
+      drain ();
+      expect "cancelled queued backoff started a timer" [] (Context.take_commands context);
+      cancel ();
+      expect "repeated cancellation emitted work" [] (Context.take_commands context))
+
+(** A cancel between the timer firing and the queued retry work settles the
+    operation without re-emitting the local activity. *)
+let before_retry_work ~is_replaying policy =
+  with_activity ~is_replaying policy (fun context future drain cancel ->
+      backoff context;
+      drain ();
+      ignore (Context.take_commands context);
+      get (Context.fire_timer context ~seq:2L);
+      expect "retry emitted during the job pass" [] (Context.take_commands context);
+      cancel ();
+      expect_cancelled future;
+      expect "queued retry cancellation"
+        [Activation.Request_cancel_local_activity { seq = 1L }]
+        (Context.take_commands context);
+      drain ();
+      expect "cancelled queued retry rescheduled activity" []
+        (Context.take_commands context))
 
 (** A timer that fires first starts the next attempt; Core then owns its cancel. *)
 let after_timer ~is_replaying policy =
-  with_activity ~is_replaying policy (fun context future cancel ->
+  with_activity ~is_replaying policy (fun context future drain cancel ->
       backoff context;
+      drain ();
       ignore (Context.take_commands context);
       get (Context.fire_timer context ~seq:2L);
+      drain ();
       (match Context.take_commands context with
       | [Activation.Schedule_local_activity { seq = 1L; attempt = 2L; _ }] -> ()
       | _ -> failwith "timer did not schedule the next attempt");
@@ -93,16 +144,19 @@ let after_timer ~is_replaying policy =
 
 (** A later backoff after a retry's cancellation cannot start a third attempt. *)
 let retry_backoff_after_cancel ~is_replaying policy =
-  with_activity ~is_replaying policy (fun context future cancel ->
+  with_activity ~is_replaying policy (fun context future drain cancel ->
       backoff context;
+      drain ();
       ignore (Context.take_commands context);
       get (Context.fire_timer context ~seq:2L);
+      drain ();
       ignore (Context.take_commands context);
       cancel ();
       ignore (Context.take_commands context);
       get (Context.resolve_local_activity_backoff context ~seq:1L ~attempt:3L
              ~backoff_milliseconds:60_000L ~original_schedule_time:None);
       expect_cancelled future;
+      drain ();
       expect "cancelled retry started another timer" [] (Context.take_commands context))
 
 (** The same ordered jobs must produce the same commands and outcomes in live
@@ -112,6 +166,8 @@ let () =
     List.iter (fun policy ->
         before_backoff ~is_replaying policy;
         during_backoff ~is_replaying policy;
+        before_timer_work ~is_replaying policy;
+        before_retry_work ~is_replaying policy;
         after_timer ~is_replaying policy;
         retry_backoff_after_cancel ~is_replaying policy)
       [Activation.Try_cancel; Activation.Wait_cancellation_completed; Activation.Abandon])

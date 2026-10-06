@@ -13,13 +13,36 @@ type start_metadata = {
 type activity_resolution =
   (Temporal_base.Codec.payload, Temporal_base.Error.t) result -> unit
 
+(** Language-owned retry phase of one local activity (#809). Core's backoff
+    job and the backoff timer's firing are both applied during the activation
+    job pass, but their commands are emitted by scheduler work queued at that
+    point, exactly where a fiber woken by the same job would run. Commands
+    therefore keep their relative order with commands from fibers woken by
+    earlier jobs whether Core delivers those jobs in one activation or several,
+    which is what makes the live history replayable.
+
+    - [Backoff_idle]: no retry delay is in progress; an attempt is either
+      running in Core or the activity is about to be resolved.
+    - [Backoff_timer_queued]: Core requested a backoff and the work that
+      allocates the timer sequence and emits [Start_timer] is queued.
+    - [Backoff_timer seq]: the retry timer with sequence [seq] is outstanding.
+    - [Backoff_retry_queued]: the timer fired and the work that re-emits
+      [Schedule_local_activity] is queued.
+
+    Every non-idle phase rejects a further Core backoff job for the sequence
+    and lets cancellation settle the operation without involving Core. *)
+type local_activity_backoff =
+  | Backoff_idle
+  | Backoff_timer_queued
+  | Backoff_timer of int64
+  | Backoff_retry_queued
+
 (** Retains the immutable request fields needed to re-emit one local activity
     after Core asks the language layer to back off. The resolver remains in the
     ordinary activity table so terminal completions use the same lifecycle;
-    [backoff_timer_seq] is set while the retry timer is outstanding and makes
-    duplicate Core backoff jobs fail closed. [cancellation_requested] shares
-    the handle's decision so a later backoff job cannot revive a cancelled
-    operation. *)
+    [backoff] tracks the language-owned retry delay and makes duplicate Core
+    backoff jobs fail closed. [cancellation_requested] shares the handle's
+    decision so a later backoff job cannot revive a cancelled operation. *)
 type local_activity_state = {
   activity_id : string;
   activity_type : string;
@@ -34,7 +57,7 @@ type local_activity_state = {
   mutable attempt : int64;
   mutable original_schedule_time :
     Temporal_protocol.Workflow_protocol.timestamp option;
-  mutable backoff_timer_seq : int64 option;
+  mutable backoff : local_activity_backoff;
 }
 
 (** Function saved for each pending child workflow. Child and activity
@@ -608,14 +631,17 @@ let resolve_activity context ~seq result =
     Core has already completed the preceding attempt, so there is no running
     attempt to acknowledge cancellation under any of the cancellation policies.
     Removing the timer callback before resolving also prevents another attempt
-    from being scheduled by a stale timer. *)
+    from being scheduled by a stale timer. Work queued for a
+    [Backoff_timer_queued] or [Backoff_retry_queued] phase finds the activity
+    removed from [local_activities] and becomes a no-op, so neither a timer nor
+    a retry is emitted after cancellation. *)
 let cancel_local_activity_backoff context ~seq state =
-  Option.iter
-    (fun timer_seq ->
+  (match state.backoff with
+  | Backoff_timer timer_seq ->
       Hashtbl.remove context.timers timer_seq;
-      state.backoff_timer_seq <- None;
-      emit context (Activation.Cancel_timer { seq = timer_seq }))
-    state.backoff_timer_seq;
+      emit context (Activation.Cancel_timer { seq = timer_seq })
+  | Backoff_idle | Backoff_timer_queued | Backoff_retry_queued -> ());
+  state.backoff <- Backoff_idle;
   resolve_activity context ~seq
     (Error
        (Temporal_base.Error.make ~category:`Cancelled
@@ -689,7 +715,7 @@ let schedule_activity context ~name ~input ?activity_id ?task_queue
         cancellation_requested;
         attempt = 1L;
         original_schedule_time = None;
-        backoff_timer_seq = None;
+        backoff = Backoff_idle;
       }
     in
     Hashtbl.add context.local_activities seq local_state;
@@ -748,9 +774,8 @@ let schedule_activity context ~name ~input ?activity_id ?task_queue
                else Activation.Request_cancel_activity { seq });
             cancellation_requested := true;
             (match Hashtbl.find_opt context.local_activities seq with
-            | Some ({ backoff_timer_seq = Some _; _ } as state) ->
-                cancel_local_activity_backoff context ~seq state
-            | _ -> Ok ()))
+            | Some { backoff = Backoff_idle; _ } | None -> Ok ()
+            | Some state -> cancel_local_activity_backoff context ~seq state))
     | _ ->
         Error
           (Temporal_base.Error.defect
@@ -888,10 +913,31 @@ let cancel_external_workflow context ~workflow_id ~run_id ~reason () =
        { seq; workflow_id; run_id; reason });
   future
 
-(** Starts the language-owned timer requested by Core for a local retry. The
-    original activity sequence stays pending while the timer uses its own
-    sequence; when it fires, the callback updates the attempt metadata and
-    emits the same local activity command with Core's supplied provenance. *)
+(** Returns the local activity state only while it is still in the expected
+    retry [phase]. Queued backoff work uses this to become a no-op after a
+    cancellation, terminal resolution, or shutdown removed or reset the
+    activity before the work reached the front of the scheduler queue. *)
+let local_activity_in_phase context ~seq phase =
+  match Hashtbl.find_opt context.local_activities seq with
+  | Some state when state.backoff = phase -> Some state
+  | Some _ | None -> None
+
+(** Accepts the retry delay Core requested for a local activity and queues the
+    language-owned timer behind work already runnable in this activation.
+
+    Validation and the phase change happen during the job pass so malformed or
+    duplicate Core jobs fail the activation immediately. The timer sequence is
+    allocated and [Start_timer] emitted only when the queued work runs: emitting
+    it inline would place it before commands from fibers woken by earlier jobs
+    in the same activation, and Core may merge jobs that were delivered in
+    separate activations live into one activation on replay (#809). Queuing at
+    the job's position is also how the TypeScript and Python SDKs behave,
+    where the backoff is handled by the coroutine awaiting the activity.
+
+    When the timer fires, its callback likewise queues the work that updates
+    the attempt metadata and re-emits the same local activity sequence with
+    Core's supplied provenance. The original activity sequence stays pending
+    throughout; only a terminal resolution or cancellation completes it. *)
 let resolve_local_activity_backoff context ~seq ~attempt ~backoff_milliseconds
     ~original_schedule_time =
   match Hashtbl.find_opt context.local_activities seq with
@@ -900,62 +946,83 @@ let resolve_local_activity_backoff context ~seq ~attempt ~backoff_milliseconds
         (bridge_error
            (Printf.sprintf
               "local activity backoff references unknown sequence %Ld" seq))
-  | Some state -> (
-      match state.backoff_timer_seq with
-      | Some _ ->
-          Error
-            (bridge_error
-               (Printf.sprintf
-                  "duplicate local activity backoff sequence %Ld" seq))
-      | None when attempt <= 0L ->
-          Error
-            (bridge_error
-               (Printf.sprintf
-                  "local activity backoff attempt %Ld must be positive" attempt))
-      | None when backoff_milliseconds < 0L ->
-          Error
-            (bridge_error
-               (Printf.sprintf
-                  "local activity backoff duration %Ld must be non-negative"
-                  backoff_milliseconds))
-      | None when Int64.compare attempt state.attempt <= 0 ->
-          Error
-            (bridge_error
-               (Printf.sprintf
-                  "local activity backoff attempt %Ld does not advance sequence %Ld"
-                  attempt seq))
-      | None when !(state.cancellation_requested) ->
-          cancel_local_activity_backoff context ~seq state
-      | None ->
-          let timer_seq = allocate_sequence context in
-          state.backoff_timer_seq <- Some timer_seq;
-          Hashtbl.add context.timers timer_seq (fun () ->
-              match Hashtbl.find_opt context.local_activities seq with
-              | None -> ()
-              | Some state ->
-                  state.backoff_timer_seq <- None;
-                  state.attempt <- attempt;
-                  state.original_schedule_time <- original_schedule_time;
-                  emit context
-                    (Activation.Schedule_local_activity
-                       {
-                         seq;
-                         activity_id = state.activity_id;
-                         activity_type = state.activity_type;
-                         attempt = state.attempt;
-                         original_schedule_time = state.original_schedule_time;
-                         arguments = state.arguments;
-                         schedule_to_close_timeout = state.schedule_to_close_timeout;
-                         schedule_to_start_timeout = state.schedule_to_start_timeout;
-                         start_to_close_timeout = state.start_to_close_timeout;
-                         retry_policy = state.retry_policy;
-                         local_retry_threshold = state.local_retry_threshold;
-                         cancellation_type = state.cancellation_type;
-                       }));
-          emit context
-            (Activation.Start_timer
-               { seq = timer_seq; milliseconds = backoff_milliseconds });
-          Ok ())
+  | Some
+      { backoff = Backoff_timer_queued | Backoff_timer _ | Backoff_retry_queued;
+        _ } ->
+      Error
+        (bridge_error
+           (Printf.sprintf "duplicate local activity backoff sequence %Ld" seq))
+  | Some _ when attempt <= 0L ->
+      Error
+        (bridge_error
+           (Printf.sprintf
+              "local activity backoff attempt %Ld must be positive" attempt))
+  | Some _ when backoff_milliseconds < 0L ->
+      Error
+        (bridge_error
+           (Printf.sprintf
+              "local activity backoff duration %Ld must be non-negative"
+              backoff_milliseconds))
+  | Some state when Int64.compare attempt state.attempt <= 0 ->
+      Error
+        (bridge_error
+           (Printf.sprintf
+              "local activity backoff attempt %Ld does not advance sequence %Ld"
+              attempt seq))
+  | Some state when !(state.cancellation_requested) ->
+      cancel_local_activity_backoff context ~seq state
+  | Some state ->
+      (* Re-emits the next attempt once the timer has fired and every fiber
+         queued before the firing job has run. *)
+      let retry () =
+        match local_activity_in_phase context ~seq Backoff_retry_queued with
+        | None -> ()
+        | Some state ->
+            state.backoff <- Backoff_idle;
+            state.attempt <- attempt;
+            state.original_schedule_time <- original_schedule_time;
+            emit context
+              (Activation.Schedule_local_activity
+                 {
+                   seq;
+                   activity_id = state.activity_id;
+                   activity_type = state.activity_type;
+                   attempt = state.attempt;
+                   original_schedule_time = state.original_schedule_time;
+                   arguments = state.arguments;
+                   schedule_to_close_timeout = state.schedule_to_close_timeout;
+                   schedule_to_start_timeout = state.schedule_to_start_timeout;
+                   start_to_close_timeout = state.start_to_close_timeout;
+                   retry_policy = state.retry_policy;
+                   local_retry_threshold = state.local_retry_threshold;
+                   cancellation_type = state.cancellation_type;
+                 })
+      in
+      (* Runs from [fire_timer] during the job pass, so it only records the
+         phase and queues [retry]. *)
+      let on_timer_fired () =
+        match Hashtbl.find_opt context.local_activities seq with
+        | Some ({ backoff = Backoff_timer _; _ } as state) ->
+            state.backoff <- Backoff_retry_queued;
+            Scheduler.spawn context.scheduler retry
+        | Some _ | None -> ()
+      in
+      (* Allocates the timer sequence in scheduler order, after fibers woken
+         by earlier jobs of this activation have emitted their commands. *)
+      let start_timer () =
+        match local_activity_in_phase context ~seq Backoff_timer_queued with
+        | None -> ()
+        | Some state ->
+            let timer_seq = allocate_sequence context in
+            state.backoff <- Backoff_timer timer_seq;
+            Hashtbl.add context.timers timer_seq on_timer_fired;
+            emit context
+              (Activation.Start_timer
+                 { seq = timer_seq; milliseconds = backoff_milliseconds })
+      in
+      state.backoff <- Backoff_timer_queued;
+      Scheduler.spawn context.scheduler start_timer;
+      Ok ()
 
 (** Records the start acknowledgment or removes the child resolver on a start
     failure. Once a run ID is recorded, every later start result is rejected so

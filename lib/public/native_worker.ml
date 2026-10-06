@@ -139,6 +139,19 @@ module Workflow_source = struct
 
   (** Returns the bounded diagnostic used in adapter diagnostics. *)
   let error_message error = snd (native_error_view error)
+
+  (** No workflow completion failure is retryable. The Rust bridge defines no
+      retryable workflow-completion status: pinned Core reports only
+      deterministic validation failures from [complete_workflow_activation],
+      which an identical resubmission would repeat, and every other failure
+      (lifecycle, mailbox, or an acknowledgement lost after acceptance) cannot
+      prove that the run's lease is still outstanding. A retained workflow
+      completion is therefore never resubmitted (issue #843). *)
+  let error_is_retryable (_ : error) = false
+
+  (** A raised completion is an uncertain acknowledgement; see
+      [error_is_retryable]. *)
+  let exception_is_retryable (_ : exn) = false
 end
 
 (** Activity operations use the same supervisor instance as workflow operations;

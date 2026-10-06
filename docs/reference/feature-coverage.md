@@ -2,7 +2,8 @@
 
 This reference describes the source audited at
 [`beae10d0a58e`](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/commit/beae10d0a58e58fb8e076734cd38113d7a2b4466)
-on 2026-09-20. The SDK is experimental and pre-`0.1.0`. A feature's presence,
+on 2026-09-20. The SDK is experimental; the current package version is the `0.1.0~rc.1`
+release candidate, and no final `0.1.0` has been released. A feature's presence,
 focused tests, successful live acceptance, and a release support commitment are
 separate evidence levels. [#489](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/489)
 tracks the support decision; this audit does not decide that policy.
@@ -22,7 +23,9 @@ commit-pinned test links and verified [September 19 CI run](https://github.com/A
 Its server lane used Linux OCaml 5.5, Temporal 1.32.0 and PostgreSQL 18.6. The
 other Linux/compiler and native build lanes are not additional live-server tests.
 The [generated inventory](live-acceptance-inventory.md) lists current fixture
-membership; historical milestone evidence remains in [progress](../progress.md).
+membership, including the start-metadata and workflow-task-failure controllers
+added after the audited baseline; historical milestone evidence remains in
+[progress](../progress.md).
 
 ## Runtime and public APIs
 
@@ -39,7 +42,7 @@ membership; historical milestone evidence remains in [progress](../progress.md).
 | Client operations | Start/wait/follow/cancel/terminate/reset, signals, queries, update handles, bounded visibility listing and shutdown are implemented. | Start/wait/follow/cancel/terminate and named interactions are live-tested. Reset/visibility conformance, deadlines and reconciliation races remain unqualified. A control RPC acknowledgement is not worker execution or terminal completion. |
 | Continue-as-new and patching | Explicit successor handles; `patched` decisions and `deprecate_patch` markers with mixed-mode protection. | Live successor following and marker-free to active, active to deprecated, deprecated to removed patch histories. Broader history compatibility and migration automation remain open. |
 | External operations | Workflow signal/cancellation commands preserve exact workflow/run identity and typed acknowledgement/failure. | Live signal delivery, signal rejection for a confirmed completed target, external cancellation and wrong-run cancellation rejection. Missing targets, completed-target cancellation and retry/replay combinations remain unqualified. |
-| Worker versioning and metadata | Legacy build-ID and deployment-based Core options, task-local deployment identity, start memo/search attributes, search-attribute upserts and activity priority/fairness fields are implemented and focused-tested. | No dedicated live routing, deployment rollout, metadata or fairness qualification in the audited controller set. |
+| Worker versioning and metadata | Legacy build-ID and deployment-based Core options, task-local deployment identity, start memo/search attributes, search-attribute upserts and activity priority/fairness fields are implemented and focused-tested. | No dedicated live routing, deployment rollout or fairness qualification. `make test-temporal-start-metadata-live`, added after the audited baseline, checks start memo/search attributes, continue-as-new and an official-CLI start across worker replacement; see [start metadata](workflow-start-metadata.md). Search-attribute upserts and priority metadata are not live-qualified. |
 
 Focused tests are under [`test/unit/`](../../test/unit/),
 [`test/runtime/`](../../test/runtime/), [`test/bridge/`](../../test/bridge/),

@@ -22,7 +22,8 @@ nor the original Dune build tree. Artifacts contain no SDK `.ml` source files.
 
 Published releases include assets named, for example,
 `ocaml-temporal-sdk-v0.1.0-rc.1-linux-arm64-ocaml-5.5.1.tar.gz`.
-Each contains `library.tar.gz`, `manifest.json`, and the two installation helpers.
+Each contains `library.tar.gz`, `manifest.json`, the two installation helpers,
+and `LICENSE` plus `THIRD-PARTY-NOTICES.txt` for the statically linked Rust bridge.
 The release's top-level manifest records the source commit and all asset hashes.
 The first release must be published before these example assets are available.
 

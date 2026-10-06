@@ -126,9 +126,9 @@ entry is `ocamlfind.1.9.9~preview` for OCaml 5.5, because `ocamlfind.1.9.8`
 declares `ocaml < 5.5.0~`; ocamlfind (MIT) is a build-only tool reached
 through topkg and is not linked into the SDK.
 
-The image copies Rust 1.98.1, Cargo, Clippy, and rustfmt from the official
-multi-architecture `rust:1.98-bookworm` image at manifest digest
-`sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e`.
+The image copies Rust 1.99.0, Cargo, Clippy, and rustfmt from the official
+multi-architecture `rust:1.99-bookworm` image at manifest digest
+`sha256:59037199c44290f2befcdd58dcc540164763fc296950255aaefeef096a1866b0`.
 That manifest contains native `linux/amd64` and `linux/arm64/v8` images. Rust
 is dual-licensed Apache-2.0 OR MIT. Debian's `protobuf-compiler` and
 `libprotobuf-dev` packages are installed as build-only tools required by
@@ -228,6 +228,102 @@ than publishing a Cargo `license` expression: `temporalio-client`,
 for those exact package names, the immutable Core git revision, and a file
 named `LICENSE.txt`; the reviewed upstream license is MIT. See
 [ADR 0001](decisions/0001-temporal-core-c-boundary.md).
+
+That conclusion lives once, as `concluded_license` in
+`scripts/check-cargo-licenses.py`, and the SBOM generator and the notices
+generator below import it rather than repeating the package list. Following
+SPDX 2.3, the Cargo SBOM records what each package declares separately from
+what this project concludes: the six Core packages have `licenseDeclared`
+`NOASSERTION` (Cargo metadata names only a file), `licenseConcluded` `MIT`, and
+a `licenseComments` entry naming the reviewed `LICENSE.txt`. Every other
+package's Cargo expression is used for both fields, with the historical
+`MIT/Apache-2.0` slash rewritten as SPDX `OR`. The SBOM audit rejects a package
+whose concluded license is missing or `NOASSERTION`.
+
+## Third-party notices in release archives
+
+Every release archive contains the Rust bridge, which statically links the
+locked Cargo graph, and the MIT, BSD, ISC, Apache-2.0, Unicode-3.0, and similar
+licenses of those packages require their texts and attributions to accompany
+binary redistribution. `scripts/generate-third-party-notices.py` produces
+`THIRD-PARTY-NOTICES.txt` from `cargo metadata --locked` without any new tool
+dependency: it copies each package's top-level `LICENSE*`, `LICENCE*`,
+`COPYING*`, `COPYRIGHT*`, `NOTICE*`, and `UNLICENSE*` files (and one level of a
+`LICENSES` directory) from the package sources Cargo already downloaded, plus
+the metadata `license_file` (the Core workspace `LICENSE.txt`). The document
+contains this project's `LICENSE`, an inventory of every non-workspace package
+grouped by concluded license, and each distinct text once with the packages
+that use it. Output depends only on the Cargo graph: no checkout path,
+timestamp, or environment value is recorded, and CRLF and trailing whitespace
+are normalized.
+
+Some published crates declare a license in Cargo metadata but omit the file
+(currently the OpenTelemetry, `prost-wkt`, `pbjson`, `tonic-prost`, `jni`,
+`objc2-*`, `r-efi`, `valuable`, and `winapi-*-gnu` crates). MIT and BSD
+require the actual copyright notice to accompany binaries, so the generator
+never fills in a licence template for them. Instead each such package must
+have a reviewed entry for its exact version in
+`scripts/license-texts/crates/manifest.json`, which points at upstream texts
+vendored byte for byte under `scripts/license-texts/crates/`. An entry records
+the package names and versions, the concluded license expression it was
+reviewed against (it must still equal the package's concluded license), each
+vendored file's SHA-256 and upstream URL pinned to a full commit hash, and the
+evidence for choosing that commit. Optional `standard_texts` add a text from
+`scripts/license-texts/` (only Apache-2.0 is kept) when upstream merely names a
+license whose terms need no holder line, as for the `objc2` crates; the MIT and
+BSD templates are deliberately absent. An entry without any upstream file is
+accepted only with a `maintainer_exception` explaining the maintainer's
+approval. Generation also rejects any emitted text, including a crate's own
+file, whose copyright line still contains a template placeholder such as
+`<year> <copyright holders>` (the Apache-2.0 appendix's
+`[yyyy] [name of copyright owner]` instruction is part of that licence and is
+allowed), and the `--audit` mode rejects such a line in a finished document.
+
+A package with no licence file and no reviewed entry, an unconcluded license,
+or a missing declared `license_file` fails generation with every affected
+package listed; no partial file is written. The list covers the whole locked
+graph, including platform-specific and build-only packages, so it is a superset
+of what any single platform links.
+
+To add a reviewed notice when a Cargo update introduces a file-less package or
+version:
+
+1. Run the generator against fresh `cargo metadata --locked` output; it names
+   every package that needs review.
+2. Read the crate's `.cargo_vcs_info.json` (in the downloaded registry source)
+   for the commit and path it was published from, or, for an older crate
+   without one, find the commit that set the published version.
+3. Locate the `LICENSE*`, `COPYING*`, `NOTICE*`, or equivalent file at that
+   commit (crate directory first, then repository root) with
+   `gh api repos/<owner>/<repo>/contents/<path>?ref=<commit>`, and save its
+   exact bytes under `scripts/license-texts/crates/<source>/`. Include any
+   upstream `NOTICE` file, and for an `AND` expression the text of every part
+   (for example the protobuf `LICENSE` for `prost-wkt-types`' BSD-3-Clause
+   schemas).
+4. Add or extend the manifest entry with the file's SHA-256, its
+   `https://github.com/<owner>/<repo>/blob/<commit>/<path>` URL, and the
+   evidence. Never write a copyright holder that upstream does not state; if
+   upstream publishes no licence text, record the evidence and ask a
+   maintainer to decide on a `maintainer_exception`.
+5. Re-run the generator and `--audit`, and
+   `python3 -m unittest discover -s test/smoke -p 'test_*artifact*.py'`.
+
+Entries for versions no longer in the lock file are harmless and can be
+removed in the same change that drops the package.
+
+OCaml packages need no entry: the SDK archive contains only the installed
+`temporal-sdk` package, while the OCaml runtime, `logs`, and `yojson` are
+linked by the application from its own OPAM switch and are not redistributed
+(see the locked OCaml closure table above).
+
+The Release workflow generates the file on the publish runner, audits it
+against the same metadata (every package listed exactly once, every referenced
+text present), and passes it to `scripts/package-release-bridges.py`. Packaging
+rejects a notices file that is not generated or does not embed the project
+`LICENSE`, adds `LICENSE` and `THIRD-PARTY-NOTICES.txt` at the root of every
+bridge and SDK archive, re-reads each archive to confirm both files, and
+publishes the notices as a separate checksummed asset recorded in
+`manifest.json`.
 
 ## CI-only quality tools
 
