@@ -169,12 +169,17 @@ module Make (Supervisor : SUPERVISOR) : sig
       non-UTF-8 values return a typed configuration error instead of failing
       the first workflow activation. A valid queue is copied into every
       execution context so an activity without an explicit queue is sent back
-      to the same queue as its workflow worker. No native operation is
+      to the same queue as its workflow worker. [namespace] is the worker's
+      Temporal namespace; it is validated with the same rules (reported at
+      path [$.namespace]) and copied into every execution context so
+      [Temporal.Workflow.info] can report it, because Core activations do not
+      carry it. Both default to ["default"]. No native operation is
       performed and no workflow function is called during creation. *)
   val create :
     ?on_activation:(activation_info -> unit) ->
     ?on_completion:(activation_info -> unit) ->
     ?task_queue:string ->
+    ?namespace:string ->
     supervisor:Supervisor.t ->
     workflows:registered_workflow list ->
     unit ->

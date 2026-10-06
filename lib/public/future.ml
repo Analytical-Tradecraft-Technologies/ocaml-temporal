@@ -54,14 +54,16 @@ let make_derived ~parent ~outside_error =
   let callbacks_live = Temporal_sdk_kernel.Future.callback_liveness parent in
   let await_gate = Temporal_sdk_kernel.Future.await_gate parent in
   let result = ref None in
-  let observers = ref [] in
+  (* Pending subscriptions in registration order.  The registry gives O(1)
+     unsubscription, so many short-lived subscribers on one long-lived derived
+     future do not make each removal scan every other subscriber. *)
+  let observers = Temporal_base.Ordered_registry.create () in
   let resolve value =
     match !result with
     | Some _ -> invalid_arg "Temporal future resolved more than once"
     | None ->
         result := Some value;
-        let callbacks = List.rev !observers in
-        observers := [];
+        let callbacks = Temporal_base.Ordered_registry.take_all observers in
         List.iter
           (fun callback ->
             enqueue (fun () ->
@@ -74,17 +76,20 @@ let make_derived ~parent ~outside_error =
   (* Clearing a token suppresses queued delivery as well as unlinking it. *)
   let subscribe callback =
     let token = ref (Some callback) in
-    (match !result with
-    | Some value ->
-        enqueue (fun () ->
-            let action = !token in
-            token := None;
-            if callbacks_live () then
-              Option.iter (fun action -> action value) action)
-    | None -> observers := token :: !observers);
+    let registration =
+      match !result with
+      | Some value ->
+          enqueue (fun () ->
+              let action = !token in
+              token := None;
+              if callbacks_live () then
+                Option.iter (fun action -> action value) action);
+          None
+      | None -> Some (Temporal_base.Ordered_registry.add observers token)
+    in
     fun () ->
       token := None;
-      observers := List.filter (fun current -> current != token) !observers
+      Option.iter Temporal_base.Ordered_registry.remove registration
   in
   let await () =
     match !result with
