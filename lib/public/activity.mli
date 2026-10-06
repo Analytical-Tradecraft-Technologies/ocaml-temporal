@@ -230,7 +230,7 @@ val heartbeat : context -> 'a Codec.t -> 'a -> (unit, Error.t) result
 (** Read-only identity and scheduling facts for one activity attempt, copied
     from the task Temporal delivered. The type is abstract so later releases
     can add fields compatibly. A common use is an idempotency key for
-    at-least-once side effects, for example combining {!Info.workflow},
+    at-least-once side effects, for example combining {!Info.val-workflow},
     {!Info.activity_id}, and, when each retry must be distinct,
     {!Info.attempt}. *)
 module Info : sig
