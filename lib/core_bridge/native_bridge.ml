@@ -511,10 +511,7 @@ let validate_replay_history input =
         when String.length workflow_id > 0
              && String.length workflow_id <= max_transport_string_bytes
              && not (String.contains workflow_id '\000') -> (
-          match
-            Control_protocol.decode_payload
-              (Yojson.Safe.to_string history_json)
-          with
+          match Control_protocol.decode_payload_json history_json with
           | Ok _ -> Ok ()
           | Error _ -> invalid ())
       | _ -> invalid ())

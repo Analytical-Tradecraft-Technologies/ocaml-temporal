@@ -46,6 +46,27 @@ passed locally against a Temporal 1.32 development server with Temporal Core
 `95e97686a079dcfe6c42e3254b2f3f5e3d97408f`; CI runs it against the Compose
 stack's Temporal Server 1.32.0 with PostgreSQL 18.6.
 
+## 2026-10-06: Fewer payload passes in the OCaml protocol codec (#846)
+
+Payload bytes used to be serialized, reparsed, and base64 re-encoded several
+times per crossing purely as self-checks. A parsed payload wrapper is now
+decoded in place from its base64 string by a single table-driven pass that
+checks canonical form directly (alphabet, terminal padding, zero unused bits)
+instead of re-encoding the result. Building a wrapper no longer serializes and
+reparses it. Outgoing payload-bearing documents keep the receiver's checks
+without a second parse: the tree is validated as `parse_strict` would, the
+serialized bytes go through the same raw-text preflight as Rust applies, and
+the semantic decoder runs on the validated tree. Replay-history validation
+decodes the parsed history wrapper in place. The wire format is unchanged.
+On an Apple M4 Pro with OCaml 5.4.1, one 2 MiB-payload activation decode
+went from 58 ms to 19 ms, and `encode_activation`/`encode_completion` went
+from 150 ms to 11 ms. The new `payload-codec` benchmark sample went from
+413 ms to 59 ms at p50. A task with ten 2 MiB results in and ten 2 MiB
+arguments out, run through the runtime's current call pattern, went from 6.7 s
+to 0.62 s. Protocol tests compare the new decoder with an independent
+re-encoding reference for RFC 4648 vectors, every length from 0 to 300 bytes,
+an exhaustive set of four-symbol groups, and malformed wrappers.
+
 ## 2026-10-06: Offline opam builds from the release source archive (#778)
 
 opam's build sandbox denies network access, so `cargo build --locked` could

@@ -515,13 +515,15 @@ val decode_activation : string -> (activation, error) result
 (** Strictly decodes and semantically validates one activation document. *)
 
 val encode_activation : activation -> (string, error) result
-(** Validates, normalizes, and semantically reparses an outgoing activation. *)
+(** Validates, normalizes, and serializes an outgoing activation, then applies
+    every semantic rule of [decode_activation] to the validated value. *)
 
 val decode_completion : string -> (completion, error) result
 (** Strictly decodes and semantically validates one completion document. *)
 
 val encode_completion : completion -> (string, error) result
-(** Validates, normalizes, and semantically reparses an outgoing completion. *)
+(** Validates, normalizes, and serializes an outgoing completion, then applies
+    every semantic rule of [decode_completion] to the validated value. *)
 
 val validate_retry_policy : retry_policy -> (unit, error) result
 (** Validates a programmatically constructed retry policy before a command

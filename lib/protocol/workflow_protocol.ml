@@ -667,20 +667,19 @@ let nullable path decode = function
       Ok (Some value)
 
 (** Decodes one canonical base64 wrapper by delegating to the shared binary
-    validator. *)
+    validator. The wrapper is decoded in place from its parsed base64 string;
+    re-serializing and reparsing it would add several passes over the payload
+    bytes without adding a check (#846). *)
 let bytes_wrapper path json =
-  match Control.decode_payload (Yojson.Safe.to_string json) with
+  match Control.decode_payload_json json with
   | Ok value -> Ok value
   | Error error -> Error (of_control_error path error)
 
 (** Builds the canonical base64 wrapper produced by the shared validator. *)
 let bytes_wrapper_json bytes =
-  match Control.encode_payload bytes with
+  match Control.payload_json bytes with
+  | Ok json -> Ok json
   | Error error -> Error (of_control_error "$" error)
-  | Ok encoded -> (
-      match Control.decode_payload_object encoded with
-      | Ok json -> Ok json
-      | Error error -> Error (of_control_error "$" error))
 
 (** Decodes one binary-safe Temporal payload, including arbitrary binary
     metadata values. *)
@@ -2459,7 +2458,7 @@ let decode_activation input =
   | Error error -> Error (of_control_error_at_source error)
   | Ok json -> activation_from_json json
 
-(** Encodes and semantically reparses one activation. *)
+(** Encodes one activation and applies the decoder's semantic rules to it. *)
 let encode_activation value =
   let* jobs = activation_jobs_json value.jobs in
   let* metadata =
@@ -2485,7 +2484,9 @@ let encode_activation value =
   match Control.encode_payload_object json with
   | Error error -> Error (of_control_error_at_source error)
   | Ok output ->
-      let* _ = decode_activation output in
+      (* Apply the receiver's semantic rules to the tree that was just
+         validated and serialized, rather than parsing [output] again. *)
+      let* _ = activation_from_json json in
       Ok output
 
 (** Maps the activity-cancellation spelling from Core. *)
@@ -3219,7 +3220,8 @@ let decode_completion input =
   | Error error -> Error (of_control_error_at_source error)
   | Ok json -> completion_from_json json
 
-(** Encodes and semantically reparses one outgoing completion. *)
+(** Encodes one outgoing completion and applies the decoder's semantic rules
+    to it. *)
 let encode_completion value =
   let* commands = completion_commands_json value.commands in
   let* fields =
@@ -3235,7 +3237,9 @@ let encode_completion value =
   match Control.encode_payload_object json with
   | Error error -> Error (of_control_error_at_source error)
   | Ok output ->
-      let* _ = decode_completion output in
+      (* Apply the receiver's semantic rules to the tree that was just
+         validated and serialized, rather than parsing [output] again. *)
+      let* _ = completion_from_json json in
       Ok output
 
 (** Private aliases make the canonical semantic codecs reusable without
