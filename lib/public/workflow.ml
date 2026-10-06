@@ -249,6 +249,10 @@ module Info = struct
   (** Parent identity; see the interface. *)
   type parent = { namespace : string; workflow_id : string; run_id : string }
 
+  (** Continue-as-new suggestion reason; see the interface. *)
+  type continue_as_new_reason =
+    [ `History_size_too_large | `Too_many_history_events | `Too_many_updates ]
+
   (** Returns the workflow ID. *)
   let workflow_id info = info.run.workflow_id
 
@@ -307,6 +311,23 @@ module Info = struct
 
   (** Returns the snapshot's continue-as-new suggestion. *)
   let continue_as_new_suggested info = info.history.continue_as_new_suggested
+
+  (** Maps the protocol reasons to public variants. The native adapter already
+      removed the unspecified placeholder, so meeting it here is a violated
+      internal invariant. *)
+  let continue_as_new_reasons info : continue_as_new_reason list =
+    List.map
+      (function
+        | Temporal_sdk_kernel.Workflow_protocol.History_size_too_large ->
+            `History_size_too_large
+        | Temporal_sdk_kernel.Workflow_protocol.Too_many_history_events ->
+            `Too_many_history_events
+        | Temporal_sdk_kernel.Workflow_protocol.Too_many_updates ->
+            `Too_many_updates
+        | Temporal_sdk_kernel.Workflow_protocol.Suggest_unspecified ->
+            invalid_arg
+              "unspecified continue-as-new reason escaped activation filtering")
+      info.history.continue_as_new_reasons
 end
 
 (** Snapshots run identity together with the current activation's facts. The

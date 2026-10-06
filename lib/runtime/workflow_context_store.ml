@@ -24,6 +24,8 @@ type activation_history = {
   history_length : int;
   history_size_bytes : int option;
   continue_as_new_suggested : bool;
+  continue_as_new_reasons :
+    Temporal_protocol.Workflow_protocol.suggest_continue_as_new_reason list;
 }
 
 (** Function saved for each pending activity. It receives the raw payload,
@@ -261,7 +263,7 @@ let seed_of_decimal seed =
     synthetic activations that carry no metadata. *)
 let empty_activation_history =
   { history_length = 0; history_size_bytes = None;
-    continue_as_new_suggested = false }
+    continue_as_new_suggested = false; continue_as_new_reasons = [] }
 
 (** Creates empty activity and timer tables. The tables grow normally if a
     workflow has more than the small initial capacity. *)
