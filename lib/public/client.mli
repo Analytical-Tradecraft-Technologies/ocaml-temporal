@@ -206,10 +206,12 @@ val cancel :
 (** Terminates the exact run retained by [handle] immediately. Success means
     Temporal acknowledged the termination RPC; call [wait handle] to observe
     the immutable [Terminated] terminal result. [reason] is bounded operator
-    context and may be empty. If the transport deadline expires, the returned
-    bridge error has code [termination_outcome_uncertain]: the server may have
-    accepted the command, and this RPC has no idempotency key for a blind
-    retry. Reconcile that result with [wait handle] or visibility. *)
+    context and may be empty. The request is re-sent only after the server
+    rejects it as [resource_exhausted]. If the transport deadline expires or
+    the server is unavailable, the returned bridge error has code
+    [termination_outcome_uncertain]: the server may have accepted the command,
+    and this RPC has no idempotency key for a blind retry. Reconcile that
+    result with [wait handle] or visibility. *)
 val terminate :
   ?reason:string ->
   ('input, 'output) handle ->
