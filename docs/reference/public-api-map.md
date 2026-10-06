@@ -149,6 +149,12 @@ for those rules.
   call beyond either bound is rejected before reaching Temporal with a
   retryable `bridge` error that `Client.is_at_capacity` recognizes, and the
   client stays usable.
+- `Client.create` and `Worker.create` accept `?io_threads`, an upper bound on
+  the background threads each instance uses for network I/O and server
+  communication; the SDK may use fewer (#832). The default is the host's
+  available parallelism capped at 4; a value outside 1..256 is a typed defect
+  returned before anything is allocated. The bound applies per client and per
+  worker.
 - `Temporal.Worker` registers workflows, activities, and the signal, query, and
   update handlers attached to each workflow registration. It owns one
   supervisor graph, runs the poll loops, and performs idempotent shutdown.

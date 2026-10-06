@@ -502,8 +502,12 @@ module Native : sig
     unit ->
     (worker_config, Temporal_core_bridge.Native_bridge.error) result
 
-  (** Starts a dedicated owner Domain and creates the real Rust runtime. *)
-  val create : capacity:int -> unit -> (t, error) result
+  (** Starts a dedicated owner Domain and creates the real Rust runtime.
+      [runtime_threads] bounds that runtime's Tokio worker pool; see
+      {!Temporal_core_bridge.Native_bridge.runtime_create}. An out-of-range
+      count is a [Backend] error with status [Invalid_argument]. *)
+  val create :
+    ?runtime_threads:int -> capacity:int -> unit -> (t, error) result
 
   (** Runs one typed bridge operation on the sole owner Domain. Network waits
       enter Rust through C stubs which release the OCaml runtime lock. *)

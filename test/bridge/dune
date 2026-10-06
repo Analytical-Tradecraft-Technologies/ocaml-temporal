@@ -3,6 +3,10 @@
  (libraries temporal-sdk temporal_core_bridge unix))
 
 (test
+ (name test_runtime_threads)
+ (libraries temporal-sdk temporal_core_bridge))
+
+(test
  (name test_ocaml_runtime_lifetime)
  (libraries temporal_core_bridge unix))
 

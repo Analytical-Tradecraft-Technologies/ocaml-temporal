@@ -42,6 +42,26 @@ carrying a 2 MiB activity result in and a 2 MiB activity input out took a
 median of 6.39 s before and 3.19 s after, measured on the codec that was
 current before #923.
 
+## 2026-10-06: Bounded Tokio worker pool per runtime (#832)
+
+Every client and worker built its Core runtime with Tokio's default of one
+worker thread per core, so a client plus a worker on a 64-core host cost
+about 135 threads. Runtime creation now resolves an explicit worker count:
+`Client.create` and `Worker.create` accept `?io_threads` (1 to 256,
+validated as a typed defect before anything is allocated), and the default is
+the host's available parallelism capped at 4. The count reaches Tokio through
+the new `ocaml_temporal_core_v3_runtime_new_with_worker_threads` symbol; the
+existing `ocaml_temporal_core_v3_runtime_new` keeps its signature and uses the
+default, so this additive symbol needs no ABI version change beyond v3. Rust integration tests read the pool
+size back from Tokio's metrics for explicit counts, both range ends, and the
+default, and prove an oversized count is rejected without a handle; the C ABI
+harness covers both outcomes and an OCaml test covers bridge and public
+validation for mock and native targets. The public argument is named
+`io_threads` and documented only as an upper bound on network and
+server-communication threads, so applications are not coupled to the private
+Tokio executor; the Tokio mapping is recorded in `docs/reference/core-bridge.md`.
+Sharing one runtime between instances remains future work.
+
 ## 2026-10-06: Every client RPC uses Core's retry layer (#820)
 
 Only workflow start went through Core's retrying `Connection`; every other

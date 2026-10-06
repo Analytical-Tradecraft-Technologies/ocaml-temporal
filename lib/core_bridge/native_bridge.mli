@@ -103,9 +103,20 @@ val worker_config :
   unit ->
   (worker_config, error) result
 
+(** Largest explicit Tokio worker-thread count accepted by [runtime_create]. *)
+val max_runtime_worker_threads : int
+
+(** Returns [Invalid_argument] unless an explicit count is between [1] and
+    [max_runtime_worker_threads]; [None] is always valid. *)
+val validate_runtime_worker_threads : int option -> (unit, error) result
+
 (** Creates a native runtime after checking that the statically linked bridge
-    implements the compatibility contract expected by this OCaml build. *)
-val runtime_create : unit -> (runtime, error) result
+    implements the compatibility contract expected by this OCaml build.
+    [worker_threads] bounds the runtime's Tokio worker pool (#832); when
+    omitted the bridge uses the host's available parallelism capped at 4. An
+    out-of-range count returns [Invalid_argument] before anything is
+    allocated. *)
+val runtime_create : ?worker_threads:int -> unit -> (runtime, error) result
 
 (** Connects the official Core-based Temporal client. The network wait occurs
     in Rust while the C stub has released the OCaml runtime lock. *)
