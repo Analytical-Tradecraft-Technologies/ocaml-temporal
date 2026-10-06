@@ -843,7 +843,9 @@ module Native_backend = struct
   module Bridge = Temporal_core_bridge.Native_bridge
   module Client = Temporal_protocol.Client_protocol
 
-  type config = unit
+  (* Optional Tokio worker-thread count for the runtime (#832); [None]
+     selects the bridge default. *)
+  type config = int option
   type state = Bridge.runtime
   type error = Bridge.error
   type _ operation =
@@ -919,8 +921,9 @@ module Native_backend = struct
     | Shutdown_worker : unit operation
     | Disconnect_client : unit operation
 
-  (** Creates the runtime through the ownership-safe C stubs. *)
-  let create () = Bridge.runtime_create ()
+  (** Creates the runtime through the ownership-safe C stubs, bounding its
+      Tokio worker pool when [worker_threads] is supplied. *)
+  let create worker_threads = Bridge.runtime_create ?worker_threads ()
 
   (** Revalidates the statically linked ABI without exposing the runtime. The
       state argument proves the operation remains ordered with lifecycle use. *)
@@ -1083,6 +1086,10 @@ end
 (** Specializes the generic supervisor to the real native runtime. *)
 module Native = struct
   include Make (Native_backend)
+
+  (** Shadows the generic constructor so callers name the optional runtime
+      thread bound instead of passing the backend's raw [config]. *)
+  let create ?runtime_threads ~capacity () = create ~capacity runtime_threads
 
   module Protocol_adapter = Protocol_adapter
   module Client = Temporal_protocol.Client_protocol

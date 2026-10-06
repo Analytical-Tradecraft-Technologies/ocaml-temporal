@@ -86,6 +86,14 @@ type visibility_page = {
     Temporal SDKs, computed once when the client is created; host names are
     sanitized to printable ASCII and bounded so the default is always valid.
 
+    [io_threads] is an upper bound on the background threads this client
+    uses for network I/O and server communication; the SDK may use fewer.
+    When omitted it is the host's available parallelism capped at 4. Each
+    client and each worker has its own threads, so the bound applies per
+    instance. It must be between 1 and 256; any other value returns a typed
+    defect before anything is allocated, for every target including
+    [mock://].
+
     A [mock://] target selects an in-memory ledger for testing client plumbing
     only. It runs no workflow code: [wait] echoes the encoded start input back
     as the output, completing only when the workflow's output codec can
@@ -94,6 +102,7 @@ type visibility_page = {
     Server to observe real workflow results. *)
 val create :
   ?identity:string ->
+  ?io_threads:int ->
   target_url:string ->
   namespace:string ->
   unit ->
@@ -206,11 +215,12 @@ val cancel :
 (** Terminates the exact run retained by [handle] immediately. Success means
     Temporal acknowledged the termination RPC; call [wait handle] to observe
     the immutable [Terminated] terminal result. [reason] is bounded operator
-    context and may be empty. If the transport deadline expires, the returned
-    non-retryable bridge error has [rpc_status]
-    [Some `Termination_outcome_uncertain]: the server may have accepted the
-    command, and this RPC has no idempotency key for a blind retry. Reconcile
-    that result with [wait handle] or visibility. *)
+    context and may be empty. The request is re-sent only after the server
+    rejects it as [resource_exhausted]. If the transport deadline expires or
+    the server is unavailable, the returned non-retryable bridge error has
+    [rpc_status] [Some `Termination_outcome_uncertain]: the server may have
+    accepted the command, and this RPC has no idempotency key for a blind
+    retry. Reconcile that result with [wait handle] or visibility. *)
 val terminate :
   ?reason:string ->
   ('input, 'output) handle ->

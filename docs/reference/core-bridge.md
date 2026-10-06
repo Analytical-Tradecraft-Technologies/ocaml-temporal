@@ -36,7 +36,7 @@ outcome documents carry a required `started` flag that a version 2 Rust
 archive never emits and a version 2 OCaml decoder rejects as unknown. Without
 a bump, either mixed pairing would pass negotiation and then fail every
 `Client.start` with a protocol error. Renaming the symbol prefix to
-`ocaml_temporal_core_v3_` together with the constant makes a stale archive or
+`ocaml_temporal_core_v4_` together with the constant makes a stale archive or
 stale OCaml object fail at link time or during startup negotiation instead.
 
 Version 4 is intentionally incompatible with version 3. The closed client
@@ -182,6 +182,36 @@ request remains uncertain when the deadline expires. Callback-transport tests
 under `tests/support/client_start.rs` cover recovery, request identity,
 non-retryable rejection, cancellation of a hung request, and the 64-ticket
 admission bound.
+
+Every other client RPC (wait, signal, query, cancel, terminate, reset,
+update, update poll, and visibility listing) goes through the same retrying
+`Connection` (#820). Core decides which statuses are transient (`unavailable`,
+`resource_exhausted`, `unknown`, `internal`, `aborted`, `out_of_range`,
+`data_loss`, and transport-level cancellation) and re-sends the identical
+request, so `request_id` or the update ID deduplicates a retried mutation.
+Each bounded RPC replaces Core's ten-second retry window with its own budget
+(three seconds for the signal, cancel, reset, and terminate control RPCs, ten
+for visibility, thirty for query, update acceptance, and update polling) and
+uses that budget as every attempt's gRPC deadline; the outer timeout still
+caps an attempt in flight when the budget ends. The pinned Core accepts a
+`resource_exhausted` retry using its ordinary backoff and then replaces the
+wait with a separate throttle backoff (1 s, 2 s, 4 s, ... up to 10 s, each
++/-20%) without rechecking the retry window, so the control budget is three
+seconds rather than one: one throttled re-send fits, while a throttle wait
+still pending when the budget ends is cut off by the outer timeout and
+reported as the RPC's deadline error. Terminate has no idempotency key, so
+Core re-sends it only after `resource_exhausted`; `unavailable`, a
+per-attempt `deadline_exceeded` or `cancelled`, and the outer deadline may
+follow an applied termination and are reported as
+`termination_outcome_uncertain` without a re-send. The `wait` history long poll has no
+total budget: Core measures its retry window from the start of a call, which
+would forbid retrying a long poll that failed after ten healthy seconds, so the
+wait instead allows up to thirty consecutive attempts per long poll (roughly
+two minutes of outage with Core's default backoff). Tests under
+`tests/support/client_retry.rs` cover recovery of each RPC, identical
+re-sends, non-retried rejections, the terminate restriction and its
+uncertain `unavailable` result, a throttled signal re-send inside the control
+budget, and that budget's bound on a persistent outage.
 
 The wait request names `namespace`, `workflow_id`, and one concrete `run_id`.
 There is no `follow_runs` escape hatch in the document: the operation always
@@ -507,6 +537,33 @@ enter a synchronized MPSC mailbox and receive typed one-shot `result` replies.
 The supervisor serializes lifecycle transitions and destroys workers before
 clients and the runtime. Rust retains internal Tokio concurrency; workflow
 executions retain their separate deterministic effect schedulers.
+
+### Runtime thread budget (#832)
+
+Each runtime builds its own multi-thread Tokio executor. Tokio's default of
+one worker per core made every client and worker cost dozens of idle threads
+on a large host, so runtime creation takes an explicit worker count through
+`ocaml_temporal_core_v4_runtime_new_with_worker_threads`. `0` selects the
+bridge default, `min(available parallelism, DEFAULT_RUNTIME_WORKER_THREADS_CAP)`
+(4), falling back to one thread when parallelism cannot be queried.
+`1..=OCAML_TEMPORAL_CORE_MAX_RUNTIME_WORKER_THREADS` (256) is used unchanged,
+and a larger value returns `STATUS_INVALID_ARGUMENT` before anything is
+allocated, leaving the runtime slot null. `ocaml_temporal_core_v4_runtime_new`
+is the same call with `0`. The count is resolved before Core is built, so it
+adds no owner or release path: the Tokio pool remains owned by Core inside the
+runtime handle and is shut down by the existing runtime destruction path.
+
+OCaml exposes the bound as the implementation-neutral `?io_threads` on
+`Client.create` and `Worker.create`: the public documentation promises only an
+upper bound on network and server-communication threads, so the Tokio mapping
+stays private and could change without a public API migration. The SDK
+validates the same range as a typed defect before any supervisor or native
+allocation, and passes it through
+`Sdk_supervisor.Native.create` to `Native_bridge.runtime_create`. The C stub
+maps a negative or oversized OCaml integer to `UINT32_MAX` so Rust rejects it
+rather than truncating. Each instance still owns a separate runtime, its
+cleanup thread, and its supervisor Domain; sharing one runtime across
+instances is not implemented.
 
 The implemented private supervisor owns the real runtime, one official client
 connection, and one Core worker for workflows and remote activities. Its backend protocol exposes

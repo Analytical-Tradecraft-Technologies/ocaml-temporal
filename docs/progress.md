@@ -51,6 +51,49 @@ CLI 1.5.1 development server (Temporal Server 1.29.1) with Temporal Core
 stack. The live smoke driver's unknown-query and uncertain-termination checks
 now use the typed classification.
 
+## 2026-10-06: Bounded Tokio worker pool per runtime (#832)
+
+Every client and worker built its Core runtime with Tokio's default of one
+worker thread per core, so a client plus a worker on a 64-core host cost
+about 135 threads. Runtime creation now resolves an explicit worker count:
+`Client.create` and `Worker.create` accept `?io_threads` (1 to 256,
+validated as a typed defect before anything is allocated), and the default is
+the host's available parallelism capped at 4. The count reaches Tokio through
+the new `ocaml_temporal_core_v3_runtime_new_with_worker_threads` symbol; the
+existing `ocaml_temporal_core_v3_runtime_new` keeps its signature and uses the
+default, so this additive symbol needs no ABI version change beyond v3. Rust integration tests read the pool
+size back from Tokio's metrics for explicit counts, both range ends, and the
+default, and prove an oversized count is rejected without a handle; the C ABI
+harness covers both outcomes and an OCaml test covers bridge and public
+validation for mock and native targets. The public argument is named
+`io_threads` and documented only as an upper bound on network and
+server-communication threads, so applications are not coupled to the private
+Tokio executor; the Tokio mapping is recorded in `docs/reference/core-bridge.md`.
+Sharing one runtime between instances remains future work.
+
+## 2026-10-06: Every client RPC uses Core's retry layer (#820)
+
+Only workflow start went through Core's retrying `Connection`; every other
+client RPC called the raw `workflow_service()` stub, so `Client.wait` failed
+about a second after the Temporal Server stopped. Wait, signal, query, cancel,
+terminate, reset, update, update polling, and visibility listing now use the
+retrying connection. Bounded RPCs fit Core's retry window and each attempt's
+gRPC deadline inside their budgets; the control-RPC budget grew from one to
+three seconds so that Core's 1 s +/-20% throttle wait before re-sending after
+`resource_exhausted` fits. Terminate has no idempotency key, so it is re-sent
+only after `resource_exhausted` and reports `unavailable` as
+`termination_outcome_uncertain` instead of risking a misleading `not_found`
+from a blind re-send. The history long poll allows thirty consecutive attempts
+per poll. Callback transport tests in
+`rust/core-bridge/tests/support/client_retry.rs` prove recovery after one
+`unavailable` reply for each idempotent RPC with byte-identical re-sends, a
+signal and a terminate delivered after one `resource_exhausted` inside the
+control budget (the signal case fails with the old one-second budget), no
+retry of `not_found`/`invalid_argument` or of ambiguous terminate statuses, an
+uncertain result for an unavailable terminate, and a persistently unavailable
+signal returning within its budget. See
+[the Core bridge reference](reference/core-bridge.md#native-client-start-and-exact-run-wait).
+
 ## 2026-10-06: Workflow ID conflict policies for Client.start; bridge ABI v3 (#933)
 
 `Temporal.Client.start` accepts `?id_conflict_policy` (`` `Fail ``,

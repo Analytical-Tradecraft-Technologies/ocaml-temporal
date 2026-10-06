@@ -284,11 +284,20 @@ workflow ID, run ID, and bounded reason text. It deliberately has no
 `request_id`: Temporal's terminate RPC has no idempotency-key field. The
 deterministic mock preserves this exact-run and terminal-history contract.
 
-The native call has a bounded control-plane deadline so a stalled server cannot
-hold the supervisor owner indefinitely. If that deadline expires, the server
-may already have accepted the command, so the bridge returns the explicit
-`rpc` code `termination_outcome_uncertain` rather than pretending that the
-termination was rejected or that a retry is safe. Reconcile this result by
+The native call has the three-second control-plane deadline so a stalled
+server cannot hold the supervisor owner indefinitely. Within it, Core re-sends
+the request only after `resource_exhausted`, which Temporal returns before
+processing the command. Every other failure is returned on its first
+occurrence, because a blind re-send of a termination the server already
+applied would report `not_found` for the run it just terminated. `unavailable`
+is such an ambiguous failure: besides a refused connection, it is what the
+transport reports when the connection drops after the server applied the
+termination but before the acknowledgement arrived. The bridge therefore
+reports `unavailable`, a per-attempt `deadline_exceeded` or `cancelled`, and an
+expired overall deadline as the explicit `rpc` code
+`termination_outcome_uncertain` rather than pretending that the termination
+was rejected or that a retry is safe. Other ambiguous statuses such as
+`unknown` or `internal` keep their own code and are likewise not retried. Reconcile this result by
 calling `wait handle` (or by checking visibility) before deciding what to do;
 there is no idempotency key that can make a blind retry equivalent to the first
 request.
@@ -448,9 +457,16 @@ workflow task may process it later or the run may already be closing. Signal
 failures use the closed `rpc` and `protocol` client error documents, while the
 start-only `already_started` category is rejected as impossible. Both sides
 reject unknown or duplicate members and validate the positive acknowledgement.
-The bridge bounds this control-plane RPC to one second, matching cancellation:
-an unavailable server cannot hold the supervisor's single owner Domain
-indefinitely, and a timeout is returned as a typed `deadline_exceeded` error.
+The bridge bounds this control-plane RPC to three seconds, matching
+cancellation: an unavailable server cannot hold the supervisor's single owner
+Domain indefinitely. Core retries transient transport failures within that
+budget with the identical request. The budget is three seconds rather than one
+because Core waits a separate throttle backoff of 1 s +/-20% before re-sending
+after `resource_exhausted`; one such throttled re-send fits, a second
+consecutive one (a further 2 s +/-20%) does not. When the budget ends, the
+last transport status (such as `unavailable`) is returned, or a typed
+`deadline_exceeded` error when an attempt is still in flight or Core is still
+waiting out a throttle backoff.
 Callers that retry an uncertain result should reuse the same `request_id`.
 The request and response shapes are defined by
 [`client-signal-request.schema.json`](../schemas/bridge/client-signal-request.schema.json)
@@ -653,7 +669,10 @@ history long poll with the equivalent of `follow_runs = false`, bounded to
 `STATUS_NOT_READY` and no response object; the caller or a later orchestration
 loop can retry the same request through its mailbox. A timeout is therefore a
 pending observation, not a workflow failure. A terminal response always names
-the exact run requested.
+the exact run requested. Transient transport failures of the long poll (for
+example a Temporal Server restart) are retried by Core inside the pending
+observation, up to thirty consecutive attempts per long poll, so they do not
+end the wait (#820); a definitive status such as `not_found` still does.
 
 The public `Temporal.Client.wait handle` performs that retry loop internally:
 it resubmits the same exact-run request after each bounded `NOT_READY` result
