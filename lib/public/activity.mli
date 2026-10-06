@@ -218,6 +218,55 @@ end
     task token. *)
 val heartbeat : context -> 'a Codec.t -> 'a -> (unit, Error.t) result
 
+(** Read-only identity and scheduling facts for one activity attempt, copied
+    from the task Temporal delivered. The type is abstract so later releases
+    can add fields compatibly. A common use is an idempotency key for
+    at-least-once side effects, for example combining {!Info.workflow},
+    {!Info.activity_id}, and, when each retry must be distinct,
+    {!Info.attempt}. *)
+module Info : sig
+  (** Metadata for one activity attempt. *)
+  type t
+
+  (** The workflow execution that scheduled this activity. *)
+  type workflow = { workflow_id : string; run_id : string; workflow_type : string }
+
+  (** Returns the Temporal namespace of the scheduling workflow. *)
+  val namespace : t -> string
+
+  (** Returns the workflow execution that scheduled this activity. Standalone
+      activities (scheduled without a workflow) are not supported: the bridge
+      fails such a task back to Temporal before any activity code runs, so
+      every context that reaches an implementation has a scheduling
+      workflow. *)
+  val workflow : t -> workflow
+
+  (** Returns the activity ID. Temporal keeps it stable across retries of the
+      same scheduled activity. *)
+  val activity_id : t -> string
+
+  (** Returns the registered activity type name that this attempt runs. *)
+  val activity_type : t -> string
+
+  (** Returns the 1-based attempt number; retries increase it. *)
+  val attempt : t -> int
+
+  (** Returns [true] when Temporal Core is running this attempt as a local
+      activity rather than through a task queue. *)
+  val is_local : t -> bool
+
+  (** Returns when the activity was first scheduled, if Core reported it. *)
+  val scheduled_time : t -> Time.t option
+
+  (** Returns when this attempt was scheduled, if Core reported it. It differs
+      from {!scheduled_time} after a retry. *)
+  val current_attempt_scheduled_time : t -> Time.t option
+
+  (** Returns when the server recorded this attempt as started, if Core
+      reported it. *)
+  val started_time : t -> Time.t option
+end
+
 (** Operations available to a contextual activity attempt. *)
 module Context : sig
   (** The attempt-scoped context passed to contextual activity helpers. *)
@@ -240,6 +289,12 @@ module Context : sig
 
   (** Returns the configured heartbeat interval, if one was supplied. *)
   val heartbeat_timeout : t -> Duration.t option
+
+  (** Returns this attempt's task metadata. Contexts created by a native worker
+      always carry it; a context from a backend without a Temporal task, such
+      as the in-process test backend, returns a typed [Defect] error. The value
+      is immutable and remains readable after the attempt completes. *)
+  val info : t -> (Info.t, Error.t) result
 end
 
 (** The cancellation policy sent with an activity command. [Try_cancel] asks

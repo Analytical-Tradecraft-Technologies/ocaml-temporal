@@ -246,6 +246,14 @@ let set_activation_deployment_version execution version =
 let set_activation_is_replaying execution is_replaying =
   Workflow_context_store.set_activation_is_replaying execution.context is_replaying
 
+(** Forwards task-local history facts to the execution context. *)
+let set_activation_history execution history =
+  Workflow_context_store.set_activation_history execution.context history
+
+(** Forwards the run identity to the execution context. *)
+let set_run_info execution info =
+  Workflow_context_store.set_run_info execution.context info
+
 (** Validates the opaque protocol instance identifier before it is retained as
     a pending continuation key. IDs are transport strings, but accepting an
     empty, NUL-containing, or invalid UTF-8 key would make duplicate detection
