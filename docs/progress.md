@@ -23,9 +23,9 @@ about 135 threads. Runtime creation now resolves an explicit worker count:
 `Client.create` and `Worker.create` accept `?io_threads` (1 to 256,
 validated as a typed defect before anything is allocated), and the default is
 the host's available parallelism capped at 4. The count reaches Tokio through
-the new `ocaml_temporal_core_v2_runtime_new_with_worker_threads` symbol; the
-existing `ocaml_temporal_core_v2_runtime_new` keeps its signature and uses the
-default, so ABI version 2 is unchanged. Rust integration tests read the pool
+the new `ocaml_temporal_core_v3_runtime_new_with_worker_threads` symbol; the
+existing `ocaml_temporal_core_v3_runtime_new` keeps its signature and uses the
+default, so this additive symbol needs no ABI version change beyond v3. Rust integration tests read the pool
 size back from Tokio's metrics for explicit counts, both range ends, and the
 default, and prove an oversized count is rejected without a handle; the C ABI
 harness covers both outcomes and an OCaml test covers bridge and public
