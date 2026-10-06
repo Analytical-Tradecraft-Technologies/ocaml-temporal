@@ -22,7 +22,7 @@ def targets(root: Path) -> list[str]:
     if not names or len(names) != len(set(names)):
         raise ValueError("empty or duplicate smoke executable list")
     for name in names:
-        if not re.fullmatch(r"test/integration/[a-zA-Z0-9_/]+\.exe", name):
+        if not re.fullmatch(r"(?:test/integration|examples)/[a-zA-Z0-9_/]+\.exe", name):
             raise ValueError(f"invalid executable path: {name}")
     return names
 

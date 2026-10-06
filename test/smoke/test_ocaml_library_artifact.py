@@ -8,7 +8,7 @@ import tarfile
 import tempfile
 import unittest
 
-from test_ci_artifacts import COMMIT, MATRIX, RELEASE, VERSION, load_script
+from test_ci_artifacts import COMMIT, MATRIX, NOTICES, RELEASE, VERSION, load_script
 
 ARTIFACT = load_script("ocaml-library-artifact")
 PLATFORM = "linux-arm64"
@@ -156,23 +156,29 @@ class LibraryReleaseTests(unittest.TestCase):
                 stage_sdk(stage, ocaml, platform)
                 bundle = self.root / f"ocaml-sdk-{platform}-ocaml-{ocaml}"
                 ARTIFACT.pack(stage, bundle, COMMIT, ocaml, platform, "release", bridge_key(platform))
+        license_path = self.root / "LICENSE"
+        license_path.write_text("Apache License\nVersion 2.0, January 2004\n")
+        notices = self.root / "THIRD-PARTY-NOTICES.txt"
+        notices.write_text(NOTICES.render([], license_path.read_text()))
+        self.legal = RELEASE.legal_files(license_path, notices)
 
     def test_complete_release(self):
-        """Every compiler/platform yields a checksummed archive with install tools."""
-        RELEASE.package_libraries(self.root, self.output, self.tag, COMMIT)
+        """Every compiler/platform yields a checksummed archive with install tools and licences."""
+        RELEASE.package_libraries(self.root, self.output, self.tag, COMMIT, self.legal)
         manifest = json.loads((self.output / "manifest.json").read_text())
         self.assertEqual(len(manifest["ocaml_libraries"]), 16)
         for entry in manifest["ocaml_libraries"].values():
             archive = self.output / entry["asset"]
             self.assertEqual(ARTIFACT.sha256(archive), entry["sha256"])
             with tarfile.open(archive) as tar:
-                self.assertEqual(set(tar.getnames()), {"manifest.json", "library.tar.gz", *ARTIFACT.TOOLS})
+                self.assertEqual(set(tar.getnames()), {"manifest.json", "library.tar.gz", *ARTIFACT.TOOLS,
+                                                       RELEASE.LICENSE_NAME, RELEASE.NOTICES_NAME})
 
     def test_missing_combination(self):
         """A release cannot silently omit an older compiler or desktop platform."""
         shutil.rmtree(self.root / "ocaml-sdk-windows-amd64-ocaml-5.2.1")
         with self.assertRaises(FileNotFoundError):
-            RELEASE.package_libraries(self.root, self.output, self.tag, COMMIT)
+            RELEASE.package_libraries(self.root, self.output, self.tag, COMMIT, self.legal)
         self.assertNotIn("ocaml_libraries", json.loads((self.output / "manifest.json").read_text()))
 
     def test_different_rust_input(self):
@@ -182,7 +188,7 @@ class LibraryReleaseTests(unittest.TestCase):
         manifest["rust_bridge_key"] = "another-bridge"
         path.write_text(json.dumps(manifest))
         with self.assertRaisesRegex(ValueError, "Rust bridge differ"):
-            RELEASE.package_libraries(self.root, self.output, self.tag, COMMIT)
+            RELEASE.package_libraries(self.root, self.output, self.tag, COMMIT, self.legal)
 
 
 if __name__ == "__main__":

@@ -307,6 +307,63 @@ let heartbeat (context : context) (codec : 'a Codec.t) (value : 'a) =
       Temporal_base.Activity_context.heartbeat context [ payload ]
       |> Result.map_error Error_private.of_base
 
+(** Public projection of the private activity task metadata. The private
+    record already holds immutable, validated values, so accessors only
+    convert representations. *)
+module Info = struct
+  type t = Temporal_base.Activity_context.info
+
+  (** Scheduling workflow identity; see the interface. *)
+  type workflow = { workflow_id : string; run_id : string; workflow_type : string }
+
+  (** Returns the namespace reported by Core. *)
+  let namespace (info : t) = info.namespace
+
+  (** Every dispatched task has a scheduling workflow: the bridge fails
+      standalone activities back to Core before dispatch, so the private
+      record always carries a validated workflow identity. *)
+  let workflow (info : t) =
+    {
+      workflow_id = info.workflow_id;
+      run_id = info.workflow_run_id;
+      workflow_type = info.workflow_type;
+    }
+
+  (** Returns the retry-stable activity ID. *)
+  let activity_id (info : t) = info.activity_id
+
+  (** Returns the activity type name. *)
+  let activity_type (info : t) = info.activity_type
+
+  (** Returns the 1-based attempt number. *)
+  let attempt (info : t) = info.attempt
+
+  (** Returns whether Core runs this attempt in the local-activity lane. *)
+  let is_local (info : t) = info.is_local
+
+  (** Converts a timestamp the protocol decoder already range-checked. A
+      failure would mean that private validation was bypassed, which is an
+      internal invariant violation rather than an operational error. *)
+  let time = function
+    | None -> None
+    | Some ({ seconds; nanoseconds } : Temporal_base.Activity_context.timestamp)
+      -> (
+        match Time.of_unix ~seconds ~nanoseconds with
+        | Ok time -> Some time
+        | Error _ ->
+            invalid_arg "activity task timestamp escaped protocol validation")
+
+  (** Returns the first scheduling time of the activity. *)
+  let scheduled_time (info : t) = time info.scheduled_time
+
+  (** Returns the scheduling time of this attempt. *)
+  let current_attempt_scheduled_time (info : t) =
+    time info.current_attempt_scheduled_time
+
+  (** Returns the server start time of this attempt. *)
+  let started_time (info : t) = time info.started_time
+end
+
 (** Safe operations exposed to contextual activity implementations. *)
 module Context = struct
   (** Alias used by contextual activity helpers; the private context controls
@@ -348,6 +405,18 @@ module Context = struct
     Temporal_base.Activity_context.heartbeat_timeout context
     |> Option.map (fun duration ->
            Duration.of_ms (Temporal_base.Duration.to_ms duration))
+
+  (** Returns the native task metadata, or a defect for a synthetic context
+      whose backend has no Temporal task to describe. *)
+  let info context =
+    match Temporal_base.Activity_context.info context with
+    | Some info -> Ok info
+    | None ->
+        Error
+          (Error.defect
+             ~message:
+               "Temporal.Activity.Context.info is unavailable for this \
+                activity context")
 end
 
 (** Cancellation policy carried by a scheduled activity command. The closed

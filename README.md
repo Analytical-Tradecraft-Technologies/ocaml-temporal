@@ -303,7 +303,8 @@ The complete, buildable version is split the way a real deployment often is:
 
 See the [examples guide](examples/README.md) for the startup order, connection
 settings, and commands. CI compiles all three executables on every Docker and
-native build without running them.
+native build, and the Linux live job runs them together against Temporal Server
+with `make test-temporal-examples-live`.
 
 See [Writing Workflows in OCaml](docs/guides/workflows.md) for codecs, worker
 registration, client handles, child-workflow boundaries, futures, and

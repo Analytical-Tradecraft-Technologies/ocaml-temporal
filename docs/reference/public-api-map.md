@@ -34,7 +34,12 @@ for those rules.
   `current_deployment_version ()` reports the deployment and build identity
   selected for the current task, or `None` when no versioned task metadata is
   available; it is diagnostic metadata, not a replacement for replay-safe
-  patching. `upsert_search_attributes` merges encoded values into the
+  patching. `info ()` returns an abstract `Workflow.Info.t` with the run's
+  identity (workflow and run IDs, first run ID, type, task queue, attempt,
+  parent, start time) and the current activation's replay flag, history
+  length and size, and continue-as-new suggestion, all taken from Temporal's
+  activations; `is_replaying ()` is the shorthand for replay-aware logging.
+  `upsert_search_attributes` merges encoded values into the
   execution's indexed search attributes; the update becomes visible after the
   workflow task is accepted. `continue_as_new` ends the current run and starts
   a successor. `patched ~id`
@@ -59,7 +64,9 @@ for those rules.
   plus non-terminal `heartbeat`, while `Async_context` is only used to obtain
   that retained capability. The attempt-scoped `Context` instead supplies
   copied heartbeat details and timeout metadata for callbacks that complete
-  during dispatch.
+  during dispatch, and `Context.info` returns an abstract `Activity.Info.t`
+  with the namespace, scheduling workflow, activity ID and type, attempt,
+  local-activity flag, and Core-reported scheduling timestamps.
 - `Temporal.Child_workflow` schedules a child workflow and exposes its typed
   future. Use its operation handle when the parent must cancel one exact child;
   child retry and cancellation policies are passed to the durable command; see
@@ -109,8 +116,9 @@ for those rules.
   that successor. The client also sends typed signals and output-only or
   exactly-one-input queries. `Client.query_with_input` encodes the typed query
   argument before transport; the client lists bounded visibility results and
-  waits for typed terminal outcomes. `Client.start_update` admits one typed
-  workflow update and returns an opaque handle; `Client.wait_update` polls that
+  waits for typed terminal outcomes. `Client.start_update` waits until Temporal
+  accepts one typed workflow update and returns an opaque handle;
+  `Client.wait_update` polls that
   exact update until it has a typed outcome, while `Client.update_id` exposes
   the server-correlated update ID for diagnostics and retry bookkeeping.
   `Client.follow`
@@ -134,6 +142,8 @@ for those rules.
 - `Temporal.Worker` registers workflows, activities, and the signal, query, and
   update handlers attached to each workflow registration. It owns one
   supervisor graph, runs the poll loops, and performs idempotent shutdown.
+  `Worker.request_shutdown` is the signal-handler-safe way to make `run`
+  return; call `Worker.shutdown` afterwards to release the worker.
   `Temporal.Worker.Options` provides typed, immutable resource and worker
   routing settings, including legacy build-ID and deployment-based versioning;
   see the [worker versioning reference](worker-versioning.md). A

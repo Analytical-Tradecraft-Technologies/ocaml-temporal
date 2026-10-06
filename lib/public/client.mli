@@ -264,7 +264,11 @@ val query_with_input :
     valid UTF-8, NUL-free, and no more than 65,536 bytes. The returned handle
     can be polled independently of other workflow handles. Failures already
     returned at admission, including validator rejection, are returned directly
-    as [Error.t]. A completed successful outcome is retained in the handle. *)
+    as [Error.t]. A completed successful outcome is retained in the handle.
+    An update Temporal has only admitted (not yet accepted) never yields a
+    handle: the request is re-issued with the same update ID until a worker
+    accepts or rejects it, for at most 30 seconds, after which a retryable
+    [deadline_exceeded] RPC error is returned. *)
 val start_update :
   ?update_id:string ->
   ('workflow_input, 'workflow_output) handle ->

@@ -35,6 +35,20 @@ rejection, line formatting, non-blocking enqueue, drop reporting, and runtime
 close with a blocked writer. An OCaml unit test proves the cause reaches
 `Client.create`.
 
+## 2026-10-06: Stopping a worker from a signal handler (#830)
+
+An OCaml signal handler may run on the thread blocked in `Worker.run`, so in a
+single-Domain program the natural `SIGTERM` handler calling `Worker.shutdown`
+was rejected as re-entrant and the worker never stopped. The new
+`Worker.request_shutdown` is a single atomic write that both run lanes treat
+as a stop at their next check; `run` returns `Ok ()` and the application then
+calls `Worker.shutdown` to drain and release the worker. A re-entrant
+`shutdown` still returns a defect but now posts the same request. A runtime
+model test raises a real `SIGUSR1` against a loop on the main thread, a mock
+worker test raises it from inside an activity callback, and the examples and
+the Compose smoke worker now use the handler directly instead of a watcher
+Domain.
+
 ## 2026-10-06: Retained completions fail closed (#843)
 
 The workflow and activity adapters used to resubmit every retained completion
@@ -2698,3 +2712,22 @@ the per-series replacements listed in `scripts/opam-lock-overrides.txt`
 Local validation covered the repository contract scripts and a stub-OPAM test
 of the installer; the image builds and native installs are validated by the
 hosted CI matrix.
+
+## 2026-10-06: Workflow and activity execution info (#792)
+
+`Temporal.Workflow.info ()` and `Temporal.Workflow.is_replaying ()` expose the
+run identity Core sends in the initialization job (workflow and run IDs, first
+run ID, type, attempt, parent, start time), the worker task queue, and the
+task-local replay flag, history length/size, and continue-as-new suggestion
+that the native adapter now installs before every activation alongside the
+existing clock and deployment metadata. `Temporal.Activity.Context.info`
+exposes the start task's namespace, workflow identity, activity ID/type,
+attempt, local flag, and timestamps. Both are abstract accessor modules so
+fields can be added compatibly. No bridge protocol change was needed: every
+value already crossed the private JSON boundary. The workflow namespace is not
+exposed yet because activations do not carry it and the worker adapter does
+not pass it to executions; asynchronous activity contexts do not expose info
+yet. `test/runtime/test_execution_info.ml` drives live and replayed native
+activations through the adapter and covers the detached, synthetic, and
+standalone-activity paths; the native activity adapter test checks the
+forwarded task identity.
