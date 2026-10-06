@@ -47,9 +47,24 @@ dune exec examples/client/client.exe -- "Ada Lovelace"
 The `make build-examples` (or `make native-build` on a native host) target is
 useful for
 compilation checks, but it does not replace the three `dune exec` processes.
-This example path is separate from `make test-temporal-integration`, whose
-dedicated smoke worker and driver provide the repository's automated live
-acceptance evidence.
+
+`make test-temporal-examples-live` runs this exact application in CI: it
+compiles the three executables, starts the Compose Temporal/PostgreSQL stack,
+starts both workers as separate containers on a fresh task queue, runs the
+client, and requires the documented output below. It also checks that a blank
+name fails the workflow with `a name is required`, and that both workers exit
+cleanly after `SIGTERM`. It always removes the stack afterwards. A new example
+executable must be added to that target;
+`test/smoke/test_examples_live_contract.sh` fails until it is.
+
+```text
+Workflow completed:
+Hello, Ada Lovelace!
+Next: review the Temporal result for Ada Lovelace.
+```
+
+The broader SDK acceptance evidence comes from `make test-temporal-integration`,
+whose dedicated smoke worker and driver exercise many more Temporal features.
 
 The activity worker turns two requested message styles into text. The workflow
 worker concurrently schedules those activities, records a short durable timer,

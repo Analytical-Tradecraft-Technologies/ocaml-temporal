@@ -1017,6 +1017,23 @@ let test_contextual_heartbeat_lifecycle () =
           | Some timeout when Temporal.Duration.to_ms timeout = 2_000L -> ()
           | _ -> failwith "activity heartbeat timeout was not converted exactly"
         end;
+        (* #792: the native adapter must forward the task's identity so
+           activities can build idempotency keys. *)
+        begin
+          match Temporal.Activity.Context.info context with
+          | Error error -> failwith (Temporal.Error.message error)
+          | Ok info ->
+              let module Info = Temporal.Activity.Info in
+              if Info.namespace info <> "default"
+                 || Info.workflow info
+                    <> { Info.workflow_id = "workflow-1"; run_id = "run-1";
+                         workflow_type = "test_workflow" }
+                 || Info.activity_id info <> "activity-1"
+                 || Info.activity_type info <> "native_activity_heartbeat"
+                 || Info.attempt info <> 1 || Info.is_local info
+                 || Option.is_some (Info.scheduled_time info)
+              then failwith "activity info did not mirror the start task"
+        end;
         match Temporal.Activity.Context.heartbeat context Temporal.Codec.string
                 "progress" with
         | Error error -> Error error
