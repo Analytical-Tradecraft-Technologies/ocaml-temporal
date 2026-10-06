@@ -23,5 +23,6 @@
   test_workflow_time
   test_random_seed_reset
   test_condition
-  test_external_workflow)
+  test_external_workflow
+  test_execution_info)
  (libraries temporal-sdk temporal_runtime unix))

@@ -2694,3 +2694,22 @@ is still acknowledged rather than failed.
 `rust/core-bridge/tests/runtime_dispose_eviction.rs` drives a
 leased activation through runtime close against a gRPC double and fails
 within 30 s without the fix.
+
+## 2026-10-06: Workflow and activity execution info (#792)
+
+`Temporal.Workflow.info ()` and `Temporal.Workflow.is_replaying ()` expose the
+run identity Core sends in the initialization job (workflow and run IDs, first
+run ID, type, attempt, parent, start time), the worker task queue, and the
+task-local replay flag, history length/size, and continue-as-new suggestion
+that the native adapter now installs before every activation alongside the
+existing clock and deployment metadata. `Temporal.Activity.Context.info`
+exposes the start task's namespace, workflow identity, activity ID/type,
+attempt, local flag, and timestamps. Both are abstract accessor modules so
+fields can be added compatibly. No bridge protocol change was needed: every
+value already crossed the private JSON boundary. The workflow namespace is not
+exposed yet because activations do not carry it and the worker adapter does
+not pass it to executions; asynchronous activity contexts do not expose info
+yet. `test/runtime/test_execution_info.ml` drives live and replayed native
+activations through the adapter and covers the detached, synthetic, and
+standalone-activity paths; the native activity adapter test checks the
+forwarded task identity.

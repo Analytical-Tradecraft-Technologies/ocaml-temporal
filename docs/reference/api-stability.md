@@ -8,8 +8,9 @@ documented in [the package-boundary reference](package-boundary.md).
 
 ## Current status
 
-The package is experimental and has not reached `0.1.0`. There is therefore no
-stable-version compatibility promise yet. Public signatures are nevertheless
+The package is experimental. Its current version is the `0.1.0~rc.1` release
+candidate; no final `0.1.0` has been released, and there is no stable-version
+compatibility promise yet. Public signatures are nevertheless
 treated as a deliberate contract: a breaking change must be intentional,
 documented, and reflected in the checked-in consumer witness before it is
 merged. Adding a new public value is normally compatible; removing a value,
