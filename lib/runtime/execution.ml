@@ -343,6 +343,42 @@ let fail execution error =
 let bridge_error message =
   Temporal_base.Error.make ~non_retryable:true ~category:`Bridge ~message ()
 
+(** Maximum number of signal-name bytes quoted in an unhandled-signal
+    diagnostic. The bridge admits names up to 65,536 bytes, and the
+    diagnostic is repeated on every replayed task failure, so only a prefix
+    that is long enough to identify a typo is retained. *)
+let max_diagnostic_signal_name_bytes = 256
+
+(** Returns at most [max_diagnostic_signal_name_bytes] of [name], backing off
+    to a UTF-8 boundary so the diagnostic remains valid text, and marks a
+    truncated name with ["..."]. *)
+let diagnostic_signal_name name =
+  if String.length name <= max_diagnostic_signal_name_bytes then name
+  else
+    let rec prefix length =
+      let candidate = String.sub name 0 length in
+      if length = 0 || Temporal_base.Codec.valid_utf_8 candidate then candidate
+      else prefix (length - 1)
+    in
+    prefix max_diagnostic_signal_name_bytes ^ "..."
+
+(** Builds the task failure for a signal with no registered handler. The v1
+    signal policy is deliberately fail-closed (#811): the signal is already in
+    history, so acknowledging it without a handler would let this worker's
+    state diverge from a worker that does apply it. The error is a [`Defect]
+    (incompatible worker code, not an SDK/bridge disagreement) and therefore
+    fails only the workflow task; the run stays open until a worker that
+    registers the handler replays it, or an operator resets or terminates it. *)
+let unhandled_signal_error signal_name =
+  Temporal_base.Error.make ~non_retryable:true ~category:`Defect
+    ~message:
+      (Printf.sprintf
+         "unhandled workflow signal: %s (no handler is registered on this \
+          worker; the workflow task fails until a worker that registers it \
+          replays the run, or the run is reset or terminated)"
+         (diagnostic_signal_name signal_name))
+    ()
+
 (** Queues the root once, after the initialization activation's job pass has
     queued its signal/update handlers. A handler may suspend and let the root
     proceed; it must at least be invoked before the root makes decisions or
@@ -598,7 +634,10 @@ let process_job execution = function
       (* Signals are queued as scheduler work rather than dispatched inline.
          This preserves FIFO ordering with root and resolver continuations and
          gives a handler the same direct-style suspension semantics as the
-         workflow body. *)
+         workflow body. Delivery is fail-closed (#811): a missing handler fails
+         the task here, and a handler's [`Codec] (undecodable payload or wrong
+         arity) or [`Defect] error fails the task through [fail]; only a
+         deliberate application error from the callback closes the run. *)
       let signal = { input; identity; headers } in
       begin match Signal_map.find_opt signal_name execution.signal_handlers with
       | None ->
@@ -608,8 +647,7 @@ let process_job execution = function
           in
           report ~src:Observability.Source.workflow Logs.Error ~tags
             "workflow signal has no registered handler";
-          fail_task execution
-            (bridge_error ("unhandled workflow signal: " ^ signal_name))
+          fail_task execution (unhandled_signal_error signal_name)
       | Some handler ->
           let tags =
             Observability.tags ~operation:"workflow_signal_received"

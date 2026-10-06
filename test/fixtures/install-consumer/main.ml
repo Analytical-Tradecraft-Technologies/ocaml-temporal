@@ -114,7 +114,7 @@ let () =
      value);
   if T.Workflow_context.is_active () then failwith "consumer context leaked";
   match T.Runtime_info.native_bridge_abi_version () with
-  | Ok 2l -> ()
+  | Ok 3l -> ()
   | Ok version ->
       failwith (Printf.sprintf "unexpected native ABI version %ld" version)
   | Error error -> failwith (T.Error.message error)

@@ -21,6 +21,13 @@ state. An activity-side attempt log must still contain exactly one invocation
 per execution after replay. The driver terminates its remaining executions and
 stops/reaps its workers on exit; an overall timeout bounds failed runs.
 
+Each history read is one `temporal workflow show` invocation with a 30-second
+`--command-timeout`. The CLI reports an expired deadline only as "program
+interrupted"; the original 5-second budget expired on a loaded CI runner.
+While waiting for the retry timer, a failed read is logged and polled again
+until a 60-second deadline; a completed history is read up to three times. The
+event assertions are unchanged.
+
 The fixture uses the private runtime scheduling handle because the public local
 activity API currently exposes only a future. It does not introduce a public
 cancellation API. The client, worker, signal, and query paths use the public SDK.

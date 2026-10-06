@@ -26,10 +26,10 @@ use std::time::{Duration, Instant};
 
 use ocaml_temporal_core_bridge::{
     Buffer, Result as AbiResult, Runtime, STATUS_NOT_READY, STATUS_OK, Status,
-    ocaml_temporal_core_v2_client_connect_json, ocaml_temporal_core_v2_result_free,
-    ocaml_temporal_core_v2_runtime_free, ocaml_temporal_core_v2_runtime_new,
-    ocaml_temporal_core_v2_worker_start_json, ocaml_temporal_core_v2_worker_try_poll_workflow,
-    ocaml_temporal_core_v2_worker_wait_workflow,
+    ocaml_temporal_core_v3_client_connect_json, ocaml_temporal_core_v3_result_free,
+    ocaml_temporal_core_v3_runtime_free, ocaml_temporal_core_v3_runtime_new,
+    ocaml_temporal_core_v3_worker_start_json, ocaml_temporal_core_v3_worker_try_poll_workflow,
+    ocaml_temporal_core_v3_worker_wait_workflow,
 };
 use prost::Message;
 use prost::bytes::Bytes;
@@ -284,7 +284,7 @@ fn release(mut result: AbiResult) -> (Status, String) {
     let message = String::from_utf8(bytes(&result.error)).expect("diagnostic is UTF-8");
     // SAFETY: This helper has exclusive ownership of the initialized result.
     assert_eq!(
-        unsafe { ocaml_temporal_core_v2_result_free(&mut result) },
+        unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
         STATUS_OK
     );
     (status, message)
@@ -361,7 +361,7 @@ fn start_worker(address: SocketAddr) -> *mut Runtime {
     let mut runtime = ptr::null_mut();
     let mut result = AbiResult::default();
     // SAFETY: Both output locations are writable and exclusively owned.
-    unsafe { ocaml_temporal_core_v2_runtime_new(&mut runtime, &mut result) };
+    unsafe { ocaml_temporal_core_v3_runtime_new(&mut runtime, &mut result) };
     assert_eq!(release(result).0, STATUS_OK);
 
     let client = format!(r#"{{"target_url":"http://{address}","identity":"dispose-eviction"}}"#);
@@ -369,7 +369,7 @@ fn start_worker(address: SocketAddr) -> *mut Runtime {
     // SAFETY: The runtime is live and exclusively owned; the input remains
     // readable for the full blocking call.
     unsafe {
-        ocaml_temporal_core_v2_client_connect_json(
+        ocaml_temporal_core_v3_client_connect_json(
             runtime,
             client.as_ptr(),
             client.len(),
@@ -383,7 +383,7 @@ fn start_worker(address: SocketAddr) -> *mut Runtime {
     // SAFETY: Same exclusive runtime ownership; the static document stays
     // readable for the call.
     unsafe {
-        ocaml_temporal_core_v2_worker_start_json(
+        ocaml_temporal_core_v3_worker_start_json(
             runtime,
             WORKFLOW_WORKER.as_ptr(),
             WORKFLOW_WORKER.len(),
@@ -404,7 +404,7 @@ fn wait_for_ready_workflow(mut runtime: *mut Runtime) -> *mut Runtime {
         let (returned, status, message) = call_result(
             runtime,
             "workflow readiness wait",
-            ocaml_temporal_core_v2_worker_wait_workflow,
+            ocaml_temporal_core_v3_worker_wait_workflow,
         );
         runtime = returned;
         match status {
@@ -430,7 +430,7 @@ fn runtime_close_acknowledges_eviction_after_retiring_leased_activation() {
     let (runtime, status, message) = call_result(
         runtime,
         "workflow lease",
-        ocaml_temporal_core_v2_worker_try_poll_workflow,
+        ocaml_temporal_core_v3_worker_try_poll_workflow,
     );
     assert_eq!(status, STATUS_OK, "{message}");
 
@@ -439,7 +439,7 @@ fn runtime_close_acknowledges_eviction_after_retiring_leased_activation() {
     let (runtime, status) = call_bounded(runtime, "runtime close", |runtime| {
         // SAFETY: This thread exclusively owns the live runtime slot. Close
         // is allowed with a live worker: it disposes the whole graph.
-        unsafe { ocaml_temporal_core_v2_runtime_free(runtime) }
+        unsafe { ocaml_temporal_core_v3_runtime_free(runtime) }
     });
     assert_eq!(status, STATUS_OK);
     assert!(runtime.is_null());

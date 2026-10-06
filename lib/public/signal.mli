@@ -56,6 +56,17 @@ module Handler : sig
       adapter boundary. Zero payloads, which the Temporal CLI, Web UI, and
       other SDKs send for a no-argument signal, are decoded as the canonical
       [binary/null] unit payload; one payload is passed to [dispatch]; more
-      than one is a non-retryable workflow error. *)
+      than one is a non-retryable [`Codec] error and the callback is not
+      invoked.
+
+      Signal delivery is fail-closed in v1. When a native worker receives a
+      signal it cannot apply (no handler registered under the signal's name,
+      a payload the codec cannot decode, or more than one payload) it fails
+      the current workflow task instead of closing the run. The signal stays
+      in history, so every replay fails the same way; the run stays open and
+      makes no progress until a worker with a matching handler and codec is
+      deployed, or an operator resets or terminates it. A typed error that the
+      callback itself returns keeps its own classification: a [`Workflow]
+      error closes the run as Failed. *)
   val dispatch_payloads : t -> Payload.t list -> (unit, Error.t) result
 end

@@ -1343,10 +1343,11 @@ let test_unhandled_query_failure_message_is_bounded () =
   | _ -> failwith "long unhandled query did not emit a failed query result"
   end
 
-(** A SignalWorkflow with no matching registration fails the workflow
-    non-retryably. Silently acknowledging an unknown signal would make replay
-    diverge from the worker's observable state, so the run is removed only
-    after Core acknowledges the explicit failure command. *)
+(** A SignalWorkflow with no matching registration fails only the workflow
+    task (the v1 fail-closed policy, #811). Silently acknowledging an unknown
+    signal would make replay diverge from the worker's observable state, so
+    the poisoned execution is removed only after Core acknowledges the failed
+    task, and no terminal workflow command is emitted. *)
 let test_unhandled_signal_fails_closed () =
   let supervisor = fake_supervisor () in
   let workflow =
@@ -1373,9 +1374,10 @@ let test_unhandled_signal_fails_closed () =
   begin
     match (latest_completion supervisor).commands, (latest_completion supervisor).task_failure with
     | [], Some { message; _ }
-      when String.equal message "unhandled workflow signal: missing" ->
+      when String.starts_with ~prefix:"unhandled workflow signal: missing "
+             message ->
         ()
-    | _ -> failwith "unhandled signal did not produce a non-retryable failure"
+    | _ -> failwith "unhandled signal did not fail only the workflow task"
   end;
   if Hashtbl.length supervisor.leased <> 0 then
     failwith "unhandled signal left a native lease outstanding";

@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 use temporalio_client::callback_based::{CallbackBasedGrpcService, GrpcSuccessResponse};
 use temporalio_client::tonic::Status as RpcStatus;
+use temporalio_common::protos::temporal::api::enums::v1::WorkflowIdConflictPolicy;
 use temporalio_common::protos::temporal::api::workflowservice::v1::{
     StartWorkflowExecutionRequest, StartWorkflowExecutionResponse,
 };
@@ -18,6 +19,9 @@ enum Reply {
     Recovering,
     Denied,
     Hung,
+    /// Answers like a server applying `USE_EXISTING` to an open run: the
+    /// existing run ID with `started = false`.
+    Existing,
 }
 
 /// Records wire requests and the release of their in-flight transport futures.
@@ -64,6 +68,17 @@ fn connected_runtime(reply: Reply) -> (Runtime, Arc<Probe>) {
                     }
                     Reply::Denied => return Err(RpcStatus::permission_denied("synthetic denial")),
                     Reply::Hung => std::future::pending::<()>().await,
+                    Reply::Existing => {
+                        return Ok(GrpcSuccessResponse {
+                            headers: Default::default(),
+                            proto: StartWorkflowExecutionResponse {
+                                run_id: "existing-run".to_owned(),
+                                started: false,
+                                ..Default::default()
+                            }
+                            .encode_to_vec(),
+                        });
+                    }
                     Reply::Recovering => {}
                 }
                 Ok(GrpcSuccessResponse {
@@ -99,6 +114,20 @@ fn connected_runtime(reply: Reply) -> (Runtime, Arc<Probe>) {
 /// Admits one logical start, then observes it through bounded owner turns.
 fn start(runtime: &mut Runtime) -> serde_json::Value {
     let request = br#"{"request_id":"stable-request-1","namespace":"default","workflow_id":"workflow-1","workflow_type":"Workflow","task_queue":"queue","input":[]}"#;
+    start_document(runtime, request)
+}
+
+/// Admits one start with an explicit workflow ID conflict policy name.
+fn start_with_policy(runtime: &mut Runtime, policy: &str) -> serde_json::Value {
+    let request = format!(
+        r#"{{"request_id":"stable-request-1","namespace":"default","workflow_id":"workflow-1","workflow_type":"Workflow","task_queue":"queue","input":[],"id_conflict_policy":"{policy}"}}"#
+    );
+    start_document(runtime, request.as_bytes())
+}
+
+/// Admits one encoded start request and polls its ticket to a terminal
+/// outcome within the start deadline.
+fn start_document(runtime: &mut Runtime, request: &[u8]) -> serde_json::Value {
     let ticket = runtime
         .begin_start_workflow_json(request)
         .expect("start ticket");
@@ -126,6 +155,56 @@ fn transient_start_failures_retry_the_identical_request() {
     assert_eq!(requests[0].request_id, "stable-request-1");
     assert!(requests.iter().all(|request| request == &requests[0]));
     assert!(runtime.pending_starts.is_empty());
+}
+
+/// Each closed policy name reaches the wire as Temporal's explicit enum
+/// value; an omitted policy is sent as `FAIL` rather than `UNSPECIFIED`. A
+/// server that predates `StartWorkflowExecutionResponse.started` leaves it
+/// false, so a successful non-`USE_EXISTING` start is still reported as a
+/// newly started run.
+#[test]
+fn id_conflict_policy_reaches_the_start_request() {
+    for (policy, expected) in [
+        (None, WorkflowIdConflictPolicy::Fail),
+        (Some("fail"), WorkflowIdConflictPolicy::Fail),
+        (
+            Some("terminate_existing"),
+            WorkflowIdConflictPolicy::TerminateExisting,
+        ),
+    ] {
+        let (mut runtime, probe) = connected_runtime(Reply::Recovering);
+        let outcome = match policy {
+            None => start(&mut runtime),
+            Some(policy) => start_with_policy(&mut runtime, policy),
+        };
+        assert_eq!(outcome["kind"], "accepted");
+        assert_eq!(outcome["execution"]["run_id"], "run-1");
+        assert_eq!(outcome["started"], true);
+        let requests = probe.requests.lock().unwrap();
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.workflow_id_conflict_policy == i32::from(expected))
+        );
+    }
+}
+
+/// `USE_EXISTING` returns the open run Temporal reports, not a fabricated new
+/// run, and preserves `started = false` so OCaml can tell the two apart.
+#[test]
+fn use_existing_returns_the_existing_run_id() {
+    let (mut runtime, probe) = connected_runtime(Reply::Existing);
+    let outcome = start_with_policy(&mut runtime, "use_existing");
+    assert_eq!(outcome["kind"], "accepted");
+    assert_eq!(outcome["execution"]["run_id"], "existing-run");
+    assert_eq!(outcome["started"], false);
+    let requests = probe.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].workflow_id_conflict_policy,
+        i32::from(WorkflowIdConflictPolicy::UseExisting)
+    );
+    assert_eq!(requests[0].request_id, "stable-request-1");
 }
 
 /// A definitive rejection must not be retried or reported as uncertain.

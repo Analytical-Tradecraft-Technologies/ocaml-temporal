@@ -1,0 +1,7 @@
+; A unit test, not a long-lived example process: it runs the example
+; workflow in-process through Temporal.Testing, so it needs no Temporal
+; Server and is deliberately a `test` stanza outside the live example gate.
+
+(test
+ (name example_workflow_test)
+ (libraries temporal-sdk temporal_sdk_examples_common))

@@ -420,6 +420,107 @@ let test_mock_start_reuses_closed_workflow_id () =
   | Error error -> failwith (Temporal.Error.message error));
   unwrap (Temporal.Client.shutdown client)
 
+(** Each workflow ID conflict policy applies only while the current run is
+    open. [`Fail] (also the default) returns the typed already-started error
+    whose execution can be followed; [`Use_existing] attaches to the running
+    run with [started = false]; [`Terminate_existing] terminates it and starts
+    a new run. A request-ID retry of the start that created a run still
+    returns that run, and changing only the policy under that ID is rejected. *)
+let test_mock_start_id_conflict_policy () =
+  let client =
+    unwrap
+      (Temporal.Client.create ~target_url:"mock://client"
+         ~namespace:"unit-test" ())
+  in
+  let start ?id_conflict_policy ~request_id input =
+    Temporal.Client.start client ?id_conflict_policy ~workflow:echo_workflow
+      ~request_id ~task_queue:"unit-test" ~id:"conflict-id" ~input ()
+  in
+  let first = unwrap (start ~request_id:"conflict-first" "first") in
+  assert (Temporal.Client.started first);
+  let expect_already_started result =
+    match result with
+    | Ok _ -> failwith "a conflicting start unexpectedly succeeded"
+    | Error error -> (
+        let view = Temporal.Error.view error in
+        assert (view.category = `Workflow);
+        assert view.non_retryable;
+        assert (view.error_type = Some "WorkflowExecutionAlreadyStarted");
+        match Temporal.Client.already_started error with
+        | Some { namespace = "unit-test"; workflow_id = "conflict-id"; run_id }
+          when run_id = Temporal.Client.run_id first ->
+            ()
+        | Some _ -> failwith "already-started error named the wrong run"
+        | None -> failwith "already-started error lost the existing run")
+  in
+  expect_already_started (start ~request_id:"conflict-default" "blocked");
+  expect_already_started
+    (start ~id_conflict_policy:`Fail ~request_id:"conflict-fail" "blocked");
+  (* Ordinary errors never look like an already-started conflict. *)
+  assert (
+    Temporal.Client.already_started
+      (Temporal.Error.make ~category:`Workflow ~message:"other" ())
+    = None);
+  (* The typed identity is directly usable with [follow]. *)
+  (match start ~request_id:"conflict-follow" "blocked" with
+  | Ok _ -> failwith "a conflicting start unexpectedly succeeded"
+  | Error error -> (
+      match Temporal.Client.already_started error with
+      | None -> failwith "already-started error lost the existing run"
+      | Some execution ->
+          let followed =
+            unwrap
+              (Temporal.Client.follow client ~workflow:echo_workflow execution)
+          in
+          assert (not (Temporal.Client.started followed));
+          assert (Temporal.Client.run_id followed = Temporal.Client.run_id first)));
+  let attached =
+    unwrap
+      (start ~id_conflict_policy:`Use_existing ~request_id:"conflict-attach"
+         "ignored")
+  in
+  assert (not (Temporal.Client.started attached));
+  assert (Temporal.Client.run_id attached = Temporal.Client.run_id first);
+  (* Request-ID deduplication precedes the conflict policy. *)
+  let retried =
+    unwrap
+      (start ~id_conflict_policy:`Fail ~request_id:"conflict-first" "first")
+  in
+  assert (Temporal.Client.started retried);
+  assert (Temporal.Client.run_id retried = Temporal.Client.run_id first);
+  expect_error_message_contains "workflow" "different start data"
+    (start ~id_conflict_policy:`Terminate_existing ~request_id:"conflict-first"
+       "first");
+  let replacement =
+    unwrap
+      (start ~id_conflict_policy:`Terminate_existing
+         ~request_id:"conflict-replace" "second")
+  in
+  assert (Temporal.Client.started replacement);
+  assert (Temporal.Client.run_id replacement <> Temporal.Client.run_id first);
+  (match Temporal.Client.wait first with
+  | Ok (Temporal.Client.Terminated _) -> ()
+  | Ok _ -> failwith "terminate_existing did not terminate the open run"
+  | Error error -> failwith (Temporal.Error.message error));
+  (match Temporal.Client.wait attached with
+  | Ok (Temporal.Client.Terminated _) -> ()
+  | Ok _ -> failwith "use_existing handle did not name the original run"
+  | Error error -> failwith (Temporal.Error.message error));
+  (match Temporal.Client.wait replacement with
+  | Ok (Temporal.Client.Completed "second") -> ()
+  | Ok _ -> failwith "replacement run returned the wrong result"
+  | Error error -> failwith (Temporal.Error.message error));
+  (* With no open run every policy starts a new run. *)
+  let after_close =
+    unwrap
+      (start ~id_conflict_policy:`Use_existing ~request_id:"conflict-closed"
+         "third")
+  in
+  assert (Temporal.Client.started after_close);
+  assert (
+    Temporal.Client.run_id after_close <> Temporal.Client.run_id replacement);
+  unwrap (Temporal.Client.shutdown client)
+
 (** The deterministic client seam exposes the same visibility row shape as the
     native adapter. Starting two workflows proves rows retain type, queue,
     exact run identity, and monotone running status before waits complete. *)
@@ -1336,6 +1437,7 @@ let () =
   test_client_custom_codec_failures ();
   test_mock_start_idempotent_retry ();
   test_mock_start_reuses_closed_workflow_id ();
+  test_mock_start_id_conflict_policy ();
   test_client_visibility_listing ();
   test_follow_continued_as_new_handle ();
   test_follow_rejects_malformed_successor_identity ();

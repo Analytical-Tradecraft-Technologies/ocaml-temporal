@@ -116,7 +116,10 @@ When a public API change is intentional:
 
 Do not weaken an annotation merely to make a changed signature compile. If a
 new capability requires a new public module, add it to the explicit root
-allow-list and document why it belongs in the exported surface. Before the
+allow-list and document why it belongs in the exported surface. For
+example, `Temporal.Testing` is exported because applications need a
+supported way to unit-test their own workflow code; its engine stays in the
+private runtime library and its interface names only public types. Before the
 MVP prerelease is published, maintainers must approve its scope and complete
 its candidate qualification checklist. The installed witness and
 private-module negative checks remain required even for exported capabilities

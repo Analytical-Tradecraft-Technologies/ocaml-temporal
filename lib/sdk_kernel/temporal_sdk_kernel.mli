@@ -55,3 +55,10 @@ module Native_worker_observer = Temporal_runtime.Native_worker_observer
 
 (** Callback representation underlying the public abstract future type. *)
 module Future = Temporal_future_kernel
+
+(** Per-run workflow runtime; exposed for its private interaction-handler
+    constructors, which the in-process test environment registers. *)
+module Execution = Temporal_runtime.Execution
+
+(** Deterministic in-process engine behind [Temporal.Testing]. *)
+module Test_environment = Temporal_runtime.Test_environment

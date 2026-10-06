@@ -22,7 +22,7 @@ ledger validates the run ID or opaque task token before Core sees a completion.
 
 ## Startup compatibility
 
-ABI version `2` guards the C layout and operations. The bridge checks it once
+ABI version `3` guards the C layout and operations. The bridge checks it once
 before creating an SDK runtime. It is absent from messages because OCaml and
 Rust are compiled and shipped together. Direct JSON documents are strictly
 validated and evolve with those paired sources; CI identifies prebuilt Rust
