@@ -263,7 +263,10 @@ workflow ID, run ID, and bounded reason text. It deliberately has no
 deterministic mock preserves this exact-run and terminal-history contract.
 
 The native call has a bounded control-plane deadline so a stalled server cannot
-hold the supervisor owner indefinitely. If that deadline expires, the server
+hold the supervisor owner indefinitely. Within it, Core re-sends the request
+only after `unavailable` or `resource_exhausted`; ambiguous statuses such as
+`unknown` or `internal` are returned at once because a blind re-send of an
+applied termination would report `not_found`. If that deadline expires, the server
 may already have accepted the command, so the bridge returns the explicit
 `rpc` code `termination_outcome_uncertain` rather than pretending that the
 termination was rejected or that a retry is safe. Reconcile this result by
@@ -418,7 +421,10 @@ start-only `already_started` category is rejected as impossible. Both sides
 reject unknown or duplicate members and validate the positive acknowledgement.
 The bridge bounds this control-plane RPC to one second, matching cancellation:
 an unavailable server cannot hold the supervisor's single owner Domain
-indefinitely, and a timeout is returned as a typed `deadline_exceeded` error.
+indefinitely. Core retries transient transport failures within that second
+with the identical request; when the budget ends the last transport status
+(such as `unavailable`) or, for an attempt still in flight, a typed
+`deadline_exceeded` error is returned.
 Callers that retry an uncertain result should reuse the same `request_id`.
 The request and response shapes are defined by
 [`client-signal-request.schema.json`](../schemas/bridge/client-signal-request.schema.json)
@@ -603,7 +609,10 @@ history long poll with the equivalent of `follow_runs = false`, bounded to
 `STATUS_NOT_READY` and no response object; the caller or a later orchestration
 loop can retry the same request through its mailbox. A timeout is therefore a
 pending observation, not a workflow failure. A terminal response always names
-the exact run requested.
+the exact run requested. Transient transport failures of the long poll (for
+example a Temporal Server restart) are retried by Core inside the pending
+observation, up to thirty consecutive attempts per long poll, so they do not
+end the wait (#820); a definitive status such as `not_found` still does.
 
 The public `Temporal.Client.wait handle` performs that retry loop internally:
 it resubmits the same exact-run request after each bounded `NOT_READY` result

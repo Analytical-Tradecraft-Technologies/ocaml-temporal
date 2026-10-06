@@ -11,9 +11,10 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Duration;
-use temporalio_client::Connection;
 use temporalio_client::grpc::WorkflowService;
-use temporalio_client::tonic::{Code, IntoRequest, Status};
+use temporalio_client::request_extensions::{NoRetryOnMatching, RetryConfigForCall};
+use temporalio_client::tonic::{Code, IntoRequest, Request, Status};
+use temporalio_client::{Connection, RetryOptions};
 use temporalio_common::protos::temporal::api::{
     common::v1::{Memo, Payloads, SearchAttributes, WorkflowExecution, WorkflowType},
     enums::v1::{HistoryEventFilterType, UpdateWorkflowExecutionLifecycleStage},
@@ -839,6 +840,94 @@ pub fn encode_visibility_response(
     encode_document(response)
 }
 
+/// Maximum transport attempts, including the first, that one exact-run history
+/// long poll may make while Core retries transient failures (#820).
+///
+/// With Core's default backoff (100 ms growing by 1.7x to a 5 s cap, +/-20%
+/// jitter) thirty attempts span roughly two minutes, which covers a routine
+/// Temporal Server restart. The count restarts with every long poll the
+/// server answers, so it bounds one continuous outage rather than the life of
+/// the wait.
+const WAIT_MAX_ATTEMPTS: usize = 30;
+
+/// Core retry policy for the exact-run history long poll behind `wait`.
+///
+/// Core measures its elapsed-time limit from the start of the call, and a
+/// healthy long poll can legitimately stay open for most of a minute before
+/// the server fails. Under Core's default ten-second limit such a poll would
+/// therefore not be retried at all when the server goes away mid-poll, which
+/// is exactly the outage `wait` must survive. The wait instead disables the
+/// elapsed-time limit and bounds the outage by [`WAIT_MAX_ATTEMPTS`]. Only
+/// Core's transient status codes are retried; a definitive rejection such as
+/// `not_found` still ends the wait on its first occurrence.
+fn wait_retry_options() -> RetryOptions {
+    RetryOptions {
+        max_elapsed_time: None,
+        max_retries: WAIT_MAX_ATTEMPTS,
+        ..RetryOptions::default()
+    }
+}
+
+/// Wraps one bounded client RPC message for Core's retrying `Connection`.
+///
+/// Every client RPC except the history long poll has a fixed total budget that
+/// keeps the supervisor's synchronous turn finite. Core's default retry window
+/// (ten seconds) is unrelated to those budgets, so it is replaced by Core's
+/// default backoff limited to `budget`: Core stops scheduling retries once the
+/// budget is spent and returns the last transport status (for example
+/// `unavailable`) instead of letting the caller's outer timeout discard it.
+/// The same budget is the gRPC deadline of each transport attempt, so the
+/// server also abandons work the client will no longer wait for. Callers keep
+/// their outer `tokio::time::timeout`, which still caps an attempt that is in
+/// flight when the budget expires.
+///
+/// Which status codes are retried is Core's decision (`unavailable`,
+/// `resource_exhausted`, `unknown`, `internal`, `aborted`, `out_of_range`,
+/// `data_loss`, and transport-level cancellation); every other status is
+/// returned on its first occurrence. Each retry re-sends the identical
+/// message, so the server's idempotency key (`request_id` or update ID)
+/// deduplicates a retried mutation whose first attempt was applied.
+fn budgeted_request<T>(message: T, budget: Duration) -> Request<T> {
+    let mut request = message.into_request();
+    request.set_timeout(budget);
+    request
+        .extensions_mut()
+        .insert(RetryConfigForCall(RetryOptions {
+            max_elapsed_time: Some(budget),
+            ..RetryOptions::default()
+        }));
+    request
+}
+
+/// Reports whether a failed `TerminateWorkflowExecution` attempt must be
+/// returned instead of retried.
+///
+/// Terminate has no idempotency key. Only `unavailable` (almost always a call
+/// that never reached a healthy server) and `resource_exhausted` (the server's
+/// rate limiter rejected it before processing) are retried. Statuses such as
+/// `unknown` or `internal` can be produced after the server applied the
+/// termination, when a blind re-send would turn that success into a
+/// misleading `not_found`. The residual case, an `unavailable` reported after
+/// the server applied the first attempt, can likewise surface as `not_found`
+/// from the retry; callers reconcile it with `wait`, as for
+/// `termination_outcome_uncertain`.
+fn terminate_retry_forbidden(status: &Status) -> bool {
+    !matches!(status.code(), Code::Unavailable | Code::ResourceExhausted)
+}
+
+/// Builds a budgeted terminate request (see [`budgeted_request`]) whose Core
+/// retries are restricted by [`terminate_retry_forbidden`].
+fn terminate_request(
+    message: TerminateWorkflowExecutionRequest,
+    budget: Duration,
+) -> Request<TerminateWorkflowExecutionRequest> {
+    let mut request = budgeted_request(message, budget);
+    request.extensions_mut().insert(NoRetryOnMatching {
+        predicate: terminate_retry_forbidden,
+    });
+    request
+}
+
 /// Lists one visibility page through Temporal's official workflow service.
 /// The opaque page token is copied as bytes only inside Rust and is base64 at
 /// the JSON boundary; no server-owned protobuf or byte buffer is retained.
@@ -860,18 +949,18 @@ pub async fn list_visibility(
                 })
         })
         .transpose()?;
-    let mut service = connection.workflow_service();
+    let mut service = connection.clone();
     let response = match tokio::time::timeout(
         VISIBILITY_RPC_TIMEOUT,
-        service.list_workflow_executions(
+        service.list_workflow_executions(budgeted_request(
             ListWorkflowExecutionsRequest {
                 namespace: request.namespace,
                 query: request.query,
                 page_size: request.page_size as i32,
                 next_page_token: token.unwrap_or_default(),
-            }
-            .into_request(),
-        ),
+            },
+            VISIBILITY_RPC_TIMEOUT,
+        )),
     )
     .await
     {
@@ -924,7 +1013,7 @@ pub async fn cancel_workflow(
     // forever; callers can retry the same request ID when the outcome is
     // uncertain.
     const CONTROL_RPC_TIMEOUT: Duration = Duration::from_secs(1);
-    let mut service = connection.workflow_service();
+    let mut service = connection.clone();
     let request = RequestCancelWorkflowExecutionRequest {
         namespace: request.namespace,
         workflow_execution: Some(WorkflowExecution {
@@ -938,7 +1027,7 @@ pub async fn cancel_workflow(
     };
     match tokio::time::timeout(
         CONTROL_RPC_TIMEOUT,
-        service.request_cancel_workflow_execution(request.into_request()),
+        service.request_cancel_workflow_execution(budgeted_request(request, CONTROL_RPC_TIMEOUT)),
     )
     .await
     {
@@ -962,12 +1051,12 @@ pub async fn reset_workflow(
     request: ResetWorkflowRequest,
 ) -> Result<ResetWorkflowResponse, ClientOperationError> {
     const CONTROL_RPC_TIMEOUT: Duration = Duration::from_secs(1);
-    let mut service = connection.workflow_service();
+    let mut service = connection.clone();
     let namespace = request.namespace.clone();
     let workflow_id = request.workflow_id.clone();
     let response = match tokio::time::timeout(
         CONTROL_RPC_TIMEOUT,
-        service.reset_workflow_execution(
+        service.reset_workflow_execution(budgeted_request(
             ResetWorkflowExecutionRequest {
                 namespace: request.namespace,
                 workflow_execution: Some(WorkflowExecution {
@@ -979,9 +1068,9 @@ pub async fn reset_workflow(
                 request_id: request.request_id,
                 identity: connection.identity().to_owned(),
                 ..Default::default()
-            }
-            .into_request(),
-        ),
+            },
+            CONTROL_RPC_TIMEOUT,
+        )),
     )
     .await
     {
@@ -1026,7 +1115,7 @@ pub async fn terminate_workflow(
     request: TerminateWorkflowRequest,
 ) -> Result<TerminateWorkflowResponse, ClientOperationError> {
     const CONTROL_RPC_TIMEOUT: Duration = Duration::from_secs(1);
-    let mut service = connection.workflow_service();
+    let mut service = connection.clone();
     let request = TerminateWorkflowExecutionRequest {
         namespace: request.namespace,
         workflow_execution: Some(WorkflowExecution {
@@ -1039,7 +1128,7 @@ pub async fn terminate_workflow(
     };
     match tokio::time::timeout(
         CONTROL_RPC_TIMEOUT,
-        service.terminate_workflow_execution(request.into_request()),
+        service.terminate_workflow_execution(terminate_request(request, CONTROL_RPC_TIMEOUT)),
     )
     .await
     {
@@ -1072,7 +1161,7 @@ pub async fn signal_workflow(
     // request ID after an uncertain timeout.
     const CONTROL_RPC_TIMEOUT: Duration = Duration::from_secs(1);
     let payloads = payloads_to_core(&request.input).map_err(ClientOperationError::Core)?;
-    let mut service = connection.workflow_service();
+    let mut service = connection.clone();
     let request = SignalWorkflowExecutionRequest {
         namespace: request.namespace,
         workflow_execution: Some(WorkflowExecution {
@@ -1087,7 +1176,7 @@ pub async fn signal_workflow(
     };
     match tokio::time::timeout(
         CONTROL_RPC_TIMEOUT,
-        service.signal_workflow_execution(request.into_request()),
+        service.signal_workflow_execution(budgeted_request(request, CONTROL_RPC_TIMEOUT)),
     )
     .await
     {
@@ -1120,7 +1209,7 @@ pub async fn query_workflow(
     // does not yet expose a caller-selected deadline.
     const QUERY_RPC_TIMEOUT: Duration = Duration::from_secs(30);
     let query_args = payloads_to_core(&request.input).map_err(ClientOperationError::Core)?;
-    let mut service = connection.workflow_service();
+    let mut service = connection.clone();
     let request = QueryWorkflowExecutionRequest {
         namespace: request.namespace,
         execution: Some(WorkflowExecution {
@@ -1139,7 +1228,7 @@ pub async fn query_workflow(
     };
     let response = match tokio::time::timeout(
         QUERY_RPC_TIMEOUT,
-        service.query_workflow(request.into_request()),
+        service.query_workflow(budgeted_request(request, QUERY_RPC_TIMEOUT)),
     )
     .await
     {
@@ -1232,14 +1321,16 @@ pub(crate) async fn update_workflow_within(
         code: "deadline_exceeded".to_owned(),
     };
     let deadline = tokio::time::Instant::now() + budget;
-    let mut service = connection.workflow_service();
+    let mut service = connection.clone();
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
             return Err(deadline_exceeded());
         }
-        let mut attempt = rpc_request.clone().into_request();
-        attempt.set_timeout(remaining);
+        // Core may retry a transient transport failure inside this attempt;
+        // both its retry window and every transport attempt's deadline are
+        // limited to what remains of the shared acceptance budget.
+        let attempt = budgeted_request(rpc_request.clone(), remaining);
         let response =
             tokio::time::timeout_at(deadline, service.update_workflow_execution(attempt))
                 .await
@@ -1356,16 +1447,21 @@ fn update_response_from_core(
     })
 }
 
+/// Total time one `poll_workflow_update` call may spend, including Core's
+/// retries of transient transport failures, before it reports the update as
+/// still pending.
+const UPDATE_POLL_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Polls one update until completion, bounded so the supervisor remains
 /// responsive to shutdown and unrelated client requests.
 pub async fn poll_workflow_update(
     connection: Connection,
     request: PollWorkflowUpdateRequest,
 ) -> Result<PollWorkflowUpdateResponse, ClientOperationError> {
-    let mut service = connection.workflow_service();
+    let mut service = connection.clone();
     let response = match tokio::time::timeout(
-        Duration::from_secs(30),
-        service.poll_workflow_execution_update(
+        UPDATE_POLL_TIMEOUT,
+        service.poll_workflow_execution_update(budgeted_request(
             PollWorkflowExecutionUpdateRequest {
                 namespace: request.namespace,
                 update_ref: Some(update::v1::UpdateRef {
@@ -1379,9 +1475,9 @@ pub async fn poll_workflow_update(
                 wait_policy: Some(WaitPolicy {
                     lifecycle_stage: i32::from(UpdateWorkflowExecutionLifecycleStage::Completed),
                 }),
-            }
-            .into_request(),
-        ),
+            },
+            UPDATE_POLL_TIMEOUT,
+        )),
     )
     .await
     {
@@ -1546,25 +1642,29 @@ pub async fn wait_workflow(
         run_id: request.run_id.clone(),
     };
     let mut next_page_token = Vec::new();
-    let mut service = connection.workflow_service();
+    let mut service = connection.clone();
 
     loop {
+        let mut poll = GetWorkflowExecutionHistoryRequest {
+            namespace: request.namespace.clone(),
+            execution: Some(WorkflowExecution {
+                workflow_id: request.workflow_id.clone(),
+                run_id: request.run_id.clone(),
+            }),
+            next_page_token: std::mem::take(&mut next_page_token),
+            skip_archival: false,
+            wait_new_event: true,
+            history_event_filter_type: i32::from(HistoryEventFilterType::CloseEvent),
+            ..Default::default()
+        }
+        .into_request();
+        // Core marks this `wait_new_event` request as a user long poll and
+        // gives it Core's long-poll transport deadline; the bridge supplies
+        // only the retry window documented on `wait_retry_options`.
+        poll.extensions_mut()
+            .insert(RetryConfigForCall(wait_retry_options()));
         let response = service
-            .get_workflow_execution_history(
-                GetWorkflowExecutionHistoryRequest {
-                    namespace: request.namespace.clone(),
-                    execution: Some(WorkflowExecution {
-                        workflow_id: request.workflow_id.clone(),
-                        run_id: request.run_id.clone(),
-                    }),
-                    next_page_token: std::mem::take(&mut next_page_token),
-                    skip_archival: false,
-                    wait_new_event: true,
-                    history_event_filter_type: HistoryEventFilterType::CloseEvent as i32,
-                    ..Default::default()
-                }
-                .into_request(),
-            )
+            .get_workflow_execution_history(poll)
             .await
             .map_err(map_rpc_status)?
             .into_inner();
@@ -3212,3 +3312,7 @@ mod tests {
 #[cfg(test)]
 #[path = "../tests/support/client_update.rs"]
 mod update_acceptance_tests;
+
+#[cfg(test)]
+#[path = "../tests/support/client_retry.rs"]
+mod client_retry_tests;

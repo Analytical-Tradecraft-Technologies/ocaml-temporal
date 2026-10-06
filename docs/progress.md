@@ -15,6 +15,23 @@ implementation when a later entry documents that work as complete. The
 records the current tested source, named assertions and successful CI job for
 the Temporal acceptance controllers.
 
+## 2026-10-06: Every client RPC uses Core's retry layer (#820)
+
+Only workflow start went through Core's retrying `Connection`; every other
+client RPC called the raw `workflow_service()` stub, so `Client.wait` failed
+about a second after the Temporal Server stopped. Wait, signal, query, cancel,
+terminate, reset, update, update polling, and visibility listing now use the
+retrying connection. Bounded RPCs fit Core's retry window and each attempt's
+gRPC deadline inside their existing budgets, terminate retries only
+`unavailable` and `resource_exhausted` because it has no idempotency key, and
+the history long poll allows thirty consecutive attempts per poll. Callback
+transport tests in `rust/core-bridge/tests/support/client_retry.rs` prove
+recovery after one `unavailable` reply for each RPC with byte-identical
+re-sends, no retry of `not_found`/`invalid_argument` or of ambiguous terminate
+statuses, and a persistently unavailable signal returning within its
+one-second budget. See
+[the Core bridge reference](reference/core-bridge.md#native-client-start-and-exact-run-wait).
+
 ## 2026-10-06: Retained completions fail closed (#843)
 
 The workflow and activity adapters used to resubmit every retained completion

@@ -161,6 +161,26 @@ under `tests/support/client_start.rs` cover recovery, request identity,
 non-retryable rejection, cancellation of a hung request, and the 64-ticket
 admission bound.
 
+Every other client RPC (wait, signal, query, cancel, terminate, reset,
+update, update poll, and visibility listing) goes through the same retrying
+`Connection` (#820). Core decides which statuses are transient (`unavailable`,
+`resource_exhausted`, `unknown`, `internal`, `aborted`, `out_of_range`,
+`data_loss`, and transport-level cancellation) and re-sends the identical
+request, so `request_id` or the update ID deduplicates a retried mutation.
+Each bounded RPC replaces Core's ten-second retry window with its own existing
+budget (one second for control RPCs, ten for visibility, thirty for query,
+update acceptance, and update polling) and uses that budget as every
+attempt's gRPC deadline; the outer timeout still caps an attempt in flight
+when the budget ends. Terminate has no idempotency key, so it retries only
+`unavailable` and `resource_exhausted`. The `wait` history long poll has no
+total budget: Core measures its retry window from the start of a call, which
+would forbid retrying a long poll that failed after ten healthy seconds, so the
+wait instead allows up to thirty consecutive attempts per long poll (roughly
+two minutes of outage with Core's default backoff). Tests under
+`tests/support/client_retry.rs` cover recovery of each RPC, identical
+re-sends, non-retried rejections, the terminate restriction, and the control
+budget.
+
 The wait request names `namespace`, `workflow_id`, and one concrete `run_id`.
 There is no `follow_runs` escape hatch in the document: the operation always
 uses a close-event history long poll for that exact run, but each native call
