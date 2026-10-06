@@ -70,6 +70,13 @@ module Source = struct
     | Native.Closed -> "replay supervisor closed"
     | Native.Supervisor_failed _ -> "replay supervisor failed"
     | Native.Owner_unavailable _ -> "replay supervisor could not start"
+
+  (** Replay completions are never resubmitted after a failure: the source
+      cannot prove the replay lease is still outstanding. *)
+  let error_is_retryable _ = false
+
+  (** A raised replay completion is equally fail-closed. *)
+  let exception_is_retryable _ = false
 end
 
 (** Uses the ordinary worker registry and deterministic execution machinery. *)

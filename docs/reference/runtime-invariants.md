@@ -189,6 +189,19 @@ and bridge, read the [documentation guide](../README.md) first.
   [runtime regression](../../test/runtime/test_local_activity_cancellation.ml)
   and [live history/replay fixture](../../test/integration/local_activity_cancellation/README.md)
   cover these ownership boundaries.
+- Local-activity backoff commands are emitted in scheduler order, not during
+  the activation job pass (#809). The backoff job and the retry timer's firing
+  are validated in the job pass, but allocating the timer sequence and
+  emitting `StartTimer`, and later re-emitting `ScheduleLocalActivity`, are
+  queued scheduler work at that job's position, after fibers woken by earlier
+  jobs. Core may merge jobs that a live worker received in separate
+  activations (for example inside a heartbeating workflow task) into one
+  activation on replay; queuing keeps sequence numbers and command order
+  identical in both cases, as in the TypeScript and Python SDKs where the
+  coroutine awaiting the activity handles its backoff. Cancellation while
+  that work is queued settles the future and the queued work emits nothing.
+  The [split/merged activation regression](../../test/runtime/test_local_activity_backoff_order.ml)
+  compares the command streams.
 - An activity retry policy is immutable once attached to a command. Its initial
   interval is positive, its maximum interval is at least the initial interval,
   its finite backoff coefficient is at least 1.0, and its maximum-attempt count
@@ -235,8 +248,9 @@ and bridge, read the [documentation guide](../README.md) first.
   deduplicate same-mode commands or share patch state between runs, but it
   rejects active and deprecated calls for one ID in one execution before
   emitting the second mode. Patch IDs are durable history keys, not deployment or process state.
-- Replay-safe randomness, side effects, and workflow logging APIs remain
-  required before production release. The complete [PR #348 CI
+- Replay-safe randomness is provided by `Temporal.Workflow.random_int`.
+  Side-effect and replay-aware workflow logging APIs remain required before
+  production release. The complete [PR #348 CI
   run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29411260374) verifies
   the two original live patch-in histories. The complete [PR #356 run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29469232271) additionally
   verifies active-to-deprecated and deprecated-to-removed replacement.
@@ -328,6 +342,18 @@ and bridge, read the [documentation guide](../README.md) first.
   failures, so `Connection`, `Not_ready`, and `Worker` never authorize a
   second completion attempt. The dedicated retry backoff is a 10 ms native
   timer with the OCaml runtime lock released; it is not a readiness signal.
+- Both the workflow and activity adapters record the first completion failure
+  that is not explicitly retryable (a typed error, an exception, or an async
+  handle admission that fails after Core accepted `WillCompleteAsync`) on the
+  retained entry. From then on neither a later `poll`, a second `Worker.run`,
+  nor a shutdown drain submits that completion again; each returns the
+  recorded error without a native call, and only terminal `discard` releases
+  it (issue #843). No workflow completion failure is retryable: the bridge
+  defines `Retryable` only for activity completion, and pinned Core reports
+  only deterministic validation failures from
+  `complete_workflow_activation`, so an identical resubmission could at best
+  fail again and, after a lost acknowledgement, could complete a later
+  activation of the same run.
 - Namespace-bound async heartbeats and async complete/fail/cancel do not
   consume that Core completion lease, so they do not fail closed. An
   uncertain RPC `Connection` keeps the public handle and adapter async lease

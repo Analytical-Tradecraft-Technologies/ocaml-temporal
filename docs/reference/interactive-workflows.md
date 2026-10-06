@@ -263,9 +263,11 @@ worker. The execution mode depends on the interaction kind:
 The `ref` above is deliberately small synthetic-test state. It demonstrates
 that a handler can close over ordinary OCaml values; it is not a substitute
 for replay-safe workflow state and it is not synchronized for concurrent
-Domains. Keep a dispatcher and its callback-owned mutable state on one owning
-Domain until native worker scheduling supplies the corresponding ownership
-boundary.
+Domains. Keep a local `Interaction` dispatcher and its callback-owned mutable
+state on one Domain. The native worker already runs each registered handler on
+its execution's owner scheduler, but a module-level value captured by a handler
+is still shared by every execution the worker runs and is not reconstructed by
+replay.
 
 For state that belongs to each workflow execution, use
 `Temporal.Workflow_context.Local` instead of a module-level mutable value:
@@ -392,5 +394,6 @@ interaction work is:
 - live acceptance scenarios for update handlers that suspend, including
   recovery and shutdown/eviction cleanup;
 - query deadlines and query behavior across replay or cache eviction;
-- Docker Compose acceptance scenarios for updates, including workflow-side
-  assertions through Temporal Server.
+- live update validator-rejection, deadline, retry, and replay/eviction
+  scenarios beyond the verified admission, completion, and unknown-update
+  rejection paths.

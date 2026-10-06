@@ -25,6 +25,7 @@ def load_script(name):
 MATRIX = load_script("ci-matrix")
 SMOKE = load_script("smoke-artifact")
 RELEASE = load_script("package-release-bridges")
+NOTICES = RELEASE.load_script("generate-third-party-notices")
 COMMIT = "a" * 40
 VERSION = "5.5.1"
 
@@ -211,6 +212,11 @@ class ReleaseTests(unittest.TestCase):
                 (bundle / "import-libs").mkdir()
                 (bundle / "import-libs/libexample.a").write_bytes(b"import library")
             self.checksums(bundle)
+        self.license = self.root / "LICENSE"
+        self.license.write_text("Apache License\nVersion 2.0, January 2004\n")
+        self.notices = self.root / "THIRD-PARTY-NOTICES.txt"
+        self.notices.write_text(NOTICES.render([], self.license.read_text()))
+        self.legal = RELEASE.legal_files(self.license, self.notices)
 
     def checksums(self, bundle):
         """Refresh checksums to distinguish validation errors from corruption."""
@@ -222,22 +228,67 @@ class ReleaseTests(unittest.TestCase):
     def test_complete_release(self):
         """Publication packages four versioned archives with exact provenance."""
         output = self.root / "assets"
-        RELEASE.package_bridges(self.root, output, "v0.1.0-rc.1", COMMIT)
+        RELEASE.package_bridges(self.root, output, "v0.1.0-rc.1", COMMIT, self.legal)
         manifest = json.loads((output / "manifest.json").read_text())
         self.assertEqual(manifest["commit"], COMMIT)
         self.assertEqual(set(manifest["bridges"]), set(RELEASE.PLATFORMS))
         for platform, entry in manifest["bridges"].items():
             self.assertEqual(RELEASE.sha256(output / entry["asset"]), entry["sha256"])
+        notices = manifest["notices"]
+        self.assertEqual(notices["asset"], "ocaml-temporal-v0.1.0-rc.1-third-party-notices.txt")
+        self.assertEqual((output / notices["asset"]).read_bytes(), self.notices.read_bytes())
+        self.assertEqual(RELEASE.sha256(output / notices["asset"]), notices["sha256"])
+
+    def test_archives_carry_licence_files(self):
+        """Every bridge archive ships LICENSE and the notices beside the bridge (#787)."""
+        output = self.root / "assets"
+        RELEASE.package_bridges(self.root, output, "v0.1.0-rc.1", COMMIT, self.legal)
+        for platform in RELEASE.PLATFORMS:
+            with self.subTest(platform=platform):
+                archive = output / f"ocaml-temporal-bridge-v0.1.0-rc.1-{platform}.tar.gz"
+                with tarfile.open(archive) as tar:
+                    names = tar.getnames()
+                    self.assertEqual(tar.extractfile("LICENSE").read(), self.license.read_bytes())
+                    self.assertEqual(tar.extractfile(RELEASE.NOTICES_NAME).read(), self.notices.read_bytes())
+                self.assertIn("bridge/platform", names)
+
+    def test_licence_inputs_are_validated(self):
+        """Packaging rejects a hand-written, stale, or non-Apache licence input."""
+        handwritten = self.root / "handwritten.txt"
+        handwritten.write_text("third-party notices\n")
+        with self.assertRaisesRegex(ValueError, "not a generated"):
+            RELEASE.legal_files(self.license, handwritten)
+        other = self.root / "OTHER-LICENSE"
+        other.write_text("Apache License\nVersion 2.0, a different copy\n")
+        with self.assertRaisesRegex(ValueError, "embed the project licence"):
+            RELEASE.legal_files(other, self.notices)
+        mit = self.root / "MIT-LICENSE"
+        mit.write_text("MIT License\n")
+        with self.assertRaisesRegex(ValueError, "not Apache-2.0"):
+            RELEASE.legal_files(mit, self.notices)
+
+    def test_archive_without_licence_files_is_rejected(self):
+        """The post-packaging check fails when an archive lacks or alters a file."""
+        archive = self.root / "bare.tar.gz"
+        with tarfile.open(archive, "w:gz") as tar:
+            tar.add(self.license, arcname="LICENSE")
+        with self.assertRaisesRegex(ValueError, "missing THIRD-PARTY-NOTICES.txt"):
+            RELEASE.verify_legal_files(archive, self.legal)
+        with tarfile.open(archive, "w:gz") as tar:
+            tar.add(self.license, arcname="LICENSE")
+            tar.add(self.license, arcname=RELEASE.NOTICES_NAME)
+        with self.assertRaisesRegex(ValueError, "different THIRD-PARTY-NOTICES.txt"):
+            RELEASE.verify_legal_files(archive, self.legal)
 
     def test_tag_spelling(self):
         """Git cannot store a tilde tag, so packaging accepts only the hyphen form."""
         output = self.root / "assets"
         with self.assertRaisesRegex(ValueError, "cannot contain '~'"):
-            RELEASE.package_bridges(self.root, output, "v1.0.0~beta.1", COMMIT)
+            RELEASE.package_bridges(self.root, output, "v1.0.0~beta.1", COMMIT, self.legal)
         with self.assertRaisesRegex(ValueError, "invalid release tag"):
-            RELEASE.package_bridges(self.root, output, "v1.0.0-", COMMIT)
+            RELEASE.package_bridges(self.root, output, "v1.0.0-", COMMIT, self.legal)
         self.assertFalse(output.exists())
-        RELEASE.package_bridges(self.root, output, "v1.0.0-beta.1", COMMIT)
+        RELEASE.package_bridges(self.root, output, "v1.0.0-beta.1", COMMIT, self.legal)
         manifest = json.loads((output / "manifest.json").read_text())
         self.assertEqual(manifest["tag"], "v1.0.0-beta.1")
 

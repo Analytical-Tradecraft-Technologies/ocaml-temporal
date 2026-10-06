@@ -169,11 +169,16 @@ type fake_supervisor = {
   (* Number of poll errors observed; tests use this to prove the source-side
      rejection path ran exactly once. *)
   rejected_poll_count : int ref;
-  (* One-shot completion rejection used to verify retained-completion retry
-     without rerunning workflow code. *)
+  (* One-shot completion rejection that the fake classifies as explicitly
+     retryable, used to verify retained-completion retry without rerunning
+     workflow code. *)
   reject_next_completion : bool ref;
-  (* One-shot completion exception used to verify exact completion retention
-     even when the native acknowledgement is uncertain. *)
+  (* One-shot completion rejection that is not retryable. It models a failure
+     after which the lease may already be consumed, so the adapter must never
+     resubmit the retained completion (issue #843). *)
+  reject_next_completion_permanently : bool ref;
+  (* One-shot completion exception, classified as explicitly retryable, used
+     to verify exact completion retention across a raised acknowledgement. *)
   raise_next_completion : bool ref;
   (* Models Core acceptance followed by loss of the language acknowledgement. *)
   accept_then_raise : bool ref;
@@ -189,9 +194,14 @@ let fake_supervisor () =
     poll_error = ref None;
     rejected_poll_count = ref 0;
     reject_next_completion = ref false;
+    reject_next_completion_permanently = ref false;
     raise_next_completion = ref false;
     accept_then_raise = ref false;
   }
+
+(** The only exception the fake source classifies as a retryable completion
+    failure. Every other exception is an uncertain acknowledgement. *)
+exception Transient_completion_exception
 
 (** Implements the typed supervisor contract over the fake lease ledger. *)
 module Fake_supervisor = struct
@@ -219,10 +229,13 @@ module Fake_supervisor = struct
     supervisor.attempts := completion :: !(supervisor.attempts);
     if !(supervisor.raise_next_completion) then begin
       supervisor.raise_next_completion := false;
-      raise (Failure "injected completion exception")
+      raise Transient_completion_exception
     end else if !(supervisor.reject_next_completion) then begin
       supervisor.reject_next_completion := false;
       Error { code = "temporarily_unavailable"; message = "completion transport unavailable" }
+    end else if !(supervisor.reject_next_completion_permanently) then begin
+      supervisor.reject_next_completion_permanently := false;
+      Error { code = "core_rejected"; message = "completion rejected by Core" }
     end else if Hashtbl.mem supervisor.leased completion.run_id then begin
       Hashtbl.remove supervisor.leased completion.run_id;
       supervisor.completions := completion :: !(supervisor.completions);
@@ -239,6 +252,15 @@ module Fake_supervisor = struct
 
   (** Exposes the stable source diagnostic required by the adapter signature. *)
   let error_message error = error.message
+
+  (** Only the injected transient rejection proves the lease is still
+      outstanding; stale leases and permanent rejections fail closed. *)
+  let error_is_retryable error = String.equal error.code "temporarily_unavailable"
+
+  (** Only the dedicated transient exception authorizes a retry. *)
+  let exception_is_retryable = function
+    | Transient_completion_exception -> true
+    | _ -> false
 end
 
 (** The test worker instantiates the production functor with the deterministic
@@ -2774,7 +2796,62 @@ let test_accepted_completion_exception_never_reexecutes () =
   if !calls <> 1 || Queue.length supervisor.queue <> 1 ||
       List.length !(supervisor.completions) <> 1 || latest_attempt supervisor <> retained then
     failwith "uncertain acknowledgement reran code or replaced the command";
+  (* Issue #843: the lost acknowledgement is not retryable, so neither the
+     second poll nor a shutdown drain may submit the completion again. *)
+  begin match Worker.drain worker with
+  | Error { code = "completion_failed"; _ } -> ()
+  | _ -> failwith "drain hid an uncertain workflow acknowledgement"
+  end;
+  if List.length !(supervisor.attempts) <> 1 then
+    failwith "uncertain acknowledgement was resubmitted";
   Worker.discard worker
+
+(** A typed completion rejection that the source does not classify as
+    retryable is fail-closed (issue #843). The exact completion stays owned by
+    the adapter and keeps blocking the run, but no later poll or drain submits
+    it again; only terminal [discard] releases it. *)
+let test_non_retryable_completion_is_never_resubmitted () =
+  let calls = ref 0 in
+  let definition =
+    Temporal.Workflow.define ~name:"fail-closed-completion"
+      ~input:Temporal.Codec.unit ~output:Temporal.Codec.unit (fun () ->
+        incr calls;
+        Ok ())
+  in
+  let supervisor = fake_supervisor () in
+  let run_id = "fail-closed-run" in
+  let worker = worker supervisor [ Adapter.register definition ] in
+  enqueue supervisor
+    (activation ~run_id [ initialize ~run_id ~workflow_type:"fail-closed-completion" ]);
+  supervisor.reject_next_completion_permanently := true;
+  (* Matches the fail-closed error and returns it for later comparison. *)
+  let expect_refusal context (result : (_, Adapter.error_view) result) =
+    match result with
+    | Error ({ code = "completion_failed"; _ } as error) -> error
+    | Error error ->
+        failwith (Printf.sprintf "%s returned the wrong error: %s" context error.code)
+    | Ok _ -> failwith (context ^ " acknowledged a refused completion")
+  in
+  let first = expect_refusal "poll" (Worker.poll worker) in
+  let retained = latest_attempt supervisor in
+  (* Another run's activation must not be polled past the retained completion. *)
+  enqueue supervisor
+    (activation ~run_id:"fail-closed-next"
+       [ initialize ~run_id:"fail-closed-next" ~workflow_type:"fail-closed-completion" ]);
+  let again = expect_refusal "second poll" (Worker.poll worker) in
+  let drained = expect_refusal "drain" (Worker.drain worker) in
+  if again <> first || drained <> first then
+    failwith "fail-closed refusal changed its recorded diagnostic";
+  if List.length !(supervisor.attempts) <> 1 || latest_attempt supervisor <> retained then
+    failwith "non-retryable workflow completion was resubmitted";
+  if !calls <> 1 || Queue.length supervisor.queue <> 1 then
+    failwith "fail-closed completion allowed further workflow execution";
+  if Hashtbl.length supervisor.leased <> 1 then
+    failwith "fake lease changed although nothing was resubmitted";
+  Worker.discard worker;
+  match Worker.drain worker with
+  | Ok () -> ()
+  | Error error -> failwith ("discard left a retained completion: " ^ error.code)
 
 (** An accepted update may mutate state and buffer commands before raising.
     Neither those commands nor its speculative acceptance may reach history;
@@ -2912,6 +2989,7 @@ let test_terminated_child_recovery () =
 let () =
   test_terminated_child_recovery ();
   test_accepted_completion_exception_never_reexecutes ();
+  test_non_retryable_completion_is_never_resubmitted ();
   test_defect_discards_commands_and_reconstructs ();
   test_output_encoder_failure_is_task_failure ();
   test_deliberate_application_failure_remains_terminal ();

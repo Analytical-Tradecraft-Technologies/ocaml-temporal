@@ -138,14 +138,18 @@ module Make (Supervisor : SUPERVISOR) : sig
       or user implementation runs during creation. *)
 
   val poll : t -> (outcome, error_view) result
-  (** Polls at most one task. A pending completion from an earlier native
-      rejection is retried before polling a new task, so an activity is never
-      executed twice merely because its completion transport was unavailable.
-      [Ok Not_ready] means the native poll had no ready task. A retryable
-      [Error] retains the exact completion and can be retried by the worker
-      loop; a non-retryable [Error] is fatal for this worker instance. *)
+  (** Polls at most one task. A pending completion blocks new tasks, so an
+      activity is never executed twice merely because its completion transport
+      was unavailable. It is resubmitted only when its earlier failure was
+      explicitly retryable; otherwise its recorded error is returned again
+      without a native call (issue #843). [Ok Not_ready] means the native poll
+      had no ready task. A retryable [Error] retains the exact completion and
+      can be retried by the worker loop; a non-retryable [Error] is fatal for
+      this worker instance. *)
 
-  (** Retries every retained completion while the adapter mutex is held. [Ok ()]
+  (** Retries retained completions whose earlier failure was explicitly
+      retryable while the adapter mutex is held; a fail-closed completion is
+      never resubmitted and its recorded error is returned instead. [Ok ()]
       proves that no opaque activity lease remains in this adapter. [Error _]
       leaves the exact completion retained. The caller must either retry it
       after an explicitly safe transient classification or force-retire the

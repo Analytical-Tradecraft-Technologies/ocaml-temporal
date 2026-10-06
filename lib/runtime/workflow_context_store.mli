@@ -289,9 +289,14 @@ val resolve_activity :
   (unit, Temporal_base.Error.t) result
 
 (** Retains a pending local activity while scheduling the workflow timer Core
-    requested for a long retry backoff. The next timer activation re-emits the
-    same activity sequence with the supplied attempt and original schedule
-    timestamp; terminal resolution remains responsible for completing the
+    requested for a long retry backoff. The job is validated immediately, but
+    the timer's sequence allocation and [Start_timer] command are queued on the
+    execution scheduler, so they follow commands from fibers woken by earlier
+    jobs of the same activation; this keeps command order identical when Core
+    merges live activations on replay. When the timer fires, queued work
+    likewise re-emits the same activity sequence with the supplied attempt and
+    original schedule timestamp. Callers must run the scheduler to observe
+    either command. Terminal resolution remains responsible for completing the
     activity future. *)
 val resolve_local_activity_backoff :
   t ->
