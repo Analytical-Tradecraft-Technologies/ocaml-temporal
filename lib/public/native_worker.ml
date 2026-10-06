@@ -814,8 +814,8 @@ let create ?max_cached_workflows ?(versioning = Bridge.No_versioning) ~target_ur
       |> Result.map_error (public_native_error "worker startup")
     in
     let* workflows =
-      Workflow.create ?on_activation ?on_completion ~task_queue ~supervisor
-        ~workflows ()
+      Workflow.create ?on_activation ?on_completion ~task_queue ~namespace
+        ~supervisor ~workflows ()
       |> Result.map_error (public_adapter_error "workflow registration")
     in
     let* activities =

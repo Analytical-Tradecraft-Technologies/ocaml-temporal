@@ -156,6 +156,10 @@ module Info : sig
   (** Returns the registered workflow type name. *)
   val workflow_type : t -> string
 
+  (** Returns the Temporal namespace of this run, which is the namespace of
+      the worker executing it. *)
+  val namespace : t -> string
+
   (** Returns the worker task queue that delivers this run's workflow tasks. *)
   val task_queue : t -> string
 

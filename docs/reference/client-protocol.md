@@ -392,7 +392,17 @@ OCaml validates the signal name when `Temporal.Signal.define` constructs the
 definition and encodes the input before transport. Rust validates the exact
 identifiers, request ID, signal name, payload conversions, and closed JSON
 shape again before constructing Temporal's official
-`SignalWorkflowExecutionRequest` protobuf. The connected client's identity is
+`SignalWorkflowExecutionRequest` protobuf.
+
+Signal, query, and update requests use the same payload-aware decoder as
+workflow start input. Each decoded payload byte field may hold up to 128 MiB
+within the 192 MiB whole-document limit described in
+[the Core protocol limits](core-protocol.md), while identifiers, handler names,
+and payload metadata keys keep the 65,536-byte text limit. Rust enforces both
+bounds before the connection lookup, so an oversized request fails as a
+protocol error without issuing an RPC. Temporal Server's own blob-size limits,
+which are usually much smaller and namespace-configurable, still apply to
+requests the bridge accepts. The connected client's identity is
 used for the RPC; callers cannot provide a second identity or redirect the
 request to another namespace.
 

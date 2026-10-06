@@ -35,8 +35,8 @@ for those rules.
   selected for the current task, or `None` when no versioned task metadata is
   available; it is diagnostic metadata, not a replacement for replay-safe
   patching. `info ()` returns an abstract `Workflow.Info.t` with the run's
-  identity (workflow and run IDs, first run ID, type, task queue, attempt,
-  parent, start time) and the current activation's replay flag, history
+  identity (workflow and run IDs, first run ID, type, namespace, task queue,
+  attempt, parent, start time) and the current activation's replay flag, history
   length and size, and continue-as-new suggestion, all taken from Temporal's
   activations; `is_replaying ()` is the shorthand for replay-aware logging.
   `upsert_search_attributes` merges encoded values into the
@@ -62,11 +62,15 @@ for those rules.
   returns `Completed`, `Failed`, or `Will_complete_async`; after the handoff,
   `Async_handle` provides terminal `complete`, `fail`, and `cancel` operations
   plus non-terminal `heartbeat`, while `Async_context` is only used to obtain
-  that retained capability. The attempt-scoped `Context` instead supplies
+  that retained capability and, through `Async_context.info`, the same
+  `Activity.Info.t` that a synchronous callback reads. The attempt-scoped
+  `Context` instead supplies
   copied heartbeat details and timeout metadata for callbacks that complete
   during dispatch, and `Context.info` returns an abstract `Activity.Info.t`
   with the namespace, scheduling workflow, activity ID and type, attempt,
-  local-activity flag, and Core-reported scheduling timestamps.
+  local-activity flag, Core-reported scheduling timestamps, and effective
+  schedule-to-close, start-to-close, and heartbeat timeouts (rounded up to
+  whole milliseconds).
 - `Temporal.Child_workflow` schedules a child workflow and exposes its typed
   future. Use its operation handle when the parent must cancel one exact child;
   child retry and cancellation policies are passed to the durable command; see
