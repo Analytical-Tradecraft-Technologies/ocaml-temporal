@@ -12,13 +12,22 @@ and bridge, read the [documentation guide](../README.md) first.
 - One execution owns one scheduler, command sequence, pending-operation set,
   and continuation set.
 - A workflow operation can access its context only while that execution's
-  activation is running on the current domain.
+  activation is running on the current system thread. The current context,
+  the scheduler owner id, and the read-only query marker are dynamic
+  bindings keyed by Domain and `Thread.id` (`Thread_binding`), not plain
+  Domain-local storage: workers hosted on sibling system threads of one Domain
+  may interleave activations and must never observe, overwrite, or restore
+  each other's binding. A thread spawned inside an activation starts with no
+  workflow installed. Each binding is removed when its extent ends, including
+  by an exception, so an idle Domain holds no entries;
+  `test/runtime/test_thread_context_isolation.ml` forces two interleaved
+  activations on one Domain and checks isolation and cleanup (#765).
 - An inline query temporarily installs its owning execution context only for
   its synchronous handler, letting it inspect workflow-local state without
   running scheduler fibers. Query dispatch disables deterministic randomness,
   and the dynamic context binding is restored before its response is emitted.
   The query may read its own live `Temporal.Scope.is_cancelled` and `check`
-  results through a separate Domain-local read marker. It cannot cancel the
+  results through a separate thread-local read marker. It cannot cancel the
   scope, await a future, read another execution's scope, or use a scope after
   shutdown.
 - Futures from different schedulers cannot be combined.

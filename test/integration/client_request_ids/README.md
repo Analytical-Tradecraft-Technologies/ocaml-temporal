@@ -12,3 +12,7 @@ conflicting starts from two native clients, signals and updates from separate
 client processes, and intentional deduplication of explicitly supplied IDs.
 It terminates all created workflows, including after an assertion failure.
 Use a test server with the `default` namespace; no other services are required.
+
+CI runs this suite against the Compose Temporal/PostgreSQL stack through
+`make test-temporal-live-regressions`, which `make test-temporal-live-ci`
+invokes. That target supplies the `default` namespace.

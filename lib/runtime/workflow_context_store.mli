@@ -62,10 +62,11 @@ val validate_task_queue : string -> (unit, string) result
     so the worker adapter can reject it as typed configuration. *)
 val validate_namespace : string -> (unit, string) result
 
-(** Returns the context installed on the current OCaml Domain, if any. *)
+(** Returns the context installed for the calling system thread, if any.
+    Sibling threads of one Domain never observe each other's context. *)
 val current : unit -> t option
 
-(** True only while a synchronous read-only query on this Domain inspects the
+(** True only while a synchronous read-only query on this thread inspects the
     live execution whose scheduler has [owner_id]. Does not grant scheduler
     ownership or permission to mutate workflow state. *)
 val query_read_owner_matches : int -> bool
@@ -189,19 +190,25 @@ val with_randomness_disabled : t -> (unit -> 'value) -> 'value
 val upsert_search_attributes :
    t -> (string * Temporal_base.Codec.payload) list -> unit
 
-(** Runs [action] with [t] dynamically installed and restores the previous
+(** Runs [action] with [t] installed for the calling system thread and restores the previous
     context even if [action] raises. Nested calls are supported. *)
 val with_context : t -> (unit -> 'value) -> 'value
 
 (** Installs [t] for one synchronous query callback and permits owner-checked
     scope status reads while disabling deterministic randomness. Restores the
-    previous Domain-local bindings even if the callback raises. *)
+    previous thread-local bindings even if the callback raises. *)
 val with_read_only_query : t -> (unit -> 'value) -> 'value
 
 (** Runs [action] with no workflow context installed and restores the previous
     context afterward. Infrastructure callbacks that must not re-enter
     deterministic workflow state use this boundary. *)
 val without_context : (unit -> 'value) -> 'value
+
+(** Sum of the threads on the calling Domain that hold a current-context
+    binding and those that hold a read-only query marker. It is zero whenever
+    no [with_context], [with_read_only_query], or [without_context] extent is
+    active on the Domain; tests use it to detect leaked bindings. *)
+val bound_thread_count : unit -> int
 
 (** Creates an already-resolved future owned by the context scheduler. *)
 val resolved :

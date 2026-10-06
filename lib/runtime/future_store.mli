@@ -66,15 +66,21 @@ val callback_liveness : ('value, 'error) t -> (unit -> bool)
 (** Reports whether callbacks queued for the future's owner may still run. *)
 val callbacks_live : ('value, 'error) t -> bool
 
-(** Runs [action] with [id] published as the Domain-local current scheduler
-    owner. The scheduler installs this around each fiber so [await] can reject
-    foreign-owner futures even when another scheduler is running elsewhere. *)
+(** Runs [action] with [id] published as the current scheduler owner of the
+    calling system thread. The scheduler installs this around each drain so
+    [await] can reject foreign-owner futures even when another scheduler is
+    running elsewhere, including on a sibling thread of the same Domain. *)
 val with_current_owner_id : int option -> (unit -> 'a) -> 'a
 
-(** Reports whether this Domain is currently running scheduler [id]. Used by
-    derived public futures to reject outside await without mutating foreign
-    scheduler state. *)
+(** Reports whether the calling system thread is currently running scheduler
+    [id]. Used by derived public futures to reject outside await without
+    mutating foreign scheduler state. *)
 val current_owner_matches : int -> bool
+
+(** Number of system threads on the calling Domain that currently publish a
+    scheduler owner. Zero whenever no drain is running on the Domain; tests use
+    it to check that drains leave no stale binding. *)
+val bound_owner_count : unit -> int
 
 (** Queues [thunk] on the scheduler that owns [future]. The callback is never
     run inline for an active workflow, which keeps completion ordering

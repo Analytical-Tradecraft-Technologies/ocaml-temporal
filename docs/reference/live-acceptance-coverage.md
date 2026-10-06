@@ -47,7 +47,7 @@ All live controllers use a real Temporal Server and own fixture cleanup.
 | `test-temporal-parent-child-restart` | Exact parent and child histories, linkage, nonterminal prefixes after removal, both generation-two replay observations, then successful completion | [parent/child controller][parent-controller], [parent/child contract][parent-contract] |
 | `test-temporal-parent-child-failure-replay` | Both runs replay before the child fails non-retryably; child and parent failure events retain exact linkage; parent returns `SMOKE:PARENT:CHILD:FAILURE_RECOVERED` | [failure controller][failure-controller], [failure contract][failure-contract], [definitions][definitions] |
 
-Two live controllers were added to the Build workflow after the audited
+Three live controllers were added to the Build workflow after the audited
 baseline, so the successful runs above do not cover them. Their assertion
 boundaries are defined by their own references, and the
 [generated inventory](live-acceptance-inventory.md) tracks their membership:
@@ -56,6 +56,7 @@ boundaries are defined by their own references, and the
 | --- | --- | --- |
 | `test-temporal-start-metadata-live` | Five exact active runs carry memo, search-attribute, combined, continued and official-CLI start metadata; workflow snapshots match before and after worker replacement | [start metadata](workflow-start-metadata.md) |
 | `test-temporal-task-failure-live` | Body, encoder and missing-registration defects leave exact runs with durable workflow-task failures; a corrected worker replays and completes them, and typed business failures keep their retryability flags | [workflow failures](workflow-failures.md) |
+| `test-temporal-live-regressions` | Each fixed-bug regression executable in `LIVE_REGRESSION_EXECUTABLES` runs once, bounded, against a fresh stack: client request IDs (#545), update admission outcomes (#546), completed-workflow queries (#548), local activity retry cancellation (#567) and split workflow/activity workers (#805). The run fails if any suite fails; a Docker-free contract requires every `test/integration/*/regression.exe` to be in the smoke artifact and run by CI (#795) | Each suite's `README.md` or module comment under `test/integration/` |
 
 The [child-failure acceptance reference](child-failure-replay-acceptance.md)
 records the original PR #361 evidence. Its status is live-tested, not pending a
