@@ -198,9 +198,10 @@ Clippy checks, Rust tests, bridge/install smoke tests, and the repository
 quality contract. `make quality` is a separate host-tool gate and requires the
 pinned `cargo-deny`, `cargo-machete`, and `typos` binaries. The license audit is
 intentionally separate from the OCaml-version matrix and runs in containers.
-If a local Docker VM has limited memory for native linkers, set
-`DUNE_JOBS=1` (or another small value) on build/lint targets; the variable is
-empty by default so CI keeps its normal parallelism.
+Make passes `DUNE_JOBS` to every Dune build, test, and `dune exec` it runs.
+It defaults to 2 locally so concurrent native links fit a default Docker VM, and
+to Dune's automatic count when `CI` is set; use `DUNE_JOBS=1` on a smaller VM
+or `DUNE_JOBS=auto` to restore Dune's default (#851).
 For the real server smoke, the Makefile owns Compose project selection,
 readiness checks, failure logs, and volume cleanup; do not run the fixture's
 Compose file from the repository root.
