@@ -3,11 +3,11 @@ use std::time::{Duration, Instant};
 
 use ocaml_temporal_core_bridge::{
     Result as AbiResult, STATUS_NOT_READY, STATUS_OK,
-    ocaml_temporal_core_v2_replay_worker_feed_history_json,
-    ocaml_temporal_core_v2_replay_worker_start_json,
-    ocaml_temporal_core_v2_replay_worker_try_poll_workflow,
-    ocaml_temporal_core_v2_replay_worker_wait_workflow, ocaml_temporal_core_v2_result_free,
-    ocaml_temporal_core_v2_runtime_dispose, ocaml_temporal_core_v2_runtime_new,
+    ocaml_temporal_core_v3_replay_worker_feed_history_json,
+    ocaml_temporal_core_v3_replay_worker_start_json,
+    ocaml_temporal_core_v3_replay_worker_try_poll_workflow,
+    ocaml_temporal_core_v3_replay_worker_wait_workflow, ocaml_temporal_core_v3_result_free,
+    ocaml_temporal_core_v3_runtime_dispose, ocaml_temporal_core_v3_runtime_new,
     test_runtime_cleanup_counts,
 };
 
@@ -43,15 +43,15 @@ fn asynchronous_disposal_completes_without_leaking_core() {
     let mut result = AbiResult::default();
 
     assert_eq!(
-        unsafe { ocaml_temporal_core_v2_runtime_new(&mut runtime, &mut result) },
+        unsafe { ocaml_temporal_core_v3_runtime_new(&mut runtime, &mut result) },
         STATUS_OK
     );
     assert_eq!(
-        unsafe { ocaml_temporal_core_v2_result_free(&mut result) },
+        unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
         STATUS_OK
     );
     assert_eq!(
-        unsafe { ocaml_temporal_core_v2_runtime_dispose(&mut runtime) },
+        unsafe { ocaml_temporal_core_v3_runtime_dispose(&mut runtime) },
         STATUS_OK
     );
     assert!(runtime.is_null());
@@ -65,17 +65,17 @@ fn asynchronous_disposal_completes_without_leaking_core() {
     let mut replay_runtime = ptr::null_mut();
     let mut result = AbiResult::default();
     assert_eq!(
-        unsafe { ocaml_temporal_core_v2_runtime_new(&mut replay_runtime, &mut result) },
+        unsafe { ocaml_temporal_core_v3_runtime_new(&mut replay_runtime, &mut result) },
         STATUS_OK
     );
     assert_eq!(
-        unsafe { ocaml_temporal_core_v2_result_free(&mut result) },
+        unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
         STATUS_OK
     );
     let config = br#"{"namespace":"default","task_queue":"replay","build_id":"cleanup-test","versioning":{"kind":"none"},"max_cached_workflows":0,"max_outstanding_workflow_tasks":1,"max_concurrent_workflow_task_polls":1,"graceful_shutdown_timeout_ms":1000}"#;
     assert_eq!(
         unsafe {
-            ocaml_temporal_core_v2_replay_worker_start_json(
+            ocaml_temporal_core_v3_replay_worker_start_json(
                 replay_runtime,
                 config.as_ptr(),
                 config.len(),
@@ -85,13 +85,13 @@ fn asynchronous_disposal_completes_without_leaking_core() {
         STATUS_OK
     );
     assert_eq!(
-        unsafe { ocaml_temporal_core_v2_result_free(&mut result) },
+        unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
         STATUS_OK
     );
     let history = replay_fixture::complete_history_document("cleanup-replay");
     assert_eq!(
         unsafe {
-            ocaml_temporal_core_v2_replay_worker_feed_history_json(
+            ocaml_temporal_core_v3_replay_worker_feed_history_json(
                 replay_runtime,
                 history.as_ptr(),
                 history.len(),
@@ -101,21 +101,21 @@ fn asynchronous_disposal_completes_without_leaking_core() {
         STATUS_OK
     );
     assert_eq!(
-        unsafe { ocaml_temporal_core_v2_result_free(&mut result) },
+        unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
         STATUS_OK
     );
     let mut leased = false;
     for _ in 0..20 {
         let wait = unsafe {
-            ocaml_temporal_core_v2_replay_worker_wait_workflow(replay_runtime, &mut result)
+            ocaml_temporal_core_v3_replay_worker_wait_workflow(replay_runtime, &mut result)
         };
         assert!(wait == STATUS_OK || wait == STATUS_NOT_READY);
         assert_eq!(
-            unsafe { ocaml_temporal_core_v2_result_free(&mut result) },
+            unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
             STATUS_OK
         );
         let poll = unsafe {
-            ocaml_temporal_core_v2_replay_worker_try_poll_workflow(replay_runtime, &mut result)
+            ocaml_temporal_core_v3_replay_worker_try_poll_workflow(replay_runtime, &mut result)
         };
         assert!(poll == STATUS_OK || poll == STATUS_NOT_READY);
         if poll == STATUS_OK {
@@ -123,7 +123,7 @@ fn asynchronous_disposal_completes_without_leaking_core() {
             leased = true;
         }
         assert_eq!(
-            unsafe { ocaml_temporal_core_v2_result_free(&mut result) },
+            unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
             STATUS_OK
         );
         if leased {
@@ -132,7 +132,7 @@ fn asynchronous_disposal_completes_without_leaking_core() {
     }
     assert!(leased, "replay activation was not leased before disposal");
     assert_eq!(
-        unsafe { ocaml_temporal_core_v2_runtime_dispose(&mut replay_runtime) },
+        unsafe { ocaml_temporal_core_v3_runtime_dispose(&mut replay_runtime) },
         STATUS_OK
     );
     assert!(replay_runtime.is_null());

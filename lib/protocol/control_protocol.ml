@@ -56,10 +56,14 @@ let error_view (error : error) : error_view =
 (** Sequences fallible validation without exceptions. *)
 let ( let* ) = Result.bind
 
-(** Checks every byte using OCaml's UTF-8 decoder. *)
+(** Checks every byte using OCaml's UTF-8 decoder. ASCII bytes, which make up
+    every canonical base64 payload string, take a single-comparison fast path
+    so a multi-megabyte payload is not decoded one scalar value at a time. *)
 let valid_utf_8 value =
+  let length = String.length value in
   let rec loop offset =
-    if offset = String.length value then true
+    if offset = length then true
+    else if Char.code (String.get value offset) < 0x80 then loop (offset + 1)
     else
       let decoded = String.get_utf_8_uchar value offset in
       Uchar.utf_decode_is_valid decoded
@@ -79,40 +83,41 @@ let check_compatibility actual =
        }
         : error)
 
-(** Scans raw text to reject byte and depth attacks before recursive parsing. *)
+(** Scans raw text to reject byte and depth attacks before recursive parsing.
+
+    The scan is a pair of mutually tail-recursive loops over the raw bytes, so
+    it allocates nothing and stops at the first violation. [string_limit]
+    counts the unescaped source bytes of each JSON string: a backslash and the
+    byte it escapes are not counted, matching the Rust bridge's preflight
+    byte-for-byte. An unterminated string or unbalanced bracket is left for the
+    full parser to reject. *)
 let preflight ?(string_limit = max_string_bytes) input =
-  if String.length input > max_document_bytes then
+  let length = String.length input in
+  let rec outside index depth =
+    if index = length then Ok ()
+    else
+      match String.get input index with
+      | '"' -> inside (index + 1) depth 0
+      | '{' | '[' ->
+          if depth + 1 > max_depth then
+            Error (invalid "JSON nesting limit exceeded")
+          else outside (index + 1) (depth + 1)
+      | '}' | ']' -> outside (index + 1) (max 0 (depth - 1))
+      | _ -> outside (index + 1) depth
+  and inside index depth string_bytes =
+    if index >= length then Ok ()
+    else
+      match String.get input index with
+      | '\\' -> inside (index + 2) depth string_bytes
+      | '"' -> outside (index + 1) depth
+      | _ ->
+          if string_bytes + 1 > string_limit then
+            Error (invalid "JSON string byte limit exceeded")
+          else inside (index + 1) depth (string_bytes + 1)
+  in
+  if length > max_document_bytes then
     Error (invalid "document byte limit exceeded")
-  else
-    let depth = ref 0 in
-    let in_string = ref false in
-    let escaped = ref false in
-    let string_bytes = ref 0 in
-    let failure = ref None in
-    String.iter
-      (fun character ->
-        if Option.is_none !failure then
-          if !in_string then
-            if !escaped then escaped := false
-            else if Char.equal character '\\' then escaped := true
-            else if Char.equal character '"' then in_string := false
-            else (
-              incr string_bytes;
-              if !string_bytes > string_limit then
-                failure := Some (invalid "JSON string byte limit exceeded"))
-          else
-            match character with
-            | '"' ->
-                in_string := true;
-                string_bytes := 0
-            | '{' | '[' ->
-                incr depth;
-                if !depth > max_depth then
-                  failure := Some (invalid "JSON nesting limit exceeded")
-            | '}' | ']' -> depth := max 0 (!depth - 1)
-            | _ -> ())
-      input;
-    match !failure with Some error -> Error error | None -> Ok ()
+  else outside 0 0
 
 (** Validates a parsed JSON tree, including duplicate keys and finite limits. *)
 let validate_json ?(depth = 1) ?(string_limit = max_string_bytes) value =
@@ -437,17 +442,26 @@ let decode_payload_object input =
     | _ -> Error (invalid "operation body must be a JSON object")
   with _ -> Error (invalid "invalid strict JSON document")
 
-(** Normalizes and reparses a semantic object containing payload wrappers. *)
+(** Validates, normalizes, and serializes a semantic object containing payload
+    wrappers.
+
+    The checks are the ones a receiver applies to these bytes, run without a
+    second parse: [validate_json] applies the tree rules of [parse_strict]
+    (duplicate keys, UTF-8, integer range, depth, node and string limits) to the
+    outgoing tree, and [preflight] applies the raw-text rules (document size,
+    raw nesting, and escaped string length) to the exact serialized bytes, as
+    the Rust bridge does before it parses them. Earlier versions also reparsed,
+    renormalized, and reserialized the output to compare it with itself; that
+    only re-tested Yojson's printer against its own parser and cost several
+    passes over every payload byte (#846). *)
 let encode_payload_object value =
   try
     match value with
     | `Assoc _ ->
         let* () = validate_json ~string_limit:max_payload_base64_bytes value in
         let output = Yojson.Safe.to_string (normalize_json value) in
-        let* reparsed = decode_payload_object output in
-        if String.equal (Yojson.Safe.to_string (normalize_json reparsed)) output
-        then Ok output
-        else Error (invalid "outgoing object did not round trip")
+        let* () = preflight ~string_limit:max_payload_base64_bytes output in
+        Ok output
     | _ -> Error (invalid "operation body must be a JSON object")
   with _ -> Error (invalid "could not encode outgoing object")
 
@@ -455,50 +469,78 @@ let encode_payload_object value =
 let base64_alphabet =
   "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
 
-(** Encodes bytes with canonical padded RFC 4648 base64. *)
+(** Encodes bytes with canonical padded RFC 4648 base64.
+
+    Whole three-byte groups are encoded in one loop; the one- or two-byte tail
+    and its padding are written separately so the hot loop carries no
+    per-group length tests. Every alphabet index is masked to six bits. *)
 let base64_encode bytes =
   let length = Bytes.length bytes in
   let output = Bytes.make ((length + 2) / 3 * 4) '=' in
-  let rec loop input_offset output_offset =
-    if input_offset < length then (
+  (* Indexes are masked to six bits, so the alphabet lookup is in bounds. *)
+  let symbol index = String.unsafe_get base64_alphabet (index land 63) in
+  let groups = length / 3 in
+  (* [group < length / 3] gives [input_offset + 2 < length] and
+     [output_offset + 3 < (length + 2) / 3 * 4], so the unchecked accesses in
+     this hot loop stay inside both buffers. *)
+  for group = 0 to groups - 1 do
+    let input_offset = group * 3 in
+    let output_offset = group * 4 in
+    let first = Char.code (Bytes.unsafe_get bytes input_offset) in
+    let second = Char.code (Bytes.unsafe_get bytes (input_offset + 1)) in
+    let third = Char.code (Bytes.unsafe_get bytes (input_offset + 2)) in
+    Bytes.unsafe_set output output_offset (symbol (first lsr 2));
+    Bytes.unsafe_set output (output_offset + 1)
+      (symbol ((first lsl 4) lor (second lsr 4)));
+    Bytes.unsafe_set output (output_offset + 2)
+      (symbol ((second lsl 2) lor (third lsr 6)));
+    Bytes.unsafe_set output (output_offset + 3) (symbol third)
+  done;
+  let input_offset = groups * 3 in
+  let output_offset = groups * 4 in
+  (match length - input_offset with
+  | 1 ->
       let first = Char.code (Bytes.get bytes input_offset) in
-      let second =
-        if input_offset + 1 < length then
-          Char.code (Bytes.get bytes (input_offset + 1))
-        else 0
-      in
-      let third =
-        if input_offset + 2 < length then
-          Char.code (Bytes.get bytes (input_offset + 2))
-        else 0
-      in
-      Bytes.set output output_offset base64_alphabet.[first lsr 2];
+      Bytes.set output output_offset (symbol (first lsr 2));
+      Bytes.set output (output_offset + 1) (symbol (first lsl 4))
+  | 2 ->
+      let first = Char.code (Bytes.get bytes input_offset) in
+      let second = Char.code (Bytes.get bytes (input_offset + 1)) in
+      Bytes.set output output_offset (symbol (first lsr 2));
       Bytes.set output (output_offset + 1)
-        base64_alphabet.[((first land 3) lsl 4) lor (second lsr 4)];
-      if input_offset + 1 < length then
-        Bytes.set output (output_offset + 2)
-          base64_alphabet.[((second land 15) lsl 2) lor (third lsr 6)];
-      if input_offset + 2 < length then
-        Bytes.set output (output_offset + 3) base64_alphabet.[third land 63];
-      loop (input_offset + 3) (output_offset + 4))
-  in
-  loop 0 0;
+        (symbol ((first lsl 4) lor (second lsr 4)));
+      Bytes.set output (output_offset + 2) (symbol (second lsl 2))
+  | _ -> ());
   Bytes.unsafe_to_string output
 
-(** Maps one base64 alphabet byte to its six-bit value. *)
-let base64_value = function
-  | 'A' .. 'Z' as value -> Some (Char.code value - Char.code 'A')
-  | 'a' .. 'z' as value -> Some (Char.code value - Char.code 'a' + 26)
-  | '0' .. '9' as value -> Some (Char.code value - Char.code '0' + 52)
-  | '+' -> Some 62
-  | '/' -> Some 63
-  | _ -> None
+(** Maps every byte to its six-bit base64 value, or to [0xff] for a byte
+    outside the alphabet. [0xff] has bit 7 set, which no six-bit value has, so
+    one OR across a group detects any invalid symbol. The padding byte ['=']
+    is invalid here; [base64_decode] admits it only at the end of the input. *)
+let base64_decode_table =
+  let table = Bytes.make 256 '\xff' in
+  String.iteri
+    (fun value symbol -> Bytes.set table (Char.code symbol) (Char.chr value))
+    base64_alphabet;
+  Bytes.unsafe_to_string table
 
-(** Decodes base64 only when padding and re-encoding prove canonical form. *)
+(** Decodes canonical padded base64 in one pass, directly into a buffer of the
+    exact decoded size.
+
+    Canonical means exactly what [base64_encode] produces: a multiple of four
+    symbols, only alphabet bytes before the padding, one or two ['='] only at
+    the end, and zero bits in the unused low bits of the last symbol. Those
+    conditions are checked directly instead of by re-encoding the result; they
+    accept precisely the strings [base64_encode] can emit, so every payload has
+    one wire spelling. The encoded and decoded size limits are checked before
+    the output buffer is allocated. Errors never include input bytes. *)
 let base64_decode data =
-  let length = String.length data in
-  if length mod 4 <> 0 || length > (max_payload_bytes + 2) / 3 * 4 then
+  let not_canonical () =
     Error (invalid ~path:"$.data" "payload is not canonical padded base64")
+  in
+  let length = String.length data in
+  if length mod 4 <> 0 || length > max_payload_base64_bytes then
+    not_canonical ()
   else
     let padding =
       if length = 0 then 0
@@ -515,38 +557,115 @@ let base64_decode data =
       Error (invalid ~path:"$.data" "decoded payload limit exceeded")
     else
       let output = Bytes.create decoded_length in
-      let rec loop input_offset output_offset =
-        if input_offset = length then Ok output
-        else
-          let character index =
-            if index >= length - padding then Some 0
-            else base64_value data.[index]
-          in
-          match
-            ( character input_offset,
-              character (input_offset + 1),
-              character (input_offset + 2),
-              character (input_offset + 3) )
-          with
-          | Some first, Some second, Some third, Some fourth ->
-              if output_offset < decoded_length then
-                Bytes.set output output_offset
-                  (Char.chr ((first lsl 2) lor (second lsr 4)));
-              if output_offset + 1 < decoded_length then
-                Bytes.set output (output_offset + 1)
-                  (Char.chr (((second land 15) lsl 4) lor (third lsr 2)));
-              if output_offset + 2 < decoded_length then
-                Bytes.set output (output_offset + 2)
-                  (Char.chr (((third land 3) lsl 6) lor fourth));
-              loop (input_offset + 4) (output_offset + 3)
-          | _ ->
-              Error
-                (invalid ~path:"$.data" "payload is not canonical padded base64")
+      let value index =
+        Char.code (String.get base64_decode_table (Char.code data.[index]))
       in
-      let* bytes = loop 0 0 in
-      if String.equal (base64_encode bytes) data then Ok bytes
-      else
-        Error (invalid ~path:"$.data" "payload is not canonical padded base64")
+      (* Stores the high [count] bytes of the padded last group, with bounds
+         checks; it runs at most once per payload. *)
+      let store output_offset count first second third =
+        let bits = (first lsl 18) lor (second lsl 12) lor (third lsl 6) in
+        Bytes.set output output_offset (Char.unsafe_chr (bits lsr 16));
+        if count > 1 then
+          Bytes.set output (output_offset + 1)
+            (Char.unsafe_chr ((bits lsr 8) land 0xff))
+      in
+      (* Every group except a padded last one decodes to three bytes. This
+         loop carries nearly all payload bytes, so it is written out without
+         helper calls. Its unchecked accesses are in bounds by construction:
+         [group < full_groups <= length / 4] gives
+         [input_offset + 3 < length] and
+         [output_offset + 2 < full_groups * 3 <= decoded_length]; the table
+         index is a [Char.code], always below the table's 256 bytes. *)
+      let full_groups = if padding = 0 then length / 4 else (length / 4) - 1 in
+      let symbol index =
+        Char.code
+          (String.unsafe_get base64_decode_table
+             (Char.code (String.unsafe_get data index)))
+      in
+      let rec groups group =
+        if group = full_groups then true
+        else
+          let input_offset = group * 4 in
+          let first = symbol input_offset in
+          let second = symbol (input_offset + 1) in
+          let third = symbol (input_offset + 2) in
+          let fourth = symbol (input_offset + 3) in
+          if (first lor second lor third lor fourth) land 0x80 <> 0 then false
+          else
+            let bits =
+              (first lsl 18) lor (second lsl 12) lor (third lsl 6) lor fourth
+            in
+            let output_offset = group * 3 in
+            Bytes.unsafe_set output output_offset (Char.unsafe_chr (bits lsr 16));
+            Bytes.unsafe_set output (output_offset + 1)
+              (Char.unsafe_chr ((bits lsr 8) land 0xff));
+            Bytes.unsafe_set output (output_offset + 2)
+              (Char.unsafe_chr (bits land 0xff));
+            groups (group + 1)
+      in
+      (* A padded last group must also leave its unused low bits zero: two
+         bits of the third symbol for one ['='], four bits of the second for
+         two. Nonzero bits would give the same bytes a second spelling. *)
+      let last_group () =
+        let input_offset = full_groups * 4 in
+        let output_offset = full_groups * 3 in
+        match padding with
+        | 1 ->
+            let first = value input_offset in
+            let second = value (input_offset + 1) in
+            let third = value (input_offset + 2) in
+            if (first lor second lor third) land 0x80 <> 0 || third land 3 <> 0
+            then false
+            else (
+              store output_offset 2 first second third;
+              true)
+        | 2 ->
+            let first = value input_offset in
+            let second = value (input_offset + 1) in
+            if (first lor second) land 0x80 <> 0 || second land 15 <> 0 then
+              false
+            else (
+              store output_offset 1 first second 0;
+              true)
+        | _ -> true
+      in
+      if groups 0 && last_group () then Ok output else not_canonical ()
+
+(** Decodes an already-parsed closed payload wrapper without serializing it
+    again.
+
+    The wrapper must have exactly the members [encoding] and [data];
+    [encoding] must be ["base64"] and [data] canonical padded base64 within the
+    payload limits. These checks are complete on their own, so a wrapper built
+    in memory receives the same validation as one that came from
+    [parse_strict]. Errors carry no payload bytes. *)
+let decode_payload_json json =
+  let* entries = expect_object "$" json in
+  let* () = require_exact_fields "$" [ "encoding"; "data" ] entries in
+  let* encoding_json = field "$" "encoding" entries in
+  let* encoding = expect_string "$.encoding" encoding_json in
+  if not (String.equal encoding "base64") then
+    Error (invalid ~path:"$.encoding" "unsupported payload encoding")
+  else
+    (* [require_exact_fields] admits a repeated name, but both names being
+       present in a two-member object proves the members are distinct. *)
+    let* data_json = field "$" "data" entries in
+    let* data = expect_string "$.data" data_json in
+    base64_decode data
+
+(** Builds the canonical closed wrapper for opaque bytes. Base64 output is
+    ASCII from a fixed alphabet, so the wrapper needs no further JSON
+    validation. *)
+let payload_json bytes =
+  if Bytes.length bytes > max_payload_bytes then
+    Error (invalid ~path:"$.data" "decoded payload limit exceeded")
+  else
+    Ok
+      (`Assoc
+         [
+           ("encoding", `String "base64");
+           ("data", `String (base64_encode bytes));
+         ])
 
 (** Decodes a closed payload wrapper without exposing its data in errors.
     Parsing temporarily admits base64's larger encoded representation, then
@@ -555,33 +674,14 @@ let base64_decode data =
 let decode_payload input =
   try
     let* json = parse_strict ~string_limit:max_payload_base64_bytes input in
-    let* entries = expect_object "$" json in
-    let* () = require_exact_fields "$" [ "encoding"; "data" ] entries in
-    let* encoding_json = field "$" "encoding" entries in
-    let* encoding = expect_string "$.encoding" encoding_json in
-    if not (String.equal encoding "base64") then
-      Error (invalid ~path:"$.encoding" "unsupported payload encoding")
-    else
-      let* data_json = field "$" "data" entries in
-      let* data = expect_string "$.data" data_json in
-      base64_decode data
+    decode_payload_json json
   with _ -> Error (invalid "invalid strict payload document")
 
-(** Encodes opaque bytes and independently reparses the result. *)
+(** Encodes opaque bytes as one canonical payload wrapper document. The output
+    needs no reparse: [payload_json] only emits the two fixed members and an
+    ASCII base64 string. *)
 let encode_payload bytes =
   try
-    if Bytes.length bytes > max_payload_bytes then
-      Error (invalid ~path:"$.data" "decoded payload limit exceeded")
-    else
-      let output =
-        Yojson.Safe.to_string
-          (`Assoc
-             [
-               ("encoding", `String "base64");
-               ("data", `String (base64_encode bytes));
-             ])
-      in
-      let* decoded = decode_payload output in
-      if Bytes.equal decoded bytes then Ok output
-      else Error (invalid "outgoing payload did not round trip")
+    let* json = payload_json bytes in
+    Ok (Yojson.Safe.to_string json)
   with _ -> Error (invalid "could not encode outgoing payload")

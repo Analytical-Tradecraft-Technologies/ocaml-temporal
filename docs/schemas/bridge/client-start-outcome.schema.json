@@ -7,10 +7,14 @@
     {
       "type": "object",
       "additionalProperties": false,
-      "required": ["kind", "execution"],
+      "required": ["kind", "execution", "started"],
       "properties": {
         "kind": {"const": "accepted"},
-        "execution": {"$ref": "client-execution-ref.schema.json"}
+        "execution": {"$ref": "client-execution-ref.schema.json"},
+        "started": {
+          "type": "boolean",
+          "description": "False only when a use_existing start returned the open run created by another request."
+        }
       }
     },
     {

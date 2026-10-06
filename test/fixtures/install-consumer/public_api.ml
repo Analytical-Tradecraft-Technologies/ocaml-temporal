@@ -25,6 +25,7 @@ module Result_syntax = T.Result_syntax
 module Runtime_info = T.Runtime_info
 module Scope = T.Scope
 module Signal = T.Signal
+module Testing = T.Testing
 module Time = T.Time
 module Update = T.Update
 module Worker = T.Worker
@@ -618,12 +619,21 @@ let _client_start :
     ?request_id:string ->
     ?memo:(string * T.Payload.t) list ->
     ?search_attributes:(string * T.Payload.t) list ->
+    ?id_conflict_policy:T.Client.id_conflict_policy ->
     workflow:('input, 'output) T.Workflow.t ->
     task_queue:string ->
     id:string ->
     input:'input ->
     unit -> (('input, 'output) T.Client.handle, T.Error.t) result =
   T.Client.start
+
+(* The conflict policy is a closed polymorphic variant, so an exhaustive
+   match here breaks if a constructor is added or renamed. *)
+let _client_id_conflict_policy_name : T.Client.id_conflict_policy -> string =
+  function
+  | `Fail -> "fail"
+  | `Use_existing -> "use_existing"
+  | `Terminate_existing -> "terminate_existing"
 
 let _client_follow :
     T.Client.t ->
@@ -680,6 +690,9 @@ let _client_workflow_id :
   T.Client.workflow_id
 
 let _client_run_id : ('input, 'output) T.Client.handle -> string = T.Client.run_id
+let _client_started : ('input, 'output) T.Client.handle -> bool = T.Client.started
+let _client_already_started : T.Error.t -> T.Client.execution option =
+  T.Client.already_started
 let _client_is_at_capacity : T.Error.t -> bool = T.Client.is_at_capacity
 let _client_shutdown : T.Client.t -> (unit, T.Error.t) result = T.Client.shutdown
 
@@ -965,3 +978,98 @@ let _workflow_cancel_external_workflow :
 let _workflow_upsert_search_attributes :
     (string * T.Payload.t) list -> unit =
   T.Workflow.upsert_search_attributes
+
+(* In-process, time-skipping workflow test environment. *)
+let _testing_workflow :
+    ?signals:T.Signal.Handler.t list ->
+    ?queries:T.Query.Handler.t list ->
+    ?updates:T.Update.Handler.t list ->
+    ('input, 'output) T.Workflow.t -> T.Testing.registered_workflow =
+  T.Testing.workflow
+
+let _testing_mock_workflow :
+    ?signals:T.Signal.Handler.t list ->
+    ?queries:T.Query.Handler.t list ->
+    ?updates:T.Update.Handler.t list ->
+    ('input, 'output) T.Workflow.t ->
+    ('input -> ('output, T.Error.t) result) ->
+    T.Testing.registered_workflow =
+  T.Testing.mock_workflow
+
+let _testing_activity :
+    ('input, 'output) T.Activity.t -> T.Testing.registered_activity =
+  T.Testing.activity
+
+let _testing_mock_activity :
+    ('input, 'output) T.Activity.t ->
+    ('input -> ('output, T.Error.t) result) ->
+    T.Testing.registered_activity =
+  T.Testing.mock_activity
+
+let _testing_create :
+    ?namespace:string ->
+    ?task_queue:string ->
+    ?start_time:T.Time.t ->
+    ?max_activity_attempts:int ->
+    workflows:T.Testing.registered_workflow list ->
+    activities:T.Testing.registered_activity list ->
+    unit -> (T.Testing.t, T.Error.t) result =
+  T.Testing.create
+
+let _testing_shutdown : T.Testing.t -> unit = T.Testing.shutdown
+let _testing_now : T.Testing.t -> T.Time.t = T.Testing.now
+
+let _testing_skip : T.Testing.t -> T.Duration.t -> (unit, T.Error.t) result =
+  T.Testing.skip
+
+let _testing_start :
+    ?id:string ->
+    T.Testing.t ->
+    ('input, 'output) T.Workflow.t ->
+    'input -> (('input, 'output) T.Testing.handle, T.Error.t) result =
+  T.Testing.start
+
+let _testing_result :
+    ?timeout:T.Duration.t ->
+    ('input, 'output) T.Testing.handle -> ('output, T.Error.t) result =
+  T.Testing.result
+
+let _testing_execute :
+    ?id:string ->
+    ?timeout:T.Duration.t ->
+    T.Testing.t ->
+    ('input, 'output) T.Workflow.t -> 'input -> ('output, T.Error.t) result =
+  T.Testing.execute
+
+let _testing_signal :
+    ('input, 'output) T.Testing.handle ->
+    'signal T.Signal.t -> 'signal -> (unit, T.Error.t) result =
+  T.Testing.signal
+
+let _testing_query :
+    ('input, 'output) T.Testing.handle ->
+    'query T.Query.t -> ('query, T.Error.t) result =
+  T.Testing.query
+
+let _testing_query_with_input :
+    ('input, 'output) T.Testing.handle ->
+    ('query_input, 'query) T.Query.typed ->
+    'query_input -> ('query, T.Error.t) result =
+  T.Testing.query_with_input
+
+let _testing_update :
+    ?timeout:T.Duration.t ->
+    ('input, 'output) T.Testing.handle ->
+    ('update_input, 'update_output) T.Update.t ->
+    'update_input -> ('update_output, T.Error.t) result =
+  T.Testing.update
+
+let _testing_cancel :
+    ('input, 'output) T.Testing.handle -> (unit, T.Error.t) result =
+  T.Testing.cancel
+
+let _testing_workflow_id : ('input, 'output) T.Testing.handle -> string =
+  T.Testing.workflow_id
+
+let _testing_run_id : ('input, 'output) T.Testing.handle -> string =
+  T.Testing.run_id

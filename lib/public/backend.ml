@@ -33,12 +33,18 @@ type start_request = {
   input : Payload.t;
   memo : (string * Payload.t) list;
   search_attributes : (string * Payload.t) list;
+  (* What to do when [workflow_id] already has an open run; see
+     [Client.id_conflict_policy]. Part of the mock's request-ID fingerprint. *)
+  id_conflict_policy : [ `Fail | `Use_existing | `Terminate_existing ];
 }
 
-(** Server-issued workflow identity. *)
+(** The server-issued identity returned by a successful start. [started] is
+    [false] only when a [`Use_existing] start returned a run that another
+    request created; [run_id] then names that existing run. *)
 type start_response = {
   workflow_id : string;
   run_id : string;
+  started : bool;
 }
 
 (** Exact-run wait selector. *)
@@ -346,6 +352,7 @@ let equal_start_request (left : start_request) (right : start_request) =
     String.equal left_key right_key && equal_payload left_payload right_payload
   in
   left.request_id = right.request_id
+  && left.id_conflict_policy = right.id_conflict_policy
   && String.equal left.workflow_name right.workflow_name
   && String.equal left.workflow_id right.workflow_id
   && String.equal left.task_queue right.task_queue
@@ -426,22 +433,83 @@ let native_supervisor_error = function
           (Printf.sprintf "native client supervisor failed: %s"
              (Printexc.to_string exception_))
 
+(** The [Error.error_type] of the error returned when a [`Fail] start finds an
+    open run with the same workflow ID. It is Temporal's own failure name
+    ([WorkflowExecutionAlreadyStartedFailure] without the suffix, as the
+    official SDKs report it) and is part of the documented
+    [Client.already_started] contract. *)
+let already_started_error_type = "WorkflowExecutionAlreadyStarted"
+
+(** Metadata marking the single detail payload that carries the conflicting
+    execution's identity. The [encoding] entry follows Temporal's JSON payload
+    convention so other SDKs can read the detail if the error is forwarded as
+    a failure; the second entry distinguishes it from arbitrary JSON details
+    an application might attach to its own [`Workflow] errors. *)
+let already_started_detail_metadata =
+  [ ("encoding", "json/plain"); ("ocaml-temporal-detail", "already_started") ]
+
+(** Builds the typed already-started error. When Temporal reported the
+    existing run, its exact identity is attached as one JSON detail payload
+    ([{"namespace","workflow_id","run_id"}]) that [already_started_execution]
+    decodes, so callers never parse [message] (issue #837). The run ID is still
+    repeated in the message for logs. *)
+let already_started_error ~namespace ~workflow_id ~existing_run_id =
+  let suffix, details =
+    match existing_run_id with
+    | None -> ("", [])
+    | Some run_id ->
+        let json =
+          `Assoc
+            [
+              ("namespace", `String namespace);
+              ("workflow_id", `String workflow_id);
+              ("run_id", `String run_id);
+            ]
+        in
+        ( "; existing_run_id=" ^ run_id,
+          [
+            {
+              Payload.metadata = already_started_detail_metadata;
+              data = Bytes.of_string (Yojson.Safe.to_string json);
+            };
+          ] )
+  in
+  Error.make ~non_retryable:true ~error_type:already_started_error_type
+    ~details ~category:`Workflow
+    ~message:(Printf.sprintf "workflow %S is already started%s" workflow_id suffix)
+    ()
+
+(** Recovers the [(namespace, workflow_id, run_id)] attached by
+    [already_started_error]. Any other error, including an already-started
+    error whose run Temporal did not report, returns [None]. The structural
+    checks keep an unrelated [`Workflow] error with a JSON detail from being
+    misread; identity validation is left to [Client.follow]. *)
+let already_started_execution error =
+  let view = Error.view error in
+  match (view.category, view.error_type, view.details) with
+  | `Workflow, Some error_type, [ detail ]
+    when String.equal error_type already_started_error_type
+         && detail.metadata = already_started_detail_metadata -> (
+      match Yojson.Safe.from_string (Bytes.to_string detail.data) with
+      | `Assoc
+          [
+            ("namespace", `String namespace);
+            ("workflow_id", `String workflow_id);
+            ("run_id", `String run_id);
+          ] ->
+          Some (namespace, workflow_id, run_id)
+      | _ -> None
+      | exception Yojson.Json_error _ -> None)
+  | _ -> None
+
 (** Converts a structured native client operation failure while preserving its
     semantic distinction from a transport/lifecycle error. Temporal's
-    duplicate-workflow response is a workflow failure; RPC and protocol
-    failures remain bridge failures because no terminal workflow result exists. *)
-let native_client_error = function
+    duplicate-workflow response is a workflow failure carrying the existing
+    run in [namespace]; RPC and protocol failures remain bridge failures
+    because no terminal workflow result exists. *)
+let native_client_error ~namespace = function
   | Client_protocol.Already_started { workflow_id; existing_run_id } ->
-      let existing_run_id =
-        match existing_run_id with
-        | None -> ""
-        | Some run_id -> "; existing_run_id=" ^ run_id
-      in
-      Error.make ~non_retryable:true ~category:`Workflow
-        ~message:
-          (Printf.sprintf "workflow %S is already started%s" workflow_id
-             existing_run_id)
-        ()
+      already_started_error ~namespace ~workflow_id ~existing_run_id
   | Client_protocol.Rpc { code } ->
       bridge_error ("Temporal client RPC failed: " ^ code)
   | Client_protocol.Protocol { code } ->
@@ -750,6 +818,11 @@ let native_start_request client (request : start_request) : Client_protocol.star
     input = protocol_input request.input;
     memo = metadata request.memo;
     search_attributes = metadata request.search_attributes;
+    id_conflict_policy =
+      (match request.id_conflict_policy with
+      | `Fail -> Client_protocol.Fail
+      | `Use_existing -> Client_protocol.Use_existing
+      | `Terminate_existing -> Client_protocol.Terminate_existing);
   }
 
 (** Builds the non-retryable bridge error for a start whose acceptance was
@@ -785,7 +858,7 @@ let native_client_start (client : native_client) (request : start_request) :
     let request = native_start_request client request in
     match Native.perform client.supervisor (Native.Client_begin_start_workflow request) with
     | Error error -> Error (native_supervisor_error error)
-    | Ok (Error error) -> Error (native_client_error error)
+    | Ok (Error error) -> Error (native_client_error ~namespace:client.namespace error)
     | Ok (Ok ticket) ->
         let uncertain ?reason () =
           Error
@@ -814,14 +887,15 @@ let native_client_start (client : native_client) (request : start_request) :
                    owner or a workflow scheduler fiber. *)
                 Thread.yield ();
                 await_outcome ()
-          | Ok (Some (Client_protocol.Accepted { execution })) ->
+          | Ok (Some (Client_protocol.Accepted { execution; started })) ->
               Ok
                 {
                   workflow_id = execution.workflow_id;
                   run_id = execution.run_id;
+                  started;
                 }
           | Ok (Some (Client_protocol.Rejected error)) ->
-              Error (native_client_error error)
+              Error (native_client_error ~namespace:client.namespace error)
           | Ok
               (Some
                  (Client_protocol.Unknown { request_id; workflow_id })) ->
@@ -829,10 +903,45 @@ let native_client_start (client : native_client) (request : start_request) :
         in
         await_outcome ()
 
+(** Allocates a new pending mock run as the current execution for the
+    request's workflow ID and records an explicit request ID for idempotent
+    retries. The caller holds [service.mutex] and has already resolved any
+    conflict with an open run. *)
+let mock_start_new_run service (request : start_request) =
+  service.next_run <- service.next_run + 1;
+  let run_id = Printf.sprintf "mock-run-%d" service.next_run in
+  let execution =
+    {
+      run_id;
+      workflow_type = request.workflow_name;
+      task_queue = request.task_queue;
+      input = copy_payload request.input;
+      terminal = Mock_pending;
+      signal_requests = Hashtbl.create 8;
+    }
+  in
+  Hashtbl.replace service.executions request.workflow_id execution;
+  Hashtbl.add service.history (request.workflow_id, run_id) execution;
+  let response : start_response =
+    { workflow_id = request.workflow_id; run_id; started = true }
+  in
+  (match request.request_id with
+  | None -> ()
+  | Some request_id ->
+      Hashtbl.add service.start_requests
+        (request.workflow_id, request_id)
+        { request = copy_start_request request; response });
+  Ok response
+
 (** Starts a mock execution or returns the first run for an identical retry of
-    an accepted explicit request ID. Retry lookup precedes workflow-ID checks;
-    a new request rejects a pending current run but can replace a closed one.
-    Exact old runs remain in [history] after the current slot is replaced. *)
+    an accepted explicit request ID. Retry lookup precedes workflow-ID checks,
+    matching Temporal's request-ID deduplication. A new request facing a
+    pending current run follows its conflict policy: [`Fail] returns the typed
+    already-started error, [`Use_existing] returns the pending run with
+    [started = false] (without recording the request ID, since it created
+    nothing), and [`Terminate_existing] marks the pending run terminated before
+    starting a new one. A closed current run is always replaced. Exact old runs
+    remain in [history] after the current slot is replaced. *)
 let mock_client_start (client : mock_client) (request : start_request) =
   let service = client.service in
   Mutex.lock service.mutex;
@@ -856,38 +965,32 @@ let mock_client_start (client : mock_client) (request : start_request) =
               (Error.make ~non_retryable:true ~category:`Workflow
                  ~message:"start request ID was already used for different start data"
                  ())
-        | None
-          when (match Hashtbl.find_opt service.executions request.workflow_id with
-               | Some { terminal = Mock_pending; _ } -> true
-               | Some _ | None -> false) ->
-            Error
-              (Error.make ~non_retryable:true ~category:`Workflow
-                 ~message:"workflow id already exists" ())
-        | None ->
-            service.next_run <- service.next_run + 1;
-            let run_id = Printf.sprintf "mock-run-%d" service.next_run in
-            let execution =
-              {
-                run_id;
-                workflow_type = request.workflow_name;
-                task_queue = request.task_queue;
-                input = copy_payload request.input;
-                terminal = Mock_pending;
-                signal_requests = Hashtbl.create 8;
-              }
+        | None -> (
+            let open_run =
+              match Hashtbl.find_opt service.executions request.workflow_id with
+              | Some ({ terminal = Mock_pending; _ } as execution) -> Some execution
+              | Some _ | None -> None
             in
-            Hashtbl.replace service.executions request.workflow_id execution;
-            Hashtbl.add service.history (request.workflow_id, run_id) execution;
-            let response : start_response =
-              { workflow_id = request.workflow_id; run_id }
-            in
-            (match request.request_id with
-            | None -> ()
-            | Some request_id ->
-                Hashtbl.add service.start_requests
-                  (request.workflow_id, request_id)
-                  { request = copy_start_request request; response });
-            Ok response)
+            match (open_run, request.id_conflict_policy) with
+            | Some existing, `Fail ->
+                let namespace = snd service.key in
+                Error
+                  (already_started_error ~namespace
+                     ~workflow_id:request.workflow_id
+                     ~existing_run_id:(Some existing.run_id))
+            | Some existing, `Use_existing ->
+                Ok
+                  {
+                    workflow_id = request.workflow_id;
+                    run_id = existing.run_id;
+                    started = false;
+                  }
+            | Some existing, `Terminate_existing ->
+                existing.terminal <- Mock_terminated;
+                mock_start_new_run service request
+            | None, (`Fail | `Use_existing | `Terminate_existing) ->
+                mock_start_new_run service request))
+
 
 (** Starts a workflow on the selected private transport. *)
 let client_start client request =
@@ -916,7 +1019,7 @@ let native_client_wait (client : native_client) (request : wait_request) =
             Thread.yield ();
             await_terminal ()
         | Error error -> Error (native_supervisor_error error)
-        | Ok (Error error) -> Error (native_client_error error)
+        | Ok (Error error) -> Error (native_client_error ~namespace:client.namespace error)
         | Ok (Ok response) -> native_terminal_result response
     in
     await_terminal ()
@@ -1027,7 +1130,7 @@ let native_client_cancel (client : native_client) (request : cancel_request) :
         (Native.Client_cancel_workflow (native_cancel_request client request))
     with
     | Error error -> Error (native_supervisor_error error)
-    | Ok (Error error) -> Error (native_client_error error)
+    | Ok (Error error) -> Error (native_client_error ~namespace:client.namespace error)
     | Ok (Ok ()) -> Ok ()
 
 (** Sends one exact-run termination through the serialized native supervisor. *)
@@ -1048,7 +1151,7 @@ let native_client_terminate (client : native_client)
     in
     match Native.perform client.supervisor (Native.Client_terminate_workflow request) with
     | Error error -> Error (native_supervisor_error error)
-    | Ok (Error error) -> Error (native_client_error error)
+    | Ok (Error error) -> Error (native_client_error ~namespace:client.namespace error)
     | Ok (Ok ()) -> Ok ()
 
 (** Converts a reset request to the namespace-bound protocol representation. *)
@@ -1078,7 +1181,7 @@ let native_client_reset (client : native_client) (request : reset_request) :
         (Native.Client_reset_workflow (native_reset_request client request))
     with
     | Error error -> Error (native_supervisor_error error)
-    | Ok (Error error) -> Error (native_client_error error)
+    | Ok (Error error) -> Error (native_client_error ~namespace:client.namespace error)
     | Ok (Ok response) ->
         Ok { workflow_id = response.execution.workflow_id; run_id = response.execution.run_id }
 
@@ -1110,7 +1213,7 @@ let native_client_signal (client : native_client) (request : signal_request) :
         (Native.Client_signal_workflow (native_signal_request client request))
     with
     | Error error -> Error (native_supervisor_error error)
-    | Ok (Error error) -> Error (native_client_error error)
+    | Ok (Error error) -> Error (native_client_error ~namespace:client.namespace error)
     | Ok (Ok ()) -> Ok ()
 
 (** Converts a public query request to the namespace-bound protocol document.
@@ -1141,7 +1244,7 @@ let native_client_query (client : native_client) (request : query_request) :
         (Native.Client_query_workflow (native_query_request client request))
     with
     | Error error -> Error (native_supervisor_error error)
-    | Ok (Error error) -> Error (native_client_error error)
+    | Ok (Error error) -> Error (native_client_error ~namespace:client.namespace error)
     | Ok (Ok response) -> (
         match response with
         | [ payload ] -> Ok (public_payload payload)
@@ -1571,7 +1674,7 @@ let native_client_update (client : native_client) (request : update_request) =
         (Native.Client_update_workflow (native_update_request client request))
     with
     | Error error -> Error (native_supervisor_error error)
-    | Ok (Error error) -> Error (native_client_error error)
+    | Ok (Error error) -> Error (native_client_error ~namespace:client.namespace error)
     | Ok (Ok response) ->
         Ok
           {
@@ -1603,7 +1706,7 @@ let native_client_poll_update (client : native_client) (request : update_request
         (Native.Client_poll_update_workflow protocol_request)
     with
     | Error error -> Error (native_supervisor_error error)
-    | Ok (Error error) -> Error (native_client_error error)
+    | Ok (Error error) -> Error (native_client_error ~namespace:client.namespace error)
     | Ok (Ok response) ->
         Ok { outcome = Option.map public_update_outcome response.outcome }
 

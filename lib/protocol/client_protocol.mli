@@ -17,6 +17,12 @@ type execution = { namespace : string; workflow_id : string; run_id : string }
 type metadata_field = { key : string; value : payload }
 (** One named payload attached to a workflow start memo or search attribute. *)
 
+type id_conflict_policy = Fail | Use_existing | Terminate_existing
+(** Temporal's [WorkflowIdConflictPolicy] for a start whose workflow ID has
+    an open run, without its [UNSPECIFIED] value: the encoder always sends an
+    explicit policy. The wire names are ["fail"], ["use_existing"], and
+    ["terminate_existing"]. *)
+
 type start_request = {
   request_id : string;
   namespace : string;
@@ -26,14 +32,17 @@ type start_request = {
   input : payload list;
   memo : metadata_field list;
   search_attributes : metadata_field list;
+  id_conflict_policy : id_conflict_policy;
 }
 (** Dynamic workflow-start request sent to the Rust client adapter. [request_id]
     is stable across retries and is passed unchanged to Temporal, so a caller
     can reconcile an uncertain asynchronous start without issuing a second
     logical operation. *)
 
-type start_response = { execution : execution }
-(** Server-assigned execution returned by a successful start. *)
+type start_response = { execution : execution; started : bool }
+(** Execution returned by a successful start. [started] is [false] only when
+    [Use_existing] returned a run created by another start request; the
+    execution then names that existing run. *)
 
 type start_ticket
 (** Opaque capability for one admitted asynchronous start. The ticket retains

@@ -32,7 +32,14 @@ type ('input, 'output) handle = {
   (* The exact server run ID returned by Temporal; waits never follow a
      continued-as-new successor implicitly. *)
   run_id : string;
+  (* [true] only when [start] created this run; [false] for a run returned
+     by a [`Use_existing] start and for every handle built by [follow]. *)
+  started : bool;
 }
+
+(** Temporal's workflow ID conflict policy, applied when a start names a
+    workflow ID whose current run is still open. *)
+type id_conflict_policy = [ `Fail | `Use_existing | `Terminate_existing ]
 
 (** A client-side handle for one admitted workflow update. It retains the
     update definition and encoded input so completion polls cannot be confused
@@ -215,8 +222,9 @@ let validate_start_metadata ~memo ~search_attributes =
 (** Starts a workflow after encoding its typed input and checking the backend's
     response still refers to the request. The response check prevents an
     adapter bug from creating a handle for a different execution. *)
-let start client ?request_id ?(memo = []) ?(search_attributes = []) ~workflow
-    ~task_queue ~id ~input () =
+let start client ?request_id ?(memo = []) ?(search_attributes = [])
+    ?(id_conflict_policy : id_conflict_policy = `Fail) ~workflow ~task_queue ~id
+    ~input () =
   if Atomic.get client.closed then
     Error
       (Error.make ~category:`Bridge ~message:"client is shut down" ())
@@ -242,6 +250,7 @@ let start client ?request_id ?(memo = []) ?(search_attributes = []) ~workflow
                 input = encoded_input;
                 memo;
                 search_attributes;
+                id_conflict_policy;
               }
             in
             Result.bind (Backend.client_start client.backend request) (fun response ->
@@ -260,6 +269,7 @@ let start client ?request_id ?(memo = []) ?(search_attributes = []) ~workflow
                       workflow;
                       workflow_id = id;
                       run_id = response.run_id;
+                      started = response.started;
                     })))
 
 (** Rebuilds a typed handle for a successor run without starting another
@@ -288,7 +298,8 @@ let follow client ~workflow ({ namespace; workflow_id; run_id } : execution) =
           | Ok () -> (
               match validate_name "successor run id" run_id with
               | Error error -> Error error
-              | Ok () -> Ok { client; workflow; workflow_id; run_id }))
+              | Ok () ->
+                  Ok { client; workflow; workflow_id; run_id; started = false }))
 
 (** Decodes a completed payload and maps terminal failures without exposing the
     private backend constructors. Each successor gains this client's namespace
@@ -752,6 +763,17 @@ let workflow_id (handle : ('input, 'output) handle) = handle.workflow_id
 
 (** Returns the exact server run identity retained by a handle. *)
 let run_id (handle : ('input, 'output) handle) = handle.run_id
+
+(** Reports whether the [start] that produced [handle] created its run. *)
+let started (handle : ('input, 'output) handle) = handle.started
+
+(** Exposes the conflicting run attached by the backend as a public
+    [execution]. The backend owns the detail encoding so the mock and native
+    transports cannot drift apart. *)
+let already_started error =
+  Option.map
+    (fun (namespace, workflow_id, run_id) -> { namespace; workflow_id; run_id })
+    (Backend.already_started_execution error)
 
 (** Recognizes the backend's capacity rejection by its structural fields
     rather than its diagnostic message, so wording changes cannot alter the

@@ -13,7 +13,7 @@ background threads.
 
 ## Version and symbols
 
-ABI version 2 uses only symbols beginning with `ocaml_temporal_core_v2_`.
+ABI version 3 uses only symbols beginning with `ocaml_temporal_core_v3_`.
 Before using the bridge, OCaml asks Rust which ABI version it implements and
 checks that it matches `OCAML_TEMPORAL_CORE_ABI_VERSION`. The bridge represents
 the Rust runtime with one opaque handle. Client connection and worker state are
@@ -28,6 +28,16 @@ the versioned symbols and negotiation constant therefore change together so
 an OCaml object and Rust archive built from different contracts fail during
 startup negotiation instead of reaching worker construction with ambiguous
 JSON semantics.
+
+Version 3 is intentionally incompatible with version 2 for the same reason.
+The client start request carries a strict `id_conflict_policy` field that a
+version 2 Rust decoder rejects as unknown, and the start response and start
+outcome documents carry a required `started` flag that a version 2 Rust
+archive never emits and a version 2 OCaml decoder rejects as unknown. Without
+a bump, either mixed pairing would pass negotiation and then fail every
+`Client.start` with a protocol error. Renaming the symbol prefix to
+`ocaml_temporal_core_v3_` together with the constant makes a stale archive or
+stale OCaml object fail at link time or during startup negotiation instead.
 
 The canonical header is
 `rust/core-bridge/include/ocaml_temporal_core.h`. Both Rust and C compile-time
@@ -47,7 +57,11 @@ performs the inverse conversion for workflow commands. The private OCaml module
 `Temporal_protocol.Workflow_protocol` implements the same model and validation
 without importing protobuf definitions.
 
-Both encoders reparse their own output before it can cross the native boundary.
+Both encoders check their own output against the receiver's rules before it can
+cross the native boundary. Rust reparses its output; OCaml applies the
+decoder's semantic rules to the validated tree and the parser's raw-text
+preflight to the serialized bytes, so payload bytes are not parsed and base64
+decoded a second time (#846).
 Both decoders reject duplicate or unknown fields, unknown variants, numeric
 range violations, non-canonical base64, invalid workflow invariants, and
 oversized values. Core fields not represented by the current semantic slice are
@@ -272,7 +286,7 @@ blocking.
 All client-operation identifiers are nonempty and NUL-free. The schemas state the
 65,536-character necessary bound, while the bilateral runtime validators apply
 the authoritative 65,536-byte UTF-8 limit, reject duplicate members, and
-reparse encoded output. JSON Schema counts Unicode characters rather than
+check encoded output against the receiver's limits. JSON Schema counts Unicode characters rather than
 encoded bytes, so schema validation alone is not a substitute for the runtime
 checks.
 
@@ -307,7 +321,7 @@ A result has one success buffer and one error buffer. At most one owns memory:
 
 Rust owns both allocations. The caller may copy their bytes but must never
 mutate or directly free their fields. It must call
-`ocaml_temporal_core_v2_result_free` exactly once after consuming an initialized
+`ocaml_temporal_core_v3_result_free` exactly once after consuming an initialized
 result. That function clears the object, so accidentally calling it again on
 the same object is safe. Copying a live result structure creates no new
 ownership; freeing both copies is invalid.
@@ -319,7 +333,7 @@ result when passed to another operation. Free the previous result first.
 
 The private C stubs allocate an OCaml custom block before entering Rust. That
 block is the sole owner of the ABI result and has a finalizer which calls
-`ocaml_temporal_core_v2_result_free`. The OCaml wrapper also uses
+`ocaml_temporal_core_v3_result_free`. The OCaml wrapper also uses
 `Fun.protect` to release the result deterministically after copying its bytes.
 This gives every path two compatible safeguards: normal operation frees
 immediately, while an OCaml allocation failure or other exception leaves a
@@ -413,7 +427,7 @@ and cannot retire the real lease. The malformed-byte case is defensive:
 successful Rust poll encoding cannot produce malformed JSON, but both language
 decoders and both rejection entry points still validate it.
 
-`Sdk_supervisor.Native` is the private OCaml adapter for these ABI version 2
+`Sdk_supervisor.Native` is the private OCaml adapter for these ABI version 3
 operations. It exposes a typed GADT rather than raw JSON bytes:
 
 | Supervisor operation | Result and boundary behavior |
@@ -491,12 +505,12 @@ executions retain their separate deterministic effect schedulers.
 Each runtime builds its own multi-thread Tokio executor. Tokio's default of
 one worker per core made every client and worker cost dozens of idle threads
 on a large host, so runtime creation takes an explicit worker count through
-`ocaml_temporal_core_v2_runtime_new_with_worker_threads`. `0` selects the
+`ocaml_temporal_core_v3_runtime_new_with_worker_threads`. `0` selects the
 bridge default, `min(available parallelism, DEFAULT_RUNTIME_WORKER_THREADS_CAP)`
 (4), falling back to one thread when parallelism cannot be queried.
 `1..=OCAML_TEMPORAL_CORE_MAX_RUNTIME_WORKER_THREADS` (256) is used unchanged,
 and a larger value returns `STATUS_INVALID_ARGUMENT` before anything is
-allocated, leaving the runtime slot null. `ocaml_temporal_core_v2_runtime_new`
+allocated, leaving the runtime slot null. `ocaml_temporal_core_v3_runtime_new`
 is the same call with `0`. The count is resolved before Core is built, so it
 adds no owner or release path: the Tokio pool remains owned by Core inside the
 runtime handle and is shut down by the existing runtime destruction path.
@@ -654,7 +668,7 @@ and no long Core poll occupies the supervisor Domain. Keeping the lanes
 independent prevents an idle activity poll from delaying workflow completion,
 or vice versa.
 
-ABI version 2 includes private readiness-wait symbols for the two independent
+ABI version 3 includes private readiness-wait symbols for the two independent
 poll lanes and one combined wait over both. The supervisor may invoke them
 only from the owner-domain mailbox handler; the C boundary releases the OCaml
 runtime lock while Rust waits and reacquires it before returning. Callers must

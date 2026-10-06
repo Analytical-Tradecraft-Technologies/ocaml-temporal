@@ -10,9 +10,9 @@ use std::ptr;
 
 use ocaml_temporal_core_bridge::{
     DEFAULT_RUNTIME_WORKER_THREADS_CAP, MAX_RUNTIME_WORKER_THREADS, Result as AbiResult, Runtime,
-    STATUS_INVALID_ARGUMENT, STATUS_OK, ocaml_temporal_core_v2_result_free,
-    ocaml_temporal_core_v2_runtime_free, ocaml_temporal_core_v2_runtime_new,
-    ocaml_temporal_core_v2_runtime_new_with_worker_threads, test_runtime_worker_threads,
+    STATUS_INVALID_ARGUMENT, STATUS_OK, ocaml_temporal_core_v3_result_free,
+    ocaml_temporal_core_v3_runtime_free, ocaml_temporal_core_v3_runtime_new,
+    ocaml_temporal_core_v3_runtime_new_with_worker_threads, test_runtime_worker_threads,
 };
 
 /// Copies the diagnostic text out of `result`, then releases it.
@@ -26,7 +26,7 @@ fn take_message(result: &mut AbiResult) -> String {
     };
     // SAFETY: The result was initialized by the bridge and is freed once.
     assert_eq!(
-        unsafe { ocaml_temporal_core_v2_result_free(result) },
+        unsafe { ocaml_temporal_core_v3_result_free(result) },
         STATUS_OK
     );
     message
@@ -40,7 +40,7 @@ fn worker_count(worker_threads: u32) -> std::result::Result<usize, (i32, String)
     let mut result = AbiResult::default();
     // SAFETY: Both output locations are writable and exclusively owned.
     let status = unsafe {
-        ocaml_temporal_core_v2_runtime_new_with_worker_threads(
+        ocaml_temporal_core_v3_runtime_new_with_worker_threads(
             worker_threads,
             &mut runtime,
             &mut result,
@@ -55,7 +55,7 @@ fn worker_count(worker_threads: u32) -> std::result::Result<usize, (i32, String)
     let workers = unsafe { test_runtime_worker_threads(runtime) }.expect("live runtime");
     // SAFETY: The handle is released exactly once through its owning slot.
     assert_eq!(
-        unsafe { ocaml_temporal_core_v2_runtime_free(&mut runtime) },
+        unsafe { ocaml_temporal_core_v3_runtime_free(&mut runtime) },
         STATUS_OK
     );
     Ok(workers)
@@ -97,7 +97,7 @@ fn legacy_constructor_uses_default() {
     let mut runtime: *mut Runtime = ptr::null_mut();
     let mut result = AbiResult::default();
     // SAFETY: Both output locations are writable and exclusively owned.
-    let status = unsafe { ocaml_temporal_core_v2_runtime_new(&mut runtime, &mut result) };
+    let status = unsafe { ocaml_temporal_core_v3_runtime_new(&mut runtime, &mut result) };
     let message = take_message(&mut result);
     assert_eq!(status, STATUS_OK, "{message}");
     // SAFETY: The handle is live and used only by this thread.
@@ -105,7 +105,7 @@ fn legacy_constructor_uses_default() {
     assert_eq!(workers, Some(expected_default()));
     // SAFETY: The handle is released exactly once through its owning slot.
     assert_eq!(
-        unsafe { ocaml_temporal_core_v2_runtime_free(&mut runtime) },
+        unsafe { ocaml_temporal_core_v3_runtime_free(&mut runtime) },
         STATUS_OK
     );
 }
@@ -131,7 +131,7 @@ fn null_slot_is_rejected() {
     let mut result = AbiResult::default();
     // SAFETY: The result location is writable; the null slot is the subject.
     let status = unsafe {
-        ocaml_temporal_core_v2_runtime_new_with_worker_threads(2, ptr::null_mut(), &mut result)
+        ocaml_temporal_core_v3_runtime_new_with_worker_threads(2, ptr::null_mut(), &mut result)
     };
     take_message(&mut result);
     assert_eq!(status, STATUS_INVALID_ARGUMENT);
