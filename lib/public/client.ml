@@ -122,8 +122,11 @@ let validate_name field value =
     connection field. Routine configuration failures remain [result] values.
     An omitted identity is derived once here as [<pid>@<hostname>]; this runs
     outside workflow code, so reading process state is replay-safe. *)
-let create ?identity ~target_url ~namespace () =
+let create ?identity ?io_threads ~target_url ~namespace () =
   let identity = Temporal_base.Process_identity.resolve identity in
+  match Backend.validate_io_threads io_threads with
+  | Error error -> Error error
+  | Ok () ->
   match validate_name "namespace" namespace with
   | Error error -> Error error
   | Ok () -> (
@@ -142,7 +145,7 @@ let create ?identity ~target_url ~namespace () =
                 shutdown_mutex = Mutex.create ();
                 shutdown_result = None;
               })
-            (Backend.client_create config))
+            (Backend.client_create ?io_threads config))
 
 (** Validates the optional Temporal idempotency key, workflow type, durable
     workflow ID, and task queue before encoding input or constructing a native

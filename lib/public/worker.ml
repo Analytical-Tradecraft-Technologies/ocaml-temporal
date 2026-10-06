@@ -302,9 +302,12 @@ let resolve_options options max_cached_workflows =
       Options.make ~max_cached_workflows ()
   | None, None -> Ok Options.default
 
-let create ?identity ?options ?max_cached_workflows
+let create ?identity ?options ?max_cached_workflows ?io_threads
     ~target_url
     ~namespace ~task_queue ~workflows ~activities () =
+  match Backend.validate_io_threads io_threads with
+  | Error error -> Error error
+  | Ok () ->
   match resolve_options options max_cached_workflows with
   | Error error -> Error error
   | Ok options ->
@@ -424,6 +427,7 @@ let create ?identity ?options ?max_cached_workflows
                         let native_result =
                           Native_worker.create
                             ?max_cached_workflows:effective_max_cached_workflows
+                            ?io_threads
                             ~versioning:native_versioning ~target_url
                             ~namespace ~identity
                             ~task_queue ~workflows:native_workflows

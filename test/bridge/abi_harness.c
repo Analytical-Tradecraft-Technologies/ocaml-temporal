@@ -184,6 +184,21 @@ int main(void) {
          OCAML_TEMPORAL_CORE_STATUS_INVALID_ARGUMENT);
   assert(ocaml_temporal_core_v3_result_free(&result) ==
          OCAML_TEMPORAL_CORE_STATUS_OK);
+
+  /* An explicit Tokio worker count within the bound creates a runtime; one
+   * above it is rejected without publishing a handle (#832). */
+  assert(ocaml_temporal_core_v3_runtime_new_with_worker_threads(
+             1, &runtime, &result) == OCAML_TEMPORAL_CORE_STATUS_OK);
+  assert(ocaml_temporal_core_v3_result_free(&result) ==
+         OCAML_TEMPORAL_CORE_STATUS_OK);
+  assert(ocaml_temporal_core_v3_runtime_free(&runtime) ==
+         OCAML_TEMPORAL_CORE_STATUS_OK);
+  assert(ocaml_temporal_core_v3_runtime_new_with_worker_threads(
+             OCAML_TEMPORAL_CORE_MAX_RUNTIME_WORKER_THREADS + 1, &runtime,
+             &result) == OCAML_TEMPORAL_CORE_STATUS_INVALID_ARGUMENT);
+  assert(runtime == NULL);
+  assert(ocaml_temporal_core_v3_result_free(&result) ==
+         OCAML_TEMPORAL_CORE_STATUS_OK);
   assert(ocaml_temporal_core_v3_runtime_free(NULL) ==
          OCAML_TEMPORAL_CORE_STATUS_INVALID_ARGUMENT);
 
