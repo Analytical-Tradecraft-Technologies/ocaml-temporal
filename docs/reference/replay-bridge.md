@@ -197,6 +197,12 @@ The ABI-focused integration test in
 handle, missing-worker, malformed-document, semantic lease matching, natural
 shutdown, and idempotent-disposal coverage.
 
+The [replay history corpus](history-corpus.md) drives the OCaml supervisor
+operations above with real workflow definitions. Its Docker-free test replays
+every recorded corpus history and requires either natural finalization with
+the recorded run identity or, for the negative controls, Core's nondeterminism
+eviction.
+
 Two OCaml 5.2 replay-lifecycle CI failures shaped this coverage, both surfacing
 as Core's “A non-empty completion was not processed” panic. The first was
 bridge-originated: a live-worker failure completion was sent after Core had
