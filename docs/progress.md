@@ -15,6 +15,27 @@ implementation when a later entry documents that work as complete. The
 records the current tested source, named assertions and successful CI job for
 the Temporal acceptance controllers.
 
+## 2026-10-08: Successful activity completions require a payload (#954)
+
+The activity completion protocol accepted `{"kind":"completed","result":null}`
+and converted it to Core's `Success { result: None }`, which Core's
+`validate_activity_completion` rejects as malformed at the pinned commit. The
+bridge then returned `STATUS_WORKER` for a document it had accepted, and the
+lease stayed held. The lifecycle stress in #953 found this; the OCaml executor
+always sends a payload, so the public API could not reach it. The Rust
+`ActivityCompletionResult::Completed` and OCaml `Activity_protocol.Completed`
+now carry a required payload, both decoders refuse `null` with a protocol error
+at `$.result.result` before any Core call, and both completion schemas require
+the payload. A void result is an encoded payload whose data may be empty; the official SDKs
+send a `binary/null` payload with empty data for one.
+The Rust validator also checks the success payload's limits at decode, as it
+already did for heartbeat details. The ABI version is unchanged: the OCaml
+sender never produced the refused shape. `rust/core-bridge/tests/activity_protocol.rs`,
+the new `rust/core-bridge/tests/activity_null_completion.rs` (worker ABI
+against a loopback gRPC double: corrected completion and reject both retire
+the lease exactly once after the refusal), and
+`test/bridge/test_ocaml_activity_protocol.ml` cover it.
+
 ## 2026-10-08: Client handles by workflow ID and typed completed successors (#791, #837)
 
 `Temporal.Client.get_handle client ~workflow ~id ?run_id ()` builds a typed

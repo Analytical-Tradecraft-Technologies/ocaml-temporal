@@ -474,7 +474,7 @@ let test_successful_dispatch () =
   if not (Bytes.equal completion.Protocol.task_token token) then
     failwith "completion did not preserve the exact opaque task token";
   begin match completion.Protocol.result with
-  | Protocol.Completed (Some payload) ->
+  | Protocol.Completed payload ->
       if decode_output Temporal.Codec.string payload <> "HELLO" then
         failwith "activity output was not decoded from the completion payload"
   | _ -> failwith "successful activity used a non-completed result variant"
