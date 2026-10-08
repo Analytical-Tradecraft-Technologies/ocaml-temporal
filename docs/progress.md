@@ -15,6 +15,39 @@ implementation when a later entry documents that work as complete. The
 records the current tested source, named assertions and successful CI job for
 the Temporal acceptance controllers.
 
+## 2026-10-09: Query and suspended-update recovery after eviction and restart (#530)
+
+`test/integration/interaction_recovery/regression.exe` joins
+`LIVE_REGRESSION_EXECUTABLES`, so `make test-temporal-live-regressions` runs it
+against the Compose stack. It runs three executions of one workflow whose
+`add` update handler suspends on a signal and then starts a durable timer:
+
+- **Eviction:** on a worker with a one-entry sticky cache, a filler workflow
+  forces the run out of the cache after the update is accepted. Queries then
+  answer from replayed state, and the release signal resumes the handler from
+  history.
+- **Restart:** the worker process that accepted the update is terminated, and a
+  fresh process answers queries and completes the update. History attributes
+  acceptance to the original process and completion to the replacement.
+- **Control:** the same commands with no queries, rejected updates, eviction,
+  or replacement.
+
+A `probe` query reports per-process counts of workflow-body starts and
+validator calls, proving that answers come from a replay and that replaying an
+accepted update does not re-run its validator. Exact run histories, read with
+the pinned CLI, show the update accepted but not completed while suspended,
+then one acceptance and one completion with the original update ID. A handle
+re-attached by update ID returns the same result. Apart from workflow-task
+events, both recovered histories equal the control run's.
+
+Evidence: `make test-temporal-live-regressions` passed all six suites in the
+Linux development image (OCaml 5.2) against a fresh Compose Temporal
+1.32.0/PostgreSQL stack. Eight sequential and three concurrent runs of this
+suite also passed against that stack with the driver and workers built on
+macOS (OCaml 5.4.1). As a sensitivity check, forcing
+`run_validator = true` for replayed updates made the suite fail at the first
+post-eviction query. No SDK defect was found.
+
 ## 2026-10-08: Seeded bridge lifecycle stress (#522)
 
 `rust/core-bridge/tests/lifecycle_stress.rs` generates reproducible operation
