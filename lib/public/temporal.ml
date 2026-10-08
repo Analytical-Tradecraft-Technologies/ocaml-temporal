@@ -25,6 +25,7 @@ module Future = Future
 module Interaction = Interaction
 module Payload = Payload
 module Query = Query
+module Replay = Replay
 module Result_syntax = Result_syntax
 module Runtime_info = Runtime_info
 module Scope = Scope
