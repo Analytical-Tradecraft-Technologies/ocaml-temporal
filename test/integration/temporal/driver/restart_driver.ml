@@ -49,8 +49,8 @@ let publish_marker path contents =
     failure or cancellation is returned as a typed defect with no payload
     details, because the expected success marker is the public contract. *)
 let require_completed = function
-  | Client.Completed value when value = "SMOKE:AFTER-REPLAY:ATTEMPT:2" -> Ok ()
-  | Client.Completed value ->
+  | Client.Completed { output = value; _ } when value = "SMOKE:AFTER-REPLAY:ATTEMPT:2" -> Ok ()
+  | Client.Completed { output = value; _ } ->
       Error
         (Error.defect
            ~message:(Printf.sprintf "restart workflow returned %S" value))
@@ -98,7 +98,7 @@ let run () =
         let* () =
           publish_marker accepted_file
             (Printf.sprintf "workflow_id=%s\nrun_id=%s\n"
-               (Client.workflow_id handle) (Client.run_id handle))
+               (Client.workflow_id handle) (Option.get (Client.run_id handle)))
         in
         let* outcome = Client.wait handle in
         let* () = require_completed outcome in

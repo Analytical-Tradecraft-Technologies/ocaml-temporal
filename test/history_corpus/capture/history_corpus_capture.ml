@@ -45,7 +45,7 @@ let remote name input output = Temporal.Workflow.remote ~name ~input ~output
 (** Waits for a run and requires the expected terminal shape. *)
 let expect_completed label handle =
   match require label (Temporal.Client.wait handle) with
-  | Temporal.Client.Completed value -> value
+  | Temporal.Client.Completed { output = value; _ } -> value
   | _ -> failwith (label ^ ": run did not complete")
 
 (** Starts one workflow with a fixed ID; the export script relies on these IDs
@@ -60,7 +60,7 @@ let record ~case ~workflow_type handle =
   {
     case;
     workflow_id = Temporal.Client.workflow_id handle;
-    run_id = Some (Temporal.Client.run_id handle);
+    run_id = Temporal.Client.run_id handle;
     workflow_type;
   }
 

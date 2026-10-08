@@ -94,9 +94,9 @@ let () =
       (T.Client.start client ~workflow ~task_queue:"queue" ~id:"consumer-id"
          ~input:"input" ())
   in
-  ignore (T.Client.workflow_id handle, T.Client.run_id handle);
+  ignore (T.Client.workflow_id handle, Option.get (T.Client.run_id handle));
   (match expect_ok "client wait" (T.Client.wait handle) with
-  | T.Client.Completed value when value = "input" -> ()
+  | T.Client.Completed { output = value; _ } when value = "input" -> ()
   | _ -> failwith "unexpected mock client terminal result");
   ignore (expect_ok "client shutdown" (T.Client.shutdown client));
   let worker =
