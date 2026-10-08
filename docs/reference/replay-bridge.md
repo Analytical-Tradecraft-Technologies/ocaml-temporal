@@ -1,13 +1,14 @@
 # Internal replay worker bridge
 
 This reference describes the bounded replay slice behind the private Rust
-bridge. It is an implementation component, not a public OCaml API and not a
-standalone live acceptance fixture. Deterministic tests drive the bridge
-directly by feeding recorded histories to Temporal Core's replay
-implementation. The separate two-generation restart/replay acceptance uses it
-indirectly through the private worker path and is live-verified as an
-integration; that evidence does not make this bridge a caller-facing replay
-API. The public worker still executes normal server activations.
+bridge. The bridge itself is an implementation component; applications reach
+it only through the public [`Temporal.Replay`](#public-offline-replay-api)
+module, which wraps it without exposing handles, documents, or Core types.
+Deterministic tests drive the bridge directly by feeding recorded histories to
+Temporal Core's replay implementation. The separate two-generation
+restart/replay acceptance uses it indirectly through the private worker path
+and is live-verified as an integration. The public worker still executes
+normal server activations.
 
 ## Why this layer exists
 
@@ -66,7 +67,8 @@ error text are not copied into an ABI diagnostic.
 
 ## OCaml supervisor operation
 
-The public `Temporal` module does not expose a replay handle. Internally,
+The public `Temporal` module does not expose a replay handle; `Temporal.Replay`
+creates and releases one per call. Internally,
 `Sdk_supervisor.Native_backend` sends these typed operations to the one
 supervisor Domain that owns the runtime:
 
@@ -130,6 +132,62 @@ cannot convert a Core activation into the semantic model, no JSON is exposed
 to OCaml; Rust rejects that leased run directly with a constant reason. Both
 paths retire the native obligation without echoing workflow-controlled bytes in
 an error or log.
+
+## Public offline replay API
+
+[`Temporal.Replay`](../../lib/public/replay.mli) (#515) is the supported
+application entry point. It adds no replay engine: one `replay` call performs
+exactly the operation sequence above, in the same order as the private
+cold-replay benchmark.
+
+1. `History.of_protobuf ~workflow_id bytes` checks the schema-free bounds
+   (non-empty, NUL-free, valid UTF-8 workflow ID of at most 65,536 bytes;
+   non-empty history of at most the 128 MiB bridge payload limit) and builds
+   the strict replay document above once, with the shared canonical base64
+   payload wrapper. The protobuf and Core invariants are checked by the
+   bridge at feed time.
+2. `replay` validates the registration list exactly as `Worker.create` does,
+   then creates a private supervisor (its own owner Domain and Rust runtime),
+   starts the workflow-only replay worker, feeds the one history, and closes
+   input.
+3. The production workflow adapter (`Native_worker_execution.Make`) is
+   instantiated with a replay-mode task source whose poll and completion use
+   `Try_poll_replay_workflow` and `Complete_replay_workflow`. Workflow code,
+   codecs, and handlers therefore run through the same conversion as a live
+   worker. The source observes, without altering, each activation and
+   completion and records the first refusal.
+4. The caller drains until `Finalize_replay` succeeds, waiting through
+   `Wait_replay_workflow` while Core reports outstanding tasks. About 300
+   consecutive idle waits (30 seconds without an activation) abandon the
+   replay as `Replay_error`.
+5. On every path, `Supervisor.shutdown` runs next. It disposes an undrained
+   replay worker, joins the owner Domain, and frees the runtime; only then are
+   the adapter's OCaml executions discarded.
+
+The typed verdict is derived from bridge and Core signals, never from parsing
+text:
+
+| Signal | Public result |
+| --- | --- |
+| Finalization succeeds with no refusal recorded | `Ok ()` |
+| `Remove_from_cache` with reason `Nondeterminism` | `Nondeterminism { run_id; message }` with Core's mismatch text |
+| A completion carrying `task_failure`, an adapter rejection that retired its lease (for example an unregistered workflow type), or eviction reason `Lang_fail`/`Unhandled_command` | `Workflow_task_failed` |
+| `Feed_replay_history` returns `PROTOCOL`, or eviction reason `Fatal` | `Invalid_history` with the bridge's constant category message |
+| A replay activation the OCaml protocol cannot represent (poll `PROTOCOL`) | `Unsupported_history` |
+| Registration, options, runtime start, or any other supervisor failure | `Replay_error` |
+
+The first refusal wins; later evictions are consequences of it. Every copied
+message is truncated to 4,096 bytes on a UTF-8 boundary. Core's
+nondeterminism text names history events and command kinds, not payloads.
+Core also logs each failed workflow task at `WARN` through the runtime's
+standard-error logger, as it does for a live worker.
+
+The Temporal CLI exports histories as protobuf JSON. The pinned Core revision
+derives a Rust-specific JSON form instead of accepting that one, so the public
+API accepts the binary protobuf and documents conversion rather than adding a
+JSON-history converter to production; the
+[task-failure fixtures](../../test/integration/temporal/task_failure/histories/README.md)
+were converted that way.
 
 ## Ownership and shutdown
 
@@ -235,8 +293,19 @@ The OCaml bridge test in
 sender-side canonical-payload validation rejects malformed replay input before
 it reaches Rust.
 
-This remains **unit-tested native and supervisor plumbing** for the private
-replay handle; it is not a public OCaml replay API. The Rust ABI exports,
+[`test_public_replay.ml`](../../test/bridge/test_public_replay.ml) uses only
+the public `Temporal.Replay` API against the five retained live task-failure
+histories. Compatible code replays all five (including histories with earlier
+failed tasks and deliberately failed executions); a removed timer and an
+activity scheduled in place of a timer are `Nondeterminism`; a defect and an
+unregistered type are `Workflow_task_failed`; non-protobuf, truncated, and
+event-free inputs are `Invalid_history`; invalid registrations and options are
+`Replay_error`; and 140 alternating successful and nondeterministic replays,
+more than OCaml's 128 simultaneous Domains, prove that each call releases its
+supervisor Domain and native graph.
+
+Beneath that API, the bridge remains **unit-tested native and supervisor
+plumbing** for the private replay handle. The Rust ABI exports,
 OCaml supervisor operations, strict sender/receiver validation, and lifecycle
 cleanup paths have focused tests. The separate live restart design is in
 [`worker-restart-replay-acceptance.md`](worker-restart-replay-acceptance.md),

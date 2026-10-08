@@ -15,6 +15,7 @@ where application code normally uses them.
 | Values crossing a Temporal boundary | `Temporal.Codec`, `Temporal.Payload`, `Temporal.Error`, `Temporal.Result_syntax` | Encoding typed values, inspecting opaque payloads, representing expected failures, and composing `result` values |
 | Signals, queries, and updates | `Temporal.Signal`, `Temporal.Query`, `Temporal.Update`, `Temporal.Interaction` | Defining typed interactions, registering handlers, and testing deterministic local dispatch |
 | Application tests | `Temporal.Testing` | Running registered workflows and activities in-process with a time-skipping virtual clock, stubbing activities and child workflows, and driving signals, queries, updates, and cancellation without a Temporal Server |
+| Compatibility checks | `Temporal.Replay` | Replaying recorded workflow histories offline against the application's current workflow definitions before deploying a change |
 
 The same module can be used by a workflow helper and by registration code when
 its contract allows it, but the execution context still matters. In
@@ -197,6 +198,15 @@ for those rules.
   plumbing-only backend that never runs workflow code. The simulated
   semantics and their limits are listed in the module documentation and the
   [workflow guide](../guides/workflows.md#test-workflows-in-process).
+- `Temporal.Replay` replays one recorded history per call through Temporal
+  Core's replay worker and the same workflow adapter a native worker uses,
+  without a server. `History.of_protobuf` accepts a binary `History` protobuf
+  and its workflow ID; `replay` and `replay_all` return `Ok ()` or a typed
+  `failure` (`Nondeterminism`, `Workflow_task_failed`, `Invalid_history`,
+  `Unsupported_history`, or `Replay_error`). Each call owns and releases its
+  own native graph. See the
+  [workflow guide](../guides/workflows.md#replay-recorded-histories-before-deploying)
+  and the [replay bridge reference](replay-bridge.md).
 
 ## What is not public
 

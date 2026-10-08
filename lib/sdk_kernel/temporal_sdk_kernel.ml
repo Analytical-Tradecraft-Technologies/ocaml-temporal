@@ -21,3 +21,4 @@ module Native_worker_observer = Temporal_runtime.Native_worker_observer
 module Future = Temporal_future_kernel
 module Execution = Temporal_runtime.Execution
 module Test_environment = Temporal_runtime.Test_environment
+module Control_protocol = Temporal_protocol.Control_protocol

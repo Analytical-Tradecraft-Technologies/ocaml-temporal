@@ -61,7 +61,7 @@ specific regression/controller files to the successful run.
 | One-owner supervisor and completion drainage | Mailbox, owner Domain, bounded readiness waits, protocol rejection, retryable completion retention and shutdown tests protect lifecycle rules. A retry does not rerun user code. The baseline also requires client and worker stop markers. |
 | Serialized activity execution | One callback is decoded, invoked and completed before another task is admitted. Core is granted one activity slot and one local-activity slot to match, so the server keeps undelivered tasks schedulable instead of starting their timeouts in the bridge queue; at most one remote task can wait behind one local callback. The pools stay separate because Core pre-reserves an idle local-activity permit, which would starve a shared pool. A cancellation task updates the original token and does not create a second completion lease. It cannot preempt a callback already executing under the adapter lock. |
 | Worker recovery | Separate successful live controllers cover graceful restart, forced crash, one-slot sticky-cache eviction, exact parent/child restart and child failure after replay. This is a bounded corpus, not arbitrary crash/failure history qualification. |
-| Private replay feeder | Strict history JSON/protobuf validation and bounded Core replay-worker plumbing exist. Live worker replacement proves server-delivered replay, not a public offline replay API or a direct test of every private feeder path. |
+| Replay feeder and offline replay | Strict history JSON/protobuf validation and bounded Core replay-worker plumbing exist. `Temporal.Replay` exposes them as an offline API with typed nondeterminism, task-failure, invalid/unsupported-history and replay-error results; its public tests replay retained live histories, detect removed or replaced commands, reject malformed input and repeat 140 isolated replays. Live worker replacement separately proves server-delivered replay. There is no replay CLI, JSON-history input or persistent compatibility corpus. |
 | Observability | Structured `logs` sources/tags and privacy-safe diagnostics have focused tests. Operational metrics/tracing, workload benchmarks and sustained-load evidence remain incomplete. |
 
 See [runtime invariants](runtime-invariants.md), [Core ownership](core-bridge.md),
@@ -72,7 +72,7 @@ See [runtime invariants](runtime-invariants.md), [Core ownership](core-bridge.md
 
 - Public TLS trust/mTLS/API-key configuration and secure connectivity acceptance.
   HTTP(S) URL handling alone is not authentication or Temporal Cloud support.
-- Public offline replay/history tooling, broader Server/Core/version history
+- A replay CLI, protobuf-JSON history input, broader Server/Core/version history
   corpora, local-activity recovery, interaction recovery and deployment routing.
 - Application-visible cooperative activity cancellation, bounded shutdown under
   slow callbacks, concurrency/load/resource qualification and operational guidance.
