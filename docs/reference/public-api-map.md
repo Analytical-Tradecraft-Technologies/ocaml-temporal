@@ -39,8 +39,8 @@ for those rules.
   patching. `info ()` returns an abstract `Workflow.Info.t` with the run's
   identity (workflow and run IDs, first run ID, type, namespace, task queue,
   attempt, parent, start time) and the current activation's replay flag, history
-  length and size, and continue-as-new suggestion, all taken from Temporal's
-  activations; `is_replaying ()` is the shorthand for replay-aware logging.
+  length and size, and continue-as-new suggestion and its reasons, all taken
+  from Temporal's activations; `is_replaying ()` is the shorthand for replay-aware logging.
   `upsert_search_attributes` merges encoded values into the
   execution's indexed search attributes; the update becomes visible after the
   workflow task is accepted. `continue_as_new` ends the current run and starts

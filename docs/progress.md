@@ -39,6 +39,23 @@ limit). The installed-consumer witness covers the new signatures. A replay CLI
 (#516), richer mismatch context (#529), JSON-history input and a persistent
 corpus (#503) remain open.
 
+## 2026-10-07: Continue-as-new suggestion reasons (#792)
+
+`Temporal.Workflow.Info.continue_as_new_reasons` reports why the server
+suggested continuing as new, as the polymorphic variants
+`` `History_size_too_large ``, `` `Too_many_history_events `` and
+`` `Too_many_updates `` matching the pinned Core enum. The reasons already
+crossed the bridge in activation metadata; now that the native adapter
+translates each activation once (#846), it installs them in the execution's
+task-local history snapshot next to `continue_as_new_suggested`, so they come
+only from activation metadata, replay identically, and are cleared by an
+activation without metadata. Core's unspecified zero value names no cause and
+is dropped, so a suggestion may carry an empty list, as older servers send.
+The bridge and OCaml decoders already reject unknown reason values, so no
+protocol or ABI change was needed. `test/runtime/test_execution_info.ml`
+checks order preservation, placeholder removal, the live and replayed paths,
+and the reset on the next activation. This completes #792.
+
 ## 2026-10-06: Typed client RPC errors and query handler failures; bridge ABI v4 (#823)
 
 Client RPC failures are classifiable without parsing messages. Every closed
@@ -3008,9 +3025,8 @@ adds no task-rejection path for sub-millisecond values; asynchronous
 definitions also skip the synchronous context's exact heartbeat-interval
 check, and the protobuf maximum is clamped to the largest public
 `Duration.t`. Server
-continue-as-new suggestion reasons are still not exposed: they are decoded
-but translating them into the execution context requires the native
-activation adapter, which is being changed by concurrent work.
+continue-as-new suggestion reasons were not exposed yet at this point; the
+2026-10-07 entry adds them.
 `test/runtime/test_execution_info.ml`, the async adapter test, and the native
 worker adapter test cover the new values.
 
