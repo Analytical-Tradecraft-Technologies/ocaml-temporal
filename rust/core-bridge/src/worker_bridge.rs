@@ -20,7 +20,7 @@ use temporalio_common::protos::temporal::api::failure::v1::{
     ApplicationFailureInfo, Failure as TemporalFailure, failure::FailureInfo,
 };
 use temporalio_common::worker::WorkerTaskTypes;
-use temporalio_sdk_core::{PollError, Worker};
+use temporalio_sdk_core::{CompleteWfError, PollError, Worker};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::task::JoinHandle;
@@ -481,6 +481,14 @@ pub enum WorkerBridgeError {
     LostPollLease,
     /// A poll task still retained the worker after both joins completed.
     WorkerStillShared,
+    /// A non-empty replay completion was still awaiting Core's reply when
+    /// Core's workflow stream terminated, so Core may have discarded it
+    /// unprocessed. See [`complete_workflow_unless_stranded`].
+    CompletionStranded,
+    /// A replay completion or rejection received no Core reply within
+    /// [`REPLAY_CORE_WAIT_TIMEOUT`] while Core's workflow stream was still
+    /// running.
+    CoreWaitTimedOut,
 }
 
 /// Converts one internal worker failure into the bounded diagnostic category
@@ -515,6 +523,10 @@ pub fn public_worker_error_message(error: &WorkerBridgeError) -> &'static str {
         WorkerBridgeError::OutstandingTasks(_) => "Temporal worker has outstanding tasks",
         WorkerBridgeError::LostPollLease => "Temporal worker has an uncompleted poll lease",
         WorkerBridgeError::WorkerStillShared => "Temporal worker remains shared after shutdown",
+        WorkerBridgeError::CompletionStranded => {
+            "Temporal workflow completion was not processed before Core shut down"
+        }
+        WorkerBridgeError::CoreWaitTimedOut => "Temporal Core did not respond within its bound",
     }
 }
 
@@ -551,6 +563,138 @@ pub enum ReadinessWait {
 /// supervisor mailbox responsive to lifecycle messages while still avoiding a
 /// polling spin when Core is quiet.
 pub const READINESS_WAIT_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// Upper bound for one replay workflow completion, rejection, or lane join.
+///
+/// Replay completions are processed by Core's in-process workflow stream and
+/// a mock client, so a healthy completion finishes in milliseconds. The bound
+/// only turns a Core or scheduler defect into a typed error instead of a
+/// supervisor that blocks forever (issue #965).
+pub const REPLAY_CORE_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How long a replay completion may stay pending after Core's workflow stream
+/// has terminated before it is classified as stranded.
+///
+/// Once the workflow lane has observed `PollError::ShutDown`, Core's workflow
+/// processing thread has dropped its input receiver, so a completion sent
+/// before that point either already has its reply or never will (see
+/// [`complete_workflow_unless_stranded`]). The grace only absorbs the gap
+/// between the receiver drop and this bridge observing the flag.
+pub const REPLAY_STRANDED_COMPLETION_GRACE: Duration = Duration::from_millis(250);
+
+/// Interval at which a pending replay completion rechecks whether Core's
+/// workflow stream has terminated. Short enough that a stranded completion
+/// is released promptly, long enough not to spin a Tokio worker.
+const REPLAY_COMPLETION_CHECK_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Outcome of a replay workflow completion bounded by
+/// [`complete_workflow_unless_stranded`].
+#[derive(Debug)]
+enum GuardedCompletion {
+    /// Core returned a result for the completion.
+    Finished(Result<(), CompleteWfError>),
+    /// Core's workflow stream terminated while the completion awaited its
+    /// reply, so no reply can ever arrive. The completion message may have
+    /// been dropped unprocessed.
+    Stranded,
+    /// Neither a reply nor stream termination was observed within
+    /// [`REPLAY_CORE_WAIT_TIMEOUT`].
+    TimedOut,
+}
+
+/// Selects how a workflow completion awaits Core's reply.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CompletionWait {
+    /// Live workers await Core directly. Their shutdown path is bounded as a
+    /// whole by [`PollLanes::drain_and_join_for_shutdown`].
+    Unbounded,
+    /// Replay workers bound each completion with
+    /// [`complete_workflow_unless_stranded`].
+    ReplayBounded,
+}
+
+/// Sends one workflow completion to a replay worker and waits for Core's
+/// reply, but never forever.
+///
+/// Core's `complete_workflow_activation` sends the completion into the
+/// workflow stream's unbounded Tokio channel together with a oneshot reply
+/// sender, then awaits the reply. When the stream ends, Core relies on the
+/// channel's receiver drop to discard queued messages, which drops the reply
+/// sender and lets the caller observe a closed reply as "ignored". Tokio's
+/// receiver drain, however, cannot see a message whose sender passed the
+/// channel's closed check before the receiver closed but finished pushing the
+/// value after the drain. That message (and its reply sender) then lives
+/// until the channel's last sender is dropped; the sender is owned by Core's
+/// `Workflows`, which the bridge itself keeps alive while it waits. The
+/// completion therefore waits forever. Replay routinely sends its last
+/// eviction acknowledgement while Core's replay stream is finishing its
+/// natural shutdown, so the rare window is reachable on every replay; landing
+/// in it is the intermittent hang in issue #965.
+///
+/// The bridge cannot repair Core's channel, so it bounds the await instead:
+///
+/// * a reply that arrives is returned unchanged;
+/// * once `signal` reports that the workflow lane observed Core's
+///   `ShutDown` (the processing thread has dropped its receiver) and the
+///   reply is still missing after [`REPLAY_STRANDED_COMPLETION_GRACE`], the
+///   completion is reported as [`GuardedCompletion::Stranded`];
+/// * otherwise the wait ends with [`GuardedCompletion::TimedOut`] after
+///   [`REPLAY_CORE_WAIT_TIMEOUT`].
+///
+/// Dropping Core's future after the first poll is safe: the message was sent
+/// synchronously on that poll, and the future then owns only the reply
+/// receiver. Must run inside the worker's Tokio runtime because it uses
+/// Tokio timers.
+async fn complete_workflow_unless_stranded(
+    worker: &Worker,
+    signal: &Readiness,
+    completion: WorkflowActivationCompletion,
+) -> GuardedCompletion {
+    await_reply_unless_stranded(
+        worker.complete_workflow_activation(completion),
+        signal,
+        REPLAY_CORE_WAIT_TIMEOUT,
+    )
+    .await
+}
+
+/// Awaits one Core completion reply under the stranded-stream and overall
+/// bounds described in [`complete_workflow_unless_stranded`].
+///
+/// Separated from the Core call so the classification can be tested with a
+/// reply future that never resolves, which is otherwise only reachable
+/// through a rare scheduler interleaving inside Tokio's channel.
+async fn await_reply_unless_stranded<F>(
+    reply: F,
+    signal: &Readiness,
+    bound: Duration,
+) -> GuardedCompletion
+where
+    F: std::future::Future<Output = Result<(), CompleteWfError>>,
+{
+    tokio::pin!(reply);
+    let deadline = Instant::now() + bound;
+    let mut stream_ended_at: Option<Instant> = None;
+    loop {
+        tokio::select! {
+            // Poll Core first so its send happens on the first iteration and a
+            // ready reply always wins over a coincident timer tick.
+            biased;
+            result = &mut reply => return GuardedCompletion::Finished(result),
+            () = tokio::time::sleep(REPLAY_COMPLETION_CHECK_INTERVAL) => {}
+        }
+        let now = Instant::now();
+        if signal.core_stream_ended() {
+            let ended_at = *stream_ended_at.get_or_insert(now);
+            if now.saturating_duration_since(ended_at) >= REPLAY_STRANDED_COMPLETION_GRACE {
+                return GuardedCompletion::Stranded;
+            }
+        }
+        if now >= deadline {
+            return GuardedCompletion::TimedOut;
+        }
+    }
+}
 
 /// Shared wake state for one Rust-owned poll queue.
 ///
@@ -625,6 +769,12 @@ struct ReadinessState {
     /// polls may still enqueue messages while the flag is true; pending work
     /// always takes precedence over this terminal state.
     closed: bool,
+    /// Set only when Core itself reported `PollError::ShutDown` to this
+    /// lane's poll loop, which means Core's workflow stream has terminated.
+    /// Unlike `closed`, a bridge-initiated shutdown never sets it, so replay
+    /// completions use it to detect a reply that can no longer arrive (see
+    /// [`complete_workflow_unless_stranded`]).
+    core_stream_ended: bool,
 }
 
 impl Readiness {
@@ -777,14 +927,35 @@ impl Readiness {
 
     /// Marks the lane as normally closed while retaining queued work for drain.
     fn close(&self) {
+        self.close_inner(false);
+    }
+
+    /// Closes the lane because Core's poll reported `ShutDown`, recording that
+    /// Core's workflow stream has terminated.
+    fn close_after_core_shutdown(&self) {
+        self.close_inner(true);
+    }
+
+    /// Shared body of [`Self::close`] and [`Self::close_after_core_shutdown`].
+    /// The Core flag is sticky: a later bridge-side close never clears it.
+    fn close_inner(&self, core_stream_ended: bool) {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.closed = true;
+        state.core_stream_ended |= core_stream_ended;
         self.wake.notify_all();
         drop(state);
         self.any.notify();
+    }
+
+    /// Reports whether Core has terminated the stream feeding this lane.
+    fn core_stream_ended(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .core_stream_ended
     }
 
     /// Blocks until work, a fatal error, or terminal closure is observable.
@@ -1290,14 +1461,31 @@ impl PollLanes {
     /// acknowledged. The join loop therefore races the lane handle against
     /// the ready queue and sends only shutdown-safe empty completions. A
     /// replay activation never receives the live-worker failure completion.
+    ///
+    /// The whole join is bounded by [`REPLAY_CORE_WAIT_TIMEOUT`], and each
+    /// acknowledgement by [`complete_workflow_unless_stranded`]. If the lane
+    /// has not stopped by the deadline it is aborted and awaited; abortion
+    /// takes effect at the lane's next suspension point, so the join still
+    /// consumes the handle and no producer survives it. That outcome is
+    /// reported as a lane error so the caller does not finalize a worker
+    /// whose shutdown Core never confirmed.
     pub async fn join_replay_poll_lane(&mut self) -> Result<(), PollLaneError> {
-        let Some(workflow_lane) = self.workflow_lane.take() else {
+        let Some(mut workflow_lane) = self.workflow_lane.take() else {
             return Ok(());
         };
-        tokio::pin!(workflow_lane);
+        let deadline = tokio::time::sleep(REPLAY_CORE_WAIT_TIMEOUT);
+        tokio::pin!(deadline);
         let mut first_error = None;
         loop {
             tokio::select! {
+                () = &mut deadline => {
+                    workflow_lane.abort();
+                    let _ = (&mut workflow_lane).await;
+                    first_error = Some(PollLaneError::Core(
+                        "workflow poll lane did not stop within its bound".to_owned(),
+                    ));
+                    break;
+                }
                 result = &mut workflow_lane => {
                     if let Err(error) = result {
                         first_error = Some(PollLaneError::Core(format!(
@@ -1319,7 +1507,15 @@ impl PollLanes {
                             .unwrap_or_else(|error| error.into_inner())
                             .force_remove_workflow(&run_id);
                         let completion = WorkflowActivationCompletion::empty(run_id);
-                        let _ = self.worker.complete_workflow_activation(completion).await;
+                        // Disposal ignores the outcome: a stranded or timed-out
+                        // acknowledgement leaves nothing more to retire, and
+                        // the deadline above still bounds the join.
+                        let _ = complete_workflow_unless_stranded(
+                            &self.worker,
+                            &self.workflow_signal,
+                            completion,
+                        )
+                        .await;
                     }
                 }
             }
@@ -1719,9 +1915,14 @@ impl PollLanes {
             }
         }
 
+        // Each acknowledgement is bounded: disposal may run after Core's
+        // replay stream ended on its own, which is exactly when an empty
+        // completion can be stranded in Core's input channel (issue #965).
         for run_id in workflow_ids {
             let completion = WorkflowActivationCompletion::empty(run_id);
-            let _ = self.worker.complete_workflow_activation(completion).await;
+            let _ =
+                complete_workflow_unless_stranded(&self.worker, &self.workflow_signal, completion)
+                    .await;
         }
     }
 
@@ -1793,7 +1994,38 @@ impl PollLanes {
         &self,
         completion: WorkflowActivationCompletion,
     ) -> Result<(), WorkerBridgeError> {
+        self.complete_workflow_with(completion, CompletionWait::Unbounded)
+            .await
+    }
+
+    /// Replay variant of [`Self::complete_workflow`] whose Core await is
+    /// bounded by [`complete_workflow_unless_stranded`].
+    ///
+    /// The ledger lease is retired before Core is called, exactly as for a
+    /// live worker. A stranded empty completion is reported as success: Core
+    /// itself ignores an empty completion that reaches a terminated workflow
+    /// stream, and the acknowledgement has no other effect. A stranded
+    /// non-empty completion, or a timeout, is a typed error; the lease stays
+    /// retired because Core may already have consumed the completion, so
+    /// restoring it could produce a second Core completion for one task.
+    pub async fn complete_replay_workflow(
+        &self,
+        completion: WorkflowActivationCompletion,
+    ) -> Result<(), WorkerBridgeError> {
+        self.complete_workflow_with(completion, CompletionWait::ReplayBounded)
+            .await
+    }
+
+    /// Shared implementation of [`Self::complete_workflow`] and
+    /// [`Self::complete_replay_workflow`]; `wait` selects how Core's reply
+    /// is awaited.
+    async fn complete_workflow_with(
+        &self,
+        completion: WorkflowActivationCompletion,
+        wait: CompletionWait,
+    ) -> Result<(), WorkerBridgeError> {
         let run_id = completion.run_id.clone();
+        let is_empty = completion.is_empty();
         let was_eviction = {
             let mut ledger = self
                 .ledger
@@ -1815,7 +2047,28 @@ impl PollLanes {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .probe_complete_completion(&run_id);
-        match self.worker.complete_workflow_activation(completion).await {
+        let core_result = match wait {
+            CompletionWait::Unbounded => self.worker.complete_workflow_activation(completion).await,
+            CompletionWait::ReplayBounded => {
+                match complete_workflow_unless_stranded(
+                    &self.worker,
+                    &self.workflow_signal,
+                    completion,
+                )
+                .await
+                {
+                    GuardedCompletion::Finished(result) => result,
+                    GuardedCompletion::Stranded if is_empty => return Ok(()),
+                    GuardedCompletion::Stranded => {
+                        return Err(WorkerBridgeError::CompletionStranded);
+                    }
+                    GuardedCompletion::TimedOut => {
+                        return Err(WorkerBridgeError::CoreWaitTimedOut);
+                    }
+                }
+            }
+        };
+        match core_result {
             Ok(()) => Ok(()),
             Err(error) => {
                 let mut ledger = self
@@ -1905,6 +2158,31 @@ impl PollLanes {
         run_id: &str,
         reason: &'static str,
     ) -> Result<(), WorkerBridgeError> {
+        self.reject_workflow_delivery_with(run_id, reason, CompletionWait::Unbounded)
+            .await
+    }
+
+    /// Replay variant of [`Self::reject_workflow_delivery_with_reason`] whose
+    /// Core await is bounded like [`Self::complete_replay_workflow`]. The
+    /// lease is retired up front in both variants, so a stranded or timed-out
+    /// rejection never leaves ledger debt behind.
+    pub async fn reject_replay_workflow_delivery(
+        &self,
+        run_id: &str,
+        reason: &'static str,
+    ) -> Result<(), WorkerBridgeError> {
+        self.reject_workflow_delivery_with(run_id, reason, CompletionWait::ReplayBounded)
+            .await
+    }
+
+    /// Shared implementation of the two rejection entry points; `wait`
+    /// selects how Core's reply is awaited.
+    async fn reject_workflow_delivery_with(
+        &self,
+        run_id: &str,
+        reason: &'static str,
+        wait: CompletionWait,
+    ) -> Result<(), WorkerBridgeError> {
         // Retire the ledger lease *before* the Core completion await.
         //
         // Failing an activation causes Core to schedule a follow-up cache
@@ -1954,10 +2232,30 @@ impl PollLanes {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .probe_reject_completion(run_id);
-        self.worker
-            .complete_workflow_activation(completion)
-            .await
-            .map_err(|error| WorkerBridgeError::CoreWorkflow(error.to_string()))
+        let core_result = match wait {
+            CompletionWait::Unbounded => self.worker.complete_workflow_activation(completion).await,
+            CompletionWait::ReplayBounded => {
+                match complete_workflow_unless_stranded(
+                    &self.worker,
+                    &self.workflow_signal,
+                    completion,
+                )
+                .await
+                {
+                    GuardedCompletion::Finished(result) => result,
+                    // An eviction acknowledgement is empty; see
+                    // `complete_replay_workflow` for why that is success.
+                    GuardedCompletion::Stranded if eviction_only => return Ok(()),
+                    GuardedCompletion::Stranded => {
+                        return Err(WorkerBridgeError::CompletionStranded);
+                    }
+                    GuardedCompletion::TimedOut => {
+                        return Err(WorkerBridgeError::CoreWaitTimedOut);
+                    }
+                }
+            }
+        };
+        core_result.map_err(|error| WorkerBridgeError::CoreWorkflow(error.to_string()))
     }
 
     /// Test-only view of the reject-completion ordering probes recorded by the
@@ -2128,7 +2426,7 @@ async fn run_workflow_lane(
         let activation = match worker.poll_workflow_activation().await {
             Ok(activation) => activation,
             Err(PollError::ShutDown) => {
-                signal.close();
+                signal.close_after_core_shutdown();
                 return;
             }
             Err(error) => {
@@ -3276,5 +3574,97 @@ mod readiness_tests {
         let (workflow, activity) = lane_pair();
 
         assert_eq!(wait_any_lane(&workflow, &activity), ReadinessWait::TimedOut);
+    }
+}
+
+/// Tests for the bounded replay completion await (issue #965).
+///
+/// The real stranding needs a rare interleaving inside Tokio's mpsc receiver
+/// drop, so these tests drive [`await_reply_unless_stranded`] with reply
+/// futures that model each Core outcome directly.
+#[cfg(test)]
+mod stranded_completion_tests {
+    use super::{
+        GuardedCompletion, REPLAY_STRANDED_COMPLETION_GRACE, Readiness, await_reply_unless_stranded,
+    };
+    use std::time::Duration;
+
+    /// Builds the current-thread runtime with timers that the helper needs.
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("test runtime should start")
+    }
+
+    /// A reply that never arrives after Core's stream ended is classified as
+    /// stranded instead of waiting for the much longer overall bound.
+    #[test]
+    fn pending_reply_after_core_shutdown_is_stranded() {
+        let signal = Readiness::new();
+        signal.close_after_core_shutdown();
+        let outcome = runtime().block_on(await_reply_unless_stranded(
+            std::future::pending(),
+            &signal,
+            Duration::from_secs(60),
+        ));
+        assert!(
+            matches!(outcome, GuardedCompletion::Stranded),
+            "{outcome:?}"
+        );
+    }
+
+    /// A bridge-initiated close does not prove Core's stream has ended, so a
+    /// pending reply is only released by the overall bound.
+    #[test]
+    fn bridge_close_alone_does_not_strand_a_reply() {
+        let signal = Readiness::new();
+        signal.close();
+        let outcome = runtime().block_on(await_reply_unless_stranded(
+            std::future::pending(),
+            &signal,
+            REPLAY_STRANDED_COMPLETION_GRACE * 2,
+        ));
+        assert!(
+            matches!(outcome, GuardedCompletion::TimedOut),
+            "{outcome:?}"
+        );
+    }
+
+    /// A reply that is already available wins even when Core's stream has
+    /// ended, so a processed completion is never misreported as stranded.
+    #[test]
+    fn ready_reply_is_returned_after_core_shutdown() {
+        let signal = Readiness::new();
+        signal.close_after_core_shutdown();
+        let outcome = runtime().block_on(await_reply_unless_stranded(
+            std::future::ready(Ok(())),
+            &signal,
+            Duration::from_secs(60),
+        ));
+        assert!(
+            matches!(outcome, GuardedCompletion::Finished(Ok(()))),
+            "{outcome:?}"
+        );
+    }
+
+    /// A reply that arrives within the grace period after Core's stream ended
+    /// is still returned rather than abandoned.
+    #[test]
+    fn late_reply_within_grace_is_returned() {
+        let signal = Readiness::new();
+        signal.close_after_core_shutdown();
+        let outcome = runtime().block_on(await_reply_unless_stranded(
+            async {
+                tokio::time::sleep(REPLAY_STRANDED_COMPLETION_GRACE / 5).await;
+                Ok(())
+            },
+            &signal,
+            Duration::from_secs(60),
+        ));
+        assert!(
+            matches!(outcome, GuardedCompletion::Finished(Ok(()))),
+            "{outcome:?}"
+        );
     }
 }

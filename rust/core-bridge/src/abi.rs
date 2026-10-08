@@ -2397,6 +2397,10 @@ fn replay_worker_failure(error: ReplayWorkerError) -> Failure {
         ReplayWorkerError::Finalization(_) => {
             (STATUS_WORKER, "Temporal replay worker finalization failed")
         }
+        ReplayWorkerError::TimedOut(_) => (
+            STATUS_WORKER,
+            "Temporal replay worker did not respond within its bound",
+        ),
     };
     Failure {
         status,

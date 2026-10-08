@@ -114,10 +114,10 @@ or reached replay shutdown.
 
 | Operation | Success means | Expected failure and owner action |
 | --- | --- | --- |
-| `Feed_replay_history` | The history entered the one-slot feeder. A full slot applies backpressure; the C stub releases the OCaml runtime lock while the Rust future waits. | `PROTOCOL` (11) means the document or Core history is invalid and no history was admitted. `INVALID_STATE` (5) means the feeder is closed or the worker is absent; do not retry the same input after `Finish_replay_input`. |
+| `Feed_replay_history` | The history entered the one-slot feeder. A full slot applies backpressure; the C stub releases the OCaml runtime lock while the Rust future waits. | `PROTOCOL` (11) means the document or Core history is invalid and no history was admitted. `INVALID_STATE` (5) means the feeder is closed or the worker is absent; do not retry the same input after `Finish_replay_input`. `WORKER` (8) means the slot did not drain within the 60-second replay bound and the history was not admitted. |
 | `Try_poll_replay_workflow` | One activation was copied into OCaml and one completion lease was retained. | `NOT_READY` (10) means the queue was empty and no lease exists. If OCaml cannot decode successful bytes, it passes the original byte string to `Reject_replay_workflow`; it never invents a run ID. |
 | `Wait_replay_workflow` | The lane either has work or has reached natural shutdown; it does not consume an activation. | `NOT_READY` (10) is the bounded 100 ms timeout and means “service the mailbox, then retry”. `INVALID_STATE` (5) means no replay worker exists. |
-| `Complete_replay_workflow` | Core accepted the completion for the exact leased run. The OCaml lease is removed only after that success. | `PROTOCOL` (11) covers malformed JSON or a completion for a different run. A Core/lane failure is `WORKER` (8); use disposal/cleanup rather than silently dropping the retained native graph. |
+| `Complete_replay_workflow` | Core accepted the completion for the exact leased run, or the completion was an empty acknowledgement that Core's already-terminated replay stream can no longer process (see [Bounded Core waits](#bounded-core-waits)). The OCaml lease is removed only after that success. | `PROTOCOL` (11) covers malformed JSON or a completion for a different run. A Core/lane failure is `WORKER` (8), including a non-empty completion stranded by Core's shutdown and a Core reply missing for 60 seconds; use disposal/cleanup rather than silently dropping the retained native graph. |
 | `Reject_replay_workflow` | Rust decoded the supplied document, confirmed that its semantic activation equals the retained activation, reported a bounded failure to Core, and retired that lease. | `PROTOCOL` (11) means the document is malformed, decodes to a different activation, or does not identify a retained lease. JSON formatting changes that preserve the same semantic activation are accepted. The original OCaml decode error remains the primary diagnostic. |
 | `Finish_replay_input` | The feeder sender was closed; already queued histories remain drainable. Repeating it is harmless. | There is no “history complete” claim here: `Finalize_replay` must still observe shutdown and an empty completion ledger. |
 | `Finalize_replay` | Input is closed, Core reported workflow-lane `Shutdown`, every activation was completed/rejected, and the native graph was joined and finalized. | `OUTSTANDING_TASKS` (9) is `ReplayNotDrained`; the worker remains owned and can be drained before retrying. `WORKER` (8) retains the graph when lane or Core finalization fails. |
@@ -280,6 +280,47 @@ poll-lane or finalization failure returns the retained worker and a typed error
 so the caller can retry; the bridge never silently drops the unfinalized native
 graph.
 
+### Bounded Core waits
+
+Every replay wait on Core either has a bound or is shown to terminate, so a
+Core or scheduler defect becomes a typed `Replay_error` instead of a
+supervisor Domain that blocks forever (issue #965):
+
+| Wait | Bound | Outcome when the bound is reached |
+| --- | --- | --- |
+| Feeder send (`feed_json`) | `REPLAY_CORE_WAIT_TIMEOUT`, 60 s | `ReplayWorkerError::TimedOut`; the history is dropped unsent. |
+| Completion and rejection replies | 60 s, or 250 ms after Core's workflow stream has ended | Empty acknowledgement: success. Non-empty: `CompletionStranded`. No reply and no stream end: `CoreWaitTimedOut`. The lease stays retired in every case, because Core may already have consumed the completion. |
+| Disposal acknowledgements | Same as completions | Outcome ignored; disposal continues. |
+| Replay lane join (finalize and dispose) | 60 s | The lane task is aborted and awaited, then reported as a `PollLane` error with the worker retained. |
+| Core `finalize_shutdown` | Not timed | Terminates: it runs only after the lane has joined, Core's workflow thread has exited, the mock client answers in-process, and Core caps its final slot-permit wait at five seconds. A timeout would have to drop the consumed Core worker mid-finalization. |
+
+The completion bound fixes the hang in issue #965. Core's
+`complete_workflow_activation` sends the completion and a oneshot reply sender
+into its workflow stream's unbounded Tokio channel, then awaits the reply.
+When the stream ends, Core relies on the channel receiver's drop to discard
+queued messages, which also drops the reply sender, and it treats a dropped
+reply to an empty completion as "ignored". Tokio's receiver drain cannot see a
+message whose send passed the channel's closed check before the receiver
+closed but finished its push after the drain. That message, with its reply
+sender, then lives until the last channel sender is dropped. Core's
+`Workflows` owns that sender, and the bridge keeps the worker alive while it
+waits, so the completion waits forever.
+
+In replay this interleaving is routine. With `ignore_evicts_on_shutdown`,
+Core's replay stream reaches its natural shutdown while the final eviction
+acknowledgement is being sent. Most runs log Core's "Tried to interact with
+workflow state after it shut down" warning and continue. Rarely, the send
+lands in the race window. The workflow lane then reports `PollError::ShutDown`
+only after Core's processing thread has dropped its receiver, so a reply still
+missing after that point can never arrive. The lane records this as a
+Core-originated close, separate from a bridge-initiated shutdown, and the
+bounded await uses it to release the stranded completion.
+
+Dropping Core's completion future after its first poll is safe. The message
+was sent synchronously on that poll, and the future then owns only the reply
+receiver. Live workers keep the unbounded await, because their whole shutdown
+is already bounded by `drain_and_join_for_shutdown`.
+
 ## Current evidence and limits
 
 The focused Rust tests in
@@ -302,6 +343,15 @@ cover:
 - a deterministic guard that the shared history fixture initializes the
   workflow rather than delivering a fatal-machines-error eviction, so an
   invalid fixture cannot silently reintroduce the shutdown-race panic below.
+
+`replay_worker_accepts_one_history_document` runs under a 30-second test
+deadline that names the step it was blocked in, so a regression of issue #965
+fails fast instead of consuming the CI job timeout. The
+`stranded_completion_tests` module in
+[`worker_bridge.rs`](../../rust/core-bridge/src/worker_bridge.rs) checks each
+outcome of the bounded completion await with model reply futures: a pending
+reply after Core's shutdown is stranded, a bridge-only close is not, and a
+ready or late-but-within-grace reply is returned.
 
 The ABI-focused integration test in
 [`tests/replay_abi.rs`](../../rust/core-bridge/tests/replay_abi.rs) adds null

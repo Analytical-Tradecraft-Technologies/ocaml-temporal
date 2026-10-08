@@ -15,6 +15,35 @@ implementation when a later entry documents that work as complete. The
 records the current tested source, named assertions and successful CI job for
 the Temporal acceptance controllers.
 
+## 2026-10-09: Bounded replay completions (#965)
+
+`replay_worker_accepts_one_history_document` hung intermittently on Windows CI
+until the job timeout. Running the unit tests in parallel loops on macOS
+reproduced it 3 times in about 2,500 runs, all under parallel load. In all three, the test thread was
+blocked in the final eviction acknowledgement, and Core's workflow processing
+thread had already exited.
+
+The cause is a race between Core's natural replay shutdown and that
+acknowledgement. Core's completion reply sender can be stranded in a Tokio
+channel whose receiver has dropped, and Core's `Workflows` keeps the sender
+alive. The [replay bridge reference](reference/replay-bridge.md#bounded-core-waits)
+explains the mechanism.
+
+Changes:
+
+- Replay completions, rejections, and disposal acknowledgements now await
+  Core with a bound. An empty acknowledgement still pending 250 ms after the
+  workflow lane observed Core's `ShutDown` is treated as accepted, which is
+  what Core does for an empty completion that reaches a closed stream.
+- The feeder send and the replay lane join are bounded at 60 seconds, so
+  other stalls become typed `WORKER` failures, and hence `Replay_error`.
+- The test runs under a 30-second deadline that reports the blocked step.
+
+After the fix, 3,200 runs of the same loops passed with no hang. Temporary
+instrumentation recorded two stranded acknowledgements in those runs, and
+both were released by the new bound. Also verified with `cargo test --locked`,
+clippy, rustfmt, and the bridge and history-corpus dune tests.
+
 ## 2026-10-09: Deterministic race matrix (#520)
 
 `test/runtime/test_race_matrix.ml` drives the private workflow runtime with
