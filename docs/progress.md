@@ -53,6 +53,42 @@ instrumentation recorded two stranded acknowledgements in those runs, and
 both were released by the new bound. Also verified with `cargo test --locked`,
 clippy, rustfmt, and the bridge and history-corpus dune tests.
 
+## 2026-10-09: Query and suspended-update recovery after eviction and restart (#530)
+
+`test/integration/interaction_recovery/regression.exe` joins
+`LIVE_REGRESSION_EXECUTABLES`, so `make test-temporal-live-regressions` runs it
+against the Compose stack. It runs three executions of one workflow whose
+`add` update handler suspends on a signal and then starts a durable timer:
+
+- **Eviction:** on a worker with a one-entry sticky cache, a filler workflow
+  forces the run out of the cache after the update is accepted. Queries then
+  answer from replayed state, and the release signal resumes the handler from
+  history.
+- **Restart:** the worker process that accepted the update is terminated, and a
+  fresh process answers queries and completes the update. History attributes
+  acceptance to the original process and completion to the replacement.
+- **Control:** the same commands with no queries, rejected updates, eviction,
+  or replacement.
+
+A `probe` query reports per-process counts of workflow-body starts and
+validator calls, proving that answers come from a replay and that replaying an
+accepted update does not re-run its validator. Exact run histories, read with
+the pinned CLI, show the update accepted but not completed while suspended,
+then one acceptance and one completion with the original update ID. A handle
+re-attached by update ID returns the same result. Apart from workflow-task
+events, both recovered histories equal the control run's, compared by event
+type and an allowlist of meaningful attributes (payloads, update and signal
+names, update ID and outcome, timer duration).
+
+Evidence: `make test-temporal-live-regressions` passed all six suites in the
+Linux development image (OCaml 5.2) against a fresh Compose Temporal
+1.32.0/PostgreSQL stack. Eight sequential and three concurrent runs of this
+suite also passed against that stack with the driver and workers built on
+macOS (OCaml 5.4.1). As a sensitivity check, forcing
+`run_validator = true` for replayed updates made the suite fail at the first
+post-eviction query, and giving only the recovered runs a different timer
+duration failed the control comparison. No SDK defect was found.
+
 ## 2026-10-08: Successful activity completions require a payload (#954)
 
 The activity completion protocol accepted `{"kind":"completed","result":null}`
