@@ -432,3 +432,34 @@ diverge on replay, and because the typed handler API has no channel for a
 signal it cannot type. Wrong arity is classified with decode failures rather
 than as a terminal workflow failure so that a malformed sender can never close
 a run that a corrected worker could still complete.
+
+### Handler races with completion and cancellation
+
+The SDK does not wait for unfinished handlers, and workflow cancellation is
+immediate (cooperative cleanup is [#514]). The deterministic race matrix in
+[`test/runtime/test_race_matrix.ml`](../../test/runtime/test_race_matrix.ml)
+feeds scripted Core activations to the workflow runtime and pins these
+outcomes. "Same activation" means Core delivered the jobs in one workflow
+task; Core orders signal and update jobs before timer, activity, child, and
+cancellation jobs.
+
+| Ordering | Worker commands | Update outcome |
+| --- | --- | --- |
+| Suspended update finishes before the root completes | `accepted`, then `completed`, then `Complete_workflow` | Completed |
+| Handler and root timers fire in one activation, handler's first | `completed`, `Complete_workflow` | Completed |
+| Non-suspending update and root completion in one activation | `accepted`, `completed`, `Complete_workflow` | Completed |
+| Validator rejects in the activation where the root completes | `rejected`, `Complete_workflow` | Rejected |
+| Suspended update when the root completes or the run is cancelled | `accepted` earlier; then only the terminal command | Abandoned |
+| Handler and root timers fire in one activation, root's first | `Complete_workflow` only | Abandoned (known gap [#962]) |
+| Update and `Cancel_workflow` in one activation | `Cancel_workflow_execution` only; handler not invoked | Unanswered (known gap [#962]) |
+| Signal and `Cancel_workflow` in one activation | `Cancel_workflow_execution` only; handler not invoked | n/a (known gap [#962]) |
+
+An abandoned update is accepted, and its completion is never sent. When the run
+closes, the Temporal Server fails the caller's pending update request. That
+server step and the caller-visible results of the [#962] orderings are not
+yet verified against a live server. A replay with `run_validator = false`
+reproduces each accepted row exactly even when the validator would now reject,
+because a replayed update follows its recorded acceptance.
+
+[#514]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/514
+[#962]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/962
