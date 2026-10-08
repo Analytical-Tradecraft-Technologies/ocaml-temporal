@@ -1,0 +1,22 @@
+; Process-level tests for the offline replay checker in examples/replay
+; (issue #516). The altered executable links deliberately incompatible
+; versions of the example workflow to produce the failure exit statuses.
+
+(executable
+ (name altered_replay_history)
+ (modules altered_replay_history)
+ (libraries
+  temporal-sdk
+  temporal_sdk_examples_common
+  temporal_sdk_examples_replay))
+
+(test
+ (name test_replay_cli)
+ (modules test_replay_cli)
+ (libraries unix)
+ (action
+  (run
+   %{test}
+   %{exe:../../examples/replay/replay_history.exe}
+   %{exe:altered_replay_history.exe}
+   %{dep:../../examples/replay/histories/compose-message-ada-lovelace.pb})))

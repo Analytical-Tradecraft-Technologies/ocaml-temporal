@@ -1304,6 +1304,40 @@ histories recorded before and after the change. `replay` blocks the calling
 thread; do not call it from workflow or activity code. Every call releases
 its native resources before returning, on success and on every failure.
 
+### Run a replay check before deploying
+
+[`examples/replay`](../../examples/replay) is a small command to copy into an
+application and run as the pre-deployment gate. Its reusable
+`replay_command.ml` reads binary history files, replays each one offline,
+prints one `PASS` or `FAIL` line per history, and exits with a distinct status
+for nondeterminism (1), a failed workflow task (2), an invalid (3) or
+unsupported (4) history, a replay that could not run (5), a usage error (64)
+and an unreadable file (66). The application supplies only the entry point,
+which must link the same workflow definitions, codecs, and handlers as the
+production worker:
+
+```ocaml
+let () =
+  Replay_command.main
+    ~workflows:
+      [
+        Temporal.Replay.workflow ~signals:[ cancel_handler ] order_workflow;
+        Temporal.Replay.workflow invoice_workflow;
+      ]
+```
+
+```sh
+order_replay.exe --workflow-id order-123 histories/order-123.pb \
+  --workflow-id order-456 histories/order-456.pb
+```
+
+Run it in the job that builds the release candidate and fail the job on any
+non-zero status. The command needs no server or credentials, only history
+files exported with read access to the namespace. The
+[examples guide](../../examples/README.md#export-a-history) gives the complete
+`temporal workflow show --output json` export and JSON-to-protobuf conversion
+steps, and the exit status table.
+
 ## 10. Validate locally
 
 From the repository root, the focused Make targets are:

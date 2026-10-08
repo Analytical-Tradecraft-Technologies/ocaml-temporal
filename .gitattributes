@@ -27,3 +27,7 @@ scripts/license-texts/** text eol=lf
 # their manifest (docs/reference/history-corpus.md); never convert them.
 test/fixtures/history-corpus/histories/** -text
 test/fixtures/history-corpus/manifest.json text eol=lf
+
+# The replay example's history is replayed byte for byte, and its JSON export
+# is the provenance it was converted from; never convert either.
+examples/replay/histories/** -text
