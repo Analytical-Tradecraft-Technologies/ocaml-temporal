@@ -151,7 +151,9 @@ Each record is exactly one line: in `FILE`, `ID`, the diagnostic and usage
 errors, a backslash is printed as `\\`, newline, carriage return and tab as
 `\n`, `\r` and `\t`, and any other control character as `\xHH`, so a path or
 message containing line breaks cannot split a record or imitate another one.
-Other text, including UTF-8, is printed unchanged. The process exits with the status of the first failing history in
+Other text, including UTF-8, is printed unchanged. Output is written in binary
+mode, so every line ends in a bare `\n` on Windows as well, and a Windows
+path's `\` separators appear as `\\`. The process exits with the status of the first failing history in
 command-line order:
 
 | Exit status | Meaning |

@@ -270,8 +270,15 @@ let run ~workflows { namespace; task_queue; inputs } =
 
 (** Parses [arguments] (without the program name), runs the replay, and
     returns the exit status without exiting, so tests and larger programs can
-    embed the command. Usage errors go to standard error. *)
+    embed the command. Usage errors go to standard error.
+
+    Standard output and standard error are switched to binary mode first, so
+    the machine-parsed records end in a bare [\n] on every platform instead
+    of Windows text mode's [\r\n], and the output is byte-identical across
+    platforms. This has no effect on POSIX systems. *)
 let run_command ~program ~workflows arguments =
+  set_binary_mode_out stdout true;
+  set_binary_mode_out stderr true;
   match parse arguments with
   | Help ->
       print_string (usage program);

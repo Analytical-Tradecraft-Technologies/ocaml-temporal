@@ -21,16 +21,24 @@ let example, altered, history =
       (absolute example, absolute altered, history)
   | _ -> failwith "usage: test_replay_cli EXAMPLE ALTERED HISTORY"
 
+(** Renders a dynamic value exactly as the command prints it. Paths must go
+    through this before being compared with the output: on Windows they
+    contain backslashes, which the command escapes as [\\]. *)
+let shown = Replay_command.escape
+
 (** The workflow ID recorded when the example history was captured. *)
 let workflow_id = "compose-message-ada-lovelace"
 
 (** Runs [program] with [arguments] and returns its exit code and complete
     standard output. Standard error is inherited so usage diagnostics appear
-    in the test log. *)
+    in the test log. The pipe is read in binary mode so the bytes compared
+    are exactly the bytes the command wrote; the command itself writes in
+    binary mode, so its lines end in a bare [\n] on every platform. *)
 let run program arguments =
   let channel =
     Unix.open_process_args_in program (Array.of_list (program :: arguments))
   in
+  set_binary_mode_in channel true;
   let output = In_channel.input_all channel in
   match Unix.close_process_in channel with
   | Unix.WEXITED code -> (code, output)
@@ -91,6 +99,8 @@ let check_one_line_per_history ~name ~records ~expect_output ~expected program
     code <> expected
     || List.length lines <> records + 1
     || forged || missing <> []
+    (* Binary-mode output never contains a carriage return, so any [\r] is
+       one that escaped the escaping, on every platform. *)
     || String.contains output '\r'
   then
     failwith
@@ -139,7 +149,7 @@ let () =
       check ~name:"compatible history" ~expected:0
         ~expect_output:
           [
-            "PASS " ^ history ^ " workflow_id=" ^ workflow_id;
+            "PASS " ^ shown history ^ " workflow_id=" ^ workflow_id;
             "replayed 1 history: 1 passed, 0 failed";
           ]
         example
@@ -152,11 +162,11 @@ let () =
         [ "--verbose"; "--workflow-id"; workflow_id; history ];
       check ~name:"missing value" ~expected:64 example [ "--workflow-id" ];
       check ~name:"unreadable file" ~expected:66
-        ~expect_output:[ "FAIL " ^ missing; "cannot read history file" ]
+        ~expect_output:[ "FAIL " ^ shown missing; "cannot read history file" ]
         example
         [ "--workflow-id"; workflow_id; missing ];
       check ~name:"not a history" ~expected:3
-        ~expect_output:[ "FAIL " ^ not_history; "invalid history" ]
+        ~expect_output:[ "FAIL " ^ shown not_history; "invalid history" ]
         example
         [ "--workflow-id"; workflow_id; not_history ];
       check ~name:"empty history" ~expected:3
@@ -168,9 +178,9 @@ let () =
       check ~name:"several histories" ~expected:3
         ~expect_output:
           [
-            "PASS " ^ history ^ " workflow_id=" ^ workflow_id;
-            "FAIL " ^ not_history;
-            "PASS " ^ history ^ " workflow_id=another-execution";
+            "PASS " ^ shown history ^ " workflow_id=" ^ workflow_id;
+            "FAIL " ^ shown not_history;
+            "PASS " ^ shown history ^ " workflow_id=another-execution";
             "replayed 3 histories: 2 passed, 1 failed";
           ]
         example
@@ -179,7 +189,7 @@ let () =
           "--workflow-id"; "another-execution"; history;
         ];
       check ~name:"nondeterminism" ~expected:1
-        ~expect_output:[ "FAIL " ^ history; ": nondeterminism (run " ]
+        ~expect_output:[ "FAIL " ^ shown history; ": nondeterminism (run " ]
         altered
         [ "nondeterministic"; "--workflow-id"; workflow_id; history ];
       check ~name:"first failure decides" ~expected:1
