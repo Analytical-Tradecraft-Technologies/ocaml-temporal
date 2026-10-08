@@ -102,6 +102,7 @@ require_text() {
     }
   ' "$root/temporal-sdk.opam.locked"
 } > "$scratch/expected"
+cp "$scratch/expected" "$scratch/opam-closure"
 doc_table '## Locked OCaml closure' | columns 1,2 > "$scratch/documented"
 compare 'Locked OCaml closure'
 
@@ -112,8 +113,24 @@ compare 'Per-compiler lock overrides'
 
 sed -e 's/#.*//' -e '/^[[:space:]]*$/d' "$root/scripts/docs-tools.locked" \
   | awk '{ print $1 "\t" $2 }' > "$scratch/expected"
+cp "$scratch/expected" "$scratch/docs-tools"
 doc_table '## CI-only documentation tooling' | columns 1,2 > "$scratch/documented"
 compare 'CI-only documentation tooling'
+
+# Linking-exception scope: the exact packages admitted under the OCaml
+# linking exception, at the versions their locks pin. The names are the
+# reviewed policy (check-licenses.sh for the compiler and ocamlbuild, the
+# odoc review for the docs tools), so upgrading one of them, or dropping it
+# from its lock, fails until the policy table is reviewed. A package missing
+# from its lock yields no source row and so shows as a stale documented row.
+{
+  awk -F '\t' '$1 == "ocaml" || $1 == "ocaml-base-compiler" || $1 == "ocamlbuild"' \
+    "$scratch/opam-closure"
+  awk -F '\t' '$1 == "tyxml" || $1 == "re" || $1 == "camlp-streams"' \
+    "$scratch/docs-tools"
+} > "$scratch/expected"
+doc_table '## Linking-exception scope' | columns 1,2 > "$scratch/documented"
+compare 'Linking-exception scope'
 
 # Container images: every digest-pinned reference that a build, Compose
 # service, or workflow pulls. Recorded provenance in test fixtures is not a
@@ -147,9 +164,9 @@ else
   require_text 'Locked Cargo closure' "Temporal Core commit \`$revisions\`"
 fi
 
-# Direct Rust dependencies: workspace requirement (or "Core revision" for the
-# git-pinned Core packages), every locked version in lock order, and whether
-# the bridge uses the crate as a normal and/or dev dependency.
+# Direct Rust dependencies: every crate in the workspace dependency table or
+# declared by the bridge, with its requirement, every locked version in lock
+# order, and whether the bridge uses it as a normal and/or dev dependency.
 awk '
   /^\[\[package\]\]$/ { name = ""; next }
   /^name = "/ { split($0, q, "\""); name = q[2]; next }
@@ -159,43 +176,71 @@ awk '
   }
   END { for (n in locked) print n "\t" locked[n] }
 ' "$root/rust/Cargo.lock" > "$scratch/locked"
-awk '
-  /^\[/ { section = $0; next }
-  /^[A-Za-z0-9_-]+([.=]|[ ]*=)/ {
-    name = $0
-    sub(/[ .=].*/, "", name)
-    if (section == "[dependencies]") normal[name] = 1
-    if (section == "[dev-dependencies]") dev[name] = 1
+# Shared awk helpers: a declaration's crate name, and its requirement
+# ("Core revision" for a git `rev` pin, else the version string).
+requirement_awk='
+  function crate(line) {
+    sub(/[ .=].*/, "", line)
+    return line
   }
-  END {
-    for (n in normal) kind[n] = "normal"
-    for (n in dev) kind[n] = (n in kind) ? kind[n] ", dev" : "dev"
-    for (n in kind) print n "\t" kind[n]
+  function requirement(line) {
+    if (line ~ /rev = "/) return "Core revision"
+    if (match(line, /version = "[^"]+"/)) return substr(line, RSTART + 11, RLENGTH - 12)
+    if (match(line, /= "[^"]+"/)) return substr(line, RSTART + 3, RLENGTH - 4)
+    return "unrecognized requirement"
   }
-' "$root/rust/core-bridge/Cargo.toml" > "$scratch/kinds"
-awk '
+'
+awk "$requirement_awk"'
   /^\[/ { active = ($0 == "[workspace.dependencies]"); next }
-  active && /^[A-Za-z0-9_-]+[ ]*=/ {
-    name = $0
-    sub(/[ ]*=.*/, "", name)
-    requirement = ""
-    if ($0 ~ /rev = "/) requirement = "Core revision"
-    else if (match($0, /version = "[^"]+"/)) {
-      requirement = substr($0, RSTART + 11, RLENGTH - 12)
-    } else if (match($0, /= "[^"]+"/)) {
-      requirement = substr($0, RSTART + 3, RLENGTH - 4)
-    }
-    print name "\t" requirement
-  }
+  active && /^[A-Za-z0-9_-]+[ ]*=/ { print crate($0) "\t" requirement($0) }
 ' "$root/rust/Cargo.toml" > "$scratch/requirements"
+# One line per bridge declaration: crate, kind, and either "workspace" when
+# inherited or the requirement written in the bridge manifest itself, so a
+# crate declared directly in the bridge is inventoried like a workspace one.
+# Dependency tables this extractor cannot attribute (build, target-specific,
+# or `[dependencies.<crate>]` sub-tables) fail closed rather than escaping.
+if ! awk "$requirement_awk"'
+  /^\[/ {
+    section = $0
+    if (section ~ /dependencies/ && section != "[dependencies]" \
+        && section != "[dev-dependencies]") {
+      print "unsupported bridge dependency table " section > "/dev/stderr"
+      unsupported = 1
+    }
+    next
+  }
+  /^[A-Za-z0-9_-]+([.=]|[ ]*=)/ {
+    kind = ""
+    if (section == "[dependencies]") kind = "normal"
+    if (section == "[dev-dependencies]") kind = "dev"
+    if (kind == "") next
+    inherited = ($0 ~ /workspace[ ]*=[ ]*true/)
+    print crate($0) "\t" kind "\t" (inherited ? "workspace" : requirement($0))
+  }
+  END { if (unsupported) exit 1 }
+' "$root/rust/core-bridge/Cargo.toml" > "$scratch/declarations"; then
+  echo "dependency inventory: rust/core-bridge/Cargo.toml uses a dependency table the inventory cannot attribute; extend scripts/check-dependency-inventory.sh" >&2
+  failed=1
+fi
+# Union of the workspace table and the bridge declarations. A direct bridge
+# requirement wins over the workspace one; kinds accumulate in manifest order
+# ([dependencies] precedes [dev-dependencies], giving "normal, dev").
 awk -F '\t' '
   FILENAME == ARGV[1] { locked[$1] = $2; next }
-  FILENAME == ARGV[2] { kind[$1] = $2; next }
+  FILENAME == ARGV[2] { required[$1] = $2; names[$1] = 1; next }
   {
-    print $1 "\t" $2 "\t" (($1 in locked) ? locked[$1] : "not locked") "\t" \
-      (($1 in kind) ? kind[$1] : "unused by the bridge")
+    names[$1] = 1
+    kind[$1] = ($1 in kind) ? kind[$1] ", " $2 : $2
+    if ($3 != "workspace") required[$1] = $3
+    else if (!($1 in required)) required[$1] = "missing from workspace.dependencies"
   }
-' "$scratch/locked" "$scratch/kinds" "$scratch/requirements" > "$scratch/expected"
+  END {
+    for (n in names) {
+      print n "\t" required[n] "\t" ((n in locked) ? locked[n] : "not locked") "\t" \
+        ((n in kind) ? kind[n] : "unused by the bridge")
+    }
+  }
+' "$scratch/locked" "$scratch/requirements" "$scratch/declarations" > "$scratch/expected"
 doc_table '### Direct Rust dependencies' | columns 1,2,3,4 > "$scratch/documented"
 compare 'Direct Rust dependencies'
 

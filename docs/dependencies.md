@@ -25,10 +25,11 @@ here. It uses only POSIX tools and needs neither OPAM, Cargo, nor Docker.
 |---|---|
 | [Locked OCaml closure](#locked-ocaml-closure) | Every package and version in `temporal-sdk.opam.locked`, plus the `temporal-sdk.opam` version |
 | [Per-compiler lock overrides](#per-compiler-lock-overrides) | `scripts/opam-lock-overrides.txt` |
+| [Linking-exception scope](#linking-exception-scope) | The locked versions of `ocaml`, `ocaml-base-compiler`, and `ocamlbuild` in `temporal-sdk.opam.locked`, and of `tyxml`, `re`, and `camlp-streams` in `scripts/docs-tools.locked` |
 | [CI-only documentation tooling](#ci-only-documentation-tooling) | `scripts/docs-tools.locked` |
 | [Builder image tooling](#builder-image-tooling), [toolchain and CI images](#toolchain-and-ci-images), and [local integration service images](#local-integration-service-images) | Every digest-pinned image reference in `Dockerfile.dev`, `Dockerfile.rust-ci`, `test/integration/temporal/compose.yaml`, and the GitHub workflows and composite actions |
 | [Locked Cargo closure](#locked-cargo-closure) | The `[[package]]` count in `rust/Cargo.lock` and the Temporal Core revision in `rust/Cargo.toml` |
-| [Direct Rust dependencies](#direct-rust-dependencies) | `[workspace.dependencies]` in `rust/Cargo.toml`, every locked version of each crate in `rust/Cargo.lock`, and the bridge's normal and dev dependency sections |
+| [Direct Rust dependencies](#direct-rust-dependencies) | Every crate in `[workspace.dependencies]` in `rust/Cargo.toml` or declared by the bridge (inherited or directly), every locked version of each crate in `rust/Cargo.lock`, and the bridge's normal and dev dependency sections; any other bridge dependency table fails the check |
 | [CI-only quality tools](#ci-only-quality-tools) | The `taiki-e/install-action` tool list and the Makefile `QUALITY_*_VERSION` defaults |
 | [GitHub Actions](#github-actions) | Every external `uses:` reference, its pinned ref, and its release comment |
 
@@ -112,7 +113,8 @@ disposable CI image; none of them extends to any other package.
 
 | Package | Exact version | License | Scope | Enforced by | Rationale |
 |---|---:|---|---|---|---|
-| ocaml, ocaml-base-compiler (and ocaml-compiler-libs, if it enters the lock) | compiler series | LGPL-2.1-or-later WITH OCaml-LGPL-linking-exception | compiler/runtime | `scripts/check-licenses.sh` exact package names | The OCaml compiler and runtime every OCaml program links |
+| ocaml | 5.2.1 | LGPL-2.1-or-later WITH OCaml-LGPL-linking-exception | compiler/runtime | `scripts/check-licenses.sh` exact package name | The OCaml compiler and runtime every OCaml program links |
+| ocaml-base-compiler | 5.2.1 | LGPL-2.1-or-later WITH OCaml-LGPL-linking-exception | compiler | `scripts/check-licenses.sh` exact package name | The compiler distribution that provides `ocaml` |
 | ocamlbuild | 0.16.1 | LGPL-2.0-or-later WITH OCaml-LGPL-linking-exception | build only | `scripts/check-licenses.sh` exact name and version | Required to build `logs.0.10.0`; not linked or redistributed |
 | tyxml | 4.6.0 | LGPL-2.1-only WITH OCaml-LGPL-linking-exception | CI-only documentation tool | `scripts/docs-tools.locked` and the `docs` image stage | Part of the odoc closure; renders HTML in a disposable CI image |
 | re | 1.14.0 | LGPL-2.1-or-later WITH OCaml-LGPL-linking-exception | CI-only documentation tool | `scripts/docs-tools.locked` and the `docs` image stage | Part of the odoc closure; renders HTML in a disposable CI image |
@@ -124,6 +126,14 @@ requires a matching exact-name and version checker change. The three CI-only
 rows are not admitted by `make license-check` at all: they are never SDK
 dependencies, and the reasoning that permits them as documentation tools must
 not be cited to admit them, or any other LGPL package, into the SDK closure.
+
+The compiler rows show the OCaml 5.2.1 solve of the lock; every supported
+series uses its own compiler under the same exception, and
+`scripts/check-licenses.sh` also names `ocaml-compiler-libs` should it enter
+the lock. `make check-dependency-inventory` compares each row's version with
+`temporal-sdk.opam.locked` (compiler and ocamlbuild) or
+`scripts/docs-tools.locked` (the CI-only rows), so upgrading any of these
+packages fails until this table is reviewed.
 
 ## CI-only documentation tooling
 

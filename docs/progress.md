@@ -38,14 +38,18 @@ compares those tables with `temporal-sdk.opam(.locked)`,
 `scripts/opam-lock-overrides.txt`, `scripts/docs-tools.locked`, every
 digest-pinned image in the Dockerfiles, Compose file, and workflows,
 `rust/Cargo.lock` package count and locked versions, the workspace and bridge
-Cargo manifests, `rust/rust-toolchain.toml`, the quality-tool pins, and every
-external `uses:` reference. `make license-check` runs it first, so the
+Cargo manifests (including crates the bridge declares directly; an
+unattributable dependency table fails closed), `rust/rust-toolchain.toml`, the
+quality-tool pins, and every external `uses:` reference. The
+linking-exception table is compared with the locked versions of the compiler,
+ocamlbuild, and the three CI-only odoc packages, so upgrading one fails until
+that policy row is reviewed. `make license-check` runs it first, so the
 standalone license job fails when Dependabot or a manual bump changes a pin
 without its inventory row. It compares names, versions, and pins only;
 licence columns stay a reviewed record behind the existing OPAM and Cargo
 licence gates. `make test-dependency-inventory-contract`, also run in that
 job, accepts the committed tree and a CRLF copy of the document and rejects
-eighteen single-source drifts, each named by table.
+24 single-source drifts, each named by table.
 
 Licence findings: no new or changed licence fell outside the policy. The
 Python image's CPython licence is recorded as the PSF stack (SPDX

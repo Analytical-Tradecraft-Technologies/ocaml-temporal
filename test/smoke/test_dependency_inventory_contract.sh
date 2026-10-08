@@ -171,6 +171,35 @@ insert_before rust/core-bridge/Cargo.toml 'flate2.workspace = true' 'base64.work
 expect_drift 'direct crate kind' 'Direct Rust dependencies'
 
 fresh_fixture
+insert_before rust/core-bridge/Cargo.toml 'base64.workspace = true' 'anyhow = "1"'
+expect_drift 'normal crate declared directly by the bridge' 'Direct Rust dependencies'
+
+fresh_fixture
+insert_before rust/core-bridge/Cargo.toml 'flate2.workspace = true' 'pretty_assertions = { version = "1", default-features = false }'
+expect_drift 'dev crate declared directly by the bridge' 'Direct Rust dependencies'
+
+fresh_fixture
+append rust/core-bridge/Cargo.toml '
+[build-dependencies]
+cc = "1"'
+expect_drift 'unsupported bridge dependency table' 'cannot attribute'
+
+fresh_fixture
+edit temporal-sdk.opam.locked 's/"ocamlbuild" {= "[^"]*"}/"ocamlbuild" {= "9.9.9"}/'
+edit docs/dependencies.md 's/^| ocamlbuild | [^|]* | LGPL-2.0-or-later WITH OCaml-LGPL-linking-exception | build | /| ocamlbuild | 9.9.9 | LGPL-2.0-or-later WITH OCaml-LGPL-linking-exception | build | /'
+expect_drift 'ocamlbuild upgrade without a policy review' 'Linking-exception scope'
+
+fresh_fixture
+edit temporal-sdk.opam.locked 's/"ocaml" {= "[^"]*"}/"ocaml" {= "9.9.9"}/'
+edit docs/dependencies.md 's/^| ocaml | [^|]* | LGPL-2.1-or-later WITH OCaml-LGPL-linking-exception | compiler\/runtime | yes /| ocaml | 9.9.9 | LGPL-2.1-or-later WITH OCaml-LGPL-linking-exception | compiler\/runtime | yes /'
+expect_drift 'compiler upgrade without a policy review' 'Linking-exception scope'
+
+fresh_fixture
+edit scripts/docs-tools.locked 's/^tyxml .*/tyxml 9.9.9/'
+edit docs/dependencies.md 's/^| tyxml | [^|]* | \([^|]*\) | HTML generation/| tyxml | 9.9.9 | \1 | HTML generation/'
+expect_drift 'docs-tool LGPL upgrade without a policy review' 'Linking-exception scope'
+
+fresh_fixture
 edit .github/workflows/build-pr.yml 's/typos@[0-9.]*/typos@9.9.9/'
 expect_drift 'quality tool version' 'CI-only quality tools'
 
