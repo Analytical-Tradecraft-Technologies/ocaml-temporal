@@ -6,6 +6,7 @@ use ocaml_temporal_core_bridge::activity_protocol::{
 };
 use ocaml_temporal_core_bridge::workflow_protocol::Payload;
 use std::collections::BTreeMap;
+use temporalio_protos::coresdk::activity_result as core_activity_result;
 use temporalio_protos::coresdk::activity_task as core_activity_task;
 
 /// A complete start-task fixture exercises every nullable field, the retry
@@ -30,7 +31,12 @@ fn replace_once(source: &str, before: &str, after: &str) -> String {
 fn activity_completion_preserves_opaque_task_token() {
     let completion = ActivityCompletion {
         task_token: "AAEC/v8=".to_owned(),
-        result: ActivityCompletionResult::Completed { result: None },
+        result: ActivityCompletionResult::Completed {
+            result: Payload {
+                metadata: BTreeMap::new(),
+                data: Vec::new(),
+            },
+        },
     };
 
     let encoded = encode_completion(&completion).expect("completion should encode");
@@ -71,10 +77,47 @@ fn activity_documents_are_closed_and_tokens_are_canonical() {
 fn activity_completion_result_variants_reject_unknown_fields() {
     assert!(
         decode_completion(
-            r#"{"task_token":"AA==","result":{"kind":"completed","result":null,"injected":true}}"#
+            r#"{"task_token":"AA==","result":{"kind":"completed","result":{"metadata":{},"data":{"encoding":"base64","data":""}},"injected":true}}"#
         )
         .is_err()
     );
+}
+
+/// A successful completion must carry a payload (issue #954).
+///
+/// Core's `validate_activity_completion` rejects `Success { result: None }`
+/// as malformed, so a `null` or absent payload is refused at decode, before
+/// any Core call. A void result is an encoded payload with empty data, and
+/// every decoded success converts to a Core result that has a payload.
+#[test]
+fn activity_completed_result_requires_a_payload() {
+    let null =
+        decode_completion(r#"{"task_token":"AA==","result":{"kind":"completed","result":null}}"#)
+            .expect_err("a null payload must be rejected");
+    assert_eq!(null.code, "invalid_message");
+    assert_eq!(null.path, "$.result.result");
+    assert!(
+        decode_completion(r#"{"task_token":"AA==","result":{"kind":"completed"}}"#).is_err(),
+        "an absent payload must be rejected"
+    );
+
+    let void = decode_completion(
+        r#"{"task_token":"AA==","result":{"kind":"completed","result":{"metadata":{},"data":{"encoding":"base64","data":""}}}}"#,
+    )
+    .expect("an empty payload is a valid void result");
+    let core = completion_to_core(&void).expect("void completion converts");
+    let status = core
+        .result
+        .and_then(|result| result.status)
+        .expect("conversion sets a status");
+    match status {
+        core_activity_result::activity_execution_result::Status::Completed(success) => {
+            let payload = success.result.expect("Core receives a result payload");
+            assert!(payload.data.is_empty());
+            assert!(payload.metadata.is_empty());
+        }
+        other => panic!("void completion converted to {other:?}"),
+    }
 }
 
 /// Heartbeats preserve the opaque token and binary detail payloads while

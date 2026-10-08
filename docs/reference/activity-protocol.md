@@ -33,7 +33,7 @@ a task back to Core with a non-retryable `UnrepresentableActivityTask`
 application failure and the worker keeps polling (issue #801; see
 `docs/reference/core-bridge.md`). Cancellation context retains both Core's primary
 reason and its independent detail flags. The completion result is a closed
-variant: completed with an optional payload, failed, cancelled, or
+variant: completed with a required payload, failed, cancelled, or
 will-complete-asynchronously.
 
 The `will-complete-asynchronously` variant is the remote worker-to-client
@@ -162,6 +162,19 @@ If transport or Core rejects the call, the lease remains outstanding so the
 OCaml adapter can retry the same pending completion; it never reruns the user
 activity merely because submission failed.
 
+A `completed` result must carry a payload; `null` is refused (issue #954).
+Temporal Core's `validate_activity_completion` rejects a successful completion
+whose `result` is absent, so a document the bridge accepted with `null` used to
+fail inside Core with `STATUS_WORKER` while the lease stayed held. Both
+decoders now refuse `null` with a protocol error at `$.result.result`, before
+any Core call, so the lease is untouched: a corrected completion or the reject
+path retires it exactly once. A void activity result is an encoded payload
+whose data may be empty. The OCaml executor already encodes every result, and
+the official SDKs send a `binary/null` payload with empty data for a void
+result. Every completion the decoder
+accepts therefore converts to a Core `Success` with a payload, and the
+optional-payload shape no longer exists in the Rust or OCaml types.
+
 A task with `variant.kind = "cancel"` does not invoke user activity code. The
 adapter maps its stable reason to a `Cancelled` completion with the standard
 Temporal `Canceled` failure and retains the independent flags on its private
@@ -208,4 +221,11 @@ Separated OCaml tests in
 `test/bridge/test_ocaml_activity_protocol.ml` cover all task and completion
 variants, binary token preservation, required-nullable members, closed nested
 objects, identifiers, headers, time and duration domains, attempt and retry
-numeric ranges, priority bits, and sender-side duplicate-map rejection.
+numeric ranges, priority bits, sender-side duplicate-map rejection, and the
+required completed payload. In Rust, `rust/core-bridge/tests/activity_protocol.rs`
+checks that a `null` or absent payload is refused and that an empty payload
+reaches Core as a present result, and
+`rust/core-bridge/tests/activity_null_completion.rs` drives the worker ABI
+against a loopback gRPC double: after a refused `null` completion, a corrected
+completion or the reject path retires the lease with exactly one server
+response and shutdown reports no outstanding task.
