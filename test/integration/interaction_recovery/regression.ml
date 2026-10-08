@@ -197,7 +197,7 @@ let cli_timeout = "30s"
 let history cli address handle =
   let args = [|cli; "--address"; address; "--namespace"; "default";
     "--command-timeout"; cli_timeout; "workflow"; "show";
-    "--workflow-id"; Client.workflow_id handle; "--run-id"; Client.run_id handle;
+    "--workflow-id"; Client.workflow_id handle; "--run-id"; Option.get (Client.run_id handle);
     "--output"; "json"|] in
   let input = Unix.open_process_args_in cli args in
   let document = match Yojson.Basic.from_channel input with
@@ -349,8 +349,8 @@ let expect_rejected label = function
 (** Requires the run to complete with [expected]. *)
 let expect_completed label handle expected =
   match get (Client.wait handle) with
-  | Client.Completed actual when actual = expected -> ()
-  | Client.Completed actual -> failwith (Printf.sprintf "%s: result %d, expected %d" label actual expected)
+  | Client.Completed { output = actual; _ } when actual = expected -> ()
+  | Client.Completed { output = actual; _ } -> failwith (Printf.sprintf "%s: result %d, expected %d" label actual expected)
   | _ -> failwith (label ^ ": run did not complete")
 
 (** Waits for the first workflow task of a run to complete in history. *)
