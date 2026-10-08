@@ -26,7 +26,10 @@ failure envelope. Extraction is best effort over Core's text and fails
 closed: anything Core does not state is `None`, and no OCaml source location
 is invented. `failure_message` keeps its `nondeterminism (run RUN_ID): `
 prefix and now renders that context with a reminder to guard intentional
-changes with `Temporal.Workflow.patched`. The workflow guide has a
+changes with `Temporal.Workflow.patched`. Every rendered failure is one line
+of at most about 3 KB: interpolated values are escaped and each is bounded
+(256 bytes for identifiers, 1,024 for Core's reason) without splitting UTF-8,
+while the record keeps the exact values. The workflow guide has a
 troubleshooting example for locating an incompatible change and states that
 a clean replay covers only recorded paths. No ABI, bridge, or Rust change was
 needed; a live worker already reports the same Core text on the
@@ -41,7 +44,9 @@ one-line rendering without the recorded payload; the
 with the event and command left `None`. `test/bridge/test_public_replay.ml`
 asserts the event and command of a removed timer, an activity in place of a
 timer, and an added timer (event 16 `WorkflowExecutionCompleted` against a
-`Timer` command), with task failures and invalid input still classified
+`Timer` command), and renders a 60 KB workflow ID containing line breaks
+and control bytes as one escaped, truncated line while the record keeps the
+exact ID, with task failures and invalid input still classified
 separately. The installed-consumer witness binds every new field.
 
 ## 2026-10-08: Public offline replay API (#515)

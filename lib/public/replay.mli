@@ -180,6 +180,17 @@ machine does not handle this event: HistoryEvent(id: 5, TimerStarted); guard
 intentional command changes with Temporal.Workflow.patched
     v}
 
+    The result is always one line of at most about 3 KB, whatever the
+    history contains. Every interpolated value is escaped: backslash, line
+    feed, carriage return, and tab become [\\], [\n], [\r], and [\t], and
+    other control bytes, DEL, and invalid UTF-8 bytes become [\xHH]. The
+    escaped run ID, workflow ID, workflow type, event type, and command are
+    each limited to 256 bytes, and Core's reason or another diagnostic
+    message to 1,024 bytes. A longer value ends in ["...(N bytes
+    truncated)"], and a UTF-8 character is never split. This rendering does
+    not alter the {!failure} and {!mismatch} values: [mismatch.workflow_id],
+    for example, is exactly the ID passed to {!History.of_protobuf}.
+
     The wording after the prefix is for people and may be refined; match on
     the {!failure} constructor and {!mismatch} fields in code. *)
 val failure_message : failure -> string

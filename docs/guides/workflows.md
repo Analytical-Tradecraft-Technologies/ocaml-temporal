@@ -1339,7 +1339,11 @@ match Temporal.Replay.replay ~workflows history with
 | Error _ | Ok () -> ()
 ```
 
-`event_id`, `event_type`, and `command` are `None` whenever Core's text does
+The line is always single and bounded: control characters in a workflow ID
+or type are escaped (`\n`, `\xHH`), and each value is cut to 256 bytes
+(Core's reason to 1,024) with `...(N bytes truncated)`; the `mismatch`
+fields keep the exact values. `event_id`, `event_type`, and `command` are
+`None` whenever Core's text does
 not state them, for example when Core reports a recorded patch marker that
 no `patched` call claimed; the SDK never guesses an event or an OCaml source
 location. If the change is intentional, keep the old commands for recorded

@@ -273,20 +273,80 @@ let mismatch_of_message ~workflow_id ~workflow_type message =
     reason;
   }
 
+(** Upper bound, in bytes, of each identifier interpolated into a rendered
+    failure line: the run ID, workflow ID and type, event type, and command.
+    [History.of_protobuf] accepts workflow IDs of up to 64 KiB, and a
+    history can carry an arbitrarily long workflow type, so copying them
+    verbatim would let one line grow to tens of kilobytes. *)
+let max_rendered_field_bytes = 256
+
+(** Upper bound, in bytes, of Core's reason or another free-text diagnostic
+    interpolated into a rendered failure line. *)
+let max_rendered_text_bytes = 1_024
+
+(** Renders [value] for a one-line diagnostic. Backslash, line feed,
+    carriage return, and tab become [\\], [\n], [\r], and [\t]; other C0
+    controls, DEL, and bytes that do not start a valid UTF-8 sequence become
+    [\xHH]. Escaped output is limited to [limit] bytes; the rest is replaced
+    by ["...(N bytes truncated)"], where [N] counts unrendered input bytes.
+    A multi-byte UTF-8 character is kept or dropped whole, never split. The
+    caller's exact value is not modified; only the rendering is bounded. *)
+let display ~limit value =
+  let length = String.length value in
+  let buffer = Buffer.create (min length limit + 32) in
+  let rec loop index =
+    if index >= length then Buffer.contents buffer
+    else
+      let piece, width =
+        match value.[index] with
+        | '\\' -> ("\\\\", 1)
+        | '\n' -> ("\\n", 1)
+        | '\r' -> ("\\r", 1)
+        | '\t' -> ("\\t", 1)
+        | character when Char.code character < 0x20 || Char.code character = 0x7F
+          ->
+            (Printf.sprintf "\\x%02x" (Char.code character), 1)
+        | character when Char.code character < 0x80 ->
+            (String.make 1 character, 1)
+        | character ->
+            let decoded = String.get_utf_8_uchar value index in
+            if Uchar.utf_decode_is_valid decoded then
+              let width = Uchar.utf_decode_length decoded in
+              (String.sub value index width, width)
+            else (Printf.sprintf "\\x%02x" (Char.code character), 1)
+      in
+      if Buffer.length buffer + String.length piece > limit then
+        Printf.sprintf "%s...(%d bytes truncated)" (Buffer.contents buffer)
+          (length - index)
+      else (
+        Buffer.add_string buffer piece;
+        loop (index + width))
+  in
+  loop 0
+
+(** Renders an identifier with {!max_rendered_field_bytes}. *)
+let field = display ~limit:max_rendered_field_bytes
+
+(** Renders free text with {!max_rendered_text_bytes}. *)
+let text = display ~limit:max_rendered_text_bytes
+
 (** Renders the actionable part of a nondeterminism line: which workflow,
     where it diverged when Core said so, Core's own sentence, and the fix for
-    an intentional change. Absent fields are omitted, never invented. *)
+    an intentional change. Absent fields are omitted, never invented. Every
+    dynamic value goes through {!field} or {!text}, so the line stays single
+    and bounded whatever the history contains. *)
 let describe_mismatch mismatch =
   let workflow =
     match mismatch.workflow_type with
     | Some workflow_type ->
-        Printf.sprintf "workflow %s (ID %s)" workflow_type mismatch.workflow_id
-    | None -> Printf.sprintf "workflow ID %s" mismatch.workflow_id
+        Printf.sprintf "workflow %s (ID %s)" (field workflow_type)
+          (field mismatch.workflow_id)
+    | None -> Printf.sprintf "workflow ID %s" (field mismatch.workflow_id)
   in
   let event =
     match (mismatch.event_id, mismatch.event_type) with
     | Some id, Some event_type ->
-        Some (Printf.sprintf "recorded event %Ld (%s)" id event_type)
+        Some (Printf.sprintf "recorded event %Ld (%s)" id (field event_type))
     | Some id, None -> Some (Printf.sprintf "recorded event %Ld" id)
     | None, _ -> None
   in
@@ -294,29 +354,33 @@ let describe_mismatch mismatch =
     match (event, mismatch.command) with
     | Some event, Some command ->
         Printf.sprintf ": %s does not match the current code's %s command"
-          event command
+          event (field command)
     | Some event, None -> Printf.sprintf ": first mismatch at %s" event
     | None, Some command ->
-        Printf.sprintf ": mismatch in the current code's %s command" command
+        Printf.sprintf ": mismatch in the current code's %s command"
+          (field command)
     | None, None -> ""
   in
   Printf.sprintf
     "%s%s; Core: %s; guard intentional command changes with \
      Temporal.Workflow.patched"
-    workflow location mismatch.reason
+    workflow location (text mismatch.reason)
 
-(** Prefixes each diagnostic with a stable kind so CI output can be grepped. *)
+(** Prefixes each diagnostic with a stable kind so CI output can be grepped.
+    Dynamic values are escaped and bounded so the result is always one line
+    of a few kilobytes. *)
 let failure_message = function
   | Nondeterminism { run_id; mismatch; message = _ } ->
-      Printf.sprintf "nondeterminism (run %s): %s" run_id
+      Printf.sprintf "nondeterminism (run %s): %s" (field run_id)
         (describe_mismatch mismatch)
   | Workflow_task_failed { run_id = Some run_id; message } ->
-      Printf.sprintf "workflow task failed (run %s): %s" run_id message
+      Printf.sprintf "workflow task failed (run %s): %s" (field run_id)
+        (text message)
   | Workflow_task_failed { run_id = None; message } ->
-      "workflow task failed: " ^ message
-  | Invalid_history { message } -> "invalid history: " ^ message
-  | Unsupported_history { message } -> "unsupported history: " ^ message
-  | Replay_error error -> "replay error: " ^ Error.message error
+      "workflow task failed: " ^ text message
+  | Invalid_history { message } -> "invalid history: " ^ text message
+  | Unsupported_history { message } -> "unsupported history: " ^ text message
+  | Replay_error error -> "replay error: " ^ text (Error.message error)
 
 (** Wraps an SDK-side failure that leaves the history's verdict unknown. *)
 let replay_error message =

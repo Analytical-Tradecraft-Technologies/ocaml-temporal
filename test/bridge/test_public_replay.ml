@@ -171,6 +171,56 @@ let test_incompatible_changes () =
     ~event:(16L, "WorkflowExecutionCompleted") ~command:"Timer"
     (R.replay ~workflows:[ R.workflow (extra_timer "body") ] (history "body"))
 
+(** [contains text needle] is true when [needle] occurs in [text]. *)
+let contains text needle =
+  let text_length = String.length text in
+  let needle_length = String.length needle in
+  let rec loop index =
+    index + needle_length <= text_length
+    && (String.sub text index needle_length = needle || loop (index + 1))
+  in
+  loop 0
+
+(** A workflow ID that [History.of_protobuf] accepts but that must not be
+    copied verbatim into a log line: line breaks, a tab, a backslash, an
+    escape byte, a multi-byte character, and about 60 KB of padding. The
+    rendered [failure_message] stays one bounded line while the [mismatch]
+    record keeps the exact ID. *)
+let test_hostile_workflow_id () =
+  let workflow_id =
+    "multi\nline\r\tid\\\027" ^ "\xc3\xa9" ^ String.make 60_000 'w'
+  in
+  let history =
+    match R.History.of_protobuf ~workflow_id (read_fixture "body") with
+    | Ok history -> history
+    | Error error -> failwith (Temporal.Error.message error)
+  in
+  match R.replay ~workflows:[ R.workflow (timer_removed "body") ] history with
+  | Error (R.Nondeterminism { mismatch; _ } as failure) ->
+      if mismatch.workflow_id <> workflow_id then
+        failwith "hostile ID: the mismatch record altered the workflow ID";
+      let line = R.failure_message failure in
+      if String.contains line '\n' || String.contains line '\r' then
+        failwith "hostile ID: failure_message spans several lines";
+      if String.contains line '\t' || String.contains line '\027' then
+        failwith "hostile ID: failure_message contains a raw control byte";
+      if String.length line > 3_072 then
+        failwith
+          (Printf.sprintf "hostile ID: failure_message is %d bytes"
+             (String.length line));
+      if not (String.is_valid_utf_8 line) then
+        failwith "hostile ID: failure_message is not valid UTF-8";
+      List.iter
+        (fun needle ->
+          if not (contains line needle) then
+            failwith ("hostile ID: failure_message lacks " ^ needle ^ ": " ^ line))
+        [
+          "ID multi\\nline\\r\\tid\\\\\\x1b\xc3\xa9www";
+          "bytes truncated)";
+          "recorded event 5 (TimerStarted)";
+        ]
+  | result -> failwith ("hostile ID: expected nondeterminism, got " ^ describe result)
+
 (** Failing workflow code and a missing registration are task failures,
     distinct from nondeterminism and from invalid input. *)
 let test_task_failures () =
@@ -261,6 +311,7 @@ let test_repeated_cleanup () =
 let () =
   test_compatible_histories ();
   test_incompatible_changes ();
+  test_hostile_workflow_id ();
   test_task_failures ();
   test_invalid_input ();
   test_registration_errors ();

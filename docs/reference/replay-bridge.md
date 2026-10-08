@@ -218,6 +218,16 @@ to guard intentional changes with `Temporal.Workflow.patched`. The line never
 includes payload bytes because Core's text names event and command kinds,
 not payloads.
 
+Every `failure_message` is one line of at most about 3 KB, even for a
+hostile history: `History.of_protobuf` accepts workflow IDs of up to 64 KiB
+that may contain line breaks, and a history can carry any workflow type. Each
+interpolated value is escaped (`\\`, `\n`, `\r`, `\t`, and `\xHH` for other
+control bytes, DEL, and invalid UTF-8) and bounded after escaping: 256 bytes
+for the run ID, workflow ID and type, event type, and command, and 1,024
+bytes for Core's reason or any other diagnostic message. A longer value ends
+in `...(N bytes truncated)` without splitting a UTF-8 character. Only the
+rendering is bounded; the `mismatch` fields keep their exact values.
+
 A live worker needs no SDK change to surface the same mismatch. Core fails the
 workflow task with cause `NonDeterministicError` and the same `[TMPRL1100]`
 message, which the Temporal UI and `temporal workflow show` display on the
@@ -355,7 +365,11 @@ supervisor Domain and native graph. Its nondeterminism cases also assert the
 `mismatch` fields: a removed timer is event 5 `TimerStarted` against a
 `Complete workflow` command, an activity in its place is the same event
 against an `Activity` command, and an added second timer is event 16
-`WorkflowExecutionCompleted` against a `Timer` command.
+`WorkflowExecutionCompleted` against a `Timer` command. A workflow ID with
+line breaks, a tab, a backslash, an escape byte, a multi-byte character, and
+60 KB of padding must render as one valid UTF-8 line of at most 3,072 bytes
+with the escapes and truncation marker, while `mismatch.workflow_id` stays
+byte-for-byte equal to the input.
 
 [`test_replay_diagnostics.ml`](../../test/bridge/test_replay_diagnostics.ml)
 replays the [history corpus](history-corpus.md)'s two negative controls
