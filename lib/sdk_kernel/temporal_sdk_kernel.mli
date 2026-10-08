@@ -66,3 +66,7 @@ module Execution = Temporal_runtime.Execution
 
 (** Deterministic in-process engine behind [Temporal.Testing]. *)
 module Test_environment = Temporal_runtime.Test_environment
+
+(** Shared strict JSON limits and canonical binary-payload wrappers, used by
+    [Temporal.Replay] to build the private replay-history document. *)
+module Control_protocol = Temporal_protocol.Control_protocol
