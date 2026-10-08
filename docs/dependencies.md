@@ -72,6 +72,35 @@ Only the exact compiler/runtime names and the exact ocamlbuild version
 hard-coded by the policy are accepted. Adding a row here also requires a
 matching exact-name and version checker change.
 
+## CI-only documentation tooling
+
+`make docs` renders the API documentation with odoc in the `docs` stage of
+`Dockerfile.dev`. That stage installs the exact closure in
+`scripts/docs-tools.locked` on top of the locked SDK closure. None of these
+packages is an SDK dependency: they are absent from `temporal-sdk.opam` and its
+lock, are not linked into or redistributed with any SDK artifact, and are not
+needed to build or install the SDK. `make license-check` therefore does not
+audit them; changes to the tool lock must update this table instead. The
+reasoning, and the limit that it must not be generalized to SDK dependencies,
+is recorded in [quality and security gates](reference/quality-gates.md#rendered-api-documentation).
+
+| Package | Exact version | License |
+|---|---:|---|
+| odoc | 3.2.1 | ISC |
+| odoc-parser | 3.2.1 | ISC |
+| astring | 0.8.5 | ISC |
+| cmdliner | 2.1.1 | ISC |
+| cppo | 1.8.0 | BSD-3-Clause |
+| crunch | 4.0.0 | ISC |
+| fmt | 0.11.0 | ISC |
+| fpath | 0.7.3 | ISC |
+| ptime | 1.2.0 | ISC |
+| uutf | 1.0.4 | ISC |
+| seq | base | compiler virtual package |
+| tyxml | 4.6.0 | LGPL-2.1-only WITH OCaml-LGPL-linking-exception |
+| re | 1.14.0 | LGPL-2.1-or-later WITH OCaml-LGPL-linking-exception |
+| camlp-streams | 5.0.1 | LGPL-2.1-only WITH OCaml-LGPL-linking-exception |
+
 ## Builder image tooling
 
 The development image starts from one `ocaml/opam:debian-12-ocaml-<series>`

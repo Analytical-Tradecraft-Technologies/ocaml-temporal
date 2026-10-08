@@ -29,33 +29,32 @@ type ('input, 'output) update_handle
     The namespace is retained so a successor cannot accidentally be used
     with a client connected to a different Temporal namespace. *)
 type execution = {
-  (* Namespace that owns the successor execution. *)
-  namespace : string;
-  (* Durable workflow identity shared by the original and successor runs. *)
+  namespace : string;  (** Namespace that owns the successor execution. *)
   workflow_id : string;
-  (* Server-issued identity of the successor run. *)
-  run_id : string;
+      (** Durable workflow identity shared by the original and successor runs. *)
+  run_id : string;  (** Server-issued identity of the successor run. *)
 }
 
 (** Terminal outcomes are values so workflow failures do not become control
     flow exceptions. The outer [result] of [wait] is reserved for bridge or
     payload transport errors. *)
 type 'output terminal_result =
-  (* The terminal payload decoded using the workflow definition's output codec.
-     [successor] is the run a cron schedule or retry policy started when this
-     run completed, or [None]; following it is the caller's choice. *)
   | Completed of { output : 'output; successor : execution option }
-  (* Failure and optional retry successor. Following it is the caller's choice. *)
+      (** The terminal payload decoded using the workflow definition's output
+          codec. [successor] is the run a cron schedule or retry policy started
+          when this run completed, or [None]; following it is the caller's
+          choice. *)
   | Failed of { error : Error.t; successor : execution option }
-  (* The exact run reached the cancellation state. *)
-  | Cancelled of Error.t
-  (* The exact run was terminated by an operator or another client. *)
+      (** Failure and optional retry successor. Following it is the caller's
+          choice. *)
+  | Cancelled of Error.t  (** The exact run reached the cancellation state. *)
   | Terminated of Error.t
-  (* Timeout and optional successor. Following it is the caller's choice. *)
+      (** The exact run was terminated by an operator or another client. *)
   | Timed_out of { error : Error.t; successor : execution option }
-  (* The run continued as new; the caller decides whether to wait on the
-     returned successor identity. *)
+      (** Timeout and optional successor. Following it is the caller's choice. *)
   | Continued_as_new of execution
+      (** The run continued as new; the caller decides whether to wait on the
+          returned successor identity. *)
 
 (** What [start] does when its workflow ID already has an open (running) run.
     The policy never affects a closed run: Temporal's default reuse policy
