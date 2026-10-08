@@ -82,6 +82,14 @@ CARGO_BUILD_JOBS_RUN_FLAG := $(if $(filter environment command,$(firstword $(ori
 STRUCTURED_FUZZ_CASES ?= 128
 STRUCTURED_FUZZ_SEED ?= 0x521506a1
 STRUCTURED_FUZZ_TARGET ?= fuzz_
+# Seeded lifecycle operation-sequence stress (#522). The defaults match the
+# ordinary Rust and OCaml test suites; see docs/reference/bridge-lifecycle-stress.md.
+LIFECYCLE_STRESS_SEED ?= 0x05222026
+LIFECYCLE_STRESS_CASES ?= 24
+LIFECYCLE_STRESS_STEPS ?= 48
+LIFECYCLE_STRESS_CASE ?=
+LIFECYCLE_STRESS_OCAML_CYCLES ?= 48
+LIFECYCLE_STRESS_ENV = LIFECYCLE_STRESS_SEED="$(LIFECYCLE_STRESS_SEED)" LIFECYCLE_STRESS_CASES="$(LIFECYCLE_STRESS_CASES)" LIFECYCLE_STRESS_STEPS="$(LIFECYCLE_STRESS_STEPS)" LIFECYCLE_STRESS_CASE="$(LIFECYCLE_STRESS_CASE)" LIFECYCLE_STRESS_OCAML_CYCLES="$(LIFECYCLE_STRESS_OCAML_CYCLES)"
 # CI supplies a verified, immutable bridge bundle. Each OCaml consumer still
 # builds its C stubs and runs its own tests; Rust-only checks belong to the
 # producer. Explicit test-rust/lint-rust targets always remain available.
@@ -251,6 +259,18 @@ test-parser-fuzz:
 
 native-test-parser-fuzz:
 	$(NATIVE_ENV) $(CARGO_TEST_ENV) STRUCTURED_FUZZ_CASES="$(STRUCTURED_FUZZ_CASES)" STRUCTURED_FUZZ_SEED="$(STRUCTURED_FUZZ_SEED)" STRUCTURED_FUZZ_REPLAY="$(STRUCTURED_FUZZ_REPLAY)" cargo test --manifest-path $(CARGO_MANIFEST) --locked --test structured_parser_fuzz "$(STRUCTURED_FUZZ_TARGET)" -- --nocapture
+
+# The ordinary Rust and OCaml suites already run both lifecycle stresses with
+# the default budget. These targets raise the budget, change the seed, or
+# regenerate one reported case (LIFECYCLE_STRESS_CASE) without editing code.
+.PHONY: test-lifecycle-stress native-test-lifecycle-stress
+test-lifecycle-stress:
+	$(COMPOSE_RUN) env $(CARGO_TEST_ENV) $(LIFECYCLE_STRESS_ENV) cargo test --manifest-path $(CARGO_MANIFEST) --locked --test lifecycle_stress -- --nocapture
+	$(COMPOSE_RUN) env $(LIFECYCLE_STRESS_ENV) opam exec -- dune build $(DUNE_BUILD_ARGS) @test/bridge/runtest-test_ocaml_lifecycle_gc_stress
+
+native-test-lifecycle-stress:
+	$(NATIVE_ENV) $(CARGO_TEST_ENV) $(LIFECYCLE_STRESS_ENV) cargo test --manifest-path $(CARGO_MANIFEST) --locked --test lifecycle_stress -- --nocapture
+	$(NATIVE_ENV) $(LIFECYCLE_STRESS_ENV) $(NATIVE_RUN) dune build $(DUNE_BUILD_ARGS) @test/bridge/runtest-test_ocaml_lifecycle_gc_stress
 
 test-bridge:
 	$(COMPOSE_RUN) sh test/bridge/test_abi.sh
