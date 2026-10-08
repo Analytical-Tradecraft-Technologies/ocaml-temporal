@@ -280,6 +280,17 @@ let print_table candidate cases =
     must use a new identifier. *)
 let report_schema = "ocaml-temporal/history-corpus-report/v1"
 
+(** What a passing run does and does not establish. Printed by the runner and
+    embedded in the report so an upgrade PR that cites either carries the
+    limitation with it: the candidate replaying histories written by older
+    builds is forward compatibility only. Rolling back needs the previous
+    build to replay histories the candidate wrote, which this corpus does not
+    test (production rollback qualification is issue #508). *)
+let scope_note =
+  "forward compatibility only: the candidate replays histories recorded by \
+   older SDK/Core builds; this does not show that the previous release can \
+   replay histories written by the candidate, so it is not rollback evidence"
+
 (** Encodes an optional string as JSON [null] or a string. *)
 let json_option = function None -> `Null | Some value -> `String value
 
@@ -292,6 +303,7 @@ let report ~manifest_path ~candidate ~problems cases =
   `Assoc
     [
       ("schema", `String report_schema);
+      ("scope", `String scope_note);
       ( "status",
         `String (if failing = [] && problems = [] then "pass" else "fail") );
       ("manifest", `String manifest_path);

@@ -230,7 +230,9 @@ carry this evidence before merge:
    `core_revision` and the revisions that produced the corpus. A mismatch lists
    the failing case IDs and blocks the upgrade until it is fixed or recorded as
    an approved, intentional compatibility break (see the corpus retention
-   rules).
+   rules). A pass is forward-compatibility evidence only; it does not show
+   that the previous pin can replay histories the new one writes, so it is not
+   rollback evidence.
 4. Compatibility evidence: the Temporal/PostgreSQL live job passes against the
    new pin.
 

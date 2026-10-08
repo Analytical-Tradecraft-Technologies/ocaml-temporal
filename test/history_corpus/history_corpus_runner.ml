@@ -112,6 +112,7 @@ let () =
         (coverage_failures manifest, Corpus_runner.run ~root manifest)
   in
   Corpus_runner.print_table candidate cases;
+  Printf.printf "history corpus: %s\n%!" Corpus_runner.scope_note;
   Option.iter
     (fun path ->
       Corpus_runner.write_report path

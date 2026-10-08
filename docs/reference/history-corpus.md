@@ -102,11 +102,20 @@ The report (`schema` `ocaml-temporal/history-corpus-report/v1`) contains:
 | Member | Meaning |
 | --- | --- |
 | `status` | `pass`, or `fail` on any mismatched case or manifest/coverage problem. |
+| `scope` | The forward-compatibility-only limitation below, carried with the evidence. |
 | `candidate` | `sdk_commit`, `core_revision`, `core_source`, `ocaml_version`, `native_bridge_abi` of the build under test. |
 | `summary` | Counts of `cases`, `passed`, `failed` and `problems`. |
 | `failing_cases` | IDs of mismatched cases in manifest order. |
 | `problems` | Manifest validation or coverage failures not tied to one replay; when the manifest is invalid no case is replayed. |
 | `cases[]` | Per entry: `id`, `workflow_type`, `workflow_id`, `run_id`, `history`, `replay_definitions`, `expected`, `actual`, `result`, `message` (the public failure text or mismatch reason) and `produced_by` (`capture`, `kind`, `sdk_commit`, `core_revision`). |
+
+A pass is **forward-compatibility** evidence only: the candidate replays
+histories recorded by older SDK/Core builds. It does not show that the previous
+release can replay histories written by the candidate, so it is not evidence
+that a deployment can be rolled back after the candidate has processed
+workflow tasks. The runner prints this limitation and the report records it as
+`scope`; rollback qualification belongs to
+[#508](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/508).
 
 `actual` is `replays_ok`, `nondeterminism`, `workflow_task_failed`,
 `invalid_history`, `unsupported_history`, `replay_error` (the replay could not

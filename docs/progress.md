@@ -3168,5 +3168,7 @@ those IDs in standard error and in the report. A manual mutation also
 confirmed that a wrong `run_id` fails validation. The
 [Core pin upgrade checklist](dependencies.md#temporal-core-pin-upgrades) now
 requires a passing report for every Core bump and Dependabot Cargo PR. The
+runner output and report state that a pass is forward-compatibility evidence
+only, not rollback evidence (#508). The
 whole corpus replays in about a second. Every current capture comes from Core
 `95e97686`, so the first Core bump will be the first cross-revision replay.
