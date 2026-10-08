@@ -13,7 +13,8 @@
     The fixture owns its worker Domain, uses a unique task queue, terminates
     every execution it creates, and requires every proxied socket to be closed
     after client and worker shutdown. Use only a disposable Temporal Server
-    with the [default] namespace. *)
+    with the [default] namespace. The official Temporal CLI path is an
+    explicit argument; it only reads this fixture's own activity history. *)
 open Temporal
 
 let namespace = "default"
@@ -246,19 +247,40 @@ let signal_ack_lost ~proxy ~direct_handle ~handle =
   if value <> 5 then
     failwith (Printf.sprintf "signal_ack_lost: expected one application (5), got %d" value)
 
-(** Scenario 4: the update response is delayed past a connection reset. Core
-    re-sends the identical update ID on a new connection within the same
-    acceptance budget, so the caller sees one accepted update and the
-    workflow applies it once. *)
+(** Scenario 4: the update response is lost and delivered only after a
+    connection reset. The fault is proven before it ends: the direct client
+    observes the update applied (the worker's path is not faulted) while
+    [start_update] is still blocked and the proxy has discarded response
+    bytes. Core then re-sends the identical update ID on a new connection
+    within the same acceptance budget, so the caller sees one accepted update
+    and the workflow applies it once. *)
 let update_response_delayed ~proxy ~direct_handle ~handle =
   let update_id = Client.workflow_id handle ^ "-update" in
+  let dropped_before = Fault_proxy.dropped_bytes proxy in
+  let returned = Atomic.make false in
   Fault_proxy.set_mode proxy Fault_proxy.Drop_responses;
   let pending =
     in_background (fun () ->
-      timed "update_response_delayed" 35. (fun () ->
-        Client.start_update ~update_id handle ~update ~input:7 ()))
+      let result =
+        timed "update_response_delayed" 35. (fun () ->
+          Client.start_update ~update_id handle ~update ~input:7 ())
+      in
+      Atomic.set returned true;
+      result)
   in
-  Thread.delay 2.;
+  (* Bounded so a fault that never reaches the server fails here instead of
+     passing after recovery without exercising the lost response. *)
+  await "update applied while its response is dropped" 20. (fun () ->
+    match Client.query direct_handle ~query with
+    | Ok 12 -> true
+    | Ok _ | Error _ -> false);
+  let dropped = Fault_proxy.dropped_bytes proxy - dropped_before in
+  if Atomic.get returned then
+    failwith "update_response_delayed: start_update returned while responses were dropped";
+  if dropped <= 0 then
+    failwith "update_response_delayed: the proxy discarded no response bytes";
+  Fault_proxy.log "scenario=update_response_delayed fault_exercised=true dropped_bytes=%d"
+    dropped;
   Fault_proxy.restore proxy;
   let accepted = get "update after delayed response" (join pending) in
   let value = get "wait update" (Client.wait_update accepted) in
@@ -339,20 +361,59 @@ let worker_poll_outage ~proxy ~direct ~queue ~track ~worker_stopped =
   | Ok _ -> failwith "worker_poll_outage: unexpected terminal outcome"
   | Error error -> failwith ("worker_poll_outage: wait failed: " ^ describe error)
 
+(** Fetches the exact run's history event types through the official CLI,
+    without a shell. A failed or unparsable read is [None] so the caller can
+    poll again; the CLI's own diagnostic goes to the inherited stderr. *)
+let history_event_types cli address handle =
+  let address = String.sub address 7 (String.length address - 7) in
+  let args = [| cli; "--address"; address; "--namespace"; namespace;
+    "--command-timeout"; "30s"; "workflow"; "show";
+    "--workflow-id"; Client.workflow_id handle; "--run-id"; Client.run_id handle;
+    "--output"; "json" |] in
+  let input = Unix.open_process_args_in cli args in
+  let document =
+    match Yojson.Basic.from_channel input with
+    | document -> Some document
+    | exception Yojson.Json_error _ -> None
+  in
+  match (Unix.close_process_in input, document) with
+  | Unix.WEXITED 0, Some document -> (
+      try
+        Some Yojson.Basic.Util.(
+          document |> member "events" |> to_list
+          |> List.map (fun event -> event |> member "eventType" |> to_string))
+      with Yojson.Basic.Util.Type_error _ -> None)
+  | _ -> None
+
 (** Scenario 8: the activity completion reaches Temporal but its
-    acknowledgement is lost. The worker retains and re-sends the completion
-    after reconnecting without dispatching the callback again, and the
-    workflow reaches its result. *)
-let activity_completion_ack_lost ~proxy ~direct ~queue ~track =
+    acknowledgement is lost. Before the fault ends, the server history must
+    already record [ActivityTaskCompleted] and the worker proxy must have
+    discarded response bytes, so the scenario cannot pass by completing the
+    activity only after recovery. The worker retains and re-sends the
+    completion after reconnecting without dispatching the callback again, and
+    the workflow reaches its result. *)
+let activity_completion_ack_lost ~proxy ~direct ~queue ~track ~cli ~address =
   let handle =
     track (get "activity fixture start"
       (Client.start direct ~workflow:activity_workflow ~task_queue:queue
          ~id:(queue ^ "-activity-ack-lost") ~input:41 ()))
   in
   await "activity callback" 30. (fun () -> Atomic.get activity_entered);
+  let dropped_before = Fault_proxy.dropped_bytes proxy in
   Fault_proxy.set_mode proxy Fault_proxy.Drop_responses;
   Atomic.set release_activity true;
-  Thread.delay 2.;
+  (* Bounded: a completion that never reaches the server while responses are
+     dropped means the lost acknowledgement was not exercised. *)
+  await "durable ActivityTaskCompleted while the acknowledgement is dropped" 30.
+    (fun () ->
+      match history_event_types cli address handle with
+      | Some types -> List.mem "EVENT_TYPE_ACTIVITY_TASK_COMPLETED" types
+      | None -> false);
+  let dropped = Fault_proxy.dropped_bytes proxy - dropped_before in
+  if dropped <= 0 then
+    failwith "activity_completion_ack_lost: the proxy discarded no response bytes";
+  Fault_proxy.log
+    "scenario=activity_completion_ack_lost fault_exercised=true dropped_bytes=%d" dropped;
   Fault_proxy.restore proxy;
   (match timed "activity_completion_ack_lost" 60. (fun () -> Client.wait handle) with
   | Ok (Client.Completed 42) -> ()
@@ -386,7 +447,7 @@ let expect_no_connections proxy label =
 
 (** Runs every scenario in order against one worker and cleans up even when
     an assertion fails. *)
-let check address =
+let check address cli =
   let host, port = upstream address in
   let queue =
     Printf.sprintf "transport-interruption-%d-%d" (Unix.getpid ())
@@ -436,7 +497,7 @@ let check address =
       wait_across_outage ~proxy:client_proxy ~direct_handle ~handle;
       terminate_ack_lost ~proxy:client_proxy ~client ~direct ~queue ~track;
       worker_poll_outage ~proxy:worker_proxy ~direct ~queue ~track ~worker_stopped;
-      activity_completion_ack_lost ~proxy:worker_proxy ~direct ~queue ~track;
+      activity_completion_ack_lost ~proxy:worker_proxy ~direct ~queue ~track ~cli ~address;
       shutdown_while_unavailable client_proxy;
       Ok ()
     with exception_ -> Error exception_
@@ -464,5 +525,5 @@ let check address =
 (** The supplied URL must identify a disposable test server. *)
 let () =
   match Array.to_list Sys.argv with
-  | [ _; "check"; address ] -> check address
-  | _ -> failwith "usage: regression check http://temporal:7233"
+  | [ _; "check"; address; cli ] -> check address cli
+  | _ -> failwith "usage: regression check http://temporal:7233 /path/to/temporal"

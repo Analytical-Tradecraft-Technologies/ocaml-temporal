@@ -47,12 +47,28 @@ operational failure.
 | Client connect | `Refuse` during `Client.create` | Prompt `` `Bridge `` error | The same target connects after `restore`. |
 | Start, acknowledgement lost | `Drop_responses` during `Client.start ~request_id` | After the 10 s start deadline: an uncertain-start error. It is `` `Bridge ``, non-retryable, has no `rpc_status` and no `already_started`, and names the request and workflow IDs | A start with another request ID fails with `already_started` naming the run, which proves the first start was applied. A retry with the original request ID returns that same run, with `started = true`. |
 | Signal, acknowledgement lost | `Drop_responses` during `Client.signal ~request_id` | After the 3 s control deadline: a retryable transport status (`Cancelled`, `Deadline_exceeded`, `Unavailable` or `Unknown`) | A retry with the same request ID succeeds. The counter shows that the signal was applied once. |
-| Update, response delayed | `Drop_responses` for 2 s, then `restore` | `start_update` succeeds. Core re-sends the same update ID on the new connection within the 30 s acceptance budget | `wait_update` and a direct query both show one application. |
+| Update, response delayed | `Drop_responses` until the fault is proven, then `restore` | `start_update` succeeds. Core re-sends the same update ID on the new connection within the 30 s acceptance budget | `wait_update` and a direct query both show one application. |
 | Exact-run wait | `Refuse` for 3 s while `Client.wait` is in flight | The wait does not fail | It returns `Completed` once a direct signal finishes the run. |
 | Terminate, acknowledgement lost | `Drop_responses` during `Client.terminate` | `rpc_status = Termination_outcome_uncertain`, non-retryable | A direct `wait` observes `Terminated`. |
 | Worker poll outage | `Refuse` for the worker while a workflow is started | `Worker.run` keeps running | The workflow completes after `restore`. |
-| Activity completion, acknowledgement lost | `Drop_responses` for the worker while the activity completes | The completion is retained and re-sent after reconnecting. Core treats the server's `NotFound` for the already-applied completion as done | The workflow completes, and the activity callback was dispatched exactly once in that attempt. |
+| Activity completion, acknowledgement lost | `Drop_responses` for the worker while the activity completes, until the fault is proven | The completion is retained and re-sent after reconnecting. Core treats the server's `NotFound` for the already-applied completion as done | The workflow completes, and the activity callback was dispatched exactly once in that attempt. |
 | Client shutdown while unavailable | `Refuse`, then `Client.shutdown` | `Ok ()` without waiting on the transport | None needed. |
+
+Two scenarios do not end their fault after a fixed delay, because a loaded
+host could run the operation only after recovery and the scenario would then
+pass without exercising the lost response. Each one waits, with a deadline,
+for evidence that the fault happened, and fails with a clear message if the
+evidence never appears:
+
+- Update: the direct client's query shows the update applied while
+  `start_update` is still blocked, and the client proxy has discarded response
+  bytes.
+- Activity completion: the run's history, read through the official Temporal
+  CLI, already records `ActivityTaskCompleted`, and the worker proxy has
+  discarded response bytes.
+
+The proxy counts every discarded byte, and the log records the count for each
+of these scenarios.
 
 After every proxied client and the worker are shut down, both proxies must
 report zero open connections. A connection still open at that point is a
@@ -82,12 +98,15 @@ leaked native handle or socket.
 CI runs the suite against the Compose Temporal/PostgreSQL stack through
 `make test-temporal-live-regressions`, which `make test-temporal-live-ci`
 invokes. The suite usually finishes in under a minute, and the controller
-bounds it at 180 s. To run it locally against a disposable server that has the
-`default` namespace:
+bounds it at 180 s. That controller also supplies the pinned admin-tools
+Temporal CLI, which the activity scenario uses to read its own history. To run
+the suite locally against a disposable server that has the `default`
+namespace, pass an official CLI path:
 
 ```sh
 make test-transport-interruption-live RUN='opam exec --' \
-  TEMPORAL_CLIENT_TEST_URL=http://127.0.0.1:7233
+  TEMPORAL_CLIENT_TEST_URL=http://127.0.0.1:7233 \
+  TEMPORAL_TEST_CLI=/path/to/temporal
 ```
 
 ## Remaining #504 scope

@@ -7,11 +7,14 @@ each fault. The scenarios, their required typed results, and the remaining
 #504 scope are described in
 [transport fault qualification](../../../docs/reference/transport-fault-qualification.md).
 
-Start a disposable Temporal server that has the `default` namespace, then run:
+Start a disposable Temporal server that has the `default` namespace. Then run
+the suite with an official Temporal CLI path, which the activity scenario uses
+to read its own history:
 
 ```sh
 make test-transport-interruption-live RUN='opam exec --' \
-  TEMPORAL_CLIENT_TEST_URL=http://127.0.0.1:7233
+  TEMPORAL_CLIENT_TEST_URL=http://127.0.0.1:7233 \
+  TEMPORAL_TEST_CLI=/path/to/temporal
 ```
 
 The suite runs its worker on a dedicated Domain and uses a unique task queue.

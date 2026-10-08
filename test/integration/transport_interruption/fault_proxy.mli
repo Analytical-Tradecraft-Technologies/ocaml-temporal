@@ -61,6 +61,12 @@ val active_connections : t -> int
 (** Total connections accepted since [start], including refused ones. *)
 val accepted_connections : t -> int
 
+(** Total bytes discarded since [start] because of [Drop_responses] (or a
+    chunk read while switching to [Refuse]). A scenario compares this before
+    and after its fault to prove that a response was actually lost, rather
+    than inferring it from elapsed time. *)
+val dropped_bytes : t -> int
+
 (** Stops accepting, closes every connection, and joins the proxy Domain.
     Idempotent. *)
 val stop : t -> unit

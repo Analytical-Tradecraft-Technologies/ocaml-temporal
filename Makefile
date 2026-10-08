@@ -883,12 +883,13 @@ history-corpus-capture: test-temporal-config
 	HISTORY_CORPUS_TEMPORAL_CLI='$(TEMPORAL_COMPOSE) run --rm --no-deps -T temporal-admin-tools temporal' \
 	sh test/history_corpus/scripts/capture-history-corpus.sh
 
-# Requires a disposable running Temporal server with the default namespace. The
-# regression owns an in-process TCP fault proxy, its worker, and a unique task
-# queue; it terminates its workflow executions on exit (#504).
+# Requires a disposable running Temporal server with the default namespace and
+# an explicit official Temporal CLI path. The regression owns an in-process TCP
+# fault proxy, its worker, and a unique task queue; it terminates its workflow
+# executions on exit (#504).
 .PHONY: test-transport-interruption-live
 test-transport-interruption-live:
-	$(RUN) dune exec $(DUNE_BUILD_ARGS) test/integration/transport_interruption/regression.exe -- check $(TEMPORAL_CLIENT_TEST_URL)
+	$(RUN) dune exec $(DUNE_BUILD_ARGS) test/integration/transport_interruption/regression.exe -- check $(TEMPORAL_CLIENT_TEST_URL) $(TEMPORAL_TEST_CLI)
 
 # Requires a disposable running Temporal server. The regression owns its worker,
 # uses a unique task queue, and terminates its workflow executions on exit.

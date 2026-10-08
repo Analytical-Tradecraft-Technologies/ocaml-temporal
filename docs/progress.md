@@ -42,10 +42,16 @@ regression checks these behaviors:
 - Client shutdown while the server is unavailable returns at once.
 - Both proxies end with no open connection.
 
+The update and activity scenarios do not end their fault after a fixed delay.
+Each waits, with a deadline, for proof that the fault happened: the update must
+already be applied, or `ActivityTaskCompleted` must already be in the history
+(read with the official CLI), and the proxy must have discarded response
+bytes.
+
 No production code changed. The existing classification already met each
 assertion.
 
-Evidence: three consecutive runs passed in 36-48 s with OCaml 5.4.1 on macOS
+Evidence: three consecutive runs passed in 36-38 s with OCaml 5.4.1 on macOS
 against the Compose Temporal 1.32.0/PostgreSQL stack. CI runs it through
 `make test-temporal-live-regressions`. Some #504 scope remains open, as listed
 in [transport fault qualification](reference/transport-fault-qualification.md#remaining-504-scope):

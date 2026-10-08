@@ -22,6 +22,7 @@ type t = {
   mode : mode Atomic.t;
   stopping : bool Atomic.t;
   accepted : int Atomic.t;
+  dropped : int Atomic.t;
   (* Guards [connections] and [next_id]. Held only for table updates and
      socket shutdown calls, never across blocking I/O. *)
   mutex : Mutex.t;
@@ -97,7 +98,12 @@ let pump proxy id connection direction =
           | Forward, _ | Drop_responses, Client_to_server -> true
           | Drop_responses, Server_to_client | Refuse, _ -> false
         in
-        if (not forward) || write_all target buffer 0 count then loop ()
+        if not forward then begin
+          (* Counted so a scenario can prove its fault discarded real bytes. *)
+          ignore (Atomic.fetch_and_add proxy.dropped count);
+          loop ()
+        end
+        else if write_all target buffer 0 count then loop ()
     | exception Unix.Unix_error (Unix.EINTR, _, _) -> loop ()
     | exception Unix.Unix_error _ -> ()
   in
@@ -189,6 +195,7 @@ let start ~name ~upstream_host ~upstream_port =
       mode = Atomic.make Forward;
       stopping = Atomic.make false;
       accepted = Atomic.make 0;
+      dropped = Atomic.make 0;
       mutex = Mutex.create ();
       connections = Hashtbl.create 8;
       next_id = 0;
@@ -206,6 +213,8 @@ let active_connections proxy =
   Mutex.protect proxy.mutex (fun () -> Hashtbl.length proxy.connections)
 
 let accepted_connections proxy = Atomic.get proxy.accepted
+
+let dropped_bytes proxy = Atomic.get proxy.dropped
 
 let set_mode proxy mode =
   Atomic.set proxy.mode mode;
