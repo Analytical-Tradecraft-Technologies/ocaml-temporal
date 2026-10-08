@@ -28,7 +28,7 @@ let workflow_id () =
 (** Displays one terminal workflow outcome and turns non-success terminal
     states into an expected error so the command exits nonzero after cleanup. *)
 let display_terminal = function
-  | Temporal.Client.Completed message ->
+  | Temporal.Client.Completed { output = message; _ } ->
       Printf.printf "Workflow completed:\n%s\n%!" message;
       Ok ()
   | Temporal.Client.Failed { error; _ } ->

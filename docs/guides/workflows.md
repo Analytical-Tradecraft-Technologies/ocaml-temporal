@@ -1074,8 +1074,10 @@ identifiers therefore return a typed defect consistently with either the
 deterministic mock or the native JSON bridge. This includes keys in both the
 `~memo` and `~search_attributes` collections.
 
-When the result is `Continued_as_new successor`, use
-`Temporal.Client.follow` to make an exact-run handle for that successor:
+When the result is `Continued_as_new successor` (or a `Completed`, `Failed`,
+or `Timed_out` result whose `successor` is `Some` run started by a cron
+schedule or retry policy), use `Temporal.Client.follow` to make an exact-run
+handle for that successor:
 
 ```ocaml
 let open Temporal.Result_syntax in
@@ -1085,7 +1087,6 @@ match Temporal.Client.wait handle with
       Temporal.Client.follow client ~workflow:summarize_workflow successor
     in
     Temporal.Client.wait successor_handle
-| Ok (Temporal.Client.Completed output) -> Ok (Temporal.Client.Completed output)
 | Ok terminal -> Ok terminal
 | Error error -> Error error
 ```
@@ -1098,6 +1099,33 @@ supplied workflow's codecs, and returns a typed error if the client has already
 been shut down or the identity is malformed. The caller therefore chooses
 explicitly whether to observe one successor, build a loop over a chain, or
 stop after the original run.
+
+### Addressing a workflow by ID
+
+A process that did not start a workflow, such as a web service signalling a
+long-running entity workflow by its business ID, builds a handle with
+`Temporal.Client.get_handle`. Without `~run_id` the handle addresses the
+workflow's current run: every operation sends an empty run ID and Temporal
+resolves the latest run when it handles the request, so the handle keeps
+working after the workflow continues as new.
+
+```ocaml
+let open Temporal.Result_syntax in
+let* handle =
+  Temporal.Client.get_handle client ~workflow:account_workflow ~id:"account-42" ()
+in
+let* () = Temporal.Client.signal handle ~signal:deposit ~input:100 in
+Temporal.Client.wait handle
+```
+
+`wait` on such a handle follows the run chain like the official SDKs'
+result methods: it waits on each continued-as-new, cron, or retry successor
+until a run closes without one, so it never returns `Continued_as_new`.
+`Temporal.Client.run_id` returns `None` for it. Pass `~run_id` to address one
+exact run instead; that handle behaves like one built by `follow`. Building a
+handle sends nothing to Temporal, so an unknown workflow ID surfaces from the
+first operation as an error whose `Temporal.Client.rpc_status` is
+``Some `Not_found``.
 
 `Temporal.Client.cancel` sends a cancellation request for the exact run held by
 the handle and returns after Temporal acknowledges that request. It does not

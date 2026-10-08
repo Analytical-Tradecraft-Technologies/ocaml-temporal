@@ -1,14 +1,19 @@
-(** Client operations for starting workflows and awaiting an exact run.
+(** Client operations for starting workflows and addressing their runs.
 
     The client is deliberately smaller than a worker: it owns a connection
-    backend and typed handles, but never registers or executes workflow code. *)
+    backend and typed handles, but never registers or executes workflow code.
+
+    A handle addresses either one exact run (from {!start}, {!follow}, or
+    {!get_handle} with [~run_id]) or the workflow's current run (from
+    {!get_handle} without [~run_id]). Every operation accepts both kinds. *)
 
 (** An opaque client connection owned by the caller. *)
 type t
 
-(** A typed identity for one started workflow execution. The input parameter
-    documents the value used at start; the output parameter controls decoding
-    of the terminal payload. *)
+(** A typed address for a workflow execution: one exact run, or the current
+    run of a workflow ID (see {!get_handle}). The input parameter documents
+    the value used at start; the output parameter controls decoding of the
+    terminal payload. *)
 type ('input, 'output) handle
 
 (** Opaque client-side handle for one accepted workflow update. It records the
@@ -16,8 +21,9 @@ type ('input, 'output) handle
     await it or inspect its update ID. *)
 type ('input, 'output) update_handle
 
-(** An exact successor workflow/run identity returned after a failed, timed-out,
-    or continued-as-new run.
+(** An exact workflow/run identity: a successor returned after a completed,
+    failed, timed-out, or continued-as-new run, the open run reported by
+    {!already_started}, or the new run returned by {!reset}.
     It contains no codec or client ownership; use [follow] with the original
     client and typed workflow definition to construct a handle for this run.
     The namespace is retained so a successor cannot accidentally be used
@@ -35,8 +41,10 @@ type execution = {
     flow exceptions. The outer [result] of [wait] is reserved for bridge or
     payload transport errors. *)
 type 'output terminal_result =
-  (* The terminal payload decoded using the workflow definition's output codec. *)
-  | Completed of 'output
+  (* The terminal payload decoded using the workflow definition's output codec.
+     [successor] is the run a cron schedule or retry policy started when this
+     run completed, or [None]; following it is the caller's choice. *)
+  | Completed of { output : 'output; successor : execution option }
   (* Failure and optional retry successor. Following it is the caller's choice. *)
   | Failed of { error : Error.t; successor : execution option }
   (* The exact run reached the cancellation state. *)
@@ -168,7 +176,10 @@ val start :
   unit ->
   (('input, 'output) handle, Error.t) result
 
-(** Rebuilds a typed exact-run handle for a successor returned by [wait].
+(** Rebuilds a typed exact-run handle for an {!type-execution}, such as a
+    successor returned by [wait]. [follow client ~workflow e] is
+    [get_handle client ~workflow ~id:e.workflow_id ~run_id:e.run_id ()] with
+    an additional namespace check.
     This does not start a workflow or follow a run implicitly: it only combines
     the caller's existing client, the supplied workflow definition's codecs,
     and the successor identity. The successor namespace must equal the
@@ -182,9 +193,54 @@ val follow :
   execution ->
   (('input, 'output) handle, Error.t) result
 
-(** Waits for the exact workflow ID and run ID returned by [start]. Failed,
-    timed-out, and continued-as-new outcomes may carry a typed successor;
-    the wait never follows one implicitly.
+(** Builds a handle for a workflow the caller did not necessarily start, from
+    its workflow ID: for example a web service signalling a long-running
+    entity workflow by its business ID. No request is sent and the workflow's
+    existence is not checked; an unknown workflow ID or run surfaces from the
+    first operation as an error with {!val-rpc_status} [Some `Not_found]. [id] and
+    an explicit [run_id] must be non-empty, valid UTF-8, NUL-free, and no more
+    than 65,536 bytes; violations are typed defects. The workflow definition
+    supplies the codecs, exactly as for {!follow}; nothing checks that it
+    matches the workflow type that was started.
+
+    With [~run_id] the handle addresses that exact run, like {!follow}.
+
+    Without it, the handle addresses the workflow's current run: the latest
+    run of the workflow ID, open or closed. Each operation sends an empty run
+    ID and Temporal resolves the current run when it handles that request, so
+    a handle kept across a continue-as-new reaches the new run, which is what
+    an entity workflow's signal senders need. On such a handle:
+    - {!signal}, {!query}, {!query_with_input}, {!cancel}, {!terminate}, and
+      {!reset} act on the run that is current when Temporal handles the call.
+    - {!start_update} targets the current run, and the returned update handle
+      keeps the exact run that accepted the update, so {!wait_update} polls
+      that run even if the workflow later continues as new.
+    - {!wait} follows the run chain, as the official SDKs' result methods do
+      for a handle obtained by workflow ID: it waits for the current run and,
+      whenever a run closes with a successor (continued-as-new, a cron run, or
+      a retry), waits for that successor, returning the outcome of the first
+      run that closes without one. It therefore never returns
+      [Continued_as_new], and its successor fields are always [None]. A
+      workflow with a cron schedule never ends its chain, so such a wait does
+      not return until the schedule stops. Use an exact-run handle to observe
+      one run at a time.
+    - {!val-run_id} returns [None] and {!started} returns [false].
+
+    Without [~run_id], the default cancellation request ID is derived from
+    the workflow ID alone; see {!cancel}. *)
+val get_handle :
+  t ->
+  ?run_id:string ->
+  workflow:('input, 'output) Workflow.t ->
+  id:string ->
+  unit ->
+  (('input, 'output) handle, Error.t) result
+
+(** Waits for the run [handle] addresses to close. On an exact-run handle the
+    wait observes only that run: completed, failed, timed-out, and
+    continued-as-new outcomes may carry a typed successor, and the wait never
+    follows one implicitly. On a current-run handle from {!get_handle} the
+    wait follows the run chain to its last run, as described there.
 
     The native client retains at most 64 distinct runs being waited on.
     Concurrent waits on the same run share one slot. Waiting on another run
@@ -195,13 +251,16 @@ val wait :
   ('input, 'output) handle ->
   ('output terminal_result, Error.t) result
 
-(** Requests cancellation of the exact run retained by [handle]. A successful
+(** Requests cancellation of the run [handle] addresses. A successful
     call acknowledges Temporal's cancellation RPC; it does not wait for the
     workflow to stop. Call [wait handle] to observe [Cancelled]. [request_id]
     is the idempotency key for this logical control operation. When omitted,
-    the client derives a stable key from the handle's workflow ID and run ID,
+    the client derives a stable key from the handle's workflow ID and run ID
+    (the workflow ID alone for a current-run handle),
     so every defaulted call for the same run, including a retry after an
-    uncertain transport error, is the same logical request. Supply an explicit
+    uncertain transport error, is the same logical request. Temporal
+    deduplicates the key per run, so it does not prevent cancelling a later
+    run of the same workflow. Supply an explicit
     value only when separate cancellation requests for the same run must be
     distinguished. An explicit [request_id] must be non-empty and valid UTF-8.
     Both [request_id] and [reason] are limited to 65,536 bytes and may not
@@ -212,7 +271,7 @@ val cancel :
   ('input, 'output) handle ->
   (unit, Error.t) result
 
-(** Terminates the exact run retained by [handle] immediately. Success means
+(** Terminates the run [handle] addresses immediately. Success means
     Temporal acknowledged the termination RPC; call [wait handle] to observe
     the immutable [Terminated] terminal result. [reason] is bounded operator
     context and may be empty. The request is re-sent only after the server
@@ -226,8 +285,8 @@ val terminate :
   ('input, 'output) handle ->
   (unit, Error.t) result
 
-(** Resets the exact run at a workflow-task event boundary and returns the new
-    run identity. A still-running old run is terminated, while an already
+(** Resets the run [handle] addresses at a workflow-task event boundary and
+    returns the new run identity. A still-running old run is terminated, while an already
     closed run keeps its terminal result. Callers must explicitly use [follow]
     with the returned execution to wait for the new run. When [request_id]
     is omitted, each call uses a fresh ID, so calling [reset] again at the same
@@ -244,7 +303,7 @@ val reset :
   ('input, 'output) handle ->
   (execution, Error.t) result
 
-(** Sends one typed signal to the exact run retained by [handle]. A successful
+(** Sends one typed signal to the run [handle] addresses. A successful
     call acknowledges Temporal's signal RPC; it does not wait for workflow code
     to process the message. [request_id] is optional: when omitted, the SDK
     allocates a fresh random ID across client handles and processes. Supply the
@@ -259,7 +318,7 @@ val signal :
   input:'signal ->
   (unit, Error.t) result
 
-(** Executes an output-only query against the exact run retained by [handle].
+(** Executes an output-only query against the run [handle] addresses.
     A successful result is decoded with [query]'s output codec; routine
     Temporal query failures and codec failures are returned as typed [Error.t]
     values. When the workflow's query handler fails, or the worker has no
@@ -288,8 +347,7 @@ val list_visibility :
   unit ->
   (visibility_page, Error.t) result
 
-(** Executes a typed one-input query against the exact run retained by
-    [handle]. The input is encoded with [query]'s codec before transport and
+(** Executes a typed one-input query against the run [handle] addresses. The input is encoded with [query]'s codec before transport and
     the result is decoded with its output codec. Query handlers remain
     synchronous and read-only; routine Temporal failures are returned as
     typed errors. *)
@@ -331,13 +389,16 @@ val update_id : ('input, 'output) update_handle -> string
 (** Returns the durable workflow ID supplied to [start]. *)
 val workflow_id : ('input, 'output) handle -> string
 
-(** Returns the server-issued run ID supplied to [start]. *)
-val run_id : ('input, 'output) handle -> string
+(** Returns the exact run ID [handle] addresses: the server-issued run ID
+    returned by [start], or the run supplied to [follow] or [get_handle].
+    Returns [None] for a current-run handle from {!get_handle}, which never
+    pins a run: the run it reaches can change with every operation. *)
+val run_id : ('input, 'output) handle -> string option
 
 (** Returns [true] when the [start] call that produced [handle] created its
     run, including a request-ID deduplicated retry of that same start.
     Returns [false] when a [`Use_existing] start attached to a run created by
-    another start, and for every handle built by [follow]. *)
+    another start, and for every handle built by [follow] or [get_handle]. *)
 val started : ('input, 'output) handle -> bool
 
 (** Returns the open run that made a [`Fail] start fail, or [None] for any

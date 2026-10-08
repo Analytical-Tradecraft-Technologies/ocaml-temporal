@@ -120,14 +120,14 @@ let start () =
         ~memo:(if memo then ["note", payload] else [])
         ~search_attributes:(if search then ["MetadataKeyword", payload] else [])
         ~input:((if continue then "continue|" else "") ^ expected) ()) in
-      let root_id = C.run_id root in
+      let root_id = Option.get (C.run_id root) in
       roots := (id, root_id, expected) :: !roots;
       let handle = if not continue then root else match ok (C.wait root) with
         | C.Continued_as_new execution -> ok (C.follow client ~workflow execution)
         | _ -> failwith "metadata workflow did not continue as new" in
       ready handle expected;
-      Printf.printf "started %s root=%s active=%s\n%!" id root_id (C.run_id handle);
-      id, C.run_id handle, expected) cases in
+      Printf.printf "started %s root=%s active=%s\n%!" id root_id (Option.get (C.run_id handle));
+      id, Option.get (C.run_id handle), expected) cases in
     write_runs (env "METADATA_RUNS") runs;
     write_runs (env "METADATA_RUNS" ^ ".roots") (List.rev !roots))
 
@@ -140,7 +140,7 @@ let finish () =
       ready handle expected;
       ok (C.signal handle ~signal:release ~input:());
       match ok (C.wait handle) with
-      | C.Completed value when value = expected -> Printf.printf "completed %s %s\n%!" id run_id
+      | C.Completed { output = value; _ } when value = expected -> Printf.printf "completed %s %s\n%!" id run_id
       | _ -> failwith ("unexpected terminal metadata outcome for " ^ id))
       (read_runs (env "METADATA_RUNS")))
 

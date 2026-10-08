@@ -119,8 +119,17 @@ for those rules.
   existing run `Client.already_started` returns, a handle for the running
   execution (`Client.started` is `false`), or termination of that execution
   and a new run. The client retains the exact workflow/run identity, rebuilds a
-  typed handle for a `Continued_as_new` successor with `Client.follow`,
-  requests exact-run cancellation, reset, or termination. `Client.reset`
+  typed handle for a successor (from `Continued_as_new`, or the optional
+  `successor` of `Completed { output; successor }`, `Failed`, or `Timed_out`)
+  with `Client.follow`, and requests cancellation, reset, or termination.
+  `Client.get_handle client ~workflow ~id ()` builds a handle from a workflow
+  ID without contacting Temporal, for a process that did not start the
+  workflow. With `~run_id` it addresses that exact run; without it the handle
+  addresses the workflow's current run: every operation lets Temporal resolve
+  the latest run, so the handle keeps working across continue-as-new,
+  `Client.run_id` returns `None`, and `Client.wait` follows continued-as-new,
+  cron, and retry successors to the last run, like the official SDKs' result
+  methods. `Client.reset`
   stops an exact run at a workflow-task event boundary and returns a new
   execution identity; call `Client.follow` explicitly if you want to await
   that successor. The client also sends typed signals and output-only or

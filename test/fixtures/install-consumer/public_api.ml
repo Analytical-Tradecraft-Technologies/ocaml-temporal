@@ -642,6 +642,23 @@ let _client_follow :
     (('input, 'output) T.Client.handle, T.Error.t) result =
   T.Client.follow
 
+let _client_get_handle :
+    T.Client.t ->
+    ?run_id:string ->
+    workflow:('input, 'output) T.Workflow.t ->
+    id:string ->
+    unit ->
+    (('input, 'output) T.Client.handle, T.Error.t) result =
+  T.Client.get_handle
+
+(* A completed result carries its output and the optional cron or retry
+   successor as an inline record, like the failed and timed-out results. *)
+let _client_completed_fields :
+    'output T.Client.terminal_result -> ('output * T.Client.execution option) option =
+  function
+  | T.Client.Completed { output; successor } -> Some (output, successor)
+  | _ -> None
+
 let _client_execution_fields (execution : T.Client.execution) : string * string * string =
   (execution.namespace, execution.workflow_id, execution.run_id)
 
@@ -689,7 +706,8 @@ let _client_workflow_id :
     ('input, 'output) T.Client.handle -> string =
   T.Client.workflow_id
 
-let _client_run_id : ('input, 'output) T.Client.handle -> string = T.Client.run_id
+let _client_run_id : ('input, 'output) T.Client.handle -> string option =
+  T.Client.run_id
 let _client_started : ('input, 'output) T.Client.handle -> bool = T.Client.started
 let _client_already_started : T.Error.t -> T.Client.execution option =
   T.Client.already_started
