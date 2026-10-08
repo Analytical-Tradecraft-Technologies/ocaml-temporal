@@ -1,0 +1,6 @@
+; Live-only capture program; built and run by `make history-corpus-capture`.
+; It is never run by `dune runtest` because it needs a Temporal server.
+
+(executable
+ (name history_corpus_capture)
+ (libraries temporal-sdk temporal_history_corpus_definitions yojson unix))

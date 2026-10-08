@@ -79,6 +79,9 @@ The remaining reference documents are useful when changing one subsystem:
 - [Internal replay worker bridge](reference/replay-bridge.md) documents the
   bounded Rust history feeder, strict JSON/base64 format, Core ownership, and
   the local evidence for the first replay-plumbing slice.
+- [Replay history corpus](reference/history-corpus.md) documents the versioned
+  histories, manifest schema, Docker-free replay gate, capture command and
+  addition rules for replay compatibility.
 - [Live diagnostic artifacts](reference/live-diagnostic-artifacts.md) describes
   bounded CI retention, redaction, partial failure evidence and retrieval.
 - [Worker restart/replay diagnostic contract](reference/worker-restart-replay-diagnostics.md)

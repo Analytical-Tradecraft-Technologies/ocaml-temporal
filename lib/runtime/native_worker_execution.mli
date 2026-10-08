@@ -39,7 +39,12 @@ module type SUPERVISOR = sig
       authoritative: a source must submit only its bytes and must never
       re-encode or mutate [completion]. [completion] may alias payload buffers
       owned by workflow code, so unlike the bytes it is not a snapshot. The
-      production supervisor ignores it. *)
+      production supervisor ignores it.
+
+      [abandon_activation] calls this from the watchdog Domain while the
+      workflow lane is still inside workflow code, so an implementation must
+      accept a call from a Domain other than the one that polled. The two
+      calls never overlap for one adapter. *)
   val complete_workflow :
     t ->
     completion:Temporal_protocol.Workflow_protocol.completion ->
@@ -85,6 +90,32 @@ type activation_info = {
     asynchronous cross-language callback. The same value may be delivered to
     the completion observer after Core has acknowledged the activation
     completion. *)
+
+type abandonment =
+  [ `Task_failed | `Queries_failed | `Eviction_acknowledged | `Not_acknowledged ]
+(** What the watchdog submitted in place of the lane's completion and whether
+    the supervisor acknowledged it. [`Task_failed]: an ordinary activation's
+    workflow task was failed. [`Queries_failed]: a query-only activation's
+    queries were answered with failures; the workflow task was not failed.
+    [`Eviction_acknowledged]: an eviction-only activation received its empty
+    acknowledgement. [`Not_acknowledged]: encoding or submission failed, so
+    the task, query, or eviction is left to time out. *)
+
+type stuck_activation = {
+  run_id : string;
+  workflow_id : string option;
+  workflow_type : string option;
+  is_replaying : bool;
+  elapsed_ms : int;
+  abandoned : abandonment;
+}
+(** Bounded identity of an activation abandoned by the non-yielding-code
+    watchdog (#493). [workflow_id] and [workflow_type] are [None] only when the
+    activation neither initialized the run nor matched a cached run.
+    [elapsed_ms] is the watchdog's lower bound on the time the activation had
+    spent in workflow code. [abandoned] describes the watchdog's replacement
+    completion and its acknowledgement. No payload,
+    task token, or failure text is retained. *)
 
 (** One workflow definition registered with the worker. The existential
     wrapper preserves the input/output codec relationship while allowing one
@@ -217,6 +248,40 @@ module Make (Supervisor : SUPERVISOR) : sig
       native graph and then call [discard] on a terminal path; it must never
       silently drop this completion while Rust still owns it. *)
   val drain : t -> (unit, error_view) result
+
+  (** Returns the epoch of the activation currently executing workflow code
+      (codecs, observers, handlers, or workflow fibers), or [None] while the
+      lane polls, waits, or submits a completion. Each leased activation gets
+      a fresh epoch. This is a lock-free read intended for the watchdog
+      Domain; it never blocks on the lane. *)
+  val running_epoch : t -> int option
+
+  (** [abandon_activation t ~epoch ~elapsed_ms] releases the lease of
+      activation [epoch] if it is still executing workflow code. The watchdog
+      and the lane race on one atomic claim, so exactly one of them completes
+      the native lease: on winning, this submits a failure completion through
+      the supervisor (a task failure, an empty eviction acknowledgement, or
+      failed query answers, exactly as an adapter-level rejection would),
+      records the sticky {!stuck} report with the matching {!abandonment},
+      logs one bounded diagnostic, and returns it. When the lane later returns, its completion is dropped
+      without a native call and, unless the activation only answered
+      queries, its run is removed (a task failure makes Core evict it); the poll reports [Rejected] with code
+      [activation_deadline_exceeded], or [Error] when the watchdog's
+      submission was not acknowledged. Returns [None] when [epoch] is no
+      longer running or the lane claimed the lease first.
+
+      This is the only operation that calls [Supervisor.complete_workflow]
+      without the adapter mutex, from a Domain other than the lane. It never
+      interrupts, resumes, or inspects workflow code, and never runs while
+      the lane is itself inside a supervisor call for this adapter. *)
+  val abandon_activation :
+    t -> epoch:int -> elapsed_ms:int -> stuck_activation option
+
+  (** The first activation abandoned by the watchdog, if any. The report is
+      sticky for the lifetime of the adapter: workflow code that failed to
+      yield may have corrupted process state, so recovery is a process
+      restart. *)
+  val stuck : t -> stuck_activation option
 
   (** Discards all retained completion bytes and shuts down every OCaml-owned
       execution after terminal native cleanup. This is irreversible and must

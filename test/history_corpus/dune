@@ -1,0 +1,27 @@
+; Replay history corpus (issue #518). The frozen definitions are shared by the
+; live capture program and the Docker-free corpus test so both register the
+; exact same application code; see docs/reference/history-corpus.md.
+
+(library
+ (name temporal_history_corpus_definitions)
+ (wrapped false)
+ (modules corpus_definitions)
+ (libraries temporal-sdk task_failure_support))
+
+(test
+ (name test_history_corpus)
+ (modules corpus_sha256 corpus_manifest corpus_replay test_history_corpus)
+ (deps
+  (source_tree ../fixtures/history-corpus))
+ (action
+  (run %{test} %{dep:../fixtures/history-corpus/manifest.json}))
+ (libraries
+  temporal-sdk
+  temporal_base
+  temporal_core_bridge
+  temporal_protocol
+  temporal_runtime
+  temporal_sdk_supervisor
+  temporal_history_corpus_definitions
+  yojson
+  unix))
