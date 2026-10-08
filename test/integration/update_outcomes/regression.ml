@@ -61,7 +61,7 @@ let delete_execution cli address handle =
   let address = String.sub address 7 (String.length address - 7) in
   let args = [|cli; "--address"; address; "workflow"; "delete"; "--yes";
     "--workflow-id"; Client.workflow_id handle;
-    "--run-id"; Client.run_id handle|] in
+    "--run-id"; Option.get (Client.run_id handle)|] in
   let pid = Unix.create_process cli args Unix.stdin Unix.stdout Unix.stderr in
   match snd (Unix.waitpid [] pid) with
   | Unix.WEXITED 0 -> ()

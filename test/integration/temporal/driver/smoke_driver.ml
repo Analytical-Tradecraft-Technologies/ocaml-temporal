@@ -218,8 +218,8 @@ let require_live_gate () =
 
 (** Requires a completed terminal outcome with the expected typed payload. *)
 let require_completed operation expected = function
-  | Ok (Client.Completed actual) when String.equal actual expected -> Ok ()
-  | Ok (Client.Completed actual) ->
+  | Ok (Client.Completed { output = actual; _ }) when String.equal actual expected -> Ok ()
+  | Ok (Client.Completed { output = actual; _ }) ->
       Error
         (Error.defect
            ~message:
@@ -370,19 +370,19 @@ let cancel_workflow handle =
   let operation = "cancel:" ^ Client.workflow_id handle in
   let started = Unix.gettimeofday () in
   phase ~operation ~status:"begin" ~workflow_id:(Client.workflow_id handle)
-    ~run_id:(Client.run_id handle) ();
+    ~run_id:(Option.get (Client.run_id handle)) ();
   match
     Client.cancel ~request_id:"two-binary-cancel-long-running-1"
       ~reason:"live acceptance requested cancellation" handle
   with
   | Ok () ->
       phase ~operation ~status:"acknowledged"
-        ~workflow_id:(Client.workflow_id handle) ~run_id:(Client.run_id handle)
+        ~workflow_id:(Client.workflow_id handle) ~run_id:(Option.get (Client.run_id handle))
         ~duration_ms:(elapsed_ms started) ();
       Ok ()
   | Error error ->
       phase ~operation ~status:("error:" ^ Error.kind error)
-        ~workflow_id:(Client.workflow_id handle) ~run_id:(Client.run_id handle)
+        ~workflow_id:(Client.workflow_id handle) ~run_id:(Option.get (Client.run_id handle))
         ~duration_ms:(elapsed_ms started) ();
       Error error
 
@@ -402,23 +402,23 @@ let terminate_workflow handle =
   let operation = "terminate:" ^ Client.workflow_id handle in
   let started = Unix.gettimeofday () in
   phase ~operation ~status:"begin" ~workflow_id:(Client.workflow_id handle)
-    ~run_id:(Client.run_id handle) ();
+    ~run_id:(Option.get (Client.run_id handle)) ();
   match
     Client.terminate ~reason:"live acceptance requested termination" handle
   with
   | Ok () ->
       phase ~operation ~status:"acknowledged"
-        ~workflow_id:(Client.workflow_id handle) ~run_id:(Client.run_id handle)
+        ~workflow_id:(Client.workflow_id handle) ~run_id:(Option.get (Client.run_id handle))
         ~duration_ms:(elapsed_ms started) ();
       Ok ()
   | Error error when is_uncertain_termination error ->
       phase ~operation ~status:"uncertain"
-        ~workflow_id:(Client.workflow_id handle) ~run_id:(Client.run_id handle)
+        ~workflow_id:(Client.workflow_id handle) ~run_id:(Option.get (Client.run_id handle))
         ~duration_ms:(elapsed_ms started) ();
       Ok ()
   | Error error ->
       phase ~operation ~status:("error:" ^ Error.kind error)
-        ~workflow_id:(Client.workflow_id handle) ~run_id:(Client.run_id handle)
+        ~workflow_id:(Client.workflow_id handle) ~run_id:(Option.get (Client.run_id handle))
         ~duration_ms:(elapsed_ms started) ();
       Error error
 
@@ -431,15 +431,15 @@ let query_signal_condition_workflow handle =
   let operation = "query:" ^ Client.workflow_id handle in
   let started = Unix.gettimeofday () in
   phase ~operation ~status:"begin" ~workflow_id:(Client.workflow_id handle)
-    ~run_id:(Client.run_id handle) ();
+    ~run_id:(Option.get (Client.run_id handle)) ();
   match Client.query handle ~query:Definitions.signal_condition_status with
   | Ok value ->
       phase ~operation ~status:"answered" ~workflow_id:(Client.workflow_id handle)
-        ~run_id:(Client.run_id handle) ~duration_ms:(elapsed_ms started) ();
+        ~run_id:(Option.get (Client.run_id handle)) ~duration_ms:(elapsed_ms started) ();
       Ok value
   | Error error ->
       phase ~operation ~status:("error:" ^ Error.kind error)
-        ~workflow_id:(Client.workflow_id handle) ~run_id:(Client.run_id handle)
+        ~workflow_id:(Client.workflow_id handle) ~run_id:(Option.get (Client.run_id handle))
         ~duration_ms:(elapsed_ms started) ();
       Error error
 
@@ -450,18 +450,18 @@ let query_signal_value_echo handle input =
   let operation = "query_typed:" ^ Client.workflow_id handle in
   let started = Unix.gettimeofday () in
   phase ~operation ~status:"begin" ~workflow_id:(Client.workflow_id handle)
-    ~run_id:(Client.run_id handle) ();
+    ~run_id:(Option.get (Client.run_id handle)) ();
   match
     Client.query_with_input handle ~query:Definitions.signal_value_echo ~input
   with
   | Ok value ->
       phase ~operation ~status:"answered"
-        ~workflow_id:(Client.workflow_id handle) ~run_id:(Client.run_id handle)
+        ~workflow_id:(Client.workflow_id handle) ~run_id:(Option.get (Client.run_id handle))
         ~duration_ms:(elapsed_ms started) ();
       Ok value
   | Error error ->
       phase ~operation ~status:("error:" ^ Error.kind error)
-        ~workflow_id:(Client.workflow_id handle) ~run_id:(Client.run_id handle)
+        ~workflow_id:(Client.workflow_id handle) ~run_id:(Option.get (Client.run_id handle))
         ~duration_ms:(elapsed_ms started) ();
       Error error
 
@@ -473,14 +473,14 @@ let update_signal_condition_workflow handle input =
   let operation = "update:" ^ Client.workflow_id handle in
   let started = Unix.gettimeofday () in
   phase ~operation ~status:"begin" ~workflow_id:(Client.workflow_id handle)
-    ~run_id:(Client.run_id handle) ();
+    ~run_id:(Option.get (Client.run_id handle)) ();
   match
     Client.start_update ~update_id:"two-binary-update-1" handle
       ~update:Definitions.signal_value_update ~input ()
   with
   | Error error ->
       phase ~operation ~status:("error:" ^ Error.kind error)
-        ~workflow_id:(Client.workflow_id handle) ~run_id:(Client.run_id handle)
+        ~workflow_id:(Client.workflow_id handle) ~run_id:(Option.get (Client.run_id handle))
         ~duration_ms:(elapsed_ms started) ();
       Error error
   | Ok update_handle -> (
@@ -488,12 +488,12 @@ let update_signal_condition_workflow handle input =
       | Ok value ->
           phase ~operation ~status:"completed"
             ~workflow_id:(Client.workflow_id handle)
-            ~run_id:(Client.run_id handle) ~duration_ms:(elapsed_ms started) ();
+            ~run_id:(Option.get (Client.run_id handle)) ~duration_ms:(elapsed_ms started) ();
           Ok value
       | Error error ->
           phase ~operation ~status:("error:" ^ Error.kind error)
             ~workflow_id:(Client.workflow_id handle)
-            ~run_id:(Client.run_id handle) ~duration_ms:(elapsed_ms started) ();
+            ~run_id:(Option.get (Client.run_id handle)) ~duration_ms:(elapsed_ms started) ();
           Error error)
 
 (** Confirms the live server rejects an update whose name is absent from the
@@ -505,10 +505,10 @@ let update_missing_handler handle =
   let operation = "update_missing:" ^ Client.workflow_id handle in
   let started = Unix.gettimeofday () in
   phase ~operation ~status:"begin" ~workflow_id:(Client.workflow_id handle)
-    ~run_id:(Client.run_id handle) ();
+    ~run_id:(Option.get (Client.run_id handle)) ();
   let rejected () =
     phase ~operation ~status:"rejected"
-      ~workflow_id:(Client.workflow_id handle) ~run_id:(Client.run_id handle)
+      ~workflow_id:(Client.workflow_id handle) ~run_id:(Option.get (Client.run_id handle))
       ~duration_ms:(elapsed_ms started) ();
     Ok ()
   in
@@ -607,7 +607,7 @@ let start_workflow client ~workflow ~task_queue ~id ~input =
   with
   | Ok handle as result ->
       phase ~operation ~status:"accepted" ~workflow_id:(Client.workflow_id handle)
-        ~run_id:(Client.run_id handle) ~duration_ms:(elapsed_ms started) ();
+        ~run_id:(Option.get (Client.run_id handle)) ~duration_ms:(elapsed_ms started) ();
       result
   | Error error as result ->
       phase ~operation ~status:("error:" ^ Error.kind error) ~workflow_id:id
@@ -621,16 +621,16 @@ let wait_workflow handle =
   let operation = "wait:" ^ Client.workflow_id handle in
   let started = Unix.gettimeofday () in
   phase ~operation ~status:"begin" ~workflow_id:(Client.workflow_id handle)
-    ~run_id:(Client.run_id handle) ();
+    ~run_id:(Option.get (Client.run_id handle)) ();
   match Client.wait handle with
   | Ok outcome as result ->
       phase ~operation ~status:(terminal_kind outcome)
-        ~workflow_id:(Client.workflow_id handle) ~run_id:(Client.run_id handle)
+        ~workflow_id:(Client.workflow_id handle) ~run_id:(Option.get (Client.run_id handle))
         ~duration_ms:(elapsed_ms started) ();
       result
   | Error error as result ->
       phase ~operation ~status:("error:" ^ Error.kind error)
-        ~workflow_id:(Client.workflow_id handle) ~run_id:(Client.run_id handle)
+        ~workflow_id:(Client.workflow_id handle) ~run_id:(Option.get (Client.run_id handle))
         ~duration_ms:(elapsed_ms started) ();
       result
 
@@ -887,7 +887,7 @@ let run () =
            parked behind its readiness marker, so the parent can only complete
            after Temporal has delivered the signal to that exact run. *)
         let external_signal_target =
-          Client.workflow_id signal_handle ^ "\n" ^ Client.run_id signal_handle
+          Client.workflow_id signal_handle ^ "\n" ^ Option.get (Client.run_id signal_handle)
         in
         let* external_signal_parent_handle =
           start_workflow client ~workflow:Definitions.external_signal_parent
@@ -995,7 +995,7 @@ let run () =
            fail. *)
         let external_cancellation_wrong_run_target =
           Client.workflow_id external_cancellation_handle ^ "\n"
-          ^ Client.run_id signal_handle
+          ^ Option.get (Client.run_id signal_handle)
         in
         let* external_cancellation_wrong_run_parent_handle =
           start_workflow client
@@ -1014,7 +1014,7 @@ let run () =
         in
         let external_cancellation_target =
           Client.workflow_id external_cancellation_handle ^ "\n"
-          ^ Client.run_id external_cancellation_handle
+          ^ Option.get (Client.run_id external_cancellation_handle)
         in
         let* external_cancellation_parent_handle =
           start_workflow client ~workflow:Definitions.external_cancellation_parent
@@ -1184,7 +1184,7 @@ let run () =
            an exact-run external signal does not silently succeed after completion. *)
         let completed_signal_target =
           Client.workflow_id signal_handle ^ "
-" ^ Client.run_id signal_handle
+" ^ Option.get (Client.run_id signal_handle)
         in
         let* external_signal_completed_parent_handle =
           start_workflow client

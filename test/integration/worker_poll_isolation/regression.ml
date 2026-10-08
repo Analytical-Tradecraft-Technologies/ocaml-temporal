@@ -78,7 +78,7 @@ let wait_exact label address workflow handle =
   record_phase (label ^ "_client_create") "ok";
   let execution : Client.execution =
     { namespace; workflow_id = Client.workflow_id handle;
-      run_id = Client.run_id handle }
+      run_id = Option.get (Client.run_id handle) }
   in
   let outcome = Atomic.make None in
   let waiting =
@@ -164,7 +164,7 @@ let check address =
       if Atomic.get release_activity then
         failwith "activity barrier opened before the timer workflow completed";
       (match result with
-      | Client.Completed "timer:-timer" -> ()
+      | Client.Completed { output = "timer:-timer"; _ } -> ()
       | _ -> failwith "unrelated workflow did not complete its exact run");
       (* The first workflow must still be held while the server has recorded
          the second workflow's completed result. *)
@@ -172,12 +172,12 @@ let check address =
       record_phase "activity_release" "ok";
       record_phase "activity_wait" "begin";
       (match wait_exact "activity" address activity_workflow activity with
-      | Client.Completed "activity:-activity" -> ()
+      | Client.Completed { output = "activity:-activity"; _ } -> ()
       | _ -> failwith "released activity workflow did not complete");
       record_phase "activity_wait" "ok";
       Printf.printf
         "worker poll isolation live regression: exact run %s completed before activity release\n%!"
-        (Client.run_id timer);
+        (Option.get (Client.run_id timer));
       record_phase "body" "ok";
       Ok ()
     with exception_ ->

@@ -2,8 +2,10 @@
 //!
 //! This module deliberately exposes neither `temporalio_client::Client` nor
 //! protobuf values to OCaml.  The bridge accepts small, lossless request
-//! documents for starting a workflow, observing one exact run, and requesting
-//! cancellation and output-only query operations against that same exact run.
+//! documents for starting a workflow, observing one run, and requesting
+//! control, signal, query, and update operations against a run. Every request
+//! after start names either one exact run or, with an empty `run_id`, the
+//! workflow's current run as Temporal resolves it (#791).
 //! A wait never follows a continued-as-new successor: callers can inspect the
 //! successor metadata and decide what to do in OCaml.
 
@@ -178,11 +180,13 @@ pub(crate) enum StartWorkflowOutcome {
     },
 }
 
-/// Request to wait for one exact workflow run.
+/// Request to wait for one workflow run.
 ///
 /// There is intentionally no `follow_runs` field.  This ABI operation has
 /// fixed `follow_runs = false` semantics, so a continued-as-new event is a
-/// terminal result for the requested run and cannot silently switch identity.
+/// terminal result for the observed run and cannot silently switch identity.
+/// An empty `run_id` observes the run that is current when Temporal handles
+/// the history poll; the OCaml client decides whether to follow successors.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WaitWorkflowRequest {
@@ -190,7 +194,8 @@ pub struct WaitWorkflowRequest {
     pub namespace: String,
     /// Stable workflow identifier.
     pub workflow_id: String,
-    /// Concrete run identifier to observe without following successors.
+    /// Run identifier to observe without following successors, or empty
+    /// to observe whichever run is current when Temporal handles the poll.
     pub run_id: String,
 }
 
@@ -202,7 +207,7 @@ pub struct CancelWorkflowRequest {
     pub namespace: String,
     /// Stable workflow identifier.
     pub workflow_id: String,
-    /// Concrete run identifier; an empty run is never treated as "latest".
+    /// Run identifier, or empty to select the workflow's current run.
     pub run_id: String,
     /// Caller-owned idempotency key for the cancellation RPC.
     pub request_id: String,
@@ -226,7 +231,7 @@ pub struct TerminateWorkflowRequest {
     pub namespace: String,
     /// Stable workflow identifier.
     pub workflow_id: String,
-    /// Concrete run identifier; an empty run is never treated as "latest".
+    /// Run identifier, or empty to select the workflow's current run.
     pub run_id: String,
     /// Operator-facing reason copied to Temporal.
     pub reason: String,
@@ -248,7 +253,8 @@ pub struct ResetWorkflowRequest {
     pub namespace: String,
     /// Stable workflow identifier.
     pub workflow_id: String,
-    /// Run whose workflow-task history supplies the reset point.
+    /// Run whose workflow-task history supplies the reset point, or empty
+    /// to reset the workflow's current run.
     pub run_id: String,
     /// Caller-owned idempotency key for this reset operation.
     pub request_id: String,
@@ -274,7 +280,7 @@ pub struct SignalWorkflowRequest {
     pub namespace: String,
     /// Stable workflow identifier.
     pub workflow_id: String,
-    /// Concrete run identifier; an empty run is never treated as "latest".
+    /// Run identifier, or empty to select the workflow's current run.
     pub run_id: String,
     /// Registered Temporal signal name.
     pub signal_name: String,
@@ -303,7 +309,7 @@ pub struct QueryWorkflowRequest {
     pub namespace: String,
     /// Stable workflow identifier.
     pub workflow_id: String,
-    /// Concrete run identifier; an empty run is never treated as "latest".
+    /// Run identifier, or empty to select the workflow's current run.
     pub run_id: String,
     /// Registered workflow query name.
     pub query_type: String,
@@ -328,7 +334,7 @@ pub struct UpdateWorkflowRequest {
     pub namespace: String,
     /// Stable workflow identifier.
     pub workflow_id: String,
-    /// Concrete run identifier; an empty run is never treated as latest.
+    /// Run identifier, or empty to select the workflow's current run.
     pub run_id: String,
     /// Caller-owned workflow-scoped update idempotency key.
     pub update_id: String,
@@ -346,7 +352,8 @@ pub struct PollWorkflowUpdateRequest {
     pub namespace: String,
     /// Stable workflow identifier.
     pub workflow_id: String,
-    /// Concrete run identifier returned by start or retained by the caller.
+    /// Run identifier returned by the acceptance response, or empty to
+    /// select the workflow's current run.
     pub run_id: String,
     /// Workflow-scoped update id returned by the acceptance response.
     pub update_id: String,
@@ -372,7 +379,8 @@ pub enum UpdateOutcome {
 pub struct UpdateWorkflowResponse {
     /// Update id echoed by Temporal's update reference.
     pub update_id: String,
-    /// Exact execution used by the update.
+    /// Execution that accepted the update. When the request selected the
+    /// current run, this is the concrete run Temporal resolved.
     pub execution: ExecutionRef,
     /// Present when the server completed the update before acceptance returned.
     pub outcome: Option<UpdateOutcome>,
@@ -488,11 +496,13 @@ pub enum WorkflowOutcome {
     },
 }
 
-/// Response containing the exact run identity and its terminal outcome.
+/// Response containing the waited run selector and its terminal outcome.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WaitWorkflowResponse {
-    /// Run whose close event was observed.
+    /// The request's execution, echoed unchanged. Its run ID is empty when
+    /// the wait selected the current run, because Temporal's history
+    /// response does not name the run it resolved.
     pub execution: ExecutionRef,
     /// Terminal outcome of that run; no successor is followed automatically.
     pub outcome: WorkflowOutcome,
@@ -1142,9 +1152,9 @@ pub async fn list_visibility(
     })
 }
 
-/// Requests cancellation of one exact run through Temporal's official
-/// workflow service. The connection is cloned by the owner Domain and no
-/// Tokio task calls back into OCaml.
+/// Requests cancellation of one run (exact, or current for an empty run ID)
+/// through Temporal's official workflow service. The connection is cloned by
+/// the owner Domain and no Tokio task calls back into OCaml.
 pub async fn cancel_workflow(
     connection: Connection,
     request: CancelWorkflowRequest,
@@ -1183,7 +1193,8 @@ pub async fn cancel_workflow(
     Ok(CancelWorkflowResponse { acknowledged: true })
 }
 
-/// Resets one exact workflow run through Temporal's official workflow service.
+/// Resets one workflow run (exact, or current for an empty run ID) through
+/// Temporal's official workflow service.
 /// The event ID and request ID are copied into protobuf owned by this RPC; no
 /// OCaml memory is retained after the owner Domain call returns.
 pub async fn reset_workflow(
@@ -1245,7 +1256,8 @@ pub async fn reset_workflow(
     Ok(response)
 }
 
-/// Terminates one exact workflow run through Temporal's official service.
+/// Terminates one workflow run (exact, or current for an empty run ID) through
+/// Temporal's official service.
 /// Termination is intentionally separate from cancellation: the server writes
 /// an immutable terminated event immediately and does not wait for workflow
 /// code to observe a cancellation request.
@@ -1286,9 +1298,10 @@ pub async fn terminate_workflow(
     Ok(TerminateWorkflowResponse { acknowledged: true })
 }
 
-/// Delivers one signal to one exact workflow run through Temporal's official
-/// workflow service. The request identity and payloads are copied into the
-/// protobuf message; no OCaml memory is retained by the asynchronous RPC.
+/// Delivers one signal to one workflow run (exact, or current for an empty run
+/// ID) through Temporal's official workflow service. The request identity and
+/// payloads are copied into the protobuf message; no OCaml memory is retained
+/// by the asynchronous RPC.
 pub async fn signal_workflow(
     connection: Connection,
     request: SignalWorkflowRequest,
@@ -1535,7 +1548,8 @@ fn validate_update_stage_with_outcome(stage: i32) -> Result<(), ClientOperationE
 }
 
 /// Converts one `UpdateWorkflowExecution` response into the closed bridge
-/// response after checking that it names the requested update and exact run.
+/// response after checking that it names the requested update and run (or,
+/// for a current-run request, a concrete run of the requested workflow).
 /// The stage is interpreted by the caller; this function only validates
 /// identity and converts an optional outcome.
 fn update_response_from_core(
@@ -1566,9 +1580,20 @@ fn update_response_from_core(
             execution.run_id
         },
     };
-    if execution.workflow_id != request.workflow_id || execution.run_id != request.run_id {
+    // An exact request must be answered for that run. A current-run request
+    // (empty run ID) adopts the run Temporal resolved, so later polls of the
+    // update stay on the run that accepted it even if the workflow continues
+    // as new; Temporal always reports that run, and a response without one
+    // fails closed rather than producing a handle with no run identity.
+    let changed_run = !request.run_id.is_empty() && execution.run_id != request.run_id;
+    if execution.workflow_id != request.workflow_id || changed_run {
         return Err(ClientOperationError::Core(workflow_protocol::invalid_core(
             "Temporal update response changed workflow execution",
+        )));
+    }
+    if execution.run_id.is_empty() {
+        return Err(ClientOperationError::Core(workflow_protocol::invalid_core(
+            "Temporal update response omitted the run that accepted it",
         )));
     }
     let outcome = response
@@ -1776,7 +1801,14 @@ pub async fn start_workflow(
     Ok(StartWorkflowResponse { execution, started })
 }
 
-/// Waits for the exact run named by `request`, never following successors.
+/// Waits for the run named by `request`, or for the workflow's current run
+/// when its run ID is empty, never following successors.
+///
+/// With an empty run ID Temporal resolves the current run on the first poll
+/// and pins later pages to it through the continuation token. If a long poll
+/// ends with neither an event nor a token, the next poll resolves the current
+/// run again; that can only skip a run which has already been superseded, so
+/// a caller that follows successors observes the same final run.
 pub async fn wait_workflow(
     connection: Connection,
     request: WaitWorkflowRequest,
@@ -2158,7 +2190,7 @@ fn validate_metadata(fields: &[MetadataField], path: &str) -> Result<(), protoco
 fn validate_wait_request(value: &WaitWorkflowRequest) -> Result<(), protocol::ProtocolError> {
     validate_identifier(&value.namespace, "$.namespace")?;
     validate_identifier(&value.workflow_id, "$.workflow_id")?;
-    validate_identifier(&value.run_id, "$.run_id")?;
+    validate_run_selector(&value.run_id, "$.run_id")?;
     Ok(())
 }
 
@@ -2166,7 +2198,7 @@ fn validate_wait_request(value: &WaitWorkflowRequest) -> Result<(), protocol::Pr
 fn validate_cancel_request(value: &CancelWorkflowRequest) -> Result<(), protocol::ProtocolError> {
     validate_identifier(&value.namespace, "$.namespace")?;
     validate_identifier(&value.workflow_id, "$.workflow_id")?;
-    validate_identifier(&value.run_id, "$.run_id")?;
+    validate_run_selector(&value.run_id, "$.run_id")?;
     validate_identifier(&value.request_id, "$.request_id")?;
     if value.reason.len() > protocol::MAX_STRING_BYTES {
         return Err(protocol::ProtocolError::invalid(
@@ -2189,7 +2221,7 @@ fn validate_terminate_request(
 ) -> Result<(), protocol::ProtocolError> {
     validate_identifier(&value.namespace, "$.namespace")?;
     validate_identifier(&value.workflow_id, "$.workflow_id")?;
-    validate_identifier(&value.run_id, "$.run_id")?;
+    validate_run_selector(&value.run_id, "$.run_id")?;
     if value.reason.len() > protocol::MAX_STRING_BYTES {
         return Err(protocol::ProtocolError::invalid(
             "$.reason",
@@ -2209,7 +2241,7 @@ fn validate_terminate_request(
 fn validate_reset_request(value: &ResetWorkflowRequest) -> Result<(), protocol::ProtocolError> {
     validate_identifier(&value.namespace, "$.namespace")?;
     validate_identifier(&value.workflow_id, "$.workflow_id")?;
-    validate_identifier(&value.run_id, "$.run_id")?;
+    validate_run_selector(&value.run_id, "$.run_id")?;
     validate_identifier(&value.request_id, "$.request_id")?;
     if value.workflow_task_finish_event_id <= 1 {
         return Err(protocol::ProtocolError::invalid(
@@ -2237,7 +2269,7 @@ fn validate_reset_request(value: &ResetWorkflowRequest) -> Result<(), protocol::
 fn validate_signal_request(value: &SignalWorkflowRequest) -> Result<(), protocol::ProtocolError> {
     validate_identifier(&value.namespace, "$.namespace")?;
     validate_identifier(&value.workflow_id, "$.workflow_id")?;
-    validate_identifier(&value.run_id, "$.run_id")?;
+    validate_run_selector(&value.run_id, "$.run_id")?;
     validate_identifier(&value.signal_name, "$.signal_name")?;
     validate_identifier(&value.request_id, "$.request_id")?;
     for payload in &value.input {
@@ -2254,7 +2286,7 @@ fn validate_signal_request(value: &SignalWorkflowRequest) -> Result<(), protocol
 fn validate_query_request(value: &QueryWorkflowRequest) -> Result<(), protocol::ProtocolError> {
     validate_identifier(&value.namespace, "$.namespace")?;
     validate_identifier(&value.workflow_id, "$.workflow_id")?;
-    validate_identifier(&value.run_id, "$.run_id")?;
+    validate_run_selector(&value.run_id, "$.run_id")?;
     validate_identifier(&value.query_type, "$.query_type")?;
     for payload in &value.input {
         workflow_protocol::payload_to_core(payload)
@@ -2278,7 +2310,7 @@ fn validate_query_response(value: &QueryWorkflowResponse) -> Result<(), protocol
 fn validate_update_request(value: &UpdateWorkflowRequest) -> Result<(), protocol::ProtocolError> {
     validate_identifier(&value.namespace, "$.namespace")?;
     validate_identifier(&value.workflow_id, "$.workflow_id")?;
-    validate_identifier(&value.run_id, "$.run_id")?;
+    validate_run_selector(&value.run_id, "$.run_id")?;
     validate_identifier(&value.update_id, "$.update_id")?;
     validate_identifier(&value.update_name, "$.update_name")?;
     for payload in &value.input {
@@ -2294,7 +2326,7 @@ fn validate_poll_update_request(
 ) -> Result<(), protocol::ProtocolError> {
     validate_identifier(&value.namespace, "$.namespace")?;
     validate_identifier(&value.workflow_id, "$.workflow_id")?;
-    validate_identifier(&value.run_id, "$.run_id")?;
+    validate_run_selector(&value.run_id, "$.run_id")?;
     validate_identifier(&value.update_id, "$.update_id")?;
     Ok(())
 }
@@ -2492,9 +2524,15 @@ fn validate_successor_for_execution(
     Ok(())
 }
 
-/// Validates a complete wait response.
+/// Validates a complete wait response. The execution echoes the request, so
+/// its run ID is empty when the wait selected the workflow's current run:
+/// Temporal's history response does not name the run it resolved. A successor
+/// still has to name a concrete run, which then differs from the empty
+/// selector automatically.
 fn validate_wait_response(value: &WaitWorkflowResponse) -> Result<(), protocol::ProtocolError> {
-    validate_execution(&value.execution, "$.execution")?;
+    validate_identifier(&value.execution.namespace, "$.execution.namespace")?;
+    validate_identifier(&value.execution.workflow_id, "$.execution.workflow_id")?;
+    validate_run_selector(&value.execution.run_id, "$.execution.run_id")?;
     validate_outcome(&value.outcome)?;
     let successor = match &value.outcome {
         WorkflowOutcome::Completed { successor, .. }
@@ -2527,6 +2565,19 @@ fn encode_document<T: Serialize + for<'de> Deserialize<'de> + Clone + PartialEq>
         ));
     }
     Ok(output)
+}
+
+/// Validates the run selector of a client request. An empty string selects
+/// the workflow's current run, which Temporal resolves when it handles the
+/// RPC (#791); any other value must be a valid identifier naming one exact
+/// run. Responses never use this rule: a run Temporal reports is always a
+/// concrete, non-empty identifier.
+fn validate_run_selector(value: &str, path: &str) -> Result<(), protocol::ProtocolError> {
+    if value.is_empty() {
+        Ok(())
+    } else {
+        validate_identifier(value, path)
+    }
 }
 
 /// Validates a bounded nonempty UTF-8 identifier.
@@ -2862,7 +2913,8 @@ mod tests {
         let duplicate = r#"{"namespace":"default","workflow_id":"workflow-1","run_id":"run-1","request_id":"cancel-1","request_id":"other","reason":""}"#;
         assert!(decode_cancel_request(duplicate).is_err());
 
-        for field in ["namespace", "workflow_id", "run_id", "request_id"] {
+        // An empty run_id selects the current run (#791) and is accepted.
+        for field in ["namespace", "workflow_id", "request_id"] {
             let document = serde_json::json!({
                 "namespace":"default",
                 "workflow_id":"workflow-1",
@@ -2990,13 +3042,8 @@ mod tests {
         let duplicate = r#"{"namespace":"default","workflow_id":"workflow-1","run_id":"run-1","signal_name":"add_document","request_id":"signal-1","request_id":"other","input":[]}"#;
         assert!(decode_signal_request(duplicate).is_err());
 
-        for field in [
-            "namespace",
-            "workflow_id",
-            "run_id",
-            "signal_name",
-            "request_id",
-        ] {
+        // An empty run_id selects the current run (#791) and is accepted.
+        for field in ["namespace", "workflow_id", "signal_name", "request_id"] {
             let document = serde_json::json!({
                 "namespace":"default",
                 "workflow_id":"workflow-1",
@@ -3046,7 +3093,8 @@ mod tests {
         let duplicate = r#"{"namespace":"default","workflow_id":"workflow-1","run_id":"run-1","query_type":"current_state","query_type":"other","input":[]}"#;
         assert!(decode_query_request(duplicate).is_err());
 
-        for field in ["namespace", "workflow_id", "run_id", "query_type"] {
+        // An empty run_id selects the current run (#791) and is accepted.
+        for field in ["namespace", "workflow_id", "query_type"] {
             let document = serde_json::json!({
                 "namespace":"default",
                 "workflow_id":"workflow-1",
@@ -3582,3 +3630,7 @@ mod client_retry_tests;
 #[cfg(test)]
 #[path = "../tests/support/client_errors.rs"]
 mod client_error_tests;
+
+#[cfg(test)]
+#[path = "../tests/support/client_current_run.rs"]
+mod current_run_tests;

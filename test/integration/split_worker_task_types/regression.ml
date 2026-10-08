@@ -71,7 +71,7 @@ let check address =
       List.iter
         (fun (input, handle) ->
           match get (Client.wait handle) with
-          | Client.Completed output when output = "rendered:" ^ input -> ()
+          | Client.Completed { output; _ } when output = "rendered:" ^ input -> ()
           | Client.Completed _ -> failwith "split worker returned a wrong result"
           | _ -> failwith "split worker execution did not complete")
         handles;
