@@ -143,6 +143,16 @@ module Info : sig
   (** Identity of the workflow that started this run as a child. *)
   type parent = { namespace : string; workflow_id : string; run_id : string }
 
+  (** Why the server suggested continuing as new.
+      - [`History_size_too_large]: the history byte size passed the
+        namespace's suggestion threshold.
+      - [`Too_many_history_events]: the history event count passed that
+        threshold.
+      - [`Too_many_updates]: the run accepted many workflow updates, which
+        count toward a per-run limit. *)
+  type continue_as_new_reason =
+    [ `History_size_too_large | `Too_many_history_events | `Too_many_updates ]
+
   (** Returns the workflow ID shared by every run of this execution chain. *)
   val workflow_id : t -> string
 
@@ -189,6 +199,15 @@ module Info : sig
       run indefinitely should check it at a safe point and call
       {!continue_as_new}. *)
   val continue_as_new_suggested : t -> bool
+
+  (** Returns the reasons the server gave with that activation's
+      continue-as-new suggestion, in the order Temporal reported them. The
+      list is empty whenever {!val-continue_as_new_suggested} is [false], and
+      may also be empty when it is [true] because older servers suggest
+      continue-as-new without naming a reason. Like the suggestion itself,
+      the reasons come only from activation metadata and are replayed
+      deterministically. *)
+  val continue_as_new_reasons : t -> continue_as_new_reason list
 end
 
 (** Returns metadata for the current workflow run. Calling it outside workflow
