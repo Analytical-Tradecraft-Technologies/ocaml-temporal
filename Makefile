@@ -498,13 +498,14 @@ test-temporal-live-ci:
 test-temporal-diagnostics-contract:
 	bash test/integration/temporal/scripts/test-live-diagnostics-contract.sh
 
-# Fixed-bug and feature live regressions (#499, #545, #546, #548, #567, #805)
+# Fixed-bug, feature and recovery live regressions (#499, #530, #545, #546, #548,
+# #567, #805)
 # that each own their workers and a unique task queue. Most have a per-suite
 # test-*-live target that runs one suite against any disposable server; this
 # list is what CI executes (#795). Every entry must also be in scripts/ci-smoke-executables.txt,
 # and test/smoke/test_live_regressions_contract.sh fails when a regression
 # executable under test/integration is neither here nor otherwise run by CI.
-LIVE_REGRESSION_EXECUTABLES := test/integration/client_policies/regression.exe test/integration/client_request_ids/regression.exe test/integration/completed_queries/regression.exe test/integration/local_activity_cancellation/regression.exe test/integration/split_worker_task_types/regression.exe test/integration/update_outcomes/regression.exe
+LIVE_REGRESSION_EXECUTABLES := test/integration/client_policies/regression.exe test/integration/client_request_ids/regression.exe test/integration/completed_queries/regression.exe test/integration/interaction_recovery/regression.exe test/integration/local_activity_cancellation/regression.exe test/integration/split_worker_task_types/regression.exe test/integration/update_outcomes/regression.exe
 # Seconds for each regression process; the suites normally finish in seconds.
 LIVE_REGRESSION_TIMEOUT_SECONDS ?= 180
 
@@ -874,6 +875,12 @@ test-unit:
 .PHONY: test-update-outcomes-live
 test-update-outcomes-live:
 	$(RUN) dune exec $(DUNE_BUILD_ARGS) test/integration/update_outcomes/regression.exe -- check $(TEMPORAL_CLIENT_TEST_URL) $(TEMPORAL_TEST_CLI)
+
+# Requires a disposable server with a `default` namespace and an explicit
+# official Temporal CLI path (#530).
+.PHONY: test-interaction-recovery-live
+test-interaction-recovery-live:
+	$(RUN) dune exec $(DUNE_BUILD_ARGS) test/integration/interaction_recovery/regression.exe -- check $(TEMPORAL_CLIENT_TEST_URL) $(TEMPORAL_TEST_CLI)
 
 test-runtime:
 	$(RUN) dune runtest $(DUNE_BUILD_ARGS) test/runtime test/integration/temporal/observer

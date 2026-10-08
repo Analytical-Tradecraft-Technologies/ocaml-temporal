@@ -31,9 +31,11 @@ also proves an output-only client query against the exact signal-condition run
 while it is parked. The complete [PR #434 Actions run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29684113836)
 also proves the typed-input query against that parked run, while the [PR #428
 Actions run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29676120429)
-proves typed update admission and completion. Suspended update recovery,
-query deadlines and replay/cache-eviction behavior, and broader interaction
-coverage remain future work.
+proves typed update admission and completion. The `interaction_recovery`
+live regression (#530) covers queries and an accepted, suspended update after
+sticky-cache eviction and after worker replacement; see
+[Recovery after eviction and restart](#recovery-after-eviction-and-restart).
+Query deadlines and broader interaction coverage remain future work.
 
 `Temporal.Client.query` is a separate control-plane operation: it asks an
 already registered workflow for an output-only query through an exact
@@ -118,9 +120,10 @@ native transport and the remaining handler/response lifecycles are described
 in the [native interaction design](../design/native-interactions.md). Signal
 and typed query activation delivery plus two-phase update responses are
 implemented. Output-only query acceptance is live-verified by PR #406, both
-query forms by PR #434, and typed update admission/completion by PR #428. The
-remaining live boundaries are suspended update recovery, query deadlines and
-replay/cache-eviction behavior, and broader handler policies.
+query forms by PR #434, typed update admission/completion by PR #428, and
+query and suspended-update recovery after eviction and restart by the #530
+regression. The remaining live boundaries are query deadlines and broader
+handler policies.
 
 ## Definitions
 
@@ -395,12 +398,33 @@ synchronously on the owner Domain, and argument arity is checked by the
 registered output-only or typed handler rather than discarded. The remaining native
 interaction work is:
 
-- live acceptance scenarios for update handlers that suspend, including
-  recovery and shutdown/eviction cleanup;
-- query deadlines and query behavior across replay or cache eviction;
-- live update validator-rejection, deadline, retry, and replay/eviction
-  scenarios beyond the verified admission, completion, and unknown-update
-  rejection paths.
+- live checks that a graceful worker shutdown releases suspended update
+  handlers (recovery after eviction and worker replacement is covered, see
+  below);
+- query deadlines;
+- live update deadline and retry scenarios beyond the verified admission,
+  completion, rejection, and recovery paths.
+
+### Recovery after eviction and restart
+
+`test/integration/interaction_recovery` (#530, run by
+`make test-temporal-live-regressions`) verifies against a live server that:
+
+- a query answers from state rebuilt by replay, both after Core evicts the run
+  from a one-entry sticky cache and in a fresh worker process;
+- an update accepted while its handler is suspended stays accepted and not
+  completed across eviction and replacement, then completes exactly once on
+  the same run with the same update ID once the signal it waits for arrives;
+  a handle re-attached with that update ID returns the same result;
+- replaying an accepted update does not run its validator again, while new
+  requests are still validated (Core passes `run_validator = false` for
+  updates replayed from history);
+- queries and validator-rejected updates add no history events: apart from
+  workflow-task events, the recovered runs' histories, including payloads,
+  update outcomes and the timer duration, equal a control run that had none
+  of them.
+
+No runtime defect was found by this suite.
 
 ### Unknown and undecodable signals
 
