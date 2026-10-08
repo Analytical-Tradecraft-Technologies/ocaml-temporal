@@ -588,7 +588,7 @@ let test_deferred_lifecycle () =
     failwith "accepted async completion did not retire the client lease";
   begin
     match !(supervisor.async_completions) with
-    | [ { Protocol.result = Protocol.Completed (Some payload); task_token } ] ->
+    | [ { Protocol.result = Protocol.Completed payload; task_token } ] ->
         if not (Bytes.equal task_token token) then
           failwith "async completion changed the opaque token";
         if decode_output Temporal.Codec.string payload <> "finished" then
@@ -1704,7 +1704,7 @@ let test_completer_domain_retries_until_handoff () =
   end;
   begin
     match !(supervisor.async_completions) with
-    | [ { Protocol.result = Protocol.Completed (Some payload); task_token } ]
+    | [ { Protocol.result = Protocol.Completed payload; task_token } ]
       when Bytes.equal task_token token
            && decode_output Temporal.Codec.string payload = "from-domain" -> ()
     | _ -> failwith "completer Domain did not complete exactly once"

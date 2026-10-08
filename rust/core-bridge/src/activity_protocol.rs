@@ -177,10 +177,17 @@ pub struct ActivityHeartbeat {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ActivityCompletionResult {
+    /// Activity code returned successfully.
     Completed {
-        /// Optional Temporal payload returned by the activity.
-        #[serde(deserialize_with = "workflow_protocol::required_nullable")]
-        result: Option<Payload>,
+        /// Temporal payload returned by the activity.
+        ///
+        /// The payload is required and not nullable. Core's
+        /// `validate_activity_completion` rejects `Success { result: None }`
+        /// as malformed (issue #954), so a void result is an encoded payload
+        /// whose data may be empty, as in the official SDKs. Refusing `null`
+        /// at decode keeps the failure ahead of any Core call, while the
+        /// lease is still held and the existing reject path can retire it.
+        result: Payload,
     },
     /// Activity code failed with structured Temporal failure information.
     Failed {
@@ -218,10 +225,44 @@ pub fn encode_task(value: &ActivityTask) -> Result<String, ProtocolError> {
 /// Decodes and validates one strict activity-completion document.
 pub fn decode_completion(input: &str) -> Result<ActivityCompletion, ProtocolError> {
     let value = protocol::decode_payload_object(input)?;
+    reject_null_completed_payload(&value)?;
     let completion: ActivityCompletion = serde_json::from_value(to_serde(value))
         .map_err(|_| ProtocolError::invalid("$", "invalid activity completion semantics"))?;
     validate_completion(&completion)?;
     Ok(completion)
+}
+
+/// Gives an explicit `null` success payload a precise diagnostic path.
+///
+/// Serde would also refuse `null` for the required [`Payload`], but only with
+/// the generic `$` path. Naming `$.result.result` tells a protocol author
+/// which member Core requires (issue #954). Every other shape is left to the
+/// typed decoder, which remains the single source of acceptance.
+fn reject_null_completed_payload(value: &protocol::JsonValue) -> Result<(), ProtocolError> {
+    /// Finds one member of a decoded object; duplicates were already refused.
+    fn member<'a>(value: &'a protocol::JsonValue, name: &str) -> Option<&'a protocol::JsonValue> {
+        match value {
+            protocol::JsonValue::Object(entries) => entries
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, member)| member),
+            _ => None,
+        }
+    }
+    let Some(result) = member(value, "result") else {
+        return Ok(());
+    };
+    let completed = matches!(
+        member(result, "kind"),
+        Some(protocol::JsonValue::String(kind)) if kind == "completed"
+    );
+    if completed && matches!(member(result, "result"), Some(protocol::JsonValue::Null)) {
+        return Err(ProtocolError::invalid(
+            "$.result.result",
+            "completed activity result requires a payload",
+        ));
+    }
+    Ok(())
 }
 
 /// Validates, normalizes, and reparses one outgoing activity completion.
@@ -402,11 +443,16 @@ fn validate_uint64_decimal(value: &str, path: &str) -> Result<(), ProtocolError>
 fn validate_completion(value: &ActivityCompletion) -> Result<(), ProtocolError> {
     decode_token(&value.task_token)?;
     match &value.result {
+        ActivityCompletionResult::Completed { result } => {
+            workflow_protocol::validate_payload_limits(result).map_err(|_| {
+                ProtocolError::invalid("$.result.result", "result payload violates protocol limits")
+            })?;
+        }
         ActivityCompletionResult::Failed { failure }
         | ActivityCompletionResult::Cancelled { failure } => {
             workflow_protocol::validate_failure(failure, "$.result.failure")?
         }
-        _ => {}
+        ActivityCompletionResult::WillCompleteAsync => {}
     }
     Ok(())
 }
@@ -416,7 +462,7 @@ fn validate_completion(value: &ActivityCompletion) -> Result<(), ProtocolError> 
 fn validate_heartbeat(value: &ActivityHeartbeat) -> Result<(), ProtocolError> {
     decode_token(&value.task_token)?;
     for payload in &value.details {
-        workflow_protocol::payload_to_core(payload).map_err(|_| {
+        workflow_protocol::validate_payload_limits(payload).map_err(|_| {
             ProtocolError::invalid("$.details", "heartbeat payload violates protocol limits")
         })?;
     }
@@ -555,10 +601,7 @@ pub fn completion_to_core(
     let status = match &value.result {
         ActivityCompletionResult::Completed { result } => {
             Status::Completed(activity_result::Success {
-                result: result
-                    .as_ref()
-                    .map(workflow_protocol::payload_to_core)
-                    .transpose()?,
+                result: Some(workflow_protocol::payload_to_core(result)?),
             })
         }
         ActivityCompletionResult::Failed { failure } => Status::Failed(activity_result::Failure {
