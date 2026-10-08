@@ -146,10 +146,31 @@ BENCH_COLD_REPETITIONS ?= 3
 BENCH_PAYLOAD_REPORT ?= _build/benchmarks/payload-codec.json
 BENCH_PAYLOAD_WARMUP ?= 5
 BENCH_PAYLOAD_SAMPLES ?= 50
+# Memory and allocation suites for #527 and fan-out for #528. Each listed size
+# or concurrency level writes its own report under BENCH_REPORT_DIR.
+BENCH_REPORT_DIR ?= _build/benchmarks
+BENCH_HISTORY_SIZES ?= 1000 10000 50000
+BENCH_HISTORY_EVENTS ?= 10000
+BENCH_HISTORY_PAYLOAD_BYTES ?= 128
+BENCH_HISTORY_WARMUP ?= 2
+BENCH_HISTORY_SAMPLES ?= 10
+BENCH_CACHE_RUNS ?= 1000
+BENCH_CACHE_CAPACITY ?= $(BENCH_CACHE_RUNS)
+BENCH_CACHE_CHURN_CAPACITY ?= 250
+BENCH_CACHE_DEPTH ?= 8
+BENCH_CACHE_WARMUP ?= 1000
+BENCH_CACHE_SAMPLES ?= 10000
+BENCH_FANOUT_WIDTH ?= 1000
+BENCH_FANOUT_CONCURRENCY ?= 1
+BENCH_FANOUT_LEVELS ?= 1 8
+BENCH_FANOUT_BATCH ?= 10
+BENCH_FANOUT_PAYLOAD_BYTES ?= 256
+BENCH_FANOUT_WARMUP ?= 2
+BENCH_FANOUT_SAMPLES ?= 20
 
 .PHONY: test-temporal-live-ci test-temporal-diagnostics-contract
-.PHONY: bench bench-activation bench-activation-warm bench-activation-cold bench-payload-codec
-.NOTPARALLEL: bench-activation
+.PHONY: bench bench-activation bench-activation-warm bench-activation-cold bench-payload-codec bench-memory bench-history bench-cache bench-cache-steady bench-cache-churn bench-fanout
+.NOTPARALLEL: bench-activation bench-memory bench-cache
 .PHONY: version-check build build-examples docs cargo-metadata test test-unit test-runtime test-rust test-bridge test-install test-api release-preflight release-tag-check test-quality-contract test-temporal-config test-temporal-worker-readiness-contract test-temporal-worker-stop-contract test-temporal-worker-crash-recovery-contract test-temporal-worker-cache-eviction-contract test-core-lifecycle-integration temporal-start temporal-start-worker temporal-run-driver temporal-inspect-smoke temporal-stop-worker test-temporal-two-binary test-temporal-integration test-temporal-worker-restart test-temporal-worker-restart-contract test-temporal-worker-restart-live test-temporal-worker-crash-recovery test-temporal-worker-cache-eviction test-temporal-worker-cache-eviction-live test-temporal-workflow-patching test-temporal-workflow-patching-contract test-temporal-workflow-patching-live test-temporal-parent-child-restart test-temporal-parent-child-restart-contract test-temporal-parent-child-restart-live test-temporal-parent-child-failure-replay test-temporal-parent-child-failure-replay-contract test-temporal-parent-child-failure-replay-live temporal-health temporal-status temporal-logs temporal-stop temporal-clean lint lint-rust fmt quality quality-tool-version-check quality-rust quality-spelling license-check audit clean verify check native-version-check native-build native-test native-test-rust native-test-install native-lint native-lint-rust native-verify
 version-check:
 	@output="$$( $(RUN) ocamlc -version )" || exit $$?; \
@@ -205,6 +226,15 @@ bench:
 		BENCH_DEVELOPMENT_IMAGE_ID="$$image_id" \
 		BENCH_HOST_LABEL="$(BENCH_HOST_LABEL)" \
 		BENCH_REPLAY_HISTORY="$(BENCH_REPLAY_HISTORY)" \
+		BENCH_HISTORY_EVENTS="$(BENCH_HISTORY_EVENTS)" \
+		BENCH_HISTORY_PAYLOAD_BYTES="$(BENCH_HISTORY_PAYLOAD_BYTES)" \
+		BENCH_CACHE_RUNS="$(BENCH_CACHE_RUNS)" \
+		BENCH_CACHE_CAPACITY="$(BENCH_CACHE_CAPACITY)" \
+		BENCH_CACHE_DEPTH="$(BENCH_CACHE_DEPTH)" \
+		BENCH_FANOUT_WIDTH="$(BENCH_FANOUT_WIDTH)" \
+		BENCH_FANOUT_CONCURRENCY="$(BENCH_FANOUT_CONCURRENCY)" \
+		BENCH_FANOUT_BATCH="$(BENCH_FANOUT_BATCH)" \
+		BENCH_FANOUT_PAYLOAD_BYTES="$(BENCH_FANOUT_PAYLOAD_BYTES)" \
 		opam exec -- dune exec $(DUNE_BUILD_ARGS) --profile release test/benchmark/$(BENCH_EXECUTABLE).exe -- \
 		--warmup "$(BENCH_WARMUP)" --samples "$(BENCH_SAMPLES)" \
 		--repetitions "$(BENCH_REPETITIONS)" --seed "$(BENCH_SEED)" \
@@ -234,6 +264,41 @@ bench-activation-cold:
 bench-payload-codec:
 	$(MAKE) bench BENCH_EXECUTABLE=bench_payload_codec BENCH_REPORT="$(BENCH_PAYLOAD_REPORT)" \
 		BENCH_WARMUP="$(BENCH_PAYLOAD_WARMUP)" BENCH_SAMPLES="$(BENCH_PAYLOAD_SAMPLES)"
+
+# #527 allocation and memory: replay at each history length, then the workflow
+# cache with every run resident (steady) and with eviction churn.
+bench-memory: bench-history bench-cache
+
+bench-history:
+	@set -eu; for events in $(BENCH_HISTORY_SIZES); do \
+		$(MAKE) bench BENCH_EXECUTABLE=bench_history_replay \
+			BENCH_REPORT="$(BENCH_REPORT_DIR)/history-replay-$$events.json" \
+			BENCH_HISTORY_EVENTS="$$events" \
+			BENCH_WARMUP="$(BENCH_HISTORY_WARMUP)" BENCH_SAMPLES="$(BENCH_HISTORY_SAMPLES)"; \
+	done
+
+bench-cache: bench-cache-steady bench-cache-churn
+
+bench-cache-steady:
+	$(MAKE) bench BENCH_EXECUTABLE=bench_workflow_cache \
+		BENCH_REPORT="$(BENCH_REPORT_DIR)/workflow-cache-steady.json" \
+		BENCH_CACHE_CAPACITY="$(BENCH_CACHE_RUNS)" \
+		BENCH_WARMUP="$(BENCH_CACHE_WARMUP)" BENCH_SAMPLES="$(BENCH_CACHE_SAMPLES)"
+
+bench-cache-churn:
+	$(MAKE) bench BENCH_EXECUTABLE=bench_workflow_cache \
+		BENCH_REPORT="$(BENCH_REPORT_DIR)/workflow-cache-churn.json" \
+		BENCH_CACHE_CAPACITY="$(BENCH_CACHE_CHURN_CAPACITY)" \
+		BENCH_WARMUP="$(BENCH_CACHE_WARMUP)" BENCH_SAMPLES="$(BENCH_CACHE_SAMPLES)"
+
+# #528 fan-out at each admitted concurrency level (concurrent runs).
+bench-fanout:
+	@set -eu; for level in $(BENCH_FANOUT_LEVELS); do \
+		$(MAKE) bench BENCH_EXECUTABLE=bench_activity_fanout \
+			BENCH_REPORT="$(BENCH_REPORT_DIR)/activity-fanout-c$$level.json" \
+			BENCH_FANOUT_CONCURRENCY="$$level" \
+			BENCH_WARMUP="$(BENCH_FANOUT_WARMUP)" BENCH_SAMPLES="$(BENCH_FANOUT_SAMPLES)"; \
+	done
 
 test:
 	$(MAKE) test-temporal-config
