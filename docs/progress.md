@@ -36,6 +36,34 @@ ledger, two real supervisors on one runtime, public ordering errors for
 `mock://` and refused native targets, and a Linux thread-count leak check.
 The design and ownership rules are in `docs/reference/core-bridge.md`.
 
+## 2026-10-08: Application-linked replay command example (#516)
+
+`examples/replay` wraps `Temporal.Replay` in a copyable, offline command:
+`replay_command.ml` parses `--workflow-id ID FILE...` (repeatable, so several
+executions are checked in one run), replays each binary `History` file in its
+own native graph, prints `PASS`/`FAIL` per history plus a summary, and exits
+with the first failing history's status: 1 nondeterminism, 2 workflow task
+failed, 3 invalid, 4 unsupported, 5 replay could not run, 64 usage and 66
+unreadable file. `replay_history.ml` is the only application-specific part; it
+links the example workflow. The command is a `test` stanza, outside the live
+example gate, because it never connects to a server. JSON-history input stays
+out of scope: the pinned Core's JSON form differs from the CLI's, so the
+example documents the `temporal workflow show --output json` to protobuf
+conversion, and those steps reproduce the checked-in history byte for byte.
+
+Evidence: one run of the three example processes against the Compose stack
+(Temporal Server 1.32.0, OCaml 5.4.1 on macOS arm64) was exported with the
+pinned admin-tools CLI and converted as documented, giving
+`examples/replay/histories/compose-message-ada-lovelace.pb` (SHA-256
+`525da46b18f522772491ecdb0e6f82ffaf7e51f0285cf184eefdd167cb8adbb1`).
+`dune test` replays it with the example executable, and
+`test/replay_cli/test_replay_cli.ml` runs the real executables to check exit 0,
+a removed timer (1), a defect (2), non-protobuf and empty files (3), a
+duplicate registration (5), usage errors (64), a missing file (66), and that
+a multi-history run reports every history before returning the first
+failure's status. Unsupported histories (4) have no reliable trigger yet and
+are covered only by the mapping.
+
 ## 2026-10-08: Actionable replay nondeterminism diagnostics (#529)
 
 `Temporal.Replay.Nondeterminism` now carries a `mismatch` record besides
