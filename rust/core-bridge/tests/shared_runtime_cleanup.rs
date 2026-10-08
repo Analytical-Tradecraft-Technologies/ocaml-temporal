@@ -10,10 +10,10 @@ use std::ptr;
 use std::time::{Duration, Instant};
 
 use ocaml_temporal_core_bridge::{
-    Result as AbiResult, Runtime, STATUS_OK, SharedRuntime, ocaml_temporal_core_v3_result_free,
-    ocaml_temporal_core_v3_runtime_free, ocaml_temporal_core_v3_runtime_new_attached,
-    ocaml_temporal_core_v3_shared_runtime_dispose, ocaml_temporal_core_v3_shared_runtime_free,
-    ocaml_temporal_core_v3_shared_runtime_new, test_core_runtime_counts,
+    Result as AbiResult, Runtime, STATUS_OK, SharedRuntime, ocaml_temporal_core_v4_result_free,
+    ocaml_temporal_core_v4_runtime_free, ocaml_temporal_core_v4_runtime_new_attached,
+    ocaml_temporal_core_v4_shared_runtime_dispose, ocaml_temporal_core_v4_shared_runtime_free,
+    ocaml_temporal_core_v4_shared_runtime_new, test_core_runtime_counts,
 };
 
 /// Number of Core runtimes whose destructor has returned so far.
@@ -26,10 +26,10 @@ fn new_shared() -> *mut SharedRuntime {
     let mut shared: *mut SharedRuntime = ptr::null_mut();
     let mut result = AbiResult::default();
     // SAFETY: Both output locations are writable and exclusively owned.
-    let status = unsafe { ocaml_temporal_core_v3_shared_runtime_new(1, &mut shared, &mut result) };
+    let status = unsafe { ocaml_temporal_core_v4_shared_runtime_new(1, &mut shared, &mut result) };
     // SAFETY: The result was initialized by the bridge and is freed once.
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
+        unsafe { ocaml_temporal_core_v4_result_free(&mut result) },
         STATUS_OK
     );
     assert_eq!(status, STATUS_OK);
@@ -42,10 +42,10 @@ fn attach(shared: *const SharedRuntime) -> *mut Runtime {
     let mut result = AbiResult::default();
     // SAFETY: `shared` is live; both outputs are writable.
     let status =
-        unsafe { ocaml_temporal_core_v3_runtime_new_attached(shared, &mut runtime, &mut result) };
+        unsafe { ocaml_temporal_core_v4_runtime_new_attached(shared, &mut runtime, &mut result) };
     // SAFETY: As in `new_shared`.
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
+        unsafe { ocaml_temporal_core_v4_result_free(&mut result) },
         STATUS_OK
     );
     assert_eq!(status, STATUS_OK);
@@ -56,7 +56,7 @@ fn attach(shared: *const SharedRuntime) -> *mut Runtime {
 fn free_runtime(runtime: &mut *mut Runtime) {
     // SAFETY: The slot holds a live handle used by one thread.
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_runtime_free(runtime) },
+        unsafe { ocaml_temporal_core_v4_runtime_free(runtime) },
         STATUS_OK
     );
 }
@@ -65,7 +65,7 @@ fn free_runtime(runtime: &mut *mut Runtime) {
 fn free_shared(shared: &mut *mut SharedRuntime) {
     // SAFETY: The slot holds a live handle used by one thread.
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_shared_runtime_free(shared) },
+        unsafe { ocaml_temporal_core_v4_shared_runtime_free(shared) },
         STATUS_OK
     );
 }
@@ -107,7 +107,7 @@ fn shared_core_is_destroyed_once_by_its_last_holder() {
     let mut shared = new_shared();
     // SAFETY: The slot holds a live handle used by one thread.
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_shared_runtime_dispose(&mut shared) },
+        unsafe { ocaml_temporal_core_v4_shared_runtime_dispose(&mut shared) },
         STATUS_OK
     );
     assert!(shared.is_null());

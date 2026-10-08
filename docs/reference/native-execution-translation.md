@@ -26,10 +26,11 @@ Temporal Core
     -> Rust Core/protobuf conversion and semantic validation
     -> checked activation JSON
     -> Sdk_supervisor.Native.Protocol_adapter.decode_workflow_activation
-    -> Native_execution.translate_activation
+    -> Native_execution.translate_activation (once per activation)
     -> Execution.activate
     -> Native_execution.completion_of_commands
-    -> Workflow_protocol.encode_completion
+    -> Encoded_workflow_completion.encode (once per completion)
+    -> Sdk_supervisor.Native Complete_workflow (bytes copied, not re-encoded)
     -> Rust protobuf conversion
 ```
 
@@ -38,9 +39,14 @@ native lease. The OCaml supervisor decodes that JSON, and
 `translate_activation` canonical-encodes the typed value again before it
 changes it into runtime jobs. The second pass is intentional: programmatically
 constructed OCaml values receive the same closed-object, bounds, payload, and
-ordering checks as values received from Rust. Outgoing commands follow the
-same rule in reverse: `completion_of_commands` validates the complete command
-batch before the worker submits it.
+ordering checks as values received from Rust. The worker runs it once per
+activation: `translated_activation` is a private record that retains its
+source activation, and `activate_translated` executes it without translating
+again. Outgoing commands follow the same rule in reverse: the complete command
+batch is encoded once before the worker submits it, and those canonical bytes
+(an abstract `Encoded_workflow_completion.t`) are what the supervisor sends to
+Rust, so the supervisor does not encode the completion a second time
+(issue #846).
 
 The adapter does not own a Rust handle, call the supervisor, wait on a lock, or
 perform I/O. Keeping it pure and below the supervisor makes the conversion
@@ -92,9 +98,12 @@ record instead.
 ## Command mapping
 
 `command_to_protocol` converts one runtime command only when the two types have
-an exact, lossless representation. `completion_of_commands` preserves the
+an exact, lossless representation. Completion construction preserves the
 runtime's emission order and runs `Workflow_protocol.encode_completion` over
-the complete result before returning it to the bridge. A poisoned execution
+the complete result exactly once. `activate_translated` returns that output
+with the typed completion so the worker can submit it unchanged;
+`completion_of_commands` and `activate` run the same check and return only the
+typed value. A poisoned execution
 instead returns `task_failure` with an empty command list; it never translates
 its discarded commands into an execution failure. See the
 [workflow failure contract](workflow-failures.md).

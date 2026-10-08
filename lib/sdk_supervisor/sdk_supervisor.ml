@@ -397,13 +397,6 @@ module Protocol_adapter = struct
     poll_result ~decode:decode_workflow_activation ~reject
       ~rejected_is_progress:false result
 
-  (** Canonically serializes and reparses one workflow completion before it
-      can be submitted across the C boundary. *)
-  let encode_workflow_completion completion =
-    match Workflow.encode_completion completion with
-    | Ok output -> Ok (Bytes.of_string output)
-    | Error error -> workflow_error "workflow completion encoding" error
-
   (** Strictly validates one remote activity task copied from Rust. *)
   let decode_activity_task input =
     match Activity.decode_task (Bytes.to_string input) with
@@ -534,7 +527,10 @@ module Protocol_adapter = struct
       versa. *)
   let client_error_status = function
     | Client.Already_started _ -> Bridge.Already_started
-    | Client.Rpc _ -> Bridge.Connection
+    | Client.Rpc _ | Client.Query_failed _ ->
+        (* A failed query handler arrives as an RPC status, so Rust reports
+           it with the RPC status; the JSON kind carries the distinction. *)
+        Bridge.Connection
     | Client.Protocol _ -> Bridge.Protocol
 
   (** Decodes and status-checks one structured start failure. Statuses outside
@@ -793,7 +789,7 @@ module Protocol_adapter = struct
   let decode_client_update_failure native_error =
     match native_error.Bridge.status with
     | Connection | Protocol -> (
-        match Client.decode_query_error native_error.message with
+        match Client.decode_update_error native_error.message with
         | Error error -> malformed_client_error "client update" error
         | Ok client_error ->
             if native_error.Bridge.status = client_error_status client_error then
@@ -902,7 +898,7 @@ module Native_backend = struct
         Temporal_protocol.Workflow_protocol.activation option operation
     | Wait_replay_workflow : unit operation
     | Complete_replay_workflow :
-        Temporal_protocol.Workflow_protocol.completion -> unit operation
+        Temporal_protocol.Encoded_workflow_completion.t -> unit operation
     | Reject_replay_workflow : bytes -> unit operation
     | Finalize_replay : unit operation
     | Dispose_replay : unit operation
@@ -910,7 +906,7 @@ module Native_backend = struct
         Temporal_protocol.Workflow_protocol.activation option operation
     | Wait_workflow : unit operation
     | Complete_workflow :
-        Temporal_protocol.Workflow_protocol.completion -> unit operation
+        Temporal_protocol.Encoded_workflow_completion.t -> unit operation
     | Try_poll_activity :
         Temporal_protocol.Activity_protocol.task option operation
     | Wait_activity : unit operation
@@ -1036,10 +1032,12 @@ module Native_backend = struct
           ~reject:(Bridge.replay_worker_reject_workflow_json runtime)
           (Bridge.replay_worker_try_poll_workflow runtime)
     | Wait_replay_workflow -> Bridge.replay_worker_wait_workflow runtime
-    | Complete_replay_workflow completion ->
-        Result.bind
-          (Protocol_adapter.encode_workflow_completion completion)
-          (Bridge.replay_worker_complete_workflow_json runtime)
+    | Complete_replay_workflow encoded ->
+        (* [encoded] already passed the canonical encoder exactly once in the
+           worker adapter (issue #846); only the C call's owned copy is made
+           here. *)
+        Bridge.replay_worker_complete_workflow_json runtime
+          (Temporal_protocol.Encoded_workflow_completion.to_bytes encoded)
     | Reject_replay_workflow input ->
         Bridge.replay_worker_reject_workflow_json runtime input
     | Finalize_replay -> Bridge.replay_worker_finalize runtime
@@ -1049,10 +1047,11 @@ module Native_backend = struct
           ~reject:(Bridge.worker_reject_workflow_json runtime)
           (Bridge.worker_try_poll_workflow runtime)
     | Wait_workflow -> Bridge.worker_wait_workflow runtime
-    | Complete_workflow completion ->
-        Result.bind
-          (Protocol_adapter.encode_workflow_completion completion)
-          (Bridge.worker_complete_workflow_json runtime)
+    | Complete_workflow encoded ->
+        (* As for replay: the bytes were validated by their single encoder
+           pass before entering the mailbox and are not encoded again. *)
+        Bridge.worker_complete_workflow_json runtime
+          (Temporal_protocol.Encoded_workflow_completion.to_bytes encoded)
     | Try_poll_activity ->
         Protocol_adapter.activity_poll_result
           ~reject:(Bridge.worker_reject_activity_json runtime)
@@ -1178,7 +1177,7 @@ module Native = struct
         Temporal_protocol.Workflow_protocol.activation option operation
     | Wait_replay_workflow : unit operation
     | Complete_replay_workflow :
-        Temporal_protocol.Workflow_protocol.completion -> unit operation
+        Temporal_protocol.Encoded_workflow_completion.t -> unit operation
     | Reject_replay_workflow : bytes -> unit operation
     | Finalize_replay : unit operation
     | Dispose_replay : unit operation
@@ -1186,7 +1185,7 @@ module Native = struct
         Temporal_protocol.Workflow_protocol.activation option operation
     | Wait_workflow : unit operation
     | Complete_workflow :
-        Temporal_protocol.Workflow_protocol.completion -> unit operation
+        Temporal_protocol.Encoded_workflow_completion.t -> unit operation
     | Try_poll_activity :
         Temporal_protocol.Activity_protocol.task option operation
     | Wait_activity : unit operation

@@ -12,12 +12,12 @@ use std::ptr;
 use ocaml_temporal_core_bridge::{
     MAX_RUNTIME_WORKER_THREADS, Result as AbiResult, Runtime, STATUS_INVALID_ARGUMENT,
     STATUS_NOT_READY, STATUS_OK, SharedRuntime,
-    ocaml_temporal_core_v3_replay_worker_feed_history_json,
-    ocaml_temporal_core_v3_replay_worker_start_json,
-    ocaml_temporal_core_v3_replay_worker_try_poll_workflow,
-    ocaml_temporal_core_v3_replay_worker_wait_workflow, ocaml_temporal_core_v3_result_free,
-    ocaml_temporal_core_v3_runtime_free, ocaml_temporal_core_v3_runtime_new_attached,
-    ocaml_temporal_core_v3_shared_runtime_free, ocaml_temporal_core_v3_shared_runtime_new,
+    ocaml_temporal_core_v4_replay_worker_feed_history_json,
+    ocaml_temporal_core_v4_replay_worker_start_json,
+    ocaml_temporal_core_v4_replay_worker_try_poll_workflow,
+    ocaml_temporal_core_v4_replay_worker_wait_workflow, ocaml_temporal_core_v4_result_free,
+    ocaml_temporal_core_v4_runtime_free, ocaml_temporal_core_v4_runtime_new_attached,
+    ocaml_temporal_core_v4_shared_runtime_free, ocaml_temporal_core_v4_shared_runtime_new,
     test_runtime_worker_threads, test_runtimes_share_core, test_shared_runtime_references,
 };
 
@@ -29,7 +29,7 @@ mod replay_fixture;
 fn free_result(result: &mut AbiResult) {
     // SAFETY: The result was initialized by the bridge and is freed once.
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_result_free(result) },
+        unsafe { ocaml_temporal_core_v4_result_free(result) },
         STATUS_OK
     );
 }
@@ -40,7 +40,7 @@ fn new_shared(worker_threads: u32) -> *mut SharedRuntime {
     let mut result = AbiResult::default();
     // SAFETY: Both output locations are writable and exclusively owned.
     let status = unsafe {
-        ocaml_temporal_core_v3_shared_runtime_new(worker_threads, &mut shared, &mut result)
+        ocaml_temporal_core_v4_shared_runtime_new(worker_threads, &mut shared, &mut result)
     };
     free_result(&mut result);
     assert_eq!(status, STATUS_OK);
@@ -55,7 +55,7 @@ fn attach(shared: *const SharedRuntime) -> (i32, *mut Runtime) {
     let mut result = AbiResult::default();
     // SAFETY: `shared` is null or live; both outputs are writable.
     let status =
-        unsafe { ocaml_temporal_core_v3_runtime_new_attached(shared, &mut runtime, &mut result) };
+        unsafe { ocaml_temporal_core_v4_runtime_new_attached(shared, &mut runtime, &mut result) };
     free_result(&mut result);
     (status, runtime)
 }
@@ -64,7 +64,7 @@ fn attach(shared: *const SharedRuntime) -> (i32, *mut Runtime) {
 fn free_runtime(runtime: &mut *mut Runtime) {
     // SAFETY: The slot holds a live handle or null and is used by one thread.
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_runtime_free(runtime) },
+        unsafe { ocaml_temporal_core_v4_runtime_free(runtime) },
         STATUS_OK
     );
     assert!(runtime.is_null());
@@ -74,7 +74,7 @@ fn free_runtime(runtime: &mut *mut Runtime) {
 fn free_shared(shared: &mut *mut SharedRuntime) {
     // SAFETY: The slot holds a live handle or null and is used by one thread.
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_shared_runtime_free(shared) },
+        unsafe { ocaml_temporal_core_v4_shared_runtime_free(shared) },
         STATUS_OK
     );
     assert!(shared.is_null());
@@ -89,7 +89,7 @@ fn lease_replay_activation(runtime: *mut Runtime, workflow_id: &str) {
     let config = br#"{"namespace":"default","task_queue":"replay","build_id":"shared-runtime-test","versioning":{"kind":"none"},"max_cached_workflows":0,"max_outstanding_workflow_tasks":1,"max_concurrent_workflow_task_polls":1,"graceful_shutdown_timeout_ms":1000}"#;
     // SAFETY: `runtime` is a live handle used only by this thread.
     let status = unsafe {
-        ocaml_temporal_core_v3_replay_worker_start_json(
+        ocaml_temporal_core_v4_replay_worker_start_json(
             runtime,
             config.as_ptr(),
             config.len(),
@@ -102,7 +102,7 @@ fn lease_replay_activation(runtime: *mut Runtime, workflow_id: &str) {
     let history = replay_fixture::complete_history_document(workflow_id);
     // SAFETY: As above; the history bytes outlive the call.
     let status = unsafe {
-        ocaml_temporal_core_v3_replay_worker_feed_history_json(
+        ocaml_temporal_core_v4_replay_worker_feed_history_json(
             runtime,
             history.as_ptr(),
             history.len(),
@@ -115,12 +115,12 @@ fn lease_replay_activation(runtime: *mut Runtime, workflow_id: &str) {
     for _ in 0..20 {
         // SAFETY: As above.
         let wait =
-            unsafe { ocaml_temporal_core_v3_replay_worker_wait_workflow(runtime, &mut result) };
+            unsafe { ocaml_temporal_core_v4_replay_worker_wait_workflow(runtime, &mut result) };
         free_result(&mut result);
         assert!(wait == STATUS_OK || wait == STATUS_NOT_READY);
         // SAFETY: As above.
         let poll =
-            unsafe { ocaml_temporal_core_v3_replay_worker_try_poll_workflow(runtime, &mut result) };
+            unsafe { ocaml_temporal_core_v4_replay_worker_try_poll_workflow(runtime, &mut result) };
         let leased = poll == STATUS_OK && !result.value.ptr.is_null();
         free_result(&mut result);
         assert!(poll == STATUS_OK || poll == STATUS_NOT_READY);
@@ -207,7 +207,7 @@ fn invalid_shared_runtime_arguments_are_rejected() {
     let mut result = AbiResult::default();
     // SAFETY: Both output locations are writable and exclusively owned.
     let status = unsafe {
-        ocaml_temporal_core_v3_shared_runtime_new(
+        ocaml_temporal_core_v4_shared_runtime_new(
             MAX_RUNTIME_WORKER_THREADS + 1,
             &mut shared,
             &mut result,
@@ -219,7 +219,7 @@ fn invalid_shared_runtime_arguments_are_rejected() {
 
     // SAFETY: A null slot pointer is rejected before any write.
     let status =
-        unsafe { ocaml_temporal_core_v3_shared_runtime_new(0, ptr::null_mut(), &mut result) };
+        unsafe { ocaml_temporal_core_v4_shared_runtime_new(0, ptr::null_mut(), &mut result) };
     free_result(&mut result);
     assert_eq!(status, STATUS_INVALID_ARGUMENT);
 
@@ -237,7 +237,7 @@ fn invalid_shared_runtime_arguments_are_rejected() {
     assert!(runtime.is_null());
     // SAFETY: A null slot pointer is rejected without dereferencing it.
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_shared_runtime_free(ptr::null_mut()) },
+        unsafe { ocaml_temporal_core_v4_shared_runtime_free(ptr::null_mut()) },
         STATUS_INVALID_ARGUMENT
     );
 }

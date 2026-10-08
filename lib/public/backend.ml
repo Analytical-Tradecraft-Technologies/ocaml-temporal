@@ -511,6 +511,135 @@ let already_started_execution error =
       | exception Yojson.Json_error _ -> None)
   | _ -> None
 
+(** The typed classification of a Temporal client RPC failure, mirrored by
+    [Client.rpc_status]. Each value except [`Termination_outcome_uncertain]
+    is one gRPC status code; that one is the bridge's own verdict for a
+    terminate RPC whose transport deadline expired. *)
+type rpc_status =
+  [ `Cancelled
+  | `Unknown
+  | `Invalid_argument
+  | `Deadline_exceeded
+  | `Not_found
+  | `Already_exists
+  | `Permission_denied
+  | `Resource_exhausted
+  | `Failed_precondition
+  | `Aborted
+  | `Out_of_range
+  | `Unimplemented
+  | `Internal
+  | `Unavailable
+  | `Data_loss
+  | `Unauthenticated
+  | `Termination_outcome_uncertain ]
+
+(** The single classification table for RPC failures: the closed protocol
+    code, the public status, the stable [Error.error_type] (the canonical
+    gRPC code name in PascalCase, the same naming style as Temporal's
+    ["WorkflowExecutionAlreadyStarted"]), and whether retrying the same call
+    is pointless.
+
+    A failure is permanent when the same request cannot succeed without a
+    change by the caller or an operator: a malformed request, a missing or
+    closed run, an existing entity, a failed precondition, missing
+    credentials or permission, or an unimplemented RPC. Termination with an
+    uncertain outcome is also non-retryable, because the RPC has no
+    idempotency key and must be reconciled with [Client.wait] instead. Every
+    other status follows Temporal Core's retryable set ([Unavailable],
+    [Resource_exhausted], [Aborted], [Internal], [Unknown], [Out_of_range],
+    [Data_loss]) plus [Deadline_exceeded] and [Cancelled], which describe
+    the attempt rather than the request. The error types are deliberately
+    distinct from [client_at_capacity_error_type] (["resource_exhausted"]):
+    a server [ResourceExhausted] must not look like a local admission
+    refusal. *)
+let rpc_statuses : (string * rpc_status * string * bool) list =
+  [
+    ("cancelled", `Cancelled, "Cancelled", false);
+    ("unknown", `Unknown, "Unknown", false);
+    ("invalid_argument", `Invalid_argument, "InvalidArgument", true);
+    ("deadline_exceeded", `Deadline_exceeded, "DeadlineExceeded", false);
+    ("not_found", `Not_found, "NotFound", true);
+    ("already_exists", `Already_exists, "AlreadyExists", true);
+    ("permission_denied", `Permission_denied, "PermissionDenied", true);
+    ("resource_exhausted", `Resource_exhausted, "ResourceExhausted", false);
+    ("failed_precondition", `Failed_precondition, "FailedPrecondition", true);
+    ("aborted", `Aborted, "Aborted", false);
+    ("out_of_range", `Out_of_range, "OutOfRange", false);
+    ("unimplemented", `Unimplemented, "Unimplemented", true);
+    ("internal", `Internal, "Internal", false);
+    ("unavailable", `Unavailable, "Unavailable", false);
+    ("data_loss", `Data_loss, "DataLoss", false);
+    ("unauthenticated", `Unauthenticated, "Unauthenticated", true);
+    ( "termination_outcome_uncertain",
+      `Termination_outcome_uncertain,
+      "TerminationOutcomeUncertain",
+      true );
+  ]
+
+(** Builds the typed [`Bridge] error for one closed RPC code. The message
+    keeps the historical ["Temporal client RPC failed: <code>"] form for logs
+    and never includes server text. The protocol decoder admits only known
+    codes; ["ok"], which tonic cannot report as a failure, and any code
+    missing from the table fall back to the retryable [Unknown] class rather
+    than raising. *)
+let rpc_error code =
+  let error_type, non_retryable =
+    match
+      List.find_opt (fun (wire, _, _, _) -> String.equal wire code) rpc_statuses
+    with
+    | Some (_, _, error_type, non_retryable) -> (error_type, non_retryable)
+    | None -> ("Unknown", false)
+  in
+  Error.make ~category:`Bridge ~non_retryable ~error_type
+    ~message:("Temporal client RPC failed: " ^ code)
+    ()
+
+(** Recognizes an error built by [rpc_error] (or the mock's equivalent) from
+    its structural fields, never its message. *)
+let rpc_status error =
+  let view = Error.view error in
+  match (view.category, view.error_type) with
+  | `Bridge, Some error_type ->
+      List.find_map
+        (fun (_, status, candidate, _) ->
+          if String.equal candidate error_type then Some status else None)
+        rpc_statuses
+  | _ -> None
+
+(** The [Error.error_type] of a failed workflow query handler: Temporal's
+    [QueryFailedFailure] without the suffix, as for
+    [already_started_error_type]. Part of the [Client.is_query_failed]
+    contract. *)
+let query_failed_error_type = "QueryFailed"
+
+(** Builds the non-retryable [`Workflow] error for a failed query handler.
+    The workflow answered, so this is not a transport failure, and the same
+    query against the same state fails the same way. [message] is the
+    handler's own bounded message, which the bridge deliberately keeps (unlike
+    server text) because it is the application's answer to its caller. *)
+let query_failed_error message =
+  let message =
+    if String.equal message "" then "workflow query handler failed" else message
+  in
+  Error.make ~category:`Workflow ~non_retryable:true
+    ~error_type:query_failed_error_type ~message ()
+
+(** Recognizes [query_failed_error] structurally. *)
+let is_query_failed error =
+  let view = Error.view error in
+  view.category = `Workflow
+  && view.non_retryable
+  && view.error_type = Some query_failed_error_type
+
+(** Builds the mock transport's counterpart of Temporal's [NotFound] for an
+    unknown workflow or a mismatched run, so code tested against the mock
+    sees the same typed classification as against a server while keeping the
+    mock's more specific diagnostic. *)
+let mock_not_found message =
+  Error.make ~category:`Bridge ~non_retryable:true ~error_type:"NotFound"
+    ~message ()
+
 (** Converts a structured native client operation failure while preserving its
     semantic distinction from a transport/lifecycle error. Temporal's
     duplicate-workflow response is a workflow failure carrying the existing
@@ -519,8 +648,8 @@ let already_started_execution error =
 let native_client_error ~namespace = function
   | Client_protocol.Already_started { workflow_id; existing_run_id } ->
       already_started_error ~namespace ~workflow_id ~existing_run_id
-  | Client_protocol.Rpc { code } ->
-      bridge_error ("Temporal client RPC failed: " ^ code)
+  | Client_protocol.Rpc { code } -> rpc_error code
+  | Client_protocol.Query_failed { message } -> query_failed_error message
   | Client_protocol.Protocol { code } ->
       bridge_error ("Temporal client protocol rejected the response: " ^ code)
 
@@ -1090,7 +1219,7 @@ let mock_client_wait (client : mock_client) (request : wait_request) =
           | Some _ -> Hashtbl.find_opt service.history (request.workflow_id, request.run_id)
         in
         match execution with
-        | None -> Error (bridge_error "workflow run id does not match the started run")
+        | None -> Error (mock_not_found "workflow run id does not match the started run")
         | Some execution -> (
             match execution.terminal with
             | Mock_pending ->
@@ -1138,7 +1267,7 @@ let mock_set_wait_outcome_for_test client (request : wait_request) outcome =
               Hashtbl.find_opt service.history
                 (request.workflow_id, request.run_id)
             with
-            | None -> Error (bridge_error "workflow run id does not match the started run")
+            | None -> Error (mock_not_found "workflow run id does not match the started run")
             | Some execution -> (
                 match outcome with
                 | Failed { error; successor } ->
@@ -1319,10 +1448,10 @@ let mock_client_cancel (client : mock_client) (request : cancel_request) =
       if client.closed then Error (bridge_error "client is shut down")
       else
         match Hashtbl.find_opt service.executions request.workflow_id with
-        | None -> Error (bridge_error "workflow execution was not started")
+        | None -> Error (mock_not_found "workflow execution was not started")
         | Some execution
           when not (String.equal execution.run_id request.run_id) ->
-            Error (bridge_error "workflow run id does not match the started run")
+            Error (mock_not_found "workflow run id does not match the started run")
         | Some execution ->
             (match execution.terminal with
             | Mock_pending -> execution.terminal <- Mock_cancelled
@@ -1384,8 +1513,8 @@ let mock_client_reset (client : mock_client) (request : reset_request) =
               (request.workflow_id, request.run_id)
           with
         | None when Hashtbl.mem service.executions request.workflow_id ->
-            Error (bridge_error "workflow run id does not match the started run")
-        | None -> Error (bridge_error "workflow execution was not started")
+            Error (mock_not_found "workflow run id does not match the started run")
+        | None -> Error (mock_not_found "workflow execution was not started")
         | Some execution ->
             (match Hashtbl.find_opt service.executions request.workflow_id with
             | Some current when current.terminal = Mock_pending ->
@@ -1428,10 +1557,10 @@ let mock_client_terminate (client : mock_client) (request : terminate_request) =
       if client.closed then Error (bridge_error "client is shut down")
       else
         match Hashtbl.find_opt service.executions request.workflow_id with
-        | None -> Error (bridge_error "workflow execution was not started")
+        | None -> Error (mock_not_found "workflow execution was not started")
         | Some execution
           when not (String.equal execution.run_id request.run_id) ->
-            Error (bridge_error "workflow run id does not match the started run")
+            Error (mock_not_found "workflow run id does not match the started run")
         | Some execution ->
             (match execution.terminal with
             | Mock_pending -> execution.terminal <- Mock_terminated
@@ -1460,10 +1589,10 @@ let mock_client_signal (client : mock_client) (request : signal_request) =
       if client.closed then Error (bridge_error "client is shut down")
       else
         match Hashtbl.find_opt service.executions request.workflow_id with
-        | None -> Error (bridge_error "workflow execution was not started")
+        | None -> Error (mock_not_found "workflow execution was not started")
         | Some execution
           when not (String.equal execution.run_id request.run_id) ->
-            Error (bridge_error "workflow run id does not match the started run")
+            Error (mock_not_found "workflow run id does not match the started run")
         | Some ({ terminal = Mock_pending; _ } as execution) -> (
             let delivery =
               { signal_name = request.signal_name; input = copy_payload request.input }
@@ -1484,9 +1613,8 @@ let mock_client_signal (client : mock_client) (request : signal_request) =
                        "signal request ID was already used for different signal data"
                      ()))
         | Some _ ->
-            Error
-              (Error.make ~category:`Workflow
-                 ~message:"workflow execution is not running" ()))
+            (* Temporal answers a signal to a closed run with NotFound. *)
+            Error (mock_not_found "workflow execution is not running"))
 
 (** Sends one signal on the selected private transport. *)
 let client_signal client request =
@@ -1507,10 +1635,10 @@ let mock_client_query (client : mock_client) (request : query_request) =
       if client.closed then Error (bridge_error "client is shut down")
       else
         match Hashtbl.find_opt service.executions request.workflow_id with
-        | None -> Error (bridge_error "workflow execution was not started")
+        | None -> Error (mock_not_found "workflow execution was not started")
         | Some execution
           when not (String.equal execution.run_id request.run_id) ->
-            Error (bridge_error "workflow run id does not match the started run")
+            Error (mock_not_found "workflow run id does not match the started run")
         | Some _ ->
             Error
               (Error.make ~category:`Workflow

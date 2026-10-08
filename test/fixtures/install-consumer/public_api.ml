@@ -696,6 +696,30 @@ let _client_started : ('input, 'output) T.Client.handle -> bool = T.Client.start
 let _client_already_started : T.Error.t -> T.Client.execution option =
   T.Client.already_started
 let _client_is_at_capacity : T.Error.t -> bool = T.Client.is_at_capacity
+let _client_is_query_failed : T.Error.t -> bool = T.Client.is_query_failed
+let _client_rpc_status : T.Error.t -> T.Client.rpc_status option =
+  T.Client.rpc_status
+
+(** Witnesses every [Client.rpc_status] constructor, so removing or renaming
+    one breaks this installed-consumer build. *)
+let _client_rpc_status_name : T.Client.rpc_status -> string = function
+  | `Cancelled -> "Cancelled"
+  | `Unknown -> "Unknown"
+  | `Invalid_argument -> "InvalidArgument"
+  | `Deadline_exceeded -> "DeadlineExceeded"
+  | `Not_found -> "NotFound"
+  | `Already_exists -> "AlreadyExists"
+  | `Permission_denied -> "PermissionDenied"
+  | `Resource_exhausted -> "ResourceExhausted"
+  | `Failed_precondition -> "FailedPrecondition"
+  | `Aborted -> "Aborted"
+  | `Out_of_range -> "OutOfRange"
+  | `Unimplemented -> "Unimplemented"
+  | `Internal -> "Internal"
+  | `Unavailable -> "Unavailable"
+  | `Data_loss -> "DataLoss"
+  | `Unauthenticated -> "Unauthenticated"
+  | `Termination_outcome_uncertain -> "TerminationOutcomeUncertain"
 let _client_shutdown : T.Client.t -> (unit, T.Error.t) result = T.Client.shutdown
 
 let _worker_workflow :

@@ -272,6 +272,48 @@ val client_at_capacity_error_type : string
     run with the same workflow ID. *)
 val already_started_error_type : string
 
+(** Typed classification of a client RPC failure; see [Client.rpc_status]. *)
+type rpc_status =
+  [ `Cancelled
+  | `Unknown
+  | `Invalid_argument
+  | `Deadline_exceeded
+  | `Not_found
+  | `Already_exists
+  | `Permission_denied
+  | `Resource_exhausted
+  | `Failed_precondition
+  | `Aborted
+  | `Out_of_range
+  | `Unimplemented
+  | `Internal
+  | `Unavailable
+  | `Data_loss
+  | `Unauthenticated
+  | `Termination_outcome_uncertain ]
+
+(** Converts one structured native client failure into the public error.
+    [Rpc] codes become [`Bridge] errors with a stable PascalCase
+    [Error.error_type] naming the gRPC status (for example ["NotFound"]) and
+    [non_retryable] set exactly for permanent statuses; [Query_failed]
+    becomes a non-retryable [`Workflow] error with [query_failed_error_type]
+    and the handler's message; [Already_started] becomes the typed
+    already-started error for [namespace]. Exposed so tests can check the
+    classification table without a server. *)
+val native_client_error :
+  namespace:string -> Temporal_sdk_kernel.Client_protocol.client_error -> Error.t
+
+(** Recovers the classification attached by [native_client_error] to an RPC
+    failure (or by the mock's not-found errors) from the error's category and
+    type, or [None] for any other error. *)
+val rpc_status : Error.t -> rpc_status option
+
+(** The [Error.error_type] (["QueryFailed"]) of a failed query handler. *)
+val query_failed_error_type : string
+
+(** Recognizes a failed query handler error by its structural fields. *)
+val is_query_failed : Error.t -> bool
+
 (** Returns the [(namespace, workflow_id, run_id)] of the open run attached to
     an already-started error by either transport, or [None] for any other
     error or when Temporal did not report the existing run. *)

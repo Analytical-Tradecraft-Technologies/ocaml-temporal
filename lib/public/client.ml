@@ -787,6 +787,17 @@ let is_at_capacity error =
   && (not view.non_retryable)
   && view.error_type = Some Backend.client_at_capacity_error_type
 
+(** The public RPC classification; structurally identical to
+    [Backend.rpc_status], which owns the code table. *)
+type rpc_status = Backend.rpc_status
+
+(** Delegates to the backend, which builds these errors, so the
+    classification cannot drift from their construction. *)
+let rpc_status = Backend.rpc_status
+
+(** Delegates to the backend's structural query-failure check. *)
+let is_query_failed = Backend.is_query_failed
+
 (** Closes backend resources once and returns the same cached result to later
     shutdown callers.
     Native supervisor shutdown is terminal and cached: even when its result is

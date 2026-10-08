@@ -36,6 +36,69 @@ ledger, two real supervisors on one runtime, public ordering errors for
 `mock://` and refused native targets, and a Linux thread-count leak check.
 The design and ownership rules are in `docs/reference/core-bridge.md`.
 
+## 2026-10-06: Typed client RPC errors and query handler failures; bridge ABI v4 (#823)
+
+Client RPC failures are classifiable without parsing messages. Every closed
+`rpc` code becomes a `` `Bridge `` error with a stable PascalCase
+`Error.error_type` (`NotFound`, `Unavailable`, `TerminationOutcomeUncertain`,
+...) and the new `Client.rpc_status` variant. `non_retryable` is set exactly
+for the permanent conditions (invalid argument, not found, already exists,
+failed precondition, permission denied, unauthenticated, unimplemented, and
+uncertain termination); the other codes follow Temporal Core's retryable set
+plus deadline exceeded and cancelled. A failed workflow query handler, which
+Temporal reports as `InvalidArgument` with a `QueryFailedFailure` detail, is
+now a distinct query-only `query_failed` bridge document carrying the handler's
+message (at most 4,096 bytes, NUL replaced) and becomes a non-retryable
+`` `Workflow `` error with type `QueryFailed`, recognized by
+`Client.is_query_failed`. The mock client reports an unknown workflow, a
+mismatched run, and a signal to a closed run as the same typed `NotFound`.
+
+The new error kind is rejected by a version 3 OCaml decoder, so the bridge ABI
+moved from 3 to 4 (`ABI_VERSION`, the C header constant,
+`Native_bridge.abi_version`, and the `ocaml_temporal_core_v4_` symbol prefix).
+
+Evidence: Rust tests in `rust/core-bridge/tests/support/client_errors.rs`
+cover every status code's mapping, the `QueryFailedFailure` type-URL check,
+message bounding, and query, permanent-status, and signal failures through a
+real Core connection over Core's callback transport; OCaml protocol, supervisor
+adapter, and public classification tests
+(`test/bridge/test_client_rpc_errors.ml`) cover decoding, operation-specific
+rejection, and the full classification table. The live completed-query
+regression now requires a missing and a refusing query handler to be typed
+query failures with the handler message and a signal to the completed run to
+be a non-retryable `` `Not_found ``; it passed locally against the Temporal
+CLI 1.5.1 development server (Temporal Server 1.29.1) with Temporal Core
+`95e97686a079dcfe6c42e3254b2f3f5e3d97408f`, and CI runs it against the Compose
+stack. The live smoke driver's unknown-query and uncertain-termination checks
+now use the typed classification.
+
+## 2026-10-06: One translation and one completion encode per workflow task (#846)
+
+The native workflow worker used to translate (and so canonically re-encode)
+each activation twice, once for registry lookup and again inside
+`Native_execution.activate`, and to encode each completion twice, once as
+validation in `Native_execution` and again in the supervisor before the C
+call. The worker now passes the private `translated_activation` (which keeps
+its source activation) to `Native_execution.activate_translated`, and the
+completion's single encoder pass produces an abstract
+`Temporal_protocol.Encoded_workflow_completion.t` that the adapter retains
+and the supervisor's `Complete_workflow`/`Complete_replay_workflow` copy into
+C unchanged. Retained completions are now those immutable bytes, so the
+payload deep copy is gone and a retry resubmits the identical string; an
+adapter-built completion the encoder rejects fails closed without a native
+call, as before. All validation is kept, and the wire bytes are unchanged.
+The adapter's `complete_workflow` source operation also receives the typed
+completion read-only (`~completion`), so test sources and the cold-replay
+benchmark inspect commands without decoding the submitted JSON inside the
+measured path; the production supervisor ignores it. Runtime tests check that submitted bytes equal the canonical encoding of the
+completion, that a retryable rejection resubmits the physically identical
+string without rerunning the workflow, and that the retained bytes do not
+change when a typed payload buffer is mutated afterwards. On a scratch
+harness (OCaml 5.4.1, Apple M4 Pro, release profile), ten activations each
+carrying a 2 MiB activity result in and a 2 MiB activity input out took a
+median of 6.39 s before and 3.19 s after, measured on the codec that was
+current before #923.
+
 ## 2026-10-06: Bounded Tokio worker pool per runtime (#832)
 
 Every client and worker built its Core runtime with Tokio's default of one

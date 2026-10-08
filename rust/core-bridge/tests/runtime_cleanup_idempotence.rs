@@ -2,8 +2,8 @@ use std::ptr;
 use std::time::{Duration, Instant};
 
 use ocaml_temporal_core_bridge::{
-    Result as AbiResult, STATUS_OK, ocaml_temporal_core_v3_result_free,
-    ocaml_temporal_core_v3_runtime_dispose, ocaml_temporal_core_v3_runtime_new,
+    Result as AbiResult, STATUS_OK, ocaml_temporal_core_v4_result_free,
+    ocaml_temporal_core_v4_runtime_dispose, ocaml_temporal_core_v4_runtime_new,
     test_runtime_cleanup_counts,
 };
 
@@ -21,15 +21,15 @@ fn repeated_dispose_cleans_one_runtime_once() {
     let mut result = AbiResult::default();
 
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_runtime_new(&mut runtime, &mut result) },
+        unsafe { ocaml_temporal_core_v4_runtime_new(&mut runtime, &mut result) },
         STATUS_OK
     );
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
+        unsafe { ocaml_temporal_core_v4_result_free(&mut result) },
         STATUS_OK
     );
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_runtime_dispose(&mut runtime) },
+        unsafe { ocaml_temporal_core_v4_runtime_dispose(&mut runtime) },
         STATUS_OK
     );
     assert!(runtime.is_null());
@@ -37,7 +37,7 @@ fn repeated_dispose_cleans_one_runtime_once() {
     // A second disposal must not enqueue another cleanup job or dereference a
     // graph that the first call already transferred to the cleanup thread.
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_runtime_dispose(&mut runtime) },
+        unsafe { ocaml_temporal_core_v4_runtime_dispose(&mut runtime) },
         STATUS_OK
     );
     assert!(runtime.is_null());
