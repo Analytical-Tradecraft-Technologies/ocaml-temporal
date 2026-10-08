@@ -14,7 +14,7 @@
 (library
  (name temporal_history_corpus_runner)
  (wrapped false)
- (modules corpus_sha256 corpus_manifest corpus_runner)
+ (modules corpus_sha256 corpus_history_identity corpus_manifest corpus_runner)
  (libraries temporal-sdk temporal_history_corpus_definitions yojson))
 
 ; The gate and upgrade runner. `dune runtest` replays the committed corpus;

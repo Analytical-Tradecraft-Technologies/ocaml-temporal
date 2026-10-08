@@ -31,9 +31,10 @@ entry ID, when:
   not name a `replays_ok` entry with the same history;
 - a history file's SHA-256 differs from the manifest, a referenced file is
   missing, or a file under `histories/` is not referenced (orphan);
-- an entry's JSON history does not start with a `WorkflowExecutionStarted`
-  event whose workflow type and `originalExecutionRunId` match the entry's
-  `workflow_type` and `run_id`;
+- the `WorkflowExecutionStarted` event decoded from an entry's protobuf
+  history (the bytes that are replayed) does not record the entry's
+  `workflow_type` and `run_id` (`original_execution_run_id`, the run's own
+  ID), or the optional JSON copy disagrees with them;
 - a required feature (activity, timer, activity retry, signal, update,
   child workflow, continue-as-new, marker-free/active/deprecated patch,
   workflow failure, workflow-task failure recovery) has no `replays_ok` entry,
@@ -66,8 +67,12 @@ no-progress bound. The input is the entry's binary
 
 The public API returns no run ID or workflow type for a successful replay.
 The #518 gate used a private replay path to check those; the runner instead
-checks them offline against each entry's checksummed JSON history (see above)
-and registers only the entry's workflow type. That keeps the identity checks
+reads them from the start event of each entry's protobuf history, the exact
+replay input, and registers only the entry's workflow type.
+[`corpus_history_identity.ml`](../../test/history_corpus/corpus_history_identity.ml)
+walks just the needed protobuf fields (field numbers from the Temporal API
+protos at the pinned Core revision), because no Temporal protobuf decoder is
+reachable from OCaml test code; this works for entries without a JSON copy. That keeps the identity checks
 while one runner, on the public API, serves both `dune runtest` and the
 upgrade command. The private replay path stays covered by
 `bench_cold_replay` and the
@@ -145,7 +150,10 @@ the pre-patch definitions (an expected pass that now reports nondeterminism)
 and `negative-timer-removed` at the compatible definitions (a negative control
 that now replays), runs the real runner, and requires exit status 1, both IDs
 on standard error and in the report's `failing_cases`, and every other case
-passing.
+passing. A second scenario replaces `live-2026-10-08-activity`'s protobuf
+with the timer history, updates its checksum and drops its JSON copy; the
+runner must reject the manifest with exactly that entry's workflow type and
+run ID mismatches and replay nothing.
 
 ## Manifest format
 

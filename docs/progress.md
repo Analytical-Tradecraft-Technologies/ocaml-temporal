@@ -3160,11 +3160,15 @@ exits 1 and lists every mismatched case ID. The Linux amd64 / OCaml 5.5.1 CI
 leg uploads the report as an artifact, also after a failed verification.
 
 The public API reports no run ID or workflow type on success. The manifest
-validator therefore checks each entry's `workflow_type` and `run_id` against
-its checksummed JSON history's start event, and the runner registers only the
-entry's workflow type. `test_history_corpus_mismatch` copies the corpus, breaks
-one expected pass and one negative control, and requires exit 1 with exactly
-those IDs in standard error and in the report. A manual mutation also
+validator therefore decodes each entry's `workflow_type` and
+`original_execution_run_id` from the start event of the protobuf history that
+is replayed (a minimal documented field walk, `corpus_history_identity.ml`),
+checks the optional JSON copy against the same values, and the runner
+registers only the entry's workflow type. `test_history_corpus_mismatch`
+copies the corpus, breaks one expected pass and one negative control, and
+requires exit 1 with exactly those IDs in standard error and in the report. A
+second scenario swaps in another valid protobuf without a JSON copy and
+requires validation to fail on that entry's identity. A manual mutation also
 confirmed that a wrong `run_id` fails validation. The
 [Core pin upgrade checklist](dependencies.md#temporal-core-pin-upgrades) now
 requires a passing report for every Core bump and Dependabot Cargo PR. The

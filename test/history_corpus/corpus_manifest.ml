@@ -290,16 +290,37 @@ let check_entry errors index json =
 let read_file path =
   In_channel.with_open_bin path In_channel.input_all
 
-(** Checks that an entry's recorded identity matches its JSON history: the
-    first event must be [WorkflowExecutionStarted] for the manifest's workflow
-    type and run ID. Temporal records a run's own ID as
-    [originalExecutionRunId] on its start event (a continue-as-new successor
-    keeps the chain's first run in [firstExecutionRunId]).
+(** Compares an identity read from one of an entry's history files with the
+    manifest's [workflow_type] and [run_id]. [source] names the file kind in
+    the diagnostic. *)
+let check_identity errors location ~source entry (workflow_type, run_id) =
+  if workflow_type <> entry.workflow_type then
+    error errors location
+      (Printf.sprintf "%s history workflow type is %s, manifest says %s" source
+         workflow_type entry.workflow_type);
+  if run_id <> entry.run_id then
+    error errors location
+      (Printf.sprintf "%s history run ID is %s, manifest says %s" source run_id
+         entry.run_id)
 
-    The public replay API reports no run ID or workflow type for a successful
-    replay, so this offline check is what stops a mislabelled entry from
-    passing. The JSON copy is the reviewed source of the protobuf input and
-    both are checksummed, so they describe the same history. *)
+(** Checks that the protobuf history the runner replays records the entry's
+    workflow type and run ID on its [WorkflowExecutionStarted] event. The
+    public replay API reports no run ID or workflow type for a successful
+    replay, so this check on the replay input itself is what stops a
+    mislabelled entry, or a history from another run, from passing. It applies
+    to every entry, with or without a JSON copy. *)
+let check_protobuf_identity errors location ~file entry =
+  match Corpus_history_identity.of_protobuf (read_file file) with
+  | Error message ->
+      error errors location ("protobuf history identity unreadable: " ^ message)
+  | Ok identity -> check_identity errors location ~source:"protobuf" entry identity
+
+(** Checks that an entry's optional JSON history (the reviewed Temporal CLI
+    export the protobuf was encoded from) names the same workflow type and
+    run ID. Temporal records a run's own ID as [originalExecutionRunId]; a
+    continue-as-new successor keeps the chain's first run in
+    [firstExecutionRunId]. Together with {!check_protobuf_identity} this keeps
+    the human-readable copy consistent with the replay input. *)
 let check_json_identity errors location ~file entry =
   match Yojson.Safe.from_file file with
   | exception Yojson.Json_error message ->
@@ -322,15 +343,7 @@ let check_json_identity errors location ~file entry =
           error errors location
             "JSON history does not start with a WorkflowExecutionStarted event \
              naming its workflow type and run ID"
-      | Some (workflow_type, run_id) ->
-          if workflow_type <> entry.workflow_type then
-            error errors location
-              (Printf.sprintf "history workflow type is %s, manifest says %s"
-                 workflow_type entry.workflow_type);
-          if run_id <> entry.run_id then
-            error errors location
-              (Printf.sprintf "history run ID is %s, manifest says %s" run_id
-                 entry.run_id))
+      | Some identity -> check_identity errors location ~source:"JSON" entry identity)
 
 (** Checks checksums, cross references, recorded identities and orphaned files
     against [root], the corpus directory containing [manifest.json] and
@@ -366,6 +379,8 @@ let check_files errors ~root ~captures entries =
           (List.exists (fun capture -> capture.capture_id = entry.capture) captures)
       then error errors location ("unknown capture " ^ entry.capture);
       check_file location entry.history.protobuf entry.history.protobuf_sha256;
+      (let file = Filename.concat root entry.history.protobuf in
+       if Sys.file_exists file then check_protobuf_identity errors location ~file entry);
       Option.iter
         (fun (path, digest) ->
           check_file location path digest;
