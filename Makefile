@@ -142,7 +142,7 @@ BENCH_PAYLOAD_SAMPLES ?= 50
 .PHONY: test-temporal-live-ci test-temporal-diagnostics-contract
 .PHONY: bench bench-activation bench-activation-warm bench-activation-cold bench-payload-codec
 .NOTPARALLEL: bench-activation
-.PHONY: version-check build build-examples cargo-metadata test test-unit test-runtime test-rust test-bridge test-install test-api release-preflight release-tag-check test-quality-contract test-temporal-config test-temporal-worker-readiness-contract test-temporal-worker-stop-contract test-temporal-worker-crash-recovery-contract test-temporal-worker-cache-eviction-contract test-core-lifecycle-integration temporal-start temporal-start-worker temporal-run-driver temporal-inspect-smoke temporal-stop-worker test-temporal-two-binary test-temporal-integration test-temporal-worker-restart test-temporal-worker-restart-contract test-temporal-worker-restart-live test-temporal-worker-crash-recovery test-temporal-worker-cache-eviction test-temporal-worker-cache-eviction-live test-temporal-workflow-patching test-temporal-workflow-patching-contract test-temporal-workflow-patching-live test-temporal-parent-child-restart test-temporal-parent-child-restart-contract test-temporal-parent-child-restart-live test-temporal-parent-child-failure-replay test-temporal-parent-child-failure-replay-contract test-temporal-parent-child-failure-replay-live temporal-health temporal-status temporal-logs temporal-stop temporal-clean lint lint-rust fmt quality quality-tool-version-check quality-rust quality-spelling license-check audit clean verify check native-version-check native-build native-test native-test-rust native-test-install native-lint native-lint-rust native-verify
+.PHONY: version-check build build-examples docs cargo-metadata test test-unit test-runtime test-rust test-bridge test-install test-api release-preflight release-tag-check test-quality-contract test-temporal-config test-temporal-worker-readiness-contract test-temporal-worker-stop-contract test-temporal-worker-crash-recovery-contract test-temporal-worker-cache-eviction-contract test-core-lifecycle-integration temporal-start temporal-start-worker temporal-run-driver temporal-inspect-smoke temporal-stop-worker test-temporal-two-binary test-temporal-integration test-temporal-worker-restart test-temporal-worker-restart-contract test-temporal-worker-restart-live test-temporal-worker-crash-recovery test-temporal-worker-cache-eviction test-temporal-worker-cache-eviction-live test-temporal-workflow-patching test-temporal-workflow-patching-contract test-temporal-workflow-patching-live test-temporal-parent-child-restart test-temporal-parent-child-restart-contract test-temporal-parent-child-restart-live test-temporal-parent-child-failure-replay test-temporal-parent-child-failure-replay-contract test-temporal-parent-child-failure-replay-live temporal-health temporal-status temporal-logs temporal-stop temporal-clean lint lint-rust fmt quality quality-tool-version-check quality-rust quality-spelling license-check audit clean verify check native-version-check native-build native-test native-test-rust native-test-install native-lint native-lint-rust native-verify
 version-check:
 	@output="$$( $(RUN) ocamlc -version )" || exit $$?; \
 	actual="$$(printf '%s\n' "$$output" | tail -n 1)"; \
@@ -955,6 +955,16 @@ quality-rust: quality-tool-version-check
 
 quality-spelling: quality-tool-version-check
 	typos
+
+# Builds the rendered odoc API documentation, including the package landing
+# page, and fails on any odoc warning (the root `dune` file makes them fatal in
+# the dev profile). It runs in the Compose `docs` service, which adds the exact
+# CI-only odoc closure from scripts/docs-tools.locked to the development image;
+# odoc is never an SDK dependency. Output: _build/default/_doc/_html.
+docs:
+	OCAML_IMAGE=$(OCAML_IMAGE) $(COMPOSE) --profile docs --progress plain build docs >&2 && \
+	OCAML_IMAGE=$(OCAML_IMAGE) $(COMPOSE) --profile docs --progress quiet run --rm --user $(HOST_UID):$(HOST_GID) docs \
+		opam exec -- dune build $(DUNE_BUILD_ARGS) @doc
 
 license-check:
 	$(COMPOSE_RUN) sh scripts/check-licenses.sh

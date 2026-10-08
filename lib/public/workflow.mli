@@ -1,3 +1,12 @@
+(** Typed workflow definitions and the deterministic operations available
+    inside workflow code.
+
+    A workflow is a direct-style OCaml function that Temporal can replay from
+    its history. Workflow code must not perform I/O, read the wall clock, use
+    unseeded randomness, or mutate process-global state; it uses the
+    replay-safe helpers here, such as {!sleep}, {!now}, and {!random_int},
+    together with {!Activity} and {!Child_workflow}. *)
+
 (** The type of an OCaml function that implements a workflow. It receives a
     decoded input and returns either the workflow output or a structured error.
     The function must obey Temporal's workflow determinism rules. *)
@@ -98,11 +107,11 @@ val cancel_external_workflow :
     a typed defect rather than reading the host wall clock. *)
 val now : unit -> (Time.t, Error.t) result
 
-(** Returns a deterministic pseudo-random integer in [0, bound).  The stream
-    is seeded by Temporal for the workflow run and replayed from the same
-    initialization and reset metadata, so the result is stable for an identical call
-    sequence.  [bound] must be positive; invalid bounds and calls outside a
-    workflow return a typed defect. *)
+(** Returns a deterministic pseudo-random integer [n] with [0 <= n < bound].
+    The stream is seeded by Temporal for the workflow run and replayed from
+    the same initialization and reset metadata, so the result is stable for an
+    identical call sequence. [bound] must be positive; invalid bounds and calls
+    outside a workflow return a typed defect. *)
 val random_int : bound:int -> (int, Error.t) result
 
 (** Returns the deployment/build identity attached to the current workflow

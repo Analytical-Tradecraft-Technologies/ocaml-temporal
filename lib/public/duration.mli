@@ -1,3 +1,6 @@
+(** Non-negative, millisecond-precision durations for workflow timers and
+    timeouts. *)
+
 (** A non-negative length of time represented in whole milliseconds. Workflow
     timers use this type so their requested duration is recorded exactly and
     can be reproduced during replay. *)
