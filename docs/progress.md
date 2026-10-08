@@ -23,7 +23,7 @@ now share one Core runtime and Tokio pool through the new public
 `?runtime` on `Client.create` and `Worker.create`; without it every instance
 still owns its own runtime. Rust moves Core into a reference-counted
 `SharedCore` held by an opaque shared-runtime handle and by every attached
-graph, through three additive v3 symbols (`shared_runtime_new`,
+graph, through three additive v4 symbols (`shared_runtime_new`,
 `runtime_new_attached`, `shared_runtime_free`/`_dispose`), so Core is
 destroyed exactly once by its last holder and never under a live graph. On
 the OCaml side each attachment is a lease that the instance's supervisor
