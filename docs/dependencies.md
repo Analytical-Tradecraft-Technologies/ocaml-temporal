@@ -212,6 +212,28 @@ manually.
 See the [Dependabot allow reference](https://docs.github.com/en/code-security/reference/supply-chain-security/dependabot-options-reference#allow)
 for the direct/indirect update behavior.
 
+### Temporal Core pin upgrades
+
+A change to the Temporal Core revision, whether a hand-edited pin bump or a
+grouped Dependabot `temporal-core` PR, and any other Dependabot Cargo PR must
+carry this evidence before merge:
+
+1. Updated license evidence: the standalone Cargo license job passes, and the
+   locked package count and Core revision above are updated.
+2. ABI evidence: the bridge ABI and Rust integration tests pass
+   (`make verify`, `make native-verify`).
+3. Replay evidence: the [replay history corpus](reference/history-corpus.md)
+   passes `make test-history-corpus-upgrade` without regenerating, editing or
+   deleting any committed history or expected outcome. CI runs the corpus on
+   every leg and uploads the `history-corpus-report-linux-amd64-ocaml-5.5.1`
+   report; the PR description links it and states the candidate
+   `core_revision` and the revisions that produced the corpus. A mismatch lists
+   the failing case IDs and blocks the upgrade until it is fixed or recorded as
+   an approved, intentional compatibility break (see the corpus retention
+   rules).
+4. Compatibility evidence: the Temporal/PostgreSQL live job passes against the
+   new pin.
+
 The Cargo scanner parses SPDX `AND`, `OR`, `WITH`, and parentheses rather than
 matching substrings. For an `OR`, it prints the exact approved branch selected;
 every `AND` branch must be approved. It also understands Cargo's historical

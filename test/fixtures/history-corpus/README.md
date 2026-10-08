@@ -9,4 +9,5 @@ encoded from.
 Do not edit, regenerate or delete committed histories. See
 [docs/reference/history-corpus.md](../../../docs/reference/history-corpus.md)
 for the manifest format, the Docker-free gate (`make test-history-corpus`), the
-capture command (`make history-corpus-capture`) and the addition rules.
+SDK/Core upgrade runner (`make test-history-corpus-upgrade`), the capture
+command (`make history-corpus-capture`) and the addition rules.

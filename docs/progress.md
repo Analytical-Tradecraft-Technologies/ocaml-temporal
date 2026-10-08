@@ -3143,3 +3143,30 @@ reproduced all eleven cases. See the
 [history corpus reference](reference/history-corpus.md) for the rules and the
 remaining scope (#524 runs the corpus across upgrades; #515 adds a public
 runner).
+
+## 2026-10-08: Replay corpus as the SDK/Core upgrade gate (#524)
+
+The replay history corpus now runs through the public `Temporal.Replay` API,
+the entry point applications use, instead of the private replay path.
+`test/history_corpus/history_corpus_runner.ml` replaces
+`test_history_corpus.ml` and `corpus_replay.ml` as the single runner. It is the
+Dune test, so `make verify` and `make native-verify` run it on every PR, and
+it is also `make test-history-corpus-upgrade`. That target writes a per-case
+table and `_build/history-corpus/report.json`. The report records each case's
+ID, expected and actual outcome, failure message and producing SDK commit and
+Core revision. It also records the candidate SDK commit, the Core revision
+read from `rust/Cargo.lock`, the OCaml version and the bridge ABI. The runner
+exits 1 and lists every mismatched case ID. The Linux amd64 / OCaml 5.5.1 CI
+leg uploads the report as an artifact, also after a failed verification.
+
+The public API reports no run ID or workflow type on success. The manifest
+validator therefore checks each entry's `workflow_type` and `run_id` against
+its checksummed JSON history's start event, and the runner registers only the
+entry's workflow type. `test_history_corpus_mismatch` copies the corpus, breaks
+one expected pass and one negative control, and requires exit 1 with exactly
+those IDs in standard error and in the report. A manual mutation also
+confirmed that a wrong `run_id` fails validation. The
+[Core pin upgrade checklist](dependencies.md#temporal-core-pin-upgrades) now
+requires a passing report for every Core bump and Dependabot Cargo PR. The
+whole corpus replays in about a second. Every current capture comes from Core
+`95e97686`, so the first Core bump will be the first cross-revision replay.
