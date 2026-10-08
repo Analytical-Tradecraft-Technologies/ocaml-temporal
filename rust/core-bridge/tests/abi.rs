@@ -7,18 +7,18 @@ use ocaml_temporal_core_bridge::worker_bridge::{
 use ocaml_temporal_core_bridge::{
     ABI_VERSION, Buffer, Result as AbiResult, STATUS_ABI_MISMATCH, STATUS_INVALID_ARGUMENT,
     STATUS_INVALID_STATE, STATUS_OK, STATUS_PANIC, STATUS_PROTOCOL, STATUS_RETRYABLE,
-    ocaml_temporal_core_v3_check_abi_version, ocaml_temporal_core_v3_conformance_wait_ms,
-    ocaml_temporal_core_v3_echo, ocaml_temporal_core_v3_result_free,
-    ocaml_temporal_core_v3_runtime_dispose, ocaml_temporal_core_v3_runtime_free,
-    ocaml_temporal_core_v3_runtime_new, ocaml_temporal_core_v3_worker_complete_activity_json,
-    ocaml_temporal_core_v3_worker_complete_workflow_json,
-    ocaml_temporal_core_v3_worker_record_activity_heartbeat_json,
-    ocaml_temporal_core_v3_worker_reject_activity_json,
-    ocaml_temporal_core_v3_worker_reject_workflow_json,
-    ocaml_temporal_core_v3_worker_try_poll_activity,
-    ocaml_temporal_core_v3_worker_try_poll_workflow, ocaml_temporal_core_v3_worker_wait_activity,
-    ocaml_temporal_core_v3_worker_wait_activity_completion_retry_backoff,
-    ocaml_temporal_core_v3_worker_wait_any, ocaml_temporal_core_v3_worker_wait_workflow,
+    ocaml_temporal_core_v4_check_abi_version, ocaml_temporal_core_v4_conformance_wait_ms,
+    ocaml_temporal_core_v4_echo, ocaml_temporal_core_v4_result_free,
+    ocaml_temporal_core_v4_runtime_dispose, ocaml_temporal_core_v4_runtime_free,
+    ocaml_temporal_core_v4_runtime_new, ocaml_temporal_core_v4_worker_complete_activity_json,
+    ocaml_temporal_core_v4_worker_complete_workflow_json,
+    ocaml_temporal_core_v4_worker_record_activity_heartbeat_json,
+    ocaml_temporal_core_v4_worker_reject_activity_json,
+    ocaml_temporal_core_v4_worker_reject_workflow_json,
+    ocaml_temporal_core_v4_worker_try_poll_activity,
+    ocaml_temporal_core_v4_worker_try_poll_workflow, ocaml_temporal_core_v4_worker_wait_activity,
+    ocaml_temporal_core_v4_worker_wait_activity_completion_retry_backoff,
+    ocaml_temporal_core_v4_worker_wait_any, ocaml_temporal_core_v4_worker_wait_workflow,
     test_invoke_panic, test_worker_bridge_status,
 };
 
@@ -108,14 +108,14 @@ fn poll_lane_categories_never_include_core_diagnostics() {
 fn negotiates_the_supported_abi_version() {
     let mut result = empty_result();
 
-    let status = unsafe { ocaml_temporal_core_v3_check_abi_version(ABI_VERSION, &mut result) };
+    let status = unsafe { ocaml_temporal_core_v4_check_abi_version(ABI_VERSION, &mut result) };
 
     assert_eq!(status, STATUS_OK);
     assert_eq!(result.status, STATUS_OK);
     assert!(result.value.ptr.is_null());
     assert!(result.error.ptr.is_null());
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
+        unsafe { ocaml_temporal_core_v4_result_free(&mut result) },
         STATUS_OK
     );
 }
@@ -125,14 +125,14 @@ fn negotiates_the_supported_abi_version() {
 fn reports_an_owned_error_for_an_unsupported_version() {
     let mut result = empty_result();
 
-    let status = unsafe { ocaml_temporal_core_v3_check_abi_version(ABI_VERSION + 1, &mut result) };
+    let status = unsafe { ocaml_temporal_core_v4_check_abi_version(ABI_VERSION + 1, &mut result) };
 
     assert_eq!(status, STATUS_ABI_MISMATCH);
     assert_eq!(result.status, STATUS_ABI_MISMATCH);
     assert!(result.value.ptr.is_null());
     assert!(!bytes(&result.error).is_empty());
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
+        unsafe { ocaml_temporal_core_v4_result_free(&mut result) },
         STATUS_OK
     );
 }
@@ -144,14 +144,14 @@ fn reports_an_owned_error_for_an_unsupported_version() {
 fn rejects_the_previous_abi_version() {
     let mut result = empty_result();
 
-    let status = unsafe { ocaml_temporal_core_v3_check_abi_version(ABI_VERSION - 1, &mut result) };
+    let status = unsafe { ocaml_temporal_core_v4_check_abi_version(ABI_VERSION - 1, &mut result) };
 
     assert_eq!(status, STATUS_ABI_MISMATCH);
     assert_eq!(result.status, STATUS_ABI_MISMATCH);
     assert!(result.value.ptr.is_null());
     assert!(!bytes(&result.error).is_empty());
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
+        unsafe { ocaml_temporal_core_v4_result_free(&mut result) },
         STATUS_OK
     );
 }
@@ -164,17 +164,17 @@ fn result_free_is_idempotent_for_an_error_result() {
     let mut result = empty_result();
 
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_check_abi_version(ABI_VERSION + 1, &mut result) },
+        unsafe { ocaml_temporal_core_v4_check_abi_version(ABI_VERSION + 1, &mut result) },
         STATUS_ABI_MISMATCH
     );
     assert!(!result.error.ptr.is_null());
 
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
+        unsafe { ocaml_temporal_core_v4_result_free(&mut result) },
         STATUS_OK
     );
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
+        unsafe { ocaml_temporal_core_v4_result_free(&mut result) },
         STATUS_OK
     );
     assert_eq!(result, empty_result());
@@ -186,22 +186,22 @@ fn owns_echoed_bytes_and_supports_zero_length_buffers() {
     let input = b"activation";
     let mut result = empty_result();
 
-    let status = unsafe { ocaml_temporal_core_v3_echo(input.as_ptr(), input.len(), &mut result) };
+    let status = unsafe { ocaml_temporal_core_v4_echo(input.as_ptr(), input.len(), &mut result) };
 
     assert_eq!(status, STATUS_OK);
     assert_eq!(bytes(&result.value), input);
     assert!(result.error.ptr.is_null());
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
+        unsafe { ocaml_temporal_core_v4_result_free(&mut result) },
         STATUS_OK
     );
 
-    let status = unsafe { ocaml_temporal_core_v3_echo(ptr::null(), 0, &mut result) };
+    let status = unsafe { ocaml_temporal_core_v4_echo(ptr::null(), 0, &mut result) };
     assert_eq!(status, STATUS_OK);
     assert!(result.value.ptr.is_null());
     assert_eq!(result.value.len, 0);
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
+        unsafe { ocaml_temporal_core_v4_result_free(&mut result) },
         STATUS_OK
     );
 }
@@ -210,15 +210,15 @@ fn owns_echoed_bytes_and_supports_zero_length_buffers() {
 /// Ensures required null pointers fail without dereference or allocation leak.
 fn rejects_null_required_pointers() {
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_check_abi_version(ABI_VERSION, ptr::null_mut()) },
+        unsafe { ocaml_temporal_core_v4_check_abi_version(ABI_VERSION, ptr::null_mut()) },
         STATUS_INVALID_ARGUMENT
     );
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_echo(ptr::null(), 1, ptr::null_mut()) },
+        unsafe { ocaml_temporal_core_v4_echo(ptr::null(), 1, ptr::null_mut()) },
         STATUS_INVALID_ARGUMENT
     );
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_result_free(ptr::null_mut()) },
+        unsafe { ocaml_temporal_core_v4_result_free(ptr::null_mut()) },
         STATUS_INVALID_ARGUMENT
     );
 }
@@ -246,42 +246,42 @@ fn workflow_rejection_message_contains_only_static_reason() {
 fn task_bridge_exports_reject_null_runtime_handles() {
     let mut result = empty_result();
     let statuses = [
-        unsafe { ocaml_temporal_core_v3_worker_try_poll_workflow(ptr::null_mut(), &mut result) },
+        unsafe { ocaml_temporal_core_v4_worker_try_poll_workflow(ptr::null_mut(), &mut result) },
         {
             assert_eq!(
-                unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
+                unsafe { ocaml_temporal_core_v4_result_free(&mut result) },
                 STATUS_OK
             );
-            unsafe { ocaml_temporal_core_v3_worker_try_poll_activity(ptr::null_mut(), &mut result) }
+            unsafe { ocaml_temporal_core_v4_worker_try_poll_activity(ptr::null_mut(), &mut result) }
         },
         {
             assert_eq!(
-                unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
+                unsafe { ocaml_temporal_core_v4_result_free(&mut result) },
                 STATUS_OK
             );
-            unsafe { ocaml_temporal_core_v3_worker_wait_workflow(ptr::null_mut(), &mut result) }
+            unsafe { ocaml_temporal_core_v4_worker_wait_workflow(ptr::null_mut(), &mut result) }
         },
         {
             assert_eq!(
-                unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
+                unsafe { ocaml_temporal_core_v4_result_free(&mut result) },
                 STATUS_OK
             );
-            unsafe { ocaml_temporal_core_v3_worker_wait_activity(ptr::null_mut(), &mut result) }
+            unsafe { ocaml_temporal_core_v4_worker_wait_activity(ptr::null_mut(), &mut result) }
         },
         {
             assert_eq!(
-                unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
+                unsafe { ocaml_temporal_core_v4_result_free(&mut result) },
                 STATUS_OK
             );
-            unsafe { ocaml_temporal_core_v3_worker_wait_any(ptr::null_mut(), &mut result) }
+            unsafe { ocaml_temporal_core_v4_worker_wait_any(ptr::null_mut(), &mut result) }
         },
         {
             assert_eq!(
-                unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
+                unsafe { ocaml_temporal_core_v4_result_free(&mut result) },
                 STATUS_OK
             );
             unsafe {
-                ocaml_temporal_core_v3_worker_wait_activity_completion_retry_backoff(
+                ocaml_temporal_core_v4_worker_wait_activity_completion_retry_backoff(
                     ptr::null_mut(),
                     &mut result,
                 )
@@ -289,25 +289,11 @@ fn task_bridge_exports_reject_null_runtime_handles() {
         },
         {
             assert_eq!(
-                unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
+                unsafe { ocaml_temporal_core_v4_result_free(&mut result) },
                 STATUS_OK
             );
             unsafe {
-                ocaml_temporal_core_v3_worker_complete_workflow_json(
-                    ptr::null_mut(),
-                    ptr::null(),
-                    0,
-                    &mut result,
-                )
-            }
-        },
-        {
-            assert_eq!(
-                unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
-                STATUS_OK
-            );
-            unsafe {
-                ocaml_temporal_core_v3_worker_complete_activity_json(
+                ocaml_temporal_core_v4_worker_complete_workflow_json(
                     ptr::null_mut(),
                     ptr::null(),
                     0,
@@ -317,11 +303,11 @@ fn task_bridge_exports_reject_null_runtime_handles() {
         },
         {
             assert_eq!(
-                unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
+                unsafe { ocaml_temporal_core_v4_result_free(&mut result) },
                 STATUS_OK
             );
             unsafe {
-                ocaml_temporal_core_v3_worker_reject_workflow_json(
+                ocaml_temporal_core_v4_worker_complete_activity_json(
                     ptr::null_mut(),
                     ptr::null(),
                     0,
@@ -331,11 +317,25 @@ fn task_bridge_exports_reject_null_runtime_handles() {
         },
         {
             assert_eq!(
-                unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
+                unsafe { ocaml_temporal_core_v4_result_free(&mut result) },
                 STATUS_OK
             );
             unsafe {
-                ocaml_temporal_core_v3_worker_reject_activity_json(
+                ocaml_temporal_core_v4_worker_reject_workflow_json(
+                    ptr::null_mut(),
+                    ptr::null(),
+                    0,
+                    &mut result,
+                )
+            }
+        },
+        {
+            assert_eq!(
+                unsafe { ocaml_temporal_core_v4_result_free(&mut result) },
+                STATUS_OK
+            );
+            unsafe {
+                ocaml_temporal_core_v4_worker_reject_activity_json(
                     ptr::null_mut(),
                     ptr::null(),
                     0,
@@ -348,7 +348,7 @@ fn task_bridge_exports_reject_null_runtime_handles() {
         assert_eq!(status, STATUS_INVALID_ARGUMENT);
     }
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
+        unsafe { ocaml_temporal_core_v4_result_free(&mut result) },
         STATUS_OK
     );
 }
@@ -360,18 +360,18 @@ fn task_rejection_requires_retained_delivery_before_worker_state() {
     let mut runtime = ptr::null_mut();
     let mut result = empty_result();
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_runtime_new(&mut runtime, &mut result) },
+        unsafe { ocaml_temporal_core_v4_runtime_new(&mut runtime, &mut result) },
         STATUS_OK
     );
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
+        unsafe { ocaml_temporal_core_v4_result_free(&mut result) },
         STATUS_OK
     );
 
     let workflow = br#"{"run_id":"unleased-run","timestamp":{"seconds":1,"nanoseconds":0},"is_replaying":false,"history_length":1,"jobs":[]}"#;
     assert_eq!(
         unsafe {
-            ocaml_temporal_core_v3_worker_reject_workflow_json(
+            ocaml_temporal_core_v4_worker_reject_workflow_json(
                 runtime,
                 workflow.as_ptr(),
                 workflow.len(),
@@ -381,14 +381,14 @@ fn task_rejection_requires_retained_delivery_before_worker_state() {
         STATUS_PROTOCOL
     );
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
+        unsafe { ocaml_temporal_core_v4_result_free(&mut result) },
         STATUS_OK
     );
 
     let activity = br#"{"task_token":"AAEC","variant":{"kind":"cancel","reason":"worker_shutdown","details":null}}"#;
     assert_eq!(
         unsafe {
-            ocaml_temporal_core_v3_worker_reject_activity_json(
+            ocaml_temporal_core_v4_worker_reject_activity_json(
                 runtime,
                 activity.as_ptr(),
                 activity.len(),
@@ -398,11 +398,11 @@ fn task_rejection_requires_retained_delivery_before_worker_state() {
         STATUS_PROTOCOL
     );
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
+        unsafe { ocaml_temporal_core_v4_result_free(&mut result) },
         STATUS_OK
     );
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_runtime_free(&mut runtime) },
+        unsafe { ocaml_temporal_core_v4_runtime_free(&mut runtime) },
         STATUS_OK
     );
 }
@@ -416,18 +416,18 @@ fn malformed_heartbeat_is_rejected_and_result_cleanup_is_reusable() {
     let mut runtime = ptr::null_mut();
     let mut result = empty_result();
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_runtime_new(&mut runtime, &mut result) },
+        unsafe { ocaml_temporal_core_v4_runtime_new(&mut runtime, &mut result) },
         STATUS_OK
     );
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
+        unsafe { ocaml_temporal_core_v4_result_free(&mut result) },
         STATUS_OK
     );
 
     let malformed = br#"{"task_token":"AA==","details":[{"metadata":{},"data":{"encoding":"raw","data":"AA=="}}]}"#;
     assert_eq!(
         unsafe {
-            ocaml_temporal_core_v3_worker_record_activity_heartbeat_json(
+            ocaml_temporal_core_v4_worker_record_activity_heartbeat_json(
                 runtime,
                 malformed.as_ptr(),
                 malformed.len(),
@@ -439,7 +439,7 @@ fn malformed_heartbeat_is_rejected_and_result_cleanup_is_reusable() {
     assert_eq!(result.status, STATUS_PROTOCOL);
     assert!(!result.error.ptr.is_null());
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
+        unsafe { ocaml_temporal_core_v4_result_free(&mut result) },
         STATUS_OK
     );
     assert_eq!(result, empty_result());
@@ -447,7 +447,7 @@ fn malformed_heartbeat_is_rejected_and_result_cleanup_is_reusable() {
     let valid = br#"{"task_token":"AA==","details":[]}"#;
     assert_eq!(
         unsafe {
-            ocaml_temporal_core_v3_worker_record_activity_heartbeat_json(
+            ocaml_temporal_core_v4_worker_record_activity_heartbeat_json(
                 runtime,
                 valid.as_ptr(),
                 valid.len(),
@@ -459,11 +459,11 @@ fn malformed_heartbeat_is_rejected_and_result_cleanup_is_reusable() {
     assert_eq!(result.status, STATUS_INVALID_STATE);
     assert!(!result.error.ptr.is_null());
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
+        unsafe { ocaml_temporal_core_v4_result_free(&mut result) },
         STATUS_OK
     );
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_runtime_free(&mut runtime) },
+        unsafe { ocaml_temporal_core_v4_runtime_free(&mut runtime) },
         STATUS_OK
     );
 }
@@ -475,39 +475,39 @@ fn readiness_waits_require_a_running_worker() {
     let mut runtime = ptr::null_mut();
     let mut result = empty_result();
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_runtime_new(&mut runtime, &mut result) },
+        unsafe { ocaml_temporal_core_v4_runtime_new(&mut runtime, &mut result) },
         STATUS_OK
     );
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
+        unsafe { ocaml_temporal_core_v4_result_free(&mut result) },
         STATUS_OK
     );
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_worker_wait_workflow(runtime, &mut result) },
+        unsafe { ocaml_temporal_core_v4_worker_wait_workflow(runtime, &mut result) },
         ocaml_temporal_core_bridge::STATUS_INVALID_STATE
     );
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
+        unsafe { ocaml_temporal_core_v4_result_free(&mut result) },
         STATUS_OK
     );
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_worker_wait_activity(runtime, &mut result) },
+        unsafe { ocaml_temporal_core_v4_worker_wait_activity(runtime, &mut result) },
         ocaml_temporal_core_bridge::STATUS_INVALID_STATE
     );
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
+        unsafe { ocaml_temporal_core_v4_result_free(&mut result) },
         STATUS_OK
     );
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_worker_wait_any(runtime, &mut result) },
+        unsafe { ocaml_temporal_core_v4_worker_wait_any(runtime, &mut result) },
         ocaml_temporal_core_bridge::STATUS_INVALID_STATE
     );
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
+        unsafe { ocaml_temporal_core_v4_result_free(&mut result) },
         STATUS_OK
     );
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_runtime_free(&mut runtime) },
+        unsafe { ocaml_temporal_core_v4_runtime_free(&mut runtime) },
         STATUS_OK
     );
 }
@@ -517,16 +517,16 @@ fn readiness_waits_require_a_running_worker() {
 fn result_free_is_idempotent_for_the_same_result_object() {
     let mut result = empty_result();
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_echo(b"owned".as_ptr(), 5, &mut result) },
+        unsafe { ocaml_temporal_core_v4_echo(b"owned".as_ptr(), 5, &mut result) },
         STATUS_OK
     );
 
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
+        unsafe { ocaml_temporal_core_v4_result_free(&mut result) },
         STATUS_OK
     );
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
+        unsafe { ocaml_temporal_core_v4_result_free(&mut result) },
         STATUS_OK
     );
     assert_eq!(result, empty_result());
@@ -544,7 +544,7 @@ fn contains_rust_panics_as_owned_errors() {
     assert!(result.value.ptr.is_null());
     assert!(!bytes(&result.error).is_empty());
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
+        unsafe { ocaml_temporal_core_v4_result_free(&mut result) },
         STATUS_OK
     );
 }
@@ -554,20 +554,20 @@ fn contains_rust_panics_as_owned_errors() {
 fn bounds_the_conformance_wait() {
     let mut result = empty_result();
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_conformance_wait_ms(0, &mut result) },
+        unsafe { ocaml_temporal_core_v4_conformance_wait_ms(0, &mut result) },
         STATUS_OK
     );
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
+        unsafe { ocaml_temporal_core_v4_result_free(&mut result) },
         STATUS_OK
     );
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_conformance_wait_ms(1_001, &mut result) },
+        unsafe { ocaml_temporal_core_v4_conformance_wait_ms(1_001, &mut result) },
         STATUS_INVALID_ARGUMENT
     );
     assert!(!bytes(&result.error).is_empty());
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
+        unsafe { ocaml_temporal_core_v4_result_free(&mut result) },
         STATUS_OK
     );
 }
@@ -579,22 +579,22 @@ fn creates_and_idempotently_closes_a_runtime() {
     let mut result = empty_result();
 
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_runtime_new(&mut runtime, &mut result) },
+        unsafe { ocaml_temporal_core_v4_runtime_new(&mut runtime, &mut result) },
         STATUS_OK
     );
     assert!(!runtime.is_null());
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
+        unsafe { ocaml_temporal_core_v4_result_free(&mut result) },
         STATUS_OK
     );
 
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_runtime_free(&mut runtime) },
+        unsafe { ocaml_temporal_core_v4_runtime_free(&mut runtime) },
         STATUS_OK
     );
     assert!(runtime.is_null());
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_runtime_free(&mut runtime) },
+        unsafe { ocaml_temporal_core_v4_runtime_free(&mut runtime) },
         STATUS_OK
     );
 }
@@ -608,20 +608,20 @@ fn runtime_creation_rejects_null_output_pointers() {
     let mut result = empty_result();
 
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_runtime_new(ptr::null_mut(), &mut result) },
+        unsafe { ocaml_temporal_core_v4_runtime_new(ptr::null_mut(), &mut result) },
         STATUS_INVALID_ARGUMENT
     );
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
+        unsafe { ocaml_temporal_core_v4_result_free(&mut result) },
         STATUS_OK
     );
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_runtime_new(&mut runtime, ptr::null_mut()) },
+        unsafe { ocaml_temporal_core_v4_runtime_new(&mut runtime, ptr::null_mut()) },
         STATUS_INVALID_ARGUMENT
     );
     assert!(runtime.is_null());
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_runtime_free(ptr::null_mut()) },
+        unsafe { ocaml_temporal_core_v4_runtime_free(ptr::null_mut()) },
         STATUS_INVALID_ARGUMENT
     );
 }
@@ -632,21 +632,21 @@ fn disposes_a_runtime_asynchronously_and_clears_the_handle() {
     let mut runtime = ptr::null_mut();
     let mut result = empty_result();
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_runtime_new(&mut runtime, &mut result) },
+        unsafe { ocaml_temporal_core_v4_runtime_new(&mut runtime, &mut result) },
         STATUS_OK
     );
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
+        unsafe { ocaml_temporal_core_v4_result_free(&mut result) },
         STATUS_OK
     );
 
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_runtime_dispose(&mut runtime) },
+        unsafe { ocaml_temporal_core_v4_runtime_dispose(&mut runtime) },
         STATUS_OK
     );
     assert!(runtime.is_null());
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_runtime_dispose(&mut runtime) },
+        unsafe { ocaml_temporal_core_v4_runtime_dispose(&mut runtime) },
         STATUS_OK
     );
 }

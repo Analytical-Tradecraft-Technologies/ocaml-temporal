@@ -32,6 +32,42 @@ protocol or ABI change was needed. `test/runtime/test_execution_info.ml`
 checks order preservation, placeholder removal, the live and replayed paths,
 and the reset on the next activation. This completes #792.
 
+## 2026-10-06: Typed client RPC errors and query handler failures; bridge ABI v4 (#823)
+
+Client RPC failures are classifiable without parsing messages. Every closed
+`rpc` code becomes a `` `Bridge `` error with a stable PascalCase
+`Error.error_type` (`NotFound`, `Unavailable`, `TerminationOutcomeUncertain`,
+...) and the new `Client.rpc_status` variant. `non_retryable` is set exactly
+for the permanent conditions (invalid argument, not found, already exists,
+failed precondition, permission denied, unauthenticated, unimplemented, and
+uncertain termination); the other codes follow Temporal Core's retryable set
+plus deadline exceeded and cancelled. A failed workflow query handler, which
+Temporal reports as `InvalidArgument` with a `QueryFailedFailure` detail, is
+now a distinct query-only `query_failed` bridge document carrying the handler's
+message (at most 4,096 bytes, NUL replaced) and becomes a non-retryable
+`` `Workflow `` error with type `QueryFailed`, recognized by
+`Client.is_query_failed`. The mock client reports an unknown workflow, a
+mismatched run, and a signal to a closed run as the same typed `NotFound`.
+
+The new error kind is rejected by a version 3 OCaml decoder, so the bridge ABI
+moved from 3 to 4 (`ABI_VERSION`, the C header constant,
+`Native_bridge.abi_version`, and the `ocaml_temporal_core_v4_` symbol prefix).
+
+Evidence: Rust tests in `rust/core-bridge/tests/support/client_errors.rs`
+cover every status code's mapping, the `QueryFailedFailure` type-URL check,
+message bounding, and query, permanent-status, and signal failures through a
+real Core connection over Core's callback transport; OCaml protocol, supervisor
+adapter, and public classification tests
+(`test/bridge/test_client_rpc_errors.ml`) cover decoding, operation-specific
+rejection, and the full classification table. The live completed-query
+regression now requires a missing and a refusing query handler to be typed
+query failures with the handler message and a signal to the completed run to
+be a non-retryable `` `Not_found ``; it passed locally against the Temporal
+CLI 1.5.1 development server (Temporal Server 1.29.1) with Temporal Core
+`95e97686a079dcfe6c42e3254b2f3f5e3d97408f`, and CI runs it against the Compose
+stack. The live smoke driver's unknown-query and uncertain-termination checks
+now use the typed classification.
+
 ## 2026-10-06: One translation and one completion encode per workflow task (#846)
 
 The native workflow worker used to translate (and so canonically re-encode)
