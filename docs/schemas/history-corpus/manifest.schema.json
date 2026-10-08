@@ -1,0 +1,90 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/docs/schemas/history-corpus/manifest.schema.json",
+  "title": "Replay history corpus manifest (v1)",
+  "description": "Index of test/fixtures/history-corpus. Each capture records the provenance shared by a set of histories; each entry is one replay case: a history, the frozen definition set it is replayed against, and the required verdict. test/history_corpus/corpus_manifest.ml enforces this schema plus the file-level rules JSON Schema cannot express: SHA-256 checksums, entry/capture references, negative-control sources, and the absence of orphaned files under histories/.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "captures", "entries"],
+  "properties": {
+    "schema": {"const": "ocaml-temporal/history-corpus/v1"},
+    "captures": {
+      "type": "object",
+      "propertyNames": {"$ref": "#/$defs/identifier"},
+      "additionalProperties": {"$ref": "#/$defs/capture"}
+    },
+    "entries": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/entry"}
+    }
+  },
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]*$",
+      "description": "Stable lowercase identifier for captures, entries and feature tags."
+    },
+    "commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "history_path": {
+      "type": "string",
+      "pattern": "^histories/[^/\\\\]+$",
+      "description": "Path relative to the corpus directory."
+    },
+    "nonempty": {"type": "string", "minLength": 1},
+    "capture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "captured_on", "sdk_commit", "core_revision", "temporal_server_image", "capture_command"],
+      "properties": {
+        "kind": {
+          "enum": ["live", "synthetic"],
+          "description": "live: exported from a Temporal Server; synthetic: hand-written history (temporal_server_image is \"none\")."
+        },
+        "captured_on": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"},
+        "sdk_commit": {"$ref": "#/$defs/commit", "description": "Repository commit the producing workers were built from."},
+        "sdk_tree_dirty": {"type": "boolean", "description": "Whether tracked files differed from sdk_commit when capturing."},
+        "core_revision": {"$ref": "#/$defs/commit", "description": "Pinned Temporal Core revision linked by the producing workers."},
+        "temporal_server_image": {"$ref": "#/$defs/nonempty", "description": "Digest-pinned server image for a live capture."},
+        "temporal_cli_image": {"$ref": "#/$defs/nonempty"},
+        "worker_toolchains": {"type": "array", "items": {"$ref": "#/$defs/nonempty"}},
+        "capture_command": {"$ref": "#/$defs/nonempty", "description": "Command that produced the histories."},
+        "protobuf_export": {"type": "object", "description": "Tool and descriptor identity used to encode the JSON export as protobuf."},
+        "source": {"$ref": "#/$defs/nonempty", "description": "Original fixture location for reused histories."},
+        "notes": {"$ref": "#/$defs/nonempty"}
+      }
+    },
+    "entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "purpose", "features", "workflow_type", "workflow_id", "run_id", "capture", "history", "replay_definitions", "expected"],
+      "properties": {
+        "id": {"$ref": "#/$defs/identifier", "description": "Unique case identifier printed by the corpus test."},
+        "purpose": {"$ref": "#/$defs/nonempty", "description": "Why this case exists."},
+        "features": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/identifier"}},
+        "workflow_type": {"$ref": "#/$defs/nonempty", "description": "Must equal the replayed InitializeWorkflow type for replays_ok."},
+        "workflow_id": {"$ref": "#/$defs/nonempty", "description": "Workflow ID supplied to the replay worker (not stored in History)."},
+        "run_id": {"$ref": "#/$defs/nonempty", "description": "Must equal the replayed run ID for replays_ok."},
+        "capture": {"$ref": "#/$defs/identifier", "description": "Key into captures."},
+        "generation": {"$ref": "#/$defs/nonempty", "description": "Definition set of the worker that produced the history."},
+        "history": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["protobuf", "protobuf_sha256"],
+          "dependentRequired": {"json": ["json_sha256"], "json_sha256": ["json"]},
+          "properties": {
+            "protobuf": {"$ref": "#/$defs/history_path", "description": "Binary temporal.api.history.v1.History; the replay input."},
+            "protobuf_sha256": {"$ref": "#/$defs/sha256"},
+            "json": {"$ref": "#/$defs/history_path", "description": "Human-readable Temporal CLI JSON the protobuf was encoded from."},
+            "json_sha256": {"$ref": "#/$defs/sha256"}
+          }
+        },
+        "replay_definitions": {"$ref": "#/$defs/nonempty", "description": "Name of a definition set in test/history_corpus/corpus_definitions.ml."},
+        "expected": {"enum": ["replays_ok", "nondeterminism"]},
+        "negative_control_of": {"$ref": "#/$defs/identifier", "description": "Required exactly for nondeterminism entries: the replays_ok entry whose history is reused."},
+        "notes": {"$ref": "#/$defs/nonempty"}
+      }
+    }
+  }
+}
