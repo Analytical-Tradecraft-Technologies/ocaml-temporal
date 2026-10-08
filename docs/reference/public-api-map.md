@@ -219,8 +219,10 @@ for those rules.
   without a server. `History.of_protobuf` accepts a binary `History` protobuf
   and its workflow ID; `replay` and `replay_all` return `Ok ()` or a typed
   `failure` (`Nondeterminism`, `Workflow_task_failed`, `Invalid_history`,
-  `Unsupported_history`, or `Replay_error`). Each call owns and releases its
-  own native graph. See the
+  `Unsupported_history`, or `Replay_error`). `Nondeterminism` carries a
+  `mismatch` record with the workflow ID and type and, when Core's text
+  states them, the first mismatching recorded event and the command it was
+  matched against. Each call owns and releases its own native graph. See the
   [workflow guide](../guides/workflows.md#replay-recorded-histories-before-deploying)
   and the [replay bridge reference](replay-bridge.md).
 

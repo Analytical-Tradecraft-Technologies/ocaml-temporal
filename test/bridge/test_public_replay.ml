@@ -78,12 +78,31 @@ let describe = function
   | Ok () -> "Ok"
   | Error failure -> R.failure_message failure
 
-(** Requires a [Nondeterminism] result with a non-empty Core description. *)
-let expect_nondeterminism label result =
+(** Requires a [Nondeterminism] result with a non-empty Core description and,
+    when given, the recorded event and produced command Core named. Every
+    nondeterminism result here replays a [task-failure-body] history, so the
+    workflow context is checked too. *)
+let expect_nondeterminism ?event ?command label result =
   match result with
-  | Error (R.Nondeterminism { run_id; message }) ->
-      if run_id = "" || message = "" then
-        failwith (label ^ ": nondeterminism diagnostic is empty")
+  | Error (R.Nondeterminism { run_id; message; mismatch }) ->
+      if run_id = "" || message = "" || mismatch.reason = "" then
+        failwith (label ^ ": nondeterminism diagnostic is empty");
+      if mismatch.workflow_id <> "task-failure-body" then
+        failwith (label ^ ": wrong workflow ID " ^ mismatch.workflow_id);
+      if mismatch.workflow_type <> Some (workflow_type "body") then
+        failwith (label ^ ": missing workflow type");
+      Option.iter
+        (fun (id, event_type) ->
+          if
+            mismatch.event_id <> Some id
+            || mismatch.event_type <> Some event_type
+          then failwith (label ^ ": unexpected event in " ^ mismatch.reason))
+        event;
+      Option.iter
+        (fun command ->
+          if mismatch.command <> Some command then
+            failwith (label ^ ": unexpected command in " ^ mismatch.reason))
+        command
   | _ -> failwith (label ^ ": expected nondeterminism, got " ^ describe result)
 
 (** Requires a [Workflow_task_failed] result. *)
@@ -127,14 +146,80 @@ let test_compatible_histories () =
        ~workflows:[ R.workflow (business "business-permanent" true) ]
        (history "business-permanent"))
 
-(** Changed command sequences are reported as nondeterminism. *)
+(** An incompatible change: a second timer after the recorded one, so the
+    code produces a timer where the history recorded the workflow's
+    completion. *)
+let extra_timer name =
+  define name (fun () ->
+      let open Temporal.Result_syntax in
+      let* () = Temporal.Workflow.sleep (Temporal.Duration.of_ms 100L) in
+      let* () = Temporal.Workflow.sleep (Temporal.Duration.of_ms 100L) in
+      Ok "recovered")
+
+(** Changed command sequences are reported as nondeterminism that names the
+    recorded event and the command the changed code produced instead. *)
 let test_incompatible_changes () =
-  expect_nondeterminism "timer removed"
+  expect_nondeterminism "timer removed" ~event:(5L, "TimerStarted")
+    ~command:"Complete workflow"
     (R.replay ~workflows:[ R.workflow (timer_removed "body") ] (history "body"));
   expect_nondeterminism "activity instead of timer"
+    ~event:(5L, "TimerStarted") ~command:"Activity"
     (R.replay
        ~workflows:[ R.workflow (activity_instead_of_timer "body") ]
-       (history "body"))
+       (history "body"));
+  expect_nondeterminism "extra timer"
+    ~event:(16L, "WorkflowExecutionCompleted") ~command:"Timer"
+    (R.replay ~workflows:[ R.workflow (extra_timer "body") ] (history "body"))
+
+(** [contains text needle] is true when [needle] occurs in [text]. *)
+let contains text needle =
+  let text_length = String.length text in
+  let needle_length = String.length needle in
+  let rec loop index =
+    index + needle_length <= text_length
+    && (String.sub text index needle_length = needle || loop (index + 1))
+  in
+  loop 0
+
+(** A workflow ID that [History.of_protobuf] accepts but that must not be
+    copied verbatim into a log line: line breaks, a tab, a backslash, an
+    escape byte, a multi-byte character, and about 60 KB of padding. The
+    rendered [failure_message] stays one bounded line while the [mismatch]
+    record keeps the exact ID. *)
+let test_hostile_workflow_id () =
+  let workflow_id =
+    "multi\nline\r\tid\\\027" ^ "\xc3\xa9" ^ String.make 60_000 'w'
+  in
+  let history =
+    match R.History.of_protobuf ~workflow_id (read_fixture "body") with
+    | Ok history -> history
+    | Error error -> failwith (Temporal.Error.message error)
+  in
+  match R.replay ~workflows:[ R.workflow (timer_removed "body") ] history with
+  | Error (R.Nondeterminism { mismatch; _ } as failure) ->
+      if mismatch.workflow_id <> workflow_id then
+        failwith "hostile ID: the mismatch record altered the workflow ID";
+      let line = R.failure_message failure in
+      if String.contains line '\n' || String.contains line '\r' then
+        failwith "hostile ID: failure_message spans several lines";
+      if String.contains line '\t' || String.contains line '\027' then
+        failwith "hostile ID: failure_message contains a raw control byte";
+      if String.length line > 3_072 then
+        failwith
+          (Printf.sprintf "hostile ID: failure_message is %d bytes"
+             (String.length line));
+      if not (String.is_valid_utf_8 line) then
+        failwith "hostile ID: failure_message is not valid UTF-8";
+      List.iter
+        (fun needle ->
+          if not (contains line needle) then
+            failwith ("hostile ID: failure_message lacks " ^ needle ^ ": " ^ line))
+        [
+          "ID multi\\nline\\r\\tid\\\\\\x1b\xc3\xa9www";
+          "bytes truncated)";
+          "recorded event 5 (TimerStarted)";
+        ]
+  | result -> failwith ("hostile ID: expected nondeterminism, got " ^ describe result)
 
 (** Failing workflow code and a missing registration are task failures,
     distinct from nondeterminism and from invalid input. *)
@@ -226,6 +311,7 @@ let test_repeated_cleanup () =
 let () =
   test_compatible_histories ();
   test_incompatible_changes ();
+  test_hostile_workflow_id ();
   test_task_failures ();
   test_invalid_input ();
   test_registration_errors ();

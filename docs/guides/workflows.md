@@ -1285,16 +1285,76 @@ The result distinguishes:
 - `Ok ()`: Core accepted every recorded workflow task, including runs that
   recorded failed tasks or a deliberate workflow failure.
 - `Nondeterminism`: the code produced a different command sequence, for
-  example a removed timer. The message is Core's description, such as
-  `Nondeterminism error: Complete workflow machine does not handle this
-  event: HistoryEvent(id: 5, TimerStarted)`, and names the first mismatching
-  history event.
+  example a removed timer. `message` is Core's complete description, and
+  `mismatch` gives the workflow ID and type, the first mismatching recorded
+  event and the command it was matched against when Core names them, and
+  Core's own sentence (see the troubleshooting example below).
 - `Workflow_task_failed`: the workflow code raised, returned a defect, could
   not decode its input, or its type is not registered.
 - `Invalid_history` and `Unsupported_history`: the input is not a valid
   history, or it uses a feature this SDK cannot replay yet.
 - `Replay_error`: the replay could not run (an invalid registration or an
   SDK/runtime failure); the history's verdict is unknown.
+
+### Locate an incompatible change
+
+Suppose a deployed version waited for a review timer before completing, and
+a refactor drops the timer:
+
+```ocaml
+(* Recorded executions ran this. *)
+let publish draft =
+  let open Temporal.Result_syntax in
+  let* () = Temporal.Workflow.sleep review_delay in
+  Ok (finalize draft)
+
+(* The candidate release runs this. *)
+let publish draft = Ok (finalize draft)
+```
+
+Replaying a history recorded by the old version prints one line (wrapped
+here):
+
+```text
+nondeterminism (run 01a1...): workflow agent.publish (ID publish-42):
+recorded event 5 (TimerStarted) does not match the current code's Complete
+workflow command; Core: [TMPRL1100] Nondeterminism error: Complete workflow
+machine does not handle this event: HistoryEvent(id: 5, TimerStarted); guard
+intentional command changes with Temporal.Workflow.patched
+```
+
+Read it as: at recorded event 5 the original run started a timer, but the
+current code completed the workflow instead. Open the history at that event
+(`temporal workflow show --workflow-id publish-42`, or the Temporal UI) to see
+which timer, activity, or child workflow the original code issued there and
+which workflow task (the `WorkflowTaskCompleted` before it) produced it; then
+find the command in the current code that now takes its place. The same
+fields are available to programs:
+
+```ocaml
+match Temporal.Replay.replay ~workflows history with
+| Error (Temporal.Replay.Nondeterminism { mismatch; _ }) ->
+    Option.iter (Printf.printf "first mismatch at event %Ld\n")
+      mismatch.event_id
+| Error _ | Ok () -> ()
+```
+
+The line is always single and bounded: control characters in a workflow ID
+or type are escaped (`\n`, `\xHH`), and each value is cut to 256 bytes
+(Core's reason to 1,024) with `...(N bytes truncated)`; the `mismatch`
+fields keep the exact values. `event_id`, `event_type`, and `command` are
+`None` whenever Core's text does
+not state them, for example when Core reports a recorded patch marker that
+no `patched` call claimed; the SDK never guesses an event or an OCaml source
+location. If the change is intentional, keep the old commands for recorded
+executions behind a
+[patch marker](#introduce-a-new-branch-with-a-patch-marker), and replay
+histories recorded both before and after the change.
+
+A clean replay is evidence only for the paths those histories recorded. A
+branch no recorded execution has reached yet, such as an error handler or a
+rarely sent signal, can still be incompatible, so keep histories that cover
+the branches you change.
 
 A successful replay covers only the paths the recorded history took, and Core
 compares command shapes, not payload values: a changed activity argument or

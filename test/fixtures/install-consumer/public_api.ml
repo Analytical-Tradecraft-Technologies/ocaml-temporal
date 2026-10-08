@@ -1173,8 +1173,20 @@ let _replay_failure_message : T.Replay.failure -> string =
   T.Replay.failure_message
 
 let _replay_failure_kind : T.Replay.failure -> string = function
-  | T.Replay.Nondeterminism { run_id = (_ : string); message = (_ : string) }
-    ->
+  | T.Replay.Nondeterminism
+      {
+        run_id = (_ : string);
+        message = (_ : string);
+        mismatch =
+          {
+            T.Replay.workflow_id = (_ : string);
+            workflow_type = (_ : string option);
+            event_id = (_ : int64 option);
+            event_type = (_ : string option);
+            command = (_ : string option);
+            reason = (_ : string);
+          };
+      } ->
       "nondeterminism"
   | T.Replay.Workflow_task_failed
       { run_id = (_ : string option); message = (_ : string) } ->

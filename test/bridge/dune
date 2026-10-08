@@ -90,3 +90,13 @@
  (deps
   (glob_files ../integration/temporal/task_failure/histories/*.pb))
  (libraries temporal-sdk))
+
+; Developer-facing nondeterminism diagnostics of the public replay API (#529):
+; the history corpus's negative controls replayed against its frozen
+; incompatible definitions. No Temporal Server or network is required.
+(test
+ (name test_replay_diagnostics)
+ (modules test_replay_diagnostics)
+ (deps
+  (glob_files ../fixtures/history-corpus/histories/*.pb))
+ (libraries temporal-sdk temporal_history_corpus_definitions))
