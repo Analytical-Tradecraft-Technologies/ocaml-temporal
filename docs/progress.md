@@ -19,10 +19,9 @@ the Temporal acceptance controllers.
 
 `test/runtime/test_race_matrix.ml` drives the private workflow runtime with
 scripted Core activations, so each competing ordering is forced exactly. Its
-36 rows cover these races:
+35 rows cover these races:
 
-- activity completion against workflow cancellation and repeated
-  cancellation;
+- activity completion against workflow cancellation;
 - an activity cancel request against the activity's own completion;
 - a timer against cancellation;
 - scope cancellation propagating to an activity or child, against that
@@ -39,8 +38,10 @@ or unanswered).
 
 Generic checks reject any history with a second terminal command, a command
 after the terminal one, a task failure, or a late, repeated or out-of-order
-update response. A self-test proves that each check catches a synthetic
-violation. Each row runs twice on fresh executions, as Core redelivery would.
+update response. Core never activates a run after its terminal command, so
+the harness also refuses any scripted step after one; a late job is covered
+only by replaying into a fresh execution. Self-tests prove that each check
+and this guard catch a synthetic violation. Each row runs twice on fresh executions, as Core redelivery would.
 Rows whose updates were accepted also replay with validation disabled and a
 validator that would now reject, and must reproduce the same history.
 

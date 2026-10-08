@@ -43,9 +43,10 @@
       by the root, and the SDK does not itself request cancellation of
       outstanding activities or children. Children follow their parent close
       policy on the server.
-    - The first terminal command wins and seals the run. A later activation,
-      repeated cancellation, or late resolution produces no command and no
-      task failure.
+    - The first terminal command wins and seals the run. Core sends no
+      further activation to a closed run, so scripts end at the terminal
+      command and the harness refuses any step after it; late jobs are
+      covered only as part of a fresh-execution replay.
     - Within an activation, jobs are applied to futures first and fibers then
       run FIFO, so a handler queued by a signal or update job runs before a
       root continuation woken by a later job in the same activation.
@@ -573,10 +574,24 @@ let run_once row mode =
       ~validator_rejects
   in
   Fun.protect ~finally:runner.shutdown (fun () ->
+      (* Core never activates a run again after it has accepted a terminal
+         command: the closed run gets no further activations, and a failed
+         completion is redelivered by replaying into a fresh execution, which
+         every row already does through [run_row]. A script that activates a
+         closed execution is an impossible private-API sequence, so the
+         harness refuses it rather than asserting its result. *)
+      let closed = ref false in
       let history =
         List.mapi
           (fun index (jobs, expected) ->
+            if !closed then
+              failwith
+                (Printf.sprintf
+                   "%s activation %d: script activates an execution after its \
+                    terminal command, which Core never delivers"
+                   label (index + 1));
             let commands = runner.activate jobs in
+            if List.exists is_terminal commands then closed := true;
             expect
               (Printf.sprintf "%s activation %d" label (index + 1))
               expected (List.map render commands);
@@ -603,8 +618,7 @@ let run_row row =
   if row.replayable && run_once row Replay <> first then
     failwith (row.name ^ ": validation-free replay produced a different history")
 
-(** Activity completion against workflow cancellation and repeated
-    cancellation. Under the immediate-cancellation contract the root never
+(** Activity completion against workflow cancellation. Under the immediate-cancellation contract the root never
     observes a result that shares an activation with [Cancel_workflow],
     whichever side of the cancellation Core placed it on. *)
 let activity_rows =
@@ -613,8 +627,7 @@ let activity_rows =
     case ~name:"activity completes, cancellation arrives later"
       ~fixture:activity_fixture ~trace:[ "root:activity-ok" ] (fun _ ->
         [ ([ start ], [ "schedule-activity(1)" ]);
-          ([ ok ], [ "complete-workflow" ]);
-          ([ cancel ], []) ]);
+          ([ ok ], [ "complete-workflow" ]) ]);
     case ~name:"activity completion then cancellation in one activation"
       ~fixture:activity_fixture ~trace:[] (fun _ ->
         [ ([ start ], [ "schedule-activity(1)" ]);
@@ -623,16 +636,10 @@ let activity_rows =
       ~fixture:activity_fixture ~trace:[] (fun _ ->
         [ ([ start ], [ "schedule-activity(1)" ]);
           ([ cancel; ok ], [ "cancel-workflow-execution" ]) ]);
-    case ~name:"cancellation first, activity completion redelivered later"
+    case ~name:"cancellation while the activity is pending"
       ~fixture:activity_fixture ~trace:[] (fun _ ->
         [ ([ start ], [ "schedule-activity(1)" ]);
-          ([ cancel ], [ "cancel-workflow-execution" ]);
-          ([ ok ], []) ]);
-    case ~name:"repeated cancellation requests in one activation"
-      ~fixture:activity_fixture ~trace:[] (fun _ ->
-        [ ([ start ], [ "schedule-activity(1)" ]);
-          ([ cancel; cancel ], [ "cancel-workflow-execution" ]);
-          ([ cancel ], []) ]);
+          ([ cancel ], [ "cancel-workflow-execution" ]) ]);
     (* Core orders the signal before the resolution, but jobs are applied to
        futures before any fiber runs, so the handler finds the activity
        already settled: the cancellation is a no-op and the root observes the
@@ -676,8 +683,7 @@ let timer_rows =
     case ~name:"timer fires then cancellation in one activation"
       ~fixture:timer_fixture ~trace:[] (fun _ ->
         [ ([ start ], [ "start-timer(1,100ms)" ]);
-          ([ fire 1L; cancel ], [ "cancel-workflow-execution" ]);
-          ([ fire 1L ], []) ]);
+          ([ fire 1L; cancel ], [ "cancel-workflow-execution" ]) ]);
   ]
 
 (** Scope cancellation propagating to an attached activity, against the
@@ -685,16 +691,16 @@ let timer_rows =
 let scope_rows =
   [
     (* The scope hook buffers the activity cancellation and wakes the root
-       locally, so the root may complete before Core settles the activity; the
-       late Core result is ignored by the closed run. *)
+       locally, so the root completes before Core settles the activity. Core
+       accepts the non-terminal cancellation ahead of the completion and sends
+       no further activation to the closed run. *)
     case ~name:"scope cancellation propagates to its activity"
       ~fixture:scope_fixture
       ~trace:[ "signal:cancel-scope-ok"; "root:scoped-activity-error:cancelled" ]
       (fun _ ->
         [ ([ start ], [ "schedule-activity(1)" ]);
           ([ signal "cancel-scope" ],
-           [ "request-cancel-activity(1)"; "complete-workflow" ]);
-          ([ resolve_activity 1L (Error cancelled_error) ], []) ]);
+           [ "request-cancel-activity(1)"; "complete-workflow" ]) ]);
     (* The completion is applied before the handler runs, which removes the
        activity's scope hook: no cancellation command is emitted for settled
        work and the root keeps the result it was already woken with. *)
@@ -716,8 +722,7 @@ let child_rows =
       ~fixture:child_fixture ~trace:[ "root:child-ok" ] (fun _ ->
         [ ([ start ], [ "start-child(1,race-child)" ]);
           ([ child_started 1L ], []);
-          ([ ok ], [ "complete-workflow" ]);
-          ([ cancel ], []) ]);
+          ([ ok ], [ "complete-workflow" ]) ]);
     case ~name:"child completion then parent cancellation in one activation"
       ~fixture:child_fixture ~trace:[] (fun _ ->
         [ ([ start ], [ "start-child(1,race-child)" ]);
@@ -734,17 +739,14 @@ let child_rows =
     case ~name:"parent cancelled before the child start is acknowledged"
       ~fixture:child_fixture ~trace:[] (fun _ ->
         [ ([ start ], [ "start-child(1,race-child)" ]);
-          ([ cancel ], [ "cancel-workflow-execution" ]);
-          ([ child_started 1L ], []);
-          ([ ok ], []) ]);
+          ([ cancel ], [ "cancel-workflow-execution" ]) ]);
     case ~name:"scope cancellation propagates to its child"
       ~fixture:child_fixture
       ~trace:[ "signal:cancel-scope-ok"; "root:child-error:cancelled" ]
       (fun _ ->
         [ ([ start ], [ "start-child(1,race-child)" ]);
           ([ child_started 1L ], []);
-          ([ signal "cancel-scope" ], [ "cancel-child(1)"; "complete-workflow" ]);
-          ([ child_resolved 1L (Error cancelled_error) ], []) ]);
+          ([ signal "cancel-scope" ], [ "cancel-child(1)"; "complete-workflow" ]) ]);
     case ~name:"scope cancellation and child completion in one activation"
       ~fixture:child_fixture
       ~trace:[ "signal:cancel-scope-ok"; "root:child-ok" ] (fun _ ->
@@ -802,8 +804,7 @@ let handler_rows =
       (fun mode ->
         [ ([ start ], [ "start-timer(1,100ms)" ]);
           ([ suspending mode ], [ "update-accepted(u1)"; "start-timer(2,10ms)" ]);
-          ([ fire 1L ], [ "complete-workflow" ]);
-          ([ fire 2L ], []) ]);
+          ([ fire 1L ], [ "complete-workflow" ]) ]);
     case ~name:"suspended update when the workflow is cancelled"
       ~fixture:handler_fixture ~replayable:true ~updates:[ ("u1", Abandoned) ]
       ~trace:[ "update:start" ]
@@ -868,8 +869,7 @@ let retry_rows =
       ~fixture:local_activity_fixture ~trace:[] (fun _ ->
         [ ([ start ], [ "schedule-local-activity(1,attempt=1)" ]);
           ([ backoff ], [ "start-timer(2,1000ms)" ]);
-          ([ cancel ], [ "cancel-workflow-execution" ]);
-          ([ fire 2L ], []) ]);
+          ([ cancel ], [ "cancel-workflow-execution" ]) ]);
     case ~name:"backoff timer and cancellation in one activation"
       ~fixture:local_activity_fixture ~trace:[] (fun _ ->
         [ ([ start ], [ "schedule-local-activity(1,attempt=1)" ]);
@@ -881,8 +881,7 @@ let retry_rows =
         [ ([ start ], [ "schedule-local-activity(1,attempt=1)" ]);
           ([ backoff ], [ "start-timer(2,1000ms)" ]);
           ([ fire 2L ], [ "schedule-local-activity(1,attempt=2)" ]);
-          ([ resolve_activity 1L (Ok unit_payload) ], [ "complete-workflow" ]);
-          ([ cancel ], []) ]);
+          ([ resolve_activity 1L (Ok unit_payload) ], [ "complete-workflow" ]) ]);
     case ~name:"cancellation then retried attempt result in one activation"
       ~fixture:local_activity_fixture ~trace:[] (fun _ ->
         [ ([ start ], [ "schedule-local-activity(1,attempt=1)" ]);
@@ -924,9 +923,26 @@ let test_checker_rejects_violations () =
       | _ -> failwith ("history checker accepted a violation: " ^ label))
     violations
 
-(** Runs the checker self-test and every row, and reports the matrix size. *)
+(** Proves the harness refuses a script that activates an execution after it
+    emitted a terminal command, so rows that Core could never deliver cannot
+    be added back. *)
+let test_harness_rejects_post_terminal_activation () =
+  let row =
+    case ~name:"post-terminal activation" ~fixture:activity_fixture ~trace:[]
+      (fun _ ->
+        [ ([ start ], [ "schedule-activity(1)" ]);
+          ([ cancel ], [ "cancel-workflow-execution" ]);
+          ([ resolve_activity 1L (Ok unit_payload) ], []) ])
+  in
+  match run_once row Live with
+  | exception Failure _ -> ()
+  | _ -> failwith "harness accepted an activation after the terminal command"
+
+(** Runs the checker and harness self-tests and every row, and reports the
+    matrix size. *)
 let () =
   test_checker_rejects_violations ();
+  test_harness_rejects_post_terminal_activation ();
   let rows =
     List.concat
       [ activity_rows; timer_rows; scope_rows; child_rows; handler_rows;
