@@ -23,3 +23,8 @@ scripts/docs-tools.locked text eol=lf
 # Vendored upstream licence texts are verified byte for byte against the
 # SHA-256 recorded in their reviewed manifest, so they must not gain CRLF.
 scripts/license-texts/** text eol=lf
+
+# Replay corpus histories are verified byte for byte against the SHA-256 in
+# their manifest (docs/reference/history-corpus.md); never convert them.
+test/fixtures/history-corpus/histories/** -text
+test/fixtures/history-corpus/manifest.json text eol=lf

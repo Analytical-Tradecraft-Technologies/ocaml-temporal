@@ -319,6 +319,74 @@ callback that never returns still makes the join and shutdown unbounded; the
 overall deadline and escalation policy are tracked in
 [#495](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/495).
 
+## Non-yielding workflow watchdog
+
+Workflow code runs synchronously on the workflow lane until it returns or
+performs a supported workflow effect, and the adapter mutex is held for the
+whole activation. A CPU loop or a blocking call in workflow code (including a
+codec or a signal, query, or update handler) therefore stops every workflow on
+the worker. OCaml offers no safe way to interrupt that code, so the policy
+(#493) is detect, report, and fail the task; recovery is a process restart.
+
+- **Detection.** Before any user code for an activation runs, the lane
+  publishes an `in_flight` record (a fresh epoch, the activation, and the
+  workflow ID and type) in an atomic cell, and withdraws it only after the
+  completion was submitted or dropped. `Worker.run` starts a watchdog Domain
+  (`Native_worker_watchdog`) when the deadline is enabled and the worker polls
+  workflow tasks; it is joined before the run mutex is released. The
+  watchdog samples `running_epoch` every quarter of the deadline (clamped to
+  5–250 ms) and counts ticks rather than reading a clock, so a wall-clock
+  change cannot trigger or suppress it. An epoch observed continuously for
+  the deadline is reported once; detection happens at most one tick after
+  the deadline. A configured watchdog that cannot spawn its Domain fails
+  `run` with a typed error instead of running unguarded.
+- **Single-owner completion.** Each `in_flight` record has one atomic claim.
+  The lane claims it in `enqueue_pending` before any of its own completion
+  submissions; the watchdog claims it in `abandon_activation`. Only the
+  winner completes the native lease. On winning, the watchdog submits the
+  same failure completion an adapter rejection would (a workflow-task
+  failure; answered query failures for a query-only activation; an empty
+  acknowledgement for an eviction) through the supervisor without the
+  adapter mutex. This is the only adapter operation that calls the
+  supervisor without that mutex; it cannot overlap a lane call for the same
+  adapter because the lane makes none while the claim is unclaimed.
+- **Late completion.** When the stuck code eventually returns, the lane loses
+  the claim, drops its completion without a native call, shuts down and
+  removes the run unless the activation was query-only (the task failure
+  makes Core evict it; the later eviction takes the existing
+  empty-acknowledgement path for a removed run), and reports `Rejected` with
+  code `activation_deadline_exceeded`. If the watchdog's own submission was
+  not acknowledged, the lane returns `Error`, which stops `run`, because the
+  lease state is unknown.
+- **Health.** The first abandoned activation is recorded in a sticky atomic
+  and exposed by `Temporal.Worker.health` as `Stuck_workflow_activation`
+  (workflow type and ID, run ID, replay flag, elapsed lower bound, and an
+  `abandoned` outcome: `` `Task_failed ``, `` `Queries_failed `` for a
+  query-only activation, `` `Eviction_acknowledged `` for an eviction-only
+  activation, or `` `Not_acknowledged `` when the replacement completion was
+  not delivered). Only `` `Task_failed `` claims a workflow-task failure. It never resets, because code that
+  failed to yield may have left process state inconsistent. One
+  `workflow_activation_deadline_exceeded` error record is logged with
+  `temporal.workflow_type`, `temporal.workflow_id`, `temporal.run_id`, and
+  `temporal.duration_ms`; no payload or failure text is logged.
+- **Limits.** While the code is stuck, workflow tasks that Core has already
+  received for this worker are not processed; they wait for the workflow-task
+  timeout and are then retried elsewhere. `shutdown` waits for the run mutex and
+  cannot complete while the lane is stuck (#495), so the process must be
+  terminated. If the stuck code blocks inside C without releasing the
+  runtime lock, other Domains, including the watchdog and the supervisor, can
+  stall at the next stop-the-world collection; only an external liveness
+  probe driven by a heartbeat detects that case.
+
+The default deadline is two seconds, the Python SDK's deadlock-detection
+timeout (Go uses one second). Core splits a replay into one activation per
+historical workflow task, so a legitimately large replay is not one long
+activation. Applications with genuinely long activations raise the deadline
+through `Worker.Options.make ~workflow_activation_deadline`; `` `Disabled ``
+turns the watchdog off for debugging. The watchdog's timing never reaches a
+workflow command, so it cannot cause replay divergence: a failed workflow task
+is simply retried from history.
+
 The semantic translator accepts child-start commands with the workflow identity,
 input, and optional retry policy represented by the protocol. Core child options
 not yet exposed by the OCaml runtime remain explicit defaults, but the two child
@@ -336,6 +404,14 @@ timeout policies, and cancellation options are present; a missing field is
 rejected in the same typed way.
 
 ## Verification
+
+`test/runtime/test_native_worker_watchdog.ml` drives a workflow that spins on
+a test-controlled atomic flag. It checks the pure detection rule, that the
+watchdog submits exactly one task failure for the stuck lease, that the
+lane's late completion is dropped and the evicted run is then acknowledged
+with an empty completion, that health stays sticky, that quick activations
+and an already-completed epoch are never abandoned, and the public deadline
+validation and mock-backend health.
 
 `test/runtime/test_native_worker_execution.ml` uses a fake semantic queue to
 verify:

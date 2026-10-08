@@ -858,6 +858,30 @@ test-update-outcomes-live:
 test-runtime:
 	$(RUN) dune runtest $(DUNE_BUILD_ARGS) test/runtime test/integration/temporal/observer
 
+# Replay history corpus (docs/reference/history-corpus.md). The Docker-free
+# gate also runs in every `dune runtest`, so `make test` and the native jobs
+# already enforce it; this target is the focused command for corpus changes.
+.PHONY: test-history-corpus history-corpus-capture
+test-history-corpus:
+	$(RUN) dune runtest $(DUNE_BUILD_ARGS) test/history_corpus
+
+# Captures fresh histories from a running disposable Compose stack and stages
+# them under .history-corpus-capture/ for review. Set HISTORY_CORPUS_INSTALL to
+# the corpus directory to append them; installation never replaces an entry.
+# The export step needs host python3 with the protobuf package, protoc, and
+# cargo (or HISTORY_CORPUS_CORE_PROTOS naming the pinned Core protos).
+HISTORY_CORPUS_CAPTURE_ID ?=
+HISTORY_CORPUS_INSTALL ?=
+history-corpus-capture: test-temporal-config
+	@test -n "$(HISTORY_CORPUS_CAPTURE_ID)" || { echo "set HISTORY_CORPUS_CAPTURE_ID, e.g. live-YYYY-MM-DD" >&2; exit 2; }
+	$(MAKE) temporal-start
+	$(RUN) dune build $(DUNE_BUILD_ARGS) test/history_corpus/capture/history_corpus_capture.exe
+	HISTORY_CORPUS_CAPTURE_ID="$(HISTORY_CORPUS_CAPTURE_ID)" \
+	HISTORY_CORPUS_INSTALL="$(HISTORY_CORPUS_INSTALL)" \
+	HISTORY_CORPUS_RUN='OCAML_IMAGE=$(OCAML_IMAGE) $(COMPOSE) --progress quiet run --rm --user $(HOST_UID):$(HOST_GID) $(SERVICE) env TEMPORAL_ADDRESS=http://temporal:7233 TEMPORAL_NAMESPACE=temporal-sdk-test _build/default/test/history_corpus/capture/history_corpus_capture.exe' \
+	HISTORY_CORPUS_TEMPORAL_CLI='$(TEMPORAL_COMPOSE) run --rm --no-deps -T temporal-admin-tools temporal' \
+	sh test/history_corpus/scripts/capture-history-corpus.sh
+
 # Requires a disposable running Temporal server. The regression owns its worker,
 # uses a unique task queue, and terminates its workflow executions on exit.
 .PHONY: test-client-request-ids-live

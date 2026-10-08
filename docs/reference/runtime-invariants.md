@@ -81,6 +81,19 @@ and bridge, read the [documentation guide](../README.md) first.
   still tears down pending futures in creation order (#847).
 - Command sequence numbers are monotonic per execution and begin at one.
 - Commands are returned in emission order.
+- Workflow code must yield. An activation that runs workflow code past the
+  worker's activation deadline (default two seconds) without returning is
+  detected by a separate watchdog Domain that only reads an atomically
+  published activation epoch and counts its own ticks (#493). It never
+  interrupts, resumes, or inspects the stuck code and its timing never reaches
+  a command, so it cannot change deterministic decisions. On detection, the
+  watchdog and the lane race on one atomic per-activation claim; exactly one
+  of them completes the native lease. A winning watchdog fails the workflow
+  task (Temporal retries it from history), and a lane that later loses the
+  claim drops its completion and its run without a native call. Detection
+  marks the worker unhealthy for its lifetime (`Worker.health`); recovery of
+  the stuck Domain is an external process restart. See the
+  [watchdog reference](native-worker-execution.md#non-yielding-workflow-watchdog).
 
 ## Futures and continuations
 
