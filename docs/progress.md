@@ -36,6 +36,40 @@ against a loopback gRPC double: corrected completion and reject both retire
 the lease exactly once after the refusal), and
 `test/bridge/test_ocaml_activity_protocol.ml` cover it.
 
+## 2026-10-08: Actionable replay nondeterminism diagnostics (#529)
+
+`Temporal.Replay.Nondeterminism` now carries a `mismatch` record besides
+Core's complete `message`: the history's workflow ID, the workflow type from
+the run's start job, the first unmatched recorded event's ID and type, the
+command state machine Core matched it against (normally the command the
+changed code produced), and Core's mismatch sentence unwrapped from its
+failure envelope. Extraction is best effort over Core's text and fails
+closed: anything Core does not state is `None`, and no OCaml source location
+is invented. `failure_message` keeps its `nondeterminism (run RUN_ID): `
+prefix and now renders that context with a reminder to guard intentional
+changes with `Temporal.Workflow.patched`. Every rendered failure is one line
+of at most about 3 KB: interpolated values are escaped and each is bounded
+(256 bytes for identifiers, 1,024 for Core's reason) without splitting UTF-8,
+while the record keeps the exact values. The workflow guide has a
+troubleshooting example for locating an incompatible change and states that
+a clean replay covers only recorded paths. No ABI, bridge, or Rust change was
+needed; a live worker already reports the same Core text on the
+`WorkflowTaskFailed` event and in Core's `WARN` log.
+
+Evidence: `test/bridge/test_replay_diagnostics.ml` replays the corpus
+`negative-timer-removed` control through the public API and asserts workflow
+type `corpus.timer`, workflow ID `history-corpus-timer`, event 5
+`TimerStarted`, command `Complete workflow`, Core's exact reason and a
+one-line rendering without the recorded payload; the
+`negative-patch-active-on-legacy` control asserts the patch ID in the reason
+with the event and command left `None`. `test/bridge/test_public_replay.ml`
+asserts the event and command of a removed timer, an activity in place of a
+timer, and an added timer (event 16 `WorkflowExecutionCompleted` against a
+`Timer` command), and renders a 60 KB workflow ID containing line breaks
+and control bytes as one escaped, truncated line while the record keeps the
+exact ID, with task failures and invalid input still classified
+separately. The installed-consumer witness binds every new field.
+
 ## 2026-10-08: Seeded bridge lifecycle stress (#522)
 
 `rust/core-bridge/tests/lifecycle_stress.rs` generates reproducible operation
