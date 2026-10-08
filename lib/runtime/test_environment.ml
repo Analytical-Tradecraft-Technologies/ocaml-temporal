@@ -928,6 +928,7 @@ and activate environment run jobs =
       Workflow_context_store.history_length = run.history_length;
       history_size_bytes = None;
       continue_as_new_suggested = false;
+      continue_as_new_reasons = [];
     };
   let commands = Execution.activate execution jobs in
   (match Execution.task_failure execution with
