@@ -12,7 +12,11 @@ type failure = Workflow_protocol.failure
 (** Structured Temporal failure shared with workflow activations. *)
 
 type execution = { namespace : string; workflow_id : string; run_id : string }
-(** The exact Temporal execution identified by namespace, workflow ID, and run. *)
+(** A Temporal execution identified by namespace, workflow ID, and run. In a
+    request sent after start, an empty [run_id] selects the workflow's current
+    run, which Temporal resolves when it handles the RPC (#791); every
+    execution returned by Temporal names a concrete run, except the echo in
+    {!type-wait_response}. *)
 
 type metadata_field = { key : string; value : payload }
 (** One named payload attached to a workflow start memo or search attribute. *)
@@ -50,14 +54,15 @@ type start_ticket
     with the caller's requested workflow identity before they are exposed. *)
 
 type wait_request = execution
-(** Exact run selected by a wait; continued-as-new successors are not followed. *)
+(** Run selected by a wait (empty [run_id]: the current run when Temporal
+    handles the poll); successors are never followed by the bridge. *)
 
 type cancel_request = {
   execution : execution;
   request_id : string;
   reason : string;
 }
-(** Exact run and idempotency metadata for a client cancellation request. *)
+(** Run selector and idempotency metadata for a client cancellation request. *)
 
 type cancel_response = { acknowledged : bool }
 (** Positive acknowledgement returned after Temporal accepts the cancellation RPC. *)
@@ -68,13 +73,14 @@ type reset_request = {
   reason : string;
   workflow_task_finish_event_id : int64;
 }
-(** Exact run and workflow-task event used as the reset point. *)
+(** Run selector and workflow-task event used as the reset point. *)
 
 type reset_response = { execution : execution }
 (** New run identity returned by Temporal after a successful reset. *)
 
 type terminate_request = { execution : execution; reason : string }
-(** Exact-run termination request. [reason] is bounded operator context. *)
+(** Termination request for one run selector. [reason] is bounded operator
+    context. *)
 
 type terminate_response = { acknowledged : bool }
 (** Positive acknowledgement returned after Temporal accepts termination. *)
@@ -85,7 +91,7 @@ type signal_request = {
   request_id : string;
   input : payload list;
 }
-(** Exact workflow/run identity and typed payloads for one signal delivery.
+(** Workflow/run selector and typed payloads for one signal delivery.
 
     [request_id] is the Temporal idempotency key for this logical control
     operation. The signal name and payload list are encoded in the same closed
@@ -99,7 +105,7 @@ type query_request = {
   query_type : string;
   input : payload list;
 }
-(** Exact execution identity and output-only query name sent to Temporal. The
+(** Execution selector and output-only query name sent to Temporal. The
     input list is currently required to be empty by the public client API but
     remains explicit in the closed protocol for future typed query arguments. *)
 
@@ -162,10 +168,13 @@ type outcome =
   | Terminated of { details : payload list }
   | Timed_out of { successor : execution option }
   | Continued_as_new of { successor : execution }
-(** Terminal outcome returned by Temporal for one exact run. *)
+(** Terminal outcome returned by Temporal for one run. Every successor names
+    a concrete run of the same workflow, including the successor a completed
+    cron or retry run links to. *)
 
 type wait_response = { execution : execution; outcome : outcome }
-(** Exact execution and its terminal result returned by the native adapter. *)
+(** The waited execution, echoed exactly as requested (so its [run_id] is
+    empty for a current-run wait), and the observed run's terminal result. *)
 
 type client_error =
   | Already_started of { workflow_id : string; existing_run_id : string option }
@@ -224,35 +233,37 @@ val decode_start_response : request:start_request -> string -> (start_response, 
     returned namespace and workflow ID belong to the requested start. *)
 
 val encode_wait_request : wait_request -> (string, error) result
-(** Validates and serializes one exact-run wait request. *)
+(** Validates and serializes one wait request; an empty run ID is allowed. *)
 
 val encode_cancel_request : cancel_request -> (string, error) result
-(** Validates and serializes one exact-run cancellation request. *)
+(** Validates and serializes one cancellation request; an empty run ID is
+    allowed. *)
 
 val decode_cancel_response : string -> (cancel_response, error) result
 (** Strictly decodes the positive native cancellation acknowledgement. *)
 
 val encode_reset_request : reset_request -> (string, error) result
-(** Validates and serializes one exact-run reset request whose workflow-task
-    finish event ID is greater than 1. *)
+(** Validates and serializes one reset request whose workflow-task finish
+    event ID is greater than 1; an empty run ID is allowed. *)
 
 val decode_reset_response : request:reset_request -> string -> (reset_response, error) result
 (** Strictly decodes and correlates the new run returned after reset. *)
 
 val encode_terminate_request : terminate_request -> (string, error) result
-(** Validates and serializes one exact-run termination request. *)
+(** Validates and serializes one termination request; an empty run ID is
+    allowed. *)
 
 val decode_terminate_response : string -> (terminate_response, error) result
 (** Strictly decodes the positive native termination acknowledgement. *)
 
 val encode_signal_request : signal_request -> (string, error) result
-(** Validates and serializes one exact-run signal request. *)
+(** Validates and serializes one signal request; an empty run ID is allowed. *)
 
 val decode_signal_response : string -> (signal_response, error) result
 (** Strictly decodes the positive native signal acknowledgement. *)
 
 val encode_query_request : query_request -> (string, error) result
-(** Validates and serializes one exact-run, output-only query request. *)
+(** Validates and serializes one query request; an empty run ID is allowed. *)
 
 val decode_query_response : string -> (query_response, error) result
 (** Strictly decodes one successful query result payload list. *)
@@ -264,20 +275,24 @@ val decode_visibility_response : string -> (visibility_page, error) result
 (** Strictly decodes one visibility page returned by Rust. *)
 
 val encode_update_request : update_request -> (string, error) result
-(** Validates and serializes one update admission request. *)
+(** Validates and serializes one update admission request; an empty run ID
+    is allowed. *)
 
 val encode_poll_update_request : poll_update_request -> (string, error) result
-(** Validates and serializes one update completion poll request. *)
+(** Validates and serializes one update completion poll request; an empty
+    run ID is allowed. *)
 
 val decode_update_response : request:update_request -> string -> (update_response, error) result
-(** Decodes and correlates one update admission response. *)
+(** Decodes and correlates one update admission response. The response must
+    name a concrete run: the requested one, or for a current-run request the
+    run Temporal resolved. *)
 
 val decode_poll_update_response : string -> (poll_update_response, error) result
 (** Strictly decodes one bounded update poll response. *)
 
 val decode_wait_response : request:wait_request -> string -> (wait_response, error) result
-(** Strictly decodes one terminal exact-run response and verifies that the
-    returned execution is exactly the requested run. *)
+(** Strictly decodes one terminal wait response and verifies that the
+    returned execution echoes the requested run selector exactly. *)
 
 val decode_client_error : string -> (client_error, error) result
 (** Strictly decodes the structured error body returned by the native ABI. *)

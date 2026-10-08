@@ -111,7 +111,7 @@ let describe_status = function
 let history cli address handle =
   let args = [|cli; "--address"; address; "--command-timeout"; cli_timeout;
     "workflow"; "show"; "--workflow-id"; Client.workflow_id handle;
-    "--run-id"; Client.run_id handle; "--output"; "json"|] in
+    "--run-id"; Option.get (Client.run_id handle); "--output"; "json"|] in
   let input = Unix.open_process_args_in cli args in
   let document = match Yojson.Basic.from_channel input with
     | document -> Ok document
@@ -214,7 +214,7 @@ let check address cli =
           await_backoff cli cli_address handle ~seconds:60.0;
           get (Client.signal handle ~signal:cancel_signal ~input:());
           (match get (Client.wait handle) with
-          | Client.Completed "cancelled" -> () | _ -> failwith "cancellation did not settle");
+          | Client.Completed { output = "cancelled"; _ } -> () | _ -> failwith "cancellation did not settle");
           verify_history cli cli_address handle) ["try"; "wait"; "abandon"];
         verify_attempts log;
         Option.iter stop !pid;

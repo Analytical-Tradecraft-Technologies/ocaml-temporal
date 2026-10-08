@@ -31,7 +31,7 @@ let phase operation status =
 let execution_phase operation status handle =
   Printf.eprintf
     "cache eviction phase=%s status=%s workflow_id=%s run_id=%s\n%!" operation
-    status (Client.workflow_id handle) (Client.run_id handle)
+    status (Client.workflow_id handle) (Option.get (Client.run_id handle))
 
 (** Reads a required non-empty environment value as a typed configuration
     result rather than raising while the executable is initializing. *)
@@ -175,7 +175,7 @@ let run () =
         phase "start_a" "ok";
         execution_phase "start_a" "accepted" first;
         Printf.eprintf "cache eviction execution=a workflow_id=%s run_id=%s\n%!"
-          "two-binary-cache-eviction-a" (Client.run_id first);
+          "two-binary-cache-eviction-a" (Option.get (Client.run_id first));
         phase "cache_settling" "begin";
         let* () =
           wait_for_marker ~path:ready ~expected:"initial-completion\n" ~timeout
@@ -190,7 +190,7 @@ let run () =
         phase "start_b" "ok";
         execution_phase "start_b" "accepted" second;
         Printf.eprintf "cache eviction execution=b workflow_id=%s run_id=%s\n%!"
-          "two-binary-cache-eviction-b" (Client.run_id second);
+          "two-binary-cache-eviction-b" (Option.get (Client.run_id second));
         phase "eviction_marker" "begin";
         let* () =
           wait_for_eviction_with_second_diagnostic ~eviction:marker
