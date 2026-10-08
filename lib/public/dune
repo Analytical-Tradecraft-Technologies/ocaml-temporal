@@ -16,3 +16,7 @@
   temporal_sdk_kernel
   yojson
   threads))
+
+;; Installs index.mld as the package landing page for odoc and ocaml.org.
+(documentation
+ (package temporal-sdk))
