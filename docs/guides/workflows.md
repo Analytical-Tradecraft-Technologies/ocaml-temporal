@@ -820,6 +820,14 @@ let rec drain queue =
   | Error error -> Error error
 ```
 
+`Info.continue_as_new_reasons` says why the server made the suggestion:
+`` `History_size_too_large ``, `` `Too_many_history_events ``, or
+`` `Too_many_updates ``, in the order Temporal reported them. The list is
+empty when no suggestion was made and may be empty with a suggestion from
+servers that do not name a reason, so branch on
+`Info.continue_as_new_suggested` and use the reasons for logging or for
+choosing what state to carry into the successor.
+
 The same snapshot carries the run's identity (workflow ID, run ID, first run
 ID of the chain, type, namespace, task queue, retry attempt, parent, and start
 time), taken from Temporal's activations and the worker's own configuration
