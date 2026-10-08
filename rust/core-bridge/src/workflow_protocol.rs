@@ -2294,8 +2294,11 @@ pub(crate) fn payload_from_core(
     })
 }
 
-/// Builds a Core payload whose allocation ownership is transferred into protobuf values.
-pub(crate) fn payload_to_core(value: &Payload) -> Result<api_common::Payload, CoreConversionError> {
+/// Checks a semantic payload against the protocol's byte and metadata-key
+/// limits without copying it. Validation paths use this directly so that an
+/// accepted payload (up to the protocol limit) is cloned only once, when it is
+/// actually converted for Core.
+pub(crate) fn validate_payload_limits(value: &Payload) -> Result<(), CoreConversionError> {
     if value.data.len() > MAX_PAYLOAD_BYTES
         || value
             .metadata
@@ -2315,6 +2318,12 @@ pub(crate) fn payload_to_core(value: &Payload) -> Result<api_common::Payload, Co
             "semantic payload metadata key is outside protocol limits",
         ));
     }
+    Ok(())
+}
+
+/// Builds a Core payload whose allocation ownership is transferred into protobuf values.
+pub(crate) fn payload_to_core(value: &Payload) -> Result<api_common::Payload, CoreConversionError> {
+    validate_payload_limits(value)?;
     Ok(api_common::Payload {
         metadata: value
             .metadata

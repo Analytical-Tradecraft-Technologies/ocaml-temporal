@@ -444,7 +444,7 @@ fn validate_completion(value: &ActivityCompletion) -> Result<(), ProtocolError> 
     decode_token(&value.task_token)?;
     match &value.result {
         ActivityCompletionResult::Completed { result } => {
-            workflow_protocol::payload_to_core(result).map_err(|_| {
+            workflow_protocol::validate_payload_limits(result).map_err(|_| {
                 ProtocolError::invalid("$.result.result", "result payload violates protocol limits")
             })?;
         }
@@ -462,7 +462,7 @@ fn validate_completion(value: &ActivityCompletion) -> Result<(), ProtocolError> 
 fn validate_heartbeat(value: &ActivityHeartbeat) -> Result<(), ProtocolError> {
     decode_token(&value.task_token)?;
     for payload in &value.details {
-        workflow_protocol::payload_to_core(payload).map_err(|_| {
+        workflow_protocol::validate_payload_limits(payload).map_err(|_| {
             ProtocolError::invalid("$.details", "heartbeat payload violates protocol limits")
         })?;
     }
