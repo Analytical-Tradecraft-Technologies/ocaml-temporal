@@ -62,6 +62,8 @@ Reporters receive typed structural tags independently from message prose:
 | `temporal.operation` | string | Stable operation identifier |
 | `temporal.duration_ms` | float | Finite non-negative elapsed milliseconds |
 | `temporal.workflow_type` | string | Registered workflow type |
+| `temporal.workflow_id` | string | Workflow ID; attached only to diagnostics that must name one execution |
+| `temporal.run_id` | string | Workflow run ID; attached only to diagnostics that must name one execution |
 | `temporal.job_count` | int | Jobs supplied in one activation |
 | `temporal.command_count` | int | Commands emitted by one activation |
 | `temporal.bridge_status` | string | Stable lowercase bridge status |
@@ -167,6 +169,8 @@ adapter from a public `Worker.run` or `Worker.shutdown` result:
 | `workflow_activation_completed` | `Debug` | The native supervisor accepted a retained workflow completion and the adapter retired that completion. A task failure or Core eviction removes the execution from the adapter registry; a terminal workflow completion remains available for queries until eviction. This is not a server-side workflow-result acknowledgement. |
 | `workflow_completion_diagnostic_failed` | `Warning` | A diagnostic callback raised after the supervisor accepted a workflow completion. The adapter contains the observer exception, so the completion stays accepted. |
 | `workflow_activation_rejected` | `Warning` | The adapter submitted an SDK-generated failure completion for a malformed or otherwise rejected activation, and the native supervisor accepted that rejection. `temporal.error_kind` identifies the stable reason; a transport failure that leaves the completion pending does not emit this event. |
+| `workflow_activation_deadline_exceeded` | `Error` | Workflow source. The activation watchdog found an activation running workflow code for at least the configured deadline and failed its workflow task (#493). Carries `temporal.workflow_type`, `temporal.workflow_id`, `temporal.run_id`, `temporal.duration_ms` (a lower bound), and `temporal.error_kind` `workflow_task_failed` or `workflow_task_failure_unacknowledged`. Emitted once per worker lifetime; the worker is unhealthy and should be restarted. |
+| `workflow_activation_late_completion_dropped` | `Warning` | The code of an activation the watchdog already failed finally returned; its completion was dropped without a native call and its run removed. |
 | `workflow_task_rejected` | `Warning` | The public worker observed an adapter rejection whose failure completion already retired the workflow lease. The worker loop treats that as progress and continues polling; a rejection that did not retire its lease is returned as a worker error instead. |
 | `worker_run_started` | `Info` | One invocation of `Temporal.Worker.run` acquired the run ownership guard and began polling. It does not mean that a workflow or activity task is currently available. |
 | `worker_run_finished` | `Info` | That polling invocation returned and released the run guard. It may have stopped because shutdown was requested or because the loop returned an error; inspect the public `result` rather than treating this event as success. |

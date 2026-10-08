@@ -950,6 +950,61 @@ let serve worker =
       Result.bind run_result (fun () -> shutdown_result))
 ```
 
+### Workflow code that stops yielding
+
+Workflow code runs on the worker's single workflow lane until it returns or
+awaits a workflow operation. A CPU loop, `Unix.sleepf`, a blocking socket or
+file call, or waiting on a `Mutex` or `Condition` in workflow code (including
+codecs and signal, query, and update handlers) therefore stops every workflow
+on that worker. Move such work into an activity, and use `Temporal.Workflow`
+timers and futures to wait.
+
+The worker detects the mistake but cannot undo it. When an activation runs
+for longer than its deadline (two seconds by default) without yielding, a
+watchdog fails that workflow task so Temporal retries it, normally on another
+worker, logs one `workflow_activation_deadline_exceeded` error naming the
+workflow type, workflow ID, and run ID, and makes `Temporal.Worker.health`
+report `Stuck_workflow_activation`. OCaml code cannot be safely interrupted,
+so the stuck code keeps running, `shutdown` cannot finish while it does, and
+the state stays unhealthy even if the code later returns. Recovery is to
+restart the process from an external supervisor (Kubernetes, systemd, or
+similar). Configure the deadline, or disable it while stepping through code
+in a debugger, with `Temporal.Worker.Options`:
+
+```ocaml
+let options =
+  Temporal.Worker.Options.make
+    ~workflow_activation_deadline:(`After (Temporal.Duration.of_ms 5_000L))
+    ()
+```
+
+Wire `health` into the process's liveness probe. Refresh a heartbeat from a
+thread that is not the worker's, and fail the probe when the heartbeat is
+stale or the worker is stuck; the staleness check also covers a process whose
+whole runtime is blocked:
+
+```ocaml
+let liveness_loop worker ~heartbeat_file =
+  let rec loop () =
+    match Temporal.Worker.health worker with
+    | Temporal.Worker.Health.Stuck_workflow_activation _ ->
+        (* Stop refreshing: the probe fails and the supervisor restarts us. *)
+        ()
+    | Temporal.Worker.Health.Healthy ->
+        Out_channel.with_open_text heartbeat_file (fun channel ->
+            Out_channel.output_string channel
+              (string_of_float (Unix.gettimeofday ())));
+        Thread.delay 1.0;
+        loop ()
+  in
+  Thread.create loop ()
+```
+
+A Kubernetes `livenessProbe` can then check that the file's timestamp is a
+few seconds old at most, or the application can serve the same check from an
+HTTP endpoint. Liveness probes should restart the process; readiness probes
+alone only stop routing traffic, which a Temporal worker does not receive.
+
 Both `Temporal.Worker.create` and `Temporal.Client.create` accept an optional
 `~identity`, which Temporal records in history events and task-queue poller
 listings. An explicit identity is used unchanged. When it is omitted, the SDK

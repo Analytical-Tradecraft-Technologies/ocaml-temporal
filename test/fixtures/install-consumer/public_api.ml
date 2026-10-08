@@ -975,6 +975,7 @@ let _worker_options_default : T.Worker.Options.t = T.Worker.Options.default
 let _worker_options_make :
     ?versioning:T.Worker.Options.versioning ->
     ?max_cached_workflows:int ->
+    ?workflow_activation_deadline:T.Worker.Options.activation_deadline ->
     unit -> (T.Worker.Options.t, T.Error.t) result =
   T.Worker.Options.make
 
@@ -984,6 +985,27 @@ let _worker_options_versioning :
 
 let _worker_options_max_cached_workflows : T.Worker.Options.t -> int option =
   T.Worker.Options.max_cached_workflows
+
+let _worker_options_workflow_activation_deadline :
+    T.Worker.Options.t -> [ `After of T.Duration.t | `Disabled ] =
+  T.Worker.Options.workflow_activation_deadline
+
+(* Workflow activation watchdog health for liveness probes. *)
+let _worker_health : T.Worker.t -> T.Worker.Health.t = T.Worker.health
+
+let _worker_health_fields : T.Worker.Health.t -> string option =
+  function
+  | T.Worker.Health.Healthy -> None
+  | T.Worker.Health.Stuck_workflow_activation
+      {
+        workflow_type = _;
+        workflow_id = _;
+        run_id;
+        is_replaying = _;
+        elapsed = _;
+        task_failed = _;
+      } ->
+      Some run_id
 
 (* External workflow commands and search attributes from workflow code. *)
 let _workflow_signal_external_workflow :

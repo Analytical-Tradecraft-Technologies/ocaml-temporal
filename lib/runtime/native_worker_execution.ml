@@ -61,6 +61,46 @@ type activation_info = {
   cache_removal_reason : string option;
 }
 
+(** Diagnostic identity of a workflow activation abandoned by the
+    non-yielding-code watchdog (#493). It carries only identifiers, the replay
+    flag, and the observed duration: never payloads, task tokens, or
+    continuation state. [elapsed_ms] is the watchdog's own lower bound on how
+    long the activation had been running without returning to the adapter.
+    [task_failed] records whether the supervisor acknowledged the watchdog's
+    workflow-task failure completion. *)
+type stuck_activation = {
+  run_id : string;
+  workflow_id : string option;
+  workflow_type : string option;
+  is_replaying : bool;
+  elapsed_ms : int;
+  task_failed : bool;
+}
+
+(** Single-owner claim on the native lease of the activation currently inside
+    workflow code. Exactly one party moves it out of [Unclaimed]: the workflow
+    lane before it submits its own completion, or the watchdog before it
+    submits a task failure. The loser never submits a completion for that
+    lease. *)
+type lease_claim = Unclaimed | Lane_claimed | Watchdog_claimed
+
+(** The activation the workflow lane is processing, published atomically so
+    the watchdog Domain can observe it without the adapter mutex (which the
+    lane holds for the whole activation). [epoch] distinguishes successive
+    activations, including two activations of the same run. Every field except
+    the two atomics is immutable after publication. *)
+type in_flight = {
+  epoch : int;
+  activation : Protocol.activation;
+  flight_workflow_id : string option;
+  flight_workflow_type : string option;
+  claim : lease_claim Atomic.t;
+  (* Written once by the watchdog after its failure submission returns, so a
+     lane that later loses the claim can report whether the lease was
+     retired. *)
+  watchdog_outcome : (unit, error_view) result option Atomic.t;
+}
+
 (** Runtime signal and query handler aliases kept private to this adapter. *)
 type signal = Execution.signal
 type signal_handler = Execution.signal_handler
@@ -127,6 +167,9 @@ type run =
            'input -> ('output, Base_error.t) result)
           Definition.t;
         execution : ('input, 'output) Execution.t;
+        (* Retained from initialization so watchdog diagnostics for later
+           activations of the run can name the workflow execution. *)
+        workflow_id : string;
       }
       -> run
 
@@ -559,6 +602,16 @@ module Make (Supervisor : SUPERVISOR) = struct
        admission barrier without inferring completion from an earlier
        activation callback. *)
     on_completion : (activation_info -> unit) option;
+    (* The activation currently between poll and completion on the workflow
+       lane. Written only by the lane (while it holds [mutex]); read by the
+       watchdog Domain without [mutex]. *)
+    in_flight : in_flight option Atomic.t;
+    (* Next activation epoch. Changed only while [mutex] is held. *)
+    mutable next_epoch : int;
+    (* The first activation abandoned by the watchdog. Sticky: once set, the
+       worker stays unhealthy until the process is replaced, because the code
+       that failed to yield may have left process state inconsistent. *)
+    stuck : stuck_activation option Atomic.t;
   }
 
   (** The public worker handle is the mutex-confined state above. *)
@@ -585,6 +638,9 @@ module Make (Supervisor : SUPERVISOR) = struct
         mutex = Mutex.create ();
         on_activation;
         on_completion;
+        in_flight = Atomic.make None;
+        next_epoch = 0;
+        stuck = Atomic.make None;
       }
 
   (** Distinguishes source rejection from an uncertain raised acknowledgement.
@@ -730,19 +786,6 @@ module Make (Supervisor : SUPERVISOR) = struct
                uncertain acknowledgement. *)
             refuse_unless retryable (completion_exception_error exception_))
 
-  (** Records a completion before its first native attempt. This ordering is
-      intentional: even an exception from the native binding leaves an exact
-      owned completion in [pending], where it either awaits an explicitly
-      retryable later attempt or blocks the run until terminal [discard]. *)
-  let enqueue_pending adapter pending =
-    if Run_map.mem pending.run_id adapter.pending then
-      Error
-        (make_error ~path:"$.run_id" "duplicate_pending_completion"
-           "a workflow run already has an unacknowledged completion")
-    else (
-      adapter.pending <- Run_map.add pending.run_id pending adapter.pending;
-      finish_pending adapter pending)
-
   (** Returns query IDs only when an activation consists solely of workflow
       queries. Query-only activations are read-only leases: adapter-level
       failures may retire the query requests, but must not remove the live
@@ -758,6 +801,79 @@ module Make (Supervisor : SUPERVISOR) = struct
     if query_ids <> [] && List.length query_ids = List.length activation.Protocol.jobs
     then Some query_ids
     else None
+
+  (** The diagnostic a lane reports for an activation the watchdog failed. *)
+  let deadline_exceeded_error () =
+    make_error ~path:"$.workflow_execution" "activation_deadline_exceeded"
+      "workflow activation exceeded the worker's activation deadline without \
+       yielding; its workflow task was failed by the watchdog"
+
+  (** Waits for the watchdog to publish the result of the failure submission
+      it started after winning the lease claim. The wait is bounded by one
+      supervisor completion call, which the watchdog has already begun. *)
+  let rec await_watchdog_outcome flight =
+    match Atomic.get flight.watchdog_outcome with
+    | Some outcome -> outcome
+    | None ->
+        Thread.delay 0.001;
+        await_watchdog_outcome flight
+
+  (** Handles a lane that returned from workflow code after the watchdog had
+      already failed its workflow task. The lane's own completion is dropped
+      without a native call, because the lease belongs to the watchdog's
+      submission. Unless the activation was a read-only query, the run is
+      shut down and removed: Core evicts a run whose task failed, and its
+      eviction activation is then acknowledged by the [Some _, None] path. A
+      watchdog submission that was not acknowledged leaves the lease state
+      unknown, which is returned as an [Error] so the worker loop stops. *)
+  let abandoned_by_watchdog adapter flight =
+    let activation = flight.activation in
+    if Option.is_none (query_only_ids activation) then
+      drop_run adapter activation.run_id;
+    match await_watchdog_outcome flight with
+    | Ok () ->
+        report Logs.Warning ~operation:"workflow_activation_late_completion_dropped"
+          ~error_kind:"activation_deadline_exceeded" ();
+        Ok
+          (Rejected
+             {
+               run_id = Some activation.run_id;
+               error = deadline_exceeded_error ();
+               lease_retired = true;
+             })
+    | Error error -> Error error
+
+  (** Claims the lease of the in-flight activation for the lane. Returns
+      [Some flight] only when the watchdog claimed it first. A completion for a
+      run other than the in-flight activation (none is produced today) is not
+      subject to the watchdog. *)
+  let lane_lost_claim adapter run_id =
+    match Atomic.get adapter.in_flight with
+    | Some flight when String.equal flight.activation.Protocol.run_id run_id ->
+        if Atomic.compare_and_set flight.claim Unclaimed Lane_claimed then None
+        else (
+          match Atomic.get flight.claim with
+          | Watchdog_claimed -> Some flight
+          | Unclaimed | Lane_claimed -> None)
+    | _ -> None
+
+  (** Records a completion before its first native attempt. This ordering is
+      intentional: even an exception from the native binding leaves an exact
+      owned completion in [pending], where it either awaits an explicitly
+      retryable later attempt or blocks the run until terminal [discard].
+      Every lane submission first claims the in-flight lease; if the watchdog
+      already failed the task, the completion is dropped instead (#493). *)
+  let enqueue_pending adapter pending =
+    match lane_lost_claim adapter pending.run_id with
+    | Some flight -> abandoned_by_watchdog adapter flight
+    | None ->
+    if Run_map.mem pending.run_id adapter.pending then
+      Error
+        (make_error ~path:"$.run_id" "duplicate_pending_completion"
+           "a workflow run already has an unacknowledged completion")
+    else (
+      adapter.pending <- Run_map.add pending.run_id pending adapter.pending;
+      finish_pending adapter pending)
 
   (** Query failures answer their request IDs. Other adapter defects fail the
       workflow task with no commands, preserving its durable execution. Eviction
@@ -979,7 +1095,9 @@ module Make (Supervisor : SUPERVISOR) = struct
                                       ~signal_handlers ~query_handlers
                                       ~update_handlers definition input
                                   in
-                                  let run = Run { definition; execution } in
+                                  let run =
+                                    Run { definition; execution; workflow_id = init.workflow_id }
+                                  in
                                   adapter.runs <-
                                     Run_map.add activation.run_id run adapter.runs;
                                   begin
@@ -1027,6 +1145,123 @@ module Make (Supervisor : SUPERVISOR) = struct
       retire_with_failure
         ~remove_run:(Run_map.mem activation.run_id adapter.runs)
         adapter activation error
+
+  (** Names the workflow execution an activation belongs to for watchdog
+      diagnostics: from its initialization job when it starts a run, otherwise
+      from the cached run. Called while [mutex] is held. *)
+  let activation_identity adapter (activation : Protocol.activation) =
+    match
+      List.find_map
+        (function
+          | Protocol.Initialize_workflow { workflow_id; workflow_type; _ } ->
+              Some (workflow_id, workflow_type)
+          | _ -> None)
+        activation.jobs
+    with
+    | Some (workflow_id, workflow_type) -> (Some workflow_id, Some workflow_type)
+    | None -> (
+        match Run_map.find_opt activation.run_id adapter.runs with
+        | Some (Run { definition; workflow_id; _ }) ->
+            (Some workflow_id, Some (Definition.name definition))
+        | None -> (None, None))
+
+  (** Publishes the activation for the watchdog, processes it, and withdraws
+      it. The publication happens before any user code (codecs, observers, or
+      workflow fibers) runs, and withdrawal happens only after the completion
+      was submitted or dropped, so the watchdog can never claim a lease the
+      lane has already completed. *)
+  let process_tracked adapter (activation : Protocol.activation) =
+    let flight_workflow_id, flight_workflow_type =
+      activation_identity adapter activation
+    in
+    let epoch = adapter.next_epoch in
+    adapter.next_epoch <- epoch + 1;
+    let flight =
+      {
+        epoch;
+        activation;
+        flight_workflow_id;
+        flight_workflow_type;
+        claim = Atomic.make Unclaimed;
+        watchdog_outcome = Atomic.make None;
+      }
+    in
+    Atomic.set adapter.in_flight (Some flight);
+    Fun.protect
+      ~finally:(fun () -> Atomic.set adapter.in_flight None)
+      (fun () -> process_one adapter activation)
+
+  (** Returns the epoch of the activation currently running workflow code, or
+      [None] when the lane is polling, idle, or already submitting a
+      completion. Safe to call from any Domain without the adapter mutex. *)
+  let running_epoch adapter =
+    match Atomic.get adapter.in_flight with
+    | Some flight when Atomic.get flight.claim = Unclaimed -> Some flight.epoch
+    | _ -> None
+
+  (** Logs the bounded watchdog diagnostic. Identifiers are bounded by the
+      observability layer; no payload or failure text is included. *)
+  let report_stuck (stuck : stuck_activation) =
+    try
+      let tags =
+        Observability.tags ~operation:"workflow_activation_deadline_exceeded"
+          ~duration_ms:(Float.of_int stuck.elapsed_ms)
+          ?workflow_type:stuck.workflow_type ?workflow_id:stuck.workflow_id
+          ~run_id:stuck.run_id
+          ~error_kind:
+            (if stuck.task_failed then "workflow_task_failed"
+             else "workflow_task_failure_unacknowledged")
+          ()
+      in
+      Observability.report ~src:Observability.Source.workflow Logs.Error ~tags
+        "workflow activation did not yield before its deadline; the worker \
+         is unhealthy and must be restarted"
+    with _ -> ()
+
+  (** Called by the watchdog when activation [epoch] has run workflow code for
+      at least [elapsed_ms]. If that activation is still unclaimed, the
+      watchdog takes its lease, submits a workflow-task failure through the
+      supervisor without the adapter mutex (the lane still holds it), records
+      the sticky [stuck] report, and logs it. Temporal then retries the task,
+      normally on another worker. Returns [None] when the lane finished or
+      claimed the lease first; the watchdog never touches workflow state, so
+      the stuck code keeps running until it returns on its own. *)
+  let abandon_activation adapter ~epoch ~elapsed_ms =
+    match Atomic.get adapter.in_flight with
+    | Some flight
+      when flight.epoch = epoch
+           && Atomic.compare_and_set flight.claim Unclaimed Watchdog_claimed ->
+        let completion =
+          failure_completion flight.activation (deadline_exceeded_error ())
+        in
+        let outcome =
+          match encode_submission completion with
+          | Error error -> Error error
+          | Ok submission -> (
+              match attempt_completion adapter.supervisor submission with
+              | Accepted -> Ok ()
+              | Rejected_by_supervisor { error; _ } -> Error error
+              | Raised_by_supervisor { exception_; _ } ->
+                  Error (completion_exception_error exception_))
+        in
+        Atomic.set flight.watchdog_outcome (Some outcome);
+        let stuck =
+          {
+            run_id = flight.activation.run_id;
+            workflow_id = flight.flight_workflow_id;
+            workflow_type = flight.flight_workflow_type;
+            is_replaying = flight.activation.is_replaying;
+            elapsed_ms;
+            task_failed = Result.is_ok outcome;
+          }
+        in
+        ignore (Atomic.compare_and_set adapter.stuck None (Some stuck));
+        report_stuck stuck;
+        Some stuck
+    | _ -> None
+
+  (** The first activation the watchdog abandoned, if any. *)
+  let stuck adapter = Atomic.get adapter.stuck
 
   (** Retries retained workflow completions while the adapter mutex is held.
       Shutdown uses this operation before closing Rust so an explicitly
@@ -1101,7 +1336,7 @@ module Make (Supervisor : SUPERVISOR) = struct
                 report Logs.Debug ~operation:"workflow_poll_not_ready" ();
                 Ok Not_ready
             | Ok (Some activation) ->
-                process_one adapter activation)
+                process_tracked adapter activation)
 end
 
 (** Exposes registration without exposing its existential constructor. *)
