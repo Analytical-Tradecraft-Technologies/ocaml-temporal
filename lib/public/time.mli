@@ -1,9 +1,14 @@
+(** Deterministic instants for workflow code.
+
+    Workflow code must not read the host wall clock; it obtains the current
+    time from {!Workflow.now}, which returns this replay-stable type. *)
+
 (** A deterministic instant supplied by Temporal during workflow replay. *)
 type t
 
 (** Builds an instant from a Unix timestamp without floating-point rounding.
-    [nanoseconds] must be in the half-open interval
-    [0, 1_000_000_000). Invalid components return a non-retryable defect. *)
+    [nanoseconds] must satisfy [0 <= nanoseconds < 1_000_000_000]. Invalid
+    components return a non-retryable defect. *)
 val of_unix : seconds:int64 -> nanoseconds:int -> (t, Error.t) result
 
 (** Returns the whole Unix seconds component. *)

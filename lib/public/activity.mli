@@ -1,3 +1,12 @@
+(** Typed activity definitions, worker-side activity contexts, and the
+    workflow commands that schedule activities.
+
+    An activity is ordinary OCaml code that may perform I/O; Temporal records
+    only its input and result. Define an activity with {!define} (or a
+    context-aware or asynchronous variant), register it with a worker, and
+    call it from workflow code with {!execute} or {!execute_local}. Expected
+    failures are returned as [result] values carrying {!Error.t}. *)
+
 (** The type of an OCaml function that implements an activity. It receives the
     decoded input and returns either its output or a structured error. *)
 type ('input, 'output) implementation =

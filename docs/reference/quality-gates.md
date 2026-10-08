@@ -174,6 +174,7 @@ queued Actions run does not make the local verification boundary ambiguous:
 | CI job | Workflow command | Local command | What the local result proves |
 | --- | --- | --- | --- |
 | `verify` | `make verify OCAML_VERSION=<matrix version>` with the verified bridge bundle | `make verify OCAML_VERSION=5.2` (or another supported series; each selects a digest-pinned `ocaml-<series>` stage of `Dockerfile.dev`) | Docker-backed OCaml build/lint against the exact locked OPAM closure (the image build fails on drift), bridge/install tests, and repository quality contracts. CI gets Rust validation from its producer; the default local command also runs Rust tests. PRs use the representative cells; the `master` tier uses the exhaustive matrix. |
+| `verify` (OCaml 5.2, amd64 only) | `make docs OCAML_VERSION=5.2.1` after `make verify` | `make docs` | The odoc API documentation and package landing page build without any odoc warning, using the exact CI-only odoc closure. |
 | `quality` | `make test-ci-artifacts`, then `make quality` | `make quality` | CI checks matrix selection and artifact failure cases before running the pinned native `cargo-deny`, `cargo-machete`, and `typos` scans. The exact binaries must be installed on the host. |
 | `license-audit` | `make license-check OCAML_VERSION=5.2`, plus the two isolated Python Cargo-license checks | `make license-check OCAML_VERSION=5.2` | The package/OCaml dependency license policy. The locked Cargo license scanner remains a single CI-only step and is not repeated in the OCaml matrix. |
 | `native-macos`, `native-windows` | `sh scripts/opam-locked-deps.sh install --assume-depexts`, then `make native-verify` | the same two commands on a matching native host | The OCaml 5.5 and Rust native link, format, lint, install, and test path. Both platforms run for every PR and merge group and in the `master` tier. |
@@ -243,14 +244,41 @@ narrow dictionary exception only for an intentional project term or external
 proper name; do not suppress a file or directory merely to silence a genuine
 documentation defect.
 
+## Rendered API documentation
+
+ocaml.org renders the package's API documentation with
+[`odoc`](https://github.com/ocaml/odoc) when it is published to opam, so broken
+doc comments become broken public documentation. `make docs` runs
+`dune build @doc` and fails on any odoc warning: the root `dune` file makes
+odoc warnings fatal in the `dev` profile (release builds such as
+`dune build -p` keep odoc's default, so a newer odoc cannot break a consumer).
+The check covers the `.mli` doc comments of every library in the package,
+including unresolved or ambiguous `{!...}` references, unterminated `[...]`
+code spans, and the `lib/public/index.mld` package landing page. The HTML is
+written to `_build/default/_doc/_html`.
+
+odoc is a CI-only documentation tool, not a package dependency. It is absent
+from `temporal-sdk.opam`, its lock, and every SDK build. `make docs` runs in
+the Compose `docs` service, whose `docs` stage of `Dockerfile.dev` extends the
+ordinary development image with the exact odoc closure in
+`scripts/docs-tools.locked`; the stage fails if any installed version differs
+and re-checks the locked SDK closure. CI runs `make docs` once, in the
+OCaml 5.2/amd64 `verify` lane present in every tier, because the rendered
+documentation does not depend on the compiler series or architecture.
+
+odoc 3.2.1 is ISC, but its closure contains `tyxml`, `re`, and `camlp-streams`
+under LGPL-2.1 with the OCaml linking exception. This is acceptable only
+because no package in that closure is linked into, shipped with, or required
+to build the SDK: it renders HTML in a disposable CI image, like the pinned
+Python container that runs the Cargo licence scanner. The dependency licence
+policy and its exact linking exceptions in `docs/dependencies.md` are
+unchanged and still govern everything the SDK builds or ships; this
+tool-only decision must not be cited to admit those packages, or any other
+LGPL package, as an SDK dependency.
+
 ## Evaluated OCaml alternatives
 
 No separate OCaml semantic linter was added. The maintained compiler and Dune
 checks already cover type errors, exhaustiveness, unused declarations, and
-configured warnings. The OCaml Platform's
-[`odoc`](https://github.com/ocaml/odoc) would add valuable documentation-link
-validation, but version 3.2.1 has an ordinary `tyxml` dependency licensed under
-LGPL with the OCaml linking exception. That dependency is outside this
-repository's exact approved exceptions, so adding odoc would violate policy.
-The decision can be revisited if a future permissive dependency closure is
-available.
+configured warnings. Documentation-link validation is provided by the
+odoc gate above.
