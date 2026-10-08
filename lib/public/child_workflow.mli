@@ -1,3 +1,10 @@
+(** Starting, awaiting, and cancelling child workflows from workflow code.
+
+    A child workflow is a separate Temporal execution whose start, completion,
+    and cancellation are recorded in the parent's history, so these operations
+    are replay-safe. Use {!execute} for the common start-and-wait case and
+    {!start_handle} when the parent needs the child's future or cancellation. *)
+
 (** Controls how Core reports a parent operation after cancellation has been
     requested. [Abandon] reports immediately without asking the child worker;
     [Try_cancel] requests cancellation and reports immediately;

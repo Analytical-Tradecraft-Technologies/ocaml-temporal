@@ -1,3 +1,10 @@
+(** Structured SDK and Temporal failures.
+
+    Expected operational failures are returned as [(_, Error.t) result]
+    values rather than raised. An error carries a broad {!type-category} for
+    pattern matching, a diagnostic message, retry semantics, and optional raw
+    Temporal details. *)
+
 (** Identifies the part of the SDK or Temporal operation that failed. These
     broad categories are intended for pattern matching and metrics; [message]
     provides the more specific diagnostic. *)
@@ -18,7 +25,7 @@ type category =
     [non_retryable] records whether Temporal should avoid retrying the failure.
     [details] contains any additional raw Temporal payloads supplied with it.
     [error_type] is the application-defined failure type, Temporal's
-    [ApplicationFailureInfo.type]; see {!make} and {!error_type}. *)
+    [ApplicationFailureInfo.type]; see {!make} and {!val-error_type}. *)
 type view = {
   category : category;
   message : string;

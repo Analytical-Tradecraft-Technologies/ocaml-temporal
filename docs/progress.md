@@ -52,6 +52,21 @@ owning scope has returned, exclude a released 32 MiB dummy workload, and that
 the fan-out fixture bound (512 MiB of estimated base64-encoded results,
 checked by division) rejects oversized configurations before building them.
 
+## 2026-10-06: Rendered API documentation gate (#794)
+
+`make docs` builds the odoc API documentation with odoc warnings fatal in the
+dev profile, and CI runs it once in the OCaml 5.2/amd64 `verify` lane. odoc is
+a CI-only tool installed from the exact closure in `scripts/docs-tools.locked`
+by a separate `docs` stage of `Dockerfile.dev`; it is not an SDK dependency.
+The existing defects were fixed in doc comments only: unterminated `[...]`
+interval spans, ambiguous and unresolved references, field and constructor
+comments in `Client` that were not doc comments, missing module synopses, and
+a `Temporal` preamble that described Dune internals. A package landing page
+(`lib/public/index.mld`) adds a quick start, and `@canonical` tags render the
+private context, async-handle, and future types under their public names.
+Verified locally with odoc 3.2.1 on OCaml 5.4.1; the quick-start snippets
+type-check against the library.
+
 ## 2026-10-08: Public offline replay API (#515)
 
 `Temporal.Replay` lets an application replay a recorded workflow history
