@@ -12,7 +12,8 @@
     restart run are interleaved with queries, a validator-rejected update, a
     re-attached update handle, and cache eviction or worker replacement. The
     control run receives only the command-producing interactions. Their
-    durable, non-workflow-task events must be identical, proving that queries
+    durable, non-workflow-task events, including each event's meaningful
+    attributes such as payloads and the timer duration, must be identical, proving that queries
     and rejected updates did not alter later commands, and each recovered
     update must be accepted and completed exactly once on its original run. *)
 open Temporal
@@ -226,12 +227,56 @@ let read_history cli address handle =
 (** Counts events of one type. *)
 let count kind events = List.length (List.filter (fun event -> event_type event = kind) events)
 
-(** Durable command-driven events, dropping workflow-task bookkeeping whose
-    count legitimately differs when a sticky task times out after a worker is
-    replaced. What remains is the run's observable decision sequence. *)
-let decisions events = List.filter_map (fun event ->
+(** Allowlist of compared attributes for each non-workflow-task event type
+    this workflow can record: the attribute object's key and the paths inside
+    it. They carry the meaning of each event (workflow type, input and result,
+    update ID, name, arguments and outcome, signal name and payload, timer ID
+    and duration). Everything else is deliberately not compared because it
+    legitimately differs between executions: event IDs and times, task
+    queues, workflow, run and request IDs, worker identities, references to
+    workflow-task and other event IDs, and server bookkeeping such as
+    workflow-task timeouts and attempt counters. An event type without an
+    entry fails closed, so new behavior cannot silently escape comparison. *)
+let compared_attributes = function
+  | "WORKFLOW_EXECUTION_STARTED" ->
+      "workflowExecutionStartedEventAttributes", [["workflowType"; "name"]; ["input"]]
+  | "WORKFLOW_EXECUTION_UPDATE_ACCEPTED" ->
+      "workflowExecutionUpdateAcceptedEventAttributes",
+      [["acceptedRequest"; "meta"; "updateId"]; ["acceptedRequest"; "input"; "name"];
+       ["acceptedRequest"; "input"; "args"]]
+  | "WORKFLOW_EXECUTION_SIGNALED" ->
+      "workflowExecutionSignaledEventAttributes", [["signalName"]; ["input"]]
+  | "TIMER_STARTED" -> "timerStartedEventAttributes", [["timerId"]; ["startToFireTimeout"]]
+  | "TIMER_FIRED" -> "timerFiredEventAttributes", [["timerId"]]
+  | "WORKFLOW_EXECUTION_UPDATE_COMPLETED" ->
+      "workflowExecutionUpdateCompletedEventAttributes", [["meta"; "updateId"]; ["outcome"]]
+  | "WORKFLOW_EXECUTION_COMPLETED" -> "workflowExecutionCompletedEventAttributes", [["result"]]
+  | kind -> failwith ("no compared attributes are defined for history event " ^ kind)
+
+(** Renders one non-workflow-task event as its type followed by every
+    allowlisted attribute, in a canonical (key-sorted) JSON form. A missing
+    allowlisted attribute is a failure rather than a silent [null]. *)
+let render_event event =
   let kind = event_type event in
-  if String.starts_with ~prefix:"WORKFLOW_TASK_" kind then None else Some kind) events
+  let key, paths = compared_attributes kind in
+  let attributes = Yojson.Basic.Util.member key event in
+  let field path =
+    let value = List.fold_left (fun json name -> Yojson.Basic.Util.member name json)
+      attributes path in
+    if value = `Null then
+      failwith (Printf.sprintf "%s event has no %s.%s" kind key (String.concat "." path));
+    Printf.sprintf "%s=%s" (String.concat "." path)
+      (Yojson.Basic.to_string (Yojson.Basic.sort value)) in
+  String.concat " " (kind :: List.map field paths)
+
+(** The run's durable, command- and interaction-driven events with their
+    meaningful attributes (see {!compared_attributes}). Workflow-task events
+    are dropped because their number legitimately differs when a sticky task
+    times out after a worker is replaced, or when a task is retried after
+    eviction; they carry no workflow decision of their own. *)
+let decisions events = List.filter_map (fun event ->
+  if String.starts_with ~prefix:"WORKFLOW_TASK_" (event_type event) then None
+  else Some (render_event event)) events
 
 (** Collects every string under an [updateId] key anywhere in [json]. *)
 let rec update_ids json = match json with
@@ -436,8 +481,8 @@ let control_scenario ~cli ~address ~client ~queue ~track =
 (** Requires a recovered run's decisions to equal the control run's. *)
 let expect_same_decisions label control actual =
   if actual <> control then
-    failwith (Printf.sprintf "%s decisions differ from the control run:\n  control: %s\n  %s: %s"
-      label (String.concat " " control) label (String.concat " " actual))
+    failwith (Printf.sprintf "%s decisions differ from the control run:\n  control:\n    %s\n  %s:\n    %s"
+      label (String.concat "\n    " control) label (String.concat "\n    " actual))
 
 (** Runs the three scenarios with protected cleanup of workers and runs. *)
 let check address cli =

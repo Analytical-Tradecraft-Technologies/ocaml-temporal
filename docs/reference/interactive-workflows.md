@@ -420,8 +420,9 @@ interaction work is:
   requests are still validated (Core passes `run_validator = false` for
   updates replayed from history);
 - queries and validator-rejected updates add no history events: apart from
-  workflow-task events, the recovered runs' histories equal a control run
-  that had none of them.
+  workflow-task events, the recovered runs' histories, including payloads,
+  update outcomes and the timer duration, equal a control run that had none
+  of them.
 
 No runtime defect was found by this suite.
 

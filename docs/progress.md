@@ -38,7 +38,9 @@ accepted update does not re-run its validator. Exact run histories, read with
 the pinned CLI, show the update accepted but not completed while suspended,
 then one acceptance and one completion with the original update ID. A handle
 re-attached by update ID returns the same result. Apart from workflow-task
-events, both recovered histories equal the control run's.
+events, both recovered histories equal the control run's, compared by event
+type and an allowlist of meaningful attributes (payloads, update and signal
+names, update ID and outcome, timer duration).
 
 Evidence: `make test-temporal-live-regressions` passed all six suites in the
 Linux development image (OCaml 5.2) against a fresh Compose Temporal
@@ -46,7 +48,8 @@ Linux development image (OCaml 5.2) against a fresh Compose Temporal
 suite also passed against that stack with the driver and workers built on
 macOS (OCaml 5.4.1). As a sensitivity check, forcing
 `run_validator = true` for replayed updates made the suite fail at the first
-post-eviction query. No SDK defect was found.
+post-eviction query, and giving only the recovered runs a different timer
+duration failed the control comparison. No SDK defect was found.
 
 ## 2026-10-08: Seeded bridge lifecycle stress (#522)
 

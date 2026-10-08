@@ -40,7 +40,12 @@ the same result. In the restart run, history attributes the acceptance to the
 original worker process and the completion to the replacement. Finally, the
 durable events of both recovered runs, excluding workflow-task bookkeeping,
 must equal the control run's, so queries and rejected updates did not change
-later commands. Waits are bounded polls on these observations rather than
+later commands. Each event is compared by type and an allowlist of its
+meaningful attributes (workflow input and result, update ID, name, arguments
+and outcome, signal name and payload, timer ID and duration). Values that
+legitimately differ per execution, such as event IDs, times, task queues,
+run and request IDs and worker identities, are not compared, and an event
+type without an allowlist entry fails the suite. Waits are bounded polls on these observations rather than
 fixed sleeps.
 
 CI runs this suite against the Compose Temporal/PostgreSQL stack through
