@@ -292,6 +292,14 @@ jobs:
         env:
           OCAML_VERSION: ${{ matrix.ocaml }}
         run: make verify
+      - name: Build API documentation with odoc warnings as errors
+        # Rendered documentation is compiler-independent, so one lane present
+        # in every tier checks it. The docs image extends this lane's cached
+        # development image with the exact CI-only odoc closure.
+        if: matrix.ocaml == '5.2.1' && matrix.runner == 'ubuntu-24.04'
+        env:
+          OCAML_VERSION: ${{ matrix.ocaml }}
+        run: make docs
       # `make verify` already enforces the replay history corpus on every
       # matrix leg through `dune runtest`. One leg reruns the same offline
       # runner (seconds, reusing the build) to retain the machine-readable

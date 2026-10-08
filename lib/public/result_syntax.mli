@@ -1,3 +1,5 @@
+(** Binding operators for sequencing [result] values in direct-style code. *)
+
 (** [let*] sequences explicit SDK failures in direct-style workflow helpers. *)
 val ( let* ) : ('a, 'error) result -> ('a -> ('b, 'error) result) -> ('b, 'error) result
 

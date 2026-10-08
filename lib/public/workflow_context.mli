@@ -1,3 +1,8 @@
+(** Workflow-execution-scoped state for SDK helpers.
+
+    Values stored here belong to one workflow execution and are discarded
+    with it, which makes them safe to use from replayed workflow code. *)
+
 (** Returns [true] only while the current Domain is running workflow code under
     an activation. It is intended for diagnostics and internal guard checks. *)
 val is_active : unit -> bool
