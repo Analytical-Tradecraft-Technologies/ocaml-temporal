@@ -8,7 +8,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 use temporalio_client::callback_based::{CallbackBasedGrpcService, GrpcSuccessResponse};
 use temporalio_client::tonic::Status as RpcStatus;
-use temporalio_common::protos::temporal::api::enums::v1::WorkflowIdConflictPolicy;
+use temporalio_common::protos::temporal::api::enums::v1::{
+    WorkflowIdConflictPolicy, WorkflowIdReusePolicy,
+};
 use temporalio_common::protos::temporal::api::workflowservice::v1::{
     StartWorkflowExecutionRequest, StartWorkflowExecutionResponse,
 };
@@ -350,4 +352,98 @@ fn pending_start_capacity_rejects_only_new_requests() {
     assert!(runtime.disconnect_client().is_ok());
     assert!(runtime.pending_starts.is_empty());
     assert_eq!(runtime.close(true), STATUS_OK);
+}
+
+/// Workflow execution policies (#499) reach `StartWorkflowExecutionRequest`
+/// unchanged: the reuse policy as Temporal's explicit enum value, each
+/// millisecond timeout as the equivalent protobuf duration, and the retry
+/// policy with its exact coefficient bits. An omitted reuse policy is sent as
+/// `ALLOW_DUPLICATE` rather than `UNSPECIFIED`, and omitted timeouts and
+/// retry policy stay absent so Temporal applies its defaults.
+#[test]
+fn execution_policies_reach_the_start_request() {
+    let (mut runtime, probe) = connected_runtime(Reply::Recovering);
+    let request = format!(
+        r#"{{"request_id":"stable-request-1","namespace":"default","workflow_id":"workflow-1","workflow_type":"Workflow","task_queue":"queue","input":[],"id_reuse_policy":"allow_duplicate_failed_only","execution_timeout_ms":90500,"run_timeout_ms":60000,"task_timeout_ms":1250,"retry_policy":{{"initial_interval":{{"seconds":1,"nanoseconds":0}},"backoff_coefficient_bits":"{}","maximum_interval":{{"seconds":10,"nanoseconds":0}},"maximum_attempts":3,"non_retryable_error_types":["Fatal"]}},"rpc_timeout_ms":5000}}"#,
+        2.0_f64.to_bits()
+    );
+    let outcome = start_document(&mut runtime, request.as_bytes());
+    assert_eq!(outcome["kind"], "accepted");
+    let requests = probe.requests.lock().unwrap();
+    let sent = &requests[0];
+    assert_eq!(
+        sent.workflow_id_reuse_policy,
+        i32::from(WorkflowIdReusePolicy::AllowDuplicateFailedOnly)
+    );
+    let duration = |seconds, nanos| Some(prost_wkt_types::Duration { seconds, nanos });
+    assert_eq!(sent.workflow_execution_timeout, duration(90, 500_000_000));
+    assert_eq!(sent.workflow_run_timeout, duration(60, 0));
+    assert_eq!(sent.workflow_task_timeout, duration(1, 250_000_000));
+    let retry = sent.retry_policy.as_ref().expect("retry policy sent");
+    assert_eq!(retry.initial_interval, duration(1, 0));
+    assert_eq!(retry.maximum_interval, duration(10, 0));
+    assert_eq!(retry.backoff_coefficient.to_bits(), 2.0_f64.to_bits());
+    assert_eq!(retry.maximum_attempts, 3);
+    assert_eq!(retry.non_retryable_error_types, vec!["Fatal".to_owned()]);
+    drop(requests);
+
+    let (mut runtime, probe) = connected_runtime(Reply::Recovering);
+    assert_eq!(start(&mut runtime)["kind"], "accepted");
+    let requests = probe.requests.lock().unwrap();
+    assert_eq!(
+        requests[0].workflow_id_reuse_policy,
+        i32::from(WorkflowIdReusePolicy::AllowDuplicate)
+    );
+    assert_eq!(requests[0].workflow_execution_timeout, None);
+    assert_eq!(requests[0].workflow_run_timeout, None);
+    assert_eq!(requests[0].workflow_task_timeout, None);
+    assert_eq!(requests[0].retry_policy, None);
+}
+
+/// A caller-selected start deadline replaces the ten-second default: a hung
+/// server yields the uncertain `unknown` outcome (the server may still have
+/// accepted the request) well before the default would expire, and the
+/// in-flight transport future is released.
+#[test]
+fn caller_rpc_timeout_bounds_a_hung_start() {
+    let (mut runtime, probe) = connected_runtime(Reply::Hung);
+    let started = Instant::now();
+    let outcome = start_document(
+        &mut runtime,
+        br#"{"request_id":"stable-request-1","namespace":"default","workflow_id":"workflow-1","workflow_type":"Workflow","task_queue":"queue","input":[],"rpc_timeout_ms":200}"#,
+    );
+    assert_eq!(outcome["kind"], "unknown");
+    assert_eq!(outcome["request_id"], "stable-request-1");
+    assert!(started.elapsed() < Duration::from_secs(3));
+    assert_eq!(probe.requests.lock().unwrap().len(), 1);
+    assert_eq!(probe.dropped.load(Ordering::SeqCst), 1);
+    assert!(runtime.pending_starts.is_empty());
+}
+
+/// Invalid execution policies are rejected when the start is admitted, before
+/// any request reaches the transport.
+#[test]
+fn invalid_execution_policies_never_reach_the_transport() {
+    for fields in [
+        r#""execution_timeout_ms":0"#,
+        r#""task_timeout_ms":120001"#,
+        r#""execution_timeout_ms":1000,"run_timeout_ms":1001"#,
+        r#""run_timeout_ms":1000,"task_timeout_ms":1001"#,
+        r#""id_reuse_policy":"terminate_if_running""#,
+        r#""rpc_timeout_ms":0"#,
+        r#""rpc_timeout_ms":60001"#,
+    ] {
+        let (mut runtime, probe) = connected_runtime(Reply::Recovering);
+        let request = format!(
+            r#"{{"request_id":"stable-request-1","namespace":"default","workflow_id":"workflow-1","workflow_type":"Workflow","task_queue":"queue","input":[],{fields}}}"#
+        );
+        assert!(
+            runtime
+                .begin_start_workflow_json(request.as_bytes())
+                .is_err(),
+            "{fields} must be rejected"
+        );
+        assert!(probe.requests.lock().unwrap().is_empty());
+        assert!(runtime.pending_starts.is_empty());
+    }
 }

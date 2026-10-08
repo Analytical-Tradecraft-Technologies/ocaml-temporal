@@ -15,6 +15,77 @@ implementation when a later entry documents that work as complete. The
 records the current tested source, named assertions and successful CI job for
 the Temporal acceptance controllers.
 
+## 2026-10-09: Client execution policies and RPC deadlines (#499)
+
+`Temporal.Client.start` now takes the essential server-side execution
+policies: `?execution_timeout`, `?run_timeout`, and `?task_timeout` as
+`Duration.t`, a workflow `?retry_policy` (the validated
+`Activity.Retry_policy.t`), and `?id_reuse_policy`
+(`` `Allow_duplicate `` by default, `` `Allow_duplicate_failed_only ``, or
+`` `Reject_duplicate ``) for a workflow ID whose latest run has closed, next to
+the existing `?id_conflict_policy` for an open run. Start, signal, `query`,
+`query_with_input`, `start_update`, cancel, terminate, reset, and
+`list_visibility` accept a per-call `?rpc_timeout` between 1 ms and 60 s that
+replaces the operation's built-in budget; omitted, the documented defaults are
+unchanged. The `Client` module documentation separates RPC deadlines (one
+client call) from workflow timeouts (recorded in history, ending the run as
+`Timed_out`).
+
+Validation happens before anything is sent, identically for the native and
+`mock://` backends, and again in the OCaml protocol encoder and in Rust. A
+zero timeout, a task timeout above 120 s or above the run timeout (the
+execution timeout when there is no run timeout), and a run timeout above the
+execution timeout are typed defects: the live server showed that Temporal
+silently lowers a task timeout above the run timeout instead of rejecting it.
+Negative or overflowing durations cannot be built as `Duration.t`. Every
+reuse/conflict pairing is accepted: Temporal 1.32 accepts
+`reject_duplicate` with `use_existing`. Temporal's deprecated
+`TERMINATE_IF_RUNNING` is not offered.
+
+The private start request gains optional `id_reuse_policy` (always sent by
+OCaml), `execution_timeout_ms`, `run_timeout_ms`, `task_timeout_ms`,
+`retry_policy`, and `rpc_timeout_ms` members. Every other bounded request gains
+an optional `rpc_timeout_ms`. Rust converts the millisecond counts with
+`try_from` and reuses the command retry-policy converter. The workflow
+policies are part of pending-start equality; the RPC deadline is not, so a
+reconciling retry may use another deadline. Because the transport reports its
+own expiry of a per-attempt deadline as `cancelled`, a `cancelled` or
+`deadline_exceeded` status after the caller's budget has elapsed is now
+reported as `deadline_exceeded`. An uncertain start now carries
+`Error.error_type` `StartOutcomeUncertain`, recognized by the new
+`Client.is_start_outcome_uncertain`. The mock applies the reuse policy to
+closed runs. All new protocol members are optional and no response changed,
+so the bridge ABI stays at v4.
+
+Evidence:
+
+- Rust unit tests: reuse-policy wire names, the `allow_duplicate` default and
+  enum mapping, policy and timeout validation including the boundary values,
+  `rpc_timeout_ms` bounds on every request, pending-start equality, and the
+  expired-budget status mapping.
+- Rust callback-transport tests: each policy reaching
+  `StartWorkflowExecutionRequest` with exact durations and coefficient bits,
+  invalid policies never reaching the transport, a 200 ms start deadline on a
+  hung server ending as `unknown`, and a 300 ms signal deadline ending well
+  inside the three-second default.
+- OCaml protocol tests (`test/bridge/test_ocaml_client_protocol.ml`) and
+  public mock tests (`test/unit/test_client_worker.ml`) for encoding,
+  rejected values, reuse-policy semantics, and per-operation deadline
+  validation.
+- A new live regression, `test/integration/client_policies`, added to
+  `LIVE_REGRESSION_EXECUTABLES`, passed four consecutive times against the
+  Compose Temporal 1.32/PostgreSQL stack. It shows execution and run timeouts
+  ending runs as `Timed_out`, the server recording the execution, run, and
+  task timeouts, a 1 ms query deadline failing as `` `Deadline_exceeded ``
+  while the workflow keeps running, the reuse policies refusing or allowing a
+  closed ID, a workflow retry reaching attempt 2, and a 1 ms start deadline
+  reconciled by request ID into exactly one run.
+
+Remaining limits: cron schedules and delayed starts stay deferred. Exact-run
+`wait` and `wait_update` take no caller deadline. On the pinned server an
+exact-run wait reports a retried run's link as `Continued_as_new` rather
+than as `Failed` with a successor; the live test accepts both forms.
+
 ## 2026-10-08: Successful activity completions require a payload (#954)
 
 The activity completion protocol accepted `{"kind":"completed","result":null}`

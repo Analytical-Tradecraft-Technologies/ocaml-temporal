@@ -219,6 +219,12 @@ let test_client_protocol_adapter () =
       memo = [];
       search_attributes = [];
       id_conflict_policy = Client.Fail;
+      id_reuse_policy = Client.Allow_duplicate;
+      execution_timeout_ms = None;
+      run_timeout_ms = None;
+      task_timeout_ms = None;
+      retry_policy = None;
+      rpc_timeout_ms = None;
     }
   in
   let wait_request : Client.wait_request =
@@ -229,6 +235,7 @@ let test_client_protocol_adapter () =
       execution = wait_request;
       request_id = "cancel-request-1";
       reason = "operator requested shutdown";
+      rpc_timeout_ms = None;
     }
   in
   let signal_request : Client.signal_request =
@@ -237,6 +244,7 @@ let test_client_protocol_adapter () =
       signal_name = "add_document";
       request_id = "signal-request-1";
       input = [];
+      rpc_timeout_ms = None;
     }
   in
   let query_request : Client.query_request =
@@ -244,6 +252,7 @@ let test_client_protocol_adapter () =
       execution = wait_request;
       query_type = "current_state";
       input = [];
+      rpc_timeout_ms = None;
     }
   in
   let start_json =
@@ -572,6 +581,12 @@ let test_native_client_lifecycle_guards () =
       memo = [];
       search_attributes = [];
       id_conflict_policy = Client.Fail;
+      id_reuse_policy = Client.Allow_duplicate;
+      execution_timeout_ms = None;
+      run_timeout_ms = None;
+      task_timeout_ms = None;
+      retry_policy = None;
+      rpc_timeout_ms = None;
     }
   in
   let wait_request : Client.wait_request =
@@ -622,6 +637,7 @@ let test_native_client_lifecycle_guards () =
             execution = wait_request;
             request_id = "cancel-before-connect";
             reason = "test";
+            rpc_timeout_ms = None;
           })
    with
   | Error (Supervisor.Backend { Bridge.status = Invalid_state; _ }) -> ()
@@ -634,6 +650,7 @@ let test_native_client_lifecycle_guards () =
             signal_name = "add_document";
             request_id = "signal-before-connect";
             input = [];
+            rpc_timeout_ms = None;
           })
    with
   | Error (Supervisor.Backend { Bridge.status = Invalid_state; _ }) -> ()

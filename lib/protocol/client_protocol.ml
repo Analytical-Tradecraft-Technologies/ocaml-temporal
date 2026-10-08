@@ -19,6 +19,14 @@ type metadata_field = { key : string; value : payload }
 (** Temporal's open-run conflict policy without its [UNSPECIFIED] value. *)
 type id_conflict_policy = Fail | Use_existing | Terminate_existing
 
+(** Temporal's closed-run reuse policy without [UNSPECIFIED] and without the
+    deprecated [TERMINATE_IF_RUNNING]. *)
+type id_reuse_policy = Allow_duplicate | Allow_duplicate_failed_only | Reject_duplicate
+
+let max_rpc_timeout_ms = 60_000L
+let max_workflow_task_timeout_ms = 120_000L
+let max_workflow_timeout_ms = 315_576_000_000_999L
+
 type start_request = {
   request_id : string;
   namespace : string;
@@ -29,6 +37,12 @@ type start_request = {
   memo : metadata_field list;
   search_attributes : metadata_field list;
   id_conflict_policy : id_conflict_policy;
+  id_reuse_policy : id_reuse_policy;
+  execution_timeout_ms : int64 option;
+  run_timeout_ms : int64 option;
+  task_timeout_ms : int64 option;
+  retry_policy : Workflow.retry_policy option;
+  rpc_timeout_ms : int64 option;
 }
 
 (** [started] mirrors Temporal's [StartWorkflowExecutionResponse.started]. *)
@@ -40,6 +54,7 @@ type cancel_request = {
   execution : execution;
   request_id : string;
   reason : string;
+  rpc_timeout_ms : int64 option;
 }
 
 type cancel_response = { acknowledged : bool }
@@ -49,6 +64,7 @@ type reset_request = {
   request_id : string;
   reason : string;
   workflow_task_finish_event_id : int64;
+  rpc_timeout_ms : int64 option;
 }
 
 type reset_response = { execution : execution }
@@ -56,7 +72,11 @@ type reset_response = { execution : execution }
 (** Exact-run termination request. Temporal termination is an immediate
     control-plane operation and therefore carries operator reason text rather
     than a cancellation request ID. *)
-type terminate_request = { execution : execution; reason : string }
+type terminate_request = {
+  execution : execution;
+  reason : string;
+  rpc_timeout_ms : int64 option;
+}
 
 type terminate_response = { acknowledged : bool }
 
@@ -65,6 +85,7 @@ type signal_request = {
   signal_name : string;
   request_id : string;
   input : payload list;
+  rpc_timeout_ms : int64 option;
 }
 
 type signal_response = { acknowledged : bool }
@@ -73,6 +94,7 @@ type query_request = {
   execution : execution;
   query_type : string;
   input : payload list;
+  rpc_timeout_ms : int64 option;
 }
 
 type query_response = { result : payload list }
@@ -82,6 +104,7 @@ type visibility_request = {
   query : string;
   page_size : int;
   next_page_token : string option;
+  rpc_timeout_ms : int64 option;
 }
 
 type visibility_execution = {
@@ -102,6 +125,7 @@ type update_request = {
   update_id : string;
   update_name : string;
   input : payload list;
+  rpc_timeout_ms : int64 option;
 }
 
 type poll_update_request = { execution : execution; update_id : string }
@@ -286,6 +310,83 @@ let decode_object input =
   | Ok value -> Ok value
   | Error error -> Error (of_control_error error)
 
+(** Validates an optional caller RPC timeout and returns the JSON member that
+    carries it. An absent timeout omits the member, so Rust keeps the
+    operation's default budget; a present one must be between 1 ms and
+    {!max_rpc_timeout_ms}, the bound Rust enforces too. *)
+let rpc_timeout_member = function
+  | None -> Ok []
+  | Some milliseconds
+    when Int64.compare milliseconds 1L < 0
+         || Int64.compare milliseconds max_rpc_timeout_ms > 0 ->
+      Error
+        (invalid ~path:"$.rpc_timeout_ms"
+           "rpc timeout must be between 1 and 60000 milliseconds")
+  | Some milliseconds ->
+      Ok [ ("rpc_timeout_ms", `Intlit (Int64.to_string milliseconds)) ]
+
+(** Validates the workflow execution policies of a start request and returns
+    their JSON members, mirroring Rust's [validate_start_policies]: every
+    timeout is positive and bounded, the run timeout does not exceed the
+    execution timeout, the task timeout does not exceed the run (or
+    execution) timeout, and the retry policy satisfies the command
+    invariants. The reuse policy is always explicit; absent timeouts and
+    retry policy are omitted. *)
+let start_policy_members (value : start_request) =
+  let timeout name maximum = function
+    | None -> Ok []
+    | Some milliseconds when Int64.compare milliseconds 0L <= 0 ->
+        Error (invalid ~path:("$." ^ name) "workflow timeout must be positive")
+    | Some milliseconds when Int64.compare milliseconds maximum > 0 ->
+        Error (invalid ~path:("$." ^ name) "workflow timeout exceeds its maximum")
+    | Some milliseconds -> Ok [ (name, `Intlit (Int64.to_string milliseconds)) ]
+  in
+  let* execution =
+    timeout "execution_timeout_ms" max_workflow_timeout_ms value.execution_timeout_ms
+  in
+  let* run = timeout "run_timeout_ms" max_workflow_timeout_ms value.run_timeout_ms in
+  let* task =
+    timeout "task_timeout_ms" max_workflow_task_timeout_ms value.task_timeout_ms
+  in
+  let* () =
+    match (value.execution_timeout_ms, value.run_timeout_ms) with
+    | Some execution, Some run when Int64.compare run execution > 0 ->
+        Error
+          (invalid ~path:"$.run_timeout_ms"
+             "run timeout exceeds the execution timeout")
+    | _ -> Ok ()
+  in
+  let* () =
+    let run =
+      match value.run_timeout_ms with
+      | Some _ as run -> run
+      | None -> value.execution_timeout_ms
+    in
+    match (value.task_timeout_ms, run) with
+    | Some task, Some run when Int64.compare task run > 0 ->
+        Error
+          (invalid ~path:"$.task_timeout_ms" "task timeout exceeds the run timeout")
+    | _ -> Ok ()
+  in
+  let* retry =
+    match value.retry_policy with
+    | None -> Ok []
+    | Some policy ->
+        Workflow.Internal.retry_policy_json policy
+        |> Result.map (fun json -> [ ("retry_policy", json) ])
+        |> Result.map_error (rebase_workflow_error "$.retry_policy")
+  in
+  let reuse =
+    match value.id_reuse_policy with
+    | Allow_duplicate -> "allow_duplicate"
+    | Allow_duplicate_failed_only -> "allow_duplicate_failed_only"
+    | Reject_duplicate -> "reject_duplicate"
+  in
+  let* rpc = rpc_timeout_member value.rpc_timeout_ms in
+  Ok
+    ((("id_reuse_policy", json_string reuse) :: execution)
+    @ run @ task @ retry @ rpc)
+
 let encode_start_request (value : start_request) =
   let* () = validate_identifier "$.request_id" value.request_id in
   let* () = validate_identifier "$.namespace" value.namespace in
@@ -318,9 +419,10 @@ let encode_start_request (value : start_request) =
     | Use_existing -> "use_existing"
     | Terminate_existing -> "terminate_existing"
   in
+  let* policies = start_policy_members value in
   encode_object
       (`Assoc
-      [
+      ([
         ("request_id", json_string value.request_id);
         ("namespace", json_string value.namespace);
         ("workflow_id", json_string value.workflow_id);
@@ -330,7 +432,8 @@ let encode_start_request (value : start_request) =
         ("memo", memo);
         ("search_attributes", search_attributes);
         ("id_conflict_policy", json_string id_conflict_policy);
-      ])
+      ]
+      @ policies))
 
 (** Serializes the opaque native capability used by asynchronous start polls.
     The request is retained in the OCaml value but is deliberately omitted
@@ -433,15 +536,17 @@ let encode_cancel_request (value : cancel_request) =
   else if String.contains value.reason '\000' then
     Error (invalid ~path:"$.reason" "reason contains a NUL byte")
   else
+    let* rpc = rpc_timeout_member value.rpc_timeout_ms in
     encode_object
       (`Assoc
-        [
+        ([
           ("namespace", json_string value.execution.namespace);
           ("workflow_id", json_string value.execution.workflow_id);
           ("run_id", json_string value.execution.run_id);
           ("request_id", json_string value.request_id);
           ("reason", json_string value.reason);
-        ])
+        ]
+        @ rpc))
 
 (** Decodes the positive acknowledgement returned by Rust after Temporal has
     accepted the cancellation RPC. A false acknowledgement is rejected rather
@@ -472,9 +577,10 @@ let encode_reset_request (value : reset_request) =
   else if String.contains value.reason '\000' then
     Error (invalid ~path:"$.reason" "reason contains a NUL byte")
   else
+    let* rpc = rpc_timeout_member value.rpc_timeout_ms in
     encode_object
       (`Assoc
-        [
+        ([
           ("namespace", json_string value.execution.namespace);
           ("workflow_id", json_string value.execution.workflow_id);
           ("run_id", json_string value.execution.run_id);
@@ -482,7 +588,8 @@ let encode_reset_request (value : reset_request) =
           ( "workflow_task_finish_event_id",
             `Intlit (Int64.to_string value.workflow_task_finish_event_id) );
           ("reason", json_string value.reason);
-        ])
+        ]
+        @ rpc))
 
 (** Decodes the new exact execution returned by Temporal after a reset. The
     server may choose a different run ID, so only namespace and workflow ID
@@ -515,12 +622,14 @@ let encode_terminate_request (value : terminate_request) =
   else if String.contains value.reason '\000' then
     Error (invalid ~path:"$.reason" "reason contains a NUL byte")
   else
+    let* rpc = rpc_timeout_member value.rpc_timeout_ms in
     encode_object
       (`Assoc
-        [ ("namespace", json_string value.execution.namespace);
-          ("workflow_id", json_string value.execution.workflow_id);
-          ("run_id", json_string value.execution.run_id);
-          ("reason", json_string value.reason) ])
+        ([ ("namespace", json_string value.execution.namespace);
+           ("workflow_id", json_string value.execution.workflow_id);
+           ("run_id", json_string value.execution.run_id);
+           ("reason", json_string value.reason) ]
+        @ rpc))
 
 (** Decodes the positive acknowledgement returned after Temporal accepts a
     termination request. *)
@@ -542,16 +651,18 @@ let encode_signal_request (value : signal_request) =
   let* () = validate_identifier "$.signal_name" value.signal_name in
   let* () = validate_identifier "$.request_id" value.request_id in
   let* input = payloads_json value.input in
+  let* rpc = rpc_timeout_member value.rpc_timeout_ms in
   encode_object
     (`Assoc
-      [
+      ([
         ("namespace", json_string value.execution.namespace);
         ("workflow_id", json_string value.execution.workflow_id);
         ("run_id", json_string value.execution.run_id);
         ("signal_name", json_string value.signal_name);
         ("request_id", json_string value.request_id);
         ("input", input);
-      ])
+      ]
+      @ rpc))
 
 (** Decodes the positive acknowledgement returned by Rust after Temporal has
     accepted a signal RPC. A false value is rejected so callers never observe
@@ -574,15 +685,17 @@ let encode_query_request (value : query_request) =
   let* () = validate_run_selector "$.run_id" value.execution.run_id in
   let* () = validate_identifier "$.query_type" value.query_type in
   let* input = payloads_json value.input in
+  let* rpc = rpc_timeout_member value.rpc_timeout_ms in
   encode_object
     (`Assoc
-      [
+      ([
         ("namespace", json_string value.execution.namespace);
         ("workflow_id", json_string value.execution.workflow_id);
         ("run_id", json_string value.execution.run_id);
         ("query_type", json_string value.query_type);
         ("input", input);
-      ])
+      ]
+      @ rpc))
 
 (** Decodes one successful output-only query response. The server may return
     zero payloads for a unit-like query; the public codec layer decides whether
@@ -602,14 +715,16 @@ let encode_visibility_request (value : visibility_request) =
     Error (invalid ~path:"$.page_size" "page_size must be between 1 and 1000")
   else
     let token = match value.next_page_token with None -> `Null | Some v -> `String v in
+    let* rpc = rpc_timeout_member value.rpc_timeout_ms in
     encode_object
       (`Assoc
-        [
+        ([
           ("namespace", json_string value.namespace);
           ("query", json_string value.query);
           ("page_size", `Int value.page_size);
           ("next_page_token", token);
-        ])
+        ]
+        @ rpc))
 
 let decode_visibility_response input : (visibility_page, error) result =
   let* json = decode_object input in
@@ -681,16 +796,18 @@ let encode_update_request (value : update_request) =
   let* () = validate_identifier "$.update_id" value.update_id in
   let* () = validate_identifier "$.update_name" value.update_name in
   let* input = payloads_json value.input in
+  let* rpc = rpc_timeout_member value.rpc_timeout_ms in
   encode_object
     (`Assoc
-      [
+      ([
         ("namespace", json_string value.execution.namespace);
         ("workflow_id", json_string value.execution.workflow_id);
         ("run_id", json_string value.execution.run_id);
         ("update_id", json_string value.update_id);
         ("update_name", json_string value.update_name);
         ("input", input);
-      ])
+      ]
+      @ rpc))
 
 let encode_poll_update_request (value : poll_update_request) =
   let* () = validate_identifier "$.namespace" value.execution.namespace in

@@ -57,7 +57,11 @@ The OCaml side sends one closed object:
       }
     }
   ],
-  "id_conflict_policy": "fail"
+  "id_conflict_policy": "fail",
+  "id_reuse_policy": "allow_duplicate",
+  "execution_timeout_ms": 86400000,
+  "task_timeout_ms": 10000,
+  "rpc_timeout_ms": 5000
 }
 ```
 
@@ -79,18 +83,46 @@ continue-as-new, and external signals.
 
 Rust validates every identifier, rejects NUL bytes, rejects duplicate or
 unknown members, validates payloads, and then calls Core's raw
-`WorkflowService::start_workflow_execution`. Optional start policies use
-Temporal Server's documented defaults, with one exception:
-`id_conflict_policy` (`fail`, `use_existing`, or `terminate_existing`) is
-always sent as an explicit `WorkflowIdConflictPolicy` value, never
-`UNSPECIFIED`. The OCaml encoder always emits it from
-`Client.start ?id_conflict_policy` (default `` `Fail ``); Rust treats an
-omitted member as `fail`. It is part of the pending-request equality check, so
-retrying a pending `request_id` with a different policy is rejected. Temporal's
-request-ID deduplication runs before the conflict policy, so a retry of the
-start that created the open run returns that run under every policy. The
-workflow ID reuse policy for closed runs is not exposed and keeps the server
-default. The public `Temporal.Client.start` function
+`WorkflowService::start_workflow_execution`. Both workflow ID policies are
+always sent as explicit enum values, never `UNSPECIFIED`:
+
+- `id_conflict_policy` (`fail`, `use_existing`, or `terminate_existing`)
+  applies when the workflow ID has an open run. The OCaml encoder always emits
+  it from `Client.start ?id_conflict_policy` (default `` `Fail ``); Rust
+  treats an omitted member as `fail`.
+- `id_reuse_policy` (`allow_duplicate`, `allow_duplicate_failed_only`, or
+  `reject_duplicate`, #499) applies when the latest run has closed. The OCaml
+  encoder always emits it from `Client.start ?id_reuse_policy` (default
+  `` `Allow_duplicate ``, Temporal's default); Rust treats an omitted member
+  as `allow_duplicate`. Temporal's deprecated `TERMINATE_IF_RUNNING` has no
+  spelling, because `terminate_existing` replaces it and Temporal rejects it
+  next to an explicit conflict policy. Every pairing of the two policies is
+  accepted; Temporal 1.32 accepts `reject_duplicate` with `use_existing`.
+
+The server-side execution policies (#499) are optional members that are
+omitted when absent, so Temporal applies its defaults:
+
+| Member | `Client.start` argument | Bound | Absent |
+| --- | --- | --- | --- |
+| `execution_timeout_ms` | `?execution_timeout` | 1 ms to 315,576,000,000,999 ms | unlimited |
+| `run_timeout_ms` | `?run_timeout` | as above, and at most `execution_timeout_ms` | the execution timeout |
+| `task_timeout_ms` | `?task_timeout` | 1 ms to 120,000 ms, and at most the run (or execution) timeout | 10 seconds |
+| `retry_policy` | `?retry_policy` | the activity retry-policy shape and invariants | no retry |
+
+Temporal reads a zero timeout as "unset" and silently lowers a task timeout
+above 120 seconds or above the run timeout, and a run timeout above the
+execution timeout. The OCaml encoder, the public client (for every backend,
+including `mock://`), and Rust all reject those values instead, so a caller
+never believes a bound is in force that the server does not apply. Rust
+converts each millisecond count into a protobuf `Duration` with checked
+`try_from` conversions and copies the retry policy through the same
+lossless converter as activity and child-workflow commands.
+
+The policies and both workflow ID policies are part of the pending-request
+equality check, so retrying a pending `request_id` with a different policy is
+rejected. Temporal's request-ID deduplication runs before the conflict and
+reuse policies, so a retry of the start that created a run returns that run.
+The public `Temporal.Client.start` function
 accepts an optional `request_id`. When it is supplied, that caller-owned value
 is sent unchanged to Temporal; callers should reuse it when retrying a start
 whose outcome is uncertain. When it is omitted, the adapter allocates one fresh
@@ -107,14 +139,46 @@ reused for unrelated workflow starts.
 The deterministic `mock://` backend retains successful explicit start IDs
 with their request fields and original run identity. An identical retry
 returns that run before workflow-ID conflict checks; changed request data
-under the same ID (including a different conflict policy) is rejected. For a
-new request ID facing a running execution, the mock follows the conflict
-policy: `` `Fail `` returns the same typed already-started error as the native
-client, `` `Use_existing `` returns the running execution with
-`started = false`, and `` `Terminate_existing `` marks the running execution
-terminated before starting a new run. A new run is always accepted after the
-current execution closes. Old exact-run handles remain addressable through
-the mock's retained run history.
+under the same ID (including a different conflict policy, reuse policy,
+workflow timeout, or retry policy) is rejected; a different RPC deadline is
+not part of the request. For a new request ID facing a running execution, the
+mock follows the conflict policy: `` `Fail `` returns the same typed
+already-started error as the native client, `` `Use_existing `` returns the
+running execution with `started = false`, and `` `Terminate_existing `` marks
+the running execution terminated before starting a new run. After the current
+execution closes, the mock follows the reuse policy: `` `Reject_duplicate ``
+always refuses, `` `Allow_duplicate_failed_only `` refuses a successfully
+completed run, and the refusal is the already-started error naming the closed
+run, as Temporal reports it. The mock runs no workflow code, so it accepts but
+does not enforce workflow timeouts or retry policies. Old exact-run handles
+remain addressable through the mock's retained run history.
+
+## RPC deadlines (#499)
+
+Every bounded client request (start, cancel, terminate, reset, signal, query,
+update admission, and visibility) accepts an optional `rpc_timeout_ms`
+member between 1 and 60,000. When present it replaces the operation's
+built-in budget, both as the outer `tokio::time::timeout` and as Core's retry
+window and per-attempt gRPC deadline (see `budgeted_request`). When absent,
+the defaults are unchanged: 10 seconds for start and visibility, 3 seconds
+for cancel, terminate, reset, and signal, and 30 seconds for queries and
+update acceptance. The one-minute ceiling exists because control RPCs, queries,
+and update admission run synchronously on the supervisor's owner Domain.
+Exact-run waits and update completion polls keep their own bounded internal
+polls and accept no deadline.
+
+An RPC deadline bounds the client call only; it is not a workflow timeout and
+never changes the workflow. An expired deadline is reported as the typed
+`deadline_exceeded` RPC error. The transport reports its own expiry of a
+per-attempt deadline as `cancelled`, so once the budget has elapsed the bridge
+maps `cancelled` and `deadline_exceeded` to `deadline_exceeded` whichever
+timer fired first. Terminate keeps its `termination_outcome_uncertain`
+classification. A start whose deadline expired produces the `unknown`
+outcome, which the OCaml client reports as the non-retryable `` `Bridge ``
+error with `Error.error_type` `StartOutcomeUncertain`, recognized by
+`Client.is_start_outcome_uncertain`. The deadline is excluded from the
+pending-start equality check, so a reconciling retry with the same
+`request_id` may use a different deadline.
 
 The direct `start_workflow_json` ABI can return the successful response shown
 above, but the public HTTP(S) client uses the asynchronous ticket path. It

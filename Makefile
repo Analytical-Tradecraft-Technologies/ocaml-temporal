@@ -498,13 +498,13 @@ test-temporal-live-ci:
 test-temporal-diagnostics-contract:
 	bash test/integration/temporal/scripts/test-live-diagnostics-contract.sh
 
-# Fixed-bug live regressions (#545, #546, #548, #567, #805) that each own their
-# workers and a unique task queue. Most have a per-suite test-*-live target
-# that runs one suite against any disposable server; this list is what CI
-# executes (#795). Every entry must also be in scripts/ci-smoke-executables.txt,
+# Fixed-bug and feature live regressions (#499, #545, #546, #548, #567, #805)
+# that each own their workers and a unique task queue. Most have a per-suite
+# test-*-live target that runs one suite against any disposable server; this
+# list is what CI executes (#795). Every entry must also be in scripts/ci-smoke-executables.txt,
 # and test/smoke/test_live_regressions_contract.sh fails when a regression
 # executable under test/integration is neither here nor otherwise run by CI.
-LIVE_REGRESSION_EXECUTABLES := test/integration/client_request_ids/regression.exe test/integration/completed_queries/regression.exe test/integration/local_activity_cancellation/regression.exe test/integration/split_worker_task_types/regression.exe test/integration/update_outcomes/regression.exe
+LIVE_REGRESSION_EXECUTABLES := test/integration/client_policies/regression.exe test/integration/client_request_ids/regression.exe test/integration/completed_queries/regression.exe test/integration/local_activity_cancellation/regression.exe test/integration/split_worker_task_types/regression.exe test/integration/update_outcomes/regression.exe
 # Seconds for each regression process; the suites normally finish in seconds.
 LIVE_REGRESSION_TIMEOUT_SECONDS ?= 180
 
@@ -915,6 +915,12 @@ history-corpus-capture: test-temporal-config
 	HISTORY_CORPUS_RUN='OCAML_IMAGE=$(OCAML_IMAGE) $(COMPOSE) --progress quiet run --rm --user $(HOST_UID):$(HOST_GID) $(SERVICE) env TEMPORAL_ADDRESS=http://temporal:7233 TEMPORAL_NAMESPACE=temporal-sdk-test _build/default/test/history_corpus/capture/history_corpus_capture.exe' \
 	HISTORY_CORPUS_TEMPORAL_CLI='$(TEMPORAL_COMPOSE) run --rm --no-deps -T temporal-admin-tools temporal' \
 	sh test/history_corpus/scripts/capture-history-corpus.sh
+
+# Requires a disposable server and an explicit official Temporal CLI path,
+# which the regression uses to read back each run's recorded timeouts (#499).
+.PHONY: test-client-policies-live
+test-client-policies-live:
+	$(RUN) dune exec $(DUNE_BUILD_ARGS) test/integration/client_policies/regression.exe -- check $(TEMPORAL_CLIENT_TEST_URL) $(TEMPORAL_TEST_CLI)
 
 # Requires a disposable running Temporal server. The regression owns its worker,
 # uses a unique task queue, and terminates its workflow executions on exit.

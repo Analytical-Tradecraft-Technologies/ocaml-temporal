@@ -32,6 +32,39 @@
       "enum": ["fail", "use_existing", "terminate_existing"],
       "default": "fail",
       "description": "Temporal WorkflowIdConflictPolicy applied when workflow_id already has an open run. Always sent explicitly by the OCaml encoder; an omitted member means fail."
+    },
+    "id_reuse_policy": {
+      "enum": ["allow_duplicate", "allow_duplicate_failed_only", "reject_duplicate"],
+      "default": "allow_duplicate",
+      "description": "Temporal WorkflowIdReusePolicy applied when workflow_id's latest run is closed (#499). Always sent explicitly by the OCaml encoder; an omitted member means allow_duplicate. The deprecated terminate_if_running value is not accepted."
+    },
+    "execution_timeout_ms": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 315576000000999,
+      "description": "Workflow execution timeout in milliseconds, across retries and continue-as-new runs. Omitted means unlimited."
+    },
+    "run_timeout_ms": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 315576000000999,
+      "description": "Workflow run timeout in milliseconds. Runtime validation also rejects a value above execution_timeout_ms. Omitted means the execution timeout or unlimited."
+    },
+    "task_timeout_ms": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 120000,
+      "description": "Workflow task timeout in milliseconds. Runtime validation also rejects a value above run_timeout_ms, or above execution_timeout_ms when there is no run timeout, because Temporal would silently lower it. Omitted means the server default of ten seconds."
+    },
+    "retry_policy": {
+      "$ref": "workflow-completion.schema.json#/$defs/retry_policy",
+      "description": "Server-side workflow retry policy, in the same lossless shape as activity commands. Omitted means the workflow is not retried."
+    },
+    "rpc_timeout_ms": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 60000,
+      "description": "Optional caller deadline for this start RPC in milliseconds, replacing the ten-second default. It bounds only the client call, never the workflow, and is ignored when a pending start with the same request ID is compared with a retry. When it expires the start outcome is uncertain."
     }
   }
 }

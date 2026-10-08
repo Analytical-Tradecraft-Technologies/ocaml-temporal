@@ -27,6 +27,25 @@ type id_conflict_policy = Fail | Use_existing | Terminate_existing
     explicit policy. The wire names are ["fail"], ["use_existing"], and
     ["terminate_existing"]. *)
 
+type id_reuse_policy = Allow_duplicate | Allow_duplicate_failed_only | Reject_duplicate
+(** Temporal's [WorkflowIdReusePolicy] for a start whose workflow ID's latest
+    run is closed, without [UNSPECIFIED] (the encoder always sends a value)
+    and without the deprecated [TERMINATE_IF_RUNNING]. The wire names are
+    ["allow_duplicate"], ["allow_duplicate_failed_only"], and
+    ["reject_duplicate"]. *)
+
+val max_rpc_timeout_ms : int64
+(** Largest caller-selected RPC timeout, 60,000 ms. Rust enforces the same
+    bound because control RPCs run on the supervisor's owner Domain. *)
+
+val max_workflow_task_timeout_ms : int64
+(** Largest workflow task timeout, 120,000 ms: Temporal silently lowers a
+    larger value, so the protocol rejects it instead. *)
+
+val max_workflow_timeout_ms : int64
+(** Largest workflow execution or run timeout: the protobuf [Duration]
+    maximum, 315,576,000,000,999 ms. *)
+
 type start_request = {
   request_id : string;
   namespace : string;
@@ -37,11 +56,29 @@ type start_request = {
   memo : metadata_field list;
   search_attributes : metadata_field list;
   id_conflict_policy : id_conflict_policy;
+  id_reuse_policy : id_reuse_policy;
+  execution_timeout_ms : int64 option;
+  run_timeout_ms : int64 option;
+  task_timeout_ms : int64 option;
+  retry_policy : Workflow_protocol.retry_policy option;
+  rpc_timeout_ms : int64 option;
 }
 (** Dynamic workflow-start request sent to the Rust client adapter. [request_id]
     is stable across retries and is passed unchanged to Temporal, so a caller
     can reconcile an uncertain asynchronous start without issuing a second
-    logical operation. *)
+    logical operation.
+
+    The workflow timeouts (milliseconds) and [retry_policy] are server-side
+    execution policies; [None] omits the member so Temporal applies its
+    default. Each timeout must be positive, the task timeout at most
+    {!max_workflow_task_timeout_ms}, a run timeout no larger than an
+    execution timeout, and a task timeout no larger than the run timeout (or
+    the execution timeout when there is no run timeout). Every combination
+    of the reuse and conflict policies is valid.
+    [rpc_timeout_ms] bounds only this client call (default ten seconds) and
+    never the workflow; when present it is between 1 and
+    {!max_rpc_timeout_ms}. Every other request below that carries
+    [rpc_timeout_ms] applies the same bound in place of its own default. *)
 
 type start_response = { execution : execution; started : bool }
 (** Execution returned by a successful start. [started] is [false] only when
@@ -61,6 +98,7 @@ type cancel_request = {
   execution : execution;
   request_id : string;
   reason : string;
+  rpc_timeout_ms : int64 option;
 }
 (** Run selector and idempotency metadata for a client cancellation request. *)
 
@@ -72,13 +110,18 @@ type reset_request = {
   request_id : string;
   reason : string;
   workflow_task_finish_event_id : int64;
+  rpc_timeout_ms : int64 option;
 }
 (** Run selector and workflow-task event used as the reset point. *)
 
 type reset_response = { execution : execution }
 (** New run identity returned by Temporal after a successful reset. *)
 
-type terminate_request = { execution : execution; reason : string }
+type terminate_request = {
+  execution : execution;
+  reason : string;
+  rpc_timeout_ms : int64 option;
+}
 (** Termination request for one run selector. [reason] is bounded operator
     context. *)
 
@@ -90,6 +133,7 @@ type signal_request = {
   signal_name : string;
   request_id : string;
   input : payload list;
+  rpc_timeout_ms : int64 option;
 }
 (** Workflow/run selector and typed payloads for one signal delivery.
 
@@ -104,6 +148,7 @@ type query_request = {
   execution : execution;
   query_type : string;
   input : payload list;
+  rpc_timeout_ms : int64 option;
 }
 (** Execution selector and output-only query name sent to Temporal. The
     input list is currently required to be empty by the public client API but
@@ -117,6 +162,7 @@ type visibility_request = {
   query : string;
   page_size : int;
   next_page_token : string option;
+  rpc_timeout_ms : int64 option;
 }
 (** One explicitly bounded visibility page request. The token is opaque base64. *)
 
@@ -140,6 +186,7 @@ type update_request = {
   update_id : string;
   update_name : string;
   input : payload list;
+  rpc_timeout_ms : int64 option;
 }
 (** Request to admit one named workflow update. *)
 

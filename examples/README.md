@@ -44,6 +44,14 @@ dune exec examples/workflow_worker/workflow_worker.exe
 dune exec examples/client/client.exe -- "Ada Lovelace"
 ```
 
+The client starts the workflow with a stable request ID, a one-hour workflow
+execution timeout, and a five-second deadline on the start call. If that
+deadline expires, `Client.is_start_outcome_uncertain` recognizes the error
+and the client retries once with the same request ID. Temporal then returns
+the run if the first attempt created it, or creates it exactly once. This is
+the safe way to reconcile an uncertain start: never retry with a new request
+ID.
+
 The `make build-examples` (or `make native-build` on a native host) target is
 useful for
 compilation checks, but it does not replace the three `dune exec` processes.

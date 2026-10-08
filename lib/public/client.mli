@@ -5,7 +5,36 @@
 
     A handle addresses either one exact run (from {!start}, {!follow}, or
     {!get_handle} with [~run_id]) or the workflow's current run (from
-    {!get_handle} without [~run_id]). Every operation accepts both kinds. *)
+    {!get_handle} without [~run_id]). Every operation accepts both kinds.
+
+    {2:rpc_deadlines RPC deadlines and workflow timeouts}
+
+    Two kinds of time bound are deliberately separate:
+
+    - A workflow timeout ([?execution_timeout], [?run_timeout],
+      [?task_timeout] on {!start}) is a server-side execution policy recorded
+      in the workflow's history. When it expires Temporal ends the workflow,
+      and {!wait} reports [Timed_out].
+    - An RPC deadline ([?rpc_timeout] on {!start}, {!signal}, {!query},
+      {!query_with_input}, {!start_update}, {!cancel}, {!terminate},
+      {!reset}, and {!list_visibility}) bounds one client call, including
+      the transport retries the SDK performs inside it, and never affects the
+      workflow. It must be between 1 ms and 60 seconds; other values are
+      typed defects returned before any request is sent. When omitted, each
+      operation keeps its built-in budget: 10 seconds for {!start} and
+      {!list_visibility}, 3 seconds for {!signal}, {!cancel}, {!terminate},
+      and {!reset}, and 30 seconds for queries and for {!start_update}'s
+      acceptance wait. {!wait} and {!wait_update} have no RPC deadline: they
+      wait for the workflow or update, with bounded internal polls.
+
+    An expired RPC deadline does not prove that Temporal rejected the
+    request: the server may have applied it before the reply was lost. It is
+    reported as an error with {!val-rpc_status} [Some `Deadline_exceeded] (or
+    [`Unavailable] when the last transport attempt failed first), except
+    that an expired {!start} is recognized by {!is_start_outcome_uncertain}
+    and an expired {!terminate} reports [`Termination_outcome_uncertain].
+    Reconcile by retrying with the same request ID (start, signal, cancel,
+    reset) or update ID, or by observing the run with {!wait}. *)
 
 (** An opaque client connection owned by the caller. *)
 type t
@@ -68,6 +97,26 @@ type 'output terminal_result =
     - [`Terminate_existing]: Temporal terminates the running workflow and
       starts a new run; the returned handle names the new run. *)
 type id_conflict_policy = [ `Fail | `Use_existing | `Terminate_existing ]
+
+(** What [start] does when its workflow ID's latest run has already closed
+    and Temporal still retains it. The policy never affects an open run; see
+    {!type-id_conflict_policy} for that case.
+
+    - [`Allow_duplicate] (Temporal's default): start a new run whatever the
+      closed run's outcome.
+    - [`Allow_duplicate_failed_only]: start a new run only when the closed run
+      failed, was cancelled or terminated, or timed out; a run that completed
+      successfully keeps its ID.
+    - [`Reject_duplicate]: never start another run with this ID.
+
+    A refused start returns the same already-started error as a [`Fail]
+    conflict; {!val-already_started} then names the closed run. Every
+    combination with {!type-id_conflict_policy} is valid; for example
+    [`Reject_duplicate] with [`Use_existing] attaches to an open run and
+    refuses a closed one. Temporal's deprecated [TERMINATE_IF_RUNNING] value
+    is not offered; use [`Terminate_existing] instead. *)
+type id_reuse_policy =
+  [ `Allow_duplicate | `Allow_duplicate_failed_only | `Reject_duplicate ]
 
 (** One execution row returned by the Temporal visibility service. *)
 type visibility_execution = {
@@ -140,6 +189,39 @@ val create :
     terminates the run it created. Retrying a still-pending request ID with
     a different policy is rejected rather than treated as the same start.
 
+    [id_reuse_policy] (default [`Allow_duplicate]) chooses what happens when
+    [id]'s latest run has closed; see {!type-id_reuse_policy}. It is also
+    always sent explicitly.
+
+    [execution_timeout] bounds the whole workflow execution, across retries
+    and continue-as-new runs; [run_timeout] bounds one run; [task_timeout]
+    bounds one workflow task (Temporal's default is 10 seconds). Omitted
+    timeouts keep Temporal's defaults: no execution or run limit. Each
+    supplied timeout must be positive, [run_timeout] no larger than
+    [execution_timeout], and [task_timeout] at most 120 seconds and no larger
+    than [run_timeout] (or [execution_timeout] when there is no
+    [run_timeout]): Temporal would silently lower a larger value instead of
+    honouring it. Violations are typed defects returned before anything is
+    sent. An expired workflow timeout ends the run, which {!wait} reports as
+    [Timed_out].
+
+    [retry_policy] asks Temporal to retry a failed or timed-out run as a new
+    run of the same workflow ID. Omitted, a workflow is not retried. The
+    policy is the same validated {!Activity.Retry_policy.t} used for
+    activities. An exact-run {!wait} on the closed run links the retry run as
+    its successor; the pinned Temporal server reports that link to this
+    client as [Continued_as_new] rather than as [Failed] with a successor, so
+    accept either. A current-run handle from {!get_handle} follows the retry
+    chain to its last run.
+
+    [rpc_timeout] bounds this start call only (default 10 seconds; see
+    {{!section-rpc_deadlines} RPC deadlines}). When it expires, or the client
+    shuts down while the start is in flight, the error is recognized by
+    {!is_start_outcome_uncertain}: Temporal may have accepted the start.
+    Retry with the same [request_id] to obtain the run if it was created, or
+    to create it exactly once if it was not; the RPC deadline is not part of
+    the request, so the retry may use another one.
+
     [memo] attaches named payloads visible when describing the execution.
     [search_attributes] attaches named indexed payloads used by visibility
     queries. Keys in both collections are non-empty, valid UTF-8, NUL-free, at
@@ -150,11 +232,11 @@ val create :
     namespace with matching server types. Workers
     can read the recorded values through [Workflow.start_metadata].
 
-    This client does not expose cron schedules, delayed starts, or workflow
-    execution/run/task timeout options yet. OCaml workers reject cron and
-    nonzero root start delay; do not start those policies from another SDK on
-    a queue served by this worker. Server-applied workflow/retry continuation
-    backoff, timeouts, and execution expiration metadata are preserved.
+    This client does not expose cron schedules or delayed starts. OCaml
+    workers reject cron and nonzero root start delay; do not start those
+    policies from another SDK on a queue served by this worker.
+    Server-applied workflow/retry continuation backoff, timeouts, and
+    execution expiration metadata are preserved.
 
     The native client keeps at most 64 starts in flight at once. A start
     beyond that bound is rejected before anything is sent to Temporal, with a
@@ -168,6 +250,12 @@ val start :
   ?memo:(string * Payload.t) list ->
   ?search_attributes:(string * Payload.t) list ->
   ?id_conflict_policy:id_conflict_policy ->
+  ?id_reuse_policy:id_reuse_policy ->
+  ?execution_timeout:Duration.t ->
+  ?run_timeout:Duration.t ->
+  ?task_timeout:Duration.t ->
+  ?retry_policy:Activity.Retry_policy.t ->
+  ?rpc_timeout:Duration.t ->
   workflow:('input, 'output) Workflow.t ->
   task_queue:string ->
   id:string ->
@@ -263,10 +351,12 @@ val wait :
     value only when separate cancellation requests for the same run must be
     distinguished. An explicit [request_id] must be non-empty and valid UTF-8.
     Both [request_id] and [reason] are limited to 65,536 bytes and may not
-    contain NUL; [reason] may be empty. *)
+    contain NUL; [reason] may be empty. [rpc_timeout] bounds this call
+    (default 3 seconds); see {{!section-rpc_deadlines} RPC deadlines}. *)
 val cancel :
   ?request_id:string ->
   ?reason:string ->
+  ?rpc_timeout:Duration.t ->
   ('input, 'output) handle ->
   (unit, Error.t) result
 
@@ -278,9 +368,12 @@ val cancel :
     the server is unavailable, the returned non-retryable bridge error has
     [rpc_status] [Some `Termination_outcome_uncertain]: the server may have
     accepted the command, and this RPC has no idempotency key for a blind
-    retry. Reconcile that result with [wait handle] or visibility. *)
+    retry. Reconcile that result with [wait handle] or visibility.
+    [rpc_timeout] bounds this call (default 3 seconds); see
+    {{!section-rpc_deadlines} RPC deadlines}. *)
 val terminate :
   ?reason:string ->
+  ?rpc_timeout:Duration.t ->
   ('input, 'output) handle ->
   (unit, Error.t) result
 
@@ -294,10 +387,13 @@ val terminate :
     by the first accepted request. An explicitly supplied [request_id] must be
     non-empty, valid UTF-8, NUL-free, and no more than 65,536 bytes.
     [workflow_task_finish_event_id] must be greater than 1 and identify a
-    workflow-task finish event accepted by Temporal. *)
+    workflow-task finish event accepted by Temporal.
+    [rpc_timeout] bounds this call (default 3 seconds); see
+    {{!section-rpc_deadlines} RPC deadlines}. *)
 val reset :
   ?request_id:string ->
   ?reason:string ->
+  ?rpc_timeout:Duration.t ->
   workflow_task_finish_event_id:int64 ->
   ('input, 'output) handle ->
   (execution, Error.t) result
@@ -309,9 +405,12 @@ val reset :
     same ID when retrying an uncertain transport result. An explicitly
     supplied ID must be non-empty, valid UTF-8, NUL-free, and no more than
     65,536 bytes. Signal names are validated when their definitions are
-    created and input is encoded before transport. *)
+    created and input is encoded before transport.
+    [rpc_timeout] bounds this call (default 3 seconds); see
+    {{!section-rpc_deadlines} RPC deadlines}. *)
 val signal :
   ?request_id:string ->
+  ?rpc_timeout:Duration.t ->
   ('workflow_input, 'workflow_output) handle ->
   signal:'signal Signal.t ->
   input:'signal ->
@@ -327,8 +426,11 @@ val signal :
     completed can still be queried, as long as a worker can replay it.
     [rpc_status] is [Some `Failed_precondition] only when Temporal itself
     reports the query as rejected. Use [query_with_input] when the query
-    accepts one typed argument. *)
+    accepts one typed argument.
+    [rpc_timeout] bounds this call (default 30 seconds); see
+    {{!section-rpc_deadlines} RPC deadlines}. *)
 val query :
+  ?rpc_timeout:Duration.t ->
   ('workflow_input, 'workflow_output) handle ->
   query:'query Query.t ->
   ('query, Error.t) result
@@ -337,10 +439,12 @@ val query :
     query language. [page_token] is opaque and may be passed unchanged to a
     later call; when supplied, it must be non-empty, valid UTF-8, NUL-free, and
     no more than 65,536 bytes. Invalid query metadata is returned as a typed
-    defect. *)
+    defect. [rpc_timeout] bounds this call (default 10 seconds); see
+    {{!section-rpc_deadlines} RPC deadlines}. *)
 val list_visibility :
   ?page_size:int ->
   ?page_token:string ->
+  ?rpc_timeout:Duration.t ->
   t ->
   query:string ->
   unit ->
@@ -349,8 +453,10 @@ val list_visibility :
 (** Executes a typed one-input query against the run [handle] addresses. The input is encoded with [query]'s codec before transport and
     the result is decoded with its output codec. Query handlers remain
     synchronous and read-only; routine Temporal failures are returned as
-    typed errors. *)
+    typed errors. [rpc_timeout] bounds this call (default 30 seconds); see
+    {{!section-rpc_deadlines} RPC deadlines}. *)
 val query_with_input :
+  ?rpc_timeout:Duration.t ->
   ('workflow_input, 'workflow_output) handle ->
   query:('query_input, 'query_output) Query.typed ->
   input:'query_input ->
@@ -366,9 +472,12 @@ val query_with_input :
     An update Temporal has only admitted (not yet accepted) never yields a
     handle: the request is re-issued with the same update ID until a worker
     accepts or rejects it, for at most 30 seconds, after which a retryable
-    [deadline_exceeded] RPC error is returned. *)
+    [deadline_exceeded] RPC error is returned. [rpc_timeout] replaces that
+    30-second acceptance budget; see
+    {{!section-rpc_deadlines} RPC deadlines}. *)
 val start_update :
   ?update_id:string ->
+  ?rpc_timeout:Duration.t ->
   ('workflow_input, 'workflow_output) handle ->
   update:('input, 'output) Update.t ->
   input:'input ->
@@ -400,18 +509,31 @@ val run_id : ('input, 'output) handle -> string option
     another start, and for every handle built by [follow] or [get_handle]. *)
 val started : ('input, 'output) handle -> bool
 
-(** Returns the open run that made a [`Fail] start fail, or [None] for any
-    other error.
+(** Returns the run that made a start fail with Temporal's already-started
+    error, or [None] for any other error. That run is open when a [`Fail]
+    conflict policy refused the start, and closed when the
+    {!type-id_reuse_policy} refused it.
 
     That start error has category [`Workflow], is non-retryable, and has
     [Error.error_type] [Some "WorkflowExecutionAlreadyStarted"], Temporal's
     name for this failure; test the type to recognize the conflict even in
     the rare case where Temporal did not report the existing run ID, in which
     case this function also returns [None]. The returned execution can be
-    passed to [follow] with the same client to wait on, signal, or query the
-    running workflow. The identity travels as one JSON detail payload of the
+    passed to [follow] with the same client to wait on, signal, or query that
+    workflow run. The identity travels as one JSON detail payload of the
     error, so it survives if the error is forwarded unchanged. *)
 val already_started : Error.t -> execution option
+
+(** Returns [true] when [error] means Temporal did not prove whether a
+    [start] was accepted: its RPC deadline expired, the transport failed after
+    the request may have reached the server, or the client shut down while
+    the start was in flight. The workflow may or may not exist. Such an error
+    has category [`Bridge], is non-retryable as a blind repeat, has
+    [Error.error_type] [Some "StartOutcomeUncertain"], and its message names
+    the workflow ID and request ID. Reconcile it by retrying the same start
+    with the same [request_id] (Temporal returns the run if the first attempt
+    created it) or by observing the workflow with {!get_handle} and {!wait}. *)
+val is_start_outcome_uncertain : Error.t -> bool
 
 (** Returns [true] when [error] means the native client refused a [start] or
     [wait] because its bounded set of in-flight operations was full (64 starts
@@ -491,8 +613,8 @@ val is_query_failed : Error.t -> bool
 
     Shutdown does not fail because another Domain or thread is still inside
     [start]. A native start whose request was already handed to the transport
-    is aborted; that [start] call returns a non-retryable [`Bridge] error
-    stating that Temporal did not prove whether the start was accepted, with
-    the workflow and request IDs needed to reconcile it. A start that had not
+    is aborted; that [start] call returns the error recognized by
+    {!is_start_outcome_uncertain}, with the workflow and request IDs needed
+    to reconcile it. A start that had not
     yet been admitted returns the ordinary shut-down error. *)
 val shutdown : t -> (unit, Error.t) result
