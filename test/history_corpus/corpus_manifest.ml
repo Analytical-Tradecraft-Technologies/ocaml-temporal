@@ -49,9 +49,18 @@ type entry = {
           it reuses. *)
 }
 
-(** Validated manifest. Capture provenance is validated but only its IDs are
-    needed after loading. *)
-type t = { captures : string list; entries : entry list }
+(** The provenance fields of one capture that replay reports compare with the
+    candidate under test. The remaining capture members are validated but not
+    retained. *)
+type capture = {
+  capture_id : string;
+  kind : string;  (** [live] or [synthetic]. *)
+  sdk_commit : string;  (** SDK commit that produced the histories. *)
+  core_revision : string;  (** Temporal Core revision pinned by that SDK. *)
+}
+
+(** Validated manifest, with captures in manifest order. *)
+type t = { captures : capture list; entries : entry list }
 
 (** Accumulates validation failures with a stable location prefix. *)
 type errors = string list ref
@@ -130,8 +139,9 @@ let string_list_member errors location members name =
       error errors location (name ^ " must be a non-empty string list");
       []
 
-(** Validates one capture provenance record. Live captures must name the
-    Temporal Server image; synthetic histories record ["none"]. *)
+(** Validates one capture provenance record and returns the fields replay
+    reports retain. Live captures must name the Temporal Server image;
+    synthetic histories record ["none"]. *)
 let check_capture errors id json =
   let location = "captures." ^ id in
   if not (is_identifier id) then error errors location "invalid capture ID";
@@ -149,10 +159,12 @@ let check_capture errors id json =
         error errors location "kind must be live or synthetic";
       if not (is_date (string_member errors location members "captured_on"))
       then error errors location "captured_on must be YYYY-MM-DD";
-      if not (is_commit (string_member errors location members "sdk_commit"))
-      then error errors location "sdk_commit must be a 40-hex commit";
-      if not (is_commit (string_member errors location members "core_revision"))
-      then error errors location "core_revision must be a 40-hex commit";
+      let sdk_commit = string_member errors location members "sdk_commit" in
+      if not (is_commit sdk_commit) then
+        error errors location "sdk_commit must be a 40-hex commit";
+      let core_revision = string_member errors location members "core_revision" in
+      if not (is_commit core_revision) then
+        error errors location "core_revision must be a 40-hex commit";
       let server = string_member errors location members "temporal_server_image" in
       if kind = "live" && not (String.contains server '@') then
         error errors location "a live capture must pin the server image by digest";
@@ -168,8 +180,11 @@ let check_capture errors id json =
           match List.assoc_opt name members with
           | None | Some (`String _) -> ()
           | Some _ -> error errors location (name ^ " must be a string"))
-        [ "temporal_cli_image"; "source"; "notes" ]
-  | _ -> error errors location "capture must be an object"
+        [ "temporal_cli_image"; "source"; "notes" ];
+      { capture_id = id; kind; sdk_commit; core_revision }
+  | _ ->
+      error errors location "capture must be an object";
+      { capture_id = id; kind = ""; sdk_commit = ""; core_revision = "" }
 
 (** Validates and decodes one history reference. *)
 let check_history errors location json =
@@ -275,8 +290,64 @@ let check_entry errors index json =
 let read_file path =
   In_channel.with_open_bin path In_channel.input_all
 
-(** Checks checksums, cross references and orphaned files against [root], the
-    corpus directory containing [manifest.json] and [histories/]. *)
+(** Compares an identity read from one of an entry's history files with the
+    manifest's [workflow_type] and [run_id]. [source] names the file kind in
+    the diagnostic. *)
+let check_identity errors location ~source entry (workflow_type, run_id) =
+  if workflow_type <> entry.workflow_type then
+    error errors location
+      (Printf.sprintf "%s history workflow type is %s, manifest says %s" source
+         workflow_type entry.workflow_type);
+  if run_id <> entry.run_id then
+    error errors location
+      (Printf.sprintf "%s history run ID is %s, manifest says %s" source run_id
+         entry.run_id)
+
+(** Checks that the protobuf history the runner replays records the entry's
+    workflow type and run ID on its [WorkflowExecutionStarted] event. The
+    public replay API reports no run ID or workflow type for a successful
+    replay, so this check on the replay input itself is what stops a
+    mislabelled entry, or a history from another run, from passing. It applies
+    to every entry, with or without a JSON copy. *)
+let check_protobuf_identity errors location ~file entry =
+  match Corpus_history_identity.of_protobuf (read_file file) with
+  | Error message ->
+      error errors location ("protobuf history identity unreadable: " ^ message)
+  | Ok identity -> check_identity errors location ~source:"protobuf" entry identity
+
+(** Checks that an entry's optional JSON history (the reviewed Temporal CLI
+    export the protobuf was encoded from) names the same workflow type and
+    run ID. Temporal records a run's own ID as [originalExecutionRunId]; a
+    continue-as-new successor keeps the chain's first run in
+    [firstExecutionRunId]. Together with {!check_protobuf_identity} this keeps
+    the human-readable copy consistent with the replay input. *)
+let check_json_identity errors location ~file entry =
+  match Yojson.Safe.from_file file with
+  | exception Yojson.Json_error message ->
+      error errors location ("invalid JSON history: " ^ message)
+  | json -> (
+      let open Yojson.Safe.Util in
+      let started =
+        try
+          let attributes =
+            json |> member "events" |> index 0
+            |> member "workflowExecutionStartedEventAttributes"
+          in
+          Some
+            ( attributes |> member "workflowType" |> member "name" |> to_string,
+              attributes |> member "originalExecutionRunId" |> to_string )
+        with Type_error _ | Invalid_argument _ -> None
+      in
+      match started with
+      | None ->
+          error errors location
+            "JSON history does not start with a WorkflowExecutionStarted event \
+             naming its workflow type and run ID"
+      | Some identity -> check_identity errors location ~source:"JSON" entry identity)
+
+(** Checks checksums, cross references, recorded identities and orphaned files
+    against [root], the corpus directory containing [manifest.json] and
+    [histories/]. *)
 let check_files errors ~root ~captures entries =
   let referenced = Hashtbl.create 32 in
   let digests = Hashtbl.create 32 in
@@ -303,17 +374,25 @@ let check_files errors ~root ~captures entries =
       let location = "entry " ^ entry.id in
       if Hashtbl.mem ids entry.id then error errors location "duplicate entry ID";
       Hashtbl.replace ids entry.id ();
-      if not (List.mem entry.capture captures) then
-        error errors location ("unknown capture " ^ entry.capture);
+      if
+        not
+          (List.exists (fun capture -> capture.capture_id = entry.capture) captures)
+      then error errors location ("unknown capture " ^ entry.capture);
       check_file location entry.history.protobuf entry.history.protobuf_sha256;
+      (let file = Filename.concat root entry.history.protobuf in
+       if Sys.file_exists file then check_protobuf_identity errors location ~file entry);
       Option.iter
-        (fun (path, digest) -> check_file location path digest)
+        (fun (path, digest) ->
+          check_file location path digest;
+          let file = Filename.concat root path in
+          if Sys.file_exists file then
+            check_json_identity errors location ~file entry)
         entry.history.json)
     entries;
   List.iter
-    (fun capture ->
-      if not (List.exists (fun entry -> entry.capture = capture) entries) then
-        error errors ("captures." ^ capture) "capture is not used by any entry")
+    (fun { capture_id; _ } ->
+      if not (List.exists (fun entry -> entry.capture = capture_id) entries) then
+        error errors ("captures." ^ capture_id) "capture is not used by any entry")
     captures;
   let directory = Filename.concat root "histories" in
   Array.iter
@@ -343,8 +422,7 @@ let load manifest_path =
         let captures =
           match List.assoc_opt "captures" members with
           | Some (`Assoc captures) ->
-              List.iter (fun (id, json) -> check_capture errors id json) captures;
-              List.map fst captures
+              List.map (fun (id, json) -> check_capture errors id json) captures
           | _ ->
               error errors "manifest" "captures must be an object";
               []

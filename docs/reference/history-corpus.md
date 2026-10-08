@@ -13,21 +13,28 @@ incompatible definition must still be reported as nondeterministic.
 | Histories and manifest | [`test/fixtures/history-corpus/`](../../test/fixtures/history-corpus/) |
 | Manifest schema (v1) | [`docs/schemas/history-corpus/manifest.schema.json`](../schemas/history-corpus/manifest.schema.json) |
 | Frozen definition sets | [`test/history_corpus/corpus_definitions.ml`](../../test/history_corpus/corpus_definitions.ml) |
-| Docker-free gate | [`test/history_corpus/test_history_corpus.ml`](../../test/history_corpus/test_history_corpus.ml) |
+| Gate and upgrade runner | [`test/history_corpus/history_corpus_runner.ml`](../../test/history_corpus/history_corpus_runner.ml), [`corpus_runner.ml`](../../test/history_corpus/corpus_runner.ml) |
+| Runner negative-path test | [`test/history_corpus/test_history_corpus_mismatch.ml`](../../test/history_corpus/test_history_corpus_mismatch.ml) |
 | Capture program and scripts | [`test/history_corpus/capture/`](../../test/history_corpus/capture/), [`test/history_corpus/scripts/`](../../test/history_corpus/scripts/) |
 
 ## What is checked, and where
 
-`test_history_corpus` is an ordinary Dune test, so `dune runtest`, `make test`
-and the native Windows/macOS `make native-test` jobs all run it; no Temporal
-Server or Docker is involved. `make test-history-corpus` runs only this test.
-It fails, naming the entry ID, when:
+`history_corpus_runner` is an ordinary Dune test, so `dune runtest`, `make test`
+(and therefore `make verify` on every Linux matrix leg of every PR) and the
+native Windows/macOS `make native-test` jobs all run it; no Temporal Server or
+Docker is involved, and the whole corpus replays in about a second.
+`make test-history-corpus` runs only the corpus tests. It fails, naming the
+entry ID, when:
 
 - the manifest violates the v1 schema (every object is closed), a capture or
   entry reference is dangling, a capture is unused, or a negative control does
   not name a `replays_ok` entry with the same history;
 - a history file's SHA-256 differs from the manifest, a referenced file is
   missing, or a file under `histories/` is not referenced (orphan);
+- the `WorkflowExecutionStarted` event decoded from an entry's protobuf
+  history (the bytes that are replayed) does not record the entry's
+  `workflow_type` and `run_id` (`original_execution_run_id`, the run's own
+  ID), or the optional JSON copy disagrees with them;
 - a required feature (activity, timer, activity retry, signal, update,
   child workflow, continue-as-new, marker-free/active/deprecated patch,
   workflow failure, workflow-task failure recovery) has no `replays_ok` entry,
@@ -35,12 +42,11 @@ It fails, naming the entry ID, when:
   feature: they record no history events, so replay never exercises a query
   handler, and query behaviour is covered by the live completed-query
   regression instead);
-- a `replays_ok` entry does not replay cleanly: Core must accept every
-  completion, report no task failure or failure eviction, see exactly one
-  `InitializeWorkflow` with the manifest's run ID and workflow type, accept
-  exactly one terminal command, and let the replay worker finalize naturally
-  within 30 seconds; or
-- a `nondeterminism` entry does not produce a Core nondeterminism eviction.
+- a `replays_ok` entry does not return `Ok ()` from `Temporal.Replay.replay`
+  with only the entry's workflow type registered from its definition set
+  (so a history recorded for another type cannot pass); or
+- a `nondeterminism` entry does not return `Nondeterminism` for the entry's
+  run ID.
 
 The SHA-256 implementation is a small test helper checked against the FIPS
 180-4 vectors before any manifest is read, because the OCaml standard library
@@ -48,25 +54,106 @@ has no SHA-256 and a hashing dependency would only serve this test.
 
 ## Replay path
 
-Replay uses the existing private path, the same one exercised by
-`bench_cold_replay` and the
-[initial-signals regression](../../test/integration/temporal/initial_signals/README.md):
-a fresh `Sdk_supervisor.Native` instance starts a workflow-only Core replay
-worker, feeds one protobuf history through the
-[replay bridge](replay-bridge.md), and the production
-`Native_worker_execution` adapter runs the registered OCaml definitions. Each
-entry gets its own supervisor, and every native resource is released before the
-next entry runs. The public `Temporal.Workflow` definitions are converted to
-private registrations by
-[`corpus_replay.ml`](../../test/history_corpus/corpus_replay.ml), which mirrors
-the package-private conversions used by `Temporal.Worker`.
+The runner replays through the public
+[`Temporal.Replay`](../../lib/public/replay.mli) API (issue
+[#515](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/515)),
+the same entry point applications use for their own pre-deployment checks, so
+an SDK or Core upgrade is judged by the behavior users observe. Each entry is
+an independent `Temporal.Replay.replay` call: its own native replay graph and
+owner Domain, released before the next entry runs, with the API's 30-second
+no-progress bound. The input is the entry's binary
+`temporal.api.history.v1.History` protobuf and workflow ID, passed to
+`Temporal.Replay.History.of_protobuf` unchanged.
 
-The corpus does not depend on that runner. The histories are binary
-`temporal.api.history.v1.History` protobufs plus a workflow ID, which is also
-the input of the proposed public `Temporal.Replay` API (issue
-[#515](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/515)).
+The public API returns no run ID or workflow type for a successful replay.
+The #518 gate used a private replay path to check those; the runner instead
+reads them from the start event of each entry's protobuf history, the exact
+replay input, and registers only the entry's workflow type.
+[`corpus_history_identity.ml`](../../test/history_corpus/corpus_history_identity.ml)
+walks just the needed protobuf fields (field numbers from the Temporal API
+protos at the pinned Core revision), because no Temporal protobuf decoder is
+reachable from OCaml test code; this works for entries without a JSON copy. That keeps the identity checks
+while one runner, on the public API, serves both `dune runtest` and the
+upgrade command. The private replay path stays covered by
+`bench_cold_replay` and the
+[initial-signals regression](../../test/integration/temporal/initial_signals/README.md).
+
+## SDK and Core upgrade gate
+
 Issue [#524](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/524)
-can run the same manifest through either path, or across SDK/Core upgrades.
+makes the corpus the replay-compatibility gate for upgrades. Histories are
+never regenerated for a candidate: each is replayed as recorded by its
+producing SDK commit and Core revision (the manifest's capture provenance).
+
+```sh
+make test-history-corpus-upgrade
+```
+
+builds the runner and replays every entry, printing a per-case table (case ID,
+the Core revision that produced the history, expected and actual outcome,
+pass/FAIL) and writing `_build/history-corpus/report.json`
+(`HISTORY_CORPUS_REPORT` overrides the path). It exits non-zero on any mismatch
+and prints `FAIL history corpus: N mismatched case(s): <IDs>`. The candidate SDK
+commit is the host checkout's `HEAD` unless `HISTORY_CORPUS_SDK_COMMIT` is
+set; the candidate Core revision is the `temporalio-sdk-core` Git source in
+`rust/Cargo.lock`. The runner can also be invoked directly:
+
+```sh
+history_corpus_runner.exe MANIFEST [--report FILE] [--cargo-lock FILE] [--sdk-commit SHA]
+```
+
+The report (`schema` `ocaml-temporal/history-corpus-report/v1`) contains:
+
+| Member | Meaning |
+| --- | --- |
+| `status` | `pass`, or `fail` on any mismatched case or manifest/coverage problem. |
+| `scope` | The forward-compatibility-only limitation below, carried with the evidence. |
+| `candidate` | `sdk_commit`, `core_revision`, `core_source`, `ocaml_version`, `native_bridge_abi` of the build under test. |
+| `summary` | Counts of `cases`, `passed`, `failed` and `problems`. |
+| `failing_cases` | IDs of mismatched cases in manifest order. |
+| `problems` | Manifest validation or coverage failures not tied to one replay; when the manifest is invalid no case is replayed. |
+| `cases[]` | Per entry: `id`, `workflow_type`, `workflow_id`, `run_id`, `history`, `replay_definitions`, `expected`, `actual`, `result`, `message` (the public failure text or mismatch reason) and `produced_by` (`capture`, `kind`, `sdk_commit`, `core_revision`). |
+
+A pass is **forward-compatibility** evidence only: the candidate replays
+histories recorded by older SDK/Core builds. It does not show that the previous
+release can replay histories written by the candidate, so it is not evidence
+that a deployment can be rolled back after the candidate has processed
+workflow tasks. The runner prints this limitation and the report records it as
+`scope`; rollback qualification belongs to
+[#508](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/508).
+
+`actual` is `replays_ok`, `nondeterminism`, `workflow_task_failed`,
+`invalid_history`, `unsupported_history`, `replay_error` (the replay could not
+run) or `not_run` (unknown definition set, unregistered type or unreadable
+history).
+
+Where it runs:
+
+- **Every PR, merge group and master build.** `make verify` runs the runner as
+  part of `dune runtest` on every Linux matrix leg, and `make native-verify` on
+  Windows and macOS. The Linux amd64 / OCaml 5.5.1 leg of
+  [`build-pr.yml`](../../.github/workflows/build-pr.yml) also runs
+  `make test-history-corpus-upgrade` (reusing that job's build) and uploads the
+  report as the `history-corpus-report-linux-amd64-ocaml-5.5.1` artifact, also
+  when verification failed. Because `rust/Cargo.lock` is a Dune dependency of
+  the test, a lockfile change always reruns the corpus.
+- **Temporal Core pin bumps and Dependabot Cargo PRs.** These must pass the
+  runner without editing the manifest or histories; the PR cites the report
+  artifact (candidate `core_revision` against each case's `produced_by`). See
+  the [Core upgrade checklist](../dependencies.md#temporal-core-pin-upgrades).
+- **Releases.** The release workflow reuses `build-pr.yml`, so the release
+  candidate commit produces the same report.
+
+`test_history_corpus_mismatch` keeps the negative path honest: it copies the
+corpus to a temporary directory, points `compat-patch-active-on-deprecated` at
+the pre-patch definitions (an expected pass that now reports nondeterminism)
+and `negative-timer-removed` at the compatible definitions (a negative control
+that now replays), runs the real runner, and requires exit status 1, both IDs
+on standard error and in the report's `failing_cases`, and every other case
+passing. A second scenario replaces `live-2026-10-08-activity`'s protobuf
+with the timer history, updates its checksum and drops its JSON copy; the
+runner must reject the manifest with exactly that entry's workflow type and
+run ID mismatches and replay nothing.
 
 ## Manifest format
 
@@ -172,16 +259,18 @@ disposable server.
   [progress](../progress.md) before changing the entry's expected verdict.
 - Add new behavior as new entries under a new capture ID. Keep payloads
   synthetic and identities fixed; do not add histories from real deployments.
-- Keep each history small. The test has a 30-second bound per entry, and the
-  whole corpus replays in a few seconds.
-- A feature removed from `required_features` in the test, or a new required
+- Keep each history small. Replay has a 30-second no-progress bound per
+  entry, and the whole corpus replays in a few seconds.
+- A feature removed from `required_features` in the runner, or a new required
   feature, must be reflected in the coverage list above.
 
 ## Scope
 
-This seeds the corpus required by #518. It does not run the corpus across older
-SDK releases or Core upgrades (#524), provide a public replay runner (#515),
-add malformed-history negative controls beyond the bridge's existing
-validation tests, or qualify every supported feature for #503. Cancellation,
+#518 seeded the corpus and #524 runs it through the public replay API as the
+SDK/Core upgrade gate. The corpus does not yet add malformed-history negative
+controls beyond the bridge's and `Temporal.Replay`'s own validation tests, or
+qualify every supported feature for #503. Every current capture was produced
+at Core `95e97686`; the first Core pin bump is the first true cross-revision
+replay, and its report is the evidence to retain. Cancellation,
 timeouts, local activities, external signals and search-attribute histories
 are not yet represented.

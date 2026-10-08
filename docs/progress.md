@@ -49,6 +49,57 @@ and control bytes as one escaped, truncated line while the record keeps the
 exact ID, with task failures and invalid input still classified
 separately. The installed-consumer witness binds every new field.
 
+## 2026-10-08: Seeded bridge lifecycle stress (#522)
+
+`rust/core-bridge/tests/lifecycle_stress.rs` generates reproducible operation
+sequences over two runtime slots and runs them against the C ABI. The
+operations cover:
+
+- runtime create, free, and GC-fallback dispose, including double release;
+- the replay-worker lifecycle (feed, poll, complete, reject, finalize, drain,
+  dispose);
+- live client connect and disconnect;
+- an activity worker against a gRPC double (poll, complete, reject, shutdown);
+- stale and repeated completions, calls on released slots, and the panic
+  probe.
+
+A model and two ledgers check every step, and check again after teardown:
+
+- each runtime is created once and cleaned up exactly once;
+- a released slot is null and rejects every call;
+- no lease is delivered twice or retired twice;
+- shutdown reports exactly the leases still held;
+- the server sees exactly one completion for every token that was leased,
+  whether an explicit call, shutdown, free, or dispose retired it;
+- a drained replay always finalizes.
+
+A failing case is minimized and reported with its seed, case number,
+reproduction command, and per-operation trace. CI keeps the report as an
+artifact.
+
+`test/bridge/test_ocaml_lifecycle_gc_stress.ml` runs seeded runtime cycles
+through the OCaml bindings, with collections and compactions between calls.
+Each cycle either closes its runtime explicitly or leaves it to the
+custom-block finalizer. The test also runs real supervisor create and
+shutdown cycles. `make test-lifecycle-stress` and
+`make native-test-lifecycle-stress` run both tests with a configurable seed
+and budget. The [lifecycle stress reference](reference/bridge-lifecycle-stress.md)
+gives budgets and the instrumentation scope of each tool.
+
+Evidence: the default Rust run (24 cases × 48 operations, seed `0x05222026`)
+and the scripted regressions pass in about 8 seconds locally. A 300-case run
+with seed `0x7e57` (14,400 operations) also passed, and so did the OCaml
+stress at 1,000 cycles. Neither found a lifecycle defect.
+
+One finding was outside the lifecycle scope. The semantic activity protocol
+accepts a `completed` result with a `null` payload, but Temporal Core rejects
+that completion, and the bridge reports `STATUS_WORKER` with the lease still
+held. The OCaml executor always sends a payload, so the stress does the same.
+
+The stable Rust test is not sanitizer-instrumented. The repository has no
+scheduled stress job yet. Concurrent multi-Domain stress also remains under
+#506.
+
 ## 2026-10-06: Rendered API documentation gate (#794)
 
 `make docs` builds the odoc API documentation with odoc warnings fatal in the
@@ -3192,3 +3243,36 @@ reproduced all eleven cases. See the
 [history corpus reference](reference/history-corpus.md) for the rules and the
 remaining scope (#524 runs the corpus across upgrades; #515 adds a public
 runner).
+
+## 2026-10-08: Replay corpus as the SDK/Core upgrade gate (#524)
+
+The replay history corpus now runs through the public `Temporal.Replay` API,
+the entry point applications use, instead of the private replay path.
+`test/history_corpus/history_corpus_runner.ml` replaces
+`test_history_corpus.ml` and `corpus_replay.ml` as the single runner. It is the
+Dune test, so `make verify` and `make native-verify` run it on every PR, and
+it is also `make test-history-corpus-upgrade`. That target writes a per-case
+table and `_build/history-corpus/report.json`. The report records each case's
+ID, expected and actual outcome, failure message and producing SDK commit and
+Core revision. It also records the candidate SDK commit, the Core revision
+read from `rust/Cargo.lock`, the OCaml version and the bridge ABI. The runner
+exits 1 and lists every mismatched case ID. The Linux amd64 / OCaml 5.5.1 CI
+leg uploads the report as an artifact, also after a failed verification.
+
+The public API reports no run ID or workflow type on success. The manifest
+validator therefore decodes each entry's `workflow_type` and
+`original_execution_run_id` from the start event of the protobuf history that
+is replayed (a minimal documented field walk, `corpus_history_identity.ml`),
+checks the optional JSON copy against the same values, and the runner
+registers only the entry's workflow type. `test_history_corpus_mismatch`
+copies the corpus, breaks one expected pass and one negative control, and
+requires exit 1 with exactly those IDs in standard error and in the report. A
+second scenario swaps in another valid protobuf without a JSON copy and
+requires validation to fail on that entry's identity. A manual mutation also
+confirmed that a wrong `run_id` fails validation. The
+[Core pin upgrade checklist](dependencies.md#temporal-core-pin-upgrades) now
+requires a passing report for every Core bump and Dependabot Cargo PR. The
+runner output and report state that a pass is forward-compatibility evidence
+only, not rollback evidence (#508). The
+whole corpus replays in about a second. Every current capture comes from Core
+`95e97686`, so the first Core bump will be the first cross-revision replay.
