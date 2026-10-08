@@ -21,6 +21,7 @@ module Future = T.Future
 module Interaction = T.Interaction
 module Payload = T.Payload
 module Query = T.Query
+module Replay = T.Replay
 module Result_syntax = T.Result_syntax
 module Runtime_info = T.Runtime_info
 module Scope = T.Scope
@@ -1155,3 +1156,52 @@ let _testing_workflow_id : ('input, 'output) T.Testing.handle -> string =
 
 let _testing_run_id : ('input, 'output) T.Testing.handle -> string =
   T.Testing.run_id
+
+(* Offline history replay against registered workflow definitions. The
+   failure match names every constructor so a removed or renamed verdict
+   breaks the consumer build. *)
+let _replay_workflow :
+    ?signals:T.Signal.Handler.t list ->
+    ?queries:T.Query.Handler.t list ->
+    ?updates:T.Update.Handler.t list ->
+    ('input, 'output) T.Workflow.t -> T.Replay.registered_workflow =
+  T.Replay.workflow
+
+let _replay_history_max_bytes : int = T.Replay.History.max_bytes
+
+let _replay_history_of_protobuf :
+    workflow_id:string -> string -> (T.Replay.History.t, T.Error.t) result =
+  T.Replay.History.of_protobuf
+
+let _replay_history_workflow_id : T.Replay.History.t -> string =
+  T.Replay.History.workflow_id
+
+let _replay_failure_message : T.Replay.failure -> string =
+  T.Replay.failure_message
+
+let _replay_failure_kind : T.Replay.failure -> string = function
+  | T.Replay.Nondeterminism { run_id = (_ : string); message = (_ : string) }
+    ->
+      "nondeterminism"
+  | T.Replay.Workflow_task_failed
+      { run_id = (_ : string option); message = (_ : string) } ->
+      "workflow_task_failed"
+  | T.Replay.Invalid_history { message = (_ : string) } -> "invalid_history"
+  | T.Replay.Unsupported_history { message = (_ : string) } ->
+      "unsupported_history"
+  | T.Replay.Replay_error (_ : T.Error.t) -> "replay_error"
+
+let _replay :
+    ?namespace:string ->
+    ?task_queue:string ->
+    workflows:T.Replay.registered_workflow list ->
+    T.Replay.History.t -> (unit, T.Replay.failure) result =
+  T.Replay.replay
+
+let _replay_all :
+    ?namespace:string ->
+    ?task_queue:string ->
+    workflows:T.Replay.registered_workflow list ->
+    T.Replay.History.t list ->
+    (T.Replay.History.t * (unit, T.Replay.failure) result) list =
+  T.Replay.replay_all
