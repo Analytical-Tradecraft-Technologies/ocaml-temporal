@@ -2,6 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/docs/schemas/bridge/client-update-response.schema.json",
   "title": "OCaml Temporal native client workflow update response",
+  "description": "The execution always names a concrete run: the requested run, or for a current-run request (empty run_id) the run Temporal resolved, which later polls of the update must use.",
   "type": "object",
   "additionalProperties": false,
   "required": ["update_id", "execution", "outcome"],

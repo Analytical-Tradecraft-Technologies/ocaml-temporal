@@ -71,7 +71,7 @@ let check address =
         ~input:expected ()) in
       Fun.protect ~finally:(fun () -> ignore (Client.terminate handle)) (fun () ->
         (match get (Client.wait handle) with
-        | Client.Completed value when value = expected -> ()
+        | Client.Completed { output = value; _ } when value = expected -> ()
         | _ -> failwith "workflow result changed");
         for _ = 1 to 2 do
           if get (Client.query handle ~query) <> expected then

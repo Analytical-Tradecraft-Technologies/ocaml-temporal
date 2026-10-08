@@ -1,15 +1,15 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/docs/schemas/bridge/client-signal-request.schema.json",
-  "title": "OCaml Temporal native client exact-run signal request",
-  "description": "Closed JSON document used only by the private Rust client bridge. The request names one exact workflow run, carries a stable signal request ID, and preserves the ordered payload list. Runtime validators also reject duplicate keys, NUL bytes, and identifiers or payload metadata keys over the 65,536-byte safety limit. Payload data follows the start-input bounds: at most 128 MiB per decoded byte field within the 192 MiB document limit.",
+  "title": "OCaml Temporal native client signal request",
+  "description": "Closed JSON document used only by the private Rust client bridge. The request names one exact workflow run or, with an empty run_id, the current run, carries a stable signal request ID, and preserves the ordered payload list. Runtime validators also reject duplicate keys, NUL bytes, and identifiers or payload metadata keys over the 65,536-byte safety limit. Payload data follows the start-input bounds: at most 128 MiB per decoded byte field within the 192 MiB document limit.",
   "type": "object",
   "additionalProperties": false,
   "required": ["namespace", "workflow_id", "run_id", "signal_name", "request_id", "input"],
   "properties": {
     "namespace": {"type": "string", "minLength": 1, "maxLength": 65536, "pattern": "^[^\\u0000]+$"},
     "workflow_id": {"type": "string", "minLength": 1, "maxLength": 65536, "pattern": "^[^\\u0000]+$"},
-    "run_id": {"type": "string", "minLength": 1, "maxLength": 65536, "pattern": "^[^\\u0000]+$"},
+    "run_id": {"type": "string", "maxLength": 65536, "pattern": "^[^\\u0000]*$", "description": "Exact run ID, or the empty string to select the workflow's current run, which Temporal resolves when it handles the request (#791)."},
     "signal_name": {"type": "string", "minLength": 1, "maxLength": 65536, "pattern": "^[^\\u0000]+$"},
     "request_id": {"type": "string", "minLength": 1, "maxLength": 65536, "pattern": "^[^\\u0000]+$"},
     "input": {

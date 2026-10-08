@@ -8,9 +8,10 @@ decision about how a workflow result is exposed.
 
 The public `Temporal.Client` module does not expose these JSON documents,
 start tickets, or native status codes. On an HTTP(S) client, `start` returns a
-typed exact-run handle, `wait` hides the bounded polling loop and returns a
-typed terminal value, and the exact-run control operations (`cancel`,
-`terminate`, `reset`, `signal`, `query`, and `query_with_input`) expose typed
+typed exact-run handle, `get_handle` builds a handle from a workflow ID with or
+without a run ID, `wait` hides the bounded polling loop and returns a typed
+terminal value, and the control operations (`cancel`, `terminate`, `reset`,
+`signal`, `query`, `query_with_input`, and `start_update`) expose typed
 results.
 `list_visibility` returns one bounded page. The sections below describe the
 private steps that make those public operations safe.
@@ -203,6 +204,39 @@ an absent caller. This is the cancellation boundary for asynchronous starts:
 Rust tasks never call OCaml, and no task is detached while it retains a Core
 connection clone.
 
+## Address the current run of a workflow
+
+Every request after start names its execution with `namespace`,
+`workflow_id`, and `run_id`. A non-empty `run_id` names one exact run. An empty
+`run_id` selects the workflow's current run (#791): the bridge forwards the
+empty value unchanged and Temporal resolves the latest run of that workflow ID
+when it handles the RPC, exactly as for an official SDK handle obtained by
+workflow ID alone. Both sides accept the empty selector in the wait, cancel,
+terminate, reset, signal, query, update, and poll-update requests; namespace
+and workflow ID stay mandatory, and a non-empty run ID keeps the usual
+identifier rules. Start requests have no run ID, and every run reported by
+Temporal (start, reset, and update responses, visibility rows, and
+successors) is still a non-empty identifier.
+
+Two responses depend on the selector:
+
+- a wait response echoes the request's execution exactly, so its `run_id` is
+  empty for a current-run wait. Temporal's history response does not name the
+  run it resolved, so neither side invents one; and
+- an update response for a current-run request names the concrete run that
+  accepted the update. Rust rejects a response without one, and OCaml accepts
+  any concrete run of the requested workflow for such a request while still
+  requiring an exact match for an exact-run request. The public update handle
+  keeps that run, so later polls cannot drift to a newer run.
+
+The public `Temporal.Client.get_handle client ~workflow ~id ()` builds a
+current-run handle without contacting Temporal; with `~run_id` it builds an
+exact-run handle like `follow`. `Temporal.Client.run_id` returns `None` for a
+current-run handle. Its `wait` is the only operation that adds behavior in
+OCaml: it sends a current-run wait and then follows each successor by its
+exact run ID until a run closes without one; see
+[Wait for one run](#wait-for-one-run).
+
 ## Request cancellation of one exact run
 
 The public `Temporal.Client.cancel` operation sends a control-plane request for
@@ -219,14 +253,17 @@ client namespace and these five fields to Rust:
 }
 ```
 
-`run_id` is required. There is no implicit “latest run” form, so a cancellation
-cannot accidentally target a continued-as-new successor or another execution
-with the same workflow ID. `request_id` is the Temporal idempotency key for the
+`run_id` is required in the document. A handle from `start`, `follow`, or
+`get_handle ~run_id` always sends its exact run, so its cancellation cannot
+accidentally target a continued-as-new successor or another execution with the
+same workflow ID; only a current-run handle sends the empty selector described
+above. `request_id` is the Temporal idempotency key for the
 logical cancellation operation. If a transport timeout leaves the outcome
 uncertain, the caller should retry with the same request ID and exact handle.
 If the public `Temporal.Client.cancel` caller omits `request_id`, OCaml derives
-a deterministic ID from that handle's workflow ID and run ID, so repeated
-attempts for the same exact handle still identify one logical cancellation.
+a deterministic ID from that handle's workflow ID and run ID (an empty run ID
+for a current-run handle), so repeated attempts for the same handle still
+identify one logical cancellation.
 The optional `reason` is copied as operator context and may be empty; it is
 bounded and NUL-free like all bridge strings.
 
@@ -504,8 +541,9 @@ The private request is a closed JSON object:
 }
 ```
 
-`run_id` is mandatory, so a query cannot accidentally inspect a different
-execution after continued-as-new. OCaml and Rust validate every identifier,
+`run_id` is mandatory in the document, so an exact-run query cannot
+accidentally inspect a different execution after continued-as-new; a
+current-run handle sends the empty selector and queries the latest run. OCaml and Rust validate every identifier,
 reject unknown and duplicate members, and validate each payload in `input`
 before entering the FFI; output-only queries send an empty list and typed
 queries send exactly one payload. Rust wraps the list in Temporal's
@@ -654,9 +692,10 @@ deterministic `mock://` transport follows the same public closed-state and
 idempotency contract, although its cleanup only releases the in-memory
 service.
 
-## Wait for one exact run
+## Wait for one run
 
-The wait request contains exactly the three identity fields:
+The wait request contains exactly the three identity fields (an empty
+`run_id` waits for whichever run is current when Temporal handles the poll):
 
 ```json
 {
@@ -671,8 +710,8 @@ history long poll with the equivalent of `follow_runs = false`, bounded to
 100 ms per native call. When the run is still open, the call returns
 `STATUS_NOT_READY` and no response object; the caller or a later orchestration
 loop can retry the same request through its mailbox. A timeout is therefore a
-pending observation, not a workflow failure. A terminal response always names
-the exact run requested. Transient transport failures of the long poll (for
+pending observation, not a workflow failure. A terminal response always echoes
+the requested execution unchanged. Transient transport failures of the long poll (for
 example a Temporal Server restart) are retried by Core inside the pending
 observation, up to thirty consecutive attempts per long poll, so they do not
 end the wait (#820); a definitive status such as `not_found` still does.
@@ -718,11 +757,29 @@ Whenever a successor is present, both sides enforce the same three invariants:
 3. successor run ID differs from the waited run ID.
 
 This prevents a malformed response from changing which execution a caller is
-observing. The public OCaml terminal result retains an optional
-`Temporal.Client.execution` successor in `Failed { error; successor }` and
-`Timed_out { error; successor }`, and a required one in `Continued_as_new`.
-`Client.wait` still returns the outcome of the requested exact run; it never
-follows a successor implicitly. See
+observing. For a current-run wait the waited run ID is empty, so the third
+invariant holds for every concrete successor. The public OCaml terminal result
+retains an optional `Temporal.Client.execution` successor in
+`Completed { output; successor }` (a run started by a cron schedule or retry
+policy when this run completed, from
+`WorkflowExecutionCompletedEventAttributes.new_execution_run_id`, #837),
+`Failed { error; successor }`, and `Timed_out { error; successor }`, and a
+required one in `Continued_as_new`. On an exact-run handle `Client.wait`
+returns the outcome of the requested run and never follows a successor
+implicitly.
+
+On a current-run handle `Client.wait` follows the chain in OCaml, matching
+the run-following default of the official SDKs' result methods (Go
+`GetWorkflow(id, "").Get`, TypeScript `getHandle(id).result()`, Python
+`get_workflow_handle(id).result()`): it sends one current-run wait, then an
+exact-run wait for each successor, until a run closes without a successor. The
+result is that last run's outcome, so it is never `Continued_as_new` and its
+successor fields are `None`. Each step is an ordinary bounded native wait, so
+shutdown interrupts the chain and the pending-wait capacity applies per step.
+If a long poll ends with neither a close event nor a continuation token, the
+bridge resolves the current run again on the next poll; that can only skip a
+run which has already been superseded, so the following wait reaches the
+same final run. See
 [`client-wait-request.schema.json`](../schemas/bridge/client-wait-request.schema.json)
 and [`client-wait-response.schema.json`](../schemas/bridge/client-wait-response.schema.json).
 
@@ -775,7 +832,9 @@ The start request uses this closed object:
 
 Rust validates every identity, update ID/name, payload, and duplicate/unknown
 member before invoking Temporal's `UpdateWorkflowExecution` RPC. The response
-echoes the update ID and exact execution. Its `outcome` is `null` while the
+echoes the update ID and exact execution (for a current-run request, the run
+Temporal resolved; see
+[Address the current run of a workflow](#address-the-current-run-of-a-workflow)). Its `outcome` is `null` while the
 update is accepted but not yet complete, or a closed `completed`/`failed`
 object when Core already has a terminal result. Poll requests contain only the
 namespace, exact execution, and update ID; poll responses contain only the
