@@ -51,6 +51,44 @@ macOS (OCaml 5.4.1). As a sensitivity check, forcing
 post-eviction query, and giving only the recovered runs a different timer
 duration failed the control comparison. No SDK defect was found.
 
+## 2026-10-08: Client handles by workflow ID and typed completed successors (#791, #837)
+
+`Temporal.Client.get_handle client ~workflow ~id ?run_id ()` builds a typed
+handle for a workflow the caller did not start, without contacting Temporal.
+With `~run_id` it addresses that exact run; without it the handle addresses
+the workflow's current run. Every request after start now accepts an empty
+run ID in the private protocol (OCaml encoders, Rust validators, and the
+bridge schemas), which the bridge forwards so Temporal resolves the latest run
+for wait, signal, query, cancel, terminate, reset, update, and update polls.
+A current-run update adopts the run Temporal reports as having accepted it,
+and the update handle keeps polling that run. `Client.wait` on a current-run
+handle follows continued-as-new, cron, and retry successors with exact-run
+waits until a run closes without one, matching the official SDKs' default
+result following; exact-run handles still never follow implicitly.
+`Client.run_id` now returns `string option` (`None` for a current-run
+handle). `Completed` became `Completed { output; successor }`, so a completed
+cron or retry run's successor (already decoded by the bridge from
+`new_execution_run_id`) is no longer discarded (#837). The already-started run
+ID half of #837 was resolved by `Client.already_started` (#936). The bridge
+ABI stays at version 4; [core-bridge.md](reference/core-bridge.md) records
+why the selector is additive.
+
+Evidence: `rust/core-bridge/tests/support/client_current_run.rs` drives every
+run-addressed operation from its JSON document with an empty run ID through a
+Core connection backed by the in-memory callback transport and checks the
+empty run ID reaches Temporal, the wait response echoes it and keeps a
+completed successor, a current-run update adopts the resolved run, and a
+missing or changed run fails closed. `test/bridge/test_ocaml_client_protocol.ml`
+and `test/bridge/test_ocaml_client_update_protocol.ml` check the OCaml encoders
+and decoders; `test/bridge/test_client_terminal_adapter.ml` checks the
+completed successor through the backend and the public client, and that a
+current-run wait follows completed, failed, timed-out, and continued-as-new
+links while an exact-run wait returns them; `test/unit/test_client_worker.ml`
+covers `get_handle` validation and a current-run handle signalling and
+terminating a reset successor on the mock. The live regression
+`test/integration/client_request_ids` signals, queries, and waits on a
+workflow by ID alone against Temporal Server.
+
 ## 2026-10-09: Deterministic race matrix (#520)
 
 `test/runtime/test_race_matrix.ml` drives the private workflow runtime with

@@ -1,13 +1,23 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/docs/schemas/bridge/client-wait-response.schema.json",
-  "title": "OCaml Temporal native client exact-run wait response",
-  "description": "Terminal result for the exact execution named by execution. When an outcome contains a non-null successor, bilateral runtime validators require its namespace and workflow_id to equal execution and its run_id to differ. Standard JSON Schema cannot express those cross-object equality constraints, so runtime validation remains authoritative.",
+  "title": "OCaml Temporal native client wait response",
+  "description": "Terminal result for the run selected by execution. A completed outcome carries the successor started by a cron schedule or retry policy, when Temporal reports one. When an outcome contains a non-null successor, bilateral runtime validators require its namespace and workflow_id to equal execution and its run_id to differ. Standard JSON Schema cannot express those cross-object equality constraints, so runtime validation remains authoritative.",
   "type": "object",
   "additionalProperties": false,
   "required": ["execution", "outcome"],
   "properties": {
-    "execution": {"$ref": "client-execution-ref.schema.json"},
+    "execution": {
+      "description": "The request's execution echoed unchanged; run_id is empty for a current-run wait because Temporal's history response does not name the run it resolved.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["namespace", "workflow_id", "run_id"],
+      "properties": {
+        "namespace": {"type": "string", "minLength": 1, "maxLength": 65536, "pattern": "^[^\\u0000]+$"},
+        "workflow_id": {"type": "string", "minLength": 1, "maxLength": 65536, "pattern": "^[^\\u0000]+$"},
+        "run_id": {"type": "string", "maxLength": 65536, "pattern": "^[^\\u0000]*$"}
+      }
+    },
     "outcome": {
       "oneOf": [
         {

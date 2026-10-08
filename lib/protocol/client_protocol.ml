@@ -205,6 +205,14 @@ let validate_identifier path value =
     Error (invalid ~path "identifier contains a NUL byte")
   else Ok ()
 
+(** Validates the run selector of a request. An empty string selects the
+    workflow's current run, which Temporal resolves when it handles the RPC
+    (#791); any other value must be a valid identifier naming one exact run.
+    Rust applies the same rule. Responses never use it: a run Temporal reports
+    is always a concrete identifier. *)
+let validate_run_selector path value =
+  if String.equal value "" then Ok () else validate_identifier path value
+
 let nullable _path (decode : Yojson.Safe.t -> ('a, error) result)
     (json : Yojson.Safe.t) : ('a option, error) result =
   match json with
@@ -402,7 +410,7 @@ let decode_start_response ~(request : start_request) input =
 let encode_wait_request (value : wait_request) =
   let* () = validate_identifier "$.namespace" value.namespace in
   let* () = validate_identifier "$.workflow_id" value.workflow_id in
-  let* () = validate_identifier "$.run_id" value.run_id in
+  let* () = validate_run_selector "$.run_id" value.run_id in
   encode_object
     (`Assoc
       [
@@ -418,7 +426,7 @@ let encode_wait_request (value : wait_request) =
 let encode_cancel_request (value : cancel_request) =
   let* () = validate_identifier "$.namespace" value.execution.namespace in
   let* () = validate_identifier "$.workflow_id" value.execution.workflow_id in
-  let* () = validate_identifier "$.run_id" value.execution.run_id in
+  let* () = validate_run_selector "$.run_id" value.execution.run_id in
   let* () = validate_identifier "$.request_id" value.request_id in
   if String.length value.reason > 65_536 then
     Error (invalid ~path:"$.reason" "reason exceeds the protocol string safety limit")
@@ -453,7 +461,7 @@ let decode_cancel_response input : (cancel_response, error) result =
 let encode_reset_request (value : reset_request) =
   let* () = validate_identifier "$.namespace" value.execution.namespace in
   let* () = validate_identifier "$.workflow_id" value.execution.workflow_id in
-  let* () = validate_identifier "$.run_id" value.execution.run_id in
+  let* () = validate_run_selector "$.run_id" value.execution.run_id in
   let* () = validate_identifier "$.request_id" value.request_id in
   if value.workflow_task_finish_event_id <= 1L then
     Error
@@ -501,7 +509,7 @@ let decode_reset_response ~(request : reset_request) input : (reset_response, er
 let encode_terminate_request (value : terminate_request) =
   let* () = validate_identifier "$.namespace" value.execution.namespace in
   let* () = validate_identifier "$.workflow_id" value.execution.workflow_id in
-  let* () = validate_identifier "$.run_id" value.execution.run_id in
+  let* () = validate_run_selector "$.run_id" value.execution.run_id in
   if String.length value.reason > 65_536 then
     Error (invalid ~path:"$.reason" "reason exceeds the protocol string safety limit")
   else if String.contains value.reason '\000' then
@@ -530,7 +538,7 @@ let decode_terminate_response input : (terminate_response, error) result =
 let encode_signal_request (value : signal_request) =
   let* () = validate_identifier "$.namespace" value.execution.namespace in
   let* () = validate_identifier "$.workflow_id" value.execution.workflow_id in
-  let* () = validate_identifier "$.run_id" value.execution.run_id in
+  let* () = validate_run_selector "$.run_id" value.execution.run_id in
   let* () = validate_identifier "$.signal_name" value.signal_name in
   let* () = validate_identifier "$.request_id" value.request_id in
   let* input = payloads_json value.input in
@@ -563,7 +571,7 @@ let decode_signal_response input : (signal_response, error) result =
 let encode_query_request (value : query_request) =
   let* () = validate_identifier "$.namespace" value.execution.namespace in
   let* () = validate_identifier "$.workflow_id" value.execution.workflow_id in
-  let* () = validate_identifier "$.run_id" value.execution.run_id in
+  let* () = validate_run_selector "$.run_id" value.execution.run_id in
   let* () = validate_identifier "$.query_type" value.query_type in
   let* input = payloads_json value.input in
   encode_object
@@ -667,7 +675,9 @@ let decode_update_outcome path json =
   | _ -> Error (invalid ~path:(path ^ ".kind") "unknown workflow update outcome kind")
 
 let encode_update_request (value : update_request) =
-  let* _execution = encode_execution "$.execution" value.execution in
+  let* () = validate_identifier "$.namespace" value.execution.namespace in
+  let* () = validate_identifier "$.workflow_id" value.execution.workflow_id in
+  let* () = validate_run_selector "$.run_id" value.execution.run_id in
   let* () = validate_identifier "$.update_id" value.update_id in
   let* () = validate_identifier "$.update_name" value.update_name in
   let* input = payloads_json value.input in
@@ -685,7 +695,7 @@ let encode_update_request (value : update_request) =
 let encode_poll_update_request (value : poll_update_request) =
   let* () = validate_identifier "$.namespace" value.execution.namespace in
   let* () = validate_identifier "$.workflow_id" value.execution.workflow_id in
-  let* () = validate_identifier "$.run_id" value.execution.run_id in
+  let* () = validate_run_selector "$.run_id" value.execution.run_id in
   let* () = validate_identifier "$.update_id" value.update_id in
   encode_object
     (`Assoc
@@ -710,11 +720,16 @@ let decode_update_response ~(request : update_request) input =
   else
     let* execution_json = field "$" "execution" entries in
     let* execution = decode_execution "$.execution" execution_json in
+    (* A current-run request (empty run ID) adopts the concrete run Temporal
+       resolved; an exact request must be answered for that run. *)
+    let expected_run =
+      if String.equal request.execution.run_id "" then None
+      else Some request.execution.run_id
+    in
     let* () =
       validate_execution_matches "$.execution"
         ~namespace:request.execution.namespace
-        ~workflow_id:request.execution.workflow_id
-        ~run_id:request.execution.run_id execution
+        ~workflow_id:request.execution.workflow_id ?run_id:expected_run execution
     in
     let* outcome = decode_optional_update_outcome "$" entries in
     Ok { update_id; execution; outcome }
@@ -901,17 +916,42 @@ let encode_client_error_json path = function
         (`Assoc
           [ ("kind", json_string "protocol"); ("code", json_string code) ])
 
-(** Parses one terminal exact-run response and verifies that the response
-    execution is the requested run before validating its outcome chain. *)
+(** Decodes the execution echoed by a wait response. Rust echoes the
+    request unchanged, so the run ID is empty exactly when the request
+    selected the current run: Temporal's history response does not name the
+    run it resolved. The echo must equal the request field for field. *)
+let decode_waited_execution ~(request : wait_request) json =
+  let path = "$.execution" in
+  let* entries = exact_object path [ "namespace"; "workflow_id"; "run_id" ] json in
+  let* namespace_json = field path "namespace" entries in
+  let* namespace = identifier (path ^ ".namespace") namespace_json in
+  let* workflow_id_json = field path "workflow_id" entries in
+  let* workflow_id = identifier (path ^ ".workflow_id") workflow_id_json in
+  let* run_id_json = field path "run_id" entries in
+  let* run_id = string (path ^ ".run_id") run_id_json in
+  let* () = validate_run_selector (path ^ ".run_id") run_id in
+  if not (String.equal namespace request.namespace) then
+    Error
+      (invalid ~path:(path ^ ".namespace")
+         "response namespace does not match the requested execution")
+  else if not (String.equal workflow_id request.workflow_id) then
+    Error
+      (invalid ~path:(path ^ ".workflow_id")
+         "response workflow ID does not match the requested execution")
+  else if not (String.equal run_id request.run_id) then
+    Error
+      (invalid ~path:(path ^ ".run_id")
+         "response run ID does not match the requested execution")
+  else Ok { namespace; workflow_id; run_id }
+
+(** Parses one terminal wait response and verifies that the response
+    execution echoes the requested run selector before validating its outcome
+    chain. *)
 let decode_wait_response ~(request : wait_request) input =
   let* json = decode_object input in
   let* entries = exact_object "$" [ "execution"; "outcome" ] json in
   let* execution_json = field "$" "execution" entries in
-  let* execution = decode_execution "$.execution" execution_json in
-  let* () =
-    validate_execution_matches "$.execution" ~namespace:request.namespace
-      ~workflow_id:request.workflow_id ~run_id:request.run_id execution
-  in
+  let* execution = decode_waited_execution ~request execution_json in
   let* outcome_json = field "$" "outcome" entries in
   let* outcome = decode_outcome outcome_json in
   let* () = validate_wait_successor execution outcome in
