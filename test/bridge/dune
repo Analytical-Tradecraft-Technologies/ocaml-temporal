@@ -14,6 +14,14 @@
  (name test_ocaml_runtime_lifetime)
  (libraries temporal_core_bridge unix))
 
+; Seeded runtime/finalizer/supervisor cycles under GC pressure (#522).
+(test
+ (name test_ocaml_lifecycle_gc_stress)
+ (deps
+  (env_var LIFECYCLE_STRESS_SEED)
+  (env_var LIFECYCLE_STRESS_OCAML_CYCLES))
+ (libraries temporal_core_bridge temporal_sdk_supervisor))
+
 (test
  (name test_ocaml_response_buffers)
  (libraries temporal_core_bridge))
