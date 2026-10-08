@@ -109,7 +109,7 @@ jobs:
       - name: Test matrix selection and artifact failure cases
         run: make test-ci-artifacts
       - name: Install pinned quality tools
-        uses: taiki-e/install-action@861a07ce7084f55488e375df125cdc99bba60eb7 # v2.87.23
+        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2.87.24
         with:
           tool: cargo-deny@0.20.2,cargo-machete@0.9.2,typos@1.48.0
           fallback: none
@@ -300,6 +300,25 @@ jobs:
         env:
           OCAML_VERSION: ${{ matrix.ocaml }}
         run: make docs
+      # `make verify` already enforces the replay history corpus on every
+      # matrix leg through `dune runtest`. One leg reruns the same offline
+      # runner (seconds, reusing the build) to retain the machine-readable
+      # report that Core pin and Dependabot Cargo PRs cite as upgrade
+      # evidence; it also runs after a failed verify so a mismatch is
+      # recorded per case.
+      - name: Write the replay history corpus upgrade report
+        if: ${{ !cancelled() && matrix.runner == 'ubuntu-24.04' && matrix.ocaml == '5.5.1' }}
+        env:
+          OCAML_VERSION: ${{ matrix.ocaml }}
+        run: make test-history-corpus-upgrade HISTORY_CORPUS_SDK_COMMIT="$GITHUB_SHA"
+      - name: Upload the replay history corpus upgrade report
+        if: ${{ !cancelled() && matrix.runner == 'ubuntu-24.04' && matrix.ocaml == '5.5.1' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: history-corpus-report-linux-amd64-ocaml-${{ matrix.ocaml }}
+          path: _build/history-corpus/report.json
+          if-no-files-found: warn
+          retention-days: ${{ vars.RUST_BRIDGE_ARTIFACT_RETENTION_DAYS || '90' }}
       - name: Package and consume the compiled OCaml library
         env:
           OCAML_VERSION: ${{ matrix.ocaml }}
