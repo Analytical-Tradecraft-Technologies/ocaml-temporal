@@ -147,7 +147,11 @@ replay_history.exe --workflow-id order-1 order-1.pb \
 Every history is replayed and printed, as `PASS FILE workflow_id=ID` or
 `FAIL FILE workflow_id=ID: DIAGNOSTIC`, followed by a summary line. The
 diagnostic starts with the failure kind from `Temporal.Replay.failure_message`.
-The process exits with the status of the first failing history in
+Each record is exactly one line: in `FILE`, `ID`, the diagnostic and usage
+errors, a backslash is printed as `\\`, newline, carriage return and tab as
+`\n`, `\r` and `\t`, and any other control character as `\xHH`, so a path or
+message containing line breaks cannot split a record or imitate another one.
+Other text, including UTF-8, is printed unchanged. The process exits with the status of the first failing history in
 command-line order:
 
 | Exit status | Meaning |

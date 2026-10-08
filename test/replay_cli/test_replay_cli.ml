@@ -69,7 +69,65 @@ let temporary_file contents =
       Out_channel.output_string channel contents);
   path
 
+(** Runs one case and fails unless it exits with [expected] and its output
+    is exactly [records] lines, one per history, followed by the summary
+    line, with no line that starts as a forged [PASS forged] record and every
+    string in [expect_output] present. This guards the one-line-per-history
+    format against line breaks in paths, IDs and diagnostics. *)
+let check_one_line_per_history ~name ~records ~expect_output ~expected program
+    arguments =
+  let code, output = run program arguments in
+  let lines =
+    String.split_on_char '\n' output
+    |> List.filter (fun line -> not (String.equal line ""))
+  in
+  let forged =
+    List.exists (String.starts_with ~prefix:"PASS forged") lines
+  in
+  let missing =
+    List.filter (fun needle -> not (contains output needle)) expect_output
+  in
+  if
+    code <> expected
+    || List.length lines <> records + 1
+    || forged || missing <> []
+    || String.contains output '\r'
+  then
+    failwith
+      (Printf.sprintf
+         "%s: expected exit %d and %d record lines, got exit %d and %d lines; \
+          missing %s; output:\n\
+          %s"
+         name expected records code (List.length lines)
+         (String.concat ", " missing)
+         output);
+  Printf.printf "ok %s\n%!" name
+
+(** Checks the escaping function directly, independent of what Core or the
+    platform's argument passing does to control characters. *)
+let test_escape () =
+  let cases =
+    [
+      ("plain text", "plain text");
+      ("na\xc3\xafve", "na\xc3\xafve");
+      ("a\nPASS b", "a\\nPASS b");
+      ("a\r\nb\tc", "a\\r\\nb\\tc");
+      ("back\\slash", "back\\\\slash");
+      ("bell\007del\127", "bell\\x07del\\x7f");
+    ]
+  in
+  List.iter
+    (fun (input, expected) ->
+      let actual = Replay_command.escape input in
+      if not (String.equal actual expected) then
+        failwith
+          (Printf.sprintf "escape %S: expected %S, got %S" input expected
+             actual))
+    cases;
+  print_endline "ok escape"
+
 let () =
+  test_escape ();
   let not_history = temporary_file "this is not a History protobuf" in
   let empty = temporary_file "" in
   let missing = Filename.concat (Filename.get_temp_dir_name ()) "replay-cli-missing.pb" in
@@ -132,6 +190,16 @@ let () =
         ~expect_output:[ ": workflow task failed" ]
         altered
         [ "failing"; "--workflow-id"; workflow_id; history ];
+      check_one_line_per_history ~name:"multi-line diagnostic" ~records:2
+        ~expected:2
+        ~expect_output:[ ": workflow task failed"; "\\nPASS forged.pb" ]
+        altered
+        [ "multiline"; "--workflow-id"; workflow_id; history; history ];
+      check_one_line_per_history ~name:"multi-line workflow id" ~records:1
+        ~expected:0
+        ~expect_output:[ "workflow_id=first\\nPASS forged" ]
+        example
+        [ "--workflow-id"; "first\nPASS forged"; history ];
       check ~name:"replay could not run" ~expected:5
         ~expect_output:[ ": replay error: duplicate workflow registration" ]
         altered

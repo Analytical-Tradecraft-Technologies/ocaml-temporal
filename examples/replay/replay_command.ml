@@ -206,14 +206,44 @@ let check ~namespace ~task_queue ~workflows { path; workflow_id } =
               ( failure_status failure,
                 Some (Temporal.Replay.failure_message failure) )))
 
+(** Makes [value] safe to embed in one output line. File paths, workflow IDs
+    and diagnostics come from the command line, the history, or workflow code
+    and may contain line breaks; printed raw, they would split a record across
+    lines or forge an extra [PASS]/[FAIL] record. A backslash becomes [\\],
+    newline, carriage return and tab become [\n], [\r] and [\t], and every
+    other ASCII control byte (including DEL) becomes [\xHH]. All other bytes,
+    including UTF-8 text, are kept as they are so ordinary output stays
+    readable. *)
+let escape value =
+  let needs_escape = function
+    | '\\' | '\000' .. '\031' | '\127' -> true
+    | _ -> false
+  in
+  if not (String.exists needs_escape value) then value
+  else
+    let buffer = Buffer.create (String.length value + 16) in
+    String.iter
+      (function
+        | '\\' -> Buffer.add_string buffer "\\\\"
+        | '\n' -> Buffer.add_string buffer "\\n"
+        | '\r' -> Buffer.add_string buffer "\\r"
+        | '\t' -> Buffer.add_string buffer "\\t"
+        | ('\000' .. '\031' | '\127') as control ->
+            Buffer.add_string buffer
+              (Printf.sprintf "\\x%02x" (Char.code control))
+        | character -> Buffer.add_char buffer character)
+      value;
+    Buffer.contents buffer
+
 (** Replays every input in [options] in order, prints one line per history on
     standard output, and returns the process exit status. Lines have the
     stable form [PASS FILE workflow_id=ID] or
     [FAIL FILE workflow_id=ID: DIAGNOSTIC], where [DIAGNOSTIC] starts with the
-    failure kind printed by {!Temporal.Replay.failure_message}. A final
-    summary line counts the results. Diagnostics never contain payload bytes,
-    but they can name workflow, activity, and timer identifiers recorded in
-    the history. *)
+    failure kind printed by {!Temporal.Replay.failure_message}. Every dynamic
+    field is passed through {!escape}, so each record is exactly one line. A
+    final summary line counts the results. Diagnostics never contain payload
+    bytes, but they can name workflow, activity, and timer identifiers
+    recorded in the history. *)
 let run ~workflows { namespace; task_queue; inputs } =
   let results =
     List.map
@@ -221,11 +251,11 @@ let run ~workflows { namespace; task_queue; inputs } =
         let status, diagnostic = check ~namespace ~task_queue ~workflows input in
         (match diagnostic with
         | None ->
-            Printf.printf "PASS %s workflow_id=%s\n%!" input.path
-              input.workflow_id
+            Printf.printf "PASS %s workflow_id=%s\n%!" (escape input.path)
+              (escape input.workflow_id)
         | Some diagnostic ->
-            Printf.printf "FAIL %s workflow_id=%s: %s\n%!" input.path
-              input.workflow_id diagnostic);
+            Printf.printf "FAIL %s workflow_id=%s: %s\n%!" (escape input.path)
+              (escape input.workflow_id) (escape diagnostic));
         status)
       inputs
   in
@@ -247,8 +277,8 @@ let run_command ~program ~workflows arguments =
       print_string (usage program);
       Exit_status.ok
   | Usage_error message ->
-      Printf.eprintf "%s: %s\nRun %s --help for usage.\n%!" program message
-        program;
+      Printf.eprintf "%s: %s\nRun %s --help for usage.\n%!" (escape program)
+        (escape message) (escape program);
       Exit_status.usage
   | Run options -> run ~workflows options
 

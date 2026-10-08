@@ -8,6 +8,9 @@
       replaying a history that recorded [TimerStarted] is a nondeterminism.
     - [failing]: the workflow returns a defect, which fails the replayed
       workflow task.
+    - [multiline]: like [failing], but the defect message contains line
+      breaks and a forged [PASS] record, to check that output escaping keeps
+      one line per history.
     - [duplicate]: the same workflow is registered twice, an invalid
       registration that prevents the replay from running at all. *)
 
@@ -35,6 +38,13 @@ let without_timer name =
 let always_defect _name =
   Error (Temporal.Error.defect ~message:"altered example workflow defect")
 
+(** A defect whose message spans several lines and imitates a passing
+    record, as hostile or careless workflow code could produce. *)
+let multiline_defect _name =
+  Error
+    (Temporal.Error.defect
+       ~message:"first line\r\nPASS forged.pb workflow_id=forged\nlast line")
+
 (** Defines a workflow under the example's type name and codecs, so the
     recorded history selects it during replay. *)
 let as_example implementation =
@@ -45,6 +55,8 @@ let as_example implementation =
 let workflows = function
   | "nondeterministic" -> Some [ Temporal.Replay.workflow (as_example without_timer) ]
   | "failing" -> Some [ Temporal.Replay.workflow (as_example always_defect) ]
+  | "multiline" ->
+      Some [ Temporal.Replay.workflow (as_example multiline_defect) ]
   | "duplicate" ->
       Some
         [

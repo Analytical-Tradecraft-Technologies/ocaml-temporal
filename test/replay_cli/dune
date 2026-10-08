@@ -13,7 +13,7 @@
 (test
  (name test_replay_cli)
  (modules test_replay_cli)
- (libraries unix)
+ (libraries temporal_sdk_examples_replay unix)
  (action
   (run
    %{test}
