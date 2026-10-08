@@ -78,12 +78,31 @@ let describe = function
   | Ok () -> "Ok"
   | Error failure -> R.failure_message failure
 
-(** Requires a [Nondeterminism] result with a non-empty Core description. *)
-let expect_nondeterminism label result =
+(** Requires a [Nondeterminism] result with a non-empty Core description and,
+    when given, the recorded event and produced command Core named. Every
+    nondeterminism result here replays a [task-failure-body] history, so the
+    workflow context is checked too. *)
+let expect_nondeterminism ?event ?command label result =
   match result with
-  | Error (R.Nondeterminism { run_id; message }) ->
-      if run_id = "" || message = "" then
-        failwith (label ^ ": nondeterminism diagnostic is empty")
+  | Error (R.Nondeterminism { run_id; message; mismatch }) ->
+      if run_id = "" || message = "" || mismatch.reason = "" then
+        failwith (label ^ ": nondeterminism diagnostic is empty");
+      if mismatch.workflow_id <> "task-failure-body" then
+        failwith (label ^ ": wrong workflow ID " ^ mismatch.workflow_id);
+      if mismatch.workflow_type <> Some (workflow_type "body") then
+        failwith (label ^ ": missing workflow type");
+      Option.iter
+        (fun (id, event_type) ->
+          if
+            mismatch.event_id <> Some id
+            || mismatch.event_type <> Some event_type
+          then failwith (label ^ ": unexpected event in " ^ mismatch.reason))
+        event;
+      Option.iter
+        (fun command ->
+          if mismatch.command <> Some command then
+            failwith (label ^ ": unexpected command in " ^ mismatch.reason))
+        command
   | _ -> failwith (label ^ ": expected nondeterminism, got " ^ describe result)
 
 (** Requires a [Workflow_task_failed] result. *)
@@ -127,14 +146,30 @@ let test_compatible_histories () =
        ~workflows:[ R.workflow (business "business-permanent" true) ]
        (history "business-permanent"))
 
-(** Changed command sequences are reported as nondeterminism. *)
+(** An incompatible change: a second timer after the recorded one, so the
+    code produces a timer where the history recorded the workflow's
+    completion. *)
+let extra_timer name =
+  define name (fun () ->
+      let open Temporal.Result_syntax in
+      let* () = Temporal.Workflow.sleep (Temporal.Duration.of_ms 100L) in
+      let* () = Temporal.Workflow.sleep (Temporal.Duration.of_ms 100L) in
+      Ok "recovered")
+
+(** Changed command sequences are reported as nondeterminism that names the
+    recorded event and the command the changed code produced instead. *)
 let test_incompatible_changes () =
-  expect_nondeterminism "timer removed"
+  expect_nondeterminism "timer removed" ~event:(5L, "TimerStarted")
+    ~command:"Complete workflow"
     (R.replay ~workflows:[ R.workflow (timer_removed "body") ] (history "body"));
   expect_nondeterminism "activity instead of timer"
+    ~event:(5L, "TimerStarted") ~command:"Activity"
     (R.replay
        ~workflows:[ R.workflow (activity_instead_of_timer "body") ]
-       (history "body"))
+       (history "body"));
+  expect_nondeterminism "extra timer"
+    ~event:(16L, "WorkflowExecutionCompleted") ~command:"Timer"
+    (R.replay ~workflows:[ R.workflow (extra_timer "body") ] (history "body"))
 
 (** Failing workflow code and a missing registration are task failures,
     distinct from nondeterminism and from invalid input. *)

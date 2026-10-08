@@ -170,7 +170,7 @@ text:
 | Signal | Public result |
 | --- | --- |
 | Finalization succeeds with no refusal recorded | `Ok ()` |
-| `Remove_from_cache` with reason `Nondeterminism` | `Nondeterminism { run_id; message }` with Core's mismatch text |
+| `Remove_from_cache` with reason `Nondeterminism` | `Nondeterminism { run_id; message; mismatch }` with Core's mismatch text |
 | A completion carrying `task_failure`, an adapter rejection that retired its lease (for example an unregistered workflow type), or eviction reason `Lang_fail`/`Unhandled_command` | `Workflow_task_failed` |
 | `Feed_replay_history` returns `PROTOCOL`, or eviction reason `Fatal` | `Invalid_history` with the bridge's constant category message |
 | A replay activation the OCaml protocol cannot represent (poll `PROTOCOL`) | `Unsupported_history` |
@@ -181,6 +181,49 @@ message is truncated to 4,096 bytes on a UTF-8 boundary. Core's
 nondeterminism text names history events and command kinds, not payloads.
 Core also logs each failed workflow task at `WARN` through the runtime's
 standard-error logger, as it does for a live worker.
+
+### Nondeterminism diagnostics
+
+The verdict above never depends on text, but a developer still needs to know
+which workflow, event, and command diverged. `Nondeterminism` therefore also
+carries a `mismatch` record (#529):
+
+| Field | Source |
+| --- | --- |
+| `workflow_id` | The ID passed to `History.of_protobuf` |
+| `workflow_type` | The `Initialize_workflow` job Core delivered for the run, before any eviction |
+| `event_id`, `event_type` | Core's `HistoryEvent(id: N, Type)` rendering of the first unmatched recorded event |
+| `command` | The `<M> machine does not handle this event` / `cannot handle this event` state machine Core names, normally the command the changed code produced |
+| `reason` | The `message` field of the failure inside Core's `Debug` envelope, or the whole message without an envelope |
+
+At the pinned Core revision a mismatch reaches the eviction as the `Debug`
+rendering of the workflow-task failure, for example `Workflow activation
+completion failed: Failure { failure: Some(Failure { message: "[TMPRL1100]
+Nondeterminism error: Complete workflow machine does not handle this event:
+HistoryEvent(id: 5, TimerStarted)", ... }), force_cause:
+NonDeterministicError }`. This wording is not a protocol, so extraction is
+best effort and fails closed: every field that Core's text does not supply in
+the expected shape is `None`, and `message` still carries the complete bounded
+text. For example, Core reports a recorded patch marker that no `patched` call
+claimed as `Non-deprecated patch marker encountered for change <id>, but
+there is no corresponding change command!`, with no event ID or command, and
+those fields stay `None`. Core reports no OCaml source location, so none is
+offered. A Core upgrade must recheck these shapes with the replay diagnostics
+test below.
+
+`failure_message` keeps its `nondeterminism (run RUN_ID): ` prefix and then
+renders the workflow type and ID, `recorded event N (Type) does not match the
+current code's M command` when both are known, Core's `reason`, and a reminder
+to guard intentional changes with `Temporal.Workflow.patched`. The line never
+includes payload bytes because Core's text names event and command kinds,
+not payloads.
+
+A live worker needs no SDK change to surface the same mismatch. Core fails the
+workflow task with cause `NonDeterministicError` and the same `[TMPRL1100]`
+message, which the Temporal UI and `temporal workflow show` display on the
+`WorkflowTaskFailed` event, and logs it at `WARN` with the run ID through the
+runtime logger. The run stays open and the server retries the workflow task
+until compatible code is deployed.
 
 The Temporal CLI exports histories as protobuf JSON. The pinned Core revision
 derives a Rust-specific JSON form instead of accepting that one, so the public
@@ -308,7 +351,20 @@ unregistered type are `Workflow_task_failed`; non-protobuf, truncated, and
 event-free inputs are `Invalid_history`; invalid registrations and options are
 `Replay_error`; and 140 alternating successful and nondeterministic replays,
 more than OCaml's 128 simultaneous Domains, prove that each call releases its
-supervisor Domain and native graph.
+supervisor Domain and native graph. Its nondeterminism cases also assert the
+`mismatch` fields: a removed timer is event 5 `TimerStarted` against a
+`Complete workflow` command, an activity in its place is the same event
+against an `Activity` command, and an added second timer is event 16
+`WorkflowExecutionCompleted` against a `Timer` command.
+
+[`test_replay_diagnostics.ml`](../../test/bridge/test_replay_diagnostics.ml)
+replays the [history corpus](history-corpus.md)'s two negative controls
+through the public API. `negative-timer-removed` must report workflow type
+`corpus.timer`, workflow ID `history-corpus-timer`, event 5 `TimerStarted`,
+command `Complete workflow`, and Core's exact reason, on one
+`failure_message` line without the recorded result payload.
+`negative-patch-active-on-legacy` must name the patch ID while leaving the
+event and command `None`, because Core's text has neither.
 
 Beneath that API, the bridge remains **unit-tested native and supervisor
 plumbing** for the private replay handle. The Rust ABI exports,

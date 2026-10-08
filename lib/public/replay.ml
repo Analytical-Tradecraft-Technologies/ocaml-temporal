@@ -94,17 +94,222 @@ module History = struct
   let workflow_id history = history.workflow_id
 end
 
+type mismatch = {
+  workflow_id : string;
+  workflow_type : string option;
+  event_id : int64 option;
+  event_type : string option;
+  command : string option;
+  reason : string;
+}
+
 type failure =
-  | Nondeterminism of { run_id : string; message : string }
+  | Nondeterminism of {
+      run_id : string;
+      message : string;
+      mismatch : mismatch;
+    }
   | Workflow_task_failed of { run_id : string option; message : string }
   | Invalid_history of { message : string }
   | Unsupported_history of { message : string }
   | Replay_error of Error.t
 
+(** Best-effort reading of Temporal Core's nondeterminism text.
+
+    Core reports a replay mismatch as an eviction message whose shape is not a
+    protocol: at the pinned revision it is the Rust [Debug] rendering of the
+    workflow-task failure, [Workflow activation completion failed: Failure {
+    failure: Some(Failure { message: "[TMPRL1100] Nondeterminism error: <M>
+    machine does not handle this event: HistoryEvent(id: <N>, <Type>)", ...
+    }), force_cause: NonDeterministicError }]. Every extraction below is
+    therefore optional and falls back to "not reported" rather than guessing,
+    so a future Core wording change degrades the structured fields to [None]
+    while the complete message is still delivered unchanged. The input is
+    already bounded by [bounded], so every scan covers at most a few
+    kilobytes. *)
+module Core_text = struct
+  (** Returns the first index where [needle] starts in [text], or [None]. *)
+  let find text needle =
+    let text_length = String.length text in
+    let needle_length = String.length needle in
+    let rec loop index =
+      if index + needle_length > text_length then None
+      else if String.sub text index needle_length = needle then Some index
+      else loop (index + 1)
+    in
+    loop 0
+
+  (** Decodes the Rust [Debug] string literal whose contents start at
+      [start], stopping at its closing quote or at the end of [text] when a
+      bounded message cut the literal short. The simple escapes Rust emits
+      are decoded; line breaks become spaces so the result stays on one line;
+      any other escape (such as [\u{...}]) is kept as written. *)
+  let debug_string text start =
+    let length = String.length text in
+    let buffer = Buffer.create 160 in
+    let rec loop index =
+      if index < length then
+        match text.[index] with
+        | '"' -> ()
+        | '\\' when index + 1 < length -> (
+            match text.[index + 1] with
+            | ('"' | '\\' | '\'') as character ->
+                Buffer.add_char buffer character;
+                loop (index + 2)
+            | 'n' | 'r' | 't' ->
+                Buffer.add_char buffer ' ';
+                loop (index + 2)
+            | _ ->
+                Buffer.add_char buffer '\\';
+                loop (index + 1))
+        | character ->
+            Buffer.add_char buffer character;
+            loop (index + 1)
+    in
+    loop start;
+    Buffer.contents buffer
+
+  (** Core's own mismatch sentence: the [message] field of the first failure
+      in the [Debug] envelope, or the whole text when there is no envelope. *)
+  let reason message =
+    let field = "message: \"" in
+    match find message field with
+    | None -> message
+    | Some index -> (
+        match debug_string message (index + String.length field) with
+        | "" -> message
+        | reason -> reason)
+
+  (** Returns the longest prefix of [text] starting at [start] whose
+      characters satisfy [accept], as [(value, next_index)]. *)
+  let span text start accept =
+    let length = String.length text in
+    let rec stop index =
+      if index < length && accept text.[index] then stop (index + 1) else index
+    in
+    let next = stop start in
+    (String.sub text start (next - start), next)
+
+  (** Parses Core's [HistoryEvent(id: <N>, <Type>)] display of the event it
+      could not match. The type is kept only when it is a plain identifier
+      followed by the closing parenthesis. *)
+  let event reason =
+    let marker = "HistoryEvent(id: " in
+    match find reason marker with
+    | None -> (None, None)
+    | Some index -> (
+        let digits, next =
+          span reason (index + String.length marker) (function
+            | '0' .. '9' -> true
+            | _ -> false)
+        in
+        match Int64.of_string_opt digits with
+        | None -> (None, None)
+        | Some id ->
+            let event_type =
+              if
+                next + 2 <= String.length reason
+                && String.sub reason next 2 = ", "
+              then
+                let name, after =
+                  span reason (next + 2) (function
+                    | 'A' .. 'Z' | 'a' .. 'z' | '0' .. '9' | '_' -> true
+                    | _ -> false)
+                in
+                if
+                  name <> "" && after < String.length reason
+                  && reason.[after] = ')'
+                then Some name
+                else None
+              else None
+            in
+            (Some id, event_type))
+
+  (** Parses the state machine Core names in ["<M> machine does not handle
+      this event"] or ["<M> machine cannot handle this event"], the two
+      wordings Core's command state machines use. The name must directly
+      follow Core's ["Nondeterminism error: "] prefix and consist of words,
+      so unrelated sentences that merely contain the word "machine" yield
+      [None]. *)
+  let command reason =
+    let prefix = "Nondeterminism error: " in
+    match find reason prefix with
+    | None -> None
+    | Some index ->
+        let start = index + String.length prefix in
+        let name, next =
+          span reason start (function
+            | 'A' .. 'Z' | 'a' .. 'z' | ' ' -> true
+            | _ -> false)
+        in
+        let rest = String.sub reason next (String.length reason - next) in
+        let ends_with_machine suffix =
+          String.length name > String.length suffix
+          && String.ends_with ~suffix name
+        in
+        (* [span] stops at the colon after "this event", so [name] is
+           "<M> machine does not handle this event" when the shape matches. *)
+        let strip suffix =
+          String.sub name 0 (String.length name - String.length suffix)
+        in
+        if not (String.starts_with ~prefix:":" rest) then None
+        else if ends_with_machine " machine does not handle this event" then
+          Some (strip " machine does not handle this event")
+        else if ends_with_machine " machine cannot handle this event" then
+          Some (strip " machine cannot handle this event")
+        else None
+end
+
+(** Builds the structured view of one bounded Core nondeterminism message. *)
+let mismatch_of_message ~workflow_id ~workflow_type message =
+  let reason = Core_text.reason message in
+  let event_id, event_type = Core_text.event reason in
+  {
+    workflow_id;
+    workflow_type;
+    event_id;
+    event_type;
+    command = Core_text.command reason;
+    reason;
+  }
+
+(** Renders the actionable part of a nondeterminism line: which workflow,
+    where it diverged when Core said so, Core's own sentence, and the fix for
+    an intentional change. Absent fields are omitted, never invented. *)
+let describe_mismatch mismatch =
+  let workflow =
+    match mismatch.workflow_type with
+    | Some workflow_type ->
+        Printf.sprintf "workflow %s (ID %s)" workflow_type mismatch.workflow_id
+    | None -> Printf.sprintf "workflow ID %s" mismatch.workflow_id
+  in
+  let event =
+    match (mismatch.event_id, mismatch.event_type) with
+    | Some id, Some event_type ->
+        Some (Printf.sprintf "recorded event %Ld (%s)" id event_type)
+    | Some id, None -> Some (Printf.sprintf "recorded event %Ld" id)
+    | None, _ -> None
+  in
+  let location =
+    match (event, mismatch.command) with
+    | Some event, Some command ->
+        Printf.sprintf ": %s does not match the current code's %s command"
+          event command
+    | Some event, None -> Printf.sprintf ": first mismatch at %s" event
+    | None, Some command ->
+        Printf.sprintf ": mismatch in the current code's %s command" command
+    | None, None -> ""
+  in
+  Printf.sprintf
+    "%s%s; Core: %s; guard intentional command changes with \
+     Temporal.Workflow.patched"
+    workflow location mismatch.reason
+
 (** Prefixes each diagnostic with a stable kind so CI output can be grepped. *)
 let failure_message = function
-  | Nondeterminism { run_id; message } ->
-      Printf.sprintf "nondeterminism (run %s): %s" run_id message
+  | Nondeterminism { run_id; mismatch; message = _ } ->
+      Printf.sprintf "nondeterminism (run %s): %s" run_id
+        (describe_mismatch mismatch)
   | Workflow_task_failed { run_id = Some run_id; message } ->
       Printf.sprintf "workflow task failed (run %s): %s" run_id message
   | Workflow_task_failed { run_id = None; message } ->
@@ -149,9 +354,17 @@ let native_failure operation error =
 
 (** Eviction reasons that mean Core refused the replayed run. Other reasons
     (cache pressure, a requested eviction, or the end of the history) are
-    normal replay housekeeping. *)
-let classify_eviction ~run_id ~message = function
-  | Protocol.Nondeterminism -> Some (Nondeterminism { run_id; message })
+    normal replay housekeeping. [workflow_id] and [workflow_type] are the
+    context the SDK adds to a nondeterminism diagnostic. *)
+let classify_eviction ~workflow_id ~workflow_type ~run_id ~message = function
+  | Protocol.Nondeterminism ->
+      Some
+        (Nondeterminism
+           {
+             run_id;
+             message;
+             mismatch = mismatch_of_message ~workflow_id ~workflow_type message;
+           })
   | Protocol.Fatal -> Some (Invalid_history { message })
   | Protocol.Lang_fail | Protocol.Unhandled_command ->
       Some (Workflow_task_failed { run_id = Some run_id; message })
@@ -165,9 +378,16 @@ let classify_eviction ~run_id ~message = function
     the supervisor's replay operations and records the first refusal; it
     never alters an activation or completion. *)
 module Source = struct
-  type t = { native : Supervisor.t; mutable verdict : failure option }
-  (** One replay's supervisor and its first observed refusal. Owned by the
-      calling thread; the adapter's mutex serializes access. *)
+  type t = {
+    native : Supervisor.t;
+    workflow_id : string;
+    mutable workflow_type : string option;
+    mutable verdict : failure option;
+  }
+  (** One replay's supervisor, the replayed history's workflow ID, the
+      workflow type Core delivered in the run's start job (once seen), and
+      the first observed refusal. Owned by the calling thread; the adapter's
+      mutex serializes access. *)
 
   type error = Supervisor.error
 
@@ -175,18 +395,25 @@ module Source = struct
   let record source failure =
     if Option.is_none source.verdict then source.verdict <- Some failure
 
-  (** Takes one replay activation and records a refusing eviction before the
-      adapter acknowledges it. *)
+  (** Takes one replay activation, remembers the recorded workflow type from
+      its start job, and records a refusing eviction before the adapter
+      acknowledges it. Jobs are visited in Core's order, so a start job is
+      seen before any eviction of the same run. *)
   let try_poll_workflow source =
     let result = Supervisor.perform source.native Supervisor.Try_poll_replay_workflow in
     (match result with
     | Ok (Some (activation : Protocol.activation)) ->
         List.iter
           (function
+            | Protocol.Initialize_workflow { workflow_type; _ } ->
+                if Option.is_none source.workflow_type then
+                  source.workflow_type <- Some (bounded workflow_type)
             | Protocol.Remove_from_cache { message; reason } ->
                 Option.iter (record source)
-                  (classify_eviction ~run_id:activation.run_id
-                     ~message:(bounded message) reason)
+                  (classify_eviction ~workflow_id:source.workflow_id
+                     ~workflow_type:source.workflow_type
+                     ~run_id:activation.run_id ~message:(bounded message)
+                     reason)
             | _ -> ())
           activation.jobs
     | Ok None | Error _ -> ());
@@ -324,7 +551,14 @@ let feed native (history : History.t) =
 (** Runs one replay inside an already created supervisor. *)
 let run_replay ~native ~config ~runner_slot ~namespace ~task_queue ~workflows
     history =
-  let source = { Source.native; verdict = None } in
+  let source =
+    {
+      Source.native;
+      workflow_id = History.workflow_id history;
+      workflow_type = None;
+      verdict = None;
+    }
+  in
   match
     Runner.create ~task_queue ~namespace ~supervisor:source ~workflows ()
   with
