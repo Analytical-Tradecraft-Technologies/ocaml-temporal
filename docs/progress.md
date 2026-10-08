@@ -3034,3 +3034,42 @@ asynchronous activities, Nexus and visibility are not simulated.
 retries, error propagation, child workflows, signals, queries, updates,
 cancellation, continue-as-new, external signals, local activities and
 reproducibility; `examples/testing` tests the example application's workflow.
+
+## 2026-10-08: Versioned replay history corpus (#518)
+
+The repository now has a versioned replay corpus, the seed for #503's
+compatibility gate. `test/fixtures/history-corpus/manifest.json` (schema
+[`manifest.schema.json`](schemas/history-corpus/manifest.schema.json)) indexes
+21 replay cases over 17 histories. Each history records its provenance
+(producing SDK commit, Core pin, digest-pinned Temporal Server image, capture
+command and date), its SHA-256 checksums, the frozen definition set to replay
+it against, and the expected verdict. Eleven histories were captured live for
+this corpus (Temporal Server 1.32.0, Core `95e97686`, OCaml 5.4.1). Together
+they cover activity success, a timer, activity retry, signal/update/query
+interaction, a parent and its child, both runs of a continue-as-new, and
+marker-free, active and deprecated patch histories. Five retained #511
+workflow-task failure histories and the synthetic #694 initial-signals history
+are copied byte for byte with their original provenance. The other entries
+reuse these histories. Two are compatibility cases: a marker-free history on
+the patched generation, and an active marker on the deprecated generation. Two
+are negative controls: the timer workflow without its timer, and a patched
+history on the pre-patch generation.
+
+`test/history_corpus/test_history_corpus.ml` is an ordinary Dune test, so
+`make test` and the native jobs gate it without Docker. The test checks the
+manifest schema, checksums, references and orphaned files, and it requires
+every promised feature tag to have coverage. It then replays every entry
+through the private Core replay path (a fresh supervisor and the production
+workflow adapter) against frozen public-API definitions. A `replays_ok` entry
+must report the recorded run ID and workflow type and finalize naturally. A
+negative control must produce Core's `[TMPRL1100]` nondeterminism eviction.
+Mutation checks confirmed that a changed checksum, an orphaned file, an
+unknown member, a missing feature, a wrong run ID, incompatible definitions and
+a flipped expectation each fail the gate. `make history-corpus-capture` runs
+`history_corpus_capture.exe` for three worker generations against the
+Compose stack, exports each run with the pinned Temporal CLI, encodes the
+JSON as protobuf, and stages it for append-only installation. A second capture
+reproduced all eleven cases. See the
+[history corpus reference](reference/history-corpus.md) for the rules and the
+remaining scope (#524 runs the corpus across upgrades; #515 adds a public
+runner).

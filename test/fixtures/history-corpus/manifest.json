@@ -1,0 +1,488 @@
+{
+  "schema": "ocaml-temporal/history-corpus/v1",
+  "captures": {
+    "live-2026-10-08": {
+      "kind": "live",
+      "captured_on": "2026-10-08",
+      "sdk_commit": "4cf43eabd024b1b7ce74d9c64de31aa541a750e5",
+      "sdk_tree_dirty": true,
+      "core_revision": "95e97686a079dcfe6c42e3254b2f3f5e3d97408f",
+      "temporal_server_image": "temporalio/server:1.32.0@sha256:c3e752127759616bb1615e0f9ba0e21635aeb5fdeb922de4f371c350955f46ae",
+      "temporal_cli_image": "temporalio/admin-tools:1.32.0@sha256:a9f84fb9a374b2374fe2e67c8efc0468ff3f1c66c8a0b14597ec86e349e62bca",
+      "worker_toolchains": [
+        "OCaml 5.4.1 (Unix)"
+      ],
+      "capture_command": "make temporal-start; HISTORY_CORPUS_RUN='env TEMPORAL_ADDRESS=http://127.0.0.1:7233 TEMPORAL_NAMESPACE=temporal-sdk-test _build/default/test/history_corpus/capture/history_corpus_capture.exe' HISTORY_CORPUS_TEMPORAL_CLI='docker compose ... run --rm --no-deps -T temporal-admin-tools temporal' sh test/history_corpus/scripts/capture-history-corpus.sh (native macOS arm64 worker; equivalent to make history-corpus-capture)",
+      "protobuf_export": {
+        "tool": "Python protobuf 6.33.6 json_format",
+        "descriptor_sha256": "aa0a3d968a421026e3a141b4faeea1d3609ddfe25e38683da05c5015321cbe9d",
+        "descriptor_source": "protoc --include_imports over the pinned Core temporal/api/history/v1/message.proto"
+      },
+      "notes": "Captured while seeding the corpus for #518. The worker and client ran natively on macOS arm64 against the Compose Temporal stack. The only tracked-file difference from sdk_commit was the new .gitignore entry; the SDK library sources matched sdk_commit, and the frozen corpus definitions were the ones committed with this corpus."
+    },
+    "task-failure-2026-09-20": {
+      "kind": "live",
+      "captured_on": "2026-09-20",
+      "sdk_commit": "beae10d0a58e58fb8e076734cd38113d7a2b4466",
+      "sdk_tree_dirty": true,
+      "core_revision": "95e97686a079dcfe6c42e3254b2f3f5e3d97408f",
+      "temporal_server_image": "temporalio/server:1.32.0@sha256:c3e752127759616bb1615e0f9ba0e21635aeb5fdeb922de4f371c350955f46ae",
+      "temporal_cli_image": "temporalio/admin-tools:1.32.0@sha256:a9f84fb9a374b2374fe2e67c8efc0468ff3f1c66c8a0b14597ec86e349e62bca",
+      "worker_toolchains": [
+        "OCaml 5.5.1 (Unix)"
+      ],
+      "capture_command": "make test-temporal-task-failure-live",
+      "protobuf_export": {
+        "tool": "Python protobuf 6.33.6 json_format",
+        "descriptor_sha256": "66f4545747106ff4da8f8a6917570673200c86383cebcb587a75b1c52f34f131",
+        "descriptor_source": "Cargo-generated temporalio-protos descriptor set at the pinned Core revision"
+      },
+      "source": "test/integration/temporal/task_failure/histories (copied byte-for-byte; manifest.json there records run IDs, binary hashes and the tracked source diff SHA-256 b08ddc6f9a7ab2aadb359b1aa766d9fb18bdb9796eeae26ec6f33ee1b73a5d6f)",
+      "notes": "Reused from the #511 workflow-task failure recovery gate (merged in b099fb6b). Replayed against the corrected generation."
+    },
+    "initial-signals-synthetic": {
+      "kind": "synthetic",
+      "captured_on": "2026-09-29",
+      "sdk_commit": "3e6b61ef15aba973ac68c1b5dc04127bc7919c61",
+      "core_revision": "95e97686a079dcfe6c42e3254b2f3f5e3d97408f",
+      "temporal_server_image": "none",
+      "capture_command": "hand-written test/integration/temporal/initial_signals/history.json, encoded with protoc --include_imports descriptors and Python protobuf json_format.ParseDict (see that directory's README.md)",
+      "source": "test/integration/temporal/initial_signals (history.json copied; the .pb is the base64-decoded history of history.replay.json)",
+      "notes": "Synthetic seven-event history from the #694 fix; not produced by a live server."
+    }
+  },
+  "entries": [
+    {
+      "id": "live-2026-10-08-patch-deprecated",
+      "purpose": "Deprecated generation records a deprecated patch marker.",
+      "features": [
+        "patch",
+        "patch-deprecated"
+      ],
+      "workflow_type": "corpus.patch",
+      "workflow_id": "history-corpus-patch-deprecated",
+      "run_id": "01a11a23-8069-75fa-bb4a-e100d132e01a",
+      "capture": "live-2026-10-08",
+      "generation": "corpus-v1-patch-deprecated",
+      "history": {
+        "protobuf": "histories/live-2026-10-08-patch-deprecated.pb",
+        "protobuf_sha256": "899219e6d9c0225d8ae0431a3b826027346950c28c6b4412bafc0ed421d8c6ac",
+        "json": "histories/live-2026-10-08-patch-deprecated.json",
+        "json_sha256": "7664b38ff9bddfb7acf874c7b7f1a5a0cf660fc5dd3980f4a6b3858fe63ec121"
+      },
+      "replay_definitions": "corpus-v1-patch-deprecated",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "live-2026-10-08-patch-marker-free",
+      "purpose": "Pre-patch generation; history has no patch marker.",
+      "features": [
+        "patch",
+        "patch-marker-free"
+      ],
+      "workflow_type": "corpus.patch",
+      "workflow_id": "history-corpus-patch-marker-free",
+      "run_id": "01a11a23-7c1b-7cdf-8c43-4f33887252e5",
+      "capture": "live-2026-10-08",
+      "generation": "corpus-v1-patch-legacy",
+      "history": {
+        "protobuf": "histories/live-2026-10-08-patch-marker-free.pb",
+        "protobuf_sha256": "03e0a2e69afd3bf39945e0e65ca1d704d8c4698fdc283f6225c1af9f348d94e4",
+        "json": "histories/live-2026-10-08-patch-marker-free.json",
+        "json_sha256": "dbbcf12f281517409c357bb0cd0b4c07d6cdcf6a2586915f2c83fe5b32a7f962"
+      },
+      "replay_definitions": "corpus-v1-patch-legacy",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "live-2026-10-08-activity",
+      "purpose": "One activity scheduled, started and completed.",
+      "features": [
+        "activity"
+      ],
+      "workflow_type": "corpus.activity",
+      "workflow_id": "history-corpus-activity",
+      "run_id": "01a11a23-88c9-74b5-b36e-6abd0ac3c75c",
+      "capture": "live-2026-10-08",
+      "generation": "corpus-v1",
+      "history": {
+        "protobuf": "histories/live-2026-10-08-activity.pb",
+        "protobuf_sha256": "6e77d3400a48591a23def3ec94760c94d37ab9b3378d8d7f611ef25551793549",
+        "json": "histories/live-2026-10-08-activity.json",
+        "json_sha256": "10f024f5878250f7b342d3593d8c527b722eaf61a5436c8331e8a2879b0c1977"
+      },
+      "replay_definitions": "corpus-v1",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "live-2026-10-08-timer",
+      "purpose": "One durable timer started and fired.",
+      "features": [
+        "timer"
+      ],
+      "workflow_type": "corpus.timer",
+      "workflow_id": "history-corpus-timer",
+      "run_id": "01a11a23-88ed-7d4a-bd17-721a837b08e5",
+      "capture": "live-2026-10-08",
+      "generation": "corpus-v1",
+      "history": {
+        "protobuf": "histories/live-2026-10-08-timer.pb",
+        "protobuf_sha256": "fe32c05828b95849703e8069bed5d14371fc2d52c449549056bb4b9996205bd5",
+        "json": "histories/live-2026-10-08-timer.json",
+        "json_sha256": "630c5c438289e1d1eec31da471681307ff92365a8eaae94bbcdd9d3d28c7dc82"
+      },
+      "replay_definitions": "corpus-v1",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "live-2026-10-08-activity-retry",
+      "purpose": "Activity fails its first attempt and succeeds on the policy retry.",
+      "features": [
+        "activity",
+        "activity-retry"
+      ],
+      "workflow_type": "corpus.activity_retry",
+      "workflow_id": "history-corpus-activity-retry",
+      "run_id": "01a11a23-8cf0-7237-9d97-a77a8751bb7a",
+      "capture": "live-2026-10-08",
+      "generation": "corpus-v1",
+      "history": {
+        "protobuf": "histories/live-2026-10-08-activity-retry.pb",
+        "protobuf_sha256": "fec015f6e939a63c91a8dc6171e8bcb7417a2a6baf29c486e8935a18e852fbf6",
+        "json": "histories/live-2026-10-08-activity-retry.json",
+        "json_sha256": "b5594f3edf57b4abb0948aedeeec23f4077fc86a786715b9be9188ef9466377e"
+      },
+      "replay_definitions": "corpus-v1",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "live-2026-10-08-interaction",
+      "purpose": "Signal and accepted update satisfy a parked condition; a query ran against the same run (queries leave no history events).",
+      "features": [
+        "signal",
+        "update",
+        "query",
+        "condition"
+      ],
+      "workflow_type": "corpus.interaction",
+      "workflow_id": "history-corpus-interaction",
+      "run_id": "01a11a23-90ff-78d5-ae6b-81654f0308b4",
+      "capture": "live-2026-10-08",
+      "generation": "corpus-v1",
+      "history": {
+        "protobuf": "histories/live-2026-10-08-interaction.pb",
+        "protobuf_sha256": "4e1b2321ba4ca94c0f1889c1936e8b331c9dd046f7701edeab570e9c446b30a5",
+        "json": "histories/live-2026-10-08-interaction.json",
+        "json_sha256": "ee33d9ef8307f8d20622ccac0e4dbae6cc1068a018c7de0f542c8adcec6aa83c"
+      },
+      "replay_definitions": "corpus-v1",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "live-2026-10-08-parent",
+      "purpose": "Parent starts one child and returns its result.",
+      "features": [
+        "child-workflow"
+      ],
+      "workflow_type": "corpus.parent",
+      "workflow_id": "history-corpus-parent",
+      "run_id": "01a11a23-913a-7be2-968d-11ad7518864c",
+      "capture": "live-2026-10-08",
+      "generation": "corpus-v1",
+      "history": {
+        "protobuf": "histories/live-2026-10-08-parent.pb",
+        "protobuf_sha256": "052daf50155b5ecf5aaee40bd5a455720b07da0fd4669f359b58097ce1d07e1f",
+        "json": "histories/live-2026-10-08-parent.json",
+        "json_sha256": "2ebf466919130c25224198ca18a274d8787942727487dff73701f76b3c9dcdfe"
+      },
+      "replay_definitions": "corpus-v1",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "live-2026-10-08-child",
+      "purpose": "Child run started by the parent.",
+      "features": [
+        "child-workflow",
+        "child-side"
+      ],
+      "workflow_type": "corpus.child",
+      "workflow_id": "history-corpus-child-corpus",
+      "run_id": "01a11a23-914a-75ec-b656-7254c2fecfb0",
+      "capture": "live-2026-10-08",
+      "generation": "corpus-v1",
+      "history": {
+        "protobuf": "histories/live-2026-10-08-child.pb",
+        "protobuf_sha256": "6d659e3a5418031b922814ad85abf869afce9481a251e2eb7548950e5d1fdb59",
+        "json": "histories/live-2026-10-08-child.json",
+        "json_sha256": "a765dcc4cafd995caf0f4eacea742ac8ed9360838a507578c45df559e493e297"
+      },
+      "replay_definitions": "corpus-v1",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "live-2026-10-08-continue-as-new-first",
+      "purpose": "First run ends with WorkflowExecutionContinuedAsNew.",
+      "features": [
+        "continue-as-new"
+      ],
+      "workflow_type": "corpus.continue_as_new",
+      "workflow_id": "history-corpus-continue-as-new",
+      "run_id": "01a11a23-916d-7983-82ee-1bf8bfd56dc4",
+      "capture": "live-2026-10-08",
+      "generation": "corpus-v1",
+      "history": {
+        "protobuf": "histories/live-2026-10-08-continue-as-new-first.pb",
+        "protobuf_sha256": "02587d60e7de06007e4da0cdc692585a758cbdfbf26c086a491963ce69f2b86d",
+        "json": "histories/live-2026-10-08-continue-as-new-first.json",
+        "json_sha256": "6e0d253e7ba8d4492a038e3fcf83b5d0a20793d4e8383b608cc9ec3f8cfbaadf"
+      },
+      "replay_definitions": "corpus-v1",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "live-2026-10-08-continue-as-new-second",
+      "purpose": "Successor run started by continue-as-new completes.",
+      "features": [
+        "continue-as-new",
+        "continue-as-new-successor"
+      ],
+      "workflow_type": "corpus.continue_as_new",
+      "workflow_id": "history-corpus-continue-as-new",
+      "run_id": "f779af44-096b-42f1-bf43-2da1df687b46",
+      "capture": "live-2026-10-08",
+      "generation": "corpus-v1",
+      "history": {
+        "protobuf": "histories/live-2026-10-08-continue-as-new-second.pb",
+        "protobuf_sha256": "2958a9924bd82683f07bba20095f9836cba6eda17b1c301d9a33002043623e58",
+        "json": "histories/live-2026-10-08-continue-as-new-second.json",
+        "json_sha256": "6f74aea6cf6a5c8172ce7e51a46a7b173749d9538437d5222f559f88fd21c391"
+      },
+      "replay_definitions": "corpus-v1",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "live-2026-10-08-patch-active",
+      "purpose": "Patched generation records an active patch marker.",
+      "features": [
+        "patch",
+        "patch-active"
+      ],
+      "workflow_type": "corpus.patch",
+      "workflow_id": "history-corpus-patch-active",
+      "run_id": "01a11a23-84b5-728d-b3a5-816493a01d16",
+      "capture": "live-2026-10-08",
+      "generation": "corpus-v1",
+      "history": {
+        "protobuf": "histories/live-2026-10-08-patch-active.pb",
+        "protobuf_sha256": "19036e87ce3fc75e8368e1e0cdd9e7f065cbfa0e580c9d24408b2e87b6880f99",
+        "json": "histories/live-2026-10-08-patch-active.json",
+        "json_sha256": "cf73558f4e2adfcec2b37605393c6003011ba0088909e3521b1dafc4a9e081ce"
+      },
+      "replay_definitions": "corpus-v1",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "task-failure-body",
+      "purpose": "Timer committed, then the workflow body raised; the corrected generation completes the same run.",
+      "features": [
+        "timer",
+        "workflow-task-failure-recovery"
+      ],
+      "workflow_type": "task-failure.body",
+      "workflow_id": "task-failure-body",
+      "run_id": "01a0be2f-c02c-77d6-9d48-0ae535904d59",
+      "capture": "task-failure-2026-09-20",
+      "history": {
+        "protobuf": "histories/task-failure-body.pb",
+        "protobuf_sha256": "411f720e5dbf2befe9fdd2389daa3c37bddcc74e0e2ef4e0de38a31d1898d646",
+        "json": "histories/task-failure-body.json",
+        "json_sha256": "ec6c570272024ec1f3e764a24a12df21b8187dcb2d01a0a4861557fa872b43bb"
+      },
+      "replay_definitions": "task-failure-corrected",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "task-failure-encoder",
+      "purpose": "Timer committed, then result encoding failed; the corrected generation completes the same run.",
+      "features": [
+        "timer",
+        "workflow-task-failure-recovery"
+      ],
+      "workflow_type": "task-failure.encoder",
+      "workflow_id": "task-failure-encoder",
+      "run_id": "01a0be2f-c033-7c8b-9adb-05c699a7b417",
+      "capture": "task-failure-2026-09-20",
+      "history": {
+        "protobuf": "histories/task-failure-encoder.pb",
+        "protobuf_sha256": "5489f6b26fd8c07b8895d8ccfd519979ede13761babe85fa3c16fa724f44d3ef",
+        "json": "histories/task-failure-encoder.json",
+        "json_sha256": "10372495ba7f9cdbb05e6d6fcf7cf01b2f923ee1466975266d32c13483a940d0"
+      },
+      "replay_definitions": "task-failure-corrected",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "task-failure-missing",
+      "purpose": "First task failed on a worker without the registration; the corrected generation completes the same run.",
+      "features": [
+        "workflow-task-failure-recovery",
+        "missing-registration"
+      ],
+      "workflow_type": "task-failure.missing",
+      "workflow_id": "task-failure-missing",
+      "run_id": "01a0be2f-c038-798b-b385-b3e39970d515",
+      "capture": "task-failure-2026-09-20",
+      "history": {
+        "protobuf": "histories/task-failure-missing.pb",
+        "protobuf_sha256": "2b2ce70eef66986331a5dadbde6e77c51f9d86ab1b6d4bf9dcef2d893a215a50",
+        "json": "histories/task-failure-missing.json",
+        "json_sha256": "9f66ebfb91d8cd9213c9c7ae1a9a5662404baf4a3a95af8040e40a1c57054c78"
+      },
+      "replay_definitions": "task-failure-corrected",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "task-failure-business-retryable",
+      "purpose": "Workflow fails with a retryable application error and no workflow retry policy.",
+      "features": [
+        "workflow-failure"
+      ],
+      "workflow_type": "task-failure.business-retryable",
+      "workflow_id": "task-failure-business-retryable",
+      "run_id": "01a0be2f-c03d-74ef-b9e3-ff8abc523370",
+      "capture": "task-failure-2026-09-20",
+      "history": {
+        "protobuf": "histories/task-failure-business-retryable.pb",
+        "protobuf_sha256": "24088ff4c25f612ca62a8fd0397492eeea863886e78e08ec486b19182a910503",
+        "json": "histories/task-failure-business-retryable.json",
+        "json_sha256": "24f00eb60a958745ebe523d171fc208595c5a71fdac4bee69cfbb6b5fe139108"
+      },
+      "replay_definitions": "task-failure-corrected",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "task-failure-business-permanent",
+      "purpose": "Workflow fails with a non-retryable application error.",
+      "features": [
+        "workflow-failure",
+        "non-retryable-failure"
+      ],
+      "workflow_type": "task-failure.business-permanent",
+      "workflow_id": "task-failure-business-permanent",
+      "run_id": "01a0be2f-c041-7925-97ba-5dc4d3798946",
+      "capture": "task-failure-2026-09-20",
+      "history": {
+        "protobuf": "histories/task-failure-business-permanent.pb",
+        "protobuf_sha256": "ef678273e25a5b7ba9a9685744f651aee83233e0f680cb74a97f6d609f27098b",
+        "json": "histories/task-failure-business-permanent.json",
+        "json_sha256": "54710f8e0084295f8d0e7fe66c29b8b0d11fb63d621e3aac4faeaf822710d17e"
+      },
+      "replay_definitions": "task-failure-corrected",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "initial-signals",
+      "purpose": "Two signals recorded before the first workflow task are delivered with initialization, before the root runs.",
+      "features": [
+        "signal",
+        "signal-before-first-task"
+      ],
+      "workflow_type": "initial-signals",
+      "workflow_id": "initial-signals-id",
+      "run_id": "run-initial-signals",
+      "capture": "initial-signals-synthetic",
+      "history": {
+        "protobuf": "histories/initial-signals.pb",
+        "protobuf_sha256": "f2784c1bd0ba24a6b40b2ab065ffb4aec7abadb7b6971b88ecd036ceec7b6767",
+        "json": "histories/initial-signals.json",
+        "json_sha256": "0c084b9f0f5e690e077a72690f1af13685f566f4c4e0c6292cb41a4c977dd56e"
+      },
+      "replay_definitions": "initial-signals",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "compat-patch-marker-free-on-patched",
+      "purpose": "Marker-free pre-patch history replays on the patched generation; Workflow.patched reports false and the legacy branch is kept.",
+      "features": [
+        "patch",
+        "patch-marker-free",
+        "patch-upgrade"
+      ],
+      "workflow_type": "corpus.patch",
+      "workflow_id": "history-corpus-patch-marker-free",
+      "run_id": "01a11a23-7c1b-7cdf-8c43-4f33887252e5",
+      "capture": "live-2026-10-08",
+      "history": {
+        "protobuf": "histories/live-2026-10-08-patch-marker-free.pb",
+        "protobuf_sha256": "03e0a2e69afd3bf39945e0e65ca1d704d8c4698fdc283f6225c1af9f348d94e4",
+        "json": "histories/live-2026-10-08-patch-marker-free.json",
+        "json_sha256": "dbbcf12f281517409c357bb0cd0b4c07d6cdcf6a2586915f2c83fe5b32a7f962"
+      },
+      "replay_definitions": "corpus-v1",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "compat-patch-active-on-deprecated",
+      "purpose": "Active-marker history replays on the deprecated generation without a new marker.",
+      "features": [
+        "patch",
+        "patch-active",
+        "patch-upgrade"
+      ],
+      "workflow_type": "corpus.patch",
+      "workflow_id": "history-corpus-patch-active",
+      "run_id": "01a11a23-84b5-728d-b3a5-816493a01d16",
+      "capture": "live-2026-10-08",
+      "history": {
+        "protobuf": "histories/live-2026-10-08-patch-active.pb",
+        "protobuf_sha256": "19036e87ce3fc75e8368e1e0cdd9e7f065cbfa0e580c9d24408b2e87b6880f99",
+        "json": "histories/live-2026-10-08-patch-active.json",
+        "json_sha256": "cf73558f4e2adfcec2b37605393c6003011ba0088909e3521b1dafc4a9e081ce"
+      },
+      "replay_definitions": "corpus-v1-patch-deprecated",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "negative-timer-removed",
+      "purpose": "Negative control: the timer workflow with its timer removed must be reported as nondeterministic.",
+      "features": [
+        "timer",
+        "negative-control"
+      ],
+      "workflow_type": "corpus.timer",
+      "workflow_id": "history-corpus-timer",
+      "run_id": "01a11a23-88ed-7d4a-bd17-721a837b08e5",
+      "capture": "live-2026-10-08",
+      "history": {
+        "protobuf": "histories/live-2026-10-08-timer.pb",
+        "protobuf_sha256": "fe32c05828b95849703e8069bed5d14371fc2d52c449549056bb4b9996205bd5",
+        "json": "histories/live-2026-10-08-timer.json",
+        "json_sha256": "630c5c438289e1d1eec31da471681307ff92365a8eaae94bbcdd9d3d28c7dc82"
+      },
+      "replay_definitions": "negative-timer-removed",
+      "expected": "nondeterminism",
+      "negative_control_of": "live-2026-10-08-timer"
+    },
+    {
+      "id": "negative-patch-active-on-legacy",
+      "purpose": "Negative control: a history that took the patched branch cannot replay on the pre-patch generation (different activity type).",
+      "features": [
+        "patch",
+        "negative-control"
+      ],
+      "workflow_type": "corpus.patch",
+      "workflow_id": "history-corpus-patch-active",
+      "run_id": "01a11a23-84b5-728d-b3a5-816493a01d16",
+      "capture": "live-2026-10-08",
+      "history": {
+        "protobuf": "histories/live-2026-10-08-patch-active.pb",
+        "protobuf_sha256": "19036e87ce3fc75e8368e1e0cdd9e7f065cbfa0e580c9d24408b2e87b6880f99",
+        "json": "histories/live-2026-10-08-patch-active.json",
+        "json_sha256": "cf73558f4e2adfcec2b37605393c6003011ba0088909e3521b1dafc4a9e081ce"
+      },
+      "replay_definitions": "corpus-v1-patch-legacy",
+      "expected": "nondeterminism",
+      "negative_control_of": "live-2026-10-08-patch-active"
+    }
+  ]
+}
