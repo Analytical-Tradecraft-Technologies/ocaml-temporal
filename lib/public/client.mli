@@ -216,10 +216,10 @@ val cancel :
     the immutable [Terminated] terminal result. [reason] is bounded operator
     context and may be empty. The request is re-sent only after the server
     rejects it as [resource_exhausted]. If the transport deadline expires or
-    the server is unavailable, the returned bridge error has code
-    [termination_outcome_uncertain]: the server may have accepted the command,
-    and this RPC has no idempotency key for a blind retry. Reconcile that
-    result with [wait handle] or visibility. *)
+    the server is unavailable, the returned non-retryable bridge error has
+    [rpc_status] [Some `Termination_outcome_uncertain]: the server may have
+    accepted the command, and this RPC has no idempotency key for a blind
+    retry. Reconcile that result with [wait handle] or visibility. *)
 val terminate :
   ?reason:string ->
   ('input, 'output) handle ->
@@ -261,7 +261,14 @@ val signal :
 (** Executes an output-only query against the exact run retained by [handle].
     A successful result is decoded with [query]'s output codec; routine
     Temporal query failures and codec failures are returned as typed [Error.t]
-    values. Use [query_with_input] when the query accepts one typed argument. *)
+    values. When the workflow's query handler fails, or the worker has no
+    handler registered under the query's name, the error is recognized by
+    [is_query_failed] and carries the handler's message. The SDK asks Temporal
+    not to reject queries by workflow status, so a run that has already
+    completed can still be queried, as long as a worker can replay it.
+    [rpc_status] is [Some `Failed_precondition] only when Temporal itself
+    reports the query as rejected. Use [query_with_input] when the query
+    accepts one typed argument. *)
 val query :
   ('workflow_input, 'workflow_output) handle ->
   query:'query Query.t ->
@@ -354,6 +361,68 @@ val already_started : Error.t -> execution option
     [Error.error_type] [Some "resource_exhausted"]. A closed client or any
     other failure returns [false]. *)
 val is_at_capacity : Error.t -> bool
+
+(** Classification of a client operation that failed with a Temporal RPC
+    error. Every value except [`Termination_outcome_uncertain] is the gRPC
+    status code the server (or the transport) reported;
+    [`Termination_outcome_uncertain] means [terminate]'s transport deadline
+    expired and the server may have accepted it.
+
+    The same error carries the classification in its public fields, so code
+    that only inspects {!Error.val-view} can use it too: the category is
+    [`Bridge], [Error.error_type] is the code's canonical gRPC name in
+    PascalCase (["Cancelled"], ["Unknown"], ["InvalidArgument"],
+    ["DeadlineExceeded"], ["NotFound"], ["AlreadyExists"],
+    ["PermissionDenied"], ["ResourceExhausted"], ["FailedPrecondition"],
+    ["Aborted"], ["OutOfRange"], ["Unimplemented"], ["Internal"],
+    ["Unavailable"], ["DataLoss"], ["Unauthenticated"], or
+    ["TerminationOutcomeUncertain"]), and [non_retryable] is [true] exactly
+    for the permanent conditions [`Invalid_argument], [`Not_found] (for
+    example a signal to an unknown or closed run), [`Already_exists],
+    [`Failed_precondition], [`Permission_denied], [`Unauthenticated],
+    [`Unimplemented], and [`Termination_outcome_uncertain] (reconcile with
+    [wait] instead of repeating it). The other statuses are transient and the
+    same call may succeed when retried with backoff. The message names the
+    code but never includes server text, which may contain user data. *)
+type rpc_status =
+  [ `Cancelled
+  | `Unknown
+  | `Invalid_argument
+  | `Deadline_exceeded
+  | `Not_found
+  | `Already_exists
+  | `Permission_denied
+  | `Resource_exhausted
+  | `Failed_precondition
+  | `Aborted
+  | `Out_of_range
+  | `Unimplemented
+  | `Internal
+  | `Unavailable
+  | `Data_loss
+  | `Unauthenticated
+  | `Termination_outcome_uncertain ]
+
+(** Returns the RPC classification of a client operation error, or [None]
+    when [error] did not come from a Temporal RPC failure. The result is
+    derived from the error's category and [Error.error_type], not its message.
+    The deterministic in-memory client reports an unknown workflow or a
+    mismatched run as [`Not_found], as a server would. A server
+    [ResourceExhausted] is [Some `Resource_exhausted] and is distinct from the
+    local refusal recognized by [is_at_capacity], whose error type is the
+    lowercase ["resource_exhausted"]. *)
+val rpc_status : Error.t -> rpc_status option
+
+(** Returns [true] when [error] means the workflow's query handler failed, or
+    the worker had no handler for the query's name. Such an error has
+    category [`Workflow], is non-retryable (the same query against the same
+    workflow state fails the same way), and has [Error.error_type]
+    [Some "QueryFailed"]. Its [Error.message] is the handler's own message,
+    truncated to at most 4,096 bytes, or ["workflow query handler failed"]
+    when the handler gave none. A Temporal Server too old to attach the query
+    failure detail reports the same condition as [rpc_status]
+    [Some `Invalid_argument] instead. *)
+val is_query_failed : Error.t -> bool
 
 (** Shuts down the client graph. Repeated calls are idempotent and return the
     same cached result, including a terminal teardown error, after the first

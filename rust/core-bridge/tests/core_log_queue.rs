@@ -14,7 +14,7 @@ use ocaml_temporal_core_bridge::diagnostics::{
     CORE_LOG_CLOSE_TIMEOUT, CoreLogWriter, CoreLogWriterClose, core_log_drop_line,
 };
 use ocaml_temporal_core_bridge::{
-    STATUS_OK, ocaml_temporal_core_v3_runtime_free, test_runtime_new_with_core_log_sink,
+    STATUS_OK, ocaml_temporal_core_v4_runtime_free, test_runtime_new_with_core_log_sink,
 };
 
 /// Generous bound for operations that must not block; far below "forever"
@@ -151,7 +151,7 @@ fn runtime_close_completes_while_log_writer_is_blocked() {
 
     let started = Instant::now();
     // SAFETY: The runtime slot holds the uniquely owned handle created above.
-    let status = unsafe { ocaml_temporal_core_v3_runtime_free(&mut runtime) };
+    let status = unsafe { ocaml_temporal_core_v4_runtime_free(&mut runtime) };
     let elapsed = started.elapsed();
     assert_eq!(status, STATUS_OK);
     assert!(runtime.is_null());

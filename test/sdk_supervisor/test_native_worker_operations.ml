@@ -375,6 +375,38 @@ let test_client_protocol_adapter () =
    with
   | Ok (Error (Client.Rpc { code = "failed_precondition" })) -> ()
   | _ -> failwith "structured query RPC error was not typed");
+  (* Issue #823: a failed query handler shares the RPC status but keeps its
+     own JSON kind and the handler's message. *)
+  (match
+     Supervisor.Protocol_adapter.decode_client_query_result
+       (Error
+          {
+            Bridge.status = Connection;
+            message = {|{"kind":"query_failed","message":"no such query"}|};
+          })
+   with
+  | Ok (Error (Client.Query_failed { message = "no such query" })) -> ()
+  | _ -> failwith "structured query handler failure was not typed");
+  (match
+     Supervisor.Protocol_adapter.decode_client_query_result
+       (Error
+          {
+            Bridge.status = Protocol;
+            message = {|{"kind":"query_failed","message":"no such query"}|};
+          })
+   with
+  | Error { Bridge.status = Protocol; _ } -> ()
+  | _ -> failwith "query failure with a mismatched status was accepted");
+  (match
+     Supervisor.Protocol_adapter.decode_client_signal_result
+       (Error
+          {
+            Bridge.status = Connection;
+            message = {|{"kind":"query_failed","message":"no such query"}|};
+          })
+   with
+  | Error { Bridge.status = Protocol; _ } -> ()
+  | _ -> failwith "query-only failure was accepted for a signal");
   (match
      Supervisor.Protocol_adapter.decode_client_wait_result wait_request
        rpc_failure

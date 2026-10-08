@@ -8,8 +8,8 @@ use std::ptr;
 
 use ocaml_temporal_core_bridge::diagnostics::CORE_LOG_ENV;
 use ocaml_temporal_core_bridge::{
-    Result as AbiResult, STATUS_CONFIGURATION, STATUS_OK, ocaml_temporal_core_v3_result_free,
-    ocaml_temporal_core_v3_runtime_free, ocaml_temporal_core_v3_runtime_new,
+    Result as AbiResult, STATUS_CONFIGURATION, STATUS_OK, ocaml_temporal_core_v4_result_free,
+    ocaml_temporal_core_v4_runtime_free, ocaml_temporal_core_v4_runtime_new,
 };
 
 /// Attempts runtime construction, releases every resource it produced, and
@@ -18,7 +18,7 @@ fn create_runtime() -> (i32, String) {
     let mut runtime = ptr::null_mut();
     let mut result = AbiResult::default();
     // SAFETY: Both output locations are writable and exclusively owned.
-    let status = unsafe { ocaml_temporal_core_v3_runtime_new(&mut runtime, &mut result) };
+    let status = unsafe { ocaml_temporal_core_v4_runtime_new(&mut runtime, &mut result) };
     let message = if result.error.ptr.is_null() {
         String::new()
     } else {
@@ -29,9 +29,9 @@ fn create_runtime() -> (i32, String) {
     // SAFETY: The result is released exactly once, and a failed constructor
     // leaves a null runtime slot that free accepts as already released.
     unsafe {
-        assert_eq!(ocaml_temporal_core_v3_result_free(&mut result), STATUS_OK);
+        assert_eq!(ocaml_temporal_core_v4_result_free(&mut result), STATUS_OK);
         if status == STATUS_OK {
-            assert_eq!(ocaml_temporal_core_v3_runtime_free(&mut runtime), STATUS_OK);
+            assert_eq!(ocaml_temporal_core_v4_runtime_free(&mut runtime), STATUS_OK);
         } else {
             assert!(runtime.is_null());
         }

@@ -24,11 +24,11 @@ use std::time::{Duration, Instant};
 
 use ocaml_temporal_core_bridge::{
     Buffer, Result as AbiResult, Runtime, STATUS_NOT_READY, STATUS_OK, STATUS_OUTSTANDING_TASKS,
-    Status, ocaml_temporal_core_v3_client_connect_json, ocaml_temporal_core_v3_client_disconnect,
-    ocaml_temporal_core_v3_result_free, ocaml_temporal_core_v3_runtime_free,
-    ocaml_temporal_core_v3_runtime_new, ocaml_temporal_core_v3_worker_shutdown,
-    ocaml_temporal_core_v3_worker_start_json, ocaml_temporal_core_v3_worker_try_poll_activity,
-    ocaml_temporal_core_v3_worker_wait_activity,
+    Status, ocaml_temporal_core_v4_client_connect_json, ocaml_temporal_core_v4_client_disconnect,
+    ocaml_temporal_core_v4_result_free, ocaml_temporal_core_v4_runtime_free,
+    ocaml_temporal_core_v4_runtime_new, ocaml_temporal_core_v4_worker_shutdown,
+    ocaml_temporal_core_v4_worker_start_json, ocaml_temporal_core_v4_worker_try_poll_activity,
+    ocaml_temporal_core_v4_worker_wait_activity,
 };
 use prost::Message;
 use prost::bytes::Bytes;
@@ -190,7 +190,7 @@ fn release(mut result: AbiResult) -> (Status, String) {
     let message = String::from_utf8(bytes(&result.error)).expect("diagnostic is UTF-8");
     // SAFETY: This helper has exclusive ownership of the initialized result.
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_result_free(&mut result) },
+        unsafe { ocaml_temporal_core_v4_result_free(&mut result) },
         STATUS_OK
     );
     (status, message)
@@ -257,7 +257,7 @@ fn start_worker(address: SocketAddr) -> *mut Runtime {
     let mut runtime = ptr::null_mut();
     let mut result = AbiResult::default();
     // SAFETY: Both output locations are writable and exclusively owned.
-    unsafe { ocaml_temporal_core_v3_runtime_new(&mut runtime, &mut result) };
+    unsafe { ocaml_temporal_core_v4_runtime_new(&mut runtime, &mut result) };
     assert_eq!(release(result).0, STATUS_OK);
 
     let client = format!(r#"{{"target_url":"http://{address}","identity":"shutdown-test"}}"#);
@@ -265,7 +265,7 @@ fn start_worker(address: SocketAddr) -> *mut Runtime {
     // SAFETY: The runtime is live and exclusively owned; the input remains
     // readable for the full blocking call.
     unsafe {
-        ocaml_temporal_core_v3_client_connect_json(
+        ocaml_temporal_core_v4_client_connect_json(
             runtime,
             client.as_ptr(),
             client.len(),
@@ -279,7 +279,7 @@ fn start_worker(address: SocketAddr) -> *mut Runtime {
     // SAFETY: Same exclusive runtime ownership; the static document stays
     // readable for the call.
     unsafe {
-        ocaml_temporal_core_v3_worker_start_json(
+        ocaml_temporal_core_v4_worker_start_json(
             runtime,
             ACTIVITY_WORKER.as_ptr(),
             ACTIVITY_WORKER.len(),
@@ -298,7 +298,7 @@ fn wait_for_ready_activity(mut runtime: *mut Runtime) -> *mut Runtime {
     loop {
         let (returned, status, message) = call_bounded(
             runtime,
-            ocaml_temporal_core_v3_worker_wait_activity,
+            ocaml_temporal_core_v4_worker_wait_activity,
             "activity readiness wait",
         );
         runtime = returned;
@@ -314,12 +314,12 @@ fn wait_for_ready_activity(mut runtime: *mut Runtime) -> *mut Runtime {
 fn close_runtime(mut runtime: *mut Runtime) {
     let mut result = AbiResult::default();
     // SAFETY: The runtime is live and exclusively owned by this thread.
-    unsafe { ocaml_temporal_core_v3_client_disconnect(runtime, &mut result) };
+    unsafe { ocaml_temporal_core_v4_client_disconnect(runtime, &mut result) };
     let (status, message) = release(result);
     assert_eq!(status, STATUS_OK, "{message}");
     // SAFETY: Children are closed and the slot is exclusively owned.
     assert_eq!(
-        unsafe { ocaml_temporal_core_v3_runtime_free(&mut runtime) },
+        unsafe { ocaml_temporal_core_v4_runtime_free(&mut runtime) },
         STATUS_OK
     );
     assert!(runtime.is_null());
@@ -336,7 +336,7 @@ fn shutdown_retires_undelivered_task_without_hanging() {
 
     let (runtime, status, message) = call_bounded(
         runtime,
-        ocaml_temporal_core_v3_worker_shutdown,
+        ocaml_temporal_core_v4_worker_shutdown,
         "worker shutdown with an undelivered task",
     );
     assert_eq!(status, STATUS_OK, "{message}");
@@ -346,7 +346,7 @@ fn shutdown_retires_undelivered_task_without_hanging() {
     // idempotent absent case.
     let (runtime, status, message) = call_bounded(
         runtime,
-        ocaml_temporal_core_v3_worker_shutdown,
+        ocaml_temporal_core_v4_worker_shutdown,
         "repeated worker shutdown",
     );
     assert_eq!(status, STATUS_OK, "{message}");
@@ -365,14 +365,14 @@ fn shutdown_force_completes_abandoned_lease_and_reports_it() {
 
     let (runtime, status, message) = call_bounded(
         runtime,
-        ocaml_temporal_core_v3_worker_try_poll_activity,
+        ocaml_temporal_core_v4_worker_try_poll_activity,
         "activity lease",
     );
     assert_eq!(status, STATUS_OK, "{message}");
 
     let (runtime, status, message) = call_bounded(
         runtime,
-        ocaml_temporal_core_v3_worker_shutdown,
+        ocaml_temporal_core_v4_worker_shutdown,
         "worker shutdown with an abandoned lease",
     );
     assert_eq!(status, STATUS_OUTSTANDING_TASKS, "{message}");
@@ -384,7 +384,7 @@ fn shutdown_force_completes_abandoned_lease_and_reports_it() {
 
     let (runtime, status, message) = call_bounded(
         runtime,
-        ocaml_temporal_core_v3_worker_shutdown,
+        ocaml_temporal_core_v4_worker_shutdown,
         "repeated worker shutdown",
     );
     assert_eq!(status, STATUS_OK, "{message}");

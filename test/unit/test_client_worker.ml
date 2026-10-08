@@ -1082,7 +1082,20 @@ let test_exact_run_signal () =
   expect_error_message_contains "bridge" "run id does not match"
     (Temporal.Client.signal ~request_id:"mismatched-run" mismatched_handle
        ~signal:add_document_signal ~input:"late");
-  expect_error "workflow"
+  (* Issue #823: the mock reports a mismatched run and a closed run as the
+     same typed, permanent NotFound a Temporal server returns. *)
+  let expect_not_found label result =
+    match result with
+    | Ok () -> failwith (label ^ " unexpectedly succeeded")
+    | Error error ->
+        assert (Temporal.Client.rpc_status error = Some `Not_found);
+        assert (Temporal.Error.view error).non_retryable;
+        assert (Temporal.Error.error_type error = Some "NotFound")
+  in
+  expect_not_found "mismatched-run signal"
+    (Temporal.Client.signal ~request_id:"mismatched-run" mismatched_handle
+       ~signal:add_document_signal ~input:"late");
+  expect_not_found "closed-run signal"
     (Temporal.Client.signal ~request_id:"late-signal" handle
        ~signal:add_document_signal ~input:"late");
   unwrap (Temporal.Client.shutdown client)

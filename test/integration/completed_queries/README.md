@@ -9,7 +9,11 @@ make test-completed-queries-live RUN='opam exec --' \
 
 The driver creates a unique task queue and a separate worker process, completes
 a workflow, then queries its final workflow-local value repeatedly. It also
-checks an unknown query returns an error without invalidating later queries.
+checks that an unknown query and a handler that returns an error are both
+reported as the typed, non-retryable query failure (`Client.is_query_failed`,
+keeping the handler message), that a signal to the completed run is a
+permanent `` `Not_found `` RPC error, and that none of this invalidates later
+queries.
 It replaces the worker and repeats the successful queries, proving a fresh process can replay a
 completed execution and answer from its reconstructed final state. All worker
 processes are stopped and reaped by the fixture.

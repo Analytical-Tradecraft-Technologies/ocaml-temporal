@@ -519,9 +519,30 @@ On success Rust returns:
 ```
 
 The result list is preserved through the bridge and the public adapter accepts
-exactly one payload for the output codec. A server-side `query_rejected` value,
-an RPC failure, or a malformed response is returned as a typed client error;
-server diagnostic text does not cross the JSON boundary. The request and
+exactly one payload for the output codec. The request sets
+`query_reject_condition` to `NONE`, so Temporal answers queries against a closed
+run (a worker replays it) instead of rejecting them; a server-side
+`query_rejected` value, which that condition should never produce, is still
+mapped to the `rpc` code `failed_precondition`; an RPC failure or
+a malformed response is likewise a typed client error, and server diagnostic
+text does not cross the JSON boundary. The one exception is a failed query
+handler (issue #823). Temporal reports it, and a query name the worker has no
+handler for, as `InvalidArgument` with a `QueryFailedFailure` status detail.
+Rust recognizes that detail by its exact `Any` type URL (Core's generic detail
+decoder ignores the URL, and an unrelated detail could otherwise decode) and
+returns the query-only document
+
+```json
+{"kind":"query_failed","message":"unknown query state"}
+```
+
+whose `message` is the detail's failure message, or the status message when
+an older SDK left the failure empty. It is the application's own answer to its
+caller rather than server prose, so it is kept, truncated at a character
+boundary to 4,096 UTF-8 bytes with NUL replaced by U+FFFD; OCaml rejects a
+longer, non-UTF-8, or NUL-bearing message. The document travels with the RPC
+native status, and only the query decoder accepts it. A server too old to send
+the detail produces a plain `invalid_argument` instead. The request and
 response schemas are
 [`client-query-request.schema.json`](../schemas/bridge/client-query-request.schema.json)
 and
@@ -792,9 +813,11 @@ one of these closed error documents in the native result's error buffer:
 ```
 
 `already_started` is used only for a start operation rejected by Temporal's
-AlreadyExists status. Other gRPC failures contain only one stable status code,
-such as `deadline_exceeded`, `unavailable`, or `permission_denied`; server text
-is intentionally discarded because it may contain user data. Core conversion
+AlreadyExists status, and `query_failed` only for a query whose handler failed
+(see [Query one exact run](#query-one-exact-run)). Other gRPC failures contain
+only one stable status code, such as `deadline_exceeded`, `unavailable`, or
+`permission_denied`; server text is intentionally discarded because it may
+contain user data. Core conversion
 failures use `{"kind":"protocol","code":"core_invalid"}` or
 `core_unsupported`. The complete code vocabulary is enumerated in the JSON
 schema and checked by both Rust and OCaml decoders.
@@ -813,6 +836,24 @@ The public adapter turns `already_started` into a non-retryable `workflow`
 the client namespace, workflow ID, and run ID, which
 `Client.already_started` returns as a typed `Client.execution` for
 `Client.follow` (#837). The mock backend builds the same error.
+
+Every `rpc` code becomes a `bridge` `Error.t` whose message is
+`Temporal client RPC failed: <code>` and whose fields classify it without
+parsing that message (issue #823). `error_type` is the code's canonical gRPC
+name in PascalCase (`NotFound`, `Unavailable`, ...;
+`termination_outcome_uncertain` becomes `TerminationOutcomeUncertain`), and
+`Client.rpc_status` returns the matching variant. `non_retryable` is `true`
+exactly for permanent conditions: `invalid_argument`, `not_found`,
+`already_exists`, `failed_precondition`, `permission_denied`,
+`unauthenticated`, `unimplemented`, and `termination_outcome_uncertain` (which
+must be reconciled with `Client.wait`, not repeated). The remaining codes
+follow Temporal Core's retryable set plus `deadline_exceeded` and `cancelled`.
+These types never equal the lowercase `resource_exhausted` of a local
+capacity refusal (`Client.is_at_capacity`). `query_failed` becomes a
+non-retryable `workflow` error with `error_type` `QueryFailed` and the
+handler's message, recognized by `Client.is_query_failed`. The mock backend
+reports an unknown workflow, a mismatched run, and a signal to a closed run as
+the same non-retryable `NotFound` classification.
 
 The OCaml protocol exposes an abstract `error` and a small `error_view` with a
 code, JSON path, and safe message. Payload bytes and raw input documents never
