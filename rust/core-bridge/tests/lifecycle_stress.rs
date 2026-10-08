@@ -378,11 +378,13 @@ impl Op {
     }
 }
 
-/// Observed `(operation, outcome)` counts across every case in the process.
-/// The default run asserts that the interesting outcomes in
+/// Observed `(operation, outcome)` counts. Each [`run_ops`] call merges its
+/// case's counts into a collector owned by the caller, never into process
+/// state: the default generated run asserts that the interesting outcomes in
 /// [`REQUIRED_COVERAGE`] were reached, so a generator change cannot silently
-/// degrade the stress into misuse-only calls.
-static COVERAGE: Mutex<BTreeMap<(String, String), usize>> = Mutex::new(BTreeMap::new());
+/// degrade the stress into misuse-only calls, and hand-written regressions or
+/// minimization reruns must not be able to satisfy that assertion for it.
+type Coverage = BTreeMap<(String, String), usize>;
 
 /// Outcomes the default seed and budget must reach at least once.
 const REQUIRED_COVERAGE: &[(&str, &str)] = &[
@@ -405,13 +407,16 @@ const REQUIRED_COVERAGE: &[(&str, &str)] = &[
     ("WorkerStart", "INVALID_ARGUMENT"),
 ];
 
-/// Counts one observed outcome.
-fn record_coverage(name: String, detail: &str) {
-    *COVERAGE
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .entry((name, detail.to_owned()))
-        .or_default() += 1;
+/// Counts one observed outcome in `coverage`.
+fn record_coverage(coverage: &mut Coverage, name: String, detail: &str) {
+    *coverage.entry((name, detail.to_owned())).or_default() += 1;
+}
+
+/// Adds every count in `from` to `into`.
+fn merge_coverage(into: &mut Coverage, from: Coverage) {
+    for (key, count) in from {
+        *into.entry(key).or_default() += count;
+    }
 }
 
 /// Builds one operation, drawing its slot and lease selector from the stream.
@@ -1047,6 +1052,9 @@ struct Case {
     base_cleaned: u64,
     /// Task tokens leased to this case; each must be completed exactly once.
     leased_tokens: Vec<Vec<u8>>,
+    /// Outcomes observed by this case only; [`run_ops`] hands them to the
+    /// caller's collector when the case ends.
+    coverage: Coverage,
 }
 
 impl Case {
@@ -1063,6 +1071,7 @@ impl Case {
             base_created,
             base_cleaned,
             leased_tokens: Vec::new(),
+            coverage: Coverage::new(),
         }
     }
 
@@ -1070,7 +1079,7 @@ impl Case {
     fn note(&mut self, op: &Op, detail: &str) {
         let index = self.trace.len();
         self.trace.push(format!("#{index:03} {op:?} -> {detail}"));
-        record_coverage(op.name(), detail);
+        record_coverage(&mut self.coverage, op.name(), detail);
     }
 
     /// Calls a runtime-scoped entry point on `slot` and requires one of the
@@ -1133,7 +1142,7 @@ impl Case {
                     .as_ref()
                     .is_some_and(|replay| !replay.leases.is_empty())
             {
-                record_coverage(op.name(), "released with a held lease");
+                record_coverage(&mut self.coverage, op.name(), "released with a held lease");
             }
             // Every lease the graph still held is force-completed by close;
             // its server completion is checked after teardown.
@@ -2039,8 +2048,9 @@ fn activity_completion(token_text: &str) -> Vec<u8> {
 // ---------------------------------------------------------------------------
 
 /// Runs one operation sequence from a fresh model, checking the ledgers
-/// after every step and once more after teardown.
-fn run_ops(ops: &[Op]) -> Result<(), Failure> {
+/// after every step and once more after teardown. The outcomes the case
+/// observed, including those of a failing case, are added to `coverage`.
+fn run_ops(ops: &[Op], coverage: &mut Coverage) -> Result<(), Failure> {
     let mut case = Case::new();
     let mut outcome = Ok(());
     for op in ops {
@@ -2060,6 +2070,7 @@ fn run_ops(ops: &[Op]) -> Result<(), Failure> {
             Err(CaseError::Check(message))
         }
     };
+    merge_coverage(coverage, std::mem::take(&mut case.coverage));
     outcome.map_err(|error| {
         let (message, wedged) = match error {
             CaseError::Check(message) => (message, false),
@@ -2086,7 +2097,8 @@ fn failure_kind(message: &str) -> &str {
 /// Deletes chunks of operations while the sequence still fails in the same
 /// category, bounded by [`MAX_SHRINK_RUNS`]. Native timing can still change
 /// the exact failure; the result is a shorter sequence with its own trace,
-/// not a proof of minimality.
+/// not a proof of minimality. Reruns record into a discarded collector so
+/// shrinking cannot add coverage the generated cases did not reach.
 fn minimize(mut ops: Vec<Op>, mut failure: Failure) -> (Vec<Op>, Failure) {
     if failure.wedged {
         return (ops, failure);
@@ -2102,7 +2114,7 @@ fn minimize(mut ops: Vec<Op>, mut failure: Failure) -> (Vec<Op>, Failure) {
             let mut candidate = ops[..start].to_vec();
             candidate.extend_from_slice(&ops[end..]);
             runs += 1;
-            match run_ops(&candidate) {
+            match run_ops(&candidate, &mut Coverage::new()) {
                 Err(smaller) if smaller.wedged => {
                     // A hang leaves a leaked runtime; stop reducing.
                     return (candidate, smaller);
@@ -2184,10 +2196,13 @@ fn seeded_lifecycle_operation_sequences() {
     };
     let started = Instant::now();
     let mut operations = 0;
+    // Local to this test: only generated cases count towards the required
+    // coverage, whatever other tests in the binary ran first.
+    let mut coverage = Coverage::new();
     for case in cases {
         let ops = generate(config.seed, case, config.steps);
         operations += ops.len();
-        if let Err(first) = run_ops(&ops) {
+        if let Err(first) = run_ops(&ops, &mut coverage) {
             let (minimized, last) = minimize(ops.clone(), first.clone());
             let text = report(&config, case, &ops, &first, &minimized, &last);
             let directory = artifact_dir();
@@ -2204,7 +2219,6 @@ fn seeded_lifecycle_operation_sequences() {
         config.only_case.map_or(config.cases, |_| 1),
         started.elapsed()
     );
-    let coverage = COVERAGE.lock().unwrap_or_else(|error| error.into_inner());
     for ((name, detail), count) in coverage.iter() {
         eprintln!("  {count:6} {name} -> {detail}");
     }
@@ -2301,8 +2315,9 @@ fn scripted_regressions() {
             RuntimeDispose(0),
         ],
     ];
+    let mut coverage = Coverage::new();
     for (index, ops) in sequences.iter().enumerate() {
-        if let Err(failure) = run_ops(ops) {
+        if let Err(failure) = run_ops(ops, &mut coverage) {
             let mut trace = String::new();
             for line in &failure.trace {
                 let _ = writeln!(trace, "  {line}");
@@ -2313,4 +2328,14 @@ fn scripted_regressions() {
             );
         }
     }
+    // The scripted outcomes land in this test's own collector, which the
+    // generated-coverage assertion never reads; check that they were
+    // collected here rather than leaking into shared state.
+    assert!(
+        coverage.contains_key(&(
+            "RuntimeDispose".to_owned(),
+            "released with a held lease".to_owned()
+        )),
+        "scripted regressions did not record their own coverage"
+    );
 }

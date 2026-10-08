@@ -11,8 +11,9 @@
     interleaved. Every call must return a documented outcome; a released
     runtime must reject further use with [Invalid_argument].
 
-    The sequence is a pure function of [LIFECYCLE_STRESS_SEED] (decimal or
-    [0x] hexadecimal) and [LIFECYCLE_STRESS_OCAML_CYCLES]; native scheduling
+    The sequence is a pure function of [LIFECYCLE_STRESS_SEED] (an unsigned
+    64-bit decimal or [0x] hexadecimal integer, the same range the Rust stress
+    accepts) and [LIFECYCLE_STRESS_OCAML_CYCLES]; native scheduling
     is not, so racy calls accept every documented status. This test observes
     OCaml-visible outcomes only: native cleanup counts are asserted by the
     Rust stress, and the C stubs are sanitizer-instrumented only by
@@ -25,7 +26,80 @@ let default_cycles = 48
 
 (** Default seed shared with the Rust stress so both streams are recorded
     together. *)
-let default_seed = 0x0522_2026
+let default_seed = 0x0522_2026L
+
+(** Parses an unsigned 64-bit integer written in decimal or with a lowercase
+    [0x] prefix in hexadecimal, the forms the Rust stress parses. Values from
+    2{^ 63} up to 2{^ 64}-1 are returned as the [Int64] with the same bit
+    pattern (two's complement), so every Rust seed maps to one distinct
+    [Int64]. Signs, underscores, other prefixes, and out-of-range values are
+    rejected; [Int64.of_string] performs the overflow check. *)
+let parse_u64 text =
+  let all_digits digit body = body <> "" && String.for_all digit body in
+  let decimal = function '0' .. '9' -> true | _ -> false in
+  let hex = function '0' .. '9' | 'a' .. 'f' | 'A' .. 'F' -> true | _ -> false in
+  let prefixed = String.length text > 2 && String.sub text 0 2 = "0x" in
+  if prefixed then
+    let body = String.sub text 2 (String.length text - 2) in
+    if all_digits hex body then Int64.of_string_opt ("0x" ^ body) else None
+  else if all_digits decimal text then Int64.of_string_opt ("0u" ^ text)
+  else None
+
+(** Folds a 64-bit seed into the [Random.State.make] seed array without
+    losing bits: the low and high 32-bit halves become two non-negative
+    elements. OCaml 5 ints are at least 63 bits wide, so each half fits. The
+    OCaml generator differs from the Rust SplitMix64 stream; the shared seed
+    only ties the two runs to one recorded value. *)
+let rng_seed seed =
+  let mask = 0xFFFF_FFFFL in
+  [|
+    Int64.to_int (Int64.logand seed mask);
+    Int64.to_int (Int64.shift_right_logical seed 32);
+  |]
+
+(** Checks the seed parser on the boundaries of the documented range, so a
+    regression fails before any native work instead of rejecting a seed the
+    Rust stress accepted. *)
+let check_parse_u64 () =
+  let accepts text expected =
+    if parse_u64 text <> Some expected then
+      failwith ("seed parser rejected or misread " ^ text)
+  in
+  let rejects text =
+    if parse_u64 text <> None then
+      failwith ("seed parser accepted invalid " ^ text)
+  in
+  accepts "0" 0L;
+  accepts "18446744073709551615" (-1L);
+  accepts "9223372036854775808" Int64.min_int;
+  accepts "0xffffffffffffffff" (-1L);
+  accepts "0xFFFFFFFFFFFFFFFF" (-1L);
+  accepts "0x05222026" default_seed;
+  List.iter rejects
+    [
+      "";
+      "0x";
+      "-1";
+      "1_000";
+      "0X10";
+      "0o7";
+      "18446744073709551616";
+      "0x10000000000000000";
+    ];
+  if rng_seed (-1L) <> [| 0xFFFF_FFFF; 0xFFFF_FFFF |] then
+    failwith "rng_seed lost bits of the maximum seed"
+
+(** Reads the optional unsigned 64-bit seed setting. *)
+let env_seed name default =
+  match Sys.getenv_opt name with
+  | None | Some "" -> default
+  | Some text -> (
+      match parse_u64 text with
+      | Some value -> value
+      | None ->
+          failwith
+            (name
+           ^ " must be an unsigned 64-bit decimal or 0x-hexadecimal integer"))
 
 (** Reads an optional integer setting in decimal or [0x] hexadecimal form. *)
 let env_int name default =
@@ -138,11 +212,12 @@ let supervisor_cycles state count =
 (** Runs the configured cycles, then forces the finalizers of every dropped
     runtime to run before the process exits. *)
 let () =
-  let seed = env_int "LIFECYCLE_STRESS_SEED" default_seed in
+  check_parse_u64 ();
+  let seed = env_seed "LIFECYCLE_STRESS_SEED" default_seed in
   let cycles = env_int "LIFECYCLE_STRESS_OCAML_CYCLES" default_cycles in
   if cycles < 1 || cycles > 100_000 then
     failwith "LIFECYCLE_STRESS_OCAML_CYCLES must be 1..100000";
-  let state = Random.State.make [| seed |] in
+  let state = Random.State.make (rng_seed seed) in
   let config = replay_config () in
   for _ = 1 to cycles do
     cycle state config

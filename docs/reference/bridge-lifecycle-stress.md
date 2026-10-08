@@ -87,7 +87,9 @@ also requires a fixed set of important outcomes to appear at least once, so a
 change to the generator cannot quietly reduce the stress to misuse-only calls.
 That set includes leased and completed activations and tasks, shutdown with
 an outstanding lease, `runtime_free` and `runtime_dispose` with a held lease,
-and a drained, finalized replay.
+and a drained, finalized replay. Only the generated cases count: the
+hand-written regressions and the reruns made while minimizing a failure record
+into their own collectors, so they cannot satisfy this check.
 
 ### Budgets and reproduction
 
@@ -176,7 +178,9 @@ supervisors are also created, checked, and shut down twice, with collections
 in between.
 
 `LIFECYCLE_STRESS_SEED` and `LIFECYCLE_STRESS_OCAML_CYCLES` (1–100,000, default
-48) set the seed and the length. The Make targets pass both, and Dune reruns
+48) set the seed and the length. The OCaml test accepts the same unsigned
+64-bit seeds as the Rust stress and splits the value into its low and high
+32-bit halves to seed `Random.State`, so no bits are lost. The Make targets pass both, and Dune reruns
 the test whenever either value changes.
 
 ## What each tool observes
