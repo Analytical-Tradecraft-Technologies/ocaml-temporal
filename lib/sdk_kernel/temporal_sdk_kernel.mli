@@ -56,6 +56,10 @@ module Native_worker_owner = Temporal_runtime.Native_worker_owner
 (** Generic private observer selection scoped to one worker constructor. *)
 module Native_worker_observer = Temporal_runtime.Native_worker_observer
 
+(** Detection-only watchdog Domain for workflow activations that do not
+    yield. *)
+module Native_worker_watchdog = Temporal_runtime.Native_worker_watchdog
+
 (** Callback representation underlying the public abstract future type. *)
 module Future = Temporal_future_kernel
 

@@ -27,21 +27,36 @@ module Options : sig
         default_versioning_behavior : [ `Auto_upgrade | `Pinned ] option;
       }
 
+  (** Deadline for one workflow activation to return control to the worker.
+      [`After d] enables the non-yielding-code watchdog: when workflow code
+      (including its codecs and signal, query, and update handlers) runs for
+      at least [d] without returning or awaiting a workflow operation, the
+      worker fails that workflow task so Temporal retries it, logs one
+      bounded diagnostic, and reports {!Health.Stuck_workflow_activation}
+      from {!health}. [`Disabled] turns the watchdog off, for example while
+      stepping through workflow code in a debugger. The watchdog never
+      interrupts the stuck code; see {!health} for the recovery contract. *)
+  type activation_deadline = [ `After of Duration.t | `Disabled ]
+
   (** A validated set of optional worker resource and routing settings. *)
   type t
 
-  (** Existing worker defaults: no routing versioning and the standard sticky
-      cache bound. *)
+  (** Existing worker defaults: no routing versioning, the standard sticky
+      cache bound, and a two-second workflow activation deadline. *)
   val default : t
 
   (** Validates and constructs options. A supplied cache value overrides the
       normal worker default; [0] disables sticky workflow caching. Legacy build
       IDs must be non-empty, NUL-free, and within the bridge transport limit.
       Deployment versioning returns a defect when [use_worker_versioning] and
-      [default_versioning_behavior] disagree as described on [versioning]. *)
+      [default_versioning_behavior] disagree as described on [versioning].
+      [workflow_activation_deadline] defaults to [`After] two seconds (the
+      Python SDK's deadlock timeout; Go uses one second); a zero deadline or
+      one above one hour returns a defect. *)
   val make :
     ?versioning:versioning ->
     ?max_cached_workflows:int ->
+    ?workflow_activation_deadline:activation_deadline ->
     unit ->
     (t, Error.t) result
 
@@ -50,6 +65,45 @@ module Options : sig
 
   (** Returns the explicit cache override, or [None] when worker defaults apply. *)
   val max_cached_workflows : t -> int option
+
+  (** Returns the workflow activation watchdog setting. *)
+  val workflow_activation_deadline : t -> activation_deadline
+end
+
+(** Worker liveness as observed by the workflow activation watchdog. *)
+module Health : sig
+  (** How the watchdog released a stuck activation, and whether Temporal
+      acknowledged it.
+      - [`Task_failed]: the workflow task was failed, so Temporal retries it,
+        normally on another worker.
+      - [`Queries_failed]: the activation only delivered queries; each query
+        was answered with a failure and the workflow task was not failed.
+      - [`Eviction_acknowledged]: the activation only evicted the run from the
+        sticky cache; it was acknowledged with an empty completion and no
+        workflow task was failed.
+      - [`Not_acknowledged]: the replacement completion could not be
+        delivered, so the task, query, or eviction will instead time out. *)
+  type abandonment =
+    [ `Task_failed | `Queries_failed | `Eviction_acknowledged | `Not_acknowledged ]
+
+  (** The first workflow activation that exceeded the activation deadline.
+      [workflow_type] and [workflow_id] are [None] only when the activation
+      could not be matched to a run. [elapsed] is a lower bound on how long the
+      activation had run when it was detected. [abandoned] reports what the
+      watchdog submitted in place of the stuck activation's completion. No
+      payload is included. *)
+  type stuck_workflow_activation = {
+    workflow_type : string option;
+    workflow_id : string option;
+    run_id : string;
+    is_replaying : bool;
+    elapsed : Duration.t;
+    abandoned : abandonment;
+  }
+
+  (** [Healthy] until the watchdog detects a stuck activation; afterwards
+      [Stuck_workflow_activation] for the life of the worker. *)
+  type t = Healthy | Stuck_workflow_activation of stuck_workflow_activation
 end
 
 (** Packs a typed workflow definition for a worker registration list. [signals]
@@ -134,6 +188,28 @@ val create :
     release the OCaml runtime lock and return periodically so shutdown cannot
     be stranded, but releasing that lock does not make [run] non-blocking. *)
 val run : t -> (unit, Error.t) result
+
+(** Reports whether the workflow activation watchdog has detected workflow
+    code that stopped yielding (see {!Options.activation_deadline}).
+
+    OCaml code cannot be safely interrupted, so the watchdog only fails the
+    stuck workflow task (Temporal then retries it, normally on another worker)
+    and marks this worker unhealthy. The stuck code keeps the workflow lane
+    busy until it returns on its own, so no other workflow task on this worker
+    makes progress meanwhile, and {!shutdown} cannot complete while it is
+    stuck. Recovery is a process restart by an external supervisor
+    (Kubernetes, systemd, or similar). Once reported, the state is sticky:
+    even if the code later returns, the process may hold inconsistent state
+    and should be replaced.
+
+    The call is lock-free and does not touch the worker's lanes or the native
+    graph, so it is safe from any Domain or thread at any time, including a
+    liveness-probe handler. A probe should fail when this returns
+    [Stuck_workflow_activation], and should also be driven by a periodic
+    heartbeat (for example a file or endpoint timestamp refreshed by a thread
+    that calls [health]), so a process whose whole runtime is blocked fails
+    the probe too. The mock backend always reports [Healthy]. *)
+val health : t -> Health.t
 
 (** Initiates graceful worker shutdown. Repeated calls are safe and return the
     same cached terminal result. A permanent native teardown error is retained

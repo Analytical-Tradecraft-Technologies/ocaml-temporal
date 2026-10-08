@@ -16,6 +16,7 @@ module Worker_loop = Temporal_sdk_kernel.Native_worker_loop
 module Worker_policy = Temporal_sdk_kernel.Native_worker_policy
 module Owner = Temporal_sdk_kernel.Native_worker_owner
 module Observer = Temporal_sdk_kernel.Native_worker_observer
+module Watchdog = Temporal_sdk_kernel.Native_worker_watchdog
 
 (** Result-bind notation keeps expected startup and lifecycle failures typed. *)
 let ( let* ) = Result.bind
@@ -344,6 +345,9 @@ type t = {
           callbacks. Tracking the exact threads, not their Domains, rejects a
           callback that would wait for its own lane while still admitting a
           sibling system thread on the same Domain (#763). *)
+  activation_deadline_ms : int option;
+      (** Deadline for one workflow activation to return to the adapter, or
+          [None] when the non-yielding-code watchdog is disabled (#493). *)
 }
 (** Native worker lifecycle state. The [closed] and [stop_requested] atomics
     are the only state observed by the polling lanes from [shutdown] and
@@ -474,10 +478,59 @@ let request_stop worker = Atomic.set worker.stop_requested true
 let stop_observed worker =
   Atomic.get worker.closed || Atomic.get worker.stop_requested
 
+(** Starts the activation watchdog for one run, or returns [None] when it is
+    disabled or this worker polls no workflow tasks. The watchdog only reads
+    the adapter's running epoch and, past the deadline, fails that activation's
+    workflow task through the supervisor; it never enters workflow code. *)
+let start_watchdog worker =
+  match worker.activation_deadline_ms with
+  | None -> Ok None
+  | Some _ when not worker.workflow_tasks -> Ok None
+  | Some deadline_ms -> (
+      match
+        Watchdog.start ~deadline_ms
+          ~running_epoch:(fun () -> Workflow.running_epoch worker.workflows)
+          ~abandon:(fun ~epoch ~elapsed_ms ->
+            ignore
+              (Workflow.abandon_activation worker.workflows ~epoch ~elapsed_ms))
+      with
+      | Ok watchdog -> Ok (Some watchdog)
+      | Error exception_ ->
+          let message =
+            try Printexc.to_string exception_
+            with _ -> "unprintable Domain spawn exception"
+          in
+          Error
+            (Base_error.make ~category:`Bridge
+               ~message:
+                 ("workflow activation watchdog could not start: "
+                 ^ bounded_message message)
+               ()))
+
+(** Runs both lanes through the generic loop and converts an escaped lane
+    exception into a defect result. *)
+let run_lanes worker =
+  try
+    Worker_loop.run
+      ~closed:(fun () -> stop_observed worker)
+      ~poll_workflow:(fun () -> poll_workflow worker)
+      ~poll_activity:(fun () ->
+        Owner.enter_activity worker.owner;
+        poll_activity worker)
+      ~wait_for_lane:(fun ~workflow_lane ~native_wait ->
+        wait_for_lane worker ~workflow_lane ~native_wait)
+      ~retry_pending:(fun ~workflow_lane -> retry_pending worker ~workflow_lane)
+  with _ ->
+    Error (Base_error.defect ~message:"native worker execution lane failed")
+
 (** Runs workflow execution on this Domain and capacity-one activity execution
     on a dedicated Domain. Both adapters continue to use the same serialized
     supervisor mailbox. [run_mutex] remains held until the activity Domain is
-    joined, so later shutdown can drain and release the graph safely. *)
+    joined, so later shutdown can drain and release the graph safely. When
+    enabled, a watchdog Domain observes the workflow lane for the duration of
+    the run and is joined before [run_mutex] is released. A configured
+    watchdog that cannot start fails the run rather than silently running
+    unguarded. *)
 let run worker =
   if is_execution_thread worker then
       Error
@@ -496,25 +549,20 @@ let run worker =
         (fun () ->
           report Logs.Info ~operation:"worker_run_started" ();
           let result =
-            try
-              Worker_loop.run
-                ~closed:(fun () -> stop_observed worker)
-                ~poll_workflow:(fun () -> poll_workflow worker)
-                ~poll_activity:(fun () ->
-                  Owner.enter_activity worker.owner;
-                  poll_activity worker)
-                ~wait_for_lane:(fun ~workflow_lane ~native_wait ->
-                  wait_for_lane worker ~workflow_lane ~native_wait)
-                ~retry_pending:(fun ~workflow_lane ->
-                  retry_pending worker ~workflow_lane)
-            with _ ->
-              Error
-                (Base_error.defect
-                   ~message:"native worker execution lane failed")
+            match start_watchdog worker with
+            | Error _ as error -> error
+            | Ok watchdog ->
+                Fun.protect
+                  ~finally:(fun () -> Option.iter Watchdog.stop watchdog)
+                  (fun () -> run_lanes worker)
           in
           report Logs.Info ~operation:"worker_run_finished" ();
           result)
   end
+
+(** The sticky watchdog report of the first workflow activation abandoned for
+    exceeding its deadline, or [None] while the worker is healthy. *)
+let stuck_activation worker = Workflow.stuck worker.workflows
 
 (** Performs one best-effort terminal native cleanup attempt. A returned [Error]
     is still considered completion of the native release protocol:
@@ -757,7 +805,9 @@ let cleanup_abandoned worker =
     [Native.create] enters [cleanup], which joins the supervisor owner Domain
     and closes all native resources before returning. Successful construction
     attaches a GC finalizer so abandoned workers still drain leases. *)
-let create ?max_cached_workflows ?io_threads ?runtime ?(versioning = Bridge.No_versioning) ~target_url ~namespace
+let create ?max_cached_workflows ?io_threads ?runtime
+    ?(versioning = Bridge.No_versioning) ?activation_deadline_ms ~target_url
+    ~namespace
     ~identity ~task_queue ~workflows ~activities () =
   let max_cached_workflows =
     Option.value max_cached_workflows ~default:default_max_cached_workflows
@@ -852,6 +902,7 @@ let create ?max_cached_workflows ?io_threads ?runtime ?(versioning = Bridge.No_v
         terminal_cleanup_scheduled = Atomic.make false;
         run_mutex = Mutex.create ();
         owner = Owner.create ();
+        activation_deadline_ms;
       }
   in
   match setup with
