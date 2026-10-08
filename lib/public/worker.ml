@@ -23,12 +23,50 @@ module Options = struct
         default_versioning_behavior : [ `Auto_upgrade | `Pinned ] option;
       }
 
+  type activation_deadline = [ `After of Duration.t | `Disabled ]
+
   type t = {
     versioning : versioning;
     max_cached_workflows : int option;
+    workflow_activation_deadline : activation_deadline;
   }
 
-  let default = { versioning = No_versioning; max_cached_workflows = None }
+  (** Two seconds matches the Python SDK's deadlock-detection timeout and is
+      above Go's one-second default. An activation is one workflow task's
+      worth of work (Core splits a replay into one activation per historical
+      task), so legitimate activations finish far sooner. *)
+  let default_workflow_activation_deadline = `After (Duration.of_ms 2_000L)
+
+  let default =
+    {
+      versioning = No_versioning;
+      max_cached_workflows = None;
+      workflow_activation_deadline = default_workflow_activation_deadline;
+    }
+
+  (** Largest accepted deadline: one hour. A longer stall is indistinguishable
+      from a hung process for any practical liveness probe, and the bound keeps
+      the millisecond value well inside a native [int]. *)
+  let max_workflow_activation_deadline_ms = 3_600_000L
+
+  (** Rejects a zero or over-long watchdog deadline. *)
+  let validate_activation_deadline = function
+    | `Disabled -> Ok ()
+    | `After duration ->
+        let milliseconds = Duration.to_ms duration in
+        if Int64.compare milliseconds 0L <= 0 then
+          Error
+            (Error.defect
+               ~message:
+                 "workflow_activation_deadline must be positive; use \
+                  `Disabled to turn the watchdog off")
+        else if
+          Int64.compare milliseconds max_workflow_activation_deadline_ms > 0
+        then
+          Error
+            (Error.defect
+               ~message:"workflow_activation_deadline exceeds one hour")
+        else Ok ()
 
   (** Checks the bridge's transport-level identifier invariants before an
       option value can be retained by a caller. *)
@@ -57,7 +95,9 @@ module Options = struct
   (** Builds an immutable option value after validating every user-supplied
       field. Rust repeats these checks because JSON is an independent trust
       boundary, not because callers should normally see duplicate failures. *)
-  let make ?(versioning = No_versioning) ?max_cached_workflows () =
+  let make ?(versioning = No_versioning) ?max_cached_workflows
+      ?(workflow_activation_deadline = default_workflow_activation_deadline) ()
+      =
     let build_id_validation =
       match versioning with
       | No_versioning -> Ok ()
@@ -108,12 +148,34 @@ module Options = struct
     match build_id_validation with
     | Error _ as error -> error
     | Ok () ->
-        Result.map
-          (fun () -> { versioning; max_cached_workflows })
-          (validate_cache max_cached_workflows)
+        Result.bind (validate_cache max_cached_workflows) (fun () ->
+            Result.map
+              (fun () ->
+                { versioning; max_cached_workflows; workflow_activation_deadline })
+              (validate_activation_deadline workflow_activation_deadline))
 
   let versioning options = options.versioning
   let max_cached_workflows options = options.max_cached_workflows
+
+  let workflow_activation_deadline options =
+    options.workflow_activation_deadline
+end
+
+(** Worker liveness as observed by the workflow activation watchdog. *)
+module Health = struct
+  type abandonment =
+    [ `Task_failed | `Queries_failed | `Eviction_acknowledged | `Not_acknowledged ]
+
+  type stuck_workflow_activation = {
+    workflow_type : string option;
+    workflow_id : string option;
+    run_id : string;
+    is_replaying : bool;
+    elapsed : Duration.t;
+    abandoned : abandonment;
+  }
+
+  type t = Healthy | Stuck_workflow_activation of stuck_workflow_activation
 end
 
 (** Heterogeneous activity registration package. *)
@@ -424,10 +486,17 @@ let create ?identity ?options ?max_cached_workflows ?io_threads
                                      Native_worker.register_activity
                                        (Activity_private.to_base definition))
                         in
+                        let activation_deadline_ms =
+                          match Options.workflow_activation_deadline options with
+                          | `Disabled -> None
+                          | `After duration ->
+                              (* Validated to at most one hour by [Options]. *)
+                              Some (Int64.to_int (Duration.to_ms duration))
+                        in
                         let native_result =
                           Native_worker.create
                             ?max_cached_workflows:effective_max_cached_workflows
-                            ?io_threads
+                            ?io_threads ?activation_deadline_ms
                             ~versioning:native_versioning ~target_url
                             ~namespace ~identity
                             ~task_queue ~workflows:native_workflows
@@ -632,6 +701,34 @@ let run worker =
     | Mock_backend backend -> run_mock worker backend
     | Native_backend backend ->
         Native_worker.run backend |> Result.map_error Error_private.of_base
+
+(** Reads the sticky watchdog report without taking any lock, so a liveness
+    probe can call it while the workflow lane is stuck. The mock backend runs
+    no watchdog and is always healthy. *)
+let health worker =
+  match worker.backend with
+  | Mock_backend _ -> Health.Healthy
+  | Native_backend backend -> (
+      match Native_worker.stuck_activation backend with
+      | None -> Health.Healthy
+      | Some
+          {
+            run_id;
+            workflow_id;
+            workflow_type;
+            is_replaying;
+            elapsed_ms;
+            abandoned;
+          } ->
+          Health.Stuck_workflow_activation
+            {
+              workflow_type;
+              workflow_id;
+              run_id;
+              is_replaying;
+              elapsed = Duration.of_ms (Int64.of_int (Int.max 0 elapsed_ms));
+              abandoned;
+            })
 
 (** Asks [run] to return without waiting for it (#830). The function performs
     only atomic writes to cells allocated with the worker: no lock, I/O,

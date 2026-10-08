@@ -171,7 +171,13 @@ for those rules.
   return; call `Worker.shutdown` afterwards to release the worker.
   `Temporal.Worker.Options` provides typed, immutable resource and worker
   routing settings, including legacy build-ID and deployment-based versioning;
-  see the [worker versioning reference](worker-versioning.md). A
+  see the [worker versioning reference](worker-versioning.md).
+  `Options.make ?workflow_activation_deadline` (`` `After `` a positive
+  `Duration.t` up to one hour, default two seconds, or `` `Disabled ``)
+  configures the non-yielding workflow watchdog, and the lock-free
+  `Worker.health` returns `Healthy` or a sticky `Stuck_workflow_activation`
+  report for liveness probes; see the
+  [watchdog reference](native-worker-execution.md#non-yielding-workflow-watchdog). A
   successfully shut-down worker is not reusable: calling `Worker.run` again
   returns a typed `bridge` error ("worker is shut down") on both the mock and
   native backends without polling. Create a new worker for a new polling
