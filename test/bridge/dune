@@ -73,3 +73,12 @@
 (test
  (name test_client_input_limits)
  (libraries temporal_core_bridge temporal_protocol))
+
+; Offline replay through the public API only, against the retained live
+; task-failure histories. No Temporal Server or network is required.
+(test
+ (name test_public_replay)
+ (modules test_public_replay)
+ (deps
+  (glob_files ../integration/temporal/task_failure/histories/*.pb))
+ (libraries temporal-sdk))

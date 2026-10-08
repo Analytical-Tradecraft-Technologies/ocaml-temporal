@@ -6,8 +6,11 @@
     the user-facing registration API. *)
 
 (** Heterogeneous executable workflow registrations accepted by the private
-    native adapter. The constructor is intentionally hidden. *)
-type workflow_registration
+    native adapter. The constructor is intentionally hidden. The type equation
+    lets [Replay] hand the same registrations to its replay-mode instance of
+    the adapter, so live and replayed workflows share one conversion path. *)
+type workflow_registration =
+  Temporal_sdk_kernel.Native_worker_execution.registered_workflow
 
 (** Heterogeneous executable activity registrations accepted by the private
     native adapter. The constructor is intentionally hidden. *)

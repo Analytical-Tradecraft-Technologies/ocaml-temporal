@@ -1236,6 +1236,74 @@ thread. [`examples/testing`](../../examples/testing/example_workflow_test.ml)
 tests the example application's workflow this way, with both its real and a
 stubbed activity.
 
+## Replay recorded histories before deploying
+
+`Temporal.Testing` checks what new code does; `Temporal.Replay` checks that
+changed code is still compatible with executions that already ran. It feeds a
+recorded history to Temporal Core's replay worker, entirely offline, and
+reports whether the registered OCaml workflow produced the same commands as
+the original run. Use it in unit tests or a pre-deployment CI job with
+histories exported from the executions you must not break:
+
+```ocaml
+let check_compatibility () =
+  let bytes = In_channel.with_open_bin "order-123.pb" In_channel.input_all in
+  match
+    Temporal.Replay.History.of_protobuf ~workflow_id:"order-123" bytes
+  with
+  | Error error -> failwith (Temporal.Error.message error)
+  | Ok history -> (
+      match
+        Temporal.Replay.replay
+          ~workflows:
+            [ Temporal.Replay.workflow ~signals:[ cancel_handler ] order_workflow ]
+          history
+      with
+      | Ok () -> ()
+      | Error failure ->
+          prerr_endline (Temporal.Replay.failure_message failure);
+          exit 1)
+```
+
+Register workflows with `Replay.workflow`, which takes the same definitions
+and handlers as `Temporal.Worker.workflow`; codecs travel with the
+definitions. Only workflow code runs: recorded activity and child-workflow
+results come from the history. `Replay.replay_all` replays a list of
+histories, each in an isolated native graph, and keeps every result.
+
+The input is the binary protobuf encoding of Temporal's
+`temporal.api.history.v1.History` message plus the workflow ID, which the
+message does not carry. `temporal workflow show --output json` produces the
+protobuf **JSON** form, so convert it with a protobuf library that has the
+Temporal API descriptors, for example Python's
+`google.protobuf.json_format.Parse` followed by `SerializeToString`. Exported
+histories contain workflow inputs, results, and signal payloads; treat them as
+production data, and prefer synthetic or scrubbed executions in a repository.
+
+The result distinguishes:
+
+- `Ok ()`: Core accepted every recorded workflow task, including runs that
+  recorded failed tasks or a deliberate workflow failure.
+- `Nondeterminism`: the code produced a different command sequence, for
+  example a removed timer. The message is Core's description, such as
+  `Nondeterminism error: Complete workflow machine does not handle this
+  event: HistoryEvent(id: 5, TimerStarted)`, and names the first mismatching
+  history event.
+- `Workflow_task_failed`: the workflow code raised, returned a defect, could
+  not decode its input, or its type is not registered.
+- `Invalid_history` and `Unsupported_history`: the input is not a valid
+  history, or it uses a feature this SDK cannot replay yet.
+- `Replay_error`: the replay could not run (an invalid registration or an
+  SDK/runtime failure); the history's verdict is unknown.
+
+A successful replay covers only the paths the recorded history took, and Core
+compares command shapes, not payload values: a changed activity argument or
+result replays successfully. Guard intentional command changes with
+[patch markers](#introduce-a-new-branch-with-a-patch-marker) and replay
+histories recorded before and after the change. `replay` blocks the calling
+thread; do not call it from workflow or activity code. Every call releases
+its native resources before returning, on success and on every failure.
+
 ## 10. Validate locally
 
 From the repository root, the focused Make targets are:
