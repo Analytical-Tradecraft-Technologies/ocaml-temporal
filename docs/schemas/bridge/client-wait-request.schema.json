@@ -1,14 +1,14 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/docs/schemas/bridge/client-wait-request.schema.json",
-  "title": "OCaml Temporal native client exact-run wait request",
-  "description": "The absence of a follow_runs option is intentional: this operation always waits for the named run and never follows continued-as-new. Runtime validators also reject NUL-containing identifiers and enforce a 65,536-byte UTF-8 safety limit; maxLength is the corresponding character-count bound expressible in standard JSON Schema.",
+  "title": "OCaml Temporal native client wait request",
+  "description": "The absence of a follow_runs option is intentional: this operation waits for the named run (or, with an empty run_id, the run that is current when Temporal handles the poll) and never follows continued-as-new. Runtime validators also reject NUL-containing identifiers and enforce a 65,536-byte UTF-8 safety limit; maxLength is the corresponding character-count bound expressible in standard JSON Schema.",
   "type": "object",
   "additionalProperties": false,
   "required": ["namespace", "workflow_id", "run_id"],
   "properties": {
     "namespace": {"type": "string", "minLength": 1, "maxLength": 65536, "pattern": "^[^\\u0000]+$"},
     "workflow_id": {"type": "string", "minLength": 1, "maxLength": 65536, "pattern": "^[^\\u0000]+$"},
-    "run_id": {"type": "string", "minLength": 1, "maxLength": 65536, "pattern": "^[^\\u0000]+$"}
+    "run_id": {"type": "string", "maxLength": 65536, "pattern": "^[^\\u0000]*$", "description": "Exact run ID, or the empty string to select the workflow's current run, which Temporal resolves when it handles the request (#791)."}
   }
 }

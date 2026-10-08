@@ -280,9 +280,9 @@ let test_typed_start_and_wait_handle () =
          ~input:"hello" ())
   in
   assert (Temporal.Client.workflow_id handle = "unit-echo");
-  assert (String.length (Temporal.Client.run_id handle) > 0);
+  assert (String.length (Option.get (Temporal.Client.run_id handle)) > 0);
   (match Temporal.Client.wait handle with
-  | Ok (Temporal.Client.Completed "hello") -> ()
+  | Ok (Temporal.Client.Completed { output = "hello"; _ }) -> ()
   | Ok _ -> failwith "mock client returned an unexpected terminal result"
   | Error error -> failwith (Temporal.Error.message error));
   unwrap (Temporal.Client.shutdown client);
@@ -333,7 +333,7 @@ let test_client_custom_codec_failures () =
   in
   expect_error "codec" (Temporal.Client.wait handle);
   (match Temporal.Client.wait handle with
-  | Ok (Temporal.Client.Completed ()) -> ()
+  | Ok (Temporal.Client.Completed { output = (); _ }) -> ()
   | Ok _ -> failwith "retried wait returned an unexpected terminal result"
   | Error error -> failwith (Temporal.Error.message error));
   unwrap (Temporal.Client.shutdown client)
@@ -353,7 +353,7 @@ let test_mock_start_idempotent_retry () =
   in
   let first = unwrap (start "original") in
   let retried = unwrap (start "original") in
-  assert (Temporal.Client.run_id first = Temporal.Client.run_id retried);
+  assert (Option.get (Temporal.Client.run_id first) = Option.get (Temporal.Client.run_id retried));
   expect_error_message_contains "workflow" "different start data"
     (start "changed");
   let visibility =
@@ -361,11 +361,11 @@ let test_mock_start_idempotent_retry () =
   in
   assert (List.length visibility.executions = 1);
   (match Temporal.Client.wait first with
-  | Ok (Temporal.Client.Completed "original") -> ()
+  | Ok (Temporal.Client.Completed { output = "original"; _ }) -> ()
   | Ok _ -> failwith "first start returned the wrong result"
   | Error error -> failwith (Temporal.Error.message error));
   (match Temporal.Client.wait retried with
-  | Ok (Temporal.Client.Completed "original") -> ()
+  | Ok (Temporal.Client.Completed { output = "original"; _ }) -> ()
   | Ok _ -> failwith "retried start returned the wrong result"
   | Error error -> failwith (Temporal.Error.message error));
   unwrap (Temporal.Client.shutdown client)
@@ -389,7 +389,7 @@ let test_mock_start_reuses_closed_workflow_id () =
        ~request_id:"reuse-while-running" ~task_queue:"unit-test"
        ~id:"reuse-id" ~input:"blocked" ());
   (match Temporal.Client.wait first with
-  | Ok (Temporal.Client.Completed "first") -> ()
+  | Ok (Temporal.Client.Completed { output = "first"; _ }) -> ()
   | Ok _ -> failwith "first mock run returned an unexpected terminal result"
   | Error error -> failwith (Temporal.Error.message error));
   let second =
@@ -398,24 +398,24 @@ let test_mock_start_reuses_closed_workflow_id () =
          ~request_id:"reuse-second" ~task_queue:"unit-test" ~id:"reuse-id"
          ~input:"second" ())
   in
-  assert (Temporal.Client.run_id first <> Temporal.Client.run_id second);
+  assert (Option.get (Temporal.Client.run_id first) <> Option.get (Temporal.Client.run_id second));
   let retried_first =
     unwrap
       (Temporal.Client.start client ~workflow:echo_workflow
          ~request_id:"reuse-first" ~task_queue:"unit-test" ~id:"reuse-id"
          ~input:"first" ())
   in
-  assert (Temporal.Client.run_id retried_first = Temporal.Client.run_id first);
+  assert (Option.get (Temporal.Client.run_id retried_first) = Option.get (Temporal.Client.run_id first));
   expect_error_message_contains "workflow" "different start data"
     (Temporal.Client.start client ~workflow:echo_workflow
        ~request_id:"reuse-first" ~task_queue:"unit-test" ~id:"reuse-id"
        ~input:"changed" ());
   (match Temporal.Client.wait first with
-  | Ok (Temporal.Client.Completed "first") -> ()
+  | Ok (Temporal.Client.Completed { output = "first"; _ }) -> ()
   | Ok _ -> failwith "first exact handle lost its original run"
   | Error error -> failwith (Temporal.Error.message error));
   (match Temporal.Client.wait second with
-  | Ok (Temporal.Client.Completed "second") -> ()
+  | Ok (Temporal.Client.Completed { output = "second"; _ }) -> ()
   | Ok _ -> failwith "replacement mock run returned the wrong result"
   | Error error -> failwith (Temporal.Error.message error));
   unwrap (Temporal.Client.shutdown client)
@@ -448,7 +448,7 @@ let test_mock_start_id_conflict_policy () =
         assert (view.error_type = Some "WorkflowExecutionAlreadyStarted");
         match Temporal.Client.already_started error with
         | Some { namespace = "unit-test"; workflow_id = "conflict-id"; run_id }
-          when run_id = Temporal.Client.run_id first ->
+          when run_id = Option.get (Temporal.Client.run_id first) ->
             ()
         | Some _ -> failwith "already-started error named the wrong run"
         | None -> failwith "already-started error lost the existing run")
@@ -473,21 +473,21 @@ let test_mock_start_id_conflict_policy () =
               (Temporal.Client.follow client ~workflow:echo_workflow execution)
           in
           assert (not (Temporal.Client.started followed));
-          assert (Temporal.Client.run_id followed = Temporal.Client.run_id first)));
+          assert (Option.get (Temporal.Client.run_id followed) = Option.get (Temporal.Client.run_id first))));
   let attached =
     unwrap
       (start ~id_conflict_policy:`Use_existing ~request_id:"conflict-attach"
          "ignored")
   in
   assert (not (Temporal.Client.started attached));
-  assert (Temporal.Client.run_id attached = Temporal.Client.run_id first);
+  assert (Option.get (Temporal.Client.run_id attached) = Option.get (Temporal.Client.run_id first));
   (* Request-ID deduplication precedes the conflict policy. *)
   let retried =
     unwrap
       (start ~id_conflict_policy:`Fail ~request_id:"conflict-first" "first")
   in
   assert (Temporal.Client.started retried);
-  assert (Temporal.Client.run_id retried = Temporal.Client.run_id first);
+  assert (Option.get (Temporal.Client.run_id retried) = Option.get (Temporal.Client.run_id first));
   expect_error_message_contains "workflow" "different start data"
     (start ~id_conflict_policy:`Terminate_existing ~request_id:"conflict-first"
        "first");
@@ -497,7 +497,7 @@ let test_mock_start_id_conflict_policy () =
          ~request_id:"conflict-replace" "second")
   in
   assert (Temporal.Client.started replacement);
-  assert (Temporal.Client.run_id replacement <> Temporal.Client.run_id first);
+  assert (Option.get (Temporal.Client.run_id replacement) <> Option.get (Temporal.Client.run_id first));
   (match Temporal.Client.wait first with
   | Ok (Temporal.Client.Terminated _) -> ()
   | Ok _ -> failwith "terminate_existing did not terminate the open run"
@@ -507,7 +507,7 @@ let test_mock_start_id_conflict_policy () =
   | Ok _ -> failwith "use_existing handle did not name the original run"
   | Error error -> failwith (Temporal.Error.message error));
   (match Temporal.Client.wait replacement with
-  | Ok (Temporal.Client.Completed "second") -> ()
+  | Ok (Temporal.Client.Completed { output = "second"; _ }) -> ()
   | Ok _ -> failwith "replacement run returned the wrong result"
   | Error error -> failwith (Temporal.Error.message error));
   (* With no open run every policy starts a new run. *)
@@ -518,7 +518,7 @@ let test_mock_start_id_conflict_policy () =
   in
   assert (Temporal.Client.started after_close);
   assert (
-    Temporal.Client.run_id after_close <> Temporal.Client.run_id replacement);
+    Option.get (Temporal.Client.run_id after_close) <> Option.get (Temporal.Client.run_id replacement));
   unwrap (Temporal.Client.shutdown client)
 
 (** The deterministic client seam exposes the same visibility row shape as the
@@ -593,7 +593,7 @@ let test_follow_continued_as_new_handle () =
       {
         namespace = "unit-test";
         workflow_id = Temporal.Client.workflow_id started;
-        run_id = Temporal.Client.run_id started;
+        run_id = Option.get (Temporal.Client.run_id started);
       }
   in
   let execution =
@@ -605,9 +605,9 @@ let test_follow_continued_as_new_handle () =
     unwrap (Temporal.Client.follow client ~workflow:echo_workflow execution)
   in
   assert (Temporal.Client.workflow_id followed = "unit-follow");
-  assert (Temporal.Client.run_id followed = Temporal.Client.run_id started);
+  assert (Option.get (Temporal.Client.run_id followed) = Option.get (Temporal.Client.run_id started));
   (match Temporal.Client.wait followed with
-  | Ok (Temporal.Client.Completed "continued") -> ()
+  | Ok (Temporal.Client.Completed { output = "continued"; _ }) -> ()
   | Ok _ -> failwith "followed handle returned an unexpected terminal result"
   | Error error -> failwith (Temporal.Error.message error));
   unwrap (Temporal.Client.shutdown client)
@@ -733,7 +733,7 @@ let test_exact_run_reset () =
       (Temporal.Client.start client ~workflow:echo_workflow
          ~task_queue:"unit-test" ~id:"unit-reset" ~input:"reset-me" ())
   in
-  let old_run = Temporal.Client.run_id handle in
+  let old_run = Option.get (Temporal.Client.run_id handle) in
   let execution =
     unwrap
       (Temporal.Client.reset ~request_id:"reset-unit-1"
@@ -800,7 +800,7 @@ let test_exact_run_reset () =
     unwrap (Temporal.Client.follow client ~workflow:echo_workflow execution)
   in
   (match Temporal.Client.wait reset_handle with
-  | Ok (Temporal.Client.Completed "reset-me") -> ()
+  | Ok (Temporal.Client.Completed { output = "reset-me"; _ }) -> ()
   | Ok _ -> failwith "reset run returned an unexpected terminal result"
   | Error error -> failwith (Temporal.Error.message error));
   List.iter
@@ -830,7 +830,7 @@ let test_reset_retired_exact_run_again () =
          ~task_queue:"unit-test" ~id:"unit-reset-again" ~input:"again" ())
   in
   (match Temporal.Client.wait original with
-  | Ok (Temporal.Client.Completed "again") -> ()
+  | Ok (Temporal.Client.Completed { output = "again"; _ }) -> ()
   | Ok _ -> failwith "original run did not complete before reset"
   | Error error -> failwith (Temporal.Error.message error));
   let first =
@@ -854,7 +854,7 @@ let test_reset_retired_exact_run_again () =
   in
   assert (retried.run_id = first.run_id);
   (match Temporal.Client.wait original with
-  | Ok (Temporal.Client.Completed "again") -> ()
+  | Ok (Temporal.Client.Completed { output = "again"; _ }) -> ()
   | Ok _ -> failwith "reset rewrote the closed source run"
   | Error error -> failwith (Temporal.Error.message error));
   (match Temporal.Client.wait first_handle with
@@ -865,7 +865,7 @@ let test_reset_retired_exact_run_again () =
     unwrap (Temporal.Client.follow client ~workflow:echo_workflow second)
   in
   (match Temporal.Client.wait second_handle with
-  | Ok (Temporal.Client.Completed "again") -> ()
+  | Ok (Temporal.Client.Completed { output = "again"; _ }) -> ()
   | Ok _ -> failwith "second reset successor returned the wrong result"
   | Error error -> failwith (Temporal.Error.message error));
   unwrap (Temporal.Client.shutdown client)
@@ -929,7 +929,7 @@ let test_reset_request_id_is_scoped_to_workflow () =
       unwrap (Temporal.Client.follow client ~workflow:echo_workflow execution)
     in
     match Temporal.Client.wait handle with
-    | Ok (Temporal.Client.Completed actual) when actual = expected -> ()
+    | Ok (Temporal.Client.Completed { output = actual; _ }) when actual = expected -> ()
     | Ok _ -> failwith "reset successor returned an unexpected result"
     | Error error -> failwith (Temporal.Error.message error)
   in
@@ -953,14 +953,14 @@ let test_completed_mock_run_is_immutable () =
          ())
   in
   (match Temporal.Client.wait handle with
-  | Ok (Temporal.Client.Completed "done") -> ()
+  | Ok (Temporal.Client.Completed { output = "done"; _ }) -> ()
   | Ok _ -> failwith "mock completed run returned an unexpected first result"
   | Error error -> failwith (Temporal.Error.message error));
   unwrap
     (Temporal.Client.cancel ~request_id:"late-cancel" ~reason:"too late"
        handle);
   (match Temporal.Client.wait handle with
-  | Ok (Temporal.Client.Completed "done") -> ()
+  | Ok (Temporal.Client.Completed { output = "done"; _ }) -> ()
   | Ok _ -> failwith "late cancellation rewrote a completed mock run"
   | Error error -> failwith (Temporal.Error.message error));
   unwrap (Temporal.Client.shutdown client)
@@ -980,7 +980,7 @@ let test_reset_preserves_completed_mock_run () =
          ())
   in
   (match Temporal.Client.wait handle with
-  | Ok (Temporal.Client.Completed "done") -> ()
+  | Ok (Temporal.Client.Completed { output = "done"; _ }) -> ()
   | Ok _ -> failwith "completed mock run returned the wrong first result"
   | Error error -> failwith (Temporal.Error.message error));
   let successor =
@@ -988,16 +988,16 @@ let test_reset_preserves_completed_mock_run () =
       (Temporal.Client.reset ~request_id:"reset-completed-1"
          ~reason:"replay after fix" ~workflow_task_finish_event_id:4L handle)
   in
-  assert (successor.run_id <> Temporal.Client.run_id handle);
+  assert (successor.run_id <> Option.get (Temporal.Client.run_id handle));
   (match Temporal.Client.wait handle with
-  | Ok (Temporal.Client.Completed "done") -> ()
+  | Ok (Temporal.Client.Completed { output = "done"; _ }) -> ()
   | Ok _ -> failwith "reset rewrote the completed mock run"
   | Error error -> failwith (Temporal.Error.message error));
   let successor_handle =
     unwrap (Temporal.Client.follow client ~workflow:echo_workflow successor)
   in
   (match Temporal.Client.wait successor_handle with
-  | Ok (Temporal.Client.Completed "done") -> ()
+  | Ok (Temporal.Client.Completed { output = "done"; _ }) -> ()
   | Ok _ -> failwith "reset successor returned the wrong result"
   | Error error -> failwith (Temporal.Error.message error));
   unwrap (Temporal.Client.shutdown client)
@@ -1026,11 +1026,11 @@ let test_reset_rejects_early_event_ids () =
   (match page.executions with
   | [ execution ] ->
       assert (execution.workflow_id = "unit-reset-early-event");
-      assert (execution.run_id = Temporal.Client.run_id handle);
+      assert (execution.run_id = Option.get (Temporal.Client.run_id handle));
       assert (execution.status = "running")
   | _ -> failwith "invalid resets changed mock visibility");
   (match Temporal.Client.wait handle with
-  | Ok (Temporal.Client.Completed "still-running") -> ()
+  | Ok (Temporal.Client.Completed { output = "still-running"; _ }) -> ()
   | Ok _ -> failwith "invalid reset changed the original mock run"
   | Error error -> failwith (Temporal.Error.message error));
   unwrap (Temporal.Client.shutdown client)
@@ -1064,7 +1064,7 @@ let test_exact_run_signal () =
     (Temporal.Client.signal ~request_id:"signal-unit-1" handle
        ~signal:add_document_signal ~input:"document");
   (match Temporal.Client.wait handle with
-  | Ok (Temporal.Client.Completed "ignored") -> ()
+  | Ok (Temporal.Client.Completed { output = "ignored"; _ }) -> ()
   | Ok _ -> failwith "signal changed the mock terminal result"
   | Error error -> failwith (Temporal.Error.message error));
   (* [follow] only reconstructs a typed handle; the backend must still reject
@@ -1129,7 +1129,7 @@ let test_default_signal_request_ids_are_process_wide () =
          {
            namespace = "unit-test";
            workflow_id = Temporal.Client.workflow_id handle_a;
-           run_id = Temporal.Client.run_id handle_a;
+           run_id = Option.get (Temporal.Client.run_id handle_a);
          })
   in
   unwrap
@@ -1435,6 +1435,101 @@ let test_worker_options_deployment_versioning () =
   | Ok _ -> ()
   | Error _ -> failwith "unversioned deployment options were rejected"
 
+(** [get_handle] validates its identifiers like [start] and refuses to
+    build a handle on a shut-down client. An explicit [run_id] must be
+    non-empty: omitting it is how a caller selects the current run. *)
+let test_get_handle_validation () =
+  let client =
+    unwrap
+      (Temporal.Client.create ~target_url:"mock://get-handle-validation"
+         ~namespace:"unit-test" ())
+  in
+  expect_error "defect"
+    (Temporal.Client.get_handle client ~workflow:echo_workflow ~id:"" ());
+  expect_error "defect"
+    (Temporal.Client.get_handle client ~workflow:echo_workflow
+       ~id:"contains\000nul" ());
+  expect_error "defect"
+    (Temporal.Client.get_handle client ~run_id:"" ~workflow:echo_workflow
+       ~id:"unit-get-handle" ());
+  let exact =
+    unwrap
+      (Temporal.Client.get_handle client ~run_id:"run-1" ~workflow:echo_workflow
+         ~id:"unit-get-handle" ())
+  in
+  assert (Temporal.Client.run_id exact = Some "run-1");
+  assert (not (Temporal.Client.started exact));
+  unwrap (Temporal.Client.shutdown client);
+  expect_error "bridge"
+    (Temporal.Client.get_handle client ~workflow:echo_workflow
+       ~id:"unit-get-handle" ())
+
+(** A handle built from the workflow ID alone (#791) addresses whichever run
+    is current when each operation runs. After a reset installs a new run,
+    the same handle signals and terminates that new run, which an exact-run
+    handle for the original run cannot do. An unknown workflow ID surfaces as
+    [Not_found] from the first operation, not from [get_handle]. *)
+let test_current_run_handle () =
+  let client =
+    unwrap
+      (Temporal.Client.create ~target_url:"mock://current-run-handle"
+         ~namespace:"unit-test" ())
+  in
+  let original =
+    unwrap
+      (Temporal.Client.start client ~workflow:echo_workflow
+         ~task_queue:"unit-test" ~id:"unit-current" ~input:"first" ())
+  in
+  let current =
+    unwrap
+      (Temporal.Client.get_handle client ~workflow:echo_workflow
+         ~id:"unit-current" ())
+  in
+  assert (Temporal.Client.run_id current = None);
+  assert (not (Temporal.Client.started current));
+  assert (Temporal.Client.workflow_id current = "unit-current");
+  unwrap
+    (Temporal.Client.signal ~request_id:"current-1" current
+       ~signal:add_document_signal ~input:"before reset");
+  let successor =
+    unwrap (Temporal.Client.reset ~workflow_task_finish_event_id:4L original)
+  in
+  let successor_handle =
+    unwrap (Temporal.Client.follow client ~workflow:echo_workflow successor)
+  in
+  (* The same request ID with different data proves the current-run signal
+     reached the reset successor, not the original run. *)
+  unwrap
+    (Temporal.Client.signal ~request_id:"current-2" current
+       ~signal:add_document_signal ~input:"after reset");
+  expect_error_message_contains "workflow"
+    "signal request ID was already used for different signal data"
+    (Temporal.Client.signal ~request_id:"current-2" successor_handle
+       ~signal:add_document_signal ~input:"different");
+  expect_error "bridge"
+    (Temporal.Client.signal original ~signal:add_document_signal ~input:"late");
+  unwrap (Temporal.Client.terminate ~reason:"done" current);
+  (match Temporal.Client.wait successor_handle with
+  | Ok (Temporal.Client.Terminated _) -> ()
+  | _ -> failwith "current-run termination did not reach the reset successor");
+  (match Temporal.Client.wait current with
+  | Ok (Temporal.Client.Terminated _) -> ()
+  | _ -> failwith "current-run wait did not observe the current run");
+  let missing =
+    unwrap
+      (Temporal.Client.get_handle client ~workflow:echo_workflow
+         ~id:"unit-current-missing" ())
+  in
+  (match
+     Temporal.Client.signal missing ~signal:add_document_signal ~input:"lost"
+   with
+  | Error error when Temporal.Client.rpc_status error = Some `Not_found -> ()
+  | _ -> failwith "unknown workflow ID was not reported as Not_found");
+  (match Temporal.Client.wait missing with
+  | Error error when Temporal.Client.rpc_status error = Some `Not_found -> ()
+  | _ -> failwith "unknown workflow ID wait was not reported as Not_found");
+  unwrap (Temporal.Client.shutdown client)
+
 (** Runs all public worker and client regression assertions. *)
 let () =
   test_duplicate_workflows ();
@@ -1455,6 +1550,8 @@ let () =
   test_follow_continued_as_new_handle ();
   test_follow_rejects_malformed_successor_identity ();
   test_follow_rejects_cross_namespace_execution ();
+  test_get_handle_validation ();
+  test_current_run_handle ();
   test_exact_run_cancellation ();
   test_exact_run_reset ();
   test_reset_retired_exact_run_again ();

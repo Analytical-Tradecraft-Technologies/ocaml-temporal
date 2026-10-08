@@ -47,7 +47,11 @@ type start_response = {
   started : bool;
 }
 
-(** Exact-run wait selector. *)
+(** Wait selector. In this and every request type below that carries a
+    [run_id] after start, an empty [run_id] selects the workflow's current
+    run (#791): the native bridge forwards it to Temporal, which resolves the
+    run when it handles the RPC, and the mock resolves it to the run its
+    ledger currently maps the workflow ID to. *)
 type wait_request = {
   workflow_id : string;
   run_id : string;
@@ -148,9 +152,10 @@ type poll_update_response = { outcome : update_outcome option }
     public client when constructing a typed execution. *)
 type successor = { workflow_id : string; run_id : string }
 
-(** Terminal workflow outcome represented independently from transport errors. *)
+(** Terminal workflow outcome represented independently from transport errors.
+    A completed run keeps the successor a cron or retry policy started (#837). *)
 type terminal_result =
-  | Completed of Payload.t
+  | Completed of { payload : Payload.t; successor : successor option }
   | Failed of { error : Error.t; successor : successor option }
   | Cancelled of Error.t
   | Terminated of Error.t
@@ -208,6 +213,11 @@ type activity_completion =
 type mock_terminal =
   | Mock_pending
   | Mock_completed
+  (* Scripted by tests: completed (echoing the start input) and linked to a
+     cron or retry successor. *)
+  | Mock_completed_with_successor of successor
+  (* Scripted by tests: the run continued as new. *)
+  | Mock_continued_as_new of successor
   | Mock_cancelled
   | Mock_terminated
   | Mock_failed of { error : Error.t; successor : successor option }
@@ -748,10 +758,11 @@ let native_terminal_result (response : Client_protocol.wait_response) =
       value
   in
   match response.outcome with
-  | Client_protocol.Completed { result; successor = _ } -> (
+  | Client_protocol.Completed { result; successor } -> (
+      let successor = successor_ref successor in
       match result with
-      | [ payload ] -> Ok (Completed (public_payload payload))
-      | [] -> Ok (Completed unit_null_payload)
+      | [ payload ] -> Ok (Completed { payload = public_payload payload; successor })
+      | [] -> Ok (Completed { payload = unit_null_payload; successor })
       | _ ->
           Error
             (Error.make ~category:`Codec
@@ -1153,6 +1164,21 @@ let native_client_wait (client : native_client) (request : wait_request) =
     in
     await_terminal ()
 
+(** Reports whether a request's run selector addresses [execution], the run
+    the mock ledger currently maps its workflow ID to. An empty selector names
+    the current run, mirroring Temporal's resolution of an empty run ID. *)
+let mock_selects_run ~run_id (execution : mock_execution) =
+  String.equal run_id "" || String.equal execution.run_id run_id
+
+(** Finds the run a request selects, including runs retired by reset or a
+    replacing start. Must be called with the service mutex held. An empty
+    [run_id] resolves to the workflow's current run. *)
+let mock_find_run service ~workflow_id ~run_id =
+  match Hashtbl.find_opt service.executions workflow_id with
+  | Some current when mock_selects_run ~run_id current -> Some current
+  | Some _ | None when String.equal run_id "" -> None
+  | Some _ | None -> Hashtbl.find_opt service.history (workflow_id, run_id)
+
 (** Waits for a mock execution and echoes its input as the completed output.
     Echoing is sufficient to test typed output decoding without coupling this
     private transport to any application workflow implementation. *)
@@ -1165,10 +1191,8 @@ let mock_client_wait (client : mock_client) (request : wait_request) =
       if client.closed then Error (bridge_error "client is shut down")
       else
         let execution =
-          match Hashtbl.find_opt service.executions request.workflow_id with
-          | None -> Hashtbl.find_opt service.history (request.workflow_id, request.run_id)
-          | Some current when String.equal current.run_id request.run_id -> Some current
-          | Some _ -> Hashtbl.find_opt service.history (request.workflow_id, request.run_id)
+          mock_find_run service ~workflow_id:request.workflow_id
+            ~run_id:request.run_id
         in
         match execution with
         | None -> Error (mock_not_found "workflow run id does not match the started run")
@@ -1179,8 +1203,14 @@ let mock_client_wait (client : mock_client) (request : wait_request) =
                    completed terminal state before returning the copied
                    payload. *)
                 execution.terminal <- Mock_completed;
-                Ok (Completed (copy_payload execution.input))
-            | Mock_completed -> Ok (Completed (copy_payload execution.input))
+                Ok (Completed { payload = copy_payload execution.input; successor = None })
+            | Mock_completed ->
+                Ok (Completed { payload = copy_payload execution.input; successor = None })
+            | Mock_completed_with_successor successor ->
+                Ok
+                  (Completed
+                     { payload = copy_payload execution.input; successor = Some successor })
+            | Mock_continued_as_new successor -> Ok (Continued_as_new successor)
             | Mock_cancelled ->
                 Ok
                   (Cancelled
@@ -1228,8 +1258,16 @@ let mock_set_wait_outcome_for_test client (request : wait_request) outcome =
                 | Timed_out { error; successor } ->
                     execution.terminal <- Mock_timed_out { error; successor };
                     Ok ()
-                | Completed _ | Cancelled _ | Terminated _ | Continued_as_new _ ->
-                    Error (defect "mock wait outcome must be failed or timed out")))
+                | Completed { successor = Some successor; _ } ->
+                    execution.terminal <- Mock_completed_with_successor successor;
+                    Ok ()
+                | Continued_as_new successor ->
+                    execution.terminal <- Mock_continued_as_new successor;
+                    Ok ()
+                | Completed { successor = None; _ } | Cancelled _ | Terminated _ ->
+                    Error
+                      (defect
+                         "mock wait outcome must carry a successor or be failed or timed out")))
 
 (** Converts one public cancellation request to the closed native protocol
     representation. The namespace is supplied by the connected client rather
@@ -1402,12 +1440,13 @@ let mock_client_cancel (client : mock_client) (request : cancel_request) =
         match Hashtbl.find_opt service.executions request.workflow_id with
         | None -> Error (mock_not_found "workflow execution was not started")
         | Some execution
-          when not (String.equal execution.run_id request.run_id) ->
+          when not (mock_selects_run ~run_id:request.run_id execution) ->
             Error (mock_not_found "workflow run id does not match the started run")
         | Some execution ->
             (match execution.terminal with
             | Mock_pending -> execution.terminal <- Mock_cancelled
-            | Mock_completed | Mock_cancelled | Mock_terminated
+            | Mock_completed | Mock_completed_with_successor _
+            | Mock_continued_as_new _ | Mock_cancelled | Mock_terminated
             | Mock_failed _ | Mock_timed_out _ ->
                 ());
             Ok ())
@@ -1461,8 +1500,8 @@ let mock_client_reset (client : mock_client) (request : reset_request) =
                  ())
         | None ->
           match
-            Hashtbl.find_opt service.history
-              (request.workflow_id, request.run_id)
+            mock_find_run service ~workflow_id:request.workflow_id
+              ~run_id:request.run_id
           with
         | None when Hashtbl.mem service.executions request.workflow_id ->
             Error (mock_not_found "workflow run id does not match the started run")
@@ -1511,12 +1550,13 @@ let mock_client_terminate (client : mock_client) (request : terminate_request) =
         match Hashtbl.find_opt service.executions request.workflow_id with
         | None -> Error (mock_not_found "workflow execution was not started")
         | Some execution
-          when not (String.equal execution.run_id request.run_id) ->
+          when not (mock_selects_run ~run_id:request.run_id execution) ->
             Error (mock_not_found "workflow run id does not match the started run")
         | Some execution ->
             (match execution.terminal with
             | Mock_pending -> execution.terminal <- Mock_terminated
-            | Mock_completed | Mock_cancelled | Mock_terminated
+            | Mock_completed | Mock_completed_with_successor _
+            | Mock_continued_as_new _ | Mock_cancelled | Mock_terminated
             | Mock_failed _ | Mock_timed_out _ ->
                 ());
             Ok ())
@@ -1543,7 +1583,7 @@ let mock_client_signal (client : mock_client) (request : signal_request) =
         match Hashtbl.find_opt service.executions request.workflow_id with
         | None -> Error (mock_not_found "workflow execution was not started")
         | Some execution
-          when not (String.equal execution.run_id request.run_id) ->
+          when not (mock_selects_run ~run_id:request.run_id execution) ->
             Error (mock_not_found "workflow run id does not match the started run")
         | Some ({ terminal = Mock_pending; _ } as execution) -> (
             let delivery =
@@ -1589,7 +1629,7 @@ let mock_client_query (client : mock_client) (request : query_request) =
         match Hashtbl.find_opt service.executions request.workflow_id with
         | None -> Error (mock_not_found "workflow execution was not started")
         | Some execution
-          when not (String.equal execution.run_id request.run_id) ->
+          when not (mock_selects_run ~run_id:request.run_id execution) ->
             Error (mock_not_found "workflow run id does not match the started run")
         | Some _ ->
             Error
@@ -1705,7 +1745,8 @@ let mock_client_list_visibility (client : mock_client)
                      let status =
                        match execution.terminal with
                        | Mock_pending -> "running"
-                       | Mock_completed -> "completed"
+                       | Mock_completed | Mock_completed_with_successor _ -> "completed"
+                       | Mock_continued_as_new _ -> "continued_as_new"
                        | Mock_cancelled -> "canceled"
                        | Mock_terminated -> "terminated"
                        | Mock_failed _ -> "failed"

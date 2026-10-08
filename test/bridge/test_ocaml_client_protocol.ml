@@ -236,7 +236,7 @@ let test_request_validation () =
     (fun request -> require_error (Protocol.encode_cancel_request request))
     [
       { cancel_request with execution = { execution with namespace = "" } };
-      { cancel_request with execution = { execution with run_id = "" } };
+      { cancel_request with execution = { execution with run_id = "a\000b" } };
       { cancel_request with request_id = "contains\000nul" };
       { cancel_request with reason = String.make 65_537 'x' };
       { cancel_request with reason = "contains\000nul" };
@@ -254,7 +254,7 @@ let test_request_validation () =
     (fun request -> require_error (Protocol.encode_signal_request request))
     [
       { signal_request with execution = { execution with namespace = "" } };
-      { signal_request with execution = { execution with run_id = "" } };
+      { signal_request with execution = { execution with run_id = "a\000b" } };
       { signal_request with signal_name = "" };
       { signal_request with request_id = "contains\000nul" };
     ]
@@ -421,7 +421,7 @@ let test_query_protocol () =
     (fun request -> require_error (Protocol.encode_query_request request))
     [
       { query_request with execution = { execution with namespace = "" } };
-      { query_request with execution = { execution with run_id = "" } };
+      { query_request with execution = { execution with run_id = "a\000b" } };
       { query_request with query_type = "" };
     ];
   require_error
@@ -560,6 +560,72 @@ let test_response_execution_correlation () =
   in
   require_error
     (Protocol.decode_wait_response ~request:execution wait_response)
+
+(** Checks the current-run selector (#791): every request after start
+    accepts an empty run ID, a wait response must echo the selector exactly,
+    and an update response must name a concrete run, adopting the resolved run
+    only for a current-run request. *)
+let test_current_run_protocol () =
+  let current = { execution with run_id = "" } in
+  let encoded = unwrap (Protocol.encode_wait_request current) in
+  require_fragment "current-run wait" {|"run_id":""|} encoded;
+  ignore (unwrap (Protocol.encode_cancel_request { cancel_request with execution = current }));
+  ignore (unwrap (Protocol.encode_reset_request { reset_request with execution = current }));
+  ignore
+    (unwrap
+       (Protocol.encode_terminate_request { execution = current; reason = "" }));
+  ignore (unwrap (Protocol.encode_signal_request { signal_request with execution = current }));
+  ignore (unwrap (Protocol.encode_query_request { query_request with execution = current }));
+  let update_request : Protocol.update_request =
+    { execution = current; update_id = "update-1"; update_name = "set"; input = [] }
+  in
+  ignore (unwrap (Protocol.encode_update_request update_request));
+  ignore
+    (unwrap
+       (Protocol.encode_poll_update_request
+          { execution = current; update_id = "update-1" }));
+  (* The namespace and workflow ID remain mandatory for a current-run request. *)
+  require_error (Protocol.encode_wait_request { current with workflow_id = "" });
+  require_error
+    (Protocol.encode_update_request
+       { update_request with execution = { current with namespace = "" } });
+  let completed_with_successor run_id =
+    Printf.sprintf
+      {|{"execution":{"namespace":"default","workflow_id":"workflow-1","run_id":"%s"},"outcome":{"kind":"completed","result":[],"successor":{"namespace":"default","workflow_id":"workflow-1","run_id":"next-run"}}}|}
+      run_id
+  in
+  let response =
+    unwrap
+      (Protocol.decode_wait_response ~request:current (completed_with_successor ""))
+  in
+  (match response.outcome with
+  | Protocol.Completed { successor = Some { run_id = "next-run"; _ }; _ } -> ()
+  | _ -> failwith "current-run wait lost the completed successor");
+  if response.execution.run_id <> "" then
+    failwith "current-run wait did not echo its selector";
+  (* The echo must equal the request in both directions. *)
+  require_error
+    (Protocol.decode_wait_response ~request:current (completed_with_successor "run-1"));
+  require_error
+    (Protocol.decode_wait_response ~request:execution (completed_with_successor ""));
+  let update_response run_id =
+    Printf.sprintf
+      {|{"update_id":"update-1","execution":{"namespace":"default","workflow_id":"workflow-1","run_id":"%s"},"outcome":null}|}
+      run_id
+  in
+  let adopted =
+    unwrap
+      (Protocol.decode_update_response ~request:update_request
+         (update_response "resolved-run"))
+  in
+  if adopted.execution.run_id <> "resolved-run" then
+    failwith "current-run update did not adopt the resolved run";
+  require_error
+    (Protocol.decode_update_response ~request:update_request (update_response ""));
+  require_error
+    (Protocol.decode_update_response
+       ~request:{ update_request with execution }
+       (update_response "resolved-run"))
 
 (** Decodes structured native errors and rejects categories or codes outside
     the bilateral closed vocabulary. *)
@@ -709,5 +775,6 @@ let () =
   run "client id conflict policy" test_id_conflict_policy_protocol;
   run "client closed response shape" test_closed_response_shape;
   run "client response correlation" test_response_execution_correlation;
+  run "client current-run selector" test_current_run_protocol;
   run "client structured errors" test_client_errors;
   run "client operation error correlation" test_operation_error_correlation
