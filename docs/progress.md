@@ -73,8 +73,9 @@ Evidence:
   rejected values, reuse-policy semantics, and per-operation deadline
   validation.
 - A new live regression, `test/integration/client_policies`, added to
-  `LIVE_REGRESSION_EXECUTABLES`, passed four consecutive times against the
-  Compose Temporal 1.32/PostgreSQL stack. It shows execution and run timeouts
+  `LIVE_REGRESSION_EXECUTABLES`, passed every run against the Compose
+  Temporal 1.32/PostgreSQL stack once the fixture was settled (six runs, the
+  last two on the committed code), driven natively from macOS. It shows execution and run timeouts
   ending runs as `Timed_out`, the server recording the execution, run, and
   task timeouts, a 1 ms query deadline failing as `` `Deadline_exceeded ``
   while the workflow keeps running, the reuse policies refusing or allowing a
