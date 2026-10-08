@@ -221,7 +221,7 @@ let start_ack_lost ~proxy ~client ~direct ~queue ~track =
     track (get "start retry with the same request ID"
       (Client.start client ~request_id ~workflow:counter ~task_queue:queue ~id ~input:100 ()))
   in
-  if Client.run_id handle <> accepted_run then
+  if Option.get (Client.run_id handle) <> accepted_run then
     failwith "start_ack_lost: request-ID retry returned a different run";
   if not (Client.started handle) then
     failwith "start_ack_lost: request-ID retry was not reported as the creating start";
@@ -301,7 +301,7 @@ let wait_across_outage ~proxy ~direct_handle ~handle =
   Fault_proxy.restore proxy;
   get "completing signal" (Client.signal direct_handle ~signal ~input:88);
   match timed "wait_across_outage" 60. (fun () -> join waiting) with
-  | Ok (Client.Completed 100) ->
+  | Ok (Client.Completed { output = 100; _ }) ->
       Fault_proxy.log "scenario=wait_across_outage outcome=completed counter=100"
   | Ok _ -> failwith "wait_across_outage: unexpected terminal outcome"
   | Error error -> failwith ("wait_across_outage: wait failed: " ^ describe error)
@@ -319,7 +319,7 @@ let terminate_ack_lost ~proxy ~client ~direct ~queue ~track =
     get "terminate follow"
       (Client.follow client ~workflow:counter
          { Client.namespace; workflow_id = Client.workflow_id direct_handle;
-           run_id = Client.run_id direct_handle })
+           run_id = Option.get (Client.run_id direct_handle) })
   in
   (* The proxied connection must exist before responses are dropped. *)
   ignore (get "terminate warm-up query" (Client.query handle ~query));
@@ -335,7 +335,7 @@ let terminate_ack_lost ~proxy ~client ~direct ~queue ~track =
   match timed "terminate reconciliation" 30. (fun () -> Client.wait direct_handle) with
   | Ok (Client.Terminated _) ->
       Fault_proxy.log "scenario=terminate_ack_lost run_id=%s reconciled=terminated"
-        (Client.run_id direct_handle)
+        (Option.get (Client.run_id direct_handle))
   | Ok _ -> failwith "terminate_ack_lost: uncertain terminate was not applied"
   | Error error -> failwith ("terminate_ack_lost: reconciliation failed: " ^ describe error)
 
@@ -355,9 +355,9 @@ let worker_poll_outage ~proxy ~direct ~queue ~track ~worker_stopped =
     failwith "worker_poll_outage: Worker.run returned while the server was unavailable";
   Fault_proxy.restore proxy;
   match timed "worker_poll_outage" 60. (fun () -> Client.wait handle) with
-  | Ok (Client.Completed 0) ->
+  | Ok (Client.Completed { output = 0; _ }) ->
       Fault_proxy.log "scenario=worker_poll_outage run_id=%s outcome=completed"
-        (Client.run_id handle)
+        (Option.get (Client.run_id handle))
   | Ok _ -> failwith "worker_poll_outage: unexpected terminal outcome"
   | Error error -> failwith ("worker_poll_outage: wait failed: " ^ describe error)
 
@@ -368,7 +368,7 @@ let history_event_types cli address handle =
   let address = String.sub address 7 (String.length address - 7) in
   let args = [| cli; "--address"; address; "--namespace"; namespace;
     "--command-timeout"; "30s"; "workflow"; "show";
-    "--workflow-id"; Client.workflow_id handle; "--run-id"; Client.run_id handle;
+    "--workflow-id"; Client.workflow_id handle; "--run-id"; Option.get (Client.run_id handle);
     "--output"; "json" |] in
   let input = Unix.open_process_args_in cli args in
   let document =
@@ -416,12 +416,12 @@ let activity_completion_ack_lost ~proxy ~direct ~queue ~track ~cli ~address =
     "scenario=activity_completion_ack_lost fault_exercised=true dropped_bytes=%d" dropped;
   Fault_proxy.restore proxy;
   (match timed "activity_completion_ack_lost" 60. (fun () -> Client.wait handle) with
-  | Ok (Client.Completed 42) -> ()
+  | Ok (Client.Completed { output = 42; _ }) -> ()
   | Ok _ -> failwith "activity_completion_ack_lost: unexpected terminal outcome"
   | Error error -> failwith ("activity_completion_ack_lost: wait failed: " ^ describe error));
   let invocations = Atomic.get activity_invocations in
   Fault_proxy.log "scenario=activity_completion_ack_lost run_id=%s callback_invocations=%d"
-    (Client.run_id handle) invocations;
+    (Option.get (Client.run_id handle)) invocations;
   if invocations <> 1 then
     failwith (Printf.sprintf
       "activity_completion_ack_lost: callback ran %d times in one attempt" invocations)
@@ -490,7 +490,7 @@ let check address cli =
         get "direct follow"
           (Client.follow direct ~workflow:counter
              { Client.namespace; workflow_id = Client.workflow_id handle;
-               run_id = Client.run_id handle })
+               run_id = Option.get (Client.run_id handle) })
       in
       signal_ack_lost ~proxy:client_proxy ~direct_handle ~handle;
       update_response_delayed ~proxy:client_proxy ~direct_handle ~handle;
