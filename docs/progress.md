@@ -58,6 +58,40 @@ in [transport fault qualification](reference/transport-fault-qualification.md#re
 worker shutdown while the server is unavailable, faults over TLS, and the
 external idempotency example.
 
+## 2026-10-08: Actionable replay nondeterminism diagnostics (#529)
+
+`Temporal.Replay.Nondeterminism` now carries a `mismatch` record besides
+Core's complete `message`: the history's workflow ID, the workflow type from
+the run's start job, the first unmatched recorded event's ID and type, the
+command state machine Core matched it against (normally the command the
+changed code produced), and Core's mismatch sentence unwrapped from its
+failure envelope. Extraction is best effort over Core's text and fails
+closed: anything Core does not state is `None`, and no OCaml source location
+is invented. `failure_message` keeps its `nondeterminism (run RUN_ID): `
+prefix and now renders that context with a reminder to guard intentional
+changes with `Temporal.Workflow.patched`. Every rendered failure is one line
+of at most about 3 KB: interpolated values are escaped and each is bounded
+(256 bytes for identifiers, 1,024 for Core's reason) without splitting UTF-8,
+while the record keeps the exact values. The workflow guide has a
+troubleshooting example for locating an incompatible change and states that
+a clean replay covers only recorded paths. No ABI, bridge, or Rust change was
+needed; a live worker already reports the same Core text on the
+`WorkflowTaskFailed` event and in Core's `WARN` log.
+
+Evidence: `test/bridge/test_replay_diagnostics.ml` replays the corpus
+`negative-timer-removed` control through the public API and asserts workflow
+type `corpus.timer`, workflow ID `history-corpus-timer`, event 5
+`TimerStarted`, command `Complete workflow`, Core's exact reason and a
+one-line rendering without the recorded payload; the
+`negative-patch-active-on-legacy` control asserts the patch ID in the reason
+with the event and command left `None`. `test/bridge/test_public_replay.ml`
+asserts the event and command of a removed timer, an activity in place of a
+timer, and an added timer (event 16 `WorkflowExecutionCompleted` against a
+`Timer` command), and renders a 60 KB workflow ID containing line breaks
+and control bytes as one escaped, truncated line while the record keeps the
+exact ID, with task failures and invalid input still classified
+separately. The installed-consumer witness binds every new field.
+
 ## 2026-10-08: Seeded bridge lifecycle stress (#522)
 
 `rust/core-bridge/tests/lifecycle_stress.rs` generates reproducible operation
@@ -3252,3 +3286,36 @@ reproduced all eleven cases. See the
 [history corpus reference](reference/history-corpus.md) for the rules and the
 remaining scope (#524 runs the corpus across upgrades; #515 adds a public
 runner).
+
+## 2026-10-08: Replay corpus as the SDK/Core upgrade gate (#524)
+
+The replay history corpus now runs through the public `Temporal.Replay` API,
+the entry point applications use, instead of the private replay path.
+`test/history_corpus/history_corpus_runner.ml` replaces
+`test_history_corpus.ml` and `corpus_replay.ml` as the single runner. It is the
+Dune test, so `make verify` and `make native-verify` run it on every PR, and
+it is also `make test-history-corpus-upgrade`. That target writes a per-case
+table and `_build/history-corpus/report.json`. The report records each case's
+ID, expected and actual outcome, failure message and producing SDK commit and
+Core revision. It also records the candidate SDK commit, the Core revision
+read from `rust/Cargo.lock`, the OCaml version and the bridge ABI. The runner
+exits 1 and lists every mismatched case ID. The Linux amd64 / OCaml 5.5.1 CI
+leg uploads the report as an artifact, also after a failed verification.
+
+The public API reports no run ID or workflow type on success. The manifest
+validator therefore decodes each entry's `workflow_type` and
+`original_execution_run_id` from the start event of the protobuf history that
+is replayed (a minimal documented field walk, `corpus_history_identity.ml`),
+checks the optional JSON copy against the same values, and the runner
+registers only the entry's workflow type. `test_history_corpus_mismatch`
+copies the corpus, breaks one expected pass and one negative control, and
+requires exit 1 with exactly those IDs in standard error and in the report. A
+second scenario swaps in another valid protobuf without a JSON copy and
+requires validation to fail on that entry's identity. A manual mutation also
+confirmed that a wrong `run_id` fails validation. The
+[Core pin upgrade checklist](dependencies.md#temporal-core-pin-upgrades) now
+requires a passing report for every Core bump and Dependabot Cargo PR. The
+runner output and report state that a pass is forward-compatibility evidence
+only, not rollback evidence (#508). The
+whole corpus replays in about a second. Every current capture comes from Core
+`95e97686`, so the first Core bump will be the first cross-revision replay.

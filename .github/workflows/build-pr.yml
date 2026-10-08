@@ -300,6 +300,25 @@ jobs:
         env:
           OCAML_VERSION: ${{ matrix.ocaml }}
         run: make docs
+      # `make verify` already enforces the replay history corpus on every
+      # matrix leg through `dune runtest`. One leg reruns the same offline
+      # runner (seconds, reusing the build) to retain the machine-readable
+      # report that Core pin and Dependabot Cargo PRs cite as upgrade
+      # evidence; it also runs after a failed verify so a mismatch is
+      # recorded per case.
+      - name: Write the replay history corpus upgrade report
+        if: ${{ !cancelled() && matrix.runner == 'ubuntu-24.04' && matrix.ocaml == '5.5.1' }}
+        env:
+          OCAML_VERSION: ${{ matrix.ocaml }}
+        run: make test-history-corpus-upgrade HISTORY_CORPUS_SDK_COMMIT="$GITHUB_SHA"
+      - name: Upload the replay history corpus upgrade report
+        if: ${{ !cancelled() && matrix.runner == 'ubuntu-24.04' && matrix.ocaml == '5.5.1' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: history-corpus-report-linux-amd64-ocaml-${{ matrix.ocaml }}
+          path: _build/history-corpus/report.json
+          if-no-files-found: warn
+          retention-days: ${{ vars.RUST_BRIDGE_ARTIFACT_RETENTION_DAYS || '90' }}
       - name: Package and consume the compiled OCaml library
         env:
           OCAML_VERSION: ${{ matrix.ocaml }}

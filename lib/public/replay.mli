@@ -86,17 +86,59 @@ module History : sig
   val workflow_id : t -> string
 end
 
+(** Where and how a replay first diverged from its recorded history, as far
+    as Temporal Core's diagnostic says. The SDK adds the context it knows
+    (the workflow ID and type) and extracts the event and command that Core's
+    text names. A field that Core's text does not supply is [None]: the SDK
+    never infers an event, command, or source location that Core did not
+    report, and Core does not report OCaml source locations at all. *)
+type mismatch = {
+  workflow_id : string;
+      (** The workflow ID supplied to {!History.of_protobuf}. *)
+  workflow_type : string option;
+      (** The workflow type recorded in the history's start event, as
+          delivered to the replayed workflow. [None] only when Core refused
+          the run before delivering its start. *)
+  event_id : int64 option;
+      (** The ID of the first recorded history event that Core could not
+          match, for example [5]. These are the event IDs shown by the
+          Temporal UI and [temporal workflow show]. *)
+  event_type : string option;
+      (** Core's name for that event's type, for example ["TimerStarted"] or
+          ["ActivityTaskScheduled"]. *)
+  command : string option;
+      (** Core's name for the command state machine the event was matched
+          against, normally the command the current workflow code produced
+          at that point, for example ["Timer"], ["Activity"], or
+          ["Complete workflow"]. [None] when Core's text names none, such as
+          ["No command scheduled for event ..."], which means the current
+          code produced no command where the history recorded one. *)
+  reason : string;
+      (** Core's mismatch sentence, unwrapped from the workflow-task failure
+          envelope it travels in, for example
+          ["[TMPRL1100] Nondeterminism error: Complete workflow machine does
+          not handle this event: HistoryEvent(id: 5, TimerStarted)"]. It is
+          the whole [message] when Core sent no envelope. *)
+}
+
 (** Why a history did not replay cleanly. Each diagnostic is bounded to a few
     kilobytes. Core's mismatch text describes recorded events and workflow
     commands; it can name workflow types, activity types, timer or activity
     IDs, and similar identifiers from the history, but the SDK never copies
     payload bytes into it. *)
 type failure =
-  | Nondeterminism of { run_id : string; message : string }
+  | Nondeterminism of {
+      run_id : string;
+      message : string;
+      mismatch : mismatch;
+    }
       (** The workflow produced commands that do not match the recorded
           history, for example a removed, added, or reordered timer or
-          activity. [message] is Temporal Core's description of the mismatch
-          and [run_id] identifies the replayed run. *)
+          activity. [message] is Temporal Core's complete description of the
+          mismatch, [run_id] identifies the replayed run, and [mismatch]
+          structures the parts of it needed to locate the change. This is
+          distinct from [Workflow_task_failed] (the code itself failed) and
+          from [Invalid_history] (the input is malformed). *)
   | Workflow_task_failed of { run_id : string option; message : string }
       (** Workflow code could not complete an activation: it raised, returned
           a defect, could not decode its input with the registered codec, or
@@ -119,7 +161,39 @@ type failure =
           The history's verdict is unknown. *)
 
 (** Returns a one-line, human-readable description of [failure], prefixed with
-    its kind, suitable for logs and CI output. *)
+    its kind, suitable for logs and CI output. The prefixes are stable:
+    ["nondeterminism (run RUN_ID): "], ["workflow task failed"],
+    ["invalid history: "], ["unsupported history: "], and
+    ["replay error: "].
+
+    A nondeterminism line continues with the workflow type and ID, the
+    recorded event and the command it was matched against when Core named
+    them, Core's [reason], and a reminder that an intentional
+    change must be guarded with [Temporal.Workflow.patched]. For example
+    (wrapped here; the real output is one line):
+
+    {v
+    nondeterminism (run 01a1...): workflow corpus.timer (ID history-corpus-timer):
+    recorded event 5 (TimerStarted) does not match the current code's Complete
+    workflow command; Core: [TMPRL1100] Nondeterminism error: Complete workflow
+    machine does not handle this event: HistoryEvent(id: 5, TimerStarted); guard
+    intentional command changes with Temporal.Workflow.patched
+    v}
+
+    The result is always one line of at most about 3 KB, whatever the
+    history contains. Every interpolated value is escaped: backslash, line
+    feed, carriage return, and tab become a backslash followed by another
+    backslash, [n], [r], or [t], and other control bytes, DEL, and invalid
+    UTF-8 bytes become a backslash, [x], and two hexadecimal digits. The
+    escaped run ID, workflow ID, workflow type, event type, and command are
+    each limited to 256 bytes, and Core's reason or another diagnostic
+    message to 1,024 bytes. A longer value ends in
+    ["...(N bytes truncated)"], and a UTF-8 character is never split. This
+    rendering does not alter the {!failure} and {!mismatch} values:
+    [mismatch.workflow_id], for example, is exactly the ID passed to {!History.of_protobuf}.
+
+    The wording after the prefix is for people and may be refined; match on
+    the {!failure} constructor and {!mismatch} fields in code. *)
 val failure_message : failure -> string
 
 (** Replays [history] against [workflows] and returns [Ok ()] when Core
