@@ -2446,6 +2446,10 @@ impl PollLanes {
     /// On failure the original [`PollLanes`] is returned so the caller can still
     /// force-complete outstanding tasks or retry. A failed finalize must not
     /// drop the only handle that can still talk to Core.
+    // The error deliberately returns the lane graph itself so ownership is
+    // never lost on failure; boxing it would only move the same value to the
+    // heap.
+    #[allow(clippy::result_large_err)]
     pub async fn finalize(self) -> Result<(), (Self, WorkerBridgeError)> {
         let (outstanding, lost_poll_lease) = {
             let ledger_state = self
