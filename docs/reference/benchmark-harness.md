@@ -140,7 +140,9 @@ above and add, per repetition:
   collections, compactions) on the benchmark Domain.
 - `memory`: snapshots `before_load` (after `Gc.compact`, before the workload
   is built), `after_warmup` (steady state), `after_measurement` (under load or
-  churn), `after_close` (workload released) and `after_compact`. Each has the
+  churn), `after_close` (workload released) and `after_compact`. The last two are taken
+  after the function that owns the workload has closed it and returned, so no
+  harness closure still references the workload or its state. Each has the
   OCaml heap, top heap and **live** bytes from `Gc.stat`, which forces a full
   major collection, and process RSS. RSS comes from `/proc/self/status`
   (`VmRSS`, with peak `VmHWM`) on Linux, otherwise from `ps`, without a peak
@@ -211,10 +213,21 @@ them all with `Future_store.all`. Results arrive `BENCH_FANOUT_BATCH` per
 activation, interleaved round-robin across the concurrent runs; the last batch
 completes the run and an eviction follows. Arguments and results are JSON
 strings of `BENCH_FANOUT_PAYLOAD_BYTES` encoded bytes. Sample latency is the
-end-to-end fan-out completion time for every concurrent run, and throughput is
-fan-outs per second; multiply by `activities_per_sample` for activities per
-second. `admitted_concurrency` is the number of concurrent runs, with
+end-to-end fan-out completion time for every concurrent run.
+`throughput_successes_per_second` counts samples (groups of
+`BENCH_FANOUT_CONCURRENCY` fan-outs), not fan-outs. Each phase therefore also
+reports `fanouts_per_second` (samples per second times the concurrency) and
+`activities_per_second` (times `activities_per_sample`).
+`admitted_concurrency` is the number of concurrent runs, with
 `admission_model: closed_loop_interleaved_runs`.
+
+All result activations are encoded before the baseline snapshot and stay
+resident, so the suite rejects a configuration before building them unless
+`BENCH_FANOUT_WIDTH * BENCH_FANOUT_CONCURRENCY` is at most 200,000 and the
+estimated fixture size is at most 512 MiB. The estimate charges each activity
+result its base64-expanded payload (4 bytes per started 3 bytes) plus a
+512-byte envelope allowance, above the measured envelope, and is checked by
+division so it cannot overflow.
 
 The untimed `json_bridge_attribution` pass, also used by the history suite,
 reruns the workload with extra timers. It splits each adapter poll into

@@ -14,15 +14,16 @@ let object_field json key = Json.(json |> member key |> to_assoc)
 (** Returns a required list field, failing the test on a schema mismatch. *)
 let list json key = Json.(json |> member key |> to_list)
 
+(** Returns a required JSON number as a float. *)
+let number json key =
+  match Json.member key json with
+  | `Int value -> float_of_int value
+  | `Float value -> value
+  | _ -> failwith (key ^ " must be numeric")
+
 (** Returns a required nonnegative JSON number. *)
 let nonnegative_number json key =
-  let value = Json.member key json in
-  let number =
-    match value with
-    | `Int value -> float_of_int value
-    | `Float value -> value
-    | _ -> failwith (key ^ " must be numeric")
-  in
+  let number = number json key in
   if Float.is_nan number || number < 0. then
     failwith (key ^ " must be nonnegative")
 
@@ -36,6 +37,25 @@ let check_phase ~attempts ~latencies phase =
   expect (list phase "error_examples" = []) "unexpected error examples";
   nonnegative_number phase "elapsed_seconds";
   nonnegative_number phase "throughput_successes_per_second"
+
+(** Checks the fan-out suite's derived rates. A sample completes
+    [concurrent_runs] fan-outs of [fanout_width] activities, so each derived
+    rate must equal the per-sample throughput scaled by that work. The
+    tolerance only absorbs floating-point rounding. *)
+let check_fanout_rates ~config phase =
+  let samples_per_second = number phase "throughput_successes_per_second" in
+  List.iter
+    (fun (key, per_sample) ->
+      let expected = samples_per_second *. float_of_int per_sample in
+      let actual = number phase key in
+      expect
+        (Float.abs (actual -. expected) <= 1e-9 *. Float.max 1. expected)
+        (key ^ " does not match samples per second times work per sample"))
+    [
+      ("fanouts_per_second", integer config "concurrent_runs");
+      ( "activities_per_second",
+        integer config "concurrent_runs" * integer config "fanout_width" );
+    ]
 
 (** Suites run through [Benchmark_harness.run_instrumented], whose reports
     must carry memory, allocation and observation sections. *)
@@ -122,6 +142,7 @@ let () =
       check_phase ~attempts:1 ~latencies:0 (Json.member "warmup" repetition);
       let measured = Json.member "measurement" repetition in
       check_phase ~attempts:samples ~latencies:samples measured;
+      if expected_suite = "activity-fanout" then check_fanout_rates ~config measured;
       List.iter (nonnegative_number measured) [ "p50_us"; "p95_us"; "p99_us" ];
       if instrumented then check_memory repetition
   | _ -> failwith "expected one benchmark repetition"

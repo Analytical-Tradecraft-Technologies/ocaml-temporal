@@ -36,10 +36,31 @@ let batch =
 let payload_bytes =
   W.env_count ~name:"BENCH_FANOUT_PAYLOAD_BYTES" ~default:256 ~limit:1_048_576
 
-(** Bounds the activities processed by one sample. *)
+(** Upper bound, in bytes, on the pre-encoded activation fixtures. The
+    fixtures are resident for the whole process, and running the workflows
+    holds roughly as many bytes again in decoded results and scheduled
+    arguments, so this keeps a misconfigured run from exhausting memory. *)
+let fixture_byte_limit = 512 * 1024 * 1024
+
+(** Bounds the activities processed by one sample and, before any fixture is
+    built, the bytes their encoded results would occupy. Both products are
+    checked without overflow: the first factors are at most 20,000 and 256,
+    and the byte bound is checked by division in
+    {!Benchmark_worker.check_fixture_bytes}. *)
 let () =
   if width * concurrency > 200_000 then
-    failwith "BENCH_FANOUT_WIDTH * BENCH_FANOUT_CONCURRENCY must be <= 200000"
+    failwith "BENCH_FANOUT_WIDTH * BENCH_FANOUT_CONCURRENCY must be <= 200000";
+  match
+    W.check_fixture_bytes
+      ~what:
+        "BENCH_FANOUT_WIDTH * BENCH_FANOUT_CONCURRENCY * \
+         encoded(BENCH_FANOUT_PAYLOAD_BYTES)"
+      ~items:(width * concurrency)
+      ~bytes_per_item:(W.encoded_payload_estimate payload_bytes)
+      ~limit:fixture_byte_limit
+  with
+  | Ok () -> ()
+  | Error message -> failwith message
 
 (** Registered workflow type name. *)
 let workflow_type = "benchmark_activity_fanout"
@@ -149,9 +170,13 @@ let make_workload _config =
         ]);
   }
 
-(** Emits the instrumented report for one fan-out configuration. *)
+(** Emits the instrumented report for one fan-out configuration. A sample
+    completes [concurrency] fan-outs, so [throughput_successes_per_second]
+    counts samples; the derived [fanouts_per_second] and
+    [activities_per_second] fields scale it by the work in each sample. *)
 let () =
   Benchmark_harness.run_instrumented ~suite:"activity-fanout"
+    ~rates:[ ("fanouts", concurrency); ("activities", width * concurrency) ]
     ~boundary:
       "Concurrent fan-out workflow runs from start activation through every \
        activity result batch, terminal completion and eviction, via strict \

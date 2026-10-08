@@ -374,8 +374,12 @@ let percentile sorted quantile =
             (min (count - 1)
                (int_of_float (ceil (quantile *. float_of_int count)) - 1)))
 
-(** Encodes one phase as stable JSON with explicit units and sample counts. *)
-let phase_json ~count phase =
+(** Encodes one phase as stable JSON with explicit units and sample counts.
+    [throughput_successes_per_second] counts successful samples. Each
+    [(unit, per_sample)] in [rates] adds a derived [<unit>_per_second] field,
+    successful samples per second times [per_sample], for suites whose sample
+    completes several units of work (for example, several fan-outs). *)
+let phase_json ~rates ~count phase =
   let sorted = Array.of_list phase.latencies_us in
   Array.sort Float.compare sorted;
   let statistics =
@@ -387,6 +391,10 @@ let phase_json ~count phase =
         ("p99_us", `Float (percentile sorted 0.99));
       ]
   in
+  let successes_per_second =
+    if phase.elapsed_seconds = 0. then 0.
+    else float_of_int (count - phase.errors) /. phase.elapsed_seconds
+  in
   `Assoc
     ([
        ("attempts", `Int count);
@@ -394,14 +402,17 @@ let phase_json ~count phase =
        ( "error_examples",
          `List (List.map (fun value -> `String value) phase.error_examples) );
        ("elapsed_seconds", `Float phase.elapsed_seconds);
-       ( "throughput_successes_per_second",
-         `Float
-           (if phase.elapsed_seconds = 0. then 0.
-            else float_of_int (count - phase.errors) /. phase.elapsed_seconds)
-       );
-       ( "latency_us",
-         `List (List.map (fun value -> `Float value) phase.latencies_us) );
+       ("throughput_successes_per_second", `Float successes_per_second);
      ]
+    @ List.map
+        (fun (unit, per_sample) ->
+          ( unit ^ "_per_second",
+            `Float (successes_per_second *. float_of_int per_sample) ))
+        rates
+    @ [
+        ( "latency_us",
+          `List (List.map (fun value -> `Float value) phase.latencies_us) );
+      ]
     @ statistics)
 
 (** Encodes UTC run time without depending on a machine's local timezone. *)
@@ -421,12 +432,25 @@ let runtime_uname () =
     value
   with _ -> "unavailable"
 
-(** Runs one repetition's warmup and measurement phases and returns its report
-    fields. With [memory], it also records {!Memory} lifecycle snapshots,
-    per-phase allocation deltas, and the workload's untimed observations. The
-    workload is always closed exactly once, including on error; when measuring
-    memory it is closed before the recovery snapshots. *)
-let run_one_repetition ~config ~memory ~total_errors ~make_workload index =
+(** Snapshots and untimed observations taken while a memory-instrumented
+    workload is still open. The record deliberately holds no reference to the
+    workload, so returning it lets the workload become unreachable. *)
+type open_memory = {
+  before_load : Memory.snapshot;
+  after_warmup : Memory.snapshot;
+  after_measurement : Memory.snapshot;
+  allocation : Yojson.Basic.t;
+  observed : (string * Yojson.Basic.t) list;
+}
+
+(** Constructs, measures, and closes one repetition's workload. [Fun.protect]
+    closes it exactly once, including on error, and only after the
+    observations have run. Every reference to the workload (the instrumented
+    record and the [finally] closure) is local to this function, so once it
+    returns nothing the caller holds can keep the workload reachable. The
+    recovery snapshots therefore belong to the caller, never to this scope. *)
+let measure_and_close ~config ~rates ~memory ~total_errors ~make_workload
+    index =
   (* The baseline precedes workload construction so the first warmup snapshot
      includes everything the workload retains. *)
   let before_load =
@@ -434,13 +458,7 @@ let run_one_repetition ~config ~memory ~total_errors ~make_workload index =
   in
   let instrumented = make_workload config in
   let workload = instrumented.workload in
-  let closed = ref false in
-  let close () =
-    if not !closed then (
-      closed := true;
-      workload.close ())
-  in
-  Fun.protect ~finally:close (fun () ->
+  Fun.protect ~finally:workload.close (fun () ->
       let warmup_start = Gc.quick_stat () in
       let warmup =
         run_phase ~workload:workload.sample ~record_latencies:false
@@ -460,35 +478,63 @@ let run_one_repetition ~config ~memory ~total_errors ~make_workload index =
       let base =
         [
           ("index", `Int (index + 1));
-          ("warmup", phase_json ~count:config.warmup warmup);
-          ("measurement", phase_json ~count:config.samples measured);
+          ("warmup", phase_json ~rates ~count:config.warmup warmup);
+          ("measurement", phase_json ~rates ~count:config.samples measured);
         ]
       in
-      match (before_load, after_warmup) with
-      | Some before_load, Some after_warmup ->
-          let after_measurement = Memory.snapshot ~compact:false () in
-          let observations = instrumented.observations () in
-          close ();
-          let after_close = Memory.snapshot ~compact:false () in
-          let after_compact = Memory.snapshot ~compact:true () in
-          base
-          @ [
-              ( "allocation",
-                `Assoc
-                  [
-                    ( "warmup",
-                      Memory.allocation_json ~attempts:config.warmup
-                        ~before:warmup_start ~after:warmup_end );
-                    ( "measurement",
-                      Memory.allocation_json ~attempts:config.samples
-                        ~before:measurement_start ~after:measurement_end );
-                  ] );
-              ( "memory",
-                Memory.repetition_json ~before_load ~after_warmup
-                  ~after_measurement ~after_close ~after_compact );
-              ("observations", `Assoc observations);
-            ]
-      | _ -> base)
+      let open_memory =
+        match (before_load, after_warmup) with
+        | Some before_load, Some after_warmup ->
+            let after_measurement = Memory.snapshot ~compact:false () in
+            Some
+              {
+                before_load;
+                after_warmup;
+                after_measurement;
+                allocation =
+                  `Assoc
+                    [
+                      ( "warmup",
+                        Memory.allocation_json ~attempts:config.warmup
+                          ~before:warmup_start ~after:warmup_end );
+                      ( "measurement",
+                        Memory.allocation_json ~attempts:config.samples
+                          ~before:measurement_start ~after:measurement_end );
+                    ];
+                observed = instrumented.observations ();
+              }
+        | _ -> None
+      in
+      (base, open_memory))
+
+(** Runs one repetition's warmup and measurement phases and returns its report
+    fields. With [memory], it also records {!Memory} lifecycle snapshots,
+    per-phase allocation deltas, and the workload's untimed observations. The
+    workload is always closed exactly once, including on error. The
+    [after_close] and [after_compact] snapshots are taken here, after
+    {!measure_and_close} has returned, so neither the workload nor anything
+    it references is still reachable and [retained_live_bytes] reflects only
+    data that outlived the released workload. *)
+let run_one_repetition ~config ~rates ~memory ~total_errors ~make_workload
+    index =
+  let base, open_memory =
+    measure_and_close ~config ~rates ~memory ~total_errors ~make_workload index
+  in
+  match open_memory with
+  | None -> base
+  | Some open_memory ->
+      let after_close = Memory.snapshot ~compact:false () in
+      let after_compact = Memory.snapshot ~compact:true () in
+      base
+      @ [
+          ("allocation", open_memory.allocation);
+          ( "memory",
+            Memory.repetition_json ~before_load:open_memory.before_load
+              ~after_warmup:open_memory.after_warmup
+              ~after_measurement:open_memory.after_measurement ~after_close
+              ~after_compact );
+          ("observations", `Assoc open_memory.observed);
+        ]
 
 (** Runs independently prepared workloads across repetitions and prints one
     versioned report. Preparation and cleanup are outside each timed phase; each
@@ -497,8 +543,8 @@ let run_one_repetition ~config ~memory ~total_errors ~make_workload index =
     the suite's unmeasured native components and enables instrumentation;
     [None] keeps the original report shape byte-compatible. The process exits
     nonzero after writing the report if any sample failed. *)
-let run_report ~suite ~boundary ~server_version ~workload_config ~memory
-    ~make_workload () =
+let run_report ~suite ~boundary ~server_version ~workload_config ~rates
+    ~memory ~make_workload () =
   let config = parse_config () in
   let source_commit = required_env "BENCH_SOURCE_COMMIT" in
   let source_dirty = required_env "BENCH_SOURCE_DIRTY" in
@@ -513,7 +559,7 @@ let run_report ~suite ~boundary ~server_version ~workload_config ~memory
   let repetitions =
     List.init config.repetitions (fun index ->
         `Assoc
-          (run_one_repetition ~config ~memory:(Option.is_some memory)
+          (run_one_repetition ~config ~rates ~memory:(Option.is_some memory)
              ~total_errors ~make_workload index))
   in
   let report =
@@ -584,7 +630,8 @@ let run_report ~suite ~boundary ~server_version ~workload_config ~memory
 (** Runs uninstrumented repetitions with the original report shape. *)
 let run_repetitions ~suite ~boundary ~server_version ~workload_config
     ~make_workload () =
-  run_report ~suite ~boundary ~server_version ~workload_config ~memory:None
+  run_report ~suite ~boundary ~server_version ~workload_config ~rates:[]
+    ~memory:None
     ~make_workload:(fun config ->
       { workload = make_workload config; observations = (fun () -> []) })
     ()
@@ -599,8 +646,9 @@ let run ~suite ~boundary ~server_version ~workload_config ~workload () =
 (** Runs memory-instrumented repetitions for the allocation, history, cache,
     and fan-out suites (#527, #528). [unmeasured] names every native or
     out-of-process component whose memory the suite cannot attribute, so a
-    reader never mistakes OCaml heap figures for total SDK memory. *)
-let run_instrumented ~suite ~boundary ~server_version ~workload_config
-    ~unmeasured ~make_workload () =
-  run_report ~suite ~boundary ~server_version ~workload_config
+    reader never mistakes OCaml heap figures for total SDK memory. [rates]
+    adds derived per-second fields to every phase; see {!phase_json}. *)
+let run_instrumented ?(rates = []) ~suite ~boundary ~server_version
+    ~workload_config ~unmeasured ~make_workload () =
+  run_report ~suite ~boundary ~server_version ~workload_config ~rates
     ~memory:(Some unmeasured) ~make_workload ()

@@ -324,3 +324,34 @@ let env_count ~name ~default ~limit =
       match int_of_string_opt text with
       | Some value when value > 0 && value <= limit -> value
       | _ -> failwith (Printf.sprintf "%s must be in 1..%d" name limit))
+
+(** Conservative per-item envelope allowance, in bytes, for one activity
+    result job in an encoded activation: job tag, sequence number, result
+    wrapper and base64 payload metadata. Measured jobs are well below it, so
+    {!encoded_payload_estimate} over-approximates rather than under-counts. *)
+let encoded_item_overhead_bytes = 512
+
+(** Over-approximates the canonical activation JSON bytes of one job carrying
+    a payload of [payload_bytes] raw bytes. Payload data crosses the bridge as
+    padded base64, which expands every started 3-byte group to 4 bytes, plus
+    {!encoded_item_overhead_bytes} of envelope. [payload_bytes] must be
+    nonnegative and small enough that the expansion fits in [int]. *)
+let encoded_payload_estimate payload_bytes =
+  (4 * ((payload_bytes + 2) / 3)) + encoded_item_overhead_bytes
+
+(** Checks that [items] fixture entries of [bytes_per_item] bytes each fit in
+    [limit] bytes without computing the possibly overflowing product: the
+    comparison divides [limit] instead, which is exact for nonnegative
+    integers because [items * b <= limit] iff [b <= limit / items]. Returns a
+    message naming [what] on rejection so a benchmark fails before it builds
+    any fixture. *)
+let check_fixture_bytes ~what ~items ~bytes_per_item ~limit =
+  if items < 0 || bytes_per_item < 0 || limit < 0 then
+    invalid_arg "check_fixture_bytes: negative argument"
+  else if items = 0 || bytes_per_item <= limit / items then Ok ()
+  else
+    Error
+      (Printf.sprintf
+         "%s would materialize about %d items of %d encoded bytes, more than \
+          the %d-byte fixture limit"
+         what items bytes_per_item limit)

@@ -44,7 +44,13 @@ fan-out are not yet measured.
 
 Evidence: `dune build @test/benchmark/runtest` runs tiny smoke
 configurations of all three suites and validates their memory report sections
-with `check_report.exe`.
+with `check_report.exe`, including that the fan-out suite's derived
+`fanouts_per_second` and `activities_per_second` equal samples per second
+times the work in each sample. `test_benchmark_harness.exe` checks that the
+`after_close` and `after_compact` snapshots, taken only after the workload's
+owning scope has returned, exclude a released 32 MiB dummy workload, and that
+the fan-out fixture bound (512 MiB of estimated base64-encoded results,
+checked by division) rejects oversized configurations before building them.
 
 ## 2026-10-07: Continue-as-new suggestion reasons (#792)
 

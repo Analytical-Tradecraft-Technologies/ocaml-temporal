@@ -140,3 +140,10 @@
             (pipe-stdout
              (run %{test} --warmup 1 --samples 2 --repetitions 1 --seed 1)
              (run %{exe:check_report.exe} activity-fanout 2 2))))))))))))))
+
+; Harness invariants: released workloads are excluded from recovery
+; snapshots, and the fan-out fixture byte bound rejects oversized runs.
+(test
+ (name test_benchmark_harness)
+ (modules test_benchmark_harness)
+ (libraries benchmark_harness benchmark_worker yojson))
