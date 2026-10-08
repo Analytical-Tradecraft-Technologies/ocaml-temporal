@@ -29,9 +29,10 @@ let unwrap label = function
 let expect label expected actual =
   if expected <> actual then failwith (label ^ " did not match")
 
-(** Builds activation metadata carrying the history facts under test; every
-    other field takes its neutral value. *)
-let metadata ~history_size_bytes ~continue_as_new_suggested :
+(** Builds activation metadata carrying the history facts under test, with
+    [reasons] as Core's continue-as-new suggestion reasons; every other field
+    takes its neutral value. *)
+let metadata ~history_size_bytes ~continue_as_new_suggested ~reasons :
     Protocol.activation_metadata =
   {
     available_internal_flags = [];
@@ -39,9 +40,7 @@ let metadata ~history_size_bytes ~continue_as_new_suggested :
     continue_as_new_suggested;
     deployment_version_for_current_task = None;
     last_sdk_version = "test";
-    suggest_continue_as_new_reasons =
-      (if continue_as_new_suggested then [ Protocol.Too_many_history_events ]
-       else []);
+    suggest_continue_as_new_reasons = reasons;
     target_worker_deployment_version_changed = false;
   }
 
@@ -89,6 +88,17 @@ let initialize : Protocol.activation_job =
       context = Some context;
     }
 
+(** Every protocol reason, in a non-sorted order and including Core's
+    unspecified zero value, so tests can check that order is preserved and
+    the placeholder is dropped. *)
+let all_reasons =
+  [
+    Protocol.Too_many_updates;
+    Protocol.Suggest_unspecified;
+    Protocol.History_size_too_large;
+    Protocol.Too_many_history_events;
+  ]
+
 (** One observation taken inside workflow code, kept as plain values so the
     assertions run after the workflow fiber has returned. *)
 type observation = {
@@ -101,6 +111,7 @@ type observation = {
   history_length : int;
   history_size_bytes : int option;
   continue_as_new_suggested : bool;
+  continue_as_new_reasons : Temporal.Workflow.Info.continue_as_new_reason list;
 }
 
 (** Reads every public accessor for the current activation. *)
@@ -128,14 +139,16 @@ let observe () =
         history_length = Info.history_length info;
         history_size_bytes = Info.history_size_bytes info;
         continue_as_new_suggested = Info.continue_as_new_suggested info;
+        continue_as_new_reasons = Info.continue_as_new_reasons info;
       }
 
 (** Runs one execution through a start activation and a timer activation and
     returns the observations taken before and after the timer. [replaying]
-    selects the replay flag of the first activation; the second activation is
+    selects the replay flag of the first activation and [reasons] the
+    continue-as-new reasons its metadata carries; the second activation is
     always new progress without metadata, which must clear the first task's
-    history facts rather than retain them. *)
-let run ~replaying =
+    history facts and reasons rather than retain them. *)
+let run ?(reasons = all_reasons) ~replaying () =
   let observations = ref [] in
   let definition =
     Temporal_base.Definition.make ~name:"info_workflow"
@@ -162,7 +175,8 @@ let run ~replaying =
       (Native_execution.activate execution
          (activation ~is_replaying:replaying ~history_length:3L
             ~metadata:
-              (metadata ~history_size_bytes:"2048" ~continue_as_new_suggested:true)
+              (metadata ~history_size_bytes:"2048" ~continue_as_new_suggested:true
+                 ~reasons)
             [ initialize ]))
   in
   (match first.commands with
@@ -186,7 +200,7 @@ let run ~replaying =
     flag and history facts follow each activation. *)
 let test_workflow_info () =
   let check ~replaying =
-    let before, after = run ~replaying in
+    let before, after = run ~replaying () in
     let identity =
       ("info-1", "run-info", Some "first-run", "info_workflow", "info-queue", 3)
     in
@@ -205,15 +219,30 @@ let test_workflow_info () =
     expect "history length" 3 before.history_length;
     expect "history size" (Some 2048) before.history_size_bytes;
     expect "continue-as-new suggestion" true before.continue_as_new_suggested;
+    expect "continue-as-new reasons"
+      [ `Too_many_updates; `History_size_too_large; `Too_many_history_events ]
+      before.continue_as_new_reasons;
     expect "later replay flag" false after.snapshot_replaying;
     expect "later live replay flag" false after.live_replaying;
     expect "later history length" 8 after.history_length;
     expect "later history size" None after.history_size_bytes;
     expect "later continue-as-new suggestion" false
-      after.continue_as_new_suggested
+      after.continue_as_new_suggested;
+    expect "later continue-as-new reasons" [] after.continue_as_new_reasons
   in
   check ~replaying:false;
   check ~replaying:true
+
+(** A suggestion whose only reason is Core's unspecified zero value, or that
+    names no reason at all as older servers do, reports the suggestion with an
+    empty reason list instead of inventing a cause. *)
+let test_unspecified_continue_as_new_reasons () =
+  List.iter
+    (fun reasons ->
+      let before, _after = run ~reasons ~replaying:false () in
+      expect "unnamed suggestion" true before.continue_as_new_suggested;
+      expect "unnamed reasons" [] before.continue_as_new_reasons)
+    [ [ Protocol.Suggest_unspecified ]; [] ]
 
 (** Detached code has no run: [info] fails closed and nothing is replaying. *)
 let test_workflow_info_outside_workflow () =
@@ -385,6 +414,7 @@ let test_async_context_info () =
 (** Runs every execution-info scenario as one dune test executable. *)
 let () =
   test_workflow_info ();
+  test_unspecified_continue_as_new_reasons ();
   test_workflow_info_outside_workflow ();
   test_workflow_info_synthetic_context ();
   test_activity_info ();

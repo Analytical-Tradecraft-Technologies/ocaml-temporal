@@ -791,6 +791,17 @@ let _workflow_info_history_size_bytes : T.Workflow.Info.t -> int option =
 let _workflow_info_continue_as_new_suggested : T.Workflow.Info.t -> bool =
   T.Workflow.Info.continue_as_new_suggested
 
+let _workflow_info_continue_as_new_reasons :
+    T.Workflow.Info.t -> T.Workflow.Info.continue_as_new_reason list =
+  T.Workflow.Info.continue_as_new_reasons
+
+(* The reason variant is closed; an exhaustive match pins its constructors. *)
+let _workflow_info_continue_as_new_reason_name :
+    T.Workflow.Info.continue_as_new_reason -> string = function
+  | `History_size_too_large -> "history_size_too_large"
+  | `Too_many_history_events -> "too_many_history_events"
+  | `Too_many_updates -> "too_many_updates"
+
 (* Record fields of the public parent identity are part of the contract. *)
 let _workflow_info_parent_fields
     ({ namespace; workflow_id; run_id } : T.Workflow.Info.parent) =
