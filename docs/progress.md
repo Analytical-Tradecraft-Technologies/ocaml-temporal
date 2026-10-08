@@ -36,6 +36,53 @@ ledger, two real supervisors on one runtime, public ordering errors for
 `mock://` and refused native targets, and a Linux thread-count leak check.
 The design and ownership rules are in `docs/reference/core-bridge.md`.
 
+## 2026-10-09: Deterministic race matrix (#520)
+
+`test/runtime/test_race_matrix.ml` drives the private workflow runtime with
+scripted Core activations, so each competing ordering is forced exactly. Its
+35 rows cover these races:
+
+- activity completion against workflow cancellation;
+- an activity cancel request against the activity's own completion;
+- a timer against cancellation;
+- scope cancellation propagating to an activity or child, against that
+  operation's completion or start failure;
+- child completion and start failure against parent cancellation;
+- signal and update handlers against root completion and cancellation;
+- local-activity retry backoff against cancellation.
+
+Rows use only job orders that the pinned Core can deliver, citing Core's
+activation job-ordering contract. Each row asserts the rendered command
+history of every activation, the trace of what workflow code observed, and
+the fate of every delivered update (completed, rejected, abandoned, pending,
+or unanswered).
+
+Generic checks reject any history with a second terminal command, a command
+after the terminal one, a task failure, or a late, repeated or out-of-order
+update response. Core never activates a run after its terminal command, so
+the harness also refuses any scripted step after one; a late job is covered
+only by replaying into a fresh execution. Self-tests prove that each check
+and this guard catch a synthetic violation. Each row runs twice on fresh executions, as Core redelivery would.
+Rows whose updates were accepted also replay with validation disabled and a
+validator that would now reject, and must reproduce the same history.
+
+The matrix pins the current contract: immediate workflow cancellation (#514),
+first terminal wins, and the SDK does not wait for unfinished handlers. It
+found two orderings that drop handler work Core expects to run. A signal or
+update in the same activation as `Cancel_workflow` is never invoked, so the
+update receives no validation response. An update continuation that is ready
+in the activation where the root completes first is discarded. Both choices
+are replay-visible and interact with the #514/#489 cancellation decision, so
+they are pinned and linked to #962 rather than changed here. The
+[interaction reference](reference/interactive-workflows.md#handler-races-with-completion-and-cancellation)
+lists the outcomes.
+
+Evidence: `dune build` and `dune test test/runtime test/unit` pass on OCaml
+5.4.1 (macOS ARM64). The matrix printed the same result in 20 consecutive
+runs. Changing one pinned update fate made the test fail with both histories
+printed. Caller-visible outcomes of abandoned and unanswered updates still
+depend on server behavior, which this offline matrix does not exercise.
+
 ## 2026-10-08: Application-linked replay command example (#516)
 
 `examples/replay` wraps `Temporal.Replay` in a copyable, offline command:
