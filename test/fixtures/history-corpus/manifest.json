@@ -157,11 +157,10 @@
     },
     {
       "id": "live-2026-10-08-interaction",
-      "purpose": "Signal and accepted update satisfy a parked condition; a query ran against the same run (queries leave no history events).",
+      "purpose": "Signal and accepted update satisfy a parked condition. A query also ran against this run during capture, but queries record no history events, so the entry does not claim query coverage.",
       "features": [
         "signal",
         "update",
-        "query",
         "condition"
       ],
       "workflow_type": "corpus.interaction",

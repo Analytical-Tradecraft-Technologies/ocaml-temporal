@@ -28,10 +28,13 @@ It fails, naming the entry ID, when:
   not name a `replays_ok` entry with the same history;
 - a history file's SHA-256 differs from the manifest, a referenced file is
   missing, or a file under `histories/` is not referenced (orphan);
-- a required feature (activity, timer, activity retry, signal, update, query,
+- a required feature (activity, timer, activity retry, signal, update,
   child workflow, continue-as-new, marker-free/active/deprecated patch,
   workflow failure, workflow-task failure recovery) has no `replays_ok` entry,
-  or there is no nondeterminism negative control;
+  or there is no nondeterminism negative control (queries are not a required
+  feature: they record no history events, so replay never exercises a query
+  handler, and query behaviour is covered by the live completed-query
+  regression instead);
 - a `replays_ok` entry does not replay cleanly: Core must accept every
   completion, report no task failure or failure eviction, see exactly one
   `InitializeWorkflow` with the manifest's run ID and workflow type, accept
@@ -94,7 +97,7 @@ Several entries may share one history file; they must agree on its checksum.
 
 | Capture | Entries | Provenance |
 | --- | --- | --- |
-| `live-2026-10-08` | `activity`, `timer`, `activity-retry`, `interaction` (signal, update, query, condition), `parent`, `child`, `continue-as-new-first`, `continue-as-new-second`, `patch-marker-free`, `patch-active`, `patch-deprecated` | Captured for this corpus with `capture-history-corpus.sh` against Temporal Server 1.32.0 (Compose stack, digest-pinned), Core `95e97686`, OCaml 5.4.1. The worker ran natively on macOS against the Compose server; the Make target runs the same program in the development container. |
+| `live-2026-10-08` | `activity`, `timer`, `activity-retry`, `interaction` (signal, update, condition), `parent`, `child`, `continue-as-new-first`, `continue-as-new-second`, `patch-marker-free`, `patch-active`, `patch-deprecated` | Captured for this corpus with `capture-history-corpus.sh` against Temporal Server 1.32.0 (Compose stack, digest-pinned), Core `95e97686`, OCaml 5.4.1. The worker ran natively on macOS against the Compose server; the Make target runs the same program in the development container. |
 | `task-failure-2026-09-20` | `task-failure-body`, `-encoder`, `-missing`, `-business-retryable`, `-business-permanent` | Copied byte for byte from the [#511 workflow-task failure gate](workflow-failures.md) (`make test-temporal-task-failure-live`), whose own manifest retains run IDs and binary hashes. |
 | `initial-signals-synthetic` | `initial-signals` | The synthetic history from the [#694 regression](../../test/integration/temporal/initial_signals/README.md); not from a server. |
 

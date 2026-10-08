@@ -16,10 +16,12 @@
 
 (** Feature tags that must each have at least one [replays_ok] entry. Removing
     a tag from this list is a deliberate corpus-scope change and must be
-    reflected in docs/reference/history-corpus.md. *)
+    reflected in docs/reference/history-corpus.md. Queries are deliberately
+    absent: they record no history events, so replaying a history never runs
+    a query handler and a "query" tag could not be checked by this gate. *)
 let required_features =
   [
-    "activity"; "timer"; "activity-retry"; "signal"; "update"; "query";
+    "activity"; "timer"; "activity-retry"; "signal"; "update";
     "child-workflow"; "continue-as-new"; "patch-marker-free"; "patch-active";
     "patch-deprecated"; "workflow-failure"; "workflow-task-failure-recovery";
   ]
