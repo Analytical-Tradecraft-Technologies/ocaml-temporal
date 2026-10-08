@@ -83,6 +83,14 @@ valid and rejected fixtures against the independently callable Rust envelope,
 payload, activation, and completion decoders. Its limits and instrumentation
 scope are stated separately from the fixed-fixture and C ABI sanitizer tests.
 
+The [lifecycle stress](bridge-lifecycle-stress.md) runs seeded,
+reproducible operation sequences against the ABI. The sequences interleave
+runtime, replay-worker, and live-worker operations: create, poll, complete,
+reject, shutdown, finalize, free, and GC-fallback dispose, including calls
+that misuse the ABI. A model and two ledgers check every handle and lease
+against them. A companion OCaml test runs the custom-block finalizer and
+supervisor cycles under GC pressure.
+
 There is one normal-start compatibility default in the initializer: Temporal
 Core maps the server's `first_workflow_task_backoff` to
 `cron_schedule_to_schedule_interval`, and Temporal Server sends an explicit
