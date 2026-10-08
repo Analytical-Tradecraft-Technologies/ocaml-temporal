@@ -15,6 +15,57 @@ implementation when a later entry documents that work as complete. The
 records the current tested source, named assertions and successful CI job for
 the Temporal acceptance controllers.
 
+## 2026-10-08: Seeded bridge lifecycle stress (#522)
+
+`rust/core-bridge/tests/lifecycle_stress.rs` generates reproducible operation
+sequences over two runtime slots and runs them against the C ABI. The
+operations cover:
+
+- runtime create, free, and GC-fallback dispose, including double release;
+- the replay-worker lifecycle (feed, poll, complete, reject, finalize, drain,
+  dispose);
+- live client connect and disconnect;
+- an activity worker against a gRPC double (poll, complete, reject, shutdown);
+- stale and repeated completions, calls on released slots, and the panic
+  probe.
+
+A model and two ledgers check every step, and check again after teardown:
+
+- each runtime is created once and cleaned up exactly once;
+- a released slot is null and rejects every call;
+- no lease is delivered twice or retired twice;
+- shutdown reports exactly the leases still held;
+- the server sees exactly one completion for every token that was leased,
+  whether an explicit call, shutdown, free, or dispose retired it;
+- a drained replay always finalizes.
+
+A failing case is minimized and reported with its seed, case number,
+reproduction command, and per-operation trace. CI keeps the report as an
+artifact.
+
+`test/bridge/test_ocaml_lifecycle_gc_stress.ml` runs seeded runtime cycles
+through the OCaml bindings, with collections and compactions between calls.
+Each cycle either closes its runtime explicitly or leaves it to the
+custom-block finalizer. The test also runs real supervisor create and
+shutdown cycles. `make test-lifecycle-stress` and
+`make native-test-lifecycle-stress` run both tests with a configurable seed
+and budget. The [lifecycle stress reference](reference/bridge-lifecycle-stress.md)
+gives budgets and the instrumentation scope of each tool.
+
+Evidence: the default Rust run (24 cases × 48 operations, seed `0x05222026`)
+and the scripted regressions pass in about 8 seconds locally. A 300-case run
+with seed `0x7e57` (14,400 operations) also passed, and so did the OCaml
+stress at 1,000 cycles. Neither found a lifecycle defect.
+
+One finding was outside the lifecycle scope. The semantic activity protocol
+accepts a `completed` result with a `null` payload, but Temporal Core rejects
+that completion, and the bridge reports `STATUS_WORKER` with the lease still
+held. The OCaml executor always sends a payload, so the stress does the same.
+
+The stable Rust test is not sanitizer-instrumented. The repository has no
+scheduled stress job yet. Concurrent multi-Domain stress also remains under
+#506.
+
 ## 2026-10-06: Rendered API documentation gate (#794)
 
 `make docs` builds the odoc API documentation with odoc warnings fatal in the
