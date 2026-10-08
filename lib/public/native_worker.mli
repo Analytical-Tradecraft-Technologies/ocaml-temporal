@@ -62,11 +62,14 @@ type t
     Temporal's worker routing strategy; omitting it preserves the unversioned
     behavior. [io_threads] is the public network-thread bound, mapped
     to the native runtime's Tokio worker pool; omitting it selects the bridge
-    default. *)
+    default. [activation_deadline_ms] enables the non-yielding workflow
+    watchdog with that positive deadline; omitting it disables the watchdog
+    (the public [Worker.Options] layer supplies the default). *)
 val create :
   ?max_cached_workflows:int ->
   ?io_threads:int ->
   ?versioning:Temporal_sdk_kernel.Bridge.worker_versioning ->
+  ?activation_deadline_ms:int ->
   target_url:string ->
   namespace:string ->
   identity:string ->
@@ -78,8 +81,19 @@ val create :
 
 (** Polls and executes both native workflow and activity lanes until [shutdown]
     is requested. A successful task-level failure is acknowledged by Temporal
-    and does not terminate this loop. *)
+    and does not terminate this loop. When the activation watchdog is enabled
+    it runs on its own Domain for the duration of this call; an activation
+    abandoned by the watchdog is reported as a rejected task when its code
+    eventually returns, so the loop continues. The loop itself cannot return
+    while workflow code refuses to yield. *)
 val run : t -> (unit, Temporal_base.Error.t) result
+
+(** The first workflow activation the watchdog abandoned because it ran past
+    its deadline without yielding, or [None]. Lock-free and safe from any
+    Domain or thread, including while the workflow lane is stuck. The report
+    is sticky until the worker value is discarded. *)
+val stuck_activation :
+  t -> Temporal_sdk_kernel.Native_worker_execution.stuck_activation option
 
 (** Whether the calling system thread is executing this worker's workflow or
     activity lane, and therefore a workflow or activity callback. Public

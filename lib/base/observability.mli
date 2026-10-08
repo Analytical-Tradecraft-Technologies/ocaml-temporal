@@ -25,6 +25,14 @@ module Tag : sig
   (** Registered Temporal workflow type, truncated to a bounded tag length. *)
   val workflow_type : string Logs.Tag.def
 
+  (** Temporal workflow ID, truncated to a bounded tag length. Used only by
+      operational diagnostics that must name one execution, such as the
+      non-yielding activation watchdog. *)
+  val workflow_id : string Logs.Tag.def
+
+  (** Temporal workflow run ID, truncated to a bounded tag length. *)
+  val run_id : string Logs.Tag.def
+
   (** Non-negative number of jobs supplied in one activation. *)
   val job_count : int Logs.Tag.def
 
@@ -46,6 +54,8 @@ val tags :
   operation:string ->
   ?duration_ms:float ->
   ?workflow_type:string ->
+  ?workflow_id:string ->
+  ?run_id:string ->
   ?job_count:int ->
   ?command_count:int ->
   ?bridge_status:string ->
