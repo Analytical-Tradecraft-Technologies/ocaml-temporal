@@ -37,12 +37,44 @@ let check_phase ~attempts ~latencies phase =
   nonnegative_number phase "elapsed_seconds";
   nonnegative_number phase "throughput_successes_per_second"
 
-(** Checks a report emitted by one of the actual activation workloads. *)
+(** Suites run through [Benchmark_harness.run_instrumented], whose reports
+    must carry memory, allocation and observation sections. *)
+let instrumented_suites =
+  [ "history-replay-memory"; "workflow-cache-memory"; "activity-fanout" ]
+
+(** Checks one instrumented repetition's memory lifecycle and allocation
+    sections without constraining the measured values. *)
+let check_memory repetition =
+  let memory = Json.member "memory" repetition in
+  List.iter
+    (fun key ->
+      let snapshot = Json.member key memory in
+      List.iter
+        (nonnegative_number snapshot)
+        [ "ocaml_heap_bytes"; "ocaml_top_heap_bytes"; "ocaml_live_bytes" ];
+      ignore Json.(snapshot |> member "rss_source" |> to_string))
+    [
+      "before_load"; "after_warmup"; "after_measurement"; "after_close";
+      "after_compact";
+    ];
+  ignore (object_field memory "recovery");
+  let allocation = Json.member "allocation" repetition in
+  List.iter
+    (fun phase ->
+      nonnegative_number (Json.member phase allocation) "allocated_bytes")
+    [ "warmup"; "measurement" ];
+  ignore (object_field repetition "observations")
+
+(** Checks a report emitted by one of the actual activation workloads. An
+    optional third argument gives the expected admitted concurrency. *)
 let () =
-  if Array.length Sys.argv <> 3 then
-    failwith "check_report expects suite and measured sample count";
+  let argc = Array.length Sys.argv in
+  if argc <> 3 && argc <> 4 then
+    failwith "check_report expects suite, measured samples, [concurrency]";
   let expected_suite = Sys.argv.(1) in
   let samples = int_of_string Sys.argv.(2) in
+  let concurrency = if argc = 4 then int_of_string Sys.argv.(3) else 1 in
+  let instrumented = List.mem expected_suite instrumented_suites in
   let report = Yojson.Basic.from_channel stdin in
   expect (integer report "schema_version" = 1) "unexpected report schema";
   expect
@@ -51,12 +83,18 @@ let () =
   ignore (object_field report "machine");
   let config = Json.member "config" report in
   ignore (object_field report "config");
+  if instrumented then (
+    ignore (object_field report "memory_scope");
+    ignore (object_field report "memory_trend"));
   if expected_suite <> "local-minimal-activation" then (
     expect
-      (integer config "admitted_concurrency" = 1)
+      (integer config "admitted_concurrency" = concurrency)
       "unexpected admitted concurrency";
     expect
-      (Json.(config |> member "admission_model" |> to_string) = "closed_loop")
+      (Json.(config |> member "admission_model" |> to_string)
+      =
+      if expected_suite = "activity-fanout" then "closed_loop_interleaved_runs"
+      else "closed_loop")
       "unexpected admission model";
     expect
       (integer config "pending_attempt_backlog_peak" = 0)
@@ -84,5 +122,6 @@ let () =
       check_phase ~attempts:1 ~latencies:0 (Json.member "warmup" repetition);
       let measured = Json.member "measurement" repetition in
       check_phase ~attempts:samples ~latencies:samples measured;
-      List.iter (nonnegative_number measured) [ "p50_us"; "p95_us"; "p99_us" ]
+      List.iter (nonnegative_number measured) [ "p50_us"; "p95_us"; "p99_us" ];
+      if instrumented then check_memory repetition
   | _ -> failwith "expected one benchmark repetition"

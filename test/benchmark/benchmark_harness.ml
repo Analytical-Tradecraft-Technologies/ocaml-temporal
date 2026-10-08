@@ -19,6 +19,259 @@ type phase = {
     retain per-attempt latency so later analysis can inspect the distribution.
 *)
 
+type instrumented = {
+  workload : workload;
+  observations : unit -> (string * Yojson.Basic.t) list;
+}
+(** A workload with suite-specific, untimed observations. [observations] runs
+    once per repetition after the measurement phase and its memory snapshot,
+    but before [workload.close], so it may inspect retained state or run a
+    separately instrumented attribution pass without perturbing sample
+    latency. *)
+
+(** OCaml heap, GC, and process-resident memory observations.
+
+    Allocation counters are [Gc.quick_stat] deltas. Live and heap sizes come
+    from [Gc.stat], which in OCaml 5 forces a full major collection, so "live"
+    means reachable data rather than garbage awaiting collection. Snapshots
+    are taken only at phase boundaries, never inside a timed sample. Counters
+    describe the calling Domain; the instrumented suites run on one Domain.
+
+    Process memory uses OS counters: [/proc/self/status] on Linux (current
+    [VmRSS] and peak [VmHWM]), otherwise the current RSS reported by [ps].
+    The standard [Unix] library does not expose [getrusage], so the peak is
+    [null] off Linux. RSS includes every native component (the OCaml runtime,
+    code pages, C or Rust allocations, and allocator capacity not yet returned
+    to the OS); each suite names the components it cannot attribute. *)
+module Memory = struct
+  type snapshot = {
+    heap_words : int;
+    top_heap_words : int;
+    live_words : int;
+    rss_bytes : int option;
+    peak_rss_bytes : int option;
+    rss_source : string;
+  }
+  (** One boundary observation. [rss_source] names the OS counter used. *)
+
+  (** Converts OCaml heap words to bytes for the host word size. *)
+  let bytes_of_words words = words * (Sys.word_size / 8)
+
+  (** Parses a ["Name:  1234 kB"] procfs line with [prefix] into bytes. *)
+  let proc_status_bytes line prefix =
+    let prefix_length = String.length prefix in
+    if
+      String.length line > prefix_length
+      && String.sub line 0 prefix_length = prefix
+    then
+      let rest =
+        String.trim
+          (String.sub line prefix_length (String.length line - prefix_length))
+      in
+      match String.split_on_char ' ' rest with
+      | value :: _ -> Option.map (fun kib -> kib * 1024) (int_of_string_opt value)
+      | [] -> None
+    else None
+
+  (** Reads current and peak RSS from Linux procfs. [None] when the file is
+      absent, which is expected on macOS and Windows. *)
+  let linux_resident () =
+    match open_in "/proc/self/status" with
+    | exception Sys_error _ -> None
+    | channel ->
+        Fun.protect
+          ~finally:(fun () -> close_in_noerr channel)
+          (fun () ->
+            let rss = ref None and peak = ref None in
+            (try
+               while true do
+                 let line = input_line channel in
+                 Option.iter
+                   (fun value -> rss := Some value)
+                   (proc_status_bytes line "VmRSS:");
+                 Option.iter
+                   (fun value -> peak := Some value)
+                   (proc_status_bytes line "VmHWM:")
+               done
+             with End_of_file -> ());
+            Option.map
+              (fun rss -> (Some rss, !peak, "linux_proc_self_status"))
+              !rss)
+
+  (** Reads the current RSS through [ps] where procfs is unavailable. A
+      missing or failing [ps] only removes this metadata. *)
+  let ps_resident () =
+    try
+      let command =
+        Printf.sprintf "ps -o rss= -p %d 2>/dev/null" (Unix.getpid ())
+      in
+      let process = Unix.open_process_in command in
+      let line =
+        Fun.protect
+          ~finally:(fun () -> ignore (Unix.close_process_in process))
+          (fun () -> input_line process)
+      in
+      match int_of_string_opt (String.trim line) with
+      | Some kib -> (Some (kib * 1024), None, "ps_rss")
+      | None -> (None, None, "unavailable")
+    with _ -> (None, None, "unavailable")
+
+  (** Returns current RSS, peak RSS, and the counter source. *)
+  let resident () =
+    match linux_resident () with Some value -> value | None -> ps_resident ()
+
+  (** Takes one boundary snapshot. [compact] first runs [Gc.compact], which
+      releases free major-heap pools to the OS; it is used for the pre-load
+      baseline and the final allocator-capacity observation. *)
+  let snapshot ~compact () =
+    if compact then Gc.compact ();
+    let stat = Gc.stat () in
+    let rss_bytes, peak_rss_bytes, rss_source = resident () in
+    {
+      heap_words = stat.heap_words;
+      top_heap_words = stat.top_heap_words;
+      live_words = stat.live_words;
+      rss_bytes;
+      peak_rss_bytes;
+      rss_source;
+    }
+
+  (** Encodes an optional byte count, using JSON [null] when unavailable. *)
+  let optional_int = function Some value -> `Int value | None -> `Null
+
+  (** Encodes one snapshot with explicit byte units. *)
+  let snapshot_json snapshot =
+    `Assoc
+      [
+        ("ocaml_heap_bytes", `Int (bytes_of_words snapshot.heap_words));
+        ("ocaml_top_heap_bytes", `Int (bytes_of_words snapshot.top_heap_words));
+        ("ocaml_live_bytes", `Int (bytes_of_words snapshot.live_words));
+        ("process_rss_bytes", optional_int snapshot.rss_bytes);
+        ("process_peak_rss_bytes", optional_int snapshot.peak_rss_bytes);
+        ("rss_source", `String snapshot.rss_source);
+      ]
+
+  (** Encodes GC counter deltas for one phase. Allocated words are minor plus
+      direct major allocation minus promotion, which would otherwise be
+      counted twice. *)
+  let allocation_json ~attempts ~(before : Gc.stat) ~(after : Gc.stat) =
+    let word_bytes = float_of_int (Sys.word_size / 8) in
+    let minor = after.minor_words -. before.minor_words in
+    let promoted = after.promoted_words -. before.promoted_words in
+    let major = after.major_words -. before.major_words in
+    let allocated = word_bytes *. (minor +. major -. promoted) in
+    `Assoc
+      [
+        ("allocated_bytes", `Float allocated);
+        ( "allocated_bytes_per_attempt",
+          `Float
+            (if attempts = 0 then 0. else allocated /. float_of_int attempts) );
+        ("minor_words", `Float minor);
+        ("promoted_words", `Float promoted);
+        ("major_words", `Float major);
+        ( "minor_collections",
+          `Int (after.minor_collections - before.minor_collections) );
+        ( "major_collections",
+          `Int (after.major_collections - before.major_collections) );
+        ("compactions", `Int (after.compactions - before.compactions));
+      ]
+
+  (** Subtracts optional RSS values, yielding [null] if either is unknown. *)
+  let rss_delta left right =
+    match (left.rss_bytes, right.rss_bytes) with
+    | Some left, Some right -> `Int (left - right)
+    | _ -> `Null
+
+  (** Encodes one repetition's lifecycle snapshots and recovery deltas.
+
+      [retained_live_bytes] is reachable OCaml data that survived closing the
+      workload, relative to the pre-load baseline; growth of that value across
+      repetitions is the suspected-retention signal. RSS that falls between
+      [after_close] and [after_compact] was free OCaml heap capacity. RSS still
+      above baseline after compaction while live bytes have recovered is
+      capacity held by the runtime or system allocator, not reachable data.
+      No pass/fail threshold is applied. *)
+  let repetition_json ~before_load ~after_warmup ~after_measurement
+      ~after_close ~after_compact =
+    `Assoc
+      [
+        ("before_load", snapshot_json before_load);
+        ("after_warmup", snapshot_json after_warmup);
+        ("after_measurement", snapshot_json after_measurement);
+        ("after_close", snapshot_json after_close);
+        ("after_compact", snapshot_json after_compact);
+        ( "recovery",
+          `Assoc
+            [
+              ( "load_live_bytes_above_baseline",
+                `Int
+                  (bytes_of_words
+                     (max after_warmup.live_words after_measurement.live_words
+                     - before_load.live_words)) );
+              ( "retained_live_bytes",
+                `Int
+                  (bytes_of_words
+                     (after_close.live_words - before_load.live_words)) );
+              ( "heap_bytes_after_compact_minus_baseline",
+                `Int
+                  (bytes_of_words
+                     (after_compact.heap_words - before_load.heap_words)) );
+              ( "rss_bytes_released_by_compaction",
+                rss_delta after_close after_compact );
+              ( "rss_bytes_after_compact_minus_baseline",
+                rss_delta after_compact before_load );
+            ] );
+      ]
+
+  (** Summarizes retained live bytes across repetitions. Each repetition owns a
+      fresh workload, so a sequence that keeps rising is reproducible evidence
+      of retention outside the workload, whereas a flat sequence attributes
+      any RSS difference to allocator capacity. *)
+  let trend_json repetitions =
+    let retained =
+      List.filter_map
+        (fun repetition ->
+          match
+            Yojson.Basic.Util.(
+              repetition |> member "memory" |> member "recovery"
+              |> member "retained_live_bytes")
+          with
+          | `Int value -> Some value
+          | _ -> None)
+        repetitions
+    in
+    let rec increasing = function
+      | first :: (second :: _ as rest) -> first < second && increasing rest
+      | _ -> true
+    in
+    `Assoc
+      [
+        ( "retained_live_bytes_by_repetition",
+          `List (List.map (fun value -> `Int value) retained) );
+        ( "strictly_increasing",
+          if List.length retained < 3 then `Null
+          else `Bool (increasing retained) );
+      ]
+
+  (** Describes what the memory figures do and do not cover. *)
+  let scope_json unmeasured =
+    `Assoc
+      [
+        ( "ocaml_heap",
+          `String
+            "Gc.stat after a forced full major collection at phase \
+             boundaries; allocation from Gc.quick_stat deltas on the benchmark \
+             Domain" );
+        ( "process_resident",
+          `String
+            "OS resident set size, including the OCaml runtime, code, any \
+             native allocation, and allocator capacity not yet returned to \
+             the OS" );
+        ( "unmeasured_native_components",
+          `List (List.map (fun value -> `String value) unmeasured) );
+      ]
+end
+
 (** Reads a required provenance field set by the Makefile benchmark command. *)
 let required_env name =
   match Sys.getenv_opt name with
@@ -168,12 +421,83 @@ let runtime_uname () =
     value
   with _ -> "unavailable"
 
+(** Runs one repetition's warmup and measurement phases and returns its report
+    fields. With [memory], it also records {!Memory} lifecycle snapshots,
+    per-phase allocation deltas, and the workload's untimed observations. The
+    workload is always closed exactly once, including on error; when measuring
+    memory it is closed before the recovery snapshots. *)
+let run_one_repetition ~config ~memory ~total_errors ~make_workload index =
+  (* The baseline precedes workload construction so the first warmup snapshot
+     includes everything the workload retains. *)
+  let before_load =
+    if memory then Some (Memory.snapshot ~compact:true ()) else None
+  in
+  let instrumented = make_workload config in
+  let workload = instrumented.workload in
+  let closed = ref false in
+  let close () =
+    if not !closed then (
+      closed := true;
+      workload.close ())
+  in
+  Fun.protect ~finally:close (fun () ->
+      let warmup_start = Gc.quick_stat () in
+      let warmup =
+        run_phase ~workload:workload.sample ~record_latencies:false
+          ~count:config.warmup ~seed:config.seed
+      in
+      let warmup_end = Gc.quick_stat () in
+      let after_warmup =
+        if memory then Some (Memory.snapshot ~compact:false ()) else None
+      in
+      let measurement_start = Gc.quick_stat () in
+      let measured =
+        run_phase ~workload:workload.sample ~record_latencies:true
+          ~count:config.samples ~seed:config.seed
+      in
+      let measurement_end = Gc.quick_stat () in
+      total_errors := !total_errors + warmup.errors + measured.errors;
+      let base =
+        [
+          ("index", `Int (index + 1));
+          ("warmup", phase_json ~count:config.warmup warmup);
+          ("measurement", phase_json ~count:config.samples measured);
+        ]
+      in
+      match (before_load, after_warmup) with
+      | Some before_load, Some after_warmup ->
+          let after_measurement = Memory.snapshot ~compact:false () in
+          let observations = instrumented.observations () in
+          close ();
+          let after_close = Memory.snapshot ~compact:false () in
+          let after_compact = Memory.snapshot ~compact:true () in
+          base
+          @ [
+              ( "allocation",
+                `Assoc
+                  [
+                    ( "warmup",
+                      Memory.allocation_json ~attempts:config.warmup
+                        ~before:warmup_start ~after:warmup_end );
+                    ( "measurement",
+                      Memory.allocation_json ~attempts:config.samples
+                        ~before:measurement_start ~after:measurement_end );
+                  ] );
+              ( "memory",
+                Memory.repetition_json ~before_load ~after_warmup
+                  ~after_measurement ~after_close ~after_compact );
+              ("observations", `Assoc observations);
+            ]
+      | _ -> base)
+
 (** Runs independently prepared workloads across repetitions and prints one
     versioned report. Preparation and cleanup are outside each timed phase; each
     sample, including its validation, is inside. Extra configuration describes
-    suite-specific dimensions and must not shadow shared keys. The process exits
+    suite-specific dimensions and must not shadow shared keys. [memory] carries
+    the suite's unmeasured native components and enables instrumentation;
+    [None] keeps the original report shape byte-compatible. The process exits
     nonzero after writing the report if any sample failed. *)
-let run_repetitions ~suite ~boundary ~server_version ~workload_config
+let run_report ~suite ~boundary ~server_version ~workload_config ~memory
     ~make_workload () =
   let config = parse_config () in
   let source_commit = required_env "BENCH_SOURCE_COMMIT" in
@@ -188,23 +512,9 @@ let run_repetitions ~suite ~boundary ~server_version ~workload_config
   let total_errors = ref 0 in
   let repetitions =
     List.init config.repetitions (fun index ->
-        let workload = make_workload config in
-        Fun.protect ~finally:workload.close (fun () ->
-            let warmup =
-              run_phase ~workload:workload.sample ~record_latencies:false
-                ~count:config.warmup ~seed:config.seed
-            in
-            let measured =
-              run_phase ~workload:workload.sample ~record_latencies:true
-                ~count:config.samples ~seed:config.seed
-            in
-            total_errors := !total_errors + warmup.errors + measured.errors;
-            `Assoc
-              [
-                ("index", `Int (index + 1));
-                ("warmup", phase_json ~count:config.warmup warmup);
-                ("measurement", phase_json ~count:config.samples measured);
-              ]))
+        `Assoc
+          (run_one_repetition ~config ~memory:(Option.is_some memory)
+             ~total_errors ~make_workload index))
   in
   let report =
     `Assoc
@@ -256,9 +566,28 @@ let run_repetitions ~suite ~boundary ~server_version ~workload_config
         ("repetitions", `List repetitions);
       ]
   in
+  let report =
+    match (memory, report) with
+    | Some unmeasured, `Assoc fields ->
+        `Assoc
+          (fields
+          @ [
+              ("memory_scope", Memory.scope_json unmeasured);
+              ("memory_trend", Memory.trend_json repetitions);
+            ])
+    | _ -> report
+  in
   Yojson.Basic.pretty_to_channel stdout report;
   output_char stdout '\n';
   if !total_errors <> 0 then exit 1
+
+(** Runs uninstrumented repetitions with the original report shape. *)
+let run_repetitions ~suite ~boundary ~server_version ~workload_config
+    ~make_workload () =
+  run_report ~suite ~boundary ~server_version ~workload_config ~memory:None
+    ~make_workload:(fun config ->
+      { workload = make_workload config; observations = (fun () -> []) })
+    ()
 
 (** Keeps the original stateless-workload entry point for suites that create and
     release all of their state within each timed sample. *)
@@ -266,3 +595,12 @@ let run ~suite ~boundary ~server_version ~workload_config ~workload () =
   run_repetitions ~suite ~boundary ~server_version ~workload_config
     ~make_workload:(fun _ -> { sample = workload; close = (fun () -> ()) })
     ()
+
+(** Runs memory-instrumented repetitions for the allocation, history, cache,
+    and fan-out suites (#527, #528). [unmeasured] names every native or
+    out-of-process component whose memory the suite cannot attribute, so a
+    reader never mistakes OCaml heap figures for total SDK memory. *)
+let run_instrumented ~suite ~boundary ~server_version ~workload_config
+    ~unmeasured ~make_workload () =
+  run_report ~suite ~boundary ~server_version ~workload_config
+    ~memory:(Some unmeasured) ~make_workload ()

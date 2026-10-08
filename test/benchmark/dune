@@ -76,3 +76,67 @@
          (pipe-stdout
           (run %{test} --warmup 1 --samples 3 --repetitions 1 --seed 1)
           (run %{exe:check_report.exe} payload-codec 3)))))))))))
+
+; Server-free production worker adapter shared by the memory (#527) and
+; fan-out (#528) suites.
+(library
+ (name benchmark_worker)
+ (modules benchmark_worker)
+ (libraries mtime.clock temporal_base temporal_protocol temporal_runtime))
+
+(test
+ (name bench_history_replay)
+ (modules bench_history_replay)
+ (libraries benchmark_harness benchmark_worker temporal_base)
+ (action
+  (setenv BENCH_SOURCE_COMMIT test-commit
+   (setenv BENCH_SOURCE_DIRTY false
+    (setenv BENCH_SDK_VERSION test-version
+     (setenv BENCH_CORE_REVISION test-core
+      (setenv BENCH_DUNE_PROFILE dev
+       (setenv BENCH_BASE_IMAGE_REFERENCE test-image
+        (setenv BENCH_DEVELOPMENT_IMAGE_ID unavailable
+         (setenv BENCH_HISTORY_EVENTS 100
+          (pipe-stdout
+           (run %{test} --warmup 1 --samples 2 --repetitions 1 --seed 1)
+           (run %{exe:check_report.exe} history-replay-memory 2))))))))))))
+
+; The smoke run uses a capacity below the run count so eviction and replayed
+; reload are exercised on every sample.
+(test
+ (name bench_workflow_cache)
+ (modules bench_workflow_cache)
+ (libraries benchmark_harness benchmark_worker temporal_base)
+ (action
+  (setenv BENCH_SOURCE_COMMIT test-commit
+   (setenv BENCH_SOURCE_DIRTY false
+    (setenv BENCH_SDK_VERSION test-version
+     (setenv BENCH_CORE_REVISION test-core
+      (setenv BENCH_DUNE_PROFILE dev
+       (setenv BENCH_BASE_IMAGE_REFERENCE test-image
+        (setenv BENCH_DEVELOPMENT_IMAGE_ID unavailable
+         (setenv BENCH_CACHE_RUNS 4
+          (setenv BENCH_CACHE_CAPACITY 2
+           (setenv BENCH_CACHE_DEPTH 2
+            (pipe-stdout
+             (run %{test} --warmup 1 --samples 9 --repetitions 1 --seed 1)
+             (run %{exe:check_report.exe} workflow-cache-memory 9))))))))))))))
+
+(test
+ (name bench_activity_fanout)
+ (modules bench_activity_fanout)
+ (libraries benchmark_harness benchmark_worker temporal_base)
+ (action
+  (setenv BENCH_SOURCE_COMMIT test-commit
+   (setenv BENCH_SOURCE_DIRTY false
+    (setenv BENCH_SDK_VERSION test-version
+     (setenv BENCH_CORE_REVISION test-core
+      (setenv BENCH_DUNE_PROFILE dev
+       (setenv BENCH_BASE_IMAGE_REFERENCE test-image
+        (setenv BENCH_DEVELOPMENT_IMAGE_ID unavailable
+         (setenv BENCH_FANOUT_WIDTH 20
+          (setenv BENCH_FANOUT_CONCURRENCY 2
+           (setenv BENCH_FANOUT_BATCH 3
+            (pipe-stdout
+             (run %{test} --warmup 1 --samples 2 --repetitions 1 --seed 1)
+             (run %{exe:check_report.exe} activity-fanout 2 2))))))))))))))

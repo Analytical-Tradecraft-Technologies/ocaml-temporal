@@ -15,6 +15,37 @@ implementation when a later entry documents that work as complete. The
 records the current tested source, named assertions and successful CI job for
 the Temporal acceptance controllers.
 
+## 2026-10-08: Memory, history, cache and fan-out benchmarks (#527, #528)
+
+The shared benchmark harness now has an instrumented mode. Each repetition
+records `Gc.quick_stat` allocation deltas per phase, and OCaml heap and live
+bytes (`Gc.stat`) plus process RSS (procfs on Linux, `ps` elsewhere) before
+load, after warmup, after measurement, after close and after compaction. It
+also records recovery deltas that separate retained live data from allocator
+capacity, and a cross-repetition retention trend. Three server-free suites
+drive the production `Native_worker_execution` adapter through an in-memory
+source that decodes pre-encoded bridge JSON exactly as the supervisor does:
+`history-replay-memory` (synthetic sequential-activity histories, run at
+1k/10k/50k equivalent events by `make bench-history`), `workflow-cache-memory`
+(steady residency and `Cache_full` eviction with replayed reload, run by
+`make bench-cache`), and `activity-fanout` (1,000-activity fan-out at one and
+eight interleaved runs, run by `make bench-fanout`). An untimed attribution
+pass splits adapter time into activation decode, completion encode and copy,
+and workflow/adapter work.
+
+Indicative local results are in
+[the benchmark reference](reference/benchmark-harness.md#indicative-results-and-bottlenecks).
+Replay costs about 25 µs and 80 KB of allocation per activation, independent
+of history length. A run holds about 3.9 KB of live OCaml data, a resident
+timer workflow about 3.3 KB, and no repetition-over-repetition retention was
+observed. OCaml-side JSON decoding and encoding take about 64% of adapter time
+with small payloads. No thresholds were added. Rust/serde, Core and live-server
+fan-out are not yet measured.
+
+Evidence: `dune build @test/benchmark/runtest` runs tiny smoke
+configurations of all three suites and validates their memory report sections
+with `check_report.exe`.
+
 ## 2026-10-06: Typed client RPC errors and query handler failures; bridge ABI v4 (#823)
 
 Client RPC failures are classifiable without parsing messages. Every closed
