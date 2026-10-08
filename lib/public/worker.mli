@@ -72,20 +72,33 @@ end
 
 (** Worker liveness as observed by the workflow activation watchdog. *)
 module Health : sig
+  (** How the watchdog released a stuck activation, and whether Temporal
+      acknowledged it.
+      - [`Task_failed]: the workflow task was failed, so Temporal retries it,
+        normally on another worker.
+      - [`Queries_failed]: the activation only delivered queries; each query
+        was answered with a failure and the workflow task was not failed.
+      - [`Eviction_acknowledged]: the activation only evicted the run from the
+        sticky cache; it was acknowledged with an empty completion and no
+        workflow task was failed.
+      - [`Not_acknowledged]: the replacement completion could not be
+        delivered, so the task, query, or eviction will instead time out. *)
+  type abandonment =
+    [ `Task_failed | `Queries_failed | `Eviction_acknowledged | `Not_acknowledged ]
+
   (** The first workflow activation that exceeded the activation deadline.
       [workflow_type] and [workflow_id] are [None] only when the activation
       could not be matched to a run. [elapsed] is a lower bound on how long the
-      activation had run when it was detected. [task_failed] is [true] when
-      Temporal acknowledged the watchdog's workflow-task failure; [false]
-      means the failure could not be delivered and the task will instead time
-      out. No payload is included. *)
+      activation had run when it was detected. [abandoned] reports what the
+      watchdog submitted in place of the stuck activation's completion. No
+      payload is included. *)
   type stuck_workflow_activation = {
     workflow_type : string option;
     workflow_id : string option;
     run_id : string;
     is_replaying : bool;
     elapsed : Duration.t;
-    task_failed : bool;
+    abandoned : abandonment;
   }
 
   (** [Healthy] until the watchdog detects a stuck activation; afterwards

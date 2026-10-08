@@ -7,7 +7,10 @@
     the watchdog. The tests prove that the watchdog fails the stuck task
     exactly once, that the lane's late completion is dropped rather than
     submitted a second time for the same lease, that health stays sticky, and
-    that ordinary activations are never affected. *)
+    that ordinary activations are never affected. Query-only and
+    eviction-only activations are stalled inside the activation observer,
+    which runs inside the watchdog's window, to prove the report names the
+    completion actually submitted rather than claiming a task failure. *)
 
 module Protocol = Temporal_protocol.Workflow_protocol
 module Adapter = Temporal_runtime.Native_worker_execution
@@ -126,6 +129,22 @@ let eviction_activation ~run_id : Protocol.activation =
     metadata = None;
   }
 
+(** Builds a query-only activation for [run_id] with one query per ID. *)
+let query_activation ~run_id ~query_ids : Protocol.activation =
+  {
+    run_id;
+    timestamp = Some timestamp;
+    is_replaying = false;
+    history_length = 1L;
+    jobs =
+      List.map
+        (fun query_id ->
+          Protocol.Query_workflow
+            { query_id; query_type = "state"; arguments = []; headers = [] })
+        query_ids;
+    metadata = None;
+  }
+
 (** Adds one activation to the fake source queue. *)
 let enqueue supervisor activation =
   locked supervisor (fun () -> Queue.add activation supervisor.queue)
@@ -167,6 +186,31 @@ let worker supervisor ~entered ~release =
   with
   | Ok worker -> worker
   | Error error -> failwith ("worker creation failed: " ^ error.message)
+
+(** Creates an adapter whose activation observer spins until [release] is
+    set. The observer runs after the activation is published to the watchdog
+    and before any workflow or eviction handling, so it stalls activations
+    that never enter a workflow function, such as query-only and eviction-only
+    ones. [entered] proves the lane reached the observer. *)
+let stalling_observer_worker supervisor ~entered ~release =
+  let on_activation (_ : Adapter.activation_info) =
+    Atomic.set entered true;
+    while not (Atomic.get release) do
+      Domain.cpu_relax ()
+    done
+  in
+  match
+    Worker.create ~on_activation ~supervisor
+      ~workflows:[ Adapter.register quick_workflow ]
+      ()
+  with
+  | Ok worker -> worker
+  | Error error -> failwith ("worker creation failed: " ^ error.message)
+
+(** Removes [run_id]'s lease from the fake so its next completion is rejected
+    as stale, simulating a supervisor that cannot acknowledge the watchdog. *)
+let revoke_lease supervisor ~run_id =
+  locked supervisor (fun () -> Hashtbl.remove supervisor.leased run_id)
 
 (** Polls [predicate] until it holds, failing after ten seconds. *)
 let await ~what predicate =
@@ -242,7 +286,8 @@ let test_abandon_drops_late_completion () =
   in
   (match Worker.abandon_activation worker ~epoch ~elapsed_ms:2_500 with
   | Some stuck ->
-      if not stuck.task_failed then failwith "task failure not acknowledged";
+      if stuck.abandoned <> `Task_failed then
+        failwith "task failure not reported as acknowledged";
       if stuck.workflow_type <> Some "spinning" then
         failwith "diagnostic lost the workflow type";
       if stuck.workflow_id <> Some ("workflow-" ^ run_id) then
@@ -285,6 +330,105 @@ let test_abandon_drops_late_completion () =
   match Worker.drain worker with
   | Ok () -> ()
   | Error error -> failwith ("adapter retained a pending completion: " ^ error.code)
+
+(** Leases the single queued activation on a lane Domain, waits until the
+    observer stalls it, abandons it as the watchdog would, and releases the
+    lane. Returns the watchdog report and the lane's late result. [before]
+    runs after the stall is observed and before the abandonment. *)
+let abandon_stalled_activation ?(before = fun () -> ()) worker ~entered
+    ~release =
+  let lane = poll_on_lane worker in
+  await ~what:"activation observer" (fun () -> Atomic.get entered);
+  let epoch =
+    match Worker.running_epoch worker with
+    | Some epoch -> epoch
+    | None -> failwith "stalled activation was not published"
+  in
+  before ();
+  let stuck =
+    match Worker.abandon_activation worker ~epoch ~elapsed_ms:2_500 with
+    | Some stuck -> stuck
+    | None -> failwith "watchdog did not abandon a stalled activation"
+  in
+  Atomic.set release true;
+  (stuck, Domain.join lane)
+
+(** A stuck query-only activation is released by failing its queries. The
+    report says so and does not claim a workflow-task failure. *)
+let test_stuck_query_reports_failed_queries () =
+  let supervisor = fake_supervisor () in
+  let entered = Atomic.make false and release = Atomic.make false in
+  let worker = stalling_observer_worker supervisor ~entered ~release in
+  let run_id = "run-query" in
+  enqueue supervisor
+    (query_activation ~run_id ~query_ids:[ "query-1"; "query-2" ]);
+  let stuck, late = abandon_stalled_activation worker ~entered ~release in
+  if stuck.abandoned <> `Queries_failed then
+    failwith "stuck query activation not reported as failed queries";
+  (match late with
+  | Ok (Adapter.Rejected { lease_retired = true; _ }) -> ()
+  | _ -> failwith "late query result was not dropped");
+  (match completions supervisor with
+  | [ { task_failure = None; commands; _ } ] ->
+      let failed_ids =
+        List.filter_map
+          (function
+            | Protocol.Query_result
+                { query_id; result = Protocol.Query_failed _ } ->
+                Some query_id
+            | _ -> None)
+          commands
+      in
+      if failed_ids <> [ "query-1"; "query-2" ] then
+        failwith "watchdog did not fail every delivered query"
+  | [ _ ] -> failwith "stuck query activation failed the workflow task"
+  | _ -> failwith "watchdog must submit exactly one completion");
+  match Worker.drain worker with
+  | Ok () -> ()
+  | Error error -> failwith ("adapter retained a pending completion: " ^ error.code)
+
+(** A stuck eviction-only activation is released with the empty eviction
+    acknowledgement, and the report does not claim a workflow-task failure. *)
+let test_stuck_eviction_reports_acknowledgement () =
+  let supervisor = fake_supervisor () in
+  let entered = Atomic.make false and release = Atomic.make false in
+  let worker = stalling_observer_worker supervisor ~entered ~release in
+  let run_id = "run-evicted" in
+  enqueue supervisor (eviction_activation ~run_id);
+  let stuck, late = abandon_stalled_activation worker ~entered ~release in
+  if stuck.abandoned <> `Eviction_acknowledged then
+    failwith "stuck eviction not reported as acknowledged";
+  (match late with
+  | Ok (Adapter.Rejected { lease_retired = true; _ }) -> ()
+  | _ -> failwith "late eviction result was not dropped");
+  (match completions supervisor with
+  | [ { task_failure = None; commands = []; _ } ] -> ()
+  | [ _ ] -> failwith "stuck eviction was not acknowledged with an empty completion"
+  | _ -> failwith "watchdog must submit exactly one completion");
+  match Worker.drain worker with
+  | Ok () -> ()
+  | Error error -> failwith ("adapter retained a pending completion: " ^ error.code)
+
+(** A watchdog completion the supervisor rejects is reported as
+    unacknowledged, never as a task failure, and the lane's late result
+    becomes an error because the lease state is unknown. *)
+let test_unacknowledged_abandonment () =
+  let supervisor = fake_supervisor () in
+  let entered = Atomic.make false and release = Atomic.make false in
+  let worker = stalling_observer_worker supervisor ~entered ~release in
+  let run_id = "run-unacknowledged" in
+  enqueue supervisor (start_activation ~run_id ~workflow_type:"quick");
+  let stuck, late =
+    abandon_stalled_activation worker ~entered ~release
+      ~before:(fun () -> revoke_lease supervisor ~run_id)
+  in
+  if stuck.abandoned <> `Not_acknowledged then
+    failwith "rejected watchdog completion not reported as unacknowledged";
+  (match late with
+  | Error _ -> ()
+  | Ok _ -> failwith "late lane result hid an unacknowledged lease");
+  if completions supervisor <> [] then
+    failwith "fake accepted a completion for a revoked lease"
 
 (** The real watchdog Domain detects a stuck activation within its declared
     bound and leaves quick activations alone. *)
@@ -412,4 +556,7 @@ let () =
   test_abandon_drops_late_completion ();
   test_watchdog_domain_detects_once ();
   test_finished_epoch_is_not_abandoned ();
+  test_stuck_query_reports_failed_queries ();
+  test_stuck_eviction_reports_acknowledgement ();
+  test_unacknowledged_abandonment ();
   test_public_options ()

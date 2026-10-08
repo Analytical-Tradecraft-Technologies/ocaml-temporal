@@ -1003,9 +1003,16 @@ let _worker_health_fields : T.Worker.Health.t -> string option =
         run_id;
         is_replaying = _;
         elapsed = _;
-        task_failed = _;
+        abandoned = _;
       } ->
       Some run_id
+
+let _worker_health_abandonment : T.Worker.Health.abandonment -> string =
+  function
+  | `Task_failed -> "task failed"
+  | `Queries_failed -> "queries failed"
+  | `Eviction_acknowledged -> "eviction acknowledged"
+  | `Not_acknowledged -> "not acknowledged"
 
 (* External workflow commands and search attributes from workflow code. *)
 let _workflow_signal_external_workflow :

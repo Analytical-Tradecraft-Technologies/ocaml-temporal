@@ -91,20 +91,30 @@ type activation_info = {
     the completion observer after Core has acknowledged the activation
     completion. *)
 
+type abandonment =
+  [ `Task_failed | `Queries_failed | `Eviction_acknowledged | `Not_acknowledged ]
+(** What the watchdog submitted in place of the lane's completion and whether
+    the supervisor acknowledged it. [`Task_failed]: an ordinary activation's
+    workflow task was failed. [`Queries_failed]: a query-only activation's
+    queries were answered with failures; the workflow task was not failed.
+    [`Eviction_acknowledged]: an eviction-only activation received its empty
+    acknowledgement. [`Not_acknowledged]: encoding or submission failed, so
+    the task, query, or eviction is left to time out. *)
+
 type stuck_activation = {
   run_id : string;
   workflow_id : string option;
   workflow_type : string option;
   is_replaying : bool;
   elapsed_ms : int;
-  task_failed : bool;
+  abandoned : abandonment;
 }
 (** Bounded identity of an activation abandoned by the non-yielding-code
     watchdog (#493). [workflow_id] and [workflow_type] are [None] only when the
     activation neither initialized the run nor matched a cached run.
     [elapsed_ms] is the watchdog's lower bound on the time the activation had
-    spent in workflow code. [task_failed] is [true] when the supervisor
-    acknowledged the watchdog's workflow-task failure completion. No payload,
+    spent in workflow code. [abandoned] describes the watchdog's replacement
+    completion and its acknowledgement. No payload,
     task token, or failure text is retained. *)
 
 (** One workflow definition registered with the worker. The existential
@@ -246,16 +256,16 @@ module Make (Supervisor : SUPERVISOR) : sig
       Domain; it never blocks on the lane. *)
   val running_epoch : t -> int option
 
-  (** [abandon_activation t ~epoch ~elapsed_ms] fails the workflow task of
+  (** [abandon_activation t ~epoch ~elapsed_ms] releases the lease of
       activation [epoch] if it is still executing workflow code. The watchdog
       and the lane race on one atomic claim, so exactly one of them completes
       the native lease: on winning, this submits a failure completion through
       the supervisor (a task failure, an empty eviction acknowledgement, or
       failed query answers, exactly as an adapter-level rejection would),
-      records the sticky {!stuck} report, logs one bounded diagnostic, and
-      returns it. When the lane later returns, its completion is dropped
-      without a native call and its run is removed (the task failure makes
-      Core evict it); the poll reports [Rejected] with code
+      records the sticky {!stuck} report with the matching {!abandonment},
+      logs one bounded diagnostic, and returns it. When the lane later returns, its completion is dropped
+      without a native call and, unless the activation only answered
+      queries, its run is removed (a task failure makes Core evict it); the poll reports [Rejected] with code
       [activation_deadline_exceeded], or [Error] when the watchdog's
       submission was not acknowledged. Returns [None] when [epoch] is no
       longer running or the lane claimed the lease first.

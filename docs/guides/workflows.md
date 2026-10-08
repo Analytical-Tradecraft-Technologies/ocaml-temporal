@@ -962,7 +962,9 @@ timers and futures to wait.
 The worker detects the mistake but cannot undo it. When an activation runs
 for longer than its deadline (two seconds by default) without yielding, a
 watchdog fails that workflow task so Temporal retries it, normally on another
-worker, logs one `workflow_activation_deadline_exceeded` error naming the
+worker (a stuck query-only activation instead has its queries answered with
+failures, and a stuck eviction is acknowledged; `Stuck_workflow_activation`'s
+`abandoned` field says which happened), logs one `workflow_activation_deadline_exceeded` error naming the
 workflow type, workflow ID, and run ID, and makes `Temporal.Worker.health`
 report `Stuck_workflow_activation`. OCaml code cannot be safely interrupted,
 so the stuck code keeps running, `shutdown` cannot finish while it does, and

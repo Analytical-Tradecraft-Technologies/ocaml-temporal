@@ -163,13 +163,16 @@ end
 
 (** Worker liveness as observed by the workflow activation watchdog. *)
 module Health = struct
+  type abandonment =
+    [ `Task_failed | `Queries_failed | `Eviction_acknowledged | `Not_acknowledged ]
+
   type stuck_workflow_activation = {
     workflow_type : string option;
     workflow_id : string option;
     run_id : string;
     is_replaying : bool;
     elapsed : Duration.t;
-    task_failed : bool;
+    abandoned : abandonment;
   }
 
   type t = Healthy | Stuck_workflow_activation of stuck_workflow_activation
@@ -715,7 +718,7 @@ let health worker =
             workflow_type;
             is_replaying;
             elapsed_ms;
-            task_failed;
+            abandoned;
           } ->
           Health.Stuck_workflow_activation
             {
@@ -724,7 +727,7 @@ let health worker =
               run_id;
               is_replaying;
               elapsed = Duration.of_ms (Int64.of_int (Int.max 0 elapsed_ms));
-              task_failed;
+              abandoned;
             })
 
 (** Asks [run] to return without waiting for it (#830). The function performs

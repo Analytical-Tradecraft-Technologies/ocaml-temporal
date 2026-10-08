@@ -61,20 +61,32 @@ type activation_info = {
   cache_removal_reason : string option;
 }
 
+(** What the watchdog's replacement completion was and whether the supervisor
+    acknowledged it. The kind mirrors [failure_completion]: an ordinary
+    activation fails its workflow task ([`Task_failed]); a query-only
+    activation answers every query with a failure and leaves the task itself
+    untouched ([`Queries_failed]); an eviction-only activation is acknowledged
+    with an empty completion ([`Eviction_acknowledged]). [`Not_acknowledged]
+    means encoding or submission failed, so Core never received a completion
+    for the lease and the task, query, or eviction is left to time out. *)
+type abandonment =
+  [ `Task_failed | `Queries_failed | `Eviction_acknowledged | `Not_acknowledged ]
+
 (** Diagnostic identity of a workflow activation abandoned by the
     non-yielding-code watchdog (#493). It carries only identifiers, the replay
     flag, and the observed duration: never payloads, task tokens, or
     continuation state. [elapsed_ms] is the watchdog's own lower bound on how
     long the activation had been running without returning to the adapter.
-    [task_failed] records whether the supervisor acknowledged the watchdog's
-    workflow-task failure completion. *)
+    [abandoned] records what the watchdog submitted in place of the lane's
+    completion and whether the supervisor acknowledged it; see
+    {!abandonment}. *)
 type stuck_activation = {
   run_id : string;
   workflow_id : string option;
   workflow_type : string option;
   is_replaying : bool;
   elapsed_ms : int;
-  task_failed : bool;
+  abandoned : abandonment;
 }
 
 (** Single-owner claim on the native lease of the activation currently inside
@@ -806,7 +818,7 @@ module Make (Supervisor : SUPERVISOR) = struct
   let deadline_exceeded_error () =
     make_error ~path:"$.workflow_execution" "activation_deadline_exceeded"
       "workflow activation exceeded the worker's activation deadline without \
-       yielding; its workflow task was failed by the watchdog"
+       yielding; the watchdog released its lease with a failure completion"
 
   (** Waits for the watchdog to publish the result of the failure submission
       it started after winning the lease claim. The wait is bounded by one
@@ -1209,8 +1221,11 @@ module Make (Supervisor : SUPERVISOR) = struct
           ?workflow_type:stuck.workflow_type ?workflow_id:stuck.workflow_id
           ~run_id:stuck.run_id
           ~error_kind:
-            (if stuck.task_failed then "workflow_task_failed"
-             else "workflow_task_failure_unacknowledged")
+            (match stuck.abandoned with
+             | `Task_failed -> "workflow_task_failed"
+             | `Queries_failed -> "workflow_queries_failed"
+             | `Eviction_acknowledged -> "eviction_acknowledged"
+             | `Not_acknowledged -> "completion_unacknowledged")
           ()
       in
       Observability.report ~src:Observability.Source.workflow Logs.Error ~tags
@@ -1218,12 +1233,25 @@ module Make (Supervisor : SUPERVISOR) = struct
          is unhealthy and must be restarted"
     with _ -> ()
 
+  (** Classifies the watchdog's replacement [completion], as built by
+      [failure_completion], together with its submission [outcome]. Only an
+      acknowledged completion carrying [task_failure] is reported as a failed
+      workflow task; failed query answers and an empty eviction acknowledgement
+      leave the workflow task itself unfailed. *)
+  let abandonment_of (completion : Protocol.completion) outcome : abandonment =
+    match (outcome, completion) with
+    | Error _, _ -> `Not_acknowledged
+    | Ok (), { task_failure = Some _; _ } -> `Task_failed
+    | Ok (), { task_failure = None; commands = _ :: _; _ } -> `Queries_failed
+    | Ok (), { task_failure = None; commands = []; _ } -> `Eviction_acknowledged
+
   (** Called by the watchdog when activation [epoch] has run workflow code for
       at least [elapsed_ms]. If that activation is still unclaimed, the
-      watchdog takes its lease, submits a workflow-task failure through the
-      supervisor without the adapter mutex (the lane still holds it), records
-      the sticky [stuck] report, and logs it. Temporal then retries the task,
-      normally on another worker. Returns [None] when the lane finished or
+      watchdog takes its lease, submits the [failure_completion] for it
+      through the supervisor without the adapter mutex (the lane still holds
+      it), records the sticky [stuck] report with the resulting
+      {!abandonment}, and logs it. For an ordinary activation Temporal then
+      retries the failed task, normally on another worker. Returns [None] when the lane finished or
       claimed the lease first; the watchdog never touches workflow state, so
       the stuck code keeps running until it returns on its own. *)
   let abandon_activation adapter ~epoch ~elapsed_ms =
@@ -1252,7 +1280,7 @@ module Make (Supervisor : SUPERVISOR) = struct
             workflow_type = flight.flight_workflow_type;
             is_replaying = flight.activation.is_replaying;
             elapsed_ms;
-            task_failed = Result.is_ok outcome;
+            abandoned = abandonment_of completion outcome;
           }
         in
         ignore (Atomic.compare_and_set adapter.stuck None (Some stuck));

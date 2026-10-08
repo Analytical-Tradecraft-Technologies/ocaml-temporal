@@ -360,8 +360,11 @@ the worker. OCaml offers no safe way to interrupt that code, so the policy
   lease state is unknown.
 - **Health.** The first abandoned activation is recorded in a sticky atomic
   and exposed by `Temporal.Worker.health` as `Stuck_workflow_activation`
-  (workflow type and ID, run ID, replay flag, elapsed lower bound, and whether
-  the task failure was acknowledged). It never resets, because code that
+  (workflow type and ID, run ID, replay flag, elapsed lower bound, and an
+  `abandoned` outcome: `` `Task_failed ``, `` `Queries_failed `` for a
+  query-only activation, `` `Eviction_acknowledged `` for an eviction-only
+  activation, or `` `Not_acknowledged `` when the replacement completion was
+  not delivered). Only `` `Task_failed `` claims a workflow-task failure. It never resets, because code that
   failed to yield may have left process state inconsistent. One
   `workflow_activation_deadline_exceeded` error record is logged with
   `temporal.workflow_type`, `temporal.workflow_id`, `temporal.run_id`, and
