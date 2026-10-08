@@ -17,9 +17,13 @@
       and {!wait} reports [Timed_out].
     - An RPC deadline ([?rpc_timeout] on {!start}, {!signal}, {!query},
       {!query_with_input}, {!start_update}, {!cancel}, {!terminate},
-      {!reset}, and {!list_visibility}) bounds one client call, including
-      the transport retries the SDK performs inside it, and never affects the
-      workflow. It must be between 1 ms and 60 seconds; other values are
+      {!reset}, and {!list_visibility}) bounds one client call and never
+      affects the workflow. The deadline is fixed on a monotonic clock when
+      the call begins, so it covers the time the request waits behind
+      earlier calls on the same client (which are served one at a time), the
+      RPC, and the transport retries the SDK performs inside it. A request
+      whose deadline expires while it waits is never sent. It must be
+      between 1 ms and 60 seconds; other values are
       typed defects returned before any request is sent. When omitted, each
       operation keeps its built-in budget: 10 seconds for {!start} and
       {!list_visibility}, 3 seconds for {!signal}, {!cancel}, {!terminate},
@@ -27,12 +31,16 @@
       acceptance wait. {!wait} and {!wait_update} have no RPC deadline: they
       wait for the workflow or update, with bounded internal polls.
 
-    An expired RPC deadline does not prove that Temporal rejected the
-    request: the server may have applied it before the reply was lost. It is
-    reported as an error with {!val-rpc_status} [Some `Deadline_exceeded] (or
-    [`Unavailable] when the last transport attempt failed first), except
-    that an expired {!start} is recognized by {!is_start_outcome_uncertain}
-    and an expired {!terminate} reports [`Termination_outcome_uncertain].
+    An expired RPC deadline is reported as an error with {!val-rpc_status}
+    [Some `Deadline_exceeded] (or [`Unavailable] when the last transport
+    attempt failed first). When it expired while the request was waiting to
+    be sent, nothing reached Temporal. When it expired during the RPC, it
+    does not prove that Temporal rejected the request: the server may have
+    applied it before the reply was lost. So a {!start} that was sent and
+    then expired is instead recognized by {!is_start_outcome_uncertain}, and
+    a sent {!terminate} reports [`Termination_outcome_uncertain]; a start or
+    terminate that expired before it was sent reports [`Deadline_exceeded]
+    like the other operations.
     Reconcile by retrying with the same request ID (start, signal, cancel,
     reset) or update ID, or by observing the run with {!wait}. *)
 
@@ -215,9 +223,12 @@ val create :
     chain to its last run.
 
     [rpc_timeout] bounds this start call only (default 10 seconds; see
-    {{!section-rpc_deadlines} RPC deadlines}). When it expires, or the client
-    shuts down while the start is in flight, the error is recognized by
-    {!is_start_outcome_uncertain}: Temporal may have accepted the start.
+    {{!section-rpc_deadlines} RPC deadlines}). If it expires while the start
+    waits behind earlier calls on this client, the start is not sent and the
+    error has {!val-rpc_status} [Some `Deadline_exceeded]. If it expires
+    after the start was sent, or the client shuts down while the start is in
+    flight, the error is recognized by {!is_start_outcome_uncertain}:
+    Temporal may have accepted the start.
     Retry with the same [request_id] to obtain the run if it was created, or
     to create it exactly once if it was not; the RPC deadline is not part of
     the request, so the retry may use another one.

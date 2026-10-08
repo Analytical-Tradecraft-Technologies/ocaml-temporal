@@ -38,6 +38,27 @@ val max_rpc_timeout_ms : int64
 (** Largest caller-selected RPC timeout, 60,000 ms. Rust enforces the same
     bound because control RPCs run on the supervisor's owner Domain. *)
 
+type rpc_deadline = { timeout_ms : int64; expires_at_ns : int64 }
+(** A caller's RPC deadline (#499). [expires_at_ns] is absolute on the
+    process's monotonic clock and is fixed when the public client call
+    begins; [timeout_ms] is the budget sent to Rust as [rpc_timeout_ms]. The
+    supervisor replaces [timeout_ms] with the budget remaining when the owner
+    Domain dispatches the request (see {!remaining_rpc_deadline}), so time
+    spent queued behind earlier calls counts against the caller's bound.
+    [expires_at_ns] never crosses the bridge, so the ABI is unchanged. *)
+
+val rpc_deadline : now_ns:int64 -> timeout_ms:int64 -> rpc_deadline
+(** [rpc_deadline ~now_ns ~timeout_ms] is a deadline expiring [timeout_ms]
+    after the monotonic reading [now_ns]. The timeout is validated by the
+    encoder, not here. *)
+
+val remaining_rpc_deadline :
+  now_ns:int64 -> rpc_deadline -> rpc_deadline option
+(** Returns the deadline with [timeout_ms] lowered to the whole milliseconds
+    remaining at [now_ns] (rounded up, so a live deadline sends at least
+    1 ms and never more than the original budget), or [None] when the
+    deadline has already expired and the request must not be sent. *)
+
 val max_workflow_task_timeout_ms : int64
 (** Largest workflow task timeout, 120,000 ms: Temporal silently lowers a
     larger value, so the protocol rejects it instead. *)
@@ -61,7 +82,7 @@ type start_request = {
   run_timeout_ms : int64 option;
   task_timeout_ms : int64 option;
   retry_policy : Workflow_protocol.retry_policy option;
-  rpc_timeout_ms : int64 option;
+  rpc_deadline : rpc_deadline option;
 }
 (** Dynamic workflow-start request sent to the Rust client adapter. [request_id]
     is stable across retries and is passed unchanged to Temporal, so a caller
@@ -75,10 +96,11 @@ type start_request = {
     execution timeout, and a task timeout no larger than the run timeout (or
     the execution timeout when there is no run timeout). Every combination
     of the reuse and conflict policies is valid.
-    [rpc_timeout_ms] bounds only this client call (default ten seconds) and
-    never the workflow; when present it is between 1 and
-    {!max_rpc_timeout_ms}. Every other request below that carries
-    [rpc_timeout_ms] applies the same bound in place of its own default. *)
+    [rpc_deadline] bounds only this client call (default ten seconds) and
+    never the workflow; its [timeout_ms] is sent as [rpc_timeout_ms] and must
+    be between 1 and {!max_rpc_timeout_ms}. Every other request below that
+    carries [rpc_deadline] applies the same bound in place of its own
+    default. *)
 
 type start_response = { execution : execution; started : bool }
 (** Execution returned by a successful start. [started] is [false] only when
@@ -98,7 +120,7 @@ type cancel_request = {
   execution : execution;
   request_id : string;
   reason : string;
-  rpc_timeout_ms : int64 option;
+  rpc_deadline : rpc_deadline option;
 }
 (** Run selector and idempotency metadata for a client cancellation request. *)
 
@@ -110,7 +132,7 @@ type reset_request = {
   request_id : string;
   reason : string;
   workflow_task_finish_event_id : int64;
-  rpc_timeout_ms : int64 option;
+  rpc_deadline : rpc_deadline option;
 }
 (** Run selector and workflow-task event used as the reset point. *)
 
@@ -120,7 +142,7 @@ type reset_response = { execution : execution }
 type terminate_request = {
   execution : execution;
   reason : string;
-  rpc_timeout_ms : int64 option;
+  rpc_deadline : rpc_deadline option;
 }
 (** Termination request for one run selector. [reason] is bounded operator
     context. *)
@@ -133,7 +155,7 @@ type signal_request = {
   signal_name : string;
   request_id : string;
   input : payload list;
-  rpc_timeout_ms : int64 option;
+  rpc_deadline : rpc_deadline option;
 }
 (** Workflow/run selector and typed payloads for one signal delivery.
 
@@ -148,7 +170,7 @@ type query_request = {
   execution : execution;
   query_type : string;
   input : payload list;
-  rpc_timeout_ms : int64 option;
+  rpc_deadline : rpc_deadline option;
 }
 (** Execution selector and output-only query name sent to Temporal. The
     input list is currently required to be empty by the public client API but
@@ -162,7 +184,7 @@ type visibility_request = {
   query : string;
   page_size : int;
   next_page_token : string option;
-  rpc_timeout_ms : int64 option;
+  rpc_deadline : rpc_deadline option;
 }
 (** One explicitly bounded visibility page request. The token is opaque base64. *)
 
@@ -186,7 +208,7 @@ type update_request = {
   update_id : string;
   update_name : string;
   input : payload list;
-  rpc_timeout_ms : int64 option;
+  rpc_deadline : rpc_deadline option;
 }
 (** Request to admit one named workflow update. *)
 

@@ -51,7 +51,18 @@ policies are part of pending-start equality; the RPC deadline is not, so a
 reconciling retry may use another deadline. Because the transport reports its
 own expiry of a per-attempt deadline as `cancelled`, a `cancelled` or
 `deadline_exceeded` status after the caller's budget has elapsed is now
-reported as `deadline_exceeded`. An uncertain start now carries
+reported as `deadline_exceeded`. The deadline is fixed on a monotonic clock
+(a private C stub, not a Rust symbol) when the public call begins, and the
+owner Domain sends only the budget that remains when it dispatches the
+request, so time queued behind earlier calls on the same client counts. A
+request that expired while queued is never sent and fails with the typed
+`deadline_exceeded` error; for a start this is a definite rejection, not an
+uncertain outcome. A supervisor test holds the owner Domain with a long
+operation and shows a queued 50 ms signal failing unsent while a queued
+two-second signal is sent with only its remaining budget, and every client
+operation on an unconnected supervisor returns `deadline_exceeded` for an
+expired deadline instead of reaching the bridge. Visibility RPC failures are
+now classified by `Client.rpc_status` too. An uncertain start now carries
 `Error.error_type` `StartOutcomeUncertain`, recognized by the new
 `Client.is_start_outcome_uncertain`. The mock applies the reuse policy to
 closed runs. All new protocol members are optional and no response changed,

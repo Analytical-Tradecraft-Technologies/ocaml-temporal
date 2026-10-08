@@ -483,6 +483,31 @@ module Protocol_adapter = struct
     | Ok output -> Ok (Bytes.of_string output)
     | Error error -> client_error "client query request encoding" error
 
+  (** The structured failure Rust reports for an expired RPC budget: the
+      [Connection] status with the closed [rpc] error document. Synthesizing
+      the identical value lets every operation's existing result decoder map
+      a deadline that expired in the mailbox exactly as one that expired on
+      the wire. *)
+  let expired_rpc_deadline_error : Bridge.error =
+    { status = Connection; message = {|{"kind":"rpc","code":"deadline_exceeded"}|} }
+
+  (** Resolves a client request's caller deadline when the owner Domain
+      dispatches it (#499). The deadline's expiry was fixed on the monotonic
+      clock when the public call began, so time spent queued in the
+      supervisor mailbox behind earlier calls on the same client already
+      counts against it. With no deadline, [live None] runs unchanged. With
+      time remaining, [live] receives the deadline lowered to the remaining
+      budget, which is what the request sends. Once expired, [expired ()]
+      runs instead and the request is never encoded or sent, so nothing
+      reaches Temporal. *)
+  let with_rpc_deadline ~now_ns deadline ~expired ~live =
+    match deadline with
+    | None -> live None
+    | Some deadline -> (
+        match Client.remaining_rpc_deadline ~now_ns deadline with
+        | None -> expired ()
+        | Some remaining -> live (Some remaining))
+
   (** Decodes the opaque ticket returned by native asynchronous-start
       admission. The ticket is bound to [request] before it is published to
       the supervisor caller, so later poll operations cannot mix identities. *)
@@ -918,6 +943,14 @@ module Native_backend = struct
       Tokio worker pool when [worker_threads] is supplied. *)
   let create worker_threads = Bridge.runtime_create ?worker_threads ()
 
+  (** Resolves a client request's RPC deadline against the monotonic clock at
+      the moment the owner Domain dispatches it; see
+      [Protocol_adapter.with_rpc_deadline]. *)
+  let deadline rpc_deadline ~expired ~live =
+    Protocol_adapter.with_rpc_deadline
+      ~now_ns:(Bridge.monotonic_now_ns ())
+      rpc_deadline ~expired ~live
+
   (** Revalidates the statically linked ABI without exposing the runtime. The
       state argument proves the operation remains ordered with lifecycle use. *)
   let perform : type value. state -> value operation -> (value, error) result =
@@ -925,18 +958,30 @@ module Native_backend = struct
     | Check_compatibility ->
         Bridge.check_abi_version Bridge.abi_version
     | Connect_client config -> Bridge.client_connect runtime config
-    | Client_start_workflow request -> (
-        match Protocol_adapter.encode_client_start_request request with
-        | Error error -> Error error
-        | Ok input ->
+    | Client_start_workflow request ->
+        deadline request.rpc_deadline
+          ~expired:(fun () ->
             Protocol_adapter.decode_client_start_result request
-              (Bridge.client_start_workflow_json runtime input))
-    | Client_begin_start_workflow request -> (
-        match Protocol_adapter.encode_client_start_request request with
-        | Error error -> Error error
-        | Ok input ->
-            Protocol_adapter.decode_client_start_ticket request
-              (Bridge.client_begin_start_workflow_json runtime input))
+              (Error Protocol_adapter.expired_rpc_deadline_error))
+          ~live:(fun rpc_deadline ->
+            let request = { request with rpc_deadline } in
+            match Protocol_adapter.encode_client_start_request request with
+            | Error error -> Error error
+            | Ok input ->
+                Protocol_adapter.decode_client_start_result request
+                  (Bridge.client_start_workflow_json runtime input))
+    | Client_begin_start_workflow request ->
+        (* An expired start was never handed to Rust, so it is a definite
+           [deadline_exceeded] rejection rather than an uncertain outcome. *)
+        deadline request.rpc_deadline
+          ~expired:(fun () -> Ok (Error (Client.Rpc { code = "deadline_exceeded" })))
+          ~live:(fun rpc_deadline ->
+            let request = { request with rpc_deadline } in
+            match Protocol_adapter.encode_client_start_request request with
+            | Error error -> Error error
+            | Ok input ->
+                Protocol_adapter.decode_client_start_ticket request
+                  (Bridge.client_begin_start_workflow_json runtime input))
     | Client_poll_start_workflow ticket -> (
         match Protocol_adapter.encode_client_start_ticket ticket with
         | Error error -> Error error
@@ -955,48 +1000,90 @@ module Native_backend = struct
         | Ok input ->
             Protocol_adapter.decode_client_wait_result request
               (Bridge.client_wait_workflow_json runtime input))
-    | Client_cancel_workflow request -> (
-        match Protocol_adapter.encode_client_cancel_request request with
-        | Error error -> Error error
-        | Ok input ->
+    | Client_cancel_workflow request ->
+        deadline request.rpc_deadline
+          ~expired:(fun () ->
             Protocol_adapter.decode_client_cancel_result
-              (Bridge.client_cancel_workflow_json runtime input))
-    | Client_reset_workflow request -> (
-        match Protocol_adapter.encode_client_reset_request request with
-        | Error error -> Error error
-        | Ok input ->
+              (Error Protocol_adapter.expired_rpc_deadline_error))
+          ~live:(fun rpc_deadline ->
+            let request = { request with rpc_deadline } in
+            match Protocol_adapter.encode_client_cancel_request request with
+            | Error error -> Error error
+            | Ok input ->
+                Protocol_adapter.decode_client_cancel_result
+                  (Bridge.client_cancel_workflow_json runtime input))
+    | Client_reset_workflow request ->
+        deadline request.rpc_deadline
+          ~expired:(fun () ->
             Protocol_adapter.decode_client_reset_result request
-              (Bridge.client_reset_workflow_json runtime input))
-    | Client_terminate_workflow request -> (
-        match Protocol_adapter.encode_client_terminate_request request with
-        | Error error -> Error error
-        | Ok input ->
+              (Error Protocol_adapter.expired_rpc_deadline_error))
+          ~live:(fun rpc_deadline ->
+            let request = { request with rpc_deadline } in
+            match Protocol_adapter.encode_client_reset_request request with
+            | Error error -> Error error
+            | Ok input ->
+                Protocol_adapter.decode_client_reset_result request
+                  (Bridge.client_reset_workflow_json runtime input))
+    | Client_terminate_workflow request ->
+        deadline request.rpc_deadline
+          ~expired:(fun () ->
             Protocol_adapter.decode_client_terminate_result
-              (Bridge.client_terminate_workflow_json runtime input))
-    | Client_signal_workflow request -> (
-        match Protocol_adapter.encode_client_signal_request request with
-        | Error error -> Error error
-        | Ok input ->
+              (Error Protocol_adapter.expired_rpc_deadline_error))
+          ~live:(fun rpc_deadline ->
+            let request = { request with rpc_deadline } in
+            match Protocol_adapter.encode_client_terminate_request request with
+            | Error error -> Error error
+            | Ok input ->
+                Protocol_adapter.decode_client_terminate_result
+                  (Bridge.client_terminate_workflow_json runtime input))
+    | Client_signal_workflow request ->
+        deadline request.rpc_deadline
+          ~expired:(fun () ->
             Protocol_adapter.decode_client_signal_result
-              (Bridge.client_signal_workflow_json runtime input))
-    | Client_list_visibility_workflows request -> (
-        match Protocol_adapter.encode_client_visibility_request request with
-        | Error error -> Error error
-        | Ok input ->
+              (Error Protocol_adapter.expired_rpc_deadline_error))
+          ~live:(fun rpc_deadline ->
+            let request = { request with rpc_deadline } in
+            match Protocol_adapter.encode_client_signal_request request with
+            | Error error -> Error error
+            | Ok input ->
+                Protocol_adapter.decode_client_signal_result
+                  (Bridge.client_signal_workflow_json runtime input))
+    | Client_list_visibility_workflows request ->
+        deadline request.rpc_deadline
+          ~expired:(fun () ->
             Protocol_adapter.decode_client_visibility_result
-              (Bridge.client_list_visibility_json runtime input))
-    | Client_query_workflow request -> (
-        match Protocol_adapter.encode_client_query_request request with
-        | Error error -> Error error
-        | Ok input ->
+              (Error Protocol_adapter.expired_rpc_deadline_error))
+          ~live:(fun rpc_deadline ->
+            let request = { request with rpc_deadline } in
+            match Protocol_adapter.encode_client_visibility_request request with
+            | Error error -> Error error
+            | Ok input ->
+                Protocol_adapter.decode_client_visibility_result
+                  (Bridge.client_list_visibility_json runtime input))
+    | Client_query_workflow request ->
+        deadline request.rpc_deadline
+          ~expired:(fun () ->
             Protocol_adapter.decode_client_query_result
-              (Bridge.client_query_workflow_json runtime input))
-    | Client_update_workflow request -> (
-        match Protocol_adapter.encode_client_update_request request with
-        | Error error -> Error error
-        | Ok input ->
+              (Error Protocol_adapter.expired_rpc_deadline_error))
+          ~live:(fun rpc_deadline ->
+            let request = { request with rpc_deadline } in
+            match Protocol_adapter.encode_client_query_request request with
+            | Error error -> Error error
+            | Ok input ->
+                Protocol_adapter.decode_client_query_result
+                  (Bridge.client_query_workflow_json runtime input))
+    | Client_update_workflow request ->
+        deadline request.rpc_deadline
+          ~expired:(fun () ->
             Protocol_adapter.decode_client_update_result request
-              (Bridge.client_update_workflow_json runtime input))
+              (Error Protocol_adapter.expired_rpc_deadline_error))
+          ~live:(fun rpc_deadline ->
+            let request = { request with rpc_deadline } in
+            match Protocol_adapter.encode_client_update_request request with
+            | Error error -> Error error
+            | Ok input ->
+                Protocol_adapter.decode_client_update_result request
+                  (Bridge.client_update_workflow_json runtime input))
     | Client_poll_update_workflow request -> (
         match Protocol_adapter.encode_client_poll_update_request request with
         | Error error -> Error error

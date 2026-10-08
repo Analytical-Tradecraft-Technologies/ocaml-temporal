@@ -135,6 +135,10 @@ external echo_raw : bytes -> response = "ocaml_temporal_echo"
 external conformance_wait_ms_raw : int -> response
   = "ocaml_temporal_conformance_wait_ms"
 
+(** Reads the process-local monotonic clock in nanoseconds; see the
+    interface. Implemented in C, not Rust, so the bridge ABI is unchanged. *)
+external monotonic_now_ns : unit -> int64 = "ocaml_temporal_monotonic_now_ns"
+
 external response_status : response -> int = "ocaml_temporal_response_status"
 external response_value : response -> bytes = "ocaml_temporal_response_value"
 external response_error : response -> string = "ocaml_temporal_response_error"

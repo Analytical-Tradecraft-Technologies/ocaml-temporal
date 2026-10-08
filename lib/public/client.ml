@@ -229,17 +229,23 @@ let validate_start_metadata ~memo ~search_attributes =
   Result.bind (validate "memo" memo) (fun () ->
       validate "search attribute" search_attributes)
 
-(** The private protocol's bounds, shared so the mock and the native bridge
-    reject the same values at the public boundary. *)
+(** The private protocol's bounds and deadline representation, shared so the
+    mock and the native bridge reject the same values at the public
+    boundary. *)
 module Client_protocol = Temporal_sdk_kernel.Client_protocol
 
-(** Validates an optional caller RPC deadline and converts it to whole
-    milliseconds. The deadline bounds one client call; it must be at least
-    1 ms and at most one minute, because control RPCs hold the supervisor's
-    owner Domain for their whole budget. Violations are typed defects, so
-    every backend (including the mock, which ignores the deadline) rejects
+(** Validates an optional caller RPC timeout and turns it into an absolute
+    deadline on the process's monotonic clock, read now, at the public entry
+    point. The timeout bounds the whole client call, including the time the
+    request waits in the supervisor's FIFO mailbox behind earlier calls on
+    the same client (#807): the owner Domain sends only the budget that
+    remains when it dispatches the request, and fails the call with the typed
+    [Deadline_exceeded] error without sending it if none remains. The timeout
+    must be at least 1 ms and at most one minute, because control RPCs hold
+    the owner Domain for their whole budget. Violations are typed defects,
+    so every backend (including the mock, which ignores the deadline) rejects
     the same values before any request is sent. *)
-let rpc_timeout_ms = function
+let rpc_deadline = function
   | None -> Ok None
   | Some timeout ->
       let milliseconds = Duration.to_ms timeout in
@@ -250,7 +256,12 @@ let rpc_timeout_ms = function
         Error
           (Error.defect
              ~message:"rpc_timeout must be between 1 ms and 60 seconds")
-      else Ok (Some milliseconds)
+      else
+        Ok
+          (Some
+             (Client_protocol.rpc_deadline
+                ~now_ns:(Temporal_sdk_kernel.Bridge.monotonic_now_ns ())
+                ~timeout_ms:milliseconds))
 
 (** Validated server-side execution policies of one start, in the
     millisecond form the backend carries. *)
@@ -258,7 +269,7 @@ type start_policies = {
   execution_timeout_ms : int64 option;
   run_timeout_ms : int64 option;
   task_timeout_ms : int64 option;
-  start_rpc_timeout_ms : int64 option;
+  start_rpc_deadline : Client_protocol.rpc_deadline option;
 }
 
 (** Validates a start's workflow timeouts and RPC deadline before encoding
@@ -313,13 +324,13 @@ let validate_start_policies ~execution_timeout ~run_timeout ~task_timeout
              ~message:"task_timeout exceeds the run (or execution) timeout")
     | _ -> Ok ()
   in
-  let* start_rpc_timeout_ms = rpc_timeout_ms rpc_timeout in
+  let* start_rpc_deadline = rpc_deadline rpc_timeout in
   Ok
     {
       execution_timeout_ms;
       run_timeout_ms;
       task_timeout_ms;
-      start_rpc_timeout_ms;
+      start_rpc_deadline;
     }
 
 (** Starts a workflow after encoding its typed input and checking the backend's
@@ -367,7 +378,7 @@ let start client ?request_id ?(memo = []) ?(search_attributes = [])
                 task_timeout_ms = policies.task_timeout_ms;
                 retry_policy =
                   Option.map Retry_policy_private.to_runtime retry_policy;
-                rpc_timeout_ms = policies.start_rpc_timeout_ms;
+                rpc_deadline = policies.start_rpc_deadline;
               }
             in
             Result.bind (Backend.client_start client.backend request) (fun response ->
@@ -581,10 +592,10 @@ let cancel ?request_id ?(reason = "") ?rpc_timeout
   else
     match
       Result.bind (validate_cancel_fields ~request_id ~reason) (fun () ->
-          rpc_timeout_ms rpc_timeout)
+          rpc_deadline rpc_timeout)
     with
     | Error error -> Error error
-    | Ok rpc_timeout_ms ->
+    | Ok rpc_deadline ->
         let request_id =
           match request_id with
           | Some request_id -> request_id
@@ -596,7 +607,7 @@ let cancel ?request_id ?(reason = "") ?rpc_timeout
             run_id = run_selector handle;
             request_id;
             reason;
-            rpc_timeout_ms;
+            rpc_deadline;
           }
         in
         Backend.client_cancel handle.client.backend request
@@ -621,16 +632,16 @@ let terminate ?(reason = "") ?rpc_timeout (handle : ('input, 'output) handle) =
   else
     match
       Result.bind (validate_terminate_reason reason) (fun () ->
-          rpc_timeout_ms rpc_timeout)
+          rpc_deadline rpc_timeout)
     with
     | Error error -> Error error
-    | Ok rpc_timeout_ms ->
+    | Ok rpc_deadline ->
         let request : Backend.terminate_request =
           {
             workflow_id = handle.workflow_id;
             run_id = run_selector handle;
             reason;
-            rpc_timeout_ms;
+            rpc_deadline;
           }
         in
         Backend.client_terminate handle.client.backend request
@@ -677,10 +688,10 @@ let reset ?request_id ?(reason = "") ?rpc_timeout ~workflow_task_finish_event_id
     match
       Result.bind
         (validate_reset_fields ~request_id ~reason ~workflow_task_finish_event_id)
-        (fun () -> rpc_timeout_ms rpc_timeout)
+        (fun () -> rpc_deadline rpc_timeout)
     with
     | Error error -> Error error
-    | Ok rpc_timeout_ms ->
+    | Ok rpc_deadline ->
         let request_id =
           match request_id with
           | Some request_id -> request_id
@@ -693,7 +704,7 @@ let reset ?request_id ?(reason = "") ?rpc_timeout ~workflow_task_finish_event_id
             request_id;
             reason;
             workflow_task_finish_event_id;
-            rpc_timeout_ms;
+            rpc_deadline;
           }
         in
         (match Backend.client_reset handle.client.backend request with
@@ -724,10 +735,10 @@ let signal ?request_id ?rpc_timeout
   else
     match
       Result.bind (validate_signal_fields ~request_id) (fun () ->
-          rpc_timeout_ms rpc_timeout)
+          rpc_deadline rpc_timeout)
     with
     | Error error -> Error error
-    | Ok rpc_timeout_ms -> (
+    | Ok rpc_deadline -> (
         match Codec.encode (Signal.input signal) input with
         | Error error -> Error error
         | Ok encoded_input ->
@@ -743,7 +754,7 @@ let signal ?request_id ?rpc_timeout
                 signal_name = Signal.name signal;
                 request_id;
                 input = encoded_input;
-                rpc_timeout_ms;
+                rpc_deadline;
               }
             in
             Backend.client_signal handle.client.backend request)
@@ -759,16 +770,16 @@ let query ?rpc_timeout (handle : ('workflow_input, 'workflow_output) handle)
     Error
       (Error.make ~category:`Bridge ~message:"client is shut down" ())
   else
-    match rpc_timeout_ms rpc_timeout with
+    match rpc_deadline rpc_timeout with
     | Error error -> Error error
-    | Ok rpc_timeout_ms ->
+    | Ok rpc_deadline ->
         let request : Backend.query_request =
           {
             workflow_id = handle.workflow_id;
             run_id = run_selector handle;
             query_name = Query.name query;
             input = [];
-            rpc_timeout_ms;
+            rpc_deadline;
           }
         in
         Result.bind (Backend.client_query handle.client.backend request)
@@ -781,9 +792,9 @@ let list_visibility ?(page_size = 100) ?page_token ?rpc_timeout client ~query
     () =
   (* The deadline is checked before the closed flag, so a malformed deadline
      is reported as a defect even on a closed client. *)
-  match rpc_timeout_ms rpc_timeout with
+  match rpc_deadline rpc_timeout with
   | Error error -> Error error
-  | Ok rpc_timeout_ms ->
+  | Ok rpc_deadline ->
   if Atomic.get client.closed then
     Error (Error.make ~category:`Bridge ~message:"client is shut down" ())
   else if page_size < 1 || page_size > 1_000 then
@@ -811,7 +822,7 @@ let list_visibility ?(page_size = 100) ?page_token ?rpc_timeout client ~query
                     query;
                     page_size;
                     next_page_token = Some token;
-                    rpc_timeout_ms;
+                    rpc_deadline;
                   }
                 in
                 Result.map
@@ -833,7 +844,7 @@ let list_visibility ?(page_size = 100) ?page_token ?rpc_timeout client ~query
                   (Backend.client_list_visibility client.backend request))
         | None ->
             let request : Backend.visibility_request =
-              { query; page_size; next_page_token = None; rpc_timeout_ms }
+              { query; page_size; next_page_token = None; rpc_deadline }
             in
             Result.map
               (fun (page : Backend.visibility_page) ->
@@ -863,20 +874,20 @@ let query_with_input ?rpc_timeout
       (Error.make ~category:`Bridge ~message:"client is shut down" ())
   else
     match
-      Result.bind (rpc_timeout_ms rpc_timeout) (fun rpc_timeout_ms ->
+      Result.bind (rpc_deadline rpc_timeout) (fun rpc_deadline ->
           Result.map
-            (fun encoded_input -> (rpc_timeout_ms, encoded_input))
+            (fun encoded_input -> (rpc_deadline, encoded_input))
             (Codec.encode (Query.input query) input))
     with
     | Error error -> Error error
-    | Ok (rpc_timeout_ms, encoded_input) ->
+    | Ok (rpc_deadline, encoded_input) ->
         let request : Backend.query_request =
           {
             workflow_id = handle.workflow_id;
             run_id = run_selector handle;
             query_name = Query.name_with_input query;
             input = [ encoded_input ];
-            rpc_timeout_ms;
+            rpc_deadline;
           }
         in
         Result.bind
@@ -922,10 +933,10 @@ let start_update ?update_id ?rpc_timeout
     in
     match
       Result.bind (validate_name "update id" update_id) (fun () ->
-          rpc_timeout_ms rpc_timeout)
+          rpc_deadline rpc_timeout)
     with
     | Error error -> Error error
-    | Ok rpc_timeout_ms -> (
+    | Ok rpc_deadline -> (
         match Codec.encode (Update.input update) input with
         | Error error -> Error error
         | Ok encoded_input ->
@@ -936,7 +947,7 @@ let start_update ?update_id ?rpc_timeout
                 update_id;
                 update_name = Update.name update;
                 input = encoded_input;
-                rpc_timeout_ms;
+                rpc_deadline;
               }
             in
             Result.bind
@@ -977,7 +988,7 @@ let wait_update handle =
             input = handle.input;
             (* Completion polls keep their own bounded window; see
                [Client.wait_update]. *)
-            rpc_timeout_ms = None;
+            rpc_deadline = None;
           }
         in
         let rec poll () =

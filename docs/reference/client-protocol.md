@@ -167,6 +167,26 @@ and update admission run synchronously on the supervisor's owner Domain.
 Exact-run waits and update completion polls keep their own bounded internal
 polls and accept no deadline.
 
+The deadline covers the whole client call, including the time the request
+waits in the supervisor's FIFO mailbox behind earlier calls on the same
+client (#807). The public client turns `?rpc_timeout` into an
+`Client_protocol.rpc_deadline`: the budget plus an absolute expiry on a
+monotonic clock (a private C stub over `CLOCK_MONOTONIC`, or the performance
+counter on Windows), read before the request is enqueued. When the owner
+Domain dispatches the request,
+`Sdk_supervisor.Native.Protocol_adapter.with_rpc_deadline` lowers the budget
+to what remains, rounded up to whole milliseconds and never above the
+original, and that is the `rpc_timeout_ms` sent to Rust. If nothing remains,
+the request is not encoded or sent: the supervisor feeds the same
+`{"kind":"rpc","code":"deadline_exceeded"}` failure Rust would return to the
+operation's result decoder, so the caller sees the typed
+`deadline_exceeded` error. An asynchronous start that expires before
+admission returns a `deadline_exceeded` rejection, not the uncertain
+outcome, because nothing was sent. The absolute expiry never crosses the
+bridge, so the JSON documents and the ABI are unchanged. Visibility errors
+with the closed `rpc` document are now decoded too, so `Client.rpc_status`
+classifies them like the other operations.
+
 An RPC deadline bounds the client call only; it is not a workflow timeout and
 never changes the workflow. An expired deadline is reported as the typed
 `deadline_exceeded` RPC error. The transport reports its own expiry of a

@@ -27,7 +27,7 @@ let update_request : Protocol.update_request =
     update_id = "update-1";
     update_name = "set_state";
     input = [ payload (Bytes.of_string "input") ];
-    rpc_timeout_ms = None;
+    rpc_deadline = None;
   }
 
 let poll_request : Protocol.poll_update_request =

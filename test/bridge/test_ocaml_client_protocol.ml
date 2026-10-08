@@ -51,7 +51,7 @@ let execution : Protocol.execution =
 (** Cancellation requests retain a stable operation identifier so a caller can
     retry a transport timeout without creating a second logical request. *)
 let cancel_request : Protocol.cancel_request =
-  { execution; request_id = "cancel-1"; reason = "operator requested cancellation"; rpc_timeout_ms = None }
+  { execution; request_id = "cancel-1"; reason = "operator requested cancellation"; rpc_deadline = None }
 
 (** Reset requests identify the exact workflow-task boundary from which
     Temporal should rebuild a new run. The event ID is intentionally kept as an
@@ -62,7 +62,7 @@ let reset_request : Protocol.reset_request =
     request_id = "reset-1";
     reason = "replay from workflow task";
     workflow_task_finish_event_id = 4L;
-    rpc_timeout_ms = None;
+    rpc_deadline = None;
   }
 
 (** Signal requests carry the exact run, stable operation ID, and ordered
@@ -73,13 +73,13 @@ let signal_request : Protocol.signal_request =
     signal_name = "add_document";
     request_id = "signal-1";
     input = [];
-    rpc_timeout_ms = None;
+    rpc_deadline = None;
   }
 
 (** Output-only query request used to exercise exact-run and query-name
     validation in the OCaml half of the closed bridge protocol. *)
 let query_request : Protocol.query_request =
-  { execution; query_type = "current_state"; input = []; rpc_timeout_ms = None }
+  { execution; query_type = "current_state"; input = []; rpc_deadline = None }
 
 (** Start requests use the same workflow identity as the response fixtures. *)
 let start_request : Protocol.start_request =
@@ -98,7 +98,7 @@ let start_request : Protocol.start_request =
     run_timeout_ms = None;
     task_timeout_ms = None;
     retry_policy = None;
-    rpc_timeout_ms = None;
+    rpc_deadline = None;
   }
 
 (** The canonical payload wrapper for the bytes [ok]. *)
@@ -325,7 +325,7 @@ let test_reset_protocol () =
     Temporal's terminate RPC does not expose one. *)
 let test_termination_protocol () =
   let request : Protocol.terminate_request =
-    { execution; reason = "operator test"; rpc_timeout_ms = None }
+    { execution; reason = "operator test"; rpc_deadline = None }
   in
   let encoded = unwrap (Protocol.encode_terminate_request request) in
   require_fragment "terminate reason" "operator test" encoded;
@@ -451,7 +451,7 @@ let test_visibility_protocol () =
       query = "WorkflowType = 'Smoke'";
       page_size = 25;
       next_page_token = None;
-      rpc_timeout_ms = None;
+      rpc_deadline = None;
     }
   in
   let encoded = unwrap (Protocol.encode_visibility_request request) in
@@ -582,11 +582,11 @@ let test_current_run_protocol () =
   ignore (unwrap (Protocol.encode_reset_request { reset_request with execution = current }));
   ignore
     (unwrap
-       (Protocol.encode_terminate_request { execution = current; reason = ""; rpc_timeout_ms = None }));
+       (Protocol.encode_terminate_request { execution = current; reason = ""; rpc_deadline = None }));
   ignore (unwrap (Protocol.encode_signal_request { signal_request with execution = current }));
   ignore (unwrap (Protocol.encode_query_request { query_request with execution = current }));
   let update_request : Protocol.update_request =
-    { execution = current; update_id = "update-1"; update_name = "set"; input = []; rpc_timeout_ms = None }
+    { execution = current; update_id = "update-1"; update_name = "set"; input = []; rpc_deadline = None }
   in
   ignore (unwrap (Protocol.encode_update_request update_request));
   ignore
@@ -766,6 +766,10 @@ let contains_fragment value fragment =
   | () -> true
   | exception Failure _ -> false
 
+(** A caller deadline with budget [timeout_ms], created at monotonic time 0;
+    encoders serialize only the budget. *)
+let deadline timeout_ms = Some (Protocol.rpc_deadline ~now_ns:0L ~timeout_ms)
+
 (** Checks the execution-policy members of a start request (#499): the reuse
     policy is always explicit with closed wire names, timeouts and the retry
     policy are omitted unless supplied, values cross as exact millisecond
@@ -814,7 +818,7 @@ let test_start_execution_policy_protocol () =
       run_timeout_ms = Some 180_000L;
       task_timeout_ms = Some Protocol.max_workflow_task_timeout_ms;
       retry_policy = Some retry_policy;
-      rpc_timeout_ms = Some Protocol.max_rpc_timeout_ms;
+      rpc_deadline = deadline Protocol.max_rpc_timeout_ms;
     }
   in
   let encoded = unwrap (Protocol.encode_start_request full) in
@@ -871,12 +875,12 @@ let test_start_execution_policy_protocol () =
         } );
       ( "zero rpc timeout",
         "$.rpc_timeout_ms",
-        { start_request with rpc_timeout_ms = Some 0L } );
+        { start_request with rpc_deadline = deadline 0L } );
       ( "long rpc timeout",
         "$.rpc_timeout_ms",
         {
           start_request with
-          rpc_timeout_ms = Some (Int64.succ Protocol.max_rpc_timeout_ms);
+          rpc_deadline = deadline (Int64.succ Protocol.max_rpc_timeout_ms);
         } );
     ]
   in
@@ -896,6 +900,33 @@ let test_start_execution_policy_protocol () =
              };
        })
 
+(** A caller deadline resolved at dispatch sends only the budget that
+    remains (#499): rounded up to whole milliseconds, never above the
+    original budget, and absent once the deadline has expired. Readings are
+    arbitrary monotonic nanoseconds. *)
+let test_rpc_deadline_remaining () =
+  let created = Protocol.rpc_deadline ~now_ns:1_000_000_000L ~timeout_ms:250L in
+  if created.expires_at_ns <> 1_250_000_000L then failwith "deadline expiry";
+  let remaining now_ns =
+    Option.map
+      (fun (value : Protocol.rpc_deadline) -> value.timeout_ms)
+      (Protocol.remaining_rpc_deadline ~now_ns created)
+  in
+  List.iter
+    (fun (now_ns, expected) ->
+      if remaining now_ns <> expected then
+        failwith (Printf.sprintf "remaining budget at %Ld" now_ns))
+    [
+      (1_000_000_000L, Some 250L);
+      (* A reading before creation never lengthens the budget. *)
+      (999_000_000L, Some 250L);
+      (1_100_000_000L, Some 150L);
+      (1_249_999_999L, Some 1L);
+      (1_249_000_001L, Some 1L);
+      (1_250_000_000L, None);
+      (2_000_000_000L, None);
+    ]
+
 (** Every bounded client request carries an optional [rpc_timeout_ms]: absent
     by default, an exact integer when supplied, and rejected outside 1 ms to
     one minute by each encoder. *)
@@ -903,40 +934,40 @@ let test_rpc_timeout_protocol () =
   let encoders =
     [
       ( "cancel",
-        fun rpc_timeout_ms ->
-          Protocol.encode_cancel_request { cancel_request with rpc_timeout_ms } );
+        fun rpc_deadline ->
+          Protocol.encode_cancel_request { cancel_request with rpc_deadline } );
       ( "reset",
-        fun rpc_timeout_ms ->
-          Protocol.encode_reset_request { reset_request with rpc_timeout_ms } );
+        fun rpc_deadline ->
+          Protocol.encode_reset_request { reset_request with rpc_deadline } );
       ( "terminate",
-        fun rpc_timeout_ms ->
+        fun rpc_deadline ->
           Protocol.encode_terminate_request
-            { execution; reason = ""; rpc_timeout_ms } );
+            { execution; reason = ""; rpc_deadline } );
       ( "signal",
-        fun rpc_timeout_ms ->
-          Protocol.encode_signal_request { signal_request with rpc_timeout_ms } );
+        fun rpc_deadline ->
+          Protocol.encode_signal_request { signal_request with rpc_deadline } );
       ( "query",
-        fun rpc_timeout_ms ->
-          Protocol.encode_query_request { query_request with rpc_timeout_ms } );
+        fun rpc_deadline ->
+          Protocol.encode_query_request { query_request with rpc_deadline } );
       ( "update",
-        fun rpc_timeout_ms ->
+        fun rpc_deadline ->
           Protocol.encode_update_request
             {
               execution;
               update_id = "update-1";
               update_name = "set";
               input = [];
-              rpc_timeout_ms;
+              rpc_deadline;
             } );
       ( "visibility",
-        fun rpc_timeout_ms ->
+        fun rpc_deadline ->
           Protocol.encode_visibility_request
             {
               namespace = "default";
               query = "";
               page_size = 10;
               next_page_token = None;
-              rpc_timeout_ms;
+              rpc_deadline;
             } );
     ]
   in
@@ -944,10 +975,10 @@ let test_rpc_timeout_protocol () =
     (fun (label, encode) ->
       if contains_fragment (unwrap (encode None)) "rpc_timeout_ms" then
         failwith (label ^ " sent an rpc timeout that was not supplied");
-      require_fragment label {|"rpc_timeout_ms":250|} (unwrap (encode (Some 250L)));
-      check_error_path label "$.rpc_timeout_ms" (encode (Some 0L));
+      require_fragment label {|"rpc_timeout_ms":250|} (unwrap (encode (deadline 250L)));
+      check_error_path label "$.rpc_timeout_ms" (encode (deadline 0L));
       check_error_path label "$.rpc_timeout_ms"
-        (encode (Some (Int64.succ Protocol.max_rpc_timeout_ms))))
+        (encode (deadline (Int64.succ Protocol.max_rpc_timeout_ms))))
     encoders
 
 (** Runs one protocol test with a stable CI-visible name. *)
@@ -975,6 +1006,7 @@ let () =
   run "client id conflict policy" test_id_conflict_policy_protocol;
   run "client start execution policies" test_start_execution_policy_protocol;
   run "client rpc timeouts" test_rpc_timeout_protocol;
+  run "client rpc deadline remaining budget" test_rpc_deadline_remaining;
   run "client closed response shape" test_closed_response_shape;
   run "client response correlation" test_response_execution_correlation;
   run "client current-run selector" test_current_run_protocol;

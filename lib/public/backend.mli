@@ -47,9 +47,10 @@ type start_request = {
   task_timeout_ms : int64 option;
   (* Server-side workflow retry policy; [None] means no retry. *)
   retry_policy : Temporal_sdk_kernel.Activation.retry_policy option;
-  (* Caller deadline of the start RPC in milliseconds. It bounds one call,
-     not the workflow, so it is not part of the request-ID fingerprint. *)
-  rpc_timeout_ms : int64 option;
+  (* Caller deadline of the start RPC, fixed on the monotonic clock when the
+     call began. It bounds one call, not the workflow, so it is not part of
+     the request-ID fingerprint. *)
+  rpc_deadline : Temporal_sdk_kernel.Client_protocol.rpc_deadline option;
 }
 
 (** The server-issued identity returned by a successful start. [started] is
@@ -78,10 +79,13 @@ type cancel_request = {
   run_id : string;
   request_id : string;
   reason : string;
-  rpc_timeout_ms : int64 option;
-      (** Caller deadline of this RPC in milliseconds, validated by the
-          public client; [None] keeps the operation's default budget. The
-          mock ledger answers immediately and ignores it. *)
+  rpc_deadline : Temporal_sdk_kernel.Client_protocol.rpc_deadline option;
+      (** Caller deadline of this RPC, validated by the public client and
+          fixed on the monotonic clock when the call began; the native
+          supervisor sends only the budget left at dispatch and fails an
+          expired request without sending it. [None] keeps the operation's
+          default budget. The mock ledger answers immediately and ignores
+          it. *)
 }
 
 (** Exact workflow/run pair and operator metadata for immediate termination. *)
@@ -89,10 +93,13 @@ type terminate_request = {
   workflow_id : string;
   run_id : string;
   reason : string;
-  rpc_timeout_ms : int64 option;
-      (** Caller deadline of this RPC in milliseconds, validated by the
-          public client; [None] keeps the operation's default budget. The
-          mock ledger answers immediately and ignores it. *)
+  rpc_deadline : Temporal_sdk_kernel.Client_protocol.rpc_deadline option;
+      (** Caller deadline of this RPC, validated by the public client and
+          fixed on the monotonic clock when the call began; the native
+          supervisor sends only the budget left at dispatch and fails an
+          expired request without sending it. [None] keeps the operation's
+          default budget. The mock ledger answers immediately and ignores
+          it. *)
 }
 
 (** Exact workflow/run pair and event boundary for a reset request. *)
@@ -102,10 +109,13 @@ type reset_request = {
   request_id : string;
   reason : string;
   workflow_task_finish_event_id : int64;
-  rpc_timeout_ms : int64 option;
-      (** Caller deadline of this RPC in milliseconds, validated by the
-          public client; [None] keeps the operation's default budget. The
-          mock ledger answers immediately and ignores it. *)
+  rpc_deadline : Temporal_sdk_kernel.Client_protocol.rpc_deadline option;
+      (** Caller deadline of this RPC, validated by the public client and
+          fixed on the monotonic clock when the call began; the native
+          supervisor sends only the budget left at dispatch and fails an
+          expired request without sending it. [None] keeps the operation's
+          default budget. The mock ledger answers immediately and ignores
+          it. *)
 }
 
 (** New run identity returned by a successful reset. *)
@@ -120,10 +130,13 @@ type signal_request = {
   signal_name : string;
   request_id : string;
   input : Payload.t;
-  rpc_timeout_ms : int64 option;
-      (** Caller deadline of this RPC in milliseconds, validated by the
-          public client; [None] keeps the operation's default budget. The
-          mock ledger answers immediately and ignores it. *)
+  rpc_deadline : Temporal_sdk_kernel.Client_protocol.rpc_deadline option;
+      (** Caller deadline of this RPC, validated by the public client and
+          fixed on the monotonic clock when the call began; the native
+          supervisor sends only the budget left at dispatch and fails an
+          expired request without sending it. [None] keeps the operation's
+          default budget. The mock ledger answers immediately and ignores
+          it. *)
 }
 
 (** Exact workflow/run identity and encoded query arguments. Output-only
@@ -135,10 +148,13 @@ type query_request = {
   run_id : string;
   query_name : string;
   input : Payload.t list;
-  rpc_timeout_ms : int64 option;
-      (** Caller deadline of this RPC in milliseconds, validated by the
-          public client; [None] keeps the operation's default budget. The
-          mock ledger answers immediately and ignores it. *)
+  rpc_deadline : Temporal_sdk_kernel.Client_protocol.rpc_deadline option;
+      (** Caller deadline of this RPC, validated by the public client and
+          fixed on the monotonic clock when the call began; the native
+          supervisor sends only the budget left at dispatch and fails an
+          expired request without sending it. [None] keeps the operation's
+          default budget. The mock ledger answers immediately and ignores
+          it. *)
 }
 
 (** One bounded visibility query. The continuation token is opaque to callers
@@ -147,10 +163,13 @@ type visibility_request = {
   query : string;
   page_size : int;
   next_page_token : string option;
-  rpc_timeout_ms : int64 option;
-      (** Caller deadline of this RPC in milliseconds, validated by the
-          public client; [None] keeps the operation's default budget. The
-          mock ledger answers immediately and ignores it. *)
+  rpc_deadline : Temporal_sdk_kernel.Client_protocol.rpc_deadline option;
+      (** Caller deadline of this RPC, validated by the public client and
+          fixed on the monotonic clock when the call began; the native
+          supervisor sends only the budget left at dispatch and fails an
+          expired request without sending it. [None] keeps the operation's
+          default budget. The mock ledger answers immediately and ignores
+          it. *)
 }
 
 (** Stable visibility metadata returned for one execution. *)
@@ -175,10 +194,13 @@ type update_request = {
   update_id : string;
   update_name : string;
   input : Payload.t;
-  rpc_timeout_ms : int64 option;
-      (** Caller deadline of this RPC in milliseconds, validated by the
-          public client; [None] keeps the operation's default budget. The
-          mock ledger answers immediately and ignores it. *)
+  rpc_deadline : Temporal_sdk_kernel.Client_protocol.rpc_deadline option;
+      (** Caller deadline of this RPC, validated by the public client and
+          fixed on the monotonic clock when the call began; the native
+          supervisor sends only the budget left at dispatch and fails an
+          expired request without sending it. [None] keeps the operation's
+          default budget. The mock ledger answers immediately and ignores
+          it. *)
 }
 
 (** Terminal update outcome returned by the native protocol. *)

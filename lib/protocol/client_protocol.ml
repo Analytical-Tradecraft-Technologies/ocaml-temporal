@@ -25,6 +25,27 @@ type id_reuse_policy = Allow_duplicate | Allow_duplicate_failed_only | Reject_du
 
 let max_rpc_timeout_ms = 60_000L
 let max_workflow_task_timeout_ms = 120_000L
+
+(** A caller deadline: the absolute monotonic expiry fixed at the public entry
+    point and the budget to send. Only [timeout_ms] is serialized. *)
+type rpc_deadline = { timeout_ms : int64; expires_at_ns : int64 }
+
+let rpc_deadline ~now_ns ~timeout_ms =
+  { timeout_ms; expires_at_ns = Int64.add now_ns (Int64.mul timeout_ms 1_000_000L) }
+
+(** Rounds the remaining nanoseconds up to whole milliseconds so a deadline
+    that has not expired is never sent as zero, and caps the result at the
+    original budget so clock granularity cannot lengthen a call. *)
+let remaining_rpc_deadline ~now_ns deadline =
+  let remaining_ns = Int64.sub deadline.expires_at_ns now_ns in
+  if Int64.compare remaining_ns 0L <= 0 then None
+  else
+    let remaining_ms = Int64.div (Int64.add remaining_ns 999_999L) 1_000_000L in
+    let timeout_ms =
+      if Int64.compare remaining_ms deadline.timeout_ms < 0 then remaining_ms
+      else deadline.timeout_ms
+    in
+    Some { deadline with timeout_ms }
 let max_workflow_timeout_ms = 315_576_000_000_999L
 
 type start_request = {
@@ -42,7 +63,7 @@ type start_request = {
   run_timeout_ms : int64 option;
   task_timeout_ms : int64 option;
   retry_policy : Workflow.retry_policy option;
-  rpc_timeout_ms : int64 option;
+  rpc_deadline : rpc_deadline option;
 }
 
 (** [started] mirrors Temporal's [StartWorkflowExecutionResponse.started]. *)
@@ -54,7 +75,7 @@ type cancel_request = {
   execution : execution;
   request_id : string;
   reason : string;
-  rpc_timeout_ms : int64 option;
+  rpc_deadline : rpc_deadline option;
 }
 
 type cancel_response = { acknowledged : bool }
@@ -64,7 +85,7 @@ type reset_request = {
   request_id : string;
   reason : string;
   workflow_task_finish_event_id : int64;
-  rpc_timeout_ms : int64 option;
+  rpc_deadline : rpc_deadline option;
 }
 
 type reset_response = { execution : execution }
@@ -75,7 +96,7 @@ type reset_response = { execution : execution }
 type terminate_request = {
   execution : execution;
   reason : string;
-  rpc_timeout_ms : int64 option;
+  rpc_deadline : rpc_deadline option;
 }
 
 type terminate_response = { acknowledged : bool }
@@ -85,7 +106,7 @@ type signal_request = {
   signal_name : string;
   request_id : string;
   input : payload list;
-  rpc_timeout_ms : int64 option;
+  rpc_deadline : rpc_deadline option;
 }
 
 type signal_response = { acknowledged : bool }
@@ -94,7 +115,7 @@ type query_request = {
   execution : execution;
   query_type : string;
   input : payload list;
-  rpc_timeout_ms : int64 option;
+  rpc_deadline : rpc_deadline option;
 }
 
 type query_response = { result : payload list }
@@ -104,7 +125,7 @@ type visibility_request = {
   query : string;
   page_size : int;
   next_page_token : string option;
-  rpc_timeout_ms : int64 option;
+  rpc_deadline : rpc_deadline option;
 }
 
 type visibility_execution = {
@@ -125,7 +146,7 @@ type update_request = {
   update_id : string;
   update_name : string;
   input : payload list;
-  rpc_timeout_ms : int64 option;
+  rpc_deadline : rpc_deadline option;
 }
 
 type poll_update_request = { execution : execution; update_id : string }
@@ -310,19 +331,20 @@ let decode_object input =
   | Ok value -> Ok value
   | Error error -> Error (of_control_error error)
 
-(** Validates an optional caller RPC timeout and returns the JSON member that
-    carries it. An absent timeout omits the member, so Rust keeps the
-    operation's default budget; a present one must be between 1 ms and
-    {!max_rpc_timeout_ms}, the bound Rust enforces too. *)
+(** Validates an optional caller RPC deadline and returns the JSON member that
+    carries its budget. An absent deadline omits the member, so Rust keeps the
+    operation's default budget; a present budget must be between 1 ms and
+    {!max_rpc_timeout_ms}, the bound Rust enforces too. The absolute expiry is
+    OCaml-side only and is not serialized. *)
 let rpc_timeout_member = function
   | None -> Ok []
-  | Some milliseconds
+  | Some { timeout_ms = milliseconds; _ }
     when Int64.compare milliseconds 1L < 0
          || Int64.compare milliseconds max_rpc_timeout_ms > 0 ->
       Error
         (invalid ~path:"$.rpc_timeout_ms"
            "rpc timeout must be between 1 and 60000 milliseconds")
-  | Some milliseconds ->
+  | Some { timeout_ms = milliseconds; _ } ->
       Ok [ ("rpc_timeout_ms", `Intlit (Int64.to_string milliseconds)) ]
 
 (** Validates the workflow execution policies of a start request and returns
@@ -382,7 +404,7 @@ let start_policy_members (value : start_request) =
     | Allow_duplicate_failed_only -> "allow_duplicate_failed_only"
     | Reject_duplicate -> "reject_duplicate"
   in
-  let* rpc = rpc_timeout_member value.rpc_timeout_ms in
+  let* rpc = rpc_timeout_member value.rpc_deadline in
   Ok
     ((("id_reuse_policy", json_string reuse) :: execution)
     @ run @ task @ retry @ rpc)
@@ -536,7 +558,7 @@ let encode_cancel_request (value : cancel_request) =
   else if String.contains value.reason '\000' then
     Error (invalid ~path:"$.reason" "reason contains a NUL byte")
   else
-    let* rpc = rpc_timeout_member value.rpc_timeout_ms in
+    let* rpc = rpc_timeout_member value.rpc_deadline in
     encode_object
       (`Assoc
         ([
@@ -577,7 +599,7 @@ let encode_reset_request (value : reset_request) =
   else if String.contains value.reason '\000' then
     Error (invalid ~path:"$.reason" "reason contains a NUL byte")
   else
-    let* rpc = rpc_timeout_member value.rpc_timeout_ms in
+    let* rpc = rpc_timeout_member value.rpc_deadline in
     encode_object
       (`Assoc
         ([
@@ -622,7 +644,7 @@ let encode_terminate_request (value : terminate_request) =
   else if String.contains value.reason '\000' then
     Error (invalid ~path:"$.reason" "reason contains a NUL byte")
   else
-    let* rpc = rpc_timeout_member value.rpc_timeout_ms in
+    let* rpc = rpc_timeout_member value.rpc_deadline in
     encode_object
       (`Assoc
         ([ ("namespace", json_string value.execution.namespace);
@@ -651,7 +673,7 @@ let encode_signal_request (value : signal_request) =
   let* () = validate_identifier "$.signal_name" value.signal_name in
   let* () = validate_identifier "$.request_id" value.request_id in
   let* input = payloads_json value.input in
-  let* rpc = rpc_timeout_member value.rpc_timeout_ms in
+  let* rpc = rpc_timeout_member value.rpc_deadline in
   encode_object
     (`Assoc
       ([
@@ -685,7 +707,7 @@ let encode_query_request (value : query_request) =
   let* () = validate_run_selector "$.run_id" value.execution.run_id in
   let* () = validate_identifier "$.query_type" value.query_type in
   let* input = payloads_json value.input in
-  let* rpc = rpc_timeout_member value.rpc_timeout_ms in
+  let* rpc = rpc_timeout_member value.rpc_deadline in
   encode_object
     (`Assoc
       ([
@@ -715,7 +737,7 @@ let encode_visibility_request (value : visibility_request) =
     Error (invalid ~path:"$.page_size" "page_size must be between 1 and 1000")
   else
     let token = match value.next_page_token with None -> `Null | Some v -> `String v in
-    let* rpc = rpc_timeout_member value.rpc_timeout_ms in
+    let* rpc = rpc_timeout_member value.rpc_deadline in
     encode_object
       (`Assoc
         ([
@@ -796,7 +818,7 @@ let encode_update_request (value : update_request) =
   let* () = validate_identifier "$.update_id" value.update_id in
   let* () = validate_identifier "$.update_name" value.update_name in
   let* input = payloads_json value.input in
-  let* rpc = rpc_timeout_member value.rpc_timeout_ms in
+  let* rpc = rpc_timeout_member value.rpc_deadline in
   encode_object
     (`Assoc
       ([

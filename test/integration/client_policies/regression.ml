@@ -252,8 +252,10 @@ let check_retry_policy context =
       fail ("retry run reported " ^ Error.message error)
   | _ -> fail "retry run did not end the chain with a failure"
 
-(** A start whose 1 ms deadline expires is reported as an uncertain outcome:
-    Temporal may or may not have created the run. Retrying with the same
+(** A start whose 1 ms deadline expires after it was sent is reported as an
+    uncertain outcome: Temporal may or may not have created the run. If it
+    expired before it was sent, it is a typed [`Deadline_exceeded]
+    rejection instead. Retrying with the same
     request ID and the default deadline returns the run as started either
     way, and a separate start then finds exactly that run open. A signal
     with an expired deadline keeps the typed RPC classification. *)
@@ -267,7 +269,10 @@ let check_uncertain_start context =
   (match start ~rpc_timeout:(ms 1L) ~request_id () with
   | Ok handle -> ignore (track context handle)
   | Error error when Client.is_start_outcome_uncertain error -> ()
-  | Error error -> fail ("expired start was not uncertain: " ^ Error.message error));
+  (* The deadline can also expire before the owner Domain sends the start,
+     which is a definite, typed rejection rather than an uncertain one. *)
+  | Error error when Client.rpc_status error = Some `Deadline_exceeded -> ()
+  | Error error -> fail ("expired start was not typed: " ^ Error.message error));
   let reconciled = track context (get (start ~request_id ())) in
   if not (Client.started reconciled) then
     fail "request-ID retry did not report the run it created";

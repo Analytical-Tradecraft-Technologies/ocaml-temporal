@@ -29,11 +29,12 @@ the policies `Client.start` exposes for #499:
   attempt 2 and ends the chain. The pinned server reports the first run's
   link to this client as continue-as-new rather than as a failure with a
   successor, so the test accepts both forms.
-- A start with a 1 ms `?rpc_timeout` is either accepted or reported as
-  uncertain (`Client.is_start_outcome_uncertain`). Retrying it with the same
-  request ID returns a started run, and a separate start then finds exactly
-  that run open. A signal with an expired deadline keeps its typed RPC
-  status.
+- A start with a 1 ms `?rpc_timeout` is accepted, reported as uncertain
+  (`Client.is_start_outcome_uncertain`) when it expired after being sent, or
+  rejected with `` `Deadline_exceeded `` when it expired before being sent.
+  Retrying it with the same request ID returns a started run, and a separate
+  start then finds exactly that run open. A signal with an expired deadline
+  keeps its typed RPC status.
 
 The test terminates every workflow it creates, including after an assertion
 failure.
