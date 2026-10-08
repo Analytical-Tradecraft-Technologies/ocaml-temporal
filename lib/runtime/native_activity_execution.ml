@@ -811,7 +811,7 @@ module Make (Supervisor : SUPERVISOR) = struct
       match operation with
       | Async_activity.Complete payload ->
           let* payload = protocol_payload "$.async_completion.result" payload in
-          Ok (Async_completion Protocol.{ task_token; result = Completed (Some payload) })
+          Ok (Async_completion Protocol.{ task_token; result = Completed payload })
       | Async_activity.Fail failure ->
           let diagnostic = application_error ~path:"$.async_failure" failure in
           let* failure = failure_of_application_error diagnostic failure in
@@ -1215,7 +1215,7 @@ module Make (Supervisor : SUPERVISOR) = struct
                                Protocol.
                                  {
                                    task_token = Bytes.copy token;
-                                   result = Completed (Some payload);
+                                   result = Completed payload;
                                  }
                              in
                              enqueue_and_finish adapter ~token ~activity_type
@@ -1346,7 +1346,7 @@ module Make (Supervisor : SUPERVISOR) = struct
                                     Protocol.
                                       {
                                         task_token = Bytes.copy token;
-                                        result = Completed (Some payload);
+                                        result = Completed payload;
                                       }
                                   in
                                   enqueue_and_finish adapter ~token

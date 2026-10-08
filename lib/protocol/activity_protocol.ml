@@ -142,7 +142,7 @@ type task_variant = Start of activity_start | Cancel of activity_cancel
 type task = { task_token : bytes; variant : task_variant }
 
 type completion_result =
-  | Completed of payload option
+  | Completed of payload
   | Failed of failure
   | Cancelled of failure
   | Will_complete_async
@@ -594,7 +594,7 @@ let completion_result path json =
   | "completed" ->
       let* entries = Shared.exact_object path [ "kind"; "result" ] json in
       let* result_json = required path "result" entries in
-      let* result = Shared.nullable (path ^ ".result") Shared.payload result_json in
+      let* result = Shared.payload (path ^ ".result") result_json in
       Ok (Completed result)
   | "failed" | "cancelled" ->
       let* entries = Shared.exact_object path [ "kind"; "failure" ] json in
@@ -611,9 +611,7 @@ let completion_result path json =
     failure codec as appropriate. *)
 let completion_result_json = function
   | Completed result ->
-      let* result =
-        match result with None -> Ok `Null | Some value -> Shared.payload_json value
-      in
+      let* result = Shared.payload_json result in
       Ok (`Assoc [ ("kind", `String "completed"); ("result", result) ])
   | Failed failure ->
       let* failure = Shared.failure_json failure in

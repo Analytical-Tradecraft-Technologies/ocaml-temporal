@@ -27,7 +27,10 @@
           "required": ["kind", "result"],
           "properties": {
             "kind": {"const": "completed"},
-            "result": {"oneOf": [{"$ref": "#/$defs/payload"}, {"type": "null"}]}
+            "result": {
+              "description": "Required, non-null result payload. Temporal Core rejects a successful completion without a payload, so a void result is an encoded payload whose data may be empty.",
+              "$ref": "#/$defs/payload"
+            }
           }
         },
         {
