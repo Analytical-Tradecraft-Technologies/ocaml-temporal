@@ -17,10 +17,8 @@
           "properties": {
             "kind": {"const": "completed"},
             "result": {
-              "oneOf": [
-                {"$ref": "activity-completion.schema.json#/$defs/payload"},
-                {"type": "null"}
-              ]
+              "description": "Required, non-null result payload, as for worker completions; the decoder is shared. A void result is an encoded payload whose data may be empty.",
+              "$ref": "activity-completion.schema.json#/$defs/payload"
             }
           }
         },
