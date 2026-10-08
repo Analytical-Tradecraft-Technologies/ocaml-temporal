@@ -15,6 +15,36 @@ implementation when a later entry documents that work as complete. The
 records the current tested source, named assertions and successful CI job for
 the Temporal acceptance controllers.
 
+## 2026-10-08: Detect and report non-yielding workflow code (#493)
+
+A workflow activation that runs workflow code past a configurable deadline
+without returning is now detected, reported, and its workflow task failed.
+The workflow lane publishes each activation (a fresh epoch, the activation,
+and its workflow ID and type) in an atomic cell before any user code runs. A
+watchdog Domain started by `Worker.run` samples that epoch every quarter of
+the deadline, counting ticks rather than reading a clock, and asks the adapter
+to abandon an epoch seen for the whole deadline. Lane and watchdog race on one
+atomic claim per activation, so exactly one completes the native lease: the
+watchdog submits the ordinary adapter failure completion through the
+supervisor, and a lane that later returns drops its completion and its run
+without a native call. The first detection is logged once
+(`workflow_activation_deadline_exceeded`, with new `temporal.workflow_id` and
+`temporal.run_id` tags) and exposed by the new lock-free
+`Temporal.Worker.health` as a sticky `Stuck_workflow_activation`. The deadline
+is `Worker.Options.make ?workflow_activation_deadline` (default two seconds,
+the Python SDK's deadlock timeout; `` `Disabled `` for debugging). The stuck
+code is never interrupted; recovery is an external process restart, and the
+guide documents liveness-probe wiring.
+
+Evidence: `test/runtime/test_native_worker_watchdog.ml` spins a workflow on a
+test-controlled flag and checks one task failure per stuck lease, the dropped
+late completion and subsequent eviction acknowledgement, sticky health, a real
+watchdog Domain detecting within its bound and firing once, unaffected quick
+activations, and public option validation. `dune build`, `@doc`, and the
+runtime, unit, SDK-supervisor, bridge, observability, and API-witness suites
+pass on OCaml 5.4.1. A live subprocess qualification against Temporal Server
+and the bounded-shutdown interaction (#495) remain outstanding.
+
 ## 2026-10-07: Continue-as-new suggestion reasons (#792)
 
 `Temporal.Workflow.Info.continue_as_new_reasons` reports why the server
