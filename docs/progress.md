@@ -15,6 +15,43 @@ implementation when a later entry documents that work as complete. The
 records the current tested source, named assertions and successful CI job for
 the Temporal acceptance controllers.
 
+## 2026-10-08: Deterministic transport fault regression (#504)
+
+`test/integration/transport_interruption` adds a live regression. An
+in-process TCP proxy sits between Temporal and one client, and a second proxy
+sits between Temporal and one worker. The proxy can refuse connections or
+forward requests while discarding the server's response bytes. A direct
+client, which is never faulted, then reconciles the durable outcome. The
+regression checks these behaviors:
+
+- A refused connect returns a typed `Bridge` error.
+- A start whose acknowledgement is lost reports the documented uncertain
+  start. A probe with another request ID proves that the start was applied,
+  and a retry with the same request ID returns the same run.
+- A signal whose acknowledgement is lost returns a retryable status. A retry
+  with the same request ID is applied once.
+- An update whose response is delayed is re-sent with the same update ID and
+  is applied once.
+- An exact-run wait survives a 3 s outage.
+- A terminate whose acknowledgement is lost reports
+  `Termination_outcome_uncertain`, and the run is then observed as
+  `Terminated`.
+- A worker survives a poll outage.
+- A lost activity-completion acknowledgement is retried without dispatching
+  the callback a second time.
+- Client shutdown while the server is unavailable returns at once.
+- Both proxies end with no open connection.
+
+No production code changed. The existing classification already met each
+assertion.
+
+Evidence: three consecutive runs passed in 36-48 s with OCaml 5.4.1 on macOS
+against the Compose Temporal 1.32.0/PostgreSQL stack. CI runs it through
+`make test-temporal-live-regressions`. Some #504 scope remains open, as listed
+in [transport fault qualification](reference/transport-fault-qualification.md#remaining-504-scope):
+worker shutdown while the server is unavailable, faults over TLS, and the
+external idempotency example.
+
 ## 2026-10-08: Public offline replay API (#515)
 
 `Temporal.Replay` lets an application replay a recorded workflow history
