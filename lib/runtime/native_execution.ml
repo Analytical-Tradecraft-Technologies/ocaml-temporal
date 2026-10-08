@@ -1404,11 +1404,12 @@ let activate_translated execution (translated : translated_activation) =
   Execution.set_activation_deployment_version execution deployment_version;
   Execution.set_activation_is_replaying execution translated.is_replaying;
   (* History facts are task-local like the replay flag: a synthetic activation
-     without metadata clears continue-as-new advice instead of keeping the
-     previous task's value. The decoder bounds the length to uint32, which
-     fits [int] on supported 64-bit targets, and the size to uint64; a size
-     beyond OCaml's native [int] range is reported as absent rather than
-     wrapped. *)
+     without metadata clears continue-as-new advice and its reasons instead of
+     keeping the previous task's value. The unspecified reason is Core's
+     protobuf zero value and names no cause, so it is not reported. The
+     decoder bounds the length to uint32, which fits [int] on supported 64-bit
+     targets, and the size to uint64; a size beyond OCaml's native [int] range
+     is reported as absent rather than wrapped. *)
   Execution.set_activation_history execution
     Workflow_context_store.
       {
@@ -1421,6 +1422,16 @@ let activate_translated execution (translated : translated_activation) =
           Option.fold ~none:false translated.metadata
             ~some:(fun (metadata : Protocol.activation_metadata) ->
               metadata.continue_as_new_suggested);
+        continue_as_new_reasons =
+          Option.fold ~none:[] translated.metadata
+            ~some:(fun (metadata : Protocol.activation_metadata) ->
+              List.filter
+                (function
+                  | Protocol.Suggest_unspecified -> false
+                  | Protocol.History_size_too_large
+                  | Protocol.Too_many_history_events
+                  | Protocol.Too_many_updates -> true)
+                metadata.suggest_continue_as_new_reasons);
       };
   let commands = Execution.activate execution translated.jobs in
   (* The single canonical encoder pass for this completion. Its checks run

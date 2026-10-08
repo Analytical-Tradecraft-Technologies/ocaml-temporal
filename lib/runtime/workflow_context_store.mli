@@ -23,11 +23,16 @@ type run_info = {
 
 (** History facts reported with one activation. [history_size_bytes] is
     [None] when the activation carried no metadata, and
-    [continue_as_new_suggested] is then [false]. *)
+    [continue_as_new_suggested] is then [false] and
+    [continue_as_new_reasons] empty. [continue_as_new_reasons] keeps Core's
+    order and omits the protocol's [Suggest_unspecified] placeholder, which
+    names no reason. *)
 type activation_history = {
   history_length : int;
   history_size_bytes : int option;
   continue_as_new_suggested : bool;
+  continue_as_new_reasons :
+    Temporal_protocol.Workflow_protocol.suggest_continue_as_new_reason list;
 }
 
 (** The activities, timers, and commands belonging to one workflow execution.
