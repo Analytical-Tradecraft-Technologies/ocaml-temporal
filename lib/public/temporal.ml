@@ -1,10 +1,19 @@
-(** The public [Temporal] root is an explicit allow-list of supported modules.
+(** An unofficial Temporal SDK for OCaml 5.
 
-    Dune normally generates aliases for every implementation file in a wrapped
-    library, which would make private adapters reachable as
-    [Temporal.Backend] or [Temporal.Native_worker].  Keeping this root module
-    in source exposes only the supported public surface while implementation
-    files remain available to one another inside the library. *)
+    Workflows are direct-style OCaml functions replayed deterministically from
+    Temporal history; activities are ordinary OCaml functions that may perform
+    I/O. Define them with {!Workflow} and {!Activity}, run them with a
+    {!Worker}, and start or await executions with a {!Client}. Expected
+    failures are returned as [result] values carrying {!Error.t}. See the
+    package {{!page-index}overview} for a quick start. *)
+
+(* This root module is an explicit allow-list of supported modules. Dune
+   normally generates aliases for every implementation file in a wrapped
+   library, which would make private adapters reachable as [Temporal.Backend]
+   or [Temporal.Native_worker]. Keeping this root module in source exposes only
+   the supported public surface while implementation files remain available to
+   one another inside the library. *)
+
 module Activity = Activity
 module Child_workflow = Child_workflow
 module Client = Client

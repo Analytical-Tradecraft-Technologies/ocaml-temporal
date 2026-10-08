@@ -6,6 +6,8 @@
     child-workflow handles to emit their real Temporal cancellation commands.
     Every operation on a scope is owner-checked, so a handle cannot be read or
     mutated from another Domain or after its workflow scheduler has shut down. *)
+
+(** A cancellation scope owned by one workflow execution. *)
 type t
 
 (** Creates a scope for the workflow execution currently running on this
