@@ -47,7 +47,10 @@ type start_response = {
   started : bool;
 }
 
-(** The exact execution selected by a client wait. *)
+(** The execution selected by a client wait. In this and every request type
+    below that carries a [run_id] after start, an empty [run_id] selects the
+    workflow's current run (#791), which Temporal (or the mock ledger)
+    resolves when it handles the request. *)
 type wait_request = {
   workflow_id : string;
   run_id : string;
@@ -127,7 +130,7 @@ type visibility_page = {
   next_page_token : string option;
 }
 
-(** Request to admit one named workflow update on an exact run. *)
+(** Request to admit one named workflow update on a run selector. *)
 type update_request = {
   workflow_id : string;
   run_id : string;
@@ -157,10 +160,11 @@ type poll_update_response = { outcome : update_outcome option }
 type successor = { workflow_id : string; run_id : string }
 
 (** Terminal outcomes are kept separate from bridge transport errors so a
-    completed Temporal failure remains an ordinary typed value. Failure and
-    timeout outcomes retain any server-supplied successor for explicit follow. *)
+    completed Temporal failure remains an ordinary typed value. Completion,
+    failure, and timeout outcomes retain any server-supplied successor (a cron
+    or retry run) for explicit follow. *)
 type terminal_result =
-  | Completed of Payload.t
+  | Completed of { payload : Payload.t; successor : successor option }
   | Failed of { error : Error.t; successor : successor option }
   | Cancelled of Error.t
   | Terminated of Error.t
@@ -325,9 +329,11 @@ val already_started_execution : Error.t -> (string * string * string) option
     ([Invalid_state]) without saturating a live Temporal connection. *)
 val native_supervisor_error : Temporal_sdk_kernel.Supervisor.error -> Error.t
 
-(** Scripts a failed or timed-out exact run in the deterministic mock for the
-    public [Client.wait] to [Client.follow] regression. This private test seam
-    rejects native clients and does not create successor runs. *)
+(** Scripts the close event of an exact run in the deterministic mock for the
+    public [Client.wait] to [Client.follow] regressions: a failed or timed-out
+    outcome, a completed outcome that carries a successor (the mock still
+    echoes the start input as its output), or continued-as-new. This private
+    test seam rejects native clients and does not create successor runs. *)
 val mock_set_wait_outcome_for_test :
   client -> wait_request -> terminal_result -> (unit, Error.t) result
 
@@ -338,17 +344,17 @@ val native_terminal_result :
   Temporal_sdk_kernel.Client_protocol.wait_response ->
   (terminal_result, Error.t) result
 
-(** Requests cancellation of one exact workflow run. Success acknowledges the
+(** Requests cancellation of one workflow run (exact or current). Success acknowledges the
     server RPC; a later [client_wait] observes the terminal cancellation. *)
 val client_cancel : client -> cancel_request -> (unit, Error.t) result
 
-(** Resets one exact workflow run and returns its new run identity. *)
+(** Resets one workflow run (exact or current) and returns its new run identity. *)
 val client_reset : client -> reset_request -> (reset_response, Error.t) result
 
-(** Terminates one exact workflow run immediately. *)
+(** Terminates one workflow run (exact or current) immediately. *)
 val client_terminate : client -> terminate_request -> (unit, Error.t) result
 
-(** Sends one signal to one exact workflow run. Success acknowledges the
+(** Sends one signal to one workflow run (exact or current). Success acknowledges the
     server RPC; it does not wait for workflow code to process the message. *)
 val client_signal : client -> signal_request -> (unit, Error.t) result
 

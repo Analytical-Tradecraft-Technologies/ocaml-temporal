@@ -47,6 +47,21 @@ archive would turn every query handler failure into a protocol error, and a
 version 3 archive never emits it. The symbol prefix therefore moves to
 `ocaml_temporal_core_v4_` together with the constant.
 
+Version 4 also carries the current-run selector (#791) without a bump.
+Client requests after start may send an empty `run_id`, which a version 4
+archive built before that change rejects as an invalid identifier, and a
+current-run wait response echoes that empty run ID. Neither direction can
+silently change meaning: an older OCaml object never sends an empty run ID,
+so every document it exchanges with a newer archive is byte-for-byte
+unchanged, and a newer OCaml object paired with an older archive gets a typed
+protocol error for current-run operations only, before any RPC, while every
+exact-run operation keeps working. No release has shipped a version 4
+archive, and renaming every symbol would collide with concurrent bridge work,
+so the selector is recorded here as an additive version 4 capability rather
+than a version 5 contract. The completed-run successor exposed by the OCaml
+client in the same change (#837) was already part of the version 4 wait
+response.
+
 The canonical header is
 `rust/core-bridge/include/ocaml_temporal_core.h`. Both Rust and C compile-time
 assertions protect the status width, every numeric status value, and field
@@ -252,7 +267,11 @@ directly without spawning or detaching tasks.
 Completed, failed, and timed-out close events retain any successor run ID
 exposed by Core. A continued-as-new close is returned as a terminal
 `continued_as_new` outcome with a required successor execution reference; the
-bridge never follows that run implicitly. This prevents an exact-run caller
+bridge never follows that run implicitly. A wait request with an empty run ID
+observes whichever run is current when Temporal handles the history poll and
+echoes the empty run ID in its response; only the public OCaml client decides,
+for a handle obtained by workflow ID, to follow successors with further
+exact-run waits. This prevents an exact-run caller
 from accidentally observing a different execution identity. Any successor
 must retain the waited namespace and workflow ID and must identify a different
 run. Both language validators enforce that cross-object relationship because

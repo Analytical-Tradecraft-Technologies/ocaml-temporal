@@ -19,7 +19,8 @@ type t = {
   mutable shutdown_result : (unit, Error.t) result option;
 }
 
-(** A handle retains the definition codecs and exact execution identity. *)
+(** A handle retains the definition codecs and the execution it addresses:
+    one exact run, or the workflow's current run. *)
 type ('input, 'output) handle = {
   (* The owning client keeps the backend alive for all operations on this
      handle; shutdown is still explicit and invalidates future calls. *)
@@ -29,11 +30,14 @@ type ('input, 'output) handle = {
   workflow : ('input, 'output) Workflow.t;
   (* The durable ID selected by the caller and echoed by the start response. *)
   workflow_id : string;
-  (* The exact server run ID returned by Temporal; waits never follow a
-     continued-as-new successor implicitly. *)
-  run_id : string;
+  (* [Some] exact server run ID: every operation targets that run and [wait]
+     never follows a successor implicitly. [None] (only from [get_handle]):
+     every operation sends an empty run ID so Temporal resolves the current
+     run, and [wait] follows the run chain to its last run. *)
+  run_id : string option;
   (* [true] only when [start] created this run; [false] for a run returned
-     by a [`Use_existing] start and for every handle built by [follow]. *)
+     by a [`Use_existing] start and for every handle built by [follow] or
+     [get_handle]. *)
   started : bool;
 }
 
@@ -56,8 +60,8 @@ type ('input, 'output) update_handle = {
   outcome : Backend.update_outcome option;
 }
 
-(** Identifies a successor execution returned after a failed, timed-out, or
-    continued-as-new run. The identity is intentionally kept separate from a
+(** Identifies a successor execution returned after a completed, failed,
+    timed-out, or continued-as-new run. The identity is intentionally kept separate from a
     typed [handle]: callers must supply the workflow definition when they turn
     it back into a handle, so the output codec is never guessed from a run ID. *)
 type execution = {
@@ -72,8 +76,9 @@ type execution = {
 (** Terminal outcomes mirror the backend while replacing payload bytes with the
     definition's typed output. *)
 type 'output terminal_result =
-  (* The terminal payload decoded with the workflow definition's output codec. *)
-  | Completed of 'output
+  (* The terminal payload decoded with the workflow definition's output codec,
+     and the cron or retry successor the completed run started, if any. *)
+  | Completed of { output : 'output; successor : execution option }
   (* Failure and its optional successor run, which callers may follow explicitly. *)
   | Failed of { error : Error.t; successor : execution option }
   (* The exact run accepted a cancellation request and reached cancellation. *)
@@ -271,7 +276,7 @@ let start client ?request_id ?(memo = []) ?(search_attributes = [])
                       client;
                       workflow;
                       workflow_id = id;
-                      run_id = response.run_id;
+                      run_id = Some response.run_id;
                       started = response.started;
                     })))
 
@@ -302,7 +307,83 @@ let follow client ~workflow ({ namespace; workflow_id; run_id } : execution) =
               match validate_name "successor run id" run_id with
               | Error error -> Error error
               | Ok () ->
-                  Ok { client; workflow; workflow_id; run_id; started = false }))
+                  Ok
+                    {
+                      client;
+                      workflow;
+                      workflow_id;
+                      run_id = Some run_id;
+                      started = false;
+                    }))
+
+(** Builds a handle from a workflow ID the caller already knows, without any
+    server round trip. The identifiers are validated at the same boundary as
+    [start] so a malformed value is a typed defect rather than a protocol
+    error. An omitted [run_id] yields a current-run handle; see the interface
+    for the semantics of each operation on it. *)
+let get_handle client ?run_id ~workflow ~id () =
+  if Atomic.get client.closed then
+    Error
+      (Error.make ~category:`Bridge ~message:"client is shut down" ())
+  else
+    match validate_name "workflow id" id with
+    | Error error -> Error error
+    | Ok () -> (
+        let run_result =
+          match run_id with
+          | None -> Ok ()
+          | Some run_id -> validate_name "run id" run_id
+        in
+        match run_result with
+        | Error error -> Error error
+        | Ok () ->
+            Ok { client; workflow; workflow_id = id; run_id; started = false })
+
+(** The run selector sent to the backend: the exact run ID, or the empty
+    string that asks Temporal to resolve the workflow's current run. Exact run
+    IDs are validated non-empty, so the two cases cannot be confused. *)
+let run_selector (handle : ('input, 'output) handle) =
+  Option.value handle.run_id ~default:""
+
+(** Returns the next run a current-run wait must observe: the successor that
+    a continued-as-new, cron, or retry close event started, or [None] when the
+    observed run ended the chain. This mirrors the official SDKs' default
+    run-following result for a handle obtained by workflow ID. *)
+let chain_successor = function
+  | Backend.Continued_as_new successor
+  | Backend.Completed { successor = Some successor; _ }
+  | Backend.Failed { successor = Some successor; _ }
+  | Backend.Timed_out { successor = Some successor; _ } ->
+      Some successor
+  | Backend.Completed { successor = None; _ }
+  | Backend.Failed { successor = None; _ }
+  | Backend.Timed_out { successor = None; _ }
+  | Backend.Cancelled _ | Backend.Terminated _ ->
+      None
+
+(** Waits for one backend terminal result. A current-run handle starts from
+    the run Temporal resolves for an empty run ID and then waits on each
+    successor by its exact run ID until a run closes without one, so the
+    result is the last run's outcome and never [Continued_as_new]. Each step is
+    a separate bounded backend wait, so client shutdown still interrupts the
+    chain between and during steps. *)
+let wait_backend (handle : ('input, 'output) handle) =
+  let wait_run run_id =
+    Backend.client_wait handle.client.backend
+      ({ workflow_id = handle.workflow_id; run_id } : Backend.wait_request)
+  in
+  match handle.run_id with
+  | Some run_id -> wait_run run_id
+  | None ->
+      let rec follow_chain run_id =
+        match wait_run run_id with
+        | Error _ as error -> error
+        | Ok terminal -> (
+            match chain_successor terminal with
+            | None -> Ok terminal
+            | Some (successor : Backend.successor) -> follow_chain successor.run_id)
+      in
+      follow_chain ""
 
 (** Decodes a completed payload and maps terminal failures without exposing the
     private backend constructors. Each successor gains this client's namespace
@@ -312,9 +393,6 @@ let wait (handle : ('input, 'output) handle) =
     Error
       (Error.make ~category:`Bridge ~message:"client is shut down" ())
   else
-    let request : Backend.wait_request =
-      { workflow_id = handle.workflow_id; run_id = handle.run_id }
-    in
     (* The backend keeps the validated run pair; the owning client supplies
        the namespace needed by [follow]. *)
     let public_successor =
@@ -325,10 +403,11 @@ let wait (handle : ('input, 'output) handle) =
             run_id = value.run_id;
           })
     in
-    Result.bind (Backend.client_wait handle.client.backend request) (function
-      | Backend.Completed payload ->
+    Result.bind (wait_backend handle) (function
+      | Backend.Completed { payload; successor } ->
           Result.map
-            (fun output -> Completed output)
+            (fun output ->
+              Completed { output; successor = public_successor successor })
             (Codec.decode (Workflow.output handle.workflow) payload)
       | Backend.Failed { error; successor } ->
           Ok (Failed { error; successor = public_successor successor })
@@ -372,15 +451,17 @@ let validate_signal_fields ~request_id =
   request_result
 
 (** Allocates a stable request ID for a cancellation call whose caller did not
-    provide one. Hashing the exact execution identity makes repeated calls on
-    the same handle represent one idempotent control operation without keeping
-    another mutable counter in the client state. *)
+    provide one. Hashing the handle's execution selector makes repeated calls
+    on the same handle represent one idempotent control operation without
+    keeping another mutable counter in the client state. A current-run handle
+    hashes the empty selector; Temporal deduplicates cancellation request IDs
+    per run, so the same key still cancels a later run of the workflow. *)
 let generated_cancel_request_id (handle : ('input, 'output) handle) =
   "ocaml-client-cancel-"
   ^ Digest.to_hex
-      (Digest.string (handle.workflow_id ^ "\000" ^ handle.run_id))
+      (Digest.string (handle.workflow_id ^ "\000" ^ run_selector handle))
 
-(** Sends a cancellation request for one exact run and returns only after the
+(** Sends a cancellation request for the run [handle] addresses and returns only after the
     server acknowledgement has been decoded. This operation is deliberately
     separate from [wait], because Temporal cancellation is asynchronous. *)
 let cancel ?request_id ?(reason = "")
@@ -400,7 +481,7 @@ let cancel ?request_id ?(reason = "")
         let request : Backend.cancel_request =
           {
             workflow_id = handle.workflow_id;
-            run_id = handle.run_id;
+            run_id = run_selector handle;
             request_id;
             reason;
           }
@@ -418,7 +499,7 @@ let validate_terminate_reason reason =
     Error (Error.defect ~message:"termination reason must not contain NUL")
   else Ok ()
 
-(** Terminates one exact run. The acknowledgement is deliberately separate
+(** Terminates the run [handle] addresses. The acknowledgement is deliberately separate
     from [wait], which observes the server's terminal history event. *)
 let terminate ?(reason = "") (handle : ('input, 'output) handle) =
   if Atomic.get handle.client.closed then
@@ -431,7 +512,7 @@ let terminate ?(reason = "") (handle : ('input, 'output) handle) =
         let request : Backend.terminate_request =
           {
             workflow_id = handle.workflow_id;
-            run_id = handle.run_id;
+            run_id = run_selector handle;
             reason;
           }
         in
@@ -467,7 +548,7 @@ let validate_reset_fields ~request_id ~reason ~workflow_task_finish_event_id =
     uncertain transport result, pass an explicit [request_id]. *)
 let generated_reset_request_id = Temporal_base.Client_request_id.create
 
-(** Resets one exact run and returns the new execution identity. A successful
+(** Resets the run [handle] addresses and returns the new execution identity. A successful
     acknowledgement does not imply the new run has completed; use [follow] and
     [wait] to observe it explicitly. *)
 let reset ?request_id ?(reason = "") ~workflow_task_finish_event_id
@@ -489,7 +570,7 @@ let reset ?request_id ?(reason = "") ~workflow_task_finish_event_id
         let request : Backend.reset_request =
           {
             workflow_id = handle.workflow_id;
-            run_id = handle.run_id;
+            run_id = run_selector handle;
             request_id;
             reason;
             workflow_task_finish_event_id;
@@ -511,7 +592,7 @@ let reset ?request_id ?(reason = "") ~workflow_task_finish_event_id
     explicit ID gives a caller retry-safe idempotency semantics. *)
 let generated_signal_request_id = Temporal_base.Client_request_id.create
 
-(** Sends one typed signal to the exact run retained by [handle]. The input is
+(** Sends one typed signal to the run [handle] addresses. The input is
     encoded before the backend call, and success means only that Temporal
     acknowledged the RPC; workflow code may process it asynchronously. *)
 let signal ?request_id
@@ -535,7 +616,7 @@ let signal ?request_id
             let request : Backend.signal_request =
               {
                 workflow_id = handle.workflow_id;
-                run_id = handle.run_id;
+                run_id = run_selector handle;
                 signal_name = Signal.name signal;
                 request_id;
                 input = encoded_input;
@@ -543,7 +624,7 @@ let signal ?request_id
             in
             Backend.client_signal handle.client.backend request)
 
-(** Executes one output-only query against the exact run retained by [handle].
+(** Executes one output-only query against the run [handle] addresses.
     Query arguments are intentionally absent in this first client slice: the
     workflow-side [Query] definition is already output-only, and the result is
     decoded with the definition's codec only after the native bridge has
@@ -557,7 +638,7 @@ let query (handle : ('workflow_input, 'workflow_output) handle)
     let request : Backend.query_request =
       {
         workflow_id = handle.workflow_id;
-        run_id = handle.run_id;
+        run_id = run_selector handle;
         query_name = Query.name query;
         input = [];
       }
@@ -633,8 +714,7 @@ let list_visibility ?(page_size = 100) ?page_token client ~query () =
                 })
               (Backend.client_list_visibility client.backend request))
 
-(** Executes a one-input typed query against the exact run retained by
-    [handle]. Encoding happens before transport, so invalid input cannot
+(** Executes a one-input typed query against the run [handle] addresses. Encoding happens before transport, so invalid input cannot
     consume a native request or become an ambiguous empty query. *)
 let query_with_input (handle : ('workflow_input, 'workflow_output) handle)
     ~(query : ('input, 'query) Query.typed) ~input =
@@ -648,7 +728,7 @@ let query_with_input (handle : ('workflow_input, 'workflow_output) handle)
         let request : Backend.query_request =
           {
             workflow_id = handle.workflow_id;
-            run_id = handle.run_id;
+            run_id = run_selector handle;
             query_name = Query.name_with_input query;
             input = [ encoded_input ];
           }
@@ -703,7 +783,7 @@ let start_update ?update_id
             let request : Backend.update_request =
               {
                 workflow_id = handle.workflow_id;
-                run_id = handle.run_id;
+                run_id = run_selector handle;
                 update_id;
                 update_name = Update.name update;
                 input = encoded_input;
@@ -764,7 +844,8 @@ let update_id (handle : ('input, 'output) update_handle) = handle.update_id
 (** Returns the durable workflow identity retained by a handle. *)
 let workflow_id (handle : ('input, 'output) handle) = handle.workflow_id
 
-(** Returns the exact server run identity retained by a handle. *)
+(** Returns the exact server run identity retained by a handle, or [None]
+    for a current-run handle. *)
 let run_id (handle : ('input, 'output) handle) = handle.run_id
 
 (** Reports whether the [start] that produced [handle] created its run. *)
