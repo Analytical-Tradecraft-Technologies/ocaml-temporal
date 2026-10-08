@@ -74,8 +74,9 @@ platforms does not establish live compatibility there.
   activity task cancellation, and worker shutdown are separate mechanisms;
   application-visible cooperative callback cancellation and bounded operational
   shutdown qualification remain incomplete.
-- A public replay API/history tool, wider history and Server/Core compatibility
-  corpora, local-activity recovery, worker deployment routing acceptance,
+- An application-linked replay command (offline replay of binary histories is
+  available through [`Temporal.Replay`](docs/guides/workflows.md#replay-recorded-histories-before-deploying)),
+  wider history and Server/Core compatibility corpora, local-activity recovery, worker deployment routing acceptance,
   suspended-update recovery, and broader failure/load testing remain open.
 - Schedules, Nexus, interceptors, workflow side effects, and other parity work
   remain incomplete. Release preflight and package tests exist; release delivery,

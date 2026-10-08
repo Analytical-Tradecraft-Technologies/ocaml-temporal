@@ -36,6 +36,30 @@ against a loopback gRPC double: corrected completion and reject both retire
 the lease exactly once after the refusal), and
 `test/bridge/test_ocaml_activity_protocol.ml` cover it.
 
+## 2026-10-08: Public offline replay API (#515)
+
+`Temporal.Replay` lets an application replay a recorded workflow history
+against its registered workflow definitions without a server or credentials.
+`History.of_protobuf ~workflow_id` accepts the binary `History` protobuf;
+`replay` and `replay_all` return `Ok ()` or a typed `Nondeterminism`,
+`Workflow_task_failed`, `Invalid_history`, `Unsupported_history`, or
+`Replay_error`. No new engine or ABI symbol was added: each call drives the
+existing private replay operations with the production workflow adapter, as
+the cold-replay benchmark does, and shuts its native graph down on every path.
+The only kernel change is an alias for the shared payload wrapper used to build
+the replay document.
+
+Evidence: `test/bridge/test_public_replay.ml`, using only the public API,
+replays all five retained live task-failure histories with compatible code,
+reports a removed timer and an activity-for-timer change as nondeterminism,
+reports a defect and an unregistered type as task failures, reports
+non-protobuf, truncated and event-free input as invalid, rejects invalid
+registrations before native allocation, and completes 140 alternating
+successful and nondeterministic replays (more than OCaml's simultaneous Domain
+limit). The installed-consumer witness covers the new signatures. A replay CLI
+(#516), richer mismatch context (#529), JSON-history input and a persistent
+corpus (#503) remain open.
+
 ## 2026-10-08: Detect and report non-yielding workflow code (#493)
 
 A workflow activation that runs workflow code past a configurable deadline
