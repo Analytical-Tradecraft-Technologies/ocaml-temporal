@@ -109,8 +109,10 @@ Reset, bounded visibility listing, worker deployment routing, search-attribute
 upserts and priority metadata have implemented/focused-tested surfaces but no
 dedicated live qualification. Start memo/search attributes have the post-baseline
 start-metadata controller described above. The private replay feeder
-is not a public history replay tool. Authentication configuration, cross-version
-history corpora, release delivery and operational/load qualification remain
+is not a public history replay tool. The seeded
+[history corpus](history-corpus.md) is replayed offline in every `dune runtest`;
+it is not live acceptance. Authentication configuration, running that corpus
+across versions (#524), release delivery and operational/load qualification remain
 tracked work; consult [feature coverage](feature-coverage.md) and the
 [roadmap](../implementation-roadmap.md).
 
