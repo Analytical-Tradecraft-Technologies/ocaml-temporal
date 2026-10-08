@@ -1,0 +1,28 @@
+; The application-linked replay checker (issue #516). It is offline: it never
+; connects to a Temporal Server, so it is outside the live example gate and,
+; like examples/testing, is declared as a `test` stanza rather than an
+; `executable` (see test/smoke/test_examples_live_contract.sh). `dune test`
+; replays the checked-in example history with it, and
+; `dune exec examples/replay/replay_history.exe -- ...` runs it by hand.
+
+(library
+ (name temporal_sdk_examples_replay)
+ (wrapped false)
+ (modules replay_command)
+ (libraries temporal-sdk))
+
+(test
+ (name replay_history)
+ (modules replay_history)
+ (libraries
+  temporal-sdk
+  temporal_sdk_examples_common
+  temporal_sdk_examples_replay)
+ (deps
+  (glob_files histories/*.pb))
+ (action
+  (run
+   %{test}
+   --workflow-id
+   compose-message-ada-lovelace
+   histories/compose-message-ada-lovelace.pb)))
