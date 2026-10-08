@@ -2026,17 +2026,17 @@ fn replay_history(kind: HistoryKind) -> (String, String) {
     (run_id, document)
 }
 
-/// Encodes a successful completion for one activity token. Core requires a
-/// result payload (possibly empty) on every successful completion, as the
-/// OCaml executor always supplies.
+/// Encodes a successful completion for one activity token. The bridge
+/// protocol requires a result payload (possibly empty) on every successful
+/// completion, as the OCaml executor always supplies.
 fn activity_completion(token_text: &str) -> Vec<u8> {
     activity_protocol::encode_completion(&ActivityCompletion {
         task_token: token_text.to_owned(),
         result: ActivityCompletionResult::Completed {
-            result: Some(Payload {
+            result: Payload {
                 metadata: BTreeMap::new(),
                 data: Vec::new(),
-            }),
+            },
         },
     })
     .expect("activity completion encodes")

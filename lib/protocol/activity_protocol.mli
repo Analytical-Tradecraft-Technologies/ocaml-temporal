@@ -189,9 +189,12 @@ type task_variant = Start of activity_start | Cancel of activity_cancel
     and must be copied unchanged into its completion. *)
 type task = { task_token : bytes; variant : task_variant }
 
-(** Terminal outcomes accepted by Temporal Core for an activity attempt. *)
+(** Terminal outcomes accepted by Temporal Core for an activity attempt.
+    [Completed] always carries a payload: Core rejects a successful completion
+    without one, so a void result is an encoded payload whose data may be
+    empty, and the wire form never accepts [null] (issue #954). *)
 type completion_result =
-  | Completed of payload option
+  | Completed of payload
   | Failed of failure
   | Cancelled of failure
   | Will_complete_async

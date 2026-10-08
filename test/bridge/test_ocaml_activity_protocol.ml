@@ -87,7 +87,7 @@ let test_cancel_round_trip () =
 let test_completion_variants () =
   let documents =
     [
-      {|{"task_token":"AA==","result":{"kind":"completed","result":null}}|};
+      {|{"task_token":"AA==","result":{"kind":"completed","result":{"metadata":{},"data":{"encoding":"base64","data":""}}}}|};
       {|{"task_token":"AA==","result":{"kind":"will_complete_async"}}|};
       {|{"task_token":"AA==","result":{"kind":"failed","failure":{"message":"bad input","source":"worker","stack_trace":"","encoded_attributes":null,"cause":null,"info":{"kind":"application","type":"InvalidInput","non_retryable":true,"details":[]}}}}|};
       {|{"task_token":"AA==","result":{"kind":"cancelled","failure":{"message":"cancelled","source":"worker","stack_trace":"","encoded_attributes":null,"cause":null,"info":{"kind":"canceled","details":[],"identity":"worker-1"}}}}|};
@@ -151,6 +151,11 @@ let test_closed_documents () =
   require_error
     (Protocol.decode_completion
        {|{"task_token":"AA==","result":{"kind":"completed"}}|});
+  (* Core rejects a successful completion without a payload, so the OCaml
+     codec refuses [null] exactly as the Rust decoder does (issue #954). *)
+  check_error_path "null completed payload" "$.result.result"
+    (Protocol.decode_completion
+       {|{"task_token":"AA==","result":{"kind":"completed","result":null}}|});
   check_error_path "nested completion duplicate" "$.result"
     (Protocol.decode_completion
        {|{"task_token":"AA==","result":{"kind":"will_complete_async","kind":"will_complete_async"}}|})

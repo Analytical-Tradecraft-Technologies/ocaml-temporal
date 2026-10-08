@@ -2214,11 +2214,7 @@ impl Runtime {
             .tokio_handle();
         let operation = match &semantic.result {
             activity_protocol::ActivityCompletionResult::Completed { result } => {
-                let payloads = result
-                    .as_ref()
-                    .map(|payload| Self::async_payloads(std::slice::from_ref(payload)))
-                    .transpose()?
-                    .flatten();
+                let payloads = Self::async_payloads(std::slice::from_ref(result))?;
                 handle.block_on(activity.complete(payloads))
             }
             activity_protocol::ActivityCompletionResult::Failed { failure } => {
