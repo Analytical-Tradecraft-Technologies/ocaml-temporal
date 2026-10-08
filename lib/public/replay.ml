@@ -366,23 +366,31 @@ let replay ?(namespace = "default") ?(task_queue = "temporal-replay")
           | Error error -> Error (native_failure "replay runtime start" error)
           | Ok native ->
               let runner_slot = ref None in
-              let outcome =
-                try
-                  run_replay ~native ~config ~runner_slot ~namespace
-                    ~task_queue ~workflows history
-                with exception_ ->
-                  (* A raise here is an SDK defect; keep the result typed so
-                     the native graph below is still released. *)
-                  Error
-                    (replay_error
-                       ("replay raised " ^ Printexc.to_string exception_))
-              in
               (* Shutdown disposes any undrained replay worker, joins the
                  owner Domain, and frees the runtime. Only then are the OCaml
                  executions released, because Core no longer holds leases
                  that could reference them. *)
-              let shutdown = Supervisor.shutdown native in
-              Option.iter Runner.discard !runner_slot;
+              let release () =
+                let shutdown = Supervisor.shutdown native in
+                Option.iter Runner.discard !runner_slot;
+                shutdown
+              in
+              let outcome =
+                match
+                  run_replay ~native ~config ~runner_slot ~namespace
+                    ~task_queue ~workflows history
+                with
+                | outcome -> outcome
+                | exception exception_ ->
+                    (* An exception here is an SDK defect or an interrupt
+                       such as [Sys.Break], not a replay verdict: release the
+                       native graph, then re-raise it unchanged with its
+                       backtrace so it is never masked as [Replay_error]. *)
+                    let backtrace = Printexc.get_raw_backtrace () in
+                    (try ignore (release ()) with _ -> ());
+                    Printexc.raise_with_backtrace exception_ backtrace
+              in
+              let shutdown = release () in
               match (outcome, shutdown) with
               | Error _, _ -> outcome
               | Ok (), Ok () -> Ok ()

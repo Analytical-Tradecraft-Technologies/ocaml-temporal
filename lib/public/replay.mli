@@ -137,7 +137,10 @@ val failure_message : failure -> string
     Each call creates and fully releases its own native replay graph, so
     repeated and concurrent calls from different system threads are
     independent. A replay that stops making progress for about 30 seconds is
-    abandoned and reported as [Replay_error]. *)
+    abandoned and reported as [Replay_error]. An exception that escapes the
+    SDK itself (an internal defect, or an interrupt such as [Sys.Break]) is
+    not turned into a result: the native graph is released and the exception
+    is re-raised unchanged. *)
 val replay :
   ?namespace:string ->
   ?task_queue:string ->
