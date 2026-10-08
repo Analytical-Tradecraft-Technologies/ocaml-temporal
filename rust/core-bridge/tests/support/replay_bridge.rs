@@ -651,6 +651,64 @@ fn replay_dispose_retains_worker_when_core_is_still_shared() {
     dispose_or_panic(worker, &handle);
 }
 
+/// A replay lane join that hits its bound must never lead into Core's
+/// unbounded finalizer (PR #966 review).
+///
+/// The workflow lane is replaced by a task that never finishes, and the join
+/// bound is shortened to 200 ms. The first disposal must time out, abort the
+/// lane, and return a typed lane error with the worker retained. Finalization
+/// of that worker must refuse rather than claim success. A retried disposal,
+/// which is also what `drop_runtime_graph` does, must release the worker by
+/// the documented leak instead of calling Core's finalizer. The whole sequence
+/// runs under [`run_within_deadline`], so a regression fails fast.
+#[test]
+fn replay_dispose_after_join_timeout_leaks_instead_of_finalizing() {
+    run_within_deadline(
+        "replay_dispose_after_join_timeout_leaks_instead_of_finalizing",
+        |progress| {
+            progress.enter("start replay worker");
+            let core = core_runtime();
+            let handle = core.tokio_handle().clone();
+            let mut worker = ReplayWorker::start(&core, replay_config())
+                .expect("replay worker should construct without a client");
+            handle
+                .block_on(worker.install_stuck_workflow_lane_for_test(Duration::from_millis(200)));
+
+            progress.enter("first dispose (join times out)");
+            let (worker, error) = match handle.block_on(worker.dispose(&handle)) {
+                Ok(()) => panic!("disposal must report the lane that never stopped"),
+                Err(result) => result,
+            };
+            assert!(
+                matches!(&error, ReplayWorkerError::PollLane(PollLaneError::Core(message))
+                    if message.contains("within its bound")),
+                "unexpected disposal error: {error:?}"
+            );
+
+            progress.enter("finalize after join timeout");
+            let worker = match handle.block_on(worker.finalize(&handle)) {
+                Ok(()) => panic!("finalization must not claim success after a join timeout"),
+                Err((worker, error)) => {
+                    assert!(
+                        matches!(error, ReplayWorkerError::PollLane(_)),
+                        "unexpected finalization error: {error:?}"
+                    );
+                    worker
+                }
+            };
+
+            progress.enter("retry dispose (leaks)");
+            let leaked_before = crate::worker_bridge::replay_workers_leaked();
+            dispose_or_panic(worker, &handle);
+            assert!(
+                crate::worker_bridge::replay_workers_leaked() > leaked_before,
+                "the retried disposal must release the worker through the leak path"
+            );
+            progress.enter("drop Core runtime");
+        },
+    );
+}
+
 /// Disposal reports a poll-task join failure while retaining the worker for a
 /// retry after every producer handle has been consumed.
 #[test]

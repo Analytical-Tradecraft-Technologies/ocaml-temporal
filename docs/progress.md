@@ -36,7 +36,16 @@ Changes:
   workflow lane observed Core's `ShutDown` is treated as accepted, which is
   what Core does for an empty completion that reaches a closed stream.
 - The feeder send and the replay lane join are bounded at 60 seconds, so
-  other stalls become typed `WORKER` failures, and hence `Replay_error`.
+  other stalls become typed `WORKER` failures, and hence `Replay_error`. The
+  join bound wraps the whole join, so an acknowledgement inside it cannot
+  extend it.
+- After a lane join times out, the worker never reaches Core's unbounded
+  finalizer. `finalize` refuses, and the next `dispose`, or
+  `drop_runtime_graph`, deliberately leaks the Core worker with a counter and
+  one stderr line. Running the finalizer could block forever, and detaching it
+  would hang the Tokio runtime drop instead. The
+  [reference](reference/replay-bridge.md#bounded-core-waits) documents the
+  trade-off. Tests force both timeout paths with a 200 ms injected bound.
 - The test runs under a 30-second deadline that reports the blocked step.
 
 After the fix, 3,200 runs of the same loops passed with no hang. Temporary

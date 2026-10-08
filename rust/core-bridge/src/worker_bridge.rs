@@ -6,6 +6,8 @@
 //! ad-hoc state machines.
 
 use std::collections::{HashMap, HashSet, hash_map::Entry};
+use std::io::Write as _;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 use temporalio_common::protos::coresdk::{
@@ -658,6 +660,94 @@ async fn complete_workflow_unless_stranded(
     .await
 }
 
+/// Number of replay Core workers leaked by
+/// [`PollLanes::leak_after_replay_join_timeout`] in this process.
+static REPLAY_WORKERS_LEAKED: AtomicU64 = AtomicU64::new(0);
+
+/// Returns how many replay Core workers this process has deliberately leaked
+/// after a lane join timeout. Exposed for tests and diagnostics.
+pub fn replay_workers_leaked() -> u64 {
+    REPLAY_WORKERS_LEAKED.load(Ordering::Relaxed)
+}
+
+/// Outcome of [`join_replay_lane_within`].
+#[derive(Debug)]
+enum ReplayLaneJoin {
+    /// The lane task finished; carries its join result.
+    Joined(Result<(), PollLaneError>),
+    /// The bound elapsed. The lane was aborted and its handle consumed.
+    TimedOut,
+}
+
+/// Upper bound for awaiting a poll lane after it has been aborted.
+///
+/// Tokio cancels an aborted task at its next suspension point, and the lane
+/// spends its life suspended in Core's poll, so this normally completes at
+/// once. The bound only keeps a misbehaving task from extending a join whose
+/// own bound has already elapsed; past it the handle is dropped, which
+/// detaches nothing that can still run, because the task is already aborted.
+const ABORTED_LANE_JOIN_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Joins a replay workflow lane while acknowledging every activation it
+/// publishes, all within one `bound`.
+///
+/// `acknowledge` receives the run ID of each queued activation after its
+/// ledger entry is removed. Because the timeout wraps the entire drain, a
+/// slow acknowledgement cannot extend the join past `bound` (an earlier
+/// version checked the deadline only between acknowledgements). On timeout
+/// the in-flight acknowledgement is dropped, the lane is aborted and awaited
+/// for at most [`ABORTED_LANE_JOIN_TIMEOUT`], and
+/// [`ReplayLaneJoin::TimedOut`] is returned. Must run inside a Tokio runtime
+/// with timers enabled.
+async fn join_replay_lane_within<A, Fut>(
+    mut workflow_lane: JoinHandle<()>,
+    bound: Duration,
+    signal: &Readiness,
+    ready: &mut mpsc::UnboundedReceiver<ReadyTask<WorkflowActivation>>,
+    ledger: &Mutex<TaskLedger>,
+    mut acknowledge: A,
+) -> ReplayLaneJoin
+where
+    A: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let drain = async {
+        loop {
+            tokio::select! {
+                result = &mut workflow_lane => {
+                    return result.map_err(|error| {
+                        PollLaneError::Core(format!("workflow poll lane failed: {error}"))
+                    });
+                }
+                message = signal.take_async(ready) => {
+                    let Some(message) = message else {
+                        // The sender is dropped only after the poll lane has
+                        // exited, so the join branch will become ready next.
+                        continue;
+                    };
+                    if let Ok(activation) = message {
+                        let run_id = activation.run_id;
+                        ledger
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .force_remove_workflow(&run_id);
+                        acknowledge(run_id).await;
+                    }
+                }
+            }
+        }
+    };
+    let outcome = tokio::time::timeout(bound, drain).await;
+    match outcome {
+        Ok(result) => ReplayLaneJoin::Joined(result),
+        Err(_elapsed) => {
+            workflow_lane.abort();
+            let _ = tokio::time::timeout(ABORTED_LANE_JOIN_TIMEOUT, &mut workflow_lane).await;
+            ReplayLaneJoin::TimedOut
+        }
+    }
+}
+
 /// Awaits one Core completion reply under the stranded-stream and overall
 /// bounds described in [`complete_workflow_unless_stranded`].
 ///
@@ -1082,6 +1172,13 @@ pub struct PollLanes {
     /// They never send and are dropped with the lanes.
     idle_senders: IdleSenders,
     shutdown_started: bool,
+    /// Bound for [`Self::join_replay_poll_lane`]. Always
+    /// [`REPLAY_CORE_WAIT_TIMEOUT`] in production; tests shorten it to force
+    /// the timeout path quickly.
+    replay_join_bound: Duration,
+    /// Set when a replay lane join hit its bound. Core never confirmed
+    /// shutdown, so the worker must be leaked rather than finalized.
+    replay_join_timed_out: bool,
 }
 
 /// Producer halves kept alive for disabled live-worker lanes; see
@@ -1190,6 +1287,8 @@ impl PollLanes {
             activity_lane,
             idle_senders,
             shutdown_started: false,
+            replay_join_bound: REPLAY_CORE_WAIT_TIMEOUT,
+            replay_join_timed_out: false,
         }
     }
 
@@ -1462,69 +1561,89 @@ impl PollLanes {
     /// the ready queue and sends only shutdown-safe empty completions. A
     /// replay activation never receives the live-worker failure completion.
     ///
-    /// The whole join is bounded by [`REPLAY_CORE_WAIT_TIMEOUT`], and each
-    /// acknowledgement by [`complete_workflow_unless_stranded`]. If the lane
-    /// has not stopped by the deadline it is aborted and awaited; abortion
-    /// takes effect at the lane's next suspension point, so the join still
-    /// consumes the handle and no producer survives it. That outcome is
-    /// reported as a lane error so the caller does not finalize a worker
-    /// whose shutdown Core never confirmed.
+    /// The whole join, including every acknowledgement it awaits, runs
+    /// under one [`REPLAY_CORE_WAIT_TIMEOUT`] bound (see
+    /// [`join_replay_lane_within`]). If the lane has not stopped by then it
+    /// is aborted, the worker is marked by [`Self::replay_join_timed_out`],
+    /// and the outcome is reported as a lane error. The caller must then
+    /// release the worker through [`Self::leak_after_replay_join_timeout`]
+    /// rather than Core's unbounded finalizer.
     pub async fn join_replay_poll_lane(&mut self) -> Result<(), PollLaneError> {
-        let Some(mut workflow_lane) = self.workflow_lane.take() else {
+        let Some(workflow_lane) = self.workflow_lane.take() else {
             return Ok(());
         };
-        let deadline = tokio::time::sleep(REPLAY_CORE_WAIT_TIMEOUT);
-        tokio::pin!(deadline);
-        let mut first_error = None;
-        loop {
-            tokio::select! {
-                () = &mut deadline => {
-                    workflow_lane.abort();
-                    let _ = (&mut workflow_lane).await;
-                    first_error = Some(PollLaneError::Core(
-                        "workflow poll lane did not stop within its bound".to_owned(),
-                    ));
-                    break;
-                }
-                result = &mut workflow_lane => {
-                    if let Err(error) = result {
-                        first_error = Some(PollLaneError::Core(format!(
-                            "workflow poll lane failed: {error}"
-                        )));
-                    }
-                    break;
-                }
-                ready = self.workflow_signal.take_async(&mut self.workflow_ready) => {
-                    let Some(ready) = ready else {
-                        // The sender is dropped only after the poll lane has
-                        // exited, so the join branch will become ready next.
-                        continue;
-                    };
-                    if let Ok(activation) = ready {
-                        let run_id = activation.run_id.clone();
-                        self.ledger
-                            .lock()
-                            .unwrap_or_else(|error| error.into_inner())
-                            .force_remove_workflow(&run_id);
-                        let completion = WorkflowActivationCompletion::empty(run_id);
-                        // Disposal ignores the outcome: a stranded or timed-out
-                        // acknowledgement leaves nothing more to retire, and
-                        // the deadline above still bounds the join.
-                        let _ = complete_workflow_unless_stranded(
-                            &self.worker,
-                            &self.workflow_signal,
-                            completion,
-                        )
-                        .await;
-                    }
-                }
-            }
-        }
+        let worker = &self.worker;
+        let signal = &self.workflow_signal;
+        let outcome = join_replay_lane_within(
+            workflow_lane,
+            self.replay_join_bound,
+            signal,
+            &mut self.workflow_ready,
+            &self.ledger,
+            |run_id| async move {
+                // Disposal ignores the outcome: a stranded or timed-out
+                // acknowledgement leaves nothing more to retire, and the
+                // enclosing join bound still caps this wait.
+                let completion = WorkflowActivationCompletion::empty(run_id);
+                let _ = complete_workflow_unless_stranded(worker, signal, completion).await;
+            },
+        )
+        .await;
         self.ledger
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .clear_dispose_retired();
-        first_error.map_or(Ok(()), Err)
+        match outcome {
+            ReplayLaneJoin::Joined(result) => result,
+            ReplayLaneJoin::TimedOut => {
+                // Core never confirmed shutdown, so its terminal finalizer may
+                // block forever joining Core's workflow thread. Every later
+                // finalize or dispose consults this flag instead of trusting
+                // the now-empty lane slot.
+                self.replay_join_timed_out = true;
+                Err(PollLaneError::Core(
+                    "workflow poll lane did not stop within its bound".to_owned(),
+                ))
+            }
+        }
+    }
+
+    /// Reports whether a replay lane join hit its bound. Such a worker must
+    /// never reach Core's unbounded terminal finalizer; see
+    /// [`Self::leak_after_replay_join_timeout`].
+    pub fn replay_join_timed_out(&self) -> bool {
+        self.replay_join_timed_out
+    }
+
+    /// Releases a replay lane graph whose lane join timed out by deliberately
+    /// leaking the Core worker instead of finalizing it.
+    ///
+    /// Core's `finalize_shutdown` joins Core's workflow processing thread
+    /// without a bound, and that thread did not stop when asked. Finalizing
+    /// could block the supervisor, or `drop_runtime_graph`, forever. Detaching
+    /// the finalizer into a Tokio task is not safe either: it waits for Core's
+    /// thread through `spawn_blocking`, and dropping the Tokio runtime waits
+    /// for blocking tasks, so the runtime drop would hang instead.
+    ///
+    /// The trade-off is a bounded, one-time leak: the Core worker allocation,
+    /// its workflow thread if that thread never exits, and the worker's
+    /// registration with the in-process replay client stay alive until the
+    /// process exits. Core's Tokio tasks are still cancelled when the runtime
+    /// is dropped, because a leaked `Arc` keeps memory, not tasks, alive. The
+    /// poll lane has already been aborted and awaited, the ledger and queues
+    /// are dropped here, and no OCaml value refers to the worker, so nothing
+    /// can use the leaked worker again. A process-wide counter and one
+    /// stderr line record each leak.
+    pub fn leak_after_replay_join_timeout(self) {
+        let Self { worker, .. } = self;
+        REPLAY_WORKERS_LEAKED.fetch_add(1, Ordering::Relaxed);
+        // One static line on a rare path. It names no workflow data.
+        let _ = writeln!(
+            std::io::stderr(),
+            "ocaml-temporal: leaked a Temporal Core replay worker whose poll lane \
+             did not stop within its bound (issue #965)"
+        );
+        std::mem::forget(worker);
     }
 
     /// Retires every outstanding task and joins both poll lanes, waiting at
@@ -2352,6 +2471,8 @@ impl PollLanes {
             activity_lane,
             idle_senders,
             shutdown_started,
+            replay_join_bound,
+            replay_join_timed_out,
         } = self;
         match Arc::try_unwrap(worker) {
             Ok(worker) => {
@@ -2370,6 +2491,8 @@ impl PollLanes {
                     activity_lane,
                     idle_senders,
                     shutdown_started,
+                    replay_join_bound,
+                    replay_join_timed_out,
                 },
                 WorkerBridgeError::WorkerStillShared,
             )),
@@ -2394,6 +2517,28 @@ impl PollLanes {
     /// replay disposal observes exactly one join failure without depending on
     /// whether Core's real poll had already reached natural shutdown.
     /// Production callers always use the Core shutdown path instead.
+    /// Replaces the workflow poll task with one that never finishes, so a
+    /// replay join can only end through its bound.
+    ///
+    /// The original Core poll handle is aborted and awaited first, so no
+    /// real producer is left behind. The replacement is a pending task, not
+    /// an aborted one: the join must abort it itself on timeout.
+    #[cfg(test)]
+    pub(crate) async fn install_stuck_workflow_lane_for_test(&mut self) {
+        if let Some(workflow_lane) = self.workflow_lane.take() {
+            workflow_lane.abort();
+            let _ = workflow_lane.await;
+        }
+        self.workflow_lane = Some(tokio::spawn(std::future::pending::<()>()));
+    }
+
+    /// Shortens the replay lane join bound so tests reach the timeout path in
+    /// milliseconds instead of [`REPLAY_CORE_WAIT_TIMEOUT`].
+    #[cfg(test)]
+    pub(crate) fn set_replay_join_bound_for_test(&mut self, bound: Duration) {
+        self.replay_join_bound = bound;
+    }
+
     #[cfg(test)]
     pub(crate) async fn abort_workflow_lane_for_test(&mut self) {
         let workflow_lane = self
@@ -3585,9 +3730,13 @@ mod readiness_tests {
 #[cfg(test)]
 mod stranded_completion_tests {
     use super::{
-        GuardedCompletion, REPLAY_STRANDED_COMPLETION_GRACE, Readiness, await_reply_unless_stranded,
+        GuardedCompletion, REPLAY_STRANDED_COMPLETION_GRACE, Readiness, ReplayLaneJoin, TaskLedger,
+        await_reply_unless_stranded, join_replay_lane_within,
     };
-    use std::time::Duration;
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    use temporalio_common::protos::coresdk::workflow_activation::WorkflowActivation;
+    use tokio::sync::mpsc;
 
     /// Builds the current-thread runtime with timers that the helper needs.
     fn runtime() -> tokio::runtime::Runtime {
@@ -3666,5 +3815,49 @@ mod stranded_completion_tests {
             matches!(outcome, GuardedCompletion::Finished(Ok(()))),
             "{outcome:?}"
         );
+    }
+
+    /// The replay lane join bound covers acknowledgement waits too (PR #966
+    /// review). A lane that never exits publishes one activation whose
+    /// acknowledgement never completes; the join must still return
+    /// `TimedOut` close to its injected 200 ms bound, with the lane aborted.
+    #[test]
+    fn lane_join_bound_includes_a_stuck_acknowledgement() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("test runtime should start");
+        runtime.block_on(async {
+            let signal = Readiness::new();
+            let (sender, mut ready) = mpsc::unbounded_channel();
+            let ledger = Mutex::new(TaskLedger::new());
+            let activation = WorkflowActivation {
+                run_id: "run-stuck-ack".to_owned(),
+                ..Default::default()
+            };
+            assert!(signal.enqueue(&sender, Ok(activation)));
+            let lane = tokio::spawn(std::future::pending::<()>());
+            let lane_probe = lane.abort_handle();
+            let started = Instant::now();
+            let outcome = join_replay_lane_within(
+                lane,
+                Duration::from_millis(200),
+                &signal,
+                &mut ready,
+                &ledger,
+                |_run_id| std::future::pending::<()>(),
+            )
+            .await;
+            assert!(matches!(outcome, ReplayLaneJoin::TimedOut), "{outcome:?}");
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "the join overran its bound: {:?}",
+                started.elapsed()
+            );
+            assert!(
+                lane_probe.is_finished(),
+                "the timed-out lane must be aborted"
+            );
+        });
     }
 }

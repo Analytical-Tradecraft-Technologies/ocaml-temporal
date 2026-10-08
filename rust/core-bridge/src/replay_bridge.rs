@@ -436,6 +436,18 @@ impl ReplayWorker {
         mut self,
         handle: &Handle,
     ) -> Result<(), (Self, ReplayWorkerError)> {
+        if self.lanes.replay_join_timed_out() {
+            // An earlier join timed out, so Core never confirmed shutdown and
+            // its finalizer may block forever. Finalization is success
+            // evidence and cannot be claimed; the caller must dispose, which
+            // releases the worker without Core's finalizer.
+            return Err((
+                self,
+                ReplayWorkerError::PollLane(PollLaneError::Core(
+                    "workflow poll lane did not stop within its bound".to_owned(),
+                )),
+            ));
+        }
         let input_finished = self.feeder.is_none();
         let workflow_shutdown_observed = self.workflow_shutdown_observed;
         let outstanding_tasks = self.lanes.has_outstanding_tasks();
@@ -509,6 +521,15 @@ impl ReplayWorker {
     /// worker is returned with the typed error instead of being dropped; the
     /// caller must retry disposal or take another explicit ownership-preserving
     /// recovery action.
+    ///
+    /// One case never reaches Core's finalizer. If a lane join hit its bound
+    /// (see `PollLanes::join_replay_poll_lane`), that attempt returns the
+    /// typed lane error, and the next `dispose` releases the graph by
+    /// deliberately leaking the Core worker and returns `Ok`. The leak is
+    /// bounded and documented on `PollLanes::leak_after_replay_join_timeout`.
+    /// The alternative, running Core's unbounded finalizer for a worker whose
+    /// workflow thread did not stop, could block the supervisor or
+    /// `drop_runtime_graph` forever.
     // The error deliberately returns the worker itself so ownership is never
     // lost on failure; boxing it would only move the same value to the heap.
     #[allow(clippy::result_large_err)]
@@ -517,6 +538,14 @@ impl ReplayWorker {
         handle: &Handle,
     ) -> Result<(), (Self, ReplayWorkerError)> {
         self.finish_input();
+        if self.lanes.replay_join_timed_out() {
+            // A previous attempt's lane join hit its bound. Core's finalizer
+            // could block forever, so release the graph by leaking the Core
+            // worker instead (see `PollLanes::leak_after_replay_join_timeout`).
+            // That earlier attempt already returned the typed lane error.
+            self.lanes.leak_after_replay_join_timeout();
+            return Ok(());
+        }
         self.lanes.abandon_replay_for_dispose().await;
         {
             let _runtime_guard = handle.enter();
@@ -575,6 +604,17 @@ impl ReplayWorker {
     #[cfg(test)]
     pub(crate) async fn abort_workflow_lane_for_test(&mut self) {
         self.lanes.abort_workflow_lane_for_test().await;
+    }
+
+    /// Installs a workflow lane that never finishes and shortens the replay
+    /// join bound to `bound`, forcing disposal down its join-timeout path.
+    #[cfg(test)]
+    pub(crate) async fn install_stuck_workflow_lane_for_test(
+        &mut self,
+        bound: std::time::Duration,
+    ) {
+        self.lanes.install_stuck_workflow_lane_for_test().await;
+        self.lanes.set_replay_join_bound_for_test(bound);
     }
 
     /// Exposes the ledger's reject-completion ordering probes so a test can

@@ -291,8 +291,32 @@ supervisor Domain that blocks forever (issue #965):
 | Feeder send (`feed_json`) | `REPLAY_CORE_WAIT_TIMEOUT`, 60 s | `ReplayWorkerError::TimedOut`; the history is dropped unsent. |
 | Completion and rejection replies | 60 s, or 250 ms after Core's workflow stream has ended | Empty acknowledgement: success. Non-empty: `CompletionStranded`. No reply and no stream end: `CoreWaitTimedOut`. The lease stays retired in every case, because Core may already have consumed the completion. |
 | Disposal acknowledgements | Same as completions | Outcome ignored; disposal continues. |
-| Replay lane join (finalize and dispose) | 60 s | The lane task is aborted and awaited, then reported as a `PollLane` error with the worker retained. |
-| Core `finalize_shutdown` | Not timed | Terminates: it runs only after the lane has joined, Core's workflow thread has exited, the mock client answers in-process, and Core caps its final slot-permit wait at five seconds. A timeout would have to drop the consumed Core worker mid-finalization. |
+| Replay lane join (finalize and dispose) | 60 s for the whole join, including every acknowledgement it awaits | The lane task is aborted and awaited, then reported as a `PollLane` error with the worker retained. The worker is marked as having timed out its join; see below. |
+| Core `finalize_shutdown` | Not timed | Runs only after a lane join that succeeded. It then terminates: Core's workflow thread has left its stream loop, the mock client answers in-process, and Core caps its final slot-permit wait at five seconds. A timeout would have to drop the consumed Core worker mid-finalization. |
+
+A lane join that times out means Core never confirmed shutdown, so Core's
+workflow thread may never stop and `finalize_shutdown`, which joins that
+thread, could block forever. The worker therefore records the timeout, and
+the lane slot being empty afterwards no longer counts as a successful join:
+
+- a later `finalize` returns a `PollLane` error with the worker retained,
+  because finalization is replay-success evidence; and
+- a later `dispose`, including the two attempts made by `drop_runtime_graph`,
+  releases the graph by **deliberately leaking the Core worker** and returns
+  success.
+
+The leak is the chosen trade-off. Detaching the finalizer into a Tokio task is
+not safe, because Core joins its thread through `spawn_blocking` and dropping
+the Tokio runtime waits for blocking tasks, which would move the hang into the
+runtime drop. A leak is bounded to that one worker. Its allocation, its Core
+workflow thread if the thread never exits, and its registration with the
+in-process replay client stay alive until the process exits. Core's Tokio
+tasks are still cancelled when the runtime is dropped. The poll lane has
+already been aborted, the ledger and queues are dropped, and no OCaml value
+refers to the worker, so the leaked worker can never be used again. Each leak
+increments a process-wide counter (`replay_workers_leaked`) and writes one
+static line to stderr. The first attempt has already returned the typed lane
+error that OCaml reports as `Replay_error`.
 
 The completion bound fixes the hang in issue #965. Core's
 `complete_workflow_activation` sends the completion and a oneshot reply sender
@@ -351,7 +375,15 @@ fails fast instead of consuming the CI job timeout. The
 [`worker_bridge.rs`](../../rust/core-bridge/src/worker_bridge.rs) checks each
 outcome of the bounded completion await with model reply futures: a pending
 reply after Core's shutdown is stranded, a bridge-only close is not, and a
-ready or late-but-within-grace reply is returned.
+ready or late-but-within-grace reply is returned. Its
+`lane_join_bound_includes_a_stuck_acknowledgement` test injects a 200 ms join
+bound and an acknowledgement that never completes, and requires the join to
+time out near that bound with the lane aborted.
+`replay_dispose_after_join_timeout_leaks_instead_of_finalizing` installs a
+lane that never stops, with the same short bound. It requires the first
+disposal to return the typed lane error, finalization to refuse, and the
+retried disposal (the `drop_runtime_graph` path) to return through the leak
+without entering Core's finalizer.
 
 The ABI-focused integration test in
 [`tests/replay_abi.rs`](../../rust/core-bridge/tests/replay_abi.rs) adds null
