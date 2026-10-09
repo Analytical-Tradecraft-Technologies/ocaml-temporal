@@ -96,6 +96,7 @@ for executable in "$@"; do
       cli_argument='' ;;
     test/integration/interaction_recovery/regression.exe|\
     test/integration/local_activity_cancellation/regression.exe|\
+    test/integration/transport_interruption/regression.exe|\
     test/integration/update_outcomes/regression.exe)
       cli_argument=$container_cli ;;
     *)
