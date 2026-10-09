@@ -15,6 +15,27 @@ implementation when a later entry documents that work as complete. The
 records the current tested source, named assertions and successful CI job for
 the Temporal acceptance controllers.
 
+## 2026-10-07: Shared runtime across clients and workers (#832)
+
+Following the maintainer decision on #832, several clients and workers can
+now share one Core runtime and Tokio pool through the new public
+`Temporal.Runtime` (`create ?io_threads`, `attached`, `shutdown`) and
+`?runtime` on `Client.create` and `Worker.create`; without it every instance
+still owns its own runtime. Rust moves Core into a reference-counted
+`SharedCore` held by an opaque shared-runtime handle and by every attached
+graph, through three additive v4 symbols (`shared_runtime_new`,
+`runtime_new_attached`, `shared_runtime_free`/`_dispose`), so Core is
+destroyed exactly once by its last holder and never under a live graph. On
+the OCaml side each attachment is a lease that the instance's supervisor
+releases after closing its graph; `Runtime.shutdown` returns a typed defect
+while any lease is outstanding. Evidence: Rust integration tests for shared
+Core identity, independent replay workers on one pool, release in both
+orders, and exactly-once destruction including the GC fallback; the C ABI
+harness under ASan/UBSan; and an OCaml test covering the bridge, the lease
+ledger, two real supervisors on one runtime, public ordering errors for
+`mock://` and refused native targets, and a Linux thread-count leak check.
+The design and ownership rules are in `docs/reference/core-bridge.md`.
+
 ## 2026-10-08: Memory, history, cache and fan-out benchmarks (#527, #528)
 
 The shared benchmark harness now has an instrumented mode. Each repetition

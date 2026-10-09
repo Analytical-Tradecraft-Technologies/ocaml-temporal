@@ -65,12 +65,17 @@ type t
     Temporal's worker routing strategy; omitting it preserves the unversioned
     behavior. [io_threads] is the public network-thread bound, mapped
     to the native runtime's Tokio worker pool; omitting it selects the bridge
-    default. [activation_deadline_ms] enables the non-yielding workflow
+    default. With [runtime], the graph is attached to that shared Core
+    runtime instead (#832); the attachment lasts until the supervisor has
+    closed the graph, and a shut-down runtime is a defect. The caller
+    validates that [io_threads] and [runtime] are not both given.
+    [activation_deadline_ms] enables the non-yielding workflow
     watchdog with that positive deadline; omitting it disables the watchdog
     (the public [Worker.Options] layer supplies the default). *)
 val create :
   ?max_cached_workflows:int ->
   ?io_threads:int ->
+  ?runtime:Temporal_sdk_kernel.Shared_runtime.t ->
   ?versioning:Temporal_sdk_kernel.Bridge.worker_versioning ->
   ?activation_deadline_ms:int ->
   target_url:string ->

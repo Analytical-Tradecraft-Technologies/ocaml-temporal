@@ -505,9 +505,18 @@ module Native : sig
   (** Starts a dedicated owner Domain and creates the real Rust runtime.
       [runtime_threads] bounds that runtime's Tokio worker pool; see
       {!Temporal_core_bridge.Native_bridge.runtime_create}. An out-of-range
-      count is a [Backend] error with status [Invalid_argument]. *)
+      count is a [Backend] error with status [Invalid_argument].
+
+      With [runtime], the graph is instead attached to that shared Core
+      runtime (#832) and [runtime_threads] is ignored. The supervisor takes
+      ownership of the lease: it releases it after closing its graph during
+      [shutdown], or before returning if creation fails. *)
   val create :
-    ?runtime_threads:int -> capacity:int -> unit -> (t, error) result
+    ?runtime_threads:int ->
+    ?runtime:Sdk_shared_runtime.lease ->
+    capacity:int ->
+    unit ->
+    (t, error) result
 
   (** Runs one typed bridge operation on the sole owner Domain. Network waits
       enter Rust through C stubs which release the OCaml runtime lock. *)

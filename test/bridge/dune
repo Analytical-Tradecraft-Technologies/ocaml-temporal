@@ -7,6 +7,10 @@
  (libraries temporal-sdk temporal_core_bridge))
 
 (test
+ (name test_shared_runtime)
+ (libraries temporal-sdk temporal_core_bridge temporal_sdk_supervisor unix))
+
+(test
  (name test_ocaml_runtime_lifetime)
  (libraries temporal_core_bridge unix))
 

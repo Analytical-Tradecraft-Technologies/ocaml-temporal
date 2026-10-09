@@ -91,7 +91,7 @@ fn nonblocking_close_joins_aborted_start_tasks_before_core_drop() {
         .expect("default Temporal Core runtime options");
     let core = CoreRuntime::new(options, TokioRuntimeBuilder::default())
         .expect("default Temporal Core runtime");
-    let mut runtime = Runtime::new(core, None).expect("runtime cleanup thread starts");
+    let mut runtime = Runtime::with_owned_core(core).expect("runtime cleanup thread starts");
 
     let dropped = Arc::new(AtomicBool::new(false));
     let task = runtime
@@ -144,7 +144,7 @@ fn nonblocking_close_joins_after_terminal_result_publication() {
         .expect("default Temporal Core runtime options");
     let core = CoreRuntime::new(options, TokioRuntimeBuilder::default())
         .expect("default Temporal Core runtime");
-    let mut runtime = Runtime::new(core, None).expect("runtime cleanup thread starts");
+    let mut runtime = Runtime::with_owned_core(core).expect("runtime cleanup thread starts");
 
     let published = Arc::new(AtomicUsize::new(0));
     let dropped = Arc::new(AtomicBool::new(false));
