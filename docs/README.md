@@ -71,6 +71,10 @@ The remaining reference documents are useful when changing one subsystem:
 - [Live acceptance coverage](reference/live-acceptance-coverage.md) separates
   synthetic evidence from the verified real-server two-binary success path
   and planned scenario expansion.
+- [Transport fault qualification](reference/transport-fault-qualification.md)
+  describes the deterministic TCP fault proxy and the typed client and worker
+  outcomes it verifies when a connection is refused or an acknowledgement is
+  lost. It also explains how to reconcile an uncertain operation.
 - [Worker restart and replay acceptance design](reference/worker-restart-replay-acceptance.md)
   specifies the controlled worker-replacement scenario, its exact assertions,
   diagnostic evidence, and fresh-volume cleanup rules, and records the live
