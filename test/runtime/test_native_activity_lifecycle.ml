@@ -175,7 +175,10 @@ let worker supervisor calls =
           incr calls;
           Ok ()))
   in
-  match Worker.create ~supervisor ~activities:[ Adapter.register activity ] with
+  match
+    Worker.create ~supervisor ~activities:[ Adapter.register activity ]
+      ~worker_shutting_down:(fun () -> false)
+  with
   | Ok worker -> worker
   | Error error ->
       failwith

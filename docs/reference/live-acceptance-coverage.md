@@ -56,7 +56,7 @@ boundaries are defined by their own references, and the
 | --- | --- | --- |
 | `test-temporal-start-metadata-live` | Five exact active runs carry memo, search-attribute, combined, continued and official-CLI start metadata; workflow snapshots match before and after worker replacement | [start metadata](workflow-start-metadata.md) |
 | `test-temporal-task-failure-live` | Body, encoder and missing-registration defects leave exact runs with durable workflow-task failures; a corrected worker replays and completes them, and typed business failures keep their retryability flags | [workflow failures](workflow-failures.md) |
-| `test-temporal-live-regressions` | Each fixed-bug regression executable in `LIVE_REGRESSION_EXECUTABLES` runs once, bounded, against a fresh stack: client request IDs (#545), update admission outcomes (#546), completed-workflow queries (#548), local activity retry cancellation (#567), split workflow/activity workers (#805) and query and suspended-update recovery after sticky-cache eviction and worker replacement (#530). The run fails if any suite fails; a Docker-free contract requires every `test/integration/*/regression.exe` to be in the smoke artifact and run by CI (#795) | Each suite's `README.md` or module comment under `test/integration/` |
+| `test-temporal-live-regressions` | Each fixed-bug regression executable in `LIVE_REGRESSION_EXECUTABLES` runs once, bounded, against a fresh stack: cooperative activity cancellation and the worker-shutdown signal (#494), client request IDs (#545), update admission outcomes (#546), completed-workflow queries (#548), local activity retry cancellation (#567), split workflow/activity workers (#805) and query and suspended-update recovery after sticky-cache eviction and worker replacement (#530). The run fails if any suite fails; a Docker-free contract requires every `test/integration/*/regression.exe` to be in the smoke artifact and run by CI (#795) | Each suite's `README.md` or module comment under `test/integration/` |
 
 The [child-failure acceptance reference](child-failure-replay-acceptance.md)
 records the original PR #361 evidence. Its status is live-tested, not pending a
@@ -99,10 +99,11 @@ The live suite does not directly qualify the `~scope` path. See
 
 Cancelling observation, buffering a Core cancellation command, receiving an
 activity cancellation task, stopping an OCaml callback, and shutting down a
-worker are distinct events. The serialized callback adapter has no public
-cooperative cancellation probe; a Core cancellation task cannot preempt an
-already running OCaml callback. Worker shutdown drains owned work through its
-lifecycle path. The stop-marker checks and focused lifecycle tests do not prove
+worker are distinct events. A Core cancellation task cannot preempt an
+already running OCaml callback; it reaches the callback cooperatively at its
+next heartbeat, and the `activity_cancellation` regression (#494) is the live
+evidence for that path and for the worker-shutdown flag. Worker shutdown
+drains owned work through its lifecycle path. The stop-marker checks and focused lifecycle tests do not prove
 a bound on application callback duration or Kubernetes termination behavior.
 
 Reset, bounded visibility listing, worker deployment routing, search-attribute

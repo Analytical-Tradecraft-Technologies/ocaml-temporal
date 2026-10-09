@@ -283,15 +283,46 @@ let callback_exception_failure (diagnostic : error_view) backtrace :
           };
     }
 
+(** Maps Core's protocol reason to the context's reason one to one. *)
+let context_cancel_reason = function
+  | Protocol.Cancellation_not_found -> Activity_context.Not_found
+  | Cancellation_requested -> Requested
+  | Cancellation_timed_out -> Timed_out
+  | Cancellation_worker_shutdown -> Worker_shutdown
+  | Cancellation_paused -> Paused
+  | Cancellation_reset -> Reset
+
 (** Uses a stable, closed set of cancellation labels so cancellation failures
-    remain valid protocol strings even when the source task is malformed. *)
-let cancellation_reason = function
-  | Protocol.Cancellation_not_found -> "not_found"
-  | Cancellation_requested -> "cancelled"
-  | Cancellation_timed_out -> "timed_out"
-  | Cancellation_worker_shutdown -> "worker_shutdown"
-  | Cancellation_paused -> "paused"
-  | Cancellation_reset -> "reset"
+    remain valid protocol strings even when the source task is malformed. The
+    labels are shared with the activity context's cancellation errors. *)
+let cancellation_reason reason =
+  Activity_context.cancel_reason_label (context_cancel_reason reason)
+
+(** Converts a Core cancellation task into the value published to a running
+    attempt's context. The primary reason comes first; each independent detail
+    flag adds its reason once, in Core's field order. *)
+let context_cancellation (cancel : Protocol.activity_cancel) :
+    Activity_context.cancellation =
+  let primary = context_cancel_reason cancel.reason in
+  let flagged =
+    match cancel.details with
+    | None -> []
+    | Some details ->
+        List.filter_map
+          (fun (set, reason) -> if set then Some reason else None)
+          [
+            (details.is_cancelled, Activity_context.Requested);
+            (details.is_timed_out, Timed_out);
+            (details.is_not_found, Not_found);
+            (details.is_worker_shutdown, Worker_shutdown);
+            (details.is_paused, Paused);
+            (details.is_reset, Reset);
+          ]
+  in
+  {
+    reason = primary;
+    reasons = primary :: List.filter (fun reason -> reason <> primary) flagged;
+  }
 
 (** Converts a cancellation task into the standard Temporal canceled failure.
     Cancellation details are intentionally not copied into a second completion
@@ -650,11 +681,63 @@ let completion_exception_error ?(retryable = false) exception_ =
     (Printf.sprintf "supervisor completion raised: %s"
        (exception_error exception_).message)
 
+(** The synchronous attempt whose callback is currently executing. It exists
+    so that a Core cancellation task taken while the callback runs can be
+    routed to that attempt's context instead of becoming a second completion:
+    Core's cancellation is an update to the original start token, and the
+    start's one completion remains owned by [process_start]. [observed] keeps
+    the exact Core task so the completion can report its reason and details. *)
+type running_attempt = {
+  running_token : bytes;
+  signal : Activity_context.cancellation_signal;
+  mutable observed : Protocol.activity_cancel option;
+}
+
+(** Work taken from the supervisor by a heartbeat delivery sweep that does not
+    belong to the running attempt. Each item is handled later, in order, by
+    [poll] (or [drain] at shutdown), exactly as if it had been polled then. A
+    poll error is kept rather than dropped because the supervisor has already
+    reported it once and the lane must still observe it. *)
+type deferred_work =
+  | Deferred_task of Protocol.task
+  | Deferred_poll_error of error_view
+
+(** Bounds one delivery sweep. Core's activity slots bound the tasks that can
+    be ready, so the cap is only a guard against a misbehaving source. *)
+let max_delivery_sweep = 64
+
+(** Builds the retryable failure for a start task that a delivery sweep took
+    but the worker shut down before dispatching. The callback never ran, so
+    Temporal may retry the attempt; this mirrors the bridge's own failure of
+    tasks it could not deliver at shutdown. *)
+let undispatched_failure : Protocol.failure =
+  Protocol.
+    {
+      message = "activity task was not dispatched before the worker shut down";
+      source = "ocaml-temporal";
+      stack_trace = "";
+      encoded_attributes = None;
+      cause = None;
+      info =
+        Application
+          {
+            type_name = "ocaml_temporal_worker_shutdown";
+            non_retryable = false;
+            details = [];
+            category = Application_category_unspecified;
+            next_retry_delay = None;
+          };
+    }
+
 module Make (Supervisor : SUPERVISOR) = struct
   (** State owned by one activity adapter. Definitions never change after
       construction; [leases] contains only copied completions whose opaque
-      task-token acknowledgements are still uncertain. Every field is accessed
-      while [mutex] is held, including calls into the supervisor. *)
+      task-token acknowledgements are still uncertain. Every field except
+      [running] and [deferred] is accessed while [mutex] is held; those two
+      are guarded by [delivery_mutex] (see below). Supervisor calls are made
+      under [mutex], except the heartbeat and delivery-sweep calls that a
+      running callback makes, which rely on the supervisor mailbox being
+      safe to call from any Domain. *)
   type adapter_state = {
     (* The owner-confined native supervisor handle. It is borrowed for each
        serialized operation and never retained by a user activity. *)
@@ -674,6 +757,24 @@ module Make (Supervisor : SUPERVISOR) = struct
        mutex is acquired, preventing a handle callback from deadlocking the
        serialized poll path. *)
     async_mutex : Mutex.t;
+    (* Guards [running] and [deferred]. A delivery sweep runs inside a
+       heartbeat, i.e. inside user code that the executor calls while holding
+       [mutex], and user code may heartbeat from another Domain; the sweep
+       therefore cannot take [mutex]. Lock order: an activity context's own
+       mutex, then [delivery_mutex]; [mutex] may be held around either. While
+       holding [delivery_mutex] the adapter takes no other adapter or context
+       lock; the sweep's supervisor calls take only the mailbox's own
+       internal locks. *)
+    delivery_mutex : Mutex.t;
+    (* The synchronous attempt now running, set by [process_start] before the
+       callback and cleared after its context is invalidated, so no sweep can
+       route a cancellation to an attempt that has already finished. *)
+    mutable running : running_attempt option;
+    (* FIFO of swept work that [poll] handles before polling the supervisor. *)
+    deferred : deferred_work Queue.t;
+    (* Non-blocking, Domain-safe probe of the owning worker's stop flag,
+       exposed to activity contexts. *)
+    worker_shutting_down : unit -> bool;
   }
 
   (** The public worker handle is the mutex-confined state above. *)
@@ -700,17 +801,80 @@ module Make (Supervisor : SUPERVISOR) = struct
   let completion_exception_is_retryable exception_ =
     try Supervisor.exception_is_retryable exception_ with _ -> false
 
+  (** Runs [f] with [delivery_mutex] held. [f] must not take an adapter or
+      context lock (see the lock order on [adapter_state]). *)
+  let with_delivery adapter f =
+    Mutex.lock adapter.delivery_mutex;
+    Fun.protect ~finally:(fun () -> Mutex.unlock adapter.delivery_mutex) f
+
+  (** Routes one task taken by a delivery sweep; [delivery_mutex] is held. A
+      cancellation for the running attempt's token is published to its
+      context exactly once; everything else is deferred unchanged. *)
+  let route_swept_task adapter (task : Protocol.task) =
+    match (adapter.running, task.variant) with
+    | Some running, Cancel cancel
+      when Bytes.equal running.running_token task.task_token -> (
+        match running.observed with
+        | Some _ ->
+            (* Core sends one cancellation per attempt; a repeated update
+               carries no new obligation and the first reason stays stable. *)
+            ()
+        | None ->
+            running.observed <- Some cancel;
+            ignore
+              (Activity_context.signal_cancellation running.signal
+                 (context_cancellation cancel));
+            report Logs.Debug ~operation:"activity_cancellation_delivered" ())
+    | _ -> Queue.push (Deferred_task task) adapter.deferred
+
+  (** Delivers pending Core activity tasks while a callback is running.
+
+      The executor holds [mutex] for the whole callback, so [poll] cannot take
+      a cancellation for the running attempt until the callback returns. A
+      heartbeat is the point where the callback hands control back to the
+      SDK, and it is also how a server-side cancellation reaches Core (in the
+      heartbeat response), so the heartbeat callback ends with this
+      non-blocking sweep. It takes every ready task through the same
+      supervisor mailbox as [poll], routes the running attempt's cancellation
+      to its context, and defers anything else for [poll]. It never runs user
+      code and never submits a completion. *)
+  let deliver_pending adapter =
+    with_delivery adapter (fun () ->
+        let rec loop remaining =
+          if remaining > 0 then
+            match
+              try Ok (Supervisor.try_poll_activity adapter.supervisor)
+              with exception_ ->
+                Error (exception_error ~path:"$.poll" exception_)
+            with
+            | Ok (Ok None) -> ()
+            | Ok (Ok (Some task)) ->
+                route_swept_task adapter task;
+                loop (remaining - 1)
+            | Ok (Error source_error) ->
+                Queue.push
+                  (Deferred_poll_error
+                     (supervisor_error ~path:"$.poll"
+                        ~retryable:(source_error_is_retryable source_error)
+                        ~error_code:Supervisor.error_code
+                        ~error_message:Supervisor.error_message source_error))
+                  adapter.deferred
+            | Error error -> Queue.push (Deferred_poll_error error) adapter.deferred
+        in
+        loop max_delivery_sweep)
+
   (** Builds the context passed to one activity attempt. Heartbeats go back
       through the same typed supervisor mailbox as polling and completion; the
       callback never captures a raw Rust pointer and the token is copied for
       each request. Contexts are invalidated by [process_start] before it
       returns, so retaining one in user code cannot submit progress for a later
-      attempt. *)
-  let activity_context adapter ~token ~info ~details ~heartbeat_timeout =
+      attempt. [signal] is the attempt's cancellation cell, written by
+      [deliver_pending]. *)
+  let activity_context adapter ~token ~signal ~info ~details ~heartbeat_timeout =
     (* The callback remains valid only for this lease. It copies the token and
        every detail before crossing to the supervisor, so a caller cannot
        mutate a heartbeat after submission. *)
-    let heartbeat payloads =
+    let record payloads =
       (* Convert public payloads with indexed paths while preserving their
          order; conversion errors never reach the native callback. *)
       let rec convert index reversed = function
@@ -759,11 +923,20 @@ module Make (Supervisor : SUPERVISOR) = struct
                      source.code source.message)
                  ())
     in
-    Activity_context.create_with_info ~info ~heartbeat ~details
-      ~heartbeat_timeout
+    (* Record first, then deliver: Core can only learn of a server-side
+       cancellation from a heartbeat response, and the sweep runs even when
+       the record failed so a cancellation already queued is not missed. *)
+    let heartbeat payloads =
+      let recorded = record payloads in
+      deliver_pending adapter;
+      recorded
+    in
+    Activity_context.create_for_task ~cancellation:signal
+      ~worker_shutting_down:adapter.worker_shutting_down ~info ~heartbeat
+      ~details ~heartbeat_timeout
 
   (** Creates the registry without contacting native Core or invoking user code. *)
-  let create ~supervisor ~activities =
+  let create ~supervisor ~activities ~worker_shutting_down =
     match build_definitions activities with
     | Error error -> Error error
     | Ok definitions ->
@@ -775,6 +948,10 @@ module Make (Supervisor : SUPERVISOR) = struct
             async_leases = Token_map.empty;
             mutex = Mutex.create ();
             async_mutex = Mutex.create ();
+            delivery_mutex = Mutex.create ();
+            running = None;
+            deferred = Queue.create ();
+            worker_shutting_down;
           }
 
   (** Converts an adapter diagnostic into the base error type expected by an
@@ -1069,13 +1246,11 @@ module Make (Supervisor : SUPERVISOR) = struct
     | Some error -> Error error
     | None -> submit_lease adapter lease
 
-  (** Validates, records, and submits one completion. Invalid application data
-      becomes a bounded failure before anything is retained for transport retry.
-      Recording still precedes the native call so uncertain submissions retain
-      their exact completion; only a [Retryable] source classification may
-      authorize resubmission, while generic transport failures remain
-      fail-closed. *)
-  let enqueue_and_finish adapter ~token ~activity_type ~completion
+  (** Validates and records one completion without submitting it. Invalid
+      application data becomes a bounded failure before anything is retained
+      for transport retry. [enqueue_and_finish] submits the recorded lease at
+      once; [drain] records several and then submits them in token order. *)
+  let admit_completion adapter ~token ~activity_type ~completion
       ~accepted_result =
     let (completion : Protocol.completion) = completion in
     let token = Bytes.copy token in
@@ -1119,7 +1294,19 @@ module Make (Supervisor : SUPERVISOR) = struct
         | Async_handoff handle -> ignore (Async_activity.close handle)
         | Completed_result _ | Rejected_result _ -> ());
         Error error
-    | Ok () -> finish_lease adapter lease
+    | Ok () -> Ok lease
+
+  (** Validates, records, and submits one completion. Recording precedes the
+      native call so uncertain submissions retain their exact completion; only
+      a [Retryable] source classification may authorize resubmission, while
+      generic transport failures remain fail-closed. *)
+  let enqueue_and_finish adapter ~token ~activity_type ~completion
+      ~accepted_result =
+    let* lease =
+      admit_completion adapter ~token ~activity_type ~completion
+        ~accepted_result
+    in
+    finish_lease adapter lease
 
   (** Turns an adapter diagnostic into a non-retryable failure completion while
       preserving the original task token. *)
@@ -1137,10 +1324,17 @@ module Make (Supervisor : SUPERVISOR) = struct
     reject_task_with_failure adapter ~token ~activity_type
       ~failure:(failure_of_error error) error
 
-  (** Retires a task whose application callback raised. Must be called directly
-      from the exception handler so the captured backtrace is the callback's. *)
-  let reject_callback_exception adapter ~token ~activity_type exception_ =
-    let backtrace = Printexc.get_raw_backtrace () in
+  (** Retires a task whose application callback raised. Without [backtrace]
+      it must be called directly from the exception handler so the captured
+      backtrace is the callback's; a caller that does other work first passes
+      the backtrace it captured in the handler. *)
+  let reject_callback_exception ?backtrace adapter ~token ~activity_type
+      exception_ =
+    let backtrace =
+      match backtrace with
+      | Some backtrace -> backtrace
+      | None -> Printexc.get_raw_backtrace ()
+    in
     let backtrace =
       try Printexc.raw_backtrace_to_string backtrace with _ -> ""
     in
@@ -1149,6 +1343,48 @@ module Make (Supervisor : SUPERVISOR) = struct
     in
     reject_task_with_failure adapter ~token ~activity_type
       ~failure:(callback_exception_failure diagnostic backtrace) diagnostic
+
+  (** Reports whether an activity error claims to acknowledge cancellation. *)
+  let is_cancelled_error error =
+    match (Base_error.view error).category with
+    | `Cancelled -> true
+    | `Activity | `Bridge | `Child_workflow | `Codec | `Defect | `Nexus
+    | `Terminated | `Timeout | `Update | `Workflow ->
+        false
+
+  (** Reads the cancellation delivered to [running], under [delivery_mutex]
+      because a sweep on a callback-spawned Domain may still be writing it. *)
+  let observed_cancel adapter running =
+    with_delivery adapter (fun () -> running.observed)
+
+  (** Completes a running attempt as cancelled after its callback returned a
+      [`Cancelled] error for a delivered Core cancellation. The error's detail
+      payloads become the canceled failure's details; Core's reason and flags
+      stay private outcome metadata, as for an unstarted cancellation. *)
+  let complete_acknowledged_cancellation adapter ~token ~activity_type
+      (cancel : Protocol.activity_cancel) error =
+    let rec details_loop reversed = function
+      | [] -> Ok (List.rev reversed)
+      | payload :: rest ->
+          let* payload =
+            protocol_payload "$.completion.result.info.details" payload
+          in
+          details_loop (payload :: reversed) rest
+    in
+    match details_loop [] (Base_error.view error).details with
+    | Error error -> reject_task adapter ~token ~activity_type error
+    | Ok details ->
+        let completion =
+          Protocol.
+            {
+              task_token = Bytes.copy token;
+              result = Cancelled (cancellation_failure ~details cancel.reason);
+            }
+        in
+        enqueue_and_finish adapter ~token ~activity_type ~completion
+          ~accepted_result:
+            (Completed_result
+               { kind = Cancelled; cancellation_details = cancel.details })
 
   (** Executes an asynchronous activity callback. The handle is dormant while
       the callback runs; only an accepted remote [Will_complete_async]
@@ -1300,18 +1536,52 @@ module Make (Supervisor : SUPERVISOR) = struct
               (match decode_start definition start with
               | Error error -> reject_task adapter ~token ~activity_type error
               | Ok (input, details, heartbeat_timeout) ->
-                  let context =
-                    activity_context adapter ~token ~info:(task_info start)
-                      ~details ~heartbeat_timeout
+                  let signal = Activity_context.cancellation_signal () in
+                  let running =
+                    { running_token = Bytes.copy token; signal; observed = None }
                   in
-                  Fun.protect
-                    ~finally:(fun () -> Activity_context.invalidate context)
-                    (fun () ->
-                      match implementation context input with
-                      | exception exception_ ->
-                          reject_callback_exception adapter ~token
+                  with_delivery adapter (fun () ->
+                      adapter.running <- Some running);
+                  let context =
+                    activity_context adapter ~token ~signal
+                      ~info:(task_info start) ~details ~heartbeat_timeout
+                  in
+                  (* Capture the callback's outcome, then end the attempt
+                     before classifying it. Invalidation waits for a heartbeat
+                     in flight (possibly on a Domain the callback spawned), so
+                     once it returns no sweep can still be routing to this
+                     attempt; only then is [running] cleared and the
+                     cancellation cell read. Classifying earlier would race a
+                     sweep that delivers the cancellation after the callback
+                     returned its [`Cancelled] error. The exception backtrace
+                     is captured in the handler, before any other work. *)
+                  let returned =
+                    Fun.protect
+                      ~finally:(fun () ->
+                        Activity_context.invalidate context;
+                        with_delivery adapter (fun () ->
+                            adapter.running <- None))
+                      (fun () ->
+                        match implementation context input with
+                        | result -> Ok result
+                        | exception exception_ ->
+                            Error (exception_, Printexc.get_raw_backtrace ()))
+                  in
+                  (* No writer remains, so this is the final value. *)
+                  let delivered = observed_cancel adapter running in
+                  (match returned with
+                      | Error (exception_, backtrace) ->
+                          reject_callback_exception ~backtrace adapter ~token
                             ~activity_type exception_
-                      | Error implementation_error ->
+                      | Ok (Error implementation_error)
+                        when is_cancelled_error implementation_error
+                             && Option.is_some delivered ->
+                          (* The callback acknowledged a cancellation that
+                             Core actually requested: report it as one. *)
+                          complete_acknowledged_cancellation adapter ~token
+                            ~activity_type (Option.get delivered)
+                            implementation_error
+                      | Ok (Error implementation_error) ->
                           let diagnostic =
                             application_error ~path:"$.implementation"
                               implementation_error
@@ -1327,7 +1597,7 @@ module Make (Supervisor : SUPERVISOR) = struct
                                 reject_task_with_failure adapter ~token
                                   ~activity_type ~failure diagnostic
                           end
-                      | Ok output ->
+                      | Ok (Ok output) ->
                           (match
                              Codec.encode (Definition.output definition) output
                            with
@@ -1363,26 +1633,52 @@ module Make (Supervisor : SUPERVISOR) = struct
       reject_task adapter ~token ~activity_type
         (exception_error ~path:"$.implementation" exception_)
 
-  (** Converts a cancellation task into a canceled completion. Cancellation has
-      no activity type in the native task shape, but its independent Core
-      details are retained on the private outcome for instrumentation. They
-      remain metadata rather than being copied into the Temporal failure. *)
-  let process_cancel adapter token (cancel : Protocol.activity_cancel) =
-    let completion =
-      Protocol.
+  (** Builds the canceled completion and accepted result for a cancellation
+      whose callback never ran. Its independent Core details are retained on
+      the private outcome for instrumentation. They remain metadata rather
+      than being copied into the Temporal failure. *)
+  let cancelled_completion token (cancel : Protocol.activity_cancel) =
+    ( Protocol.
         {
           task_token = Bytes.copy token;
           result = Cancelled (cancellation_failure cancel.reason);
-        }
-    in
-    enqueue_and_finish adapter ~token ~activity_type:None ~completion
-      ~accepted_result:
-        (Completed_result
-           { kind = Cancelled; cancellation_details = cancel.details })
+        },
+      Completed_result
+        { kind = Cancelled; cancellation_details = cancel.details } )
+
+  (** Submits the cancelled completion for a task whose callback never ran:
+      a bare cancellation, or a deferred start whose cancellation was also
+      deferred. [activity_type] is known only in the second case. *)
+  let process_cancel ?activity_type adapter token
+      (cancel : Protocol.activity_cancel) =
+    let completion, accepted_result = cancelled_completion token cancel in
+    enqueue_and_finish adapter ~token ~activity_type ~completion
+      ~accepted_result
+
+  (** Removes every deferred cancellation for [token] and returns the first.
+      Core issues at most one per attempt; any repeat would only fabricate a
+      second completion for the same token, so it is dropped with the first. *)
+  let take_deferred_cancel adapter token =
+    with_delivery adapter (fun () ->
+        let found = ref None in
+        let kept = Queue.create () in
+        Queue.iter
+          (fun work ->
+            match work with
+            | Deferred_task { task_token; variant = Cancel cancel }
+              when Bytes.equal task_token token ->
+                if Option.is_none !found then found := Some cancel
+            | Deferred_task _ | Deferred_poll_error _ -> Queue.push work kept)
+          adapter.deferred;
+        Queue.clear adapter.deferred;
+        Queue.transfer kept adapter.deferred;
+        !found)
 
   (** Processes one decoded task after copying its token. The extra empty-token
       check protects the adapter if a test or future supervisor bypasses the
-      strict JSON decoder. *)
+      strict JSON decoder. A start whose cancellation a sweep already took is
+      completed as cancelled without running its callback: the cancellation
+      arrived before the attempt was admitted to the executor. *)
   let process_task adapter (task : Protocol.task) =
     let token = Bytes.copy task.task_token in
     if Bytes.length token = 0 then
@@ -1391,20 +1687,77 @@ module Make (Supervisor : SUPERVISOR) = struct
            "activity task token must not be empty")
     else
       match task.variant with
-      | Protocol.Start start -> process_start adapter token start
+      | Protocol.Start start -> (
+          match take_deferred_cancel adapter token with
+          | Some cancel ->
+              process_cancel ~activity_type:start.activity_type adapter token
+                cancel
+          | None -> process_start adapter token start)
       | Cancel cancel -> process_cancel adapter token cancel
+
+  (** Converts work deferred by delivery sweeps into recorded completions at
+      shutdown, without running user code. A deferred start is cancelled when
+      its cancellation was deferred too, and otherwise failed retryably so
+      Temporal can run it on another worker. A bare deferred cancellation owns
+      no completion and a deferred poll error no longer matters once the lanes
+      have stopped, so both are dropped. Returns the first admission error. *)
+  let retire_deferred adapter =
+    let work =
+      with_delivery adapter (fun () ->
+          let work = List.of_seq (Queue.to_seq adapter.deferred) in
+          Queue.clear adapter.deferred;
+          work)
+    in
+    let cancel_for token =
+      List.find_map
+        (function
+          | Deferred_task { task_token; variant = Cancel cancel }
+            when Bytes.equal task_token token ->
+              Some cancel
+          | Deferred_task _ | Deferred_poll_error _ -> None)
+        work
+    in
+    List.fold_left
+      (fun result work ->
+        match (result, work) with
+        | Error _, _ -> result
+        | Ok (), Deferred_task { task_token; variant = Start start } ->
+            let token = Bytes.copy task_token in
+            let completion, accepted_result =
+              match cancel_for token with
+              | Some cancel -> cancelled_completion token cancel
+              | None ->
+                  ( Protocol.
+                      {
+                        task_token = Bytes.copy token;
+                        result = Failed undispatched_failure;
+                      },
+                    Completed_result
+                      { kind = Failed; cancellation_details = None } )
+            in
+            admit_completion adapter ~token
+              ~activity_type:(Some start.activity_type) ~completion
+              ~accepted_result
+            |> Result.map ignore
+        | Ok (), (Deferred_task { variant = Cancel _; _ } | Deferred_poll_error _)
+          ->
+            result)
+      (Ok ()) work
 
   (** Retries retained activity completions while the adapter mutex is held.
       Native worker shutdown calls this before closing Rust so an explicitly
       retryable completion transport failure cannot become an outstanding
       task-token lease. A lease whose earlier failure was not retryable is not
       resubmitted; [finish_lease] returns its recorded non-retryable error, so
-      shutdown takes the terminal force-release path. *)
+      shutdown takes the terminal force-release path. Work a delivery sweep
+      deferred is first recorded as completions by [retire_deferred], so a
+      start the executor never dispatched does not outlive the worker. *)
   let drain adapter : (unit, error_view) result =
     Mutex.lock adapter.mutex;
     Fun.protect
       ~finally:(fun () -> Mutex.unlock adapter.mutex)
       (fun () ->
+        let* () = retire_deferred adapter in
         (* Retry the smallest token first for deterministic shutdown behavior;
            stop at the first failure and retain that lease. A fail-closed lease
            stops the loop without any native call. *)
@@ -1443,6 +1796,9 @@ module Make (Supervisor : SUPERVISOR) = struct
     Fun.protect
       ~finally:(fun () -> Mutex.unlock adapter.mutex)
       (fun () ->
+        (* Deferred tasks were force-retired with the rest of the native
+           graph; dispatching or completing them now would duplicate that. *)
+        with_delivery adapter (fun () -> Queue.clear adapter.deferred);
         (* A handoff that was never accepted leaves its handle reserved in
            [Handoff_pending]. Close it so external code retrying the
            retryable "not active yet" error observes a terminal error instead
@@ -1469,7 +1825,8 @@ module Make (Supervisor : SUPERVISOR) = struct
       and is resubmitted only after an explicitly retryable failure. The mutex
       covers the complete transaction, including the user implementation, so
       the map cannot race with another poll and no token can be dispatched
-      twice. *)
+      twice. Work deferred by a delivery sweep is handled, in the order it was
+      taken, before the supervisor is polled again. *)
   let poll adapter =
     Mutex.lock adapter.mutex;
     Fun.protect
@@ -1478,23 +1835,29 @@ module Make (Supervisor : SUPERVISOR) = struct
         match Token_map.min_binding_opt adapter.leases with
         | Some (_, lease) -> finish_lease adapter lease
         | None -> (
-            let polled =
-              try Ok (Supervisor.try_poll_activity adapter.supervisor)
-              with exception_ ->
-                Error (exception_error ~path:"$.poll" exception_)
-            in
-            let* polled = polled in
-            match polled with
-            | Error source_error ->
-                Error
-                  (supervisor_error ~path:"$.poll"
-                     ~retryable:(source_error_is_retryable source_error)
-                     ~error_code:Supervisor.error_code
-                     ~error_message:Supervisor.error_message source_error)
-            | Ok None ->
-                report Logs.Debug ~operation:"activity_poll_not_ready" ();
-                Ok Not_ready
-            | Ok (Some task) -> process_task adapter task))
+            match
+              with_delivery adapter (fun () -> Queue.take_opt adapter.deferred)
+            with
+            | Some (Deferred_task task) -> process_task adapter task
+            | Some (Deferred_poll_error error) -> Error error
+            | None -> (
+                let polled =
+                  try Ok (Supervisor.try_poll_activity adapter.supervisor)
+                  with exception_ ->
+                    Error (exception_error ~path:"$.poll" exception_)
+                in
+                let* polled = polled in
+                match polled with
+                | Error source_error ->
+                    Error
+                      (supervisor_error ~path:"$.poll"
+                         ~retryable:(source_error_is_retryable source_error)
+                         ~error_code:Supervisor.error_code
+                         ~error_message:Supervisor.error_message source_error)
+                | Ok None ->
+                    report Logs.Debug ~operation:"activity_poll_not_ready" ();
+                    Ok Not_ready
+                | Ok (Some task) -> process_task adapter task)))
 end
 
 (** Hides the existential constructor from callers while retaining the shared

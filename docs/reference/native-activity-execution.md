@@ -202,14 +202,15 @@ adapter mutex:
 The adapter mutex covers this whole transaction, including the user
 implementation and the native completion call. The production worker's
 dedicated activity Domain therefore executes one OCaml activity callback at a
-time and cannot poll a second activity until that callback has returned and
+time and cannot dispatch a second activity until that callback has returned and
 its immediate completion or asynchronous handoff has been acknowledged.
 Workflow activations run concurrently on the
 calling Domain; both lanes use the same serialized supervisor mailbox for
 native operations. This preserves the adapter's token-ledger ownership while
 allowing unrelated workflow progress. It does not add parallel OCaml activity
-callbacks, and cancellation tasks behind a blocked callback cannot be polled
-until that callback returns.
+callbacks. A cancellation task for the running callback reaches it only
+cooperatively, through the heartbeat sweep described under
+[Cancellation](#cancellation).
 
 The context-aware form is authored with `Temporal.Activity.define_with_context`:
 
@@ -388,12 +389,91 @@ handed to OCaml.  If the start completed before the owner drained the queued
 update, the token is gone and the update is stale, so it is discarded without
 submitting a duplicate completion.
 
-The callback adapter is serialized: this cancellation task handling does not
-preempt a callback already running under its lock. The public activity context
-exposes heartbeat/details operations, but no cooperative cancellation probe at
-the audited baseline. Workflow-side [scope hooks](workflow-scopes.md) buffer
-activity/child cancellation commands; they do not interrupt activity code.
-Worker shutdown is a separate lifecycle/drain operation. Focused lifecycle
+### Cooperative cancellation of a running callback
+
+The callback adapter is serialized, so a cancellation task never preempts a
+callback already running under its lock, and a plain poll cannot take it
+until the callback returns. Delivery is therefore cooperative and rides on the
+heartbeat, which is also how Temporal delivers a server-side cancellation to
+Core (in a heartbeat response):
+
+1. Before a synchronous callback starts, the adapter records the running
+   attempt (its token and a fresh single-assignment cancellation cell) under
+   a separate delivery mutex.
+2. Every `Context.heartbeat` first records the heartbeat, then performs a
+   non-blocking sweep: it takes every ready activity task through the same
+   supervisor mailbox as `poll` (bounded at 64 per sweep). A cancellation for
+   the running token is published to the context's cell, once; Core's first
+   reason and flags stay fixed. Any other task, such as a local-activity start
+   or a poll error, is appended to a FIFO that `poll` drains, in order, before
+   it polls the supervisor again. A sweep never runs user code or submits a
+   completion.
+3. Once a cancellation is in the cell, `Context.cancellation` returns it (a
+   lock-free atomic read, from any Domain) and every heartbeat returns a
+   non-retryable `` `Cancelled `` error after still recording its details.
+4. When the callback returns or raises, the adapter captures its outcome
+   (and, for an exception, its backtrace) without acting on it. It then
+   invalidates the context, which waits for a heartbeat still in flight, for
+   example one sent from a Domain the callback spawned, and only then clears
+   the running attempt. From that point no sweep can write the cell, so the
+   cancellation it holds is final.
+5. Only then does the captured result decide the outcome and is the terminal
+   completion submitted. `Ok` completes the attempt; an `Error` in the
+   `` `Cancelled `` category completes it as cancelled (a Temporal `Canceled`
+   failure carrying the error's detail payloads, with Core's reason and flags
+   kept as outcome metadata) only when a cancellation was delivered, and is an
+   ordinary application failure otherwise; any other `Error` fails it, and an
+   exception fails it as a defect. Classifying before step 4 would race a
+   heartbeat that delivers the cancellation after the callback returned its
+   `` `Cancelled `` error. Because the attempt is cleared before its one
+   completion is built, a cancellation that arrives later can never become a
+   second completion; it is a stale update the Rust ledger discards.
+
+Ownership and threading: the executor Domain owns the running-attempt record
+and the deferred FIFO; the delivery mutex guards them because a callback may
+heartbeat from a Domain it spawned. The cancellation cell is written only by a
+sweep and read from any Domain. Lock order is context mutex, then delivery
+mutex; the adapter mutex may be held around either. While holding the delivery
+mutex the adapter takes no other adapter or context lock; the sweep's
+supervisor calls take only the mailbox's internal locks.
+
+A start that a sweep deferred and whose cancellation was deferred too
+completes as cancelled without running its callback (cancellation before
+admission). At shutdown, `drain` records each deferred start as a cancelled
+completion in that case and otherwise as a retryable
+`ocaml_temporal_worker_shutdown` failure, mirroring the bridge's failure of
+tasks it never delivered, so no deferred lease outlives the worker and no user
+code runs during drain.
+
+A callback that never heartbeats never observes a cancellation. Remote
+activities need a `heartbeat_timeout` for prompt delivery: Core throttles
+heartbeats to the server, so a cancellation is typically delivered one or two
+heartbeats after the request. Core's local heartbeat timer and the server's
+`NotFound` response surface as `Timed_out` and `Not_found`; Core suppresses the
+completion for those, so the callback's result is discarded. Asynchronous
+callbacks have no synchronous context and are not notified; an asynchronous
+handle's heartbeat does not report cancellation.
+
+`Context.is_worker_shutting_down` reads the public worker's `closed` and
+`stop_requested` flags. Because the worker waits for the running callback
+before it drains and closes Core, Core's own `WorkerShutdown` cancellation
+cannot reach a running callback; this flag is the shutdown signal. Bounding
+shutdown for callbacks that ignore it is [#495].
+
+The focused tests in
+[`test_native_activity_execution.ml`](../../test/runtime/test_native_activity_execution.ml)
+cover delivery and reasons, outcome precedence, cancellation before admission
+and after completion, the shutdown flag, drain of deferred starts, deferred
+poll errors, and a cancellation delivered by a cross-Domain heartbeat after the
+callback returned (forced deterministically through the fake source). The [`activity_cancellation`](../../test/integration/activity_cancellation/regression.ml)
+live regression runs a workflow-requested cancellation of a heartbeating
+activity under `Wait_cancellation_completed` (the activity observes
+`Requested` and the workflow sees a `` `Cancelled `` activity error), a
+heartbeat-timeout cancellation (`Not_found` or `Timed_out`), and the shutdown
+flag of an activity-only worker shut down mid-callback.
+
+Workflow-side [scope hooks](workflow-scopes.md) buffer activity/child
+cancellation commands; they do not interrupt activity code. Focused lifecycle
 tests and the live stop marker do not establish a callback-duration or
 operational termination bound.
 

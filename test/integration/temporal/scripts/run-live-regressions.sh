@@ -88,6 +88,7 @@ in_dev 60 "$container_cli" --version
 failed=''
 for executable in "$@"; do
   case "$executable" in
+    test/integration/activity_cancellation/regression.exe|\
     test/integration/client_request_ids/regression.exe|\
     test/integration/completed_queries/regression.exe|\
     test/integration/split_worker_task_types/regression.exe|\

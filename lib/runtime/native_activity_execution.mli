@@ -132,10 +132,14 @@ module Make (Supervisor : SUPERVISOR) : sig
   val create :
     supervisor:Supervisor.t ->
     activities:registered_activity list ->
+    worker_shutting_down:(unit -> bool) ->
     (t, error_view) result
   (** Builds a registry after checking that every definition has a local
       implementation and that Temporal activity names are unique. No native call
-      or user implementation runs during creation. *)
+      or user implementation runs during creation. [worker_shutting_down] is
+      exposed to every synchronous activity context as its worker-shutdown
+      signal; it must be non-blocking and safe to call from any Domain, which
+      reading the owner's lifecycle atomics is. *)
 
   val poll : t -> (outcome, error_view) result
   (** Polls at most one task. A pending completion blocks new tasks, so an
@@ -145,11 +149,37 @@ module Make (Supervisor : SUPERVISOR) : sig
       without a native call (issue #843). [Ok Not_ready] means the native poll
       had no ready task. A retryable [Error] retains the exact completion and
       can be retried by the worker loop; a non-retryable [Error] is fatal for
-      this worker instance. *)
+      this worker instance.
+
+      Cancellation delivery (issue #494): while a synchronous callback runs,
+      each heartbeat it sends ends with a non-blocking sweep of the
+      supervisor's ready activity tasks. A Core cancellation for the running
+      attempt is published to its context, which the callback reads with
+      [Activity_context.cancellation] and which makes later heartbeats return
+      a [`Cancelled] error. Any other swept task (for example a local-activity
+      start) is deferred and handled by later polls in the order it was
+      taken; a deferred start whose cancellation was deferred too completes as
+      cancelled without running its callback.
+
+      The callback's result is classified only after its context has been
+      invalidated (which waits for a heartbeat in flight, including one from a
+      Domain the callback spawned) and the running attempt cleared, so the
+      cancellation it reads is final. Outcome precedence for a running
+      attempt: [Ok] completes it; an
+      [Error] in the [`Cancelled] category completes it as cancelled only when
+      a cancellation was delivered to its context, and is an ordinary failure
+      otherwise; any other [Error] fails it; an exception fails it as a
+      defect. A cancellation that arrives after the callback returned is an
+      update to a start whose completion is already owned, so it never creates
+      a second completion. *)
 
   (** Retries retained completions whose earlier failure was explicitly
       retryable while the adapter mutex is held; a fail-closed completion is
-      never resubmitted and its recorded error is returned instead. [Ok ()]
+      never resubmitted and its recorded error is returned instead. Work that
+      a cancellation-delivery sweep deferred is first recorded without running
+      user code: a deferred start is completed as cancelled when its
+      cancellation was also deferred, and otherwise failed retryably so
+      Temporal can run it elsewhere. [Ok ()]
       proves that no opaque activity lease remains in this adapter. [Error _]
       leaves the exact completion retained. The caller must either retry it
       after an explicitly safe transient classification or force-retire the

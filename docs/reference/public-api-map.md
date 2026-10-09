@@ -72,7 +72,12 @@ for those rules.
   with the namespace, scheduling workflow, activity ID and type, attempt,
   local-activity flag, Core-reported scheduling timestamps, and effective
   schedule-to-close, start-to-close, and heartbeat timeouts (rounded up to
-  whole milliseconds).
+  whole milliseconds). Cancellation is cooperative: `Context.cancellation`
+  returns the `Activity.Cancellation.t` (a typed `reason` such as `Requested`,
+  `Timed_out` or `Not_found`) that the worker delivered at a heartbeat, a
+  heartbeat returns a `` `Cancelled `` error once one has been delivered, and
+  returning that error completes the attempt as cancelled.
+  `Context.is_worker_shutting_down` reports that the worker has begun to stop.
 - `Temporal.Child_workflow` schedules a child workflow and exposes its typed
   future. Use its operation handle when the parent must cancel one exact child;
   child retry and cancellation policies are passed to the durable command; see
