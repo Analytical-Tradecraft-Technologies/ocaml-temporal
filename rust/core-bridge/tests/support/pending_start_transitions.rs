@@ -68,6 +68,12 @@ fn request() -> Arc<client_protocol::StartWorkflowRequest> {
         memo: Vec::new(),
         search_attributes: Vec::new(),
         id_conflict_policy: client_protocol::IdConflictPolicy::Fail,
+        id_reuse_policy: client_protocol::IdReusePolicy::AllowDuplicate,
+        execution_timeout_ms: None,
+        run_timeout_ms: None,
+        task_timeout_ms: None,
+        retry_policy: None,
+        rpc_timeout_ms: None,
     })
 }
 

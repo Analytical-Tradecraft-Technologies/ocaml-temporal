@@ -270,6 +270,7 @@ fn query(
             run_id: "run-1".to_owned(),
             query_type: "state".to_owned(),
             input: Vec::new(),
+            rpc_timeout_ms: None,
         },
     ))
 }
@@ -288,6 +289,7 @@ fn signal(
             signal_name: "poke".to_owned(),
             request_id: "signal-1".to_owned(),
             input: Vec::new(),
+            rpc_timeout_ms: None,
         },
     ))
 }

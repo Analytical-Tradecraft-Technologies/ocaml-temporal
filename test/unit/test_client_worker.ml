@@ -1530,6 +1530,192 @@ let test_current_run_handle () =
   | _ -> failwith "unknown workflow ID wait was not reported as Not_found");
   unwrap (Temporal.Client.shutdown client)
 
+(** The workflow ID reuse policy (#499) applies only once the current run has
+    closed. [`Allow_duplicate] (also the default) starts a new run after any
+    outcome; [`Allow_duplicate_failed_only] refuses a successfully completed
+    run but reuses a terminated one; [`Reject_duplicate] refuses every closed
+    run. A refusal is the same typed already-started error as a conflict, and
+    it names the closed run. The reuse policy is part of a request ID's
+    fingerprint, while the start's RPC deadline is not. *)
+let test_mock_start_id_reuse_policy () =
+  let client =
+    unwrap
+      (Temporal.Client.create ~target_url:"mock://client"
+         ~namespace:"unit-test" ())
+  in
+  let start ?id_reuse_policy ?rpc_timeout ?request_id ~id input =
+    Temporal.Client.start client ?id_reuse_policy ?rpc_timeout ?request_id
+      ~workflow:echo_workflow ~task_queue:"unit-test" ~id ~input ()
+  in
+  let expect_refused closed result =
+    match result with
+    | Ok _ -> failwith "the reuse policy did not refuse a closed run"
+    | Error error -> (
+        assert (
+          Temporal.Error.error_type error
+          = Some "WorkflowExecutionAlreadyStarted");
+        match Temporal.Client.already_started error with
+        | Some { run_id; _ } when Some run_id = Temporal.Client.run_id closed ->
+            ()
+        | Some _ | None -> failwith "reuse refusal lost the closed run")
+  in
+  let complete handle =
+    match Temporal.Client.wait handle with
+    | Ok (Temporal.Client.Completed _) -> ()
+    | Ok _ | Error _ -> failwith "mock run did not complete"
+  in
+  (* Completed run: only the default policy reuses the ID. *)
+  let completed = unwrap (start ~id:"reuse-completed" "first") in
+  complete completed;
+  expect_refused completed
+    (start ~id_reuse_policy:`Allow_duplicate_failed_only ~id:"reuse-completed"
+       "second");
+  expect_refused completed
+    (start ~id_reuse_policy:`Reject_duplicate ~id:"reuse-completed" "second");
+  let reused = unwrap (start ~id:"reuse-completed" "second") in
+  assert (Temporal.Client.run_id reused <> Temporal.Client.run_id completed);
+  (* Terminated run: failed-only reuse is allowed, reject is not. *)
+  let terminated = unwrap (start ~id:"reuse-terminated" "first") in
+  unwrap (Temporal.Client.terminate terminated);
+  expect_refused terminated
+    (start ~id_reuse_policy:`Reject_duplicate ~id:"reuse-terminated" "second");
+  let after_failure =
+    unwrap
+      (start ~id_reuse_policy:`Allow_duplicate_failed_only
+         ~id:"reuse-terminated" "second")
+  in
+  assert (Temporal.Client.started after_failure);
+  (* A fresh ID is never refused. *)
+  ignore
+    (unwrap (start ~id_reuse_policy:`Reject_duplicate ~id:"reuse-fresh" "x"));
+  (* Request-ID fingerprint: a changed reuse policy is a different start, a
+     changed RPC deadline is the same one. *)
+  let original = unwrap (start ~request_id:"reuse-fp" ~id:"reuse-fp" "x") in
+  expect_error_message_contains "workflow" "different start data"
+    (start ~request_id:"reuse-fp" ~id_reuse_policy:`Reject_duplicate
+       ~id:"reuse-fp" "x");
+  let retried =
+    unwrap
+      (start ~request_id:"reuse-fp"
+         ~rpc_timeout:(Temporal.Duration.of_ms 50L) ~id:"reuse-fp" "x")
+  in
+  assert (Temporal.Client.run_id retried = Temporal.Client.run_id original);
+  unwrap (Temporal.Client.shutdown client)
+
+(** Workflow timeouts, the retry policy, and RPC deadlines (#499) are
+    validated at the public boundary, so the mock rejects exactly what the
+    native bridge would, before anything is started. Accepted values start
+    normally; the mock ignores the server-side policies. *)
+let test_client_execution_policy_validation () =
+  let client =
+    unwrap
+      (Temporal.Client.create ~target_url:"mock://client"
+         ~namespace:"unit-test" ())
+  in
+  let ms = Temporal.Duration.of_ms in
+  let start ?id_conflict_policy ?id_reuse_policy ?execution_timeout
+      ?run_timeout ?task_timeout ?retry_policy ?rpc_timeout id =
+    Temporal.Client.start client ?id_conflict_policy ?id_reuse_policy
+      ?execution_timeout ?run_timeout ?task_timeout ?retry_policy ?rpc_timeout
+      ~workflow:echo_workflow ~task_queue:"unit-test" ~id ~input:"x" ()
+  in
+  let rejected label fragment result =
+    match result with
+    | Ok _ -> failwith (label ^ " was accepted")
+    | Error _ as error -> expect_error_message_contains "defect" fragment error
+  in
+  rejected "zero execution timeout" "execution_timeout must be positive"
+    (start ~execution_timeout:(ms 0L) "policy-zero");
+  rejected "zero run timeout" "run_timeout must be positive"
+    (start ~run_timeout:(ms 0L) "policy-zero");
+  rejected "zero task timeout" "must be positive"
+    (start ~task_timeout:(ms 0L) "policy-zero");
+  rejected "long task timeout" "at most 120 seconds"
+    (start ~task_timeout:(ms 120_001L) "policy-task");
+  rejected "run longer than execution" "run_timeout exceeds execution_timeout"
+    (start ~execution_timeout:(ms 1_000L) ~run_timeout:(ms 1_001L) "policy-run");
+  rejected "task longer than run" "task_timeout exceeds"
+    (start ~run_timeout:(ms 1_000L) ~task_timeout:(ms 1_001L) "policy-task");
+  rejected "task longer than execution" "task_timeout exceeds"
+    (start ~execution_timeout:(ms 1_000L) ~task_timeout:(ms 1_001L)
+       "policy-task");
+  rejected "zero rpc timeout" "rpc_timeout"
+    (start ~rpc_timeout:(ms 0L) "policy-rpc");
+  rejected "long rpc timeout" "rpc_timeout"
+    (start ~rpc_timeout:(ms 60_001L) "policy-rpc");
+  (* Negative and overflowing durations cannot be constructed at all. *)
+  (match ms (-1L) with
+  | exception Invalid_argument _ -> ()
+  | _ -> failwith "negative duration was constructed");
+  (match ms Int64.max_int with
+  | exception Invalid_argument _ -> ()
+  | _ -> failwith "overflowing duration was constructed");
+  (* Nothing above created a run. *)
+  let page = unwrap (Temporal.Client.list_visibility client ~query:"" ()) in
+  assert (
+    List.for_all
+      (fun (execution : Temporal.Client.visibility_execution) ->
+        not (contains_substring execution.workflow_id "policy-"))
+      page.executions);
+  let retry_policy =
+    unwrap
+      (Temporal.Activity.Retry_policy.make ~initial_interval:(ms 1_000L)
+         ~backoff_coefficient:2.0 ~maximum_interval:(ms 10_000L)
+         ~maximum_attempts:3 ())
+  in
+  let accepted =
+    unwrap
+      (start ~id_conflict_policy:`Use_existing
+         ~id_reuse_policy:`Reject_duplicate
+         ~execution_timeout:(ms 315_576_000_000_999L)
+         ~run_timeout:(ms 180_000L) ~task_timeout:(ms 120_000L) ~retry_policy
+         ~rpc_timeout:(ms 60_000L) "policy-accepted")
+  in
+  assert (Temporal.Client.started accepted);
+  (* Every bounded client RPC validates its deadline the same way. *)
+  let bad = ms 0L and good = ms 1L in
+  let defect label = function
+    | Ok _ -> failwith (label ^ " accepted a zero rpc_timeout")
+    | Error _ as error -> expect_error_message_contains "defect" "rpc_timeout" error
+  in
+  defect "signal"
+    (Temporal.Client.signal ~rpc_timeout:bad accepted
+       ~signal:add_document_signal ~input:"x");
+  unwrap
+    (Temporal.Client.signal ~rpc_timeout:good accepted
+       ~signal:add_document_signal ~input:"x");
+  let query = Temporal.Query.define ~name:"unit.query" ~output:Temporal.Codec.string in
+  defect "query" (Temporal.Client.query ~rpc_timeout:bad accepted ~query);
+  let typed_query =
+    Temporal.Query.define_with_input ~name:"unit.typed-query"
+      ~input:Temporal.Codec.string ~output:Temporal.Codec.string
+  in
+  defect "query_with_input"
+    (Temporal.Client.query_with_input ~rpc_timeout:bad accepted
+       ~query:typed_query ~input:"x");
+  let update =
+    Temporal.Update.define ~name:"unit.update" ~input:Temporal.Codec.string
+      ~output:Temporal.Codec.string
+  in
+  defect "start_update"
+    (Temporal.Client.start_update ~rpc_timeout:bad accepted ~update ~input:"x"
+       ());
+  defect "list_visibility"
+    (Temporal.Client.list_visibility ~rpc_timeout:bad client ~query:"" ());
+  defect "reset"
+    (Temporal.Client.reset ~rpc_timeout:bad ~workflow_task_finish_event_id:3L
+       accepted);
+  defect "cancel" (Temporal.Client.cancel ~rpc_timeout:bad accepted);
+  defect "terminate" (Temporal.Client.terminate ~rpc_timeout:bad accepted);
+  unwrap (Temporal.Client.cancel ~rpc_timeout:good accepted);
+  unwrap (Temporal.Client.terminate ~rpc_timeout:good accepted);
+  (* Only the uncertain-start error is recognized as one. *)
+  assert (
+    not
+      (Temporal.Client.is_start_outcome_uncertain
+         (Temporal.Error.make ~category:`Bridge ~message:"other" ())));
+  unwrap (Temporal.Client.shutdown client)
+
 (** Runs all public worker and client regression assertions. *)
 let () =
   test_duplicate_workflows ();
@@ -1546,6 +1732,8 @@ let () =
   test_mock_start_idempotent_retry ();
   test_mock_start_reuses_closed_workflow_id ();
   test_mock_start_id_conflict_policy ();
+  test_mock_start_id_reuse_policy ();
+  test_client_execution_policy_validation ();
   test_client_visibility_listing ();
   test_follow_continued_as_new_handle ();
   test_follow_rejects_malformed_successor_identity ();

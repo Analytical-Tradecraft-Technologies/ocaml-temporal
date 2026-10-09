@@ -3268,4 +3268,5 @@ module Internal = struct
   let workflow_priority = workflow_priority
   let failure = failure
   let failure_json = failure_json
+  let retry_policy_json = retry_policy_json
 end

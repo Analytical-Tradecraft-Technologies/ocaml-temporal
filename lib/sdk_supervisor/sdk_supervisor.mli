@@ -146,6 +146,26 @@ module Native : sig
       (bytes, Temporal_core_bridge.Native_bridge.error) result
     (** Canonically serializes and reparses one activity heartbeat. *)
 
+    val expired_rpc_deadline_error : Temporal_core_bridge.Native_bridge.error
+    (** The [Connection] failure with the closed [rpc] [deadline_exceeded]
+        document that Rust returns when an RPC budget expires. The supervisor
+        feeds it to a request's result decoder when the deadline expired
+        before dispatch. *)
+
+    val with_rpc_deadline :
+      now_ns:int64 ->
+      Temporal_protocol.Client_protocol.rpc_deadline option ->
+      expired:(unit -> 'a) ->
+      live:(Temporal_protocol.Client_protocol.rpc_deadline option -> 'a) ->
+      'a
+    (** Resolves a client request's caller deadline (#499) at owner-Domain
+        dispatch time [now_ns] on the monotonic clock. [live] receives
+        [None] when there is no deadline, or the deadline lowered to the
+        budget that remains, which is what the request then sends; time the
+        request spent queued behind earlier calls therefore counts. When the
+        deadline has expired, [expired ()] runs instead and nothing is
+        encoded or sent. *)
+
     val encode_client_start_request :
       Temporal_protocol.Client_protocol.start_request ->
       (bytes, Temporal_core_bridge.Native_bridge.error) result

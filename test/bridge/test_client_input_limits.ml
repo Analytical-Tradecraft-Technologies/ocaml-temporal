@@ -58,6 +58,7 @@ let operations =
                  signal_name = "add_document";
                  request_id = "signal-1";
                  input = [ input ];
+                 rpc_deadline = None;
                }));
       submit = Bridge.client_signal_workflow_json;
     };
@@ -67,7 +68,7 @@ let operations =
         (fun input ->
           unwrap_encoding
             (Protocol.encode_query_request
-               { execution; query_type = "lookup"; input = [ input ] }));
+               { execution; query_type = "lookup"; input = [ input ]; rpc_deadline = None }));
       submit = Bridge.client_query_workflow_json;
     };
     {
@@ -81,6 +82,7 @@ let operations =
                  update_id = "update-1";
                  update_name = "set_state";
                  input = [ input ];
+                 rpc_deadline = None;
                }));
       submit = Bridge.client_update_workflow_json;
     };

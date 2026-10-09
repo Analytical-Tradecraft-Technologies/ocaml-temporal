@@ -219,6 +219,12 @@ let test_client_protocol_adapter () =
       memo = [];
       search_attributes = [];
       id_conflict_policy = Client.Fail;
+      id_reuse_policy = Client.Allow_duplicate;
+      execution_timeout_ms = None;
+      run_timeout_ms = None;
+      task_timeout_ms = None;
+      retry_policy = None;
+      rpc_deadline = None;
     }
   in
   let wait_request : Client.wait_request =
@@ -229,6 +235,7 @@ let test_client_protocol_adapter () =
       execution = wait_request;
       request_id = "cancel-request-1";
       reason = "operator requested shutdown";
+      rpc_deadline = None;
     }
   in
   let signal_request : Client.signal_request =
@@ -237,6 +244,7 @@ let test_client_protocol_adapter () =
       signal_name = "add_document";
       request_id = "signal-request-1";
       input = [];
+      rpc_deadline = None;
     }
   in
   let query_request : Client.query_request =
@@ -244,6 +252,7 @@ let test_client_protocol_adapter () =
       execution = wait_request;
       query_type = "current_state";
       input = [];
+      rpc_deadline = None;
     }
   in
   let start_json =
@@ -572,6 +581,12 @@ let test_native_client_lifecycle_guards () =
       memo = [];
       search_attributes = [];
       id_conflict_policy = Client.Fail;
+      id_reuse_policy = Client.Allow_duplicate;
+      execution_timeout_ms = None;
+      run_timeout_ms = None;
+      task_timeout_ms = None;
+      retry_policy = None;
+      rpc_deadline = None;
     }
   in
   let wait_request : Client.wait_request =
@@ -622,6 +637,7 @@ let test_native_client_lifecycle_guards () =
             execution = wait_request;
             request_id = "cancel-before-connect";
             reason = "test";
+            rpc_deadline = None;
           })
    with
   | Error (Supervisor.Backend { Bridge.status = Invalid_state; _ }) -> ()
@@ -634,11 +650,286 @@ let test_native_client_lifecycle_guards () =
             signal_name = "add_document";
             request_id = "signal-before-connect";
             input = [];
+            rpc_deadline = None;
           })
    with
   | Error (Supervisor.Backend { Bridge.status = Invalid_state; _ }) -> ()
   | _ -> failwith "client signal without connection was accepted");
   expect "client lifecycle shutdown" (Ok ()) (Supervisor.shutdown supervisor)
+
+(** A deadline that expired one second ago on the monotonic clock, with a
+    one-millisecond budget, so every dispatch finds it expired. *)
+let expired_deadline () =
+  Some
+    (Client.rpc_deadline
+       ~now_ns:(Int64.sub (Bridge.monotonic_now_ns ()) 1_000_000_000L)
+       ~timeout_ms:1L)
+
+(** A deadline with a full minute remaining. *)
+let live_deadline () =
+  Some
+    (Client.rpc_deadline ~now_ns:(Bridge.monotonic_now_ns ()) ~timeout_ms:60_000L)
+
+(** A caller deadline that has already expired when the owner Domain
+    dispatches a request (#499) fails with the typed [deadline_exceeded] RPC
+    error, and the request never reaches the bridge: on this unconnected
+    supervisor a sent request would fail with [Invalid_state] instead, as the
+    same requests with a live deadline still do. An expired start is a
+    definite rejection, never an uncertain outcome. *)
+let test_expired_rpc_deadline_is_not_sent () =
+  let supervisor = Result.get_ok (Supervisor.create ~capacity:4 ()) in
+  let execution : Client.execution =
+    { namespace = "default"; workflow_id = "workflow-1"; run_id = "run-1" }
+  in
+  let start_request rpc_deadline : Client.start_request =
+    {
+      request_id = "request-1";
+      namespace = "default";
+      workflow_id = "workflow-1";
+      workflow_type = "Smoke";
+      task_queue = "queue";
+      input = [];
+      memo = [];
+      search_attributes = [];
+      id_conflict_policy = Client.Fail;
+      id_reuse_policy = Client.Allow_duplicate;
+      execution_timeout_ms = None;
+      run_timeout_ms = None;
+      task_timeout_ms = None;
+      retry_policy = None;
+      rpc_deadline;
+    }
+  in
+  let deadline_exceeded = Client.Rpc { code = "deadline_exceeded" } in
+  (* Each check returns [`Expired] for the typed deadline error, [`Sent] for
+     the unconnected bridge's [Invalid_state], and fails otherwise. *)
+  let classify label = function
+    | Ok (Error error) when error = deadline_exceeded -> `Expired
+    | Error (Supervisor.Backend { Bridge.status = Invalid_state; _ }) -> `Sent
+    | _ -> failwith (label ^ " returned an unexpected result")
+  in
+  let operations =
+    [
+      ( "start",
+        fun rpc_deadline ->
+          classify "start"
+            (Result.map
+               (Result.map ignore)
+               (Supervisor.perform supervisor
+                  (Supervisor.Client_start_workflow (start_request rpc_deadline)))) );
+      ( "begin start",
+        fun rpc_deadline ->
+          classify "begin start"
+            (Result.map
+               (Result.map ignore)
+               (Supervisor.perform supervisor
+                  (Supervisor.Client_begin_start_workflow
+                     (start_request rpc_deadline)))) );
+      ( "cancel",
+        fun rpc_deadline ->
+          classify "cancel"
+            (Supervisor.perform supervisor
+               (Supervisor.Client_cancel_workflow
+                  { execution; request_id = "c"; reason = ""; rpc_deadline })) );
+      ( "terminate",
+        fun rpc_deadline ->
+          classify "terminate"
+            (Supervisor.perform supervisor
+               (Supervisor.Client_terminate_workflow
+                  { execution; reason = ""; rpc_deadline })) );
+      ( "reset",
+        fun rpc_deadline ->
+          classify "reset"
+            (Result.map
+               (Result.map ignore)
+               (Supervisor.perform supervisor
+                  (Supervisor.Client_reset_workflow
+                     {
+                       execution;
+                       request_id = "r";
+                       reason = "";
+                       workflow_task_finish_event_id = 3L;
+                       rpc_deadline;
+                     }))) );
+      ( "signal",
+        fun rpc_deadline ->
+          classify "signal"
+            (Supervisor.perform supervisor
+               (Supervisor.Client_signal_workflow
+                  {
+                    execution;
+                    signal_name = "s";
+                    request_id = "s";
+                    input = [];
+                    rpc_deadline;
+                  })) );
+      ( "query",
+        fun rpc_deadline ->
+          classify "query"
+            (Result.map
+               (Result.map ignore)
+               (Supervisor.perform supervisor
+                  (Supervisor.Client_query_workflow
+                     { execution; query_type = "q"; input = []; rpc_deadline }))) );
+      ( "update",
+        fun rpc_deadline ->
+          classify "update"
+            (Result.map
+               (Result.map ignore)
+               (Supervisor.perform supervisor
+                  (Supervisor.Client_update_workflow
+                     {
+                       execution;
+                       update_id = "u";
+                       update_name = "n";
+                       input = [];
+                       rpc_deadline;
+                     }))) );
+      ( "visibility",
+        fun rpc_deadline ->
+          (* Visibility has no structured error channel, so the expired
+             deadline arrives as the same native failure Rust reports. *)
+          match
+            Supervisor.perform supervisor
+              (Supervisor.Client_list_visibility_workflows
+                 {
+                   namespace = "default";
+                   query = "";
+                   page_size = 10;
+                   next_page_token = None;
+                   rpc_deadline;
+                 })
+          with
+          | Error (Supervisor.Backend error)
+            when error = Supervisor.Protocol_adapter.expired_rpc_deadline_error ->
+              `Expired
+          | Error (Supervisor.Backend { Bridge.status = Invalid_state; _ }) ->
+              `Sent
+          | _ -> failwith "visibility returned an unexpected result" );
+    ]
+  in
+  List.iter
+    (fun (label, perform) ->
+      if perform (expired_deadline ()) <> `Expired then
+        failwith (label ^ " sent a request whose deadline had expired");
+      if perform (live_deadline ()) <> `Sent then
+        failwith (label ^ " did not send a request with a live deadline");
+      if perform None <> `Sent then
+        failwith (label ^ " did not send a request without a deadline"))
+    operations;
+  expect "expired deadline shutdown" (Ok ()) (Supervisor.shutdown supervisor)
+
+(** A fake supervisor backend whose client signal uses the production
+    deadline resolution, so a test can hold the owner Domain busy with a
+    long operation and observe what a queued request does at dispatch. *)
+module Queued_backend = struct
+  type config = unit
+
+  (** Budgets of the signals this backend sent, most recent first; [None]
+      marks a request sent without a deadline. Module-level so the test can
+      read it after the owner Domain has finished. *)
+  let sent : int64 option list Atomic.t = Atomic.make []
+
+  (** The fake graph has no owner-confined state. *)
+  type state = unit
+
+  type error = Bridge.error
+
+  type _ operation =
+    | Hold : (unit -> unit) -> unit operation
+        (** Occupies the owner Domain until the supplied wait returns. *)
+    | Signal :
+        Client.signal_request
+        -> (unit, Client.client_error) result operation
+        (** Resolves the deadline as the native supervisor does, then
+            records the send instead of performing an RPC. *)
+
+  let create () = Ok ()
+
+  let perform : type value. state -> value operation -> (value, error) result =
+   fun () -> function
+    | Hold wait ->
+        wait ();
+        Ok ()
+    | Signal request ->
+        Supervisor.Protocol_adapter.with_rpc_deadline
+          ~now_ns:(Bridge.monotonic_now_ns ())
+          request.rpc_deadline
+          ~expired:(fun () ->
+            Supervisor.Protocol_adapter.decode_client_signal_result
+              (Error Supervisor.Protocol_adapter.expired_rpc_deadline_error))
+          ~live:(fun deadline ->
+            let budget =
+              Option.map (fun (value : Client.rpc_deadline) -> value.timeout_ms) deadline
+            in
+            let rec record () =
+              let current = Atomic.get sent in
+              if not (Atomic.compare_and_set sent current (budget :: current))
+              then record ()
+            in
+            record ();
+            Ok (Ok ()))
+
+  let shutdown _ = Ok ()
+end
+
+module Queued = Sdk_supervisor.Make (Queued_backend)
+
+(** The caller's RPC deadline covers the time a request waits in the
+    supervisor mailbox (#499). While the owner Domain is held by a long
+    operation, a signal with a 50 ms deadline is queued behind it for about
+    300 ms: when finally dispatched it fails with the typed
+    [deadline_exceeded] error and is never sent. A signal with a two-second
+    deadline queued the same way is sent with only the budget that remains,
+    never its full original budget. *)
+let test_queued_rpc_deadline_counts_wait () =
+  let queued = Result.get_ok (Queued.create ~capacity:4 ()) in
+  let holding = Atomic.make false and release = Atomic.make false in
+  let hold () =
+    Atomic.set holding true;
+    while not (Atomic.get release) do
+      Thread.delay 0.001
+    done
+  in
+  let signal timeout_ms : Client.signal_request =
+    {
+      execution = { namespace = "default"; workflow_id = "w"; run_id = "r" };
+      signal_name = "s";
+      request_id = "s";
+      input = [];
+      rpc_deadline =
+        Some
+          (Client.rpc_deadline ~now_ns:(Bridge.monotonic_now_ns ())
+             ~timeout_ms);
+    }
+  in
+  let holder = Domain.spawn (fun () -> Queued.perform queued (Queued_backend.Hold hold)) in
+  while not (Atomic.get holding) do
+    Thread.delay 0.001
+  done;
+  (* Both deadlines start now, while the owner is already busy. *)
+  let short = signal 50L and long = signal 2_000L in
+  let short_result =
+    Domain.spawn (fun () -> Queued.perform queued (Queued_backend.Signal short))
+  in
+  let long_result =
+    Domain.spawn (fun () -> Queued.perform queued (Queued_backend.Signal long))
+  in
+  Thread.delay 0.3;
+  Atomic.set release true;
+  expect "held operation" (Ok ()) (Domain.join holder);
+  (match Domain.join short_result with
+  | Ok (Error (Client.Rpc { code = "deadline_exceeded" })) -> ()
+  | _ -> failwith "a queued expired deadline was not reported as deadline_exceeded");
+  (match Domain.join long_result with
+  | Ok (Ok ()) -> ()
+  | _ -> failwith "a queued live deadline was not sent");
+  (* Only the long signal was sent, with the budget left after its wait. *)
+  (match Atomic.get Queued_backend.sent with
+  | [ Some budget ] when budget >= 1L && budget <= 1_750L -> ()
+  | [ Some _ ] -> failwith "a queued request was sent with its full budget"
+  | _ -> failwith "an expired queued request was sent");
+  expect "queued shutdown" (Ok ()) (Queued.shutdown queued)
 
 let () =
   test_nonblocking_readiness_results ();
@@ -647,4 +938,6 @@ let () =
   test_protocol_failures_are_typed ();
   test_client_protocol_adapter ();
   test_native_lifecycle_guards ();
-  test_native_client_lifecycle_guards ()
+  test_native_client_lifecycle_guards ();
+  test_expired_rpc_deadline_is_not_sent ();
+  test_queued_rpc_deadline_counts_wait ()

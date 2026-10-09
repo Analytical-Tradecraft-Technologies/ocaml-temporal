@@ -12,6 +12,7 @@
 #include <windows.h>
 #else
 #include <sched.h>
+#include <time.h>
 #endif
 
 #include <stdint.h>
@@ -430,6 +431,35 @@ CAMLprim value ocaml_temporal_echo(value input) {
   Response_val(response)->result = native_result;
 
   CAMLreturn(response);
+}
+
+/* Read a monotonic clock in nanoseconds for client RPC deadlines (#499).
+ * The value has an arbitrary origin and is only compared with other readings
+ * in the same process, so wall-clock adjustments cannot lengthen or shorten a
+ * deadline. Windows uses the performance counter, split into whole seconds
+ * and a remainder so the scaling to nanoseconds cannot overflow; Unix-like
+ * targets use CLOCK_MONOTONIC from libc. No Rust code is involved, so the
+ * bridge ABI is unchanged. The stub touches no OCaml heap value before it
+ * allocates the boxed result. */
+CAMLprim value ocaml_temporal_monotonic_now_ns(value unit) {
+  int64_t nanoseconds;
+  (void)unit;
+#if defined(_WIN32)
+  LARGE_INTEGER counter;
+  LARGE_INTEGER frequency;
+  (void)QueryPerformanceFrequency(&frequency);
+  (void)QueryPerformanceCounter(&counter);
+  nanoseconds = (counter.QuadPart / frequency.QuadPart) * INT64_C(1000000000) +
+                (counter.QuadPart % frequency.QuadPart) * INT64_C(1000000000) /
+                    frequency.QuadPart;
+#else
+  struct timespec now;
+  if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+    caml_failwith("monotonic clock is unavailable");
+  }
+  nanoseconds = (int64_t)now.tv_sec * INT64_C(1000000000) + (int64_t)now.tv_nsec;
+#endif
+  return caml_copy_int64(nanoseconds);
 }
 
 /* Exercise a blocking Rust call with the OCaml runtime lock released. The

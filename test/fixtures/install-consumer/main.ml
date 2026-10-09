@@ -91,8 +91,11 @@ let () =
   in
   let handle =
     expect_ok "client start"
-      (T.Client.start client ~workflow ~task_queue:"queue" ~id:"consumer-id"
-         ~input:"input" ())
+      (T.Client.start client ~id_reuse_policy:`Reject_duplicate
+         ~execution_timeout:(T.Duration.of_ms 60_000L)
+         ~task_timeout:(T.Duration.of_ms 10_000L)
+         ~rpc_timeout:(T.Duration.of_ms 5_000L) ~workflow ~task_queue:"queue"
+         ~id:"consumer-id" ~input:"input" ())
   in
   ignore (T.Client.workflow_id handle, Option.get (T.Client.run_id handle));
   (match expect_ok "client wait" (T.Client.wait handle) with

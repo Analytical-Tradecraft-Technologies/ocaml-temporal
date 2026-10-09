@@ -157,6 +157,7 @@ fn update_request() -> UpdateWorkflowRequest {
         update_id: "update-1".to_owned(),
         update_name: "set_state".to_owned(),
         input: Vec::new(),
+        rpc_timeout_ms: None,
     }
 }
 
