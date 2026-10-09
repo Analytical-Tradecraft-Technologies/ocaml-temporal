@@ -28,13 +28,16 @@ settings as labelled optional arguments:
   `max_task_queue_activities_per_second`.
 
 Times are `Duration.t` values bounded to one day. Rates must be positive
-finite floats. Counts must be between 1 and 1,000,000.
+finite floats, and the worker rate must be at least one per day because Core
+converts its reciprocal into a `Duration` and would otherwise panic during
+worker construction. Counts must be between 1 and 1,000,000.
 
 Every invalid value is a typed defect returned before anything is allocated.
 That includes zero, negative, overflowing, NaN, infinite and subnormal
 values, as well as these contradictions:
 
-- a caching worker with fewer than two workflow task slots or pollers;
+- a caching worker with fewer than two workflow task slots or two fixed
+  pollers;
 - unordered autoscaling bounds;
 - an explicit default heartbeat interval above an explicit maximum.
 
@@ -58,8 +61,11 @@ private worker document. OCaml omits it when nothing is set, so a default
 worker's document is unchanged and the ABI stays at version 4. An archive
 built before this change rejects only a tuned worker, with a typed
 configuration error. An autoscaling maximum must equal
-`max_concurrent_workflow_task_polls`, so the existing two-poller cache rule
-still covers it.
+`max_concurrent_workflow_task_polls`. Core splits a fixed poller count
+between the sticky and normal queues but applies autoscaling bounds to each
+queue separately, so the bounds are documented as per-queue and the
+two-poller cache rule applies only to fixed counts. The Rust mapping test
+asserts the per-buffer poller behaviors.
 
 Evidence:
 

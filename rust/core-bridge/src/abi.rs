@@ -2957,7 +2957,11 @@ impl WorkerConfigInput {
             self.max_concurrent_workflow_task_polls,
             false,
         )?;
+        // Core's `wft_poller_behavior` splits only `SimpleMaximum` between the
+        // sticky and normal buffers; an autoscaling behavior is given to each
+        // buffer unchanged, so a caching worker always has two pollers.
         if self.max_cached_workflows > 0
+            && self.tuning.workflow_task_poller_autoscaling.is_none()
             && self.max_concurrent_workflow_task_polls < MIN_CACHED_WORKFLOW_POLLS
         {
             return Err(Failure {
@@ -3141,7 +3145,7 @@ impl WorkerTuningInput {
             sticky_queue_schedule_to_start_timeout: sticky,
             max_heartbeat_throttle_interval: max_heartbeat,
             default_heartbeat_throttle_interval: default_heartbeat,
-            max_worker_activities_per_second: tuning_rate(
+            max_worker_activities_per_second: worker_rate(
                 "max_worker_activities_per_second",
                 self.max_worker_activities_per_second,
             )?,
@@ -3197,6 +3201,26 @@ fn tuning_rate(name: &str, value: Option<f64>) -> std::result::Result<Option<f64
             status: STATUS_CONFIGURATION,
             message: format!("{name} must be a positive finite number"),
         }),
+    }
+}
+
+/// Smallest accepted per-worker activity rate: one poll per day. Its
+/// reciprocal (about 86400 s) is far inside `Duration`'s range.
+const MIN_WORKER_ACTIVITIES_PER_SECOND: f64 = 1.0 / 86_400.0;
+
+/// Validates the per-worker activity rate. Core's `PollRateLimiter::new`
+/// computes `Duration::from_secs_f64(rate.recip())`, which panics inside
+/// worker construction when the reciprocal overflows `Duration`; bounding the
+/// reciprocal to one day keeps that conversion total. The task-queue rate is
+/// only forwarded to the server and needs no such bound.
+fn worker_rate(name: &str, value: Option<f64>) -> std::result::Result<Option<f64>, Failure> {
+    let rate = tuning_rate(name, value)?;
+    match rate {
+        Some(rate) if rate < MIN_WORKER_ACTIVITIES_PER_SECOND => Err(Failure {
+            status: STATUS_CONFIGURATION,
+            message: format!("{name} must be at least one per day (1/86400)"),
+        }),
+        _ => Ok(rate),
     }
 }
 

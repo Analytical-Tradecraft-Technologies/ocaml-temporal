@@ -208,13 +208,11 @@ module Options = struct
                ~message:
                  "workflow_task_pollers initial must be between minimum and \
                   maximum")
-        else if caching && maximum < 2 then
-          Error
-            (Error.defect
-               ~message:
-                 "workflow_task_pollers maximum must be at least 2 when \
-                  max_cached_workflows is greater than zero")
-        else Ok ()
+        else
+          (* Core applies autoscaling bounds to each poll queue separately,
+             so a caching worker always has at least one sticky and one
+             normal poll and needs no extra two-poller rule here. *)
+          Ok ()
 
   (** Rejects an optional duration outside [minimum_ms] to one day. *)
   let validate_duration ~minimum_ms field = function
@@ -232,6 +230,10 @@ module Options = struct
                  (Printf.sprintf "%s must be between %Ld ms and one day" field
                     minimum_ms))
 
+  (** Smallest per-worker activity rate: one poll per day, matching the
+      other resource bounds. *)
+  let min_worker_rate = 1.0 /. 86_400.0
+
   (** Rejects a rate that Core or the server would refuse or misread: zero,
       negative, NaN, infinite or subnormal. *)
   let validate_rate field = function
@@ -240,6 +242,20 @@ module Options = struct
         Ok ()
     | Some _ ->
         Error (Error.defect ~message:(field ^ " must be a positive finite number"))
+
+  (** Validates the per-worker rate. Core turns it into a poll interval with
+      [Duration::from_secs_f64 (1 / rate)], which panics during worker
+      construction when the reciprocal does not fit a [Duration], so a rate
+      below one poll per day is rejected here instead. *)
+  let validate_worker_rate field value =
+    let ( let* ) = Result.bind in
+    let* () = validate_rate field value in
+    match value with
+    | Some rate when rate < min_worker_rate ->
+        Error
+          (Error.defect
+             ~message:(field ^ " must be at least one per day (1/86400)"))
+    | _ -> Ok ()
 
   (** Validates every timing and rate setting. Core clips the default
       heartbeat throttle interval to the maximum, so an explicit default above
@@ -280,7 +296,7 @@ module Options = struct
       | _ -> Ok ()
     in
     let* () =
-      validate_rate "max_worker_activities_per_second"
+      validate_worker_rate "max_worker_activities_per_second"
         max_worker_activities_per_second
     in
     validate_rate "max_task_queue_activities_per_second"

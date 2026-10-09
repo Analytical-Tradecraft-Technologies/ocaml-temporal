@@ -142,6 +142,35 @@ let test_invalid_tuning () =
         (with_tuning
            { tuned with max_task_queue_activities_per_second = Some value }))
     [ 0.0; -1.0; Float.nan; Float.infinity; 5e-324 ];
+  (* The worker rate's reciprocal becomes a Core Duration, so it is bounded
+     to one day; the task-queue rate is only forwarded to the server. *)
+  List.iter
+    (fun value ->
+      expect_rejected "max_worker_activities_per_second must be at least one"
+        (with_tuning { tuned with max_worker_activities_per_second = Some value }))
+    [ Float.min_float; 1e-6 ];
+  ignore
+    (unwrap
+       (with_tuning
+          {
+            tuned with
+            max_worker_activities_per_second = Some (1.0 /. 86_400.0);
+            max_task_queue_activities_per_second = Some Float.min_float;
+          }));
+  (* Autoscaling bounds are per poll queue, so a caching worker with one
+     poll per queue is valid even though one fixed poller is not. *)
+  ignore
+    (unwrap
+       (config ~max_concurrent_workflow_task_polls:1
+          ~tuning:
+            {
+              tuned with
+              workflow_task_poller_autoscaling =
+                Some { minimum = 1; maximum = 1; initial = 1 };
+            }
+          ()));
+  expect_rejected "max_concurrent_workflow_task_polls must be at least 2"
+    (config ~max_concurrent_workflow_task_polls:1 ());
   (* Grace period and counts keep their original bounds. *)
   expect_rejected "graceful_shutdown_timeout_ms"
     (config ~graceful_shutdown_timeout_ms:86_400_001L ());

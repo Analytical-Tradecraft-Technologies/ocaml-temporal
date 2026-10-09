@@ -677,13 +677,25 @@ object. Closed Draft 2020-12 schemas live under `docs/schemas/bridge/`.
 `max_task_queue_activities_per_second`. Every member is optional, and an
 absent member keeps Core's default. The OCaml encoder omits the whole object
 when no member is set, so a default worker sends exactly the pre-#498
-document. Both sides validate it: durations are 1 ms to one day, rates must
-be positive normal numbers, an explicit default heartbeat interval must not
-exceed an explicit maximum, and autoscaling bounds must satisfy
-`minimum <= initial <= maximum` with `maximum` equal to
-`max_concurrent_workflow_task_polls`. That equality keeps the existing field
-meaning "most workflow polls" in every document, so the two-poller cache
-invariant needs no second rule. The object is closed like every other
+document. Both sides validate it:
+
+- durations are 1 ms to one day;
+- rates must be positive normal numbers;
+- the worker rate must also be at least one per day, because Core's
+  `PollRateLimiter::new` converts its reciprocal with
+  `Duration::from_secs_f64` and panics during worker construction when that
+  overflows (the task-queue rate is only forwarded to the server);
+- an explicit default heartbeat interval must not exceed an explicit
+  maximum;
+- autoscaling bounds must satisfy `minimum <= initial <= maximum`, with
+  `maximum` equal to `max_concurrent_workflow_task_polls`.
+
+Core's `wft_poller_behavior` splits a fixed `max_concurrent_workflow_task_polls`
+between the normal and sticky poll buffers, but hands an autoscaling behavior
+unchanged to each buffer. Autoscaling bounds are therefore per queue: a
+caching worker may keep up to twice `maximum` polls open. The two-poller
+cache rule applies only to a fixed count, since autoscaling always gives
+each queue at least one poll. The object is closed like every other
 document. The change is additive within ABI version 4. An older OCaml object
 never sends `tuning`. A newer object paired with an archive built before #498
 gets a typed configuration error at worker start, and only when it sets a

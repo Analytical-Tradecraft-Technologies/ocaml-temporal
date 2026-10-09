@@ -94,7 +94,10 @@ type poller_autoscaling = { minimum : int; maximum : int; initial : int }
 
     - [workflow_task_poller_autoscaling] replaces the fixed workflow poller
       count with Core's server-driven autoscaling; its [maximum] must equal
-      [max_concurrent_workflow_task_polls].
+      [max_concurrent_workflow_task_polls]. Core applies these bounds to the
+      sticky and normal poll buffers separately, whereas it splits a fixed
+      count between them, so the two-poller cache rule applies only to a
+      fixed count.
     - [sticky_queue_schedule_to_start_timeout_ms] (Core default 10 s) bounds
       how long a task waits on this worker's sticky queue before the server
       moves it to the normal queue.
@@ -132,7 +135,7 @@ val default_worker_tuning : worker_tuning
 
     [tuning] (default {!default_worker_tuning}) is validated here and again
     by Rust: tuning durations must be between 1 ms and one day, rates must be
-    positive finite numbers, an explicit default heartbeat throttle interval
+    positive finite numbers, the worker rate must be at least one per day, an explicit default heartbeat throttle interval
     must not exceed an explicit maximum, and autoscaling bounds must satisfy
     [1 <= minimum <= initial <= maximum]. *)
 val worker_config :

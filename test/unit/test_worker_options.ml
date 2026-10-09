@@ -112,11 +112,13 @@ let test_uncached_single_slot () =
   expect_defect "workflow_task_pollers must be at least 2"
     (Options.make ~max_cached_workflows:1 ~workflow_task_pollers:(Options.Fixed 1)
        ());
-  expect_defect "workflow_task_pollers maximum must be at least 2"
-    (Options.make
-       ~workflow_task_pollers:
-         (Options.Autoscaling { minimum = 1; maximum = 1; initial = 1 })
-       ())
+  (* Autoscaling bounds apply to each poll queue, so one poll per queue
+     still gives a caching worker a sticky and a normal poll. *)
+  let per_queue = Options.Autoscaling { minimum = 1; maximum = 1; initial = 1 } in
+  assert (
+    Options.workflow_task_pollers
+      (unwrap (Options.make ~workflow_task_pollers:per_queue ()))
+    = per_queue)
 
 (** Zero, negative and overflowing counts are rejected. *)
 let test_invalid_counts () =
@@ -177,7 +179,18 @@ let test_invalid_rates () =
         (Options.make ~max_worker_activities_per_second:value ());
       expect_defect "max_task_queue_activities_per_second"
         (Options.make ~max_task_queue_activities_per_second:value ()))
-    [ 0.0; -0.0; -1.0; Float.nan; Float.infinity; Float.neg_infinity; 5e-324 ]
+    [ 0.0; -0.0; -1.0; Float.nan; Float.infinity; Float.neg_infinity; 5e-324 ];
+  (* Core turns the worker rate's reciprocal into a Duration, which panics
+     on overflow, so the worker rate must be at least one per day. *)
+  List.iter
+    (fun value ->
+      expect_defect "max_worker_activities_per_second must be at least one per day"
+        (Options.make ~max_worker_activities_per_second:value ()))
+    [ Float.min_float; 1e-6; 1.0 /. 86_400.0 /. 2.0 ];
+  ignore
+    (unwrap
+       (Options.make ~max_worker_activities_per_second:(1.0 /. 86_400.0)
+          ~max_task_queue_activities_per_second:Float.min_float ()))
 
 (** A worker reports the options it was created with, and the legacy
     [~max_cached_workflows] argument is folded into those options. *)

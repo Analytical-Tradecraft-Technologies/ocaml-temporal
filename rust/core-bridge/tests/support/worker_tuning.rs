@@ -40,6 +40,36 @@ const DEFAULT_DOCUMENT: &str = concat!(
     "\"task_types\":{\"workflows\":true,\"activities\":true}}"
 );
 
+/// Per-buffer workflow poller behavior that pinned Core (95e9768) derives in
+/// its private `worker::wft_poller_behavior`: a `SimpleMaximum` total is
+/// split, giving the normal buffer `max(1, floor(total * ratio))` and the
+/// sticky buffer the rest (at least one), while an autoscaling behavior is
+/// handed unchanged to each buffer. Core does not export the function, so
+/// this mirror is pinned by the `nonsticky_to_sticky_poll_ratio` assertion
+/// below and must be re-checked on every Core upgrade. Returns the normal
+/// buffer's behavior and, for a caching worker, the sticky buffer's.
+fn per_buffer_pollers(config: &WorkerConfig) -> (PollerBehavior, Option<PollerBehavior>) {
+    let sticky = config.max_cached_workflows > 0;
+    match config.workflow_task_poller_behavior {
+        PollerBehavior::SimpleMaximum(total) => {
+            let ratio = f64::from(config.nonsticky_to_sticky_poll_ratio);
+            let mut normal = 0_usize;
+            // Integer floor of `total * ratio` without a lossy float cast.
+            while f64::from(u32::try_from(normal + 1).expect("small count"))
+                <= f64::from(u32::try_from(total).expect("small count")) * ratio
+            {
+                normal += 1;
+            }
+            let normal = normal.max(1);
+            (
+                PollerBehavior::SimpleMaximum(normal),
+                sticky.then(|| PollerBehavior::SimpleMaximum(total.saturating_sub(normal).max(1))),
+            )
+        }
+        autoscaling => (autoscaling, sticky.then_some(autoscaling)),
+    }
+}
+
 /// Decodes one document through the same strict decoder as the C ABI.
 fn decode(text: &str) -> Result<WorkerConfigInput, super::Failure> {
     // SAFETY: `text` owns `text.len()` initialized bytes for the whole call.
@@ -112,6 +142,76 @@ fn tuned_document_maps_every_option_onto_core() {
     assert_eq!(
         config.activity_task_poller_behavior,
         PollerBehavior::SimpleMaximum(1)
+    );
+    // Autoscaling bounds are per buffer: the sticky and normal queues each
+    // scale between 2 and 6 polls, so up to 12 polls can be open in total.
+    let scaled = PollerBehavior::Autoscaling {
+        minimum: 2,
+        maximum: 6,
+        initial: 3,
+    };
+    assert_eq!(per_buffer_pollers(&config), (scaled, Some(scaled)));
+}
+
+/// Pins the input of Core's fixed-count split and the resulting per-buffer
+/// pollers: a fixed count is a total shared by the two queues.
+#[test]
+fn fixed_pollers_are_split_between_buffers() {
+    let config = core(DEFAULT_DOCUMENT).expect("default document should be valid");
+    assert!((config.nonsticky_to_sticky_poll_ratio - 0.2).abs() < f32::EPSILON);
+    assert_eq!(
+        per_buffer_pollers(&config),
+        (
+            PollerBehavior::SimpleMaximum(1),
+            Some(PollerBehavior::SimpleMaximum(1))
+        )
+    );
+    let five = core(&DEFAULT_DOCUMENT.replacen(
+        "\"max_concurrent_workflow_task_polls\":2",
+        "\"max_concurrent_workflow_task_polls\":5",
+        1,
+    ))
+    .expect("five pollers should be valid");
+    assert_eq!(
+        per_buffer_pollers(&five),
+        (
+            PollerBehavior::SimpleMaximum(1),
+            Some(PollerBehavior::SimpleMaximum(4))
+        )
+    );
+}
+
+/// Because each buffer gets the full autoscaling range, a caching worker
+/// with a per-queue maximum of one still polls both queues, so the
+/// two-poller rule for fixed counts does not apply.
+#[test]
+fn caching_autoscaling_accepts_one_poll_per_queue() {
+    let text = TUNED_DOCUMENT
+        .replacen(
+            "{\"minimum\":2,\"maximum\":6,\"initial\":3}",
+            "{\"minimum\":1,\"maximum\":1,\"initial\":1}",
+            1,
+        )
+        .replacen(
+            "\"max_concurrent_workflow_task_polls\":6",
+            "\"max_concurrent_workflow_task_polls\":1",
+            1,
+        );
+    let config = core(&text).expect("per-queue autoscaling of one should be valid");
+    let one = PollerBehavior::Autoscaling {
+        minimum: 1,
+        maximum: 1,
+        initial: 1,
+    };
+    assert_eq!(per_buffer_pollers(&config), (one, Some(one)));
+    // The same single poller as a fixed count would leave one queue unpolled.
+    expect_rejected(
+        &DEFAULT_DOCUMENT.replacen(
+            "\"max_concurrent_workflow_task_polls\":2",
+            "\"max_concurrent_workflow_task_polls\":1",
+            1,
+        ),
+        "max_concurrent_workflow_task_polls must be at least 2",
     );
 }
 
@@ -260,4 +360,30 @@ fn activity_rates_must_be_positive() {
             expect_rejected(&tuned_with(&from, &to), field);
         }
     }
+}
+
+/// Core converts the worker rate's reciprocal into a `Duration` and panics
+/// when it overflows, so the bridge requires at least one poll per day. The
+/// smallest normal float, which once passed validation, is now rejected
+/// before Core sees it; the task-queue rate is only forwarded to the server.
+#[test]
+fn worker_rate_reciprocal_is_bounded() {
+    let from = "\"max_worker_activities_per_second\":2.5";
+    for invalid in ["2.2250738585072014e-308", "1e-6", "0.0000115"] {
+        let to = format!("\"max_worker_activities_per_second\":{invalid}");
+        expect_rejected(&tuned_with(from, &to), "at least one per day");
+    }
+    // Just above one per day (1/86400 is about 0.0000115741). The exact
+    // boundary is not used because JSON decoding may round it by one ULP.
+    let config = core(&tuned_with(
+        from,
+        "\"max_worker_activities_per_second\":0.0000116",
+    ))
+    .expect("a rate just above one per day should be valid");
+    assert_eq!(config.max_worker_activities_per_second, Some(0.0000116));
+    let tiny_queue_rate = tuned_with(
+        "\"max_task_queue_activities_per_second\":40.5",
+        "\"max_task_queue_activities_per_second\":2.2250738585072014e-308",
+    );
+    core(&tiny_queue_rate).expect("the server-side rate has no reciprocal bound");
 }

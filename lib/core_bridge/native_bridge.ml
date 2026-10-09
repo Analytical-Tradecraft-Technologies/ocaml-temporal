@@ -430,6 +430,20 @@ let validate_rate name = function
       Ok ()
   | Some _ -> configuration_error (name ^ " must be a positive finite number")
 
+(** Smallest accepted per-worker activity rate: one poll per day. *)
+let min_worker_rate = 1.0 /. 86_400.0
+
+(** Checks the per-worker rate. Core computes its poll interval as
+    [Duration::from_secs_f64 (1 / rate)], which panics inside worker
+    construction when the reciprocal overflows, so the reciprocal is bounded
+    to one day. The task-queue rate is only forwarded to the server. *)
+let validate_worker_rate name value =
+  let* () = validate_rate name value in
+  match value with
+  | Some rate when rate < min_worker_rate ->
+      configuration_error (name ^ " must be at least one per day (1/86400)")
+  | _ -> Ok ()
+
 (** Validates the optional settings together with the poller maximum they
     must agree with. An autoscaling poller's maximum is carried in
     [max_concurrent_workflow_task_polls], so the two can never disagree. *)
@@ -485,7 +499,7 @@ let validate_tuning ~max_concurrent_workflow_task_polls tuning =
     | _ -> Ok ()
   in
   let* () =
-    validate_rate "max_worker_activities_per_second"
+    validate_worker_rate "max_worker_activities_per_second"
       tuning.max_worker_activities_per_second
   in
   validate_rate "max_task_queue_activities_per_second"
@@ -545,8 +559,12 @@ let worker_config ~namespace ~task_queue ~build_id ?(versioning = No_versioning)
         max_outstanding_workflow_tasks;
       validate_count ~allow_zero:false "max_concurrent_workflow_task_polls"
         max_concurrent_workflow_task_polls;
+      (* Core splits only a fixed poller count between the sticky and normal
+         queues; autoscaling bounds apply to each queue, so the two-poller
+         rule does not apply to them. *)
       (if
          max_cached_workflows > 0
+         && Option.is_none tuning.workflow_task_poller_autoscaling
          && max_concurrent_workflow_task_polls < min_cached_workflow_polls
        then
          configuration_error

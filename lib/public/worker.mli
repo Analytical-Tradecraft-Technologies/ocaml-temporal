@@ -39,15 +39,24 @@ module Options : sig
   type activation_deadline = [ `After of Duration.t | `Disabled ]
 
   (** How many concurrent workflow-task polls the worker keeps open against
-      the server. [Fixed n] keeps up to [n] polls open. [Autoscaling] lets
-      Temporal Core scale between [minimum] and [maximum] polls from server
-      feedback, starting at [initial]; it requires
-      [1 <= minimum <= initial <= maximum]. While the sticky cache is enabled
-      Core splits the polls between the worker's sticky queue and the normal
-      queue, so a caching worker needs at least two: [Fixed n] needs
-      [n >= 2] and [Autoscaling] needs [maximum >= 2]. A poll is only issued
-      when a workflow-task slot is free, so polls beyond
-      [max_concurrent_workflow_tasks] just wait. *)
+      the server. While the sticky cache is enabled the worker polls two
+      queues, its own sticky queue and the shared normal queue, and the two
+      variants treat them differently:
+
+      - [Fixed n] is a total of [n] polls that Temporal Core splits between
+        the queues: [max 1 (n / 5)] on the normal queue and the rest, at
+        least one, on the sticky queue. A caching worker therefore needs
+        [n >= 2]. Core applies the same normal-queue share without the
+        cache, so an uncached worker keeps [max 1 (n / 5)] polls open.
+      - [Autoscaling] bounds apply to {e each} queue separately: Core scales
+        every queue between [minimum] and [maximum] polls from server
+        feedback, starting at [initial], and requires
+        [1 <= minimum <= initial <= maximum]. A caching worker can thus
+        keep up to [2 * maximum] polls open, and at least [2 * minimum].
+        Without the cache there is only the normal queue.
+
+      A poll is only issued when a workflow-task slot is free, so polls
+      beyond [max_concurrent_workflow_tasks] just wait. *)
   type workflow_task_pollers =
     | Fixed of int
     | Autoscaling of { minimum : int; maximum : int; initial : int }
@@ -106,7 +115,9 @@ module Options : sig
         maximum; others use the default. An explicit default above an
         explicit maximum returns a defect.
       - [max_worker_activities_per_second] limits how many remote activity
-        tasks this worker polls per second. Core applies it to polled tasks
+        tasks this worker polls per second. It must be at least one per day
+        ([1. /. 86400.]), because Core turns its reciprocal into the
+        interval between polls. Core applies it to polled tasks
         only; an activity dispatched eagerly with its workflow task
         bypasses it unless the activity sets [~do_not_eagerly_execute:true].
         [max_task_queue_activities_per_second] asks the server to limit

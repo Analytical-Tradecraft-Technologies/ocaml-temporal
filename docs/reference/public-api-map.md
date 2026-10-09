@@ -200,7 +200,10 @@ for those rules.
   `?max_task_queue_activities_per_second`. Each invalid, overflowing or
   contradictory value is a typed defect returned before anything is
   allocated. For example, a caching worker with fewer than two workflow task
-  slots or pollers is rejected. One accessor per setting reports the
+  slots or two fixed pollers is rejected, and so is a per-worker activity
+  rate below one per day. A fixed poller count is a total that Core splits
+  between the sticky and normal queues, while autoscaling bounds apply to
+  each queue. One accessor per setting reports the
   effective value, defaults included, and `Worker.options` returns the
   options a worker was created with. Activity slot counts are not options:
   the serial activity executor fixes them at one (#777).
