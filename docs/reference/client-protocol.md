@@ -800,6 +800,22 @@ example a Temporal Server restart) are retried by Core inside the pending
 observation, up to thirty consecutive attempts per long poll, so they do not
 end the wait (#820); a definitive status such as `not_found` still does.
 
+Every history poll carries the gRPC metadata `supported-features:
+follows-next-run-id`, Temporal Server's flag for a client that follows the
+`new_execution_run_id` of a completed, failed, or timed-out close event
+(#971). Without it the server, for compatibility with SDKs from before 2021,
+rewrites such a close event in a close-event-only history response into a
+synthetic `WorkflowExecutionContinuedAsNew` event. A run retried by its
+workflow retry policy would then be reported as `continued_as_new` and lose
+the failure that caused the retry. With the flag the response carries the
+real close event: a retried failure is `failed` with its failure and
+successor, a retried timeout is `timed_out` with its successor, a cron
+completion is `completed` with its successor, and only an explicit
+continue-as-new is `continued_as_new`. The official SDKs do not send this
+header because their result methods follow every successor link anyway; this
+SDK's exact-run wait reports the link to the caller instead, so it needs the
+true close event. The header is per request and does not change the ABI.
+
 The public `Temporal.Client.wait handle` performs that retry loop internally:
 it resubmits the same exact-run request after each bounded `NOT_READY` result
 and yields the calling Domain between attempts. Code using the private bridge

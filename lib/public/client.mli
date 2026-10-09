@@ -82,16 +82,22 @@ type 'output terminal_result =
           when this run completed, or [None]; following it is the caller's
           choice. *)
   | Failed of { error : Error.t; successor : execution option }
-      (** Failure and optional retry successor. Following it is the caller's
+      (** Failure and optional successor: the run a workflow retry policy or
+          cron schedule started after this failure, or [None]. A retried run
+          is reported here with the failure that caused the retry, never as
+          [Continued_as_new]. Following the successor is the caller's
           choice. *)
   | Cancelled of Error.t  (** The exact run reached the cancellation state. *)
   | Terminated of Error.t
       (** The exact run was terminated by an operator or another client. *)
   | Timed_out of { error : Error.t; successor : execution option }
-      (** Timeout and optional successor. Following it is the caller's choice. *)
+      (** Timeout and optional successor: the run a workflow retry policy or
+          cron schedule started after the run timed out, or [None]. Following
+          it is the caller's choice. *)
   | Continued_as_new of execution
-      (** The run continued as new; the caller decides whether to wait on the
-          returned successor identity. *)
+      (** The run explicitly continued as new; the caller decides whether to
+          wait on the returned successor identity. A retry or cron link is
+          reported by the close event's own constructor instead. *)
 
 (** What [start] does when its workflow ID already has an open (running) run.
     The policy never affects a closed run: Temporal's default reuse policy
@@ -225,11 +231,11 @@ val create :
     [retry_policy] asks Temporal to retry a failed or timed-out run as a new
     run of the same workflow ID. Omitted, a workflow is not retried. The
     policy is the same validated {!Activity.Retry_policy.t} used for
-    activities. An exact-run {!wait} on the closed run links the retry run as
-    its successor; the pinned Temporal server reports that link to this
-    client as [Continued_as_new] rather than as [Failed] with a successor, so
-    accept either. A current-run handle from {!get_handle} follows the retry
-    chain to its last run.
+    activities. An exact-run {!wait} on a run that was retried returns
+    [Failed] with the error that caused the retry, or [Timed_out], with the
+    retry run as its successor; it never reports a retry as
+    [Continued_as_new]. A current-run handle from {!get_handle} follows the
+    retry chain to its last run.
 
     [rpc_timeout] bounds this start call only (default 10 seconds; see
     {{!section-rpc_deadlines} RPC deadlines}). If it expires while the start
