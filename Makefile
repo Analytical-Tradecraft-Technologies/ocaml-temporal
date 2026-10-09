@@ -563,14 +563,13 @@ test-temporal-live-ci:
 test-temporal-diagnostics-contract:
 	bash test/integration/temporal/scripts/test-live-diagnostics-contract.sh
 
-# Fixed-bug, feature and recovery live regressions (#499, #530, #545, #546, #548,
-# #567, #805)
-# that each own their workers and a unique task queue. Most have a per-suite
-# test-*-live target that runs one suite against any disposable server; this
-# list is what CI executes (#795). Every entry must also be in scripts/ci-smoke-executables.txt,
+# Live regressions for fixed bugs, features and recovery paths that each own
+# their workers and a unique task queue. Most have a per-suite test-*-live
+# target that runs one suite against any disposable server; this list is what
+# CI executes (#795). Every entry must also be in scripts/ci-smoke-executables.txt,
 # and test/smoke/test_live_regressions_contract.sh fails when a regression
 # executable under test/integration is neither here nor otherwise run by CI.
-LIVE_REGRESSION_EXECUTABLES := test/integration/client_policies/regression.exe test/integration/client_request_ids/regression.exe test/integration/completed_queries/regression.exe test/integration/interaction_recovery/regression.exe test/integration/local_activity_cancellation/regression.exe test/integration/split_worker_task_types/regression.exe test/integration/update_outcomes/regression.exe
+LIVE_REGRESSION_EXECUTABLES := test/integration/client_policies/regression.exe test/integration/client_request_ids/regression.exe test/integration/completed_queries/regression.exe test/integration/interaction_recovery/regression.exe test/integration/local_activity_cancellation/regression.exe test/integration/split_worker_task_types/regression.exe test/integration/update_outcomes/regression.exe test/integration/worker_resource_options/regression.exe
 # Seconds for each regression process; the suites normally finish in seconds.
 LIVE_REGRESSION_TIMEOUT_SECONDS ?= 180
 

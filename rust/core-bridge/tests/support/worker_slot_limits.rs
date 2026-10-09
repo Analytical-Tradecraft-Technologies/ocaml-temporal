@@ -15,6 +15,7 @@ fn config(cache: u32, tasks: u32) -> WorkerConfigInput {
         max_concurrent_workflow_task_polls: 2,
         graceful_shutdown_timeout_ms: 1_000,
         task_types: Default::default(),
+        tuning: Default::default(),
     }
 }
 

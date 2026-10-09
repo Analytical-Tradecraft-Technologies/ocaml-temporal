@@ -93,6 +93,43 @@ val conformance_wait_ms : int -> (unit, error) result
 val client_config :
   target_url:string -> identity:string -> (client_config, error) result
 
+(** Autoscaling bounds for Core's workflow-task pollers: at least [minimum]
+    and at most [maximum] concurrent polls, starting from [initial]. *)
+type poller_autoscaling = { minimum : int; maximum : int; initial : int }
+
+(** Optional Core worker settings added by #498. Each [None] keeps Core's
+    default. Durations are milliseconds and rates are tasks per second.
+
+    - [workflow_task_poller_autoscaling] replaces the fixed workflow poller
+      count with Core's server-driven autoscaling; its [maximum] must equal
+      [max_concurrent_workflow_task_polls]. Core applies these bounds to the
+      sticky and normal poll buffers separately, whereas it splits a fixed
+      count between them, so the two-poller cache rule applies only to a
+      fixed count.
+    - [sticky_queue_schedule_to_start_timeout_ms] (Core default 10 s) bounds
+      how long a task waits on this worker's sticky queue before the server
+      moves it to the normal queue.
+    - [max_heartbeat_throttle_interval_ms] (default 60 s) and
+      [default_heartbeat_throttle_interval_ms] (default 30 s) bound how often
+      activity heartbeats are flushed to the server.
+    - [max_worker_activities_per_second] limits this worker's remote activity
+      starts; [max_task_queue_activities_per_second] asks the server to limit
+      the whole task queue, and the most recent poller's value wins.
+
+    An all-[None] value is not serialized, so a default worker sends exactly
+    the document that bridges built before #498 accept. *)
+type worker_tuning = {
+  workflow_task_poller_autoscaling : poller_autoscaling option;
+  sticky_queue_schedule_to_start_timeout_ms : int64 option;
+  max_heartbeat_throttle_interval_ms : int64 option;
+  default_heartbeat_throttle_interval_ms : int64 option;
+  max_worker_activities_per_second : float option;
+  max_task_queue_activities_per_second : float option;
+}
+
+(** Every tuning field set to [None]. *)
+val default_worker_tuning : worker_tuning
+
 (** Validates worker settings without constructing a worker.
     Counts are explicit so resource policy is visible to the application.
 
@@ -102,7 +139,13 @@ val client_config :
     tasks that a sibling worker on the same task queue could execute. Local
     activities follow [workflow_tasks] because Core dispatches them in-process.
     At least one kind must be enabled; otherwise a [Configuration] error is
-    returned. Replay workers ignore both: Core forces workflow-only replay. *)
+    returned. Replay workers ignore both: Core forces workflow-only replay.
+
+    [tuning] (default {!default_worker_tuning}) is validated here and again
+    by Rust: tuning durations must be between 1 ms and one day, rates must be
+    positive finite numbers, the worker rate must be at least one per day, an explicit default heartbeat throttle interval
+    must not exceed an explicit maximum, and autoscaling bounds must satisfy
+    [1 <= minimum <= initial <= maximum]. *)
 val worker_config :
   namespace:string ->
   task_queue:string ->
@@ -112,10 +155,16 @@ val worker_config :
   max_outstanding_workflow_tasks:int ->
   max_concurrent_workflow_task_polls:int ->
   graceful_shutdown_timeout_ms:int64 ->
+  ?tuning:worker_tuning ->
   ?workflow_tasks:bool ->
   ?activity_tasks:bool ->
   unit ->
   (worker_config, error) result
+
+(** The exact private JSON document that worker startup sends to Rust. It
+    contains only routing and resource settings, never credentials, so it can
+    be logged or compared in tests to inspect the effective configuration. *)
+val worker_config_document : worker_config -> string
 
 (** Largest explicit Tokio worker-thread count accepted by [runtime_create]. *)
 val max_runtime_worker_threads : int
