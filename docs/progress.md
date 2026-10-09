@@ -49,6 +49,48 @@ with its completion still accepted. Asynchronous handles are not yet
 notified of cancellation, and bounded shutdown for callbacks that ignore the
 signal remains #495.
 
+## 2026-10-09: Dependency inventory checked against its pinned sources (#783)
+
+`docs/dependencies.md` had drifted from what is built: it still named the
+`~dev` package version, PostgreSQL 16.13 and Temporal 1.31.0 service images,
+319 Cargo dependencies, `base64` 0.22.1 and Tokio 1.52.3 as direct crates, and
+older `taiki-e/install-action` and `msys2/setup-msys2` pins, and it omitted
+`conf-protoc`, `conf-rust-2024`, `mtime`, and the `uuid` and `prost` direct
+crates. The inventory was regenerated from the locked inputs, with every
+licence re-read from package metadata (`opam show -f license` or the
+opam-repository manifest, `cargo metadata`, crates.io, or the upstream
+repository). It now records each OPAM package's role (runtime, test-only,
+build, system check, or compiler), the per-compiler lock overrides, the odoc
+closure, one table for the complete linking-exception scope (compiler,
+build-only ocamlbuild, and the three CI-only odoc packages), the Rust and
+Python images, a direct Rust dependency table, and every GitHub Action with
+its pin. The stale note that odoc was rejected was replaced, since #794 adopted
+it as a CI-only renderer.
+
+`scripts/check-dependency-inventory.sh` (`make check-dependency-inventory`)
+compares those tables with `temporal-sdk.opam(.locked)`,
+`scripts/opam-lock-overrides.txt`, `scripts/docs-tools.locked`, every
+digest-pinned image in the Dockerfiles, Compose file, and workflows,
+`rust/Cargo.lock` package count and locked versions, the workspace and bridge
+Cargo manifests (including crates the bridge declares directly; an
+unattributable dependency table fails closed), `rust/rust-toolchain.toml`, the
+quality-tool pins, and every external `uses:` reference. The
+linking-exception table is compared with the locked versions of the compiler,
+ocamlbuild, and the three CI-only odoc packages, so upgrading one fails until
+that policy row is reviewed. `make license-check` runs it first, so the
+standalone license job fails when Dependabot or a manual bump changes a pin
+without its inventory row. It compares names, versions, and pins only;
+licence columns stay a reviewed record behind the existing OPAM and Cargo
+licence gates. `make test-dependency-inventory-contract`, also run in that
+job, accepts the committed tree and a CRLF copy of the document and rejects
+24 single-source drifts, each named by table.
+
+Licence findings: no new or changed licence fell outside the policy. The
+Python image's CPython licence is recorded as the PSF stack (SPDX
+`Python-2.0`) because GitHub's detector reports `NOASSERTION` for it; the image
+is CI-only. `actions/checkout` remains referenced by its `v7` tag rather than a
+commit, unlike every other action.
+
 ## 2026-10-09: Bounded replay completions (#965)
 
 `replay_worker_accepts_one_history_document` hung intermittently on Windows CI
