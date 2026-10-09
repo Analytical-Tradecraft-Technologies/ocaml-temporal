@@ -836,10 +836,19 @@ module Native_backend = struct
   module Bridge = Temporal_core_bridge.Native_bridge
   module Client = Temporal_protocol.Client_protocol
 
-  (* Optional Tokio worker-thread count for the runtime (#832); [None]
-     selects the bridge default. *)
-  type config = int option
-  type state = Bridge.runtime
+  (* Where the graph's Core runtime comes from (#832): [Owned threads]
+     builds a private Core with an optional Tokio worker bound ([None]
+     selects the bridge default); [Attached lease] runs on a shared Core. *)
+  type config =
+    | Owned of int option
+    | Attached of Sdk_shared_runtime.lease
+
+  (* The owner-confined graph plus, for an attached graph, the lease that
+     this supervisor releases only after the graph has been closed. *)
+  type state = {
+    runtime : Bridge.runtime;
+    lease : Sdk_shared_runtime.lease option;
+  }
   type error = Bridge.error
   type _ operation =
     | Check_compatibility : unit operation
@@ -914,14 +923,24 @@ module Native_backend = struct
     | Shutdown_worker : unit operation
     | Disconnect_client : unit operation
 
-  (** Creates the runtime through the ownership-safe C stubs, bounding its
-      Tokio worker pool when [worker_threads] is supplied. *)
-  let create worker_threads = Bridge.runtime_create ?worker_threads ()
+  (** Creates the graph through the ownership-safe C stubs: either with its
+      own Core, bounding its Tokio pool when a count is supplied, or attached
+      to a shared Core. A failed attach does not release the lease; the
+      supervisor's [create] wrapper owns that release. *)
+  let create = function
+    | Owned worker_threads ->
+        Result.map
+          (fun runtime -> { runtime; lease = None })
+          (Bridge.runtime_create ?worker_threads ())
+    | Attached lease ->
+        Result.map
+          (fun runtime -> { runtime; lease = Some lease })
+          (Sdk_shared_runtime.attach lease)
 
   (** Revalidates the statically linked ABI without exposing the runtime. The
       state argument proves the operation remains ordered with lifecycle use. *)
   let perform : type value. state -> value operation -> (value, error) result =
-   fun runtime -> function
+   fun { runtime; _ } -> function
     | Check_compatibility ->
         Bridge.check_abi_version Bridge.abi_version
     | Connect_client config -> Bridge.client_connect runtime config
@@ -1063,7 +1082,7 @@ module Native_backend = struct
   (** Requests reverse-order child teardown and always closes the parent graph.
       Runtime close is itself defensive and reclaims any child remaining after
       an earlier error; the first diagnostic is preserved for the caller. *)
-  let shutdown runtime =
+  let shutdown { runtime; lease } =
     let replay_result = Bridge.replay_worker_dispose runtime in
     let worker_result = Bridge.worker_shutdown runtime in
     let client_result =
@@ -1072,6 +1091,9 @@ module Native_backend = struct
       | Error _ as error -> error
     in
     let runtime_result = Bridge.runtime_close runtime in
+    (* [runtime_close] has detached the graph and, on every result, dropped
+       its Core reference, so the shared runtime no longer depends on it. *)
+    Option.iter Sdk_shared_runtime.release lease;
     match (replay_result, worker_result, client_result, runtime_result) with
     | Error _ as error, _, _, _ -> error
     | Ok (), (Error _ as error), _, _ -> error
@@ -1084,8 +1106,22 @@ module Native = struct
   include Make (Native_backend)
 
   (** Shadows the generic constructor so callers name the optional runtime
-      thread bound instead of passing the backend's raw [config]. *)
-  let create ?runtime_threads ~capacity () = create ~capacity runtime_threads
+      thread bound or shared-runtime lease instead of passing the backend's
+      raw [config]. The supervisor owns [runtime] from this call on: on
+      success it releases the lease after closing its graph; on any failure
+      (including an owner Domain that never started, so the backend never
+      saw the lease) it is released here before returning. *)
+  let create ?runtime_threads ?runtime ~capacity () =
+    let config =
+      match runtime with
+      | Some lease -> Native_backend.Attached lease
+      | None -> Native_backend.Owned runtime_threads
+    in
+    match create ~capacity config with
+    | Ok _ as created -> created
+    | Error _ as error ->
+        Option.iter Sdk_shared_runtime.release runtime;
+        error
 
   module Protocol_adapter = Protocol_adapter
   module Client = Temporal_protocol.Client_protocol
