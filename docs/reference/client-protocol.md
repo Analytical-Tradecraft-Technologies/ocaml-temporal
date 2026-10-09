@@ -28,9 +28,11 @@ Every operation copies input bytes before Rust releases the OCaml runtime lock.
 Rust copies its output into an owned result buffer. The OCaml C stub copies that
 buffer into an OCaml `bytes` value and frees the native result in a protected
 cleanup path. Synchronous operations do not retain a JSON string or payload
-pointer after the call. The asynchronous start operation retains only a
-Rust-owned typed request inside its bounded Tokio task; its ticket and final
-outcome cross the same copied JSON result boundary.
+pointer after the call. Submitted calls (the path the public client uses for
+every RPC, see [Submitted client calls](#submitted-client-calls-807)) and the
+asynchronous start ticket retain only a Rust-owned typed request inside their
+Tokio task; the call identifier or ticket and the final outcome cross the same
+copied JSON result boundary.
 
 ## Start a workflow
 
@@ -162,14 +164,16 @@ built-in budget, both as the outer `tokio::time::timeout` and as Core's retry
 window and per-attempt gRPC deadline (see `budgeted_request`). When absent,
 the defaults are unchanged: 10 seconds for start and visibility, 3 seconds
 for cancel, terminate, reset, and signal, and 30 seconds for queries and
-update acceptance. The one-minute ceiling exists because control RPCs, queries,
-and update admission run synchronously on the supervisor's owner Domain.
+update acceptance. The one-minute ceiling bounds how long one caller can hold
+a task and a connection clone for one call; since #807 no deadline occupies
+the supervisor's owner Domain, because every RPC runs as a submitted call.
 Exact-run waits and update completion polls keep their own bounded internal
 polls and accept no deadline.
 
 The deadline covers the whole client call, including the time the request
-waits in the supervisor's FIFO mailbox behind earlier calls on the same
-client (#807). The public client turns `?rpc_timeout` into an
+waits in the supervisor's FIFO mailbox. Since #807 that queue holds only
+submissions, which never wait for the network, so the wait is short, but the
+deadline still counts it. The public client turns `?rpc_timeout` into an
 `Client_protocol.rpc_deadline`: the budget plus an absolute expiry on a
 monotonic clock (a private C stub over `CLOCK_MONOTONIC`, or the performance
 counter on Windows), read before the request is enqueued. When the owner
@@ -201,10 +205,12 @@ pending-start equality check, so a reconciling retry with the same
 `request_id` may use a different deadline.
 
 The direct `start_workflow_json` ABI can return the successful response shown
-above, but the public HTTP(S) client uses the asynchronous ticket path. It
-begins the request, waits for the ticket to become terminal, and converts the
+above, but the public HTTP(S) client submits the start as a
+[submitted call](#submitted-client-calls-807) whose outcome is the closed
+accepted/rejected/unknown document of the ticket path below. It converts the
 accepted execution into the typed handle; rejected and unknown outcomes become
-typed `Error.t` results. The ticket never leaves the private supervisor.
+typed `Error.t` results. The call identifier never leaves the private
+supervisor and backend.
 
 On success Rust returns:
 
@@ -287,6 +293,89 @@ queued result is then dropped with the receiver rather than being delivered to
 an absent caller. This is the cancellation boundary for asynchronous starts:
 Rust tasks never call OCaml, and no task is detached while it retains a Core
 connection clone.
+
+## Submitted client calls (#807)
+
+One `Client.t` used to serve every call on its supervisor Domain one at a
+time, and that Domain waited for the network inside each call: a pending
+exact-run wait held it for 100 ms per turn, and a query, update admission, or
+update poll for up to 30 seconds. Every other call on the client, including
+shutdown, queued behind them. The public client now performs every RPC
+(start, wait, cancel, terminate, reset, signal, query, update admission,
+update poll, and visibility) as a submitted call:
+
+1. The caller sends a `Client_submit` message to the supervisor. The owner
+   Domain resolves the request's RPC deadline (an expired one completes the
+   call at once and nothing is sent), encodes the request, and calls
+   `ocaml_temporal_core_v4_client_submit_json` with a closed operation
+   selector (`1` start, `2` wait, `3` cancel, `4` terminate, `5` reset,
+   `6` signal, `7` query, `8` update, `9` update poll, `10` visibility) and
+   the operation's usual request document.
+2. Rust validates the document, checks capacity, registers one completion
+   cell under a fresh numeric call identifier bound to the runtime graph's
+   owner identity, spawns one Tokio task that owns a connection clone and
+   the validated request, and returns the handle `<owner>.<call>` as ASCII
+   decimal digits. The owner returns at once.
+3. The caller waits on its own Domain with
+   `ocaml_temporal_core_v4_client_await_call(owner, call, timeout_ms)`. That
+   symbol takes no runtime pointer: the pair names a cell in a process-wide
+   registry, so the wait never touches the owner's graph. The C stub releases
+   the OCaml runtime lock for the whole wait, which ends as soon as the
+   task publishes its outcome. `NOT_READY` means the bounded interval (at
+   most one minute; the OCaml client uses one second) elapsed and the caller
+   waits again.
+
+The terminal result retires the call and is exactly what the operation's
+synchronous symbol returns, with one exception: a start yields the closed
+`accepted`/`rejected`/`unknown` outcome of the ticket path. A task never calls
+OCaml and never touches the runtime; it only writes its own cell. A task that
+panics or is dropped without an outcome settles its cell with `PANIC` or the
+closed status, so no waiter is stranded.
+
+Capacity is unchanged for the two long-lived kinds: at most 64 distinct runs
+being waited on and 64 distinct start request IDs in flight, where repeats of
+an in-flight run or request ID share a slot (Temporal deduplicates the
+request ID, so concurrent identical starts report the same run). A start
+whose request ID is in flight for a different request is rejected with
+`PROTOCOL`. All submitted calls of one runtime together are capped at 4,096.
+A call counts from submission until its completion cell is retired, not
+merely until its RPC finishes: a finished but unread outcome keeps its slot,
+so callers that abandon calls cannot grow the process-wide registry without
+bound. A cell is retired by the caller's terminal read, by
+`ocaml_temporal_core_v4_client_release_call(owner, call)`, or by disconnect
+or close. The OCaml await loop calls the release symbol from a
+`Fun.protect` finalizer whenever it is left without a terminal read (an
+exception, including an asynchronous one), so in practice only a caller that
+never awaits at all holds a slot until shutdown; there is no time-based
+reclaim of such cells. Releasing drops any published outcome and frees the
+slot; a still-running task finishes into the closed cell at its own
+deadline. Release, like await, takes no runtime, and a mismatched owner or
+unknown call is a silent no-op.
+Admission beyond a bound returns `RESOURCE_EXHAUSTED` (status `15`) before
+any task exists, which the public client reports as `Client.is_at_capacity`.
+
+Client disconnect and runtime close (including the garbage-collector
+fallback) release every call of that runtime: they first close each pending
+cell, which wakes its waiter with `INVALID_STATE` (status `5`), then abort the
+tasks and join them before the connection and Core are dropped. An await on a
+retired or unknown identifier also reports `INVALID_STATE`; no submitted
+operation produces that status from inside its task.
+
+A call is reachable only through the graph that submitted it. Each runtime
+graph draws a random 62-bit owner identity when it is created; the registry
+records it with every call, and an await whose owner does not match is
+answered exactly like an unknown identifier (`INVALID_STATE`, same message)
+without waiting on, settling, or retiring the call. A caller therefore cannot
+read or consume another client's outcome, nor learn whether another
+client's call exists, by guessing identifiers. The handle stays inside the
+private supervisor and backend; public callers never see it. The OCaml supervisor maps
+it to its typed `Closed` error, which the public client reports as the
+ordinary closed-client error, or as an uncertain start when the request may
+already have been sent.
+
+The synchronous symbols and the start ticket symbols remain in ABI version 4
+for direct bridge callers and tests. The three new symbols are additive: an
+older OCaml object never calls them, so the ABI version is unchanged.
 
 ## Address the current run of a workflow
 
@@ -761,7 +850,11 @@ with that transition but have already entered the supervisor are allowed to
 finish in supervisor mailbox order. Calls that have not entered it fail with
 the typed bridge error `client is shut down`; this applies to `start`, `wait`,
 `cancel`, `signal`, and `follow`, including calls made through handles retained
-before shutdown.
+before shutdown. Calls already submitted and still in flight are not waited
+for: closing the graph closes their completion cells (see
+[Submitted client calls](#submitted-client-calls-807)), so a pending `wait`,
+query, or update poll returns `client is shut down` at once, and a start that
+may have been sent returns the uncertain-start error.
 
 For an HTTP(S) client, the supervisor admits one terminal shutdown request,
 waits for earlier admitted operations, and joins its owner Domain. The native
@@ -816,11 +909,15 @@ header because their result methods follow every successor link anyway; this
 SDK's exact-run wait reports the link to the caller instead, so it needs the
 true close event. The header is per request and does not change the ABI.
 
-The public `Temporal.Client.wait handle` performs that retry loop internally:
-it resubmits the same exact-run request after each bounded `NOT_READY` result
-and yields the calling Domain between attempts. Code using the private bridge
-directly may handle the status itself, but ordinary client callers receive only
-a terminal `Ok` value or an outer typed `Error.t`.
+The bounded `NOT_READY` loop belongs to the synchronous
+`client_wait_workflow_json` symbol. The public `Temporal.Client.wait handle`
+instead submits the same request document as a
+[submitted call](#submitted-client-calls-807) (#807): one Tokio task performs
+the close-event long poll, including pagination and the transient-failure
+retries above, for as long as the run stays open, while the caller waits on
+the call's completion cell and the supervisor owner stays free for other
+calls. Ordinary client callers receive only a terminal `Ok` value or an outer
+typed `Error.t`.
 
 For example, a terminal response has this shape:
 
@@ -912,8 +1009,11 @@ shutdown still invalidates all handles.
 
 Acceptance and completion are deliberately separate: an accepted update may
 still be waiting behind workflow code, and a pending poll is not a failure.
-The OCaml supervisor serializes both requests through the one native owner;
-Rust owns the Temporal protobuf and gRPC state and returns only copied JSON.
+Both requests are [submitted calls](#submitted-client-calls-807): the
+supervisor owner only submits them, and the caller waits for the admission or
+poll outcome on its own Domain, so a long acceptance wait or completion poll
+never delays other calls on the client (#807). Rust owns the Temporal
+protobuf and gRPC state and returns only copied JSON.
 No Rust task calls an OCaml closure, and update failures are typed `Error.t`
 values rather than exceptions.
 

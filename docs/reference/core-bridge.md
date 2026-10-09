@@ -62,6 +62,27 @@ than a version 5 contract. The completed-run successor exposed by the OCaml
 client in the same change (#837) was already part of the version 4 wait
 response.
 
+Submitted client calls (#807) are also additive within version 4.
+`ocaml_temporal_core_v4_client_submit_json` takes a closed `uint32_t`
+operation selector (`OCAML_TEMPORAL_CORE_CLIENT_CALL_*`) and the operation's
+existing request document, spawns the RPC on a Tokio task, and returns the
+handle `<owner>.<call>`: the submitting graph's random owner identity and the
+call identifier. `ocaml_temporal_core_v4_client_await_call(owner, call,
+timeout_ms)` takes that pair, not a runtime, and serves only the owner that
+submitted the call; any other owner gets the same `INVALID_STATE` as an
+unknown call and leaves the call untouched.
+`ocaml_temporal_core_v4_client_release_call(owner, call)` abandons a call
+without reading it; a call counts against the runtime's 4,096-call ceiling
+until it is read, released, or its runtime closes, even after its RPC ends.
+The await symbol waits a bounded interval for the outcome, which is the
+same document or failure the synchronous symbol returns (a start yields the
+ticket path's outcome document). No document, status value, or existing
+symbol changes, and an older OCaml object never calls the three new
+symbols, so
+the version and symbol prefix stay at 4. The completion registry, its
+ownership, and its shutdown behavior are described in the
+[client protocol](client-protocol.md#submitted-client-calls-807).
+
 The canonical header is
 `rust/core-bridge/include/ocaml_temporal_core.h`. Both Rust and C compile-time
 assertions protect the status width, every numeric status value, and field

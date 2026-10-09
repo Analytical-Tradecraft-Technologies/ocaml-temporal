@@ -521,6 +521,19 @@ let native_supervisor_error = function
           (Printf.sprintf "native client supervisor failed: %s"
              (Printexc.to_string exception_))
 
+(** Submits one native client request and awaits its outcome on the calling
+    Domain (#807). Only submission passes through the supervisor's owner
+    Domain; the RPC runs on a Rust task and the caller waits on that call's
+    own completion cell, so a long wait, query, or update poll on one thread
+    never delays a call on another. A call that shutdown closed while it was
+    in flight, or that reached a supervisor already closing, reports the same
+    error as a call made after shutdown. *)
+let native_call (client : native_client) rpc =
+  match Native.call client.supervisor rpc with
+  | Ok value -> Ok value
+  | Error Native.Closed -> Error (bridge_error "client is shut down")
+  | Error error -> Error (native_supervisor_error error)
+
 (** The [Error.error_type] of the error returned when a [`Fail] start finds an
     open run with the same workflow ID. It is Temporal's own failure name
     ([WorkflowExecutionAlreadyStartedFailure] without the suffix, as the
@@ -1133,69 +1146,54 @@ let uncertain_start_error ?reason ~request_id ~workflow_id () =
          workflow_id request_id suffix)
     ()
 
-(** Starts one native workflow through the asynchronous ticket path. Each
-    bounded wait releases the OCaml runtime lock inside the C bridge; retrying
-    [None] keeps the supervisor mailbox able to accept shutdown and other
-    lifecycle messages.
+(** Starts one native workflow as a submitted call (#807). The owner Domain
+    only validates and submits it; this caller then waits on the call's own
+    completion cell with the OCaml runtime lock released, so a slow start
+    never delays other operations on the client.
 
-    Once a ticket has been issued the request belongs to a Rust task that may
-    already have reached Temporal. Client shutdown aborts and retires that
-    ticket, so any later lifecycle failure (closed client, closed supervisor,
-    or a bridge error such as a retired ticket) is reported as an uncertain
-    start rather than a plain shutdown error that would imply nothing was
-    sent. Before admission the start is definitely not sent and the ordinary
-    shutdown error remains accurate. *)
+    Once the start has been submitted the request belongs to a Rust task that
+    may already have reached Temporal. Client shutdown aborts that task and
+    closes its completion cell, so any later lifecycle failure (closed
+    client, closed supervisor, or another bridge error) is reported as an
+    uncertain start rather than a plain shutdown error that would imply
+    nothing was sent. Before admission the start is definitely not sent and
+    the ordinary shutdown error remains accurate. *)
 let native_client_start (client : native_client) (request : start_request) :
     (start_response, Error.t) result =
   if Atomic.get client.closed then Error (bridge_error "client is shut down")
   else
     let request = native_start_request client request in
-    match Native.perform client.supervisor (Native.Client_begin_start_workflow request) with
+    match
+      Native.perform client.supervisor (Native.Client_submit (Native.Rpc_start request))
+    with
+    | Error Native.Closed -> Error (bridge_error "client is shut down")
     | Error error -> Error (native_supervisor_error error)
-    | Ok (Error error) -> Error (native_client_error ~namespace:client.namespace error)
-    | Ok (Ok ticket) ->
+    | Ok submitted -> (
         let uncertain ?reason () =
           Error
             (uncertain_start_error ?reason ~request_id:request.request_id
                ~workflow_id:request.workflow_id ())
         in
-        let rec await_outcome () : (start_response, Error.t) result =
-          if Atomic.get client.closed then
+        (* The request now belongs to a Rust task that may already have
+           reached Temporal, so every failure from here on is uncertain. The
+           wait happens on this caller's Domain, never on the owner. *)
+        match Native.await_client_call submitted with
+        | Ok (Client_protocol.Accepted { execution; started }) ->
+            Ok
+              {
+                workflow_id = execution.workflow_id;
+                run_id = execution.run_id;
+                started;
+              }
+        | Ok (Client_protocol.Rejected error) ->
+            Error (native_client_error ~namespace:client.namespace error)
+        | Ok (Client_protocol.Unknown { request_id; workflow_id }) ->
+            Error (uncertain_start_error ~request_id ~workflow_id ())
+        | Error Native.Closed ->
             uncertain ~reason:"client shut down before the start outcome was observed" ()
-          else
-            match
-              Native.perform client.supervisor
-                (Native.Client_wait_start_workflow ticket)
-            with
-            | Error Native.Closed ->
-                uncertain ~reason:"client shut down before the start outcome was observed" ()
-            | Error (Native.Backend _ as error) ->
-                (* The ticket may have been retired by a concurrent disconnect
-                   after the RPC was issued; the diagnostic is preserved but
-                   the classification stays uncertain. *)
-                uncertain ~reason:(Error.message (native_supervisor_error error)) ()
-            | Error error -> Error (native_supervisor_error error)
-            | Ok None ->
-                (* The native wait is intentionally bounded. Yielding here is
-                   only on the ordinary caller Domain, never on the supervisor
-                   owner or a workflow scheduler fiber. *)
-                Thread.yield ();
-                await_outcome ()
-          | Ok (Some (Client_protocol.Accepted { execution; started })) ->
-              Ok
-                {
-                  workflow_id = execution.workflow_id;
-                  run_id = execution.run_id;
-                  started;
-                }
-          | Ok (Some (Client_protocol.Rejected error)) ->
-              Error (native_client_error ~namespace:client.namespace error)
-          | Ok
-              (Some
-                 (Client_protocol.Unknown { request_id; workflow_id })) ->
-              Error (uncertain_start_error ~request_id ~workflow_id ())
-        in
-        await_outcome ()
+        | Error (Native.Backend _ as error) ->
+            uncertain ~reason:(Error.message (native_supervisor_error error)) ()
+        | Error error -> Error (native_supervisor_error error))
 
 (** Allocates a new pending mock run as the current execution for the
     request's workflow ID and records an explicit request ID for idempotent
@@ -1319,9 +1317,11 @@ let client_start client request =
   | Mock_client client -> mock_client_start client request
   | Native_client client -> native_client_start client request
 
-(** Waits for one exact native run. [Not_ready] resumes the same retained
-    history request on the next supervisor turn, preserving pagination and
-    exact-run identity while allowing shutdown to linearize between turns. *)
+(** Waits for one exact native run (or the current run for an empty run ID).
+    The history long poll runs on a Rust task for as long as the run stays
+    open; this caller waits on the call's own completion cell, so the
+    supervisor owner stays free for every other operation (#807). Shutdown
+    closes the call and reports the closed-client error. *)
 let native_client_wait (client : native_client) (request : wait_request) =
   if Atomic.get client.closed then Error (bridge_error "client is shut down")
   else
@@ -1332,18 +1332,10 @@ let native_client_wait (client : native_client) (request : wait_request) =
         run_id = request.run_id;
       }
     in
-    let rec await_terminal () =
-      if Atomic.get client.closed then Error (bridge_error "client is shut down")
-      else
-        match Native.perform client.supervisor (Native.Client_wait_workflow request) with
-        | Error (Native.Backend { Bridge.status = Bridge.Not_ready; _ }) ->
-            Thread.yield ();
-            await_terminal ()
-        | Error error -> Error (native_supervisor_error error)
-        | Ok (Error error) -> Error (native_client_error ~namespace:client.namespace error)
-        | Ok (Ok response) -> native_terminal_result response
-    in
-    await_terminal ()
+    match native_call client (Native.Rpc_wait request) with
+    | Error error -> Error error
+    | Ok (Error error) -> Error (native_client_error ~namespace:client.namespace error)
+    | Ok (Ok response) -> native_terminal_result response
 
 (** Reports whether a request's run selector addresses [execution], the run
     the mock ledger currently maps its workflow ID to. An empty selector names
@@ -1467,22 +1459,19 @@ let native_cancel_request client (request : cancel_request) :
     rpc_deadline = request.rpc_deadline;
   }
 
-(** Requests cancellation through the serialized supervisor operation. The
+(** Requests cancellation as a submitted call (see {!native_call}). The
     returned acknowledgement only means Temporal accepted the RPC; the exact
     wait path remains responsible for observing the eventual terminal state. *)
 let native_client_cancel (client : native_client) (request : cancel_request) :
     (unit, Error.t) result =
   if Atomic.get client.closed then Error (bridge_error "client is shut down")
   else
-    match
-      Native.perform client.supervisor
-        (Native.Client_cancel_workflow (native_cancel_request client request))
-    with
-    | Error error -> Error (native_supervisor_error error)
+    match native_call client (Native.Rpc_cancel (native_cancel_request client request)) with
+    | Error error -> Error error
     | Ok (Error error) -> Error (native_client_error ~namespace:client.namespace error)
     | Ok (Ok ()) -> Ok ()
 
-(** Sends one exact-run termination through the serialized native supervisor. *)
+(** Sends one exact-run termination as a submitted call (see {!native_call}). *)
 let native_client_terminate (client : native_client)
     (request : terminate_request) : (unit, Error.t) result =
   if Atomic.get client.closed then Error (bridge_error "client is shut down")
@@ -1499,8 +1488,8 @@ let native_client_terminate (client : native_client)
         rpc_deadline = request.rpc_deadline;
       }
     in
-    match Native.perform client.supervisor (Native.Client_terminate_workflow request) with
-    | Error error -> Error (native_supervisor_error error)
+    match native_call client (Native.Rpc_terminate request) with
+    | Error error -> Error error
     | Ok (Error error) -> Error (native_client_error ~namespace:client.namespace error)
     | Ok (Ok ()) -> Ok ()
 
@@ -1520,18 +1509,15 @@ let native_reset_request client (request : reset_request) :
     rpc_deadline = request.rpc_deadline;
   }
 
-(** Resets one exact run through the serialized supervisor operation. The
+(** Resets one exact run as a submitted call (see {!native_call}). The
     returned run identity is retained as a value; callers can explicitly
     rebuild a typed handle and observe the new history. *)
 let native_client_reset (client : native_client) (request : reset_request) :
     (reset_response, Error.t) result =
   if Atomic.get client.closed then Error (bridge_error "client is shut down")
   else
-    match
-      Native.perform client.supervisor
-        (Native.Client_reset_workflow (native_reset_request client request))
-    with
-    | Error error -> Error (native_supervisor_error error)
+    match native_call client (Native.Rpc_reset (native_reset_request client request)) with
+    | Error error -> Error error
     | Ok (Error error) -> Error (native_client_error ~namespace:client.namespace error)
     | Ok (Ok response) ->
         Ok { workflow_id = response.execution.workflow_id; run_id = response.execution.run_id }
@@ -1554,17 +1540,14 @@ let native_signal_request client (request : signal_request) :
     rpc_deadline = request.rpc_deadline;
   }
 
-(** Sends one signal through the serialized supervisor operation. The result is
+(** Sends one signal as a submitted call (see {!native_call}). The result is
     only an RPC acknowledgement; workflow code may process the signal later. *)
 let native_client_signal (client : native_client) (request : signal_request) :
     (unit, Error.t) result =
   if Atomic.get client.closed then Error (bridge_error "client is shut down")
   else
-    match
-      Native.perform client.supervisor
-        (Native.Client_signal_workflow (native_signal_request client request))
-    with
-    | Error error -> Error (native_supervisor_error error)
+    match native_call client (Native.Rpc_signal (native_signal_request client request)) with
+    | Error error -> Error error
     | Ok (Error error) -> Error (native_client_error ~namespace:client.namespace error)
     | Ok (Ok ()) -> Ok ()
 
@@ -1585,18 +1568,15 @@ let native_query_request client (request : query_request) :
     rpc_deadline = request.rpc_deadline;
   }
 
-(** Sends one output-only query through the serialized supervisor operation.
+(** Sends one output-only query as a submitted call (see {!native_call}).
     The returned payload is decoded by the public [Client.query] function so
     the backend never needs to know the caller's result type. *)
 let native_client_query (client : native_client) (request : query_request) :
     (Payload.t, Error.t) result =
   if Atomic.get client.closed then Error (bridge_error "client is shut down")
   else
-    match
-      Native.perform client.supervisor
-        (Native.Client_query_workflow (native_query_request client request))
-    with
-    | Error error -> Error (native_supervisor_error error)
+    match native_call client (Native.Rpc_query (native_query_request client request)) with
+    | Error error -> Error error
     | Ok (Error error) -> Error (native_client_error ~namespace:client.namespace error)
     | Ok (Ok response) -> (
         match response with
@@ -1842,7 +1822,7 @@ let native_visibility_request client (request : visibility_request) :
     rpc_deadline = request.rpc_deadline;
   }
 
-(** Lists one visibility page through the serialized supervisor operation.
+(** Lists one visibility page as a submitted call (see {!native_call}).
     Rust validates the request again and owns the opaque protobuf pagination
     token; OCaml only maps the stable row fields into the private backend type. *)
 let native_client_list_visibility (client : native_client)
@@ -1850,10 +1830,10 @@ let native_client_list_visibility (client : native_client)
   if Atomic.get client.closed then Error (bridge_error "client is shut down")
   else
     match
-      Native.perform client.supervisor
-        (Native.Client_list_visibility_workflows
-           (native_visibility_request client request))
+      Native.call client.supervisor
+        (Native.Rpc_visibility (native_visibility_request client request))
     with
+    | Error Native.Closed -> Error (bridge_error "client is shut down")
     | Error (Native.Backend { Bridge.status = Bridge.Connection; message } as error)
       -> (
         (* Visibility has no structured error channel of its own, so a gRPC
@@ -2036,11 +2016,8 @@ let public_update_outcome = function
 let native_client_update (client : native_client) (request : update_request) =
   if Atomic.get client.closed then Error (bridge_error "client is shut down")
   else
-    match
-      Native.perform client.supervisor
-        (Native.Client_update_workflow (native_update_request client request))
-    with
-    | Error error -> Error (native_supervisor_error error)
+    match native_call client (Native.Rpc_update (native_update_request client request)) with
+    | Error error -> Error error
     | Ok (Error error) -> Error (native_client_error ~namespace:client.namespace error)
     | Ok (Ok response) ->
         Ok
@@ -2068,11 +2045,8 @@ let native_client_poll_update (client : native_client) (request : update_request
         update_id = request.update_id;
       }
     in
-    match
-      Native.perform client.supervisor
-        (Native.Client_poll_update_workflow protocol_request)
-    with
-    | Error error -> Error (native_supervisor_error error)
+    match native_call client (Native.Rpc_poll_update protocol_request) with
+    | Error error -> Error error
     | Ok (Error error) -> Error (native_client_error ~namespace:client.namespace error)
     | Ok (Ok response) ->
         Ok { outcome = Option.map public_update_outcome response.outcome }

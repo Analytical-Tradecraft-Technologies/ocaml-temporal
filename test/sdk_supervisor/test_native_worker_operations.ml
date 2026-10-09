@@ -819,6 +819,68 @@ let test_expired_rpc_deadline_is_not_sent () =
     operations;
   expect "expired deadline shutdown" (Ok ()) (Supervisor.shutdown supervisor)
 
+(** Submitted client calls (#807) through the real native supervisor. An
+    expired deadline completes the call on the owner without reaching Rust
+    (an unconnected runtime would otherwise refuse it with [Invalid_state]),
+    and awaiting it yields the typed [deadline_exceeded] result; an expired
+    start is a definite rejection. A live or absent deadline reaches Rust,
+    which refuses the unconnected submission synchronously, and a wait (no
+    deadline) does too. After shutdown, submission reports [Closed]. *)
+let test_submitted_client_calls () =
+  let supervisor = Result.get_ok (Supervisor.create ~capacity:4 ()) in
+  let execution : Client.execution =
+    { namespace = "default"; workflow_id = "workflow-1"; run_id = "run-1" }
+  in
+  let deadline_exceeded = Client.Rpc { code = "deadline_exceeded" } in
+  let signal rpc_deadline =
+    Supervisor.Rpc_signal
+      { execution; signal_name = "s"; request_id = "s"; input = []; rpc_deadline }
+  in
+  (match Supervisor.call supervisor (signal (expired_deadline ())) with
+  | Ok (Error error) when error = deadline_exceeded -> ()
+  | _ -> failwith "an expired submitted signal was not completed with its deadline");
+  (match Supervisor.perform supervisor (Supervisor.Client_submit (signal (expired_deadline ()))) with
+  | Ok (Sdk_supervisor.Client_call.Completed _) -> ()
+  | _ -> failwith "an expired submitted signal reached the bridge");
+  List.iter
+    (fun rpc_deadline ->
+      match Supervisor.call supervisor (signal rpc_deadline) with
+      | Error (Supervisor.Backend { Bridge.status = Invalid_state; _ }) -> ()
+      | _ -> failwith "an unconnected submitted signal was accepted")
+    [ live_deadline (); None ];
+  let start rpc_deadline : Client.start_request =
+    {
+      request_id = "request-1";
+      namespace = "default";
+      workflow_id = "workflow-1";
+      workflow_type = "Smoke";
+      task_queue = "queue";
+      input = [];
+      memo = [];
+      search_attributes = [];
+      id_conflict_policy = Client.Fail;
+      id_reuse_policy = Client.Allow_duplicate;
+      execution_timeout_ms = None;
+      run_timeout_ms = None;
+      task_timeout_ms = None;
+      retry_policy = None;
+      rpc_deadline;
+    }
+  in
+  (match Supervisor.call supervisor (Supervisor.Rpc_start (start (expired_deadline ()))) with
+  | Ok (Client.Rejected error) when error = deadline_exceeded -> ()
+  | _ -> failwith "an expired submitted start was not a definite rejection");
+  (match Supervisor.call supervisor (Supervisor.Rpc_start (start None)) with
+  | Error (Supervisor.Backend { Bridge.status = Invalid_state; _ }) -> ()
+  | _ -> failwith "an unconnected submitted start was accepted");
+  (match Supervisor.call supervisor (Supervisor.Rpc_wait execution) with
+  | Error (Supervisor.Backend { Bridge.status = Invalid_state; _ }) -> ()
+  | _ -> failwith "an unconnected submitted wait was accepted");
+  expect "submitted call shutdown" (Ok ()) (Supervisor.shutdown supervisor);
+  match Supervisor.call supervisor (signal None) with
+  | Error Supervisor.Closed -> ()
+  | _ -> failwith "a submission after shutdown was not closed"
+
 (** A fake supervisor backend whose client signal uses the production
     deadline resolution, so a test can hold the owner Domain busy with a
     long operation and observe what a queued request does at dispatch. *)
@@ -940,4 +1002,5 @@ let () =
   test_native_lifecycle_guards ();
   test_native_client_lifecycle_guards ();
   test_expired_rpc_deadline_is_not_sent ();
+  test_submitted_client_calls ();
   test_queued_rpc_deadline_counts_wait ()

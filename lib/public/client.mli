@@ -19,9 +19,9 @@
       {!query_with_input}, {!start_update}, {!cancel}, {!terminate},
       {!reset}, and {!list_visibility}) bounds one client call and never
       affects the workflow. The deadline is fixed on a monotonic clock when
-      the call begins, so it covers the time the request waits behind
-      earlier calls on the same client (which are served one at a time), the
-      RPC, and the transport retries the SDK performs inside it. A request
+      the call begins, so it covers the time the request waits to be
+      submitted, the RPC, and the transport retries the SDK performs inside
+      it. A request
       whose deadline expires while it waits is never sent. It must be
       between 1 ms and 60 seconds; other values are
       typed defects returned before any request is sent. When omitted, each
@@ -44,7 +44,21 @@
     Reconcile by retrying with the same request ID (start, signal, cancel,
     reset) or update ID, or by observing the run with {!wait}. *)
 
-(** An opaque client connection owned by the caller. *)
+(** An opaque client connection owned by the caller.
+
+    {2:concurrency Concurrency}
+
+    A client may be shared by any number of threads and Domains. Every call
+    blocks only its calling thread (with the OCaml runtime lock released
+    while it waits), so it must not be made from a workflow. Calls on one
+    client proceed concurrently (#807): the client's supervisor Domain only
+    submits each request, the RPC runs in the native transport, and each
+    caller waits for its own result. A pending {!wait}, a slow {!query}, or
+    an update waiting in {!wait_update} therefore never delays another call
+    on the same client. {!shutdown} ends calls still in flight: a {!wait} or
+    other call returns the closed-client error, and a {!start} whose request
+    may already have been sent returns an error recognized by
+    {!is_start_outcome_uncertain}. *)
 type t
 
 (** A typed address for a workflow execution: one exact run, or the current
@@ -269,7 +283,8 @@ val create :
     retryable error recognized by [is_at_capacity]; the client stays usable
     and the start may be retried once another one finishes. Retrying a start
     that is still in flight with the same [request_id] does not use another
-    slot. *)
+    slot; Temporal deduplicates the request ID, so both calls report the same
+    run. *)
 val start :
   t ->
   ?request_id:string ->
@@ -358,8 +373,9 @@ val get_handle :
     The native client retains at most 64 distinct runs being waited on.
     Concurrent waits on the same run share one slot. Waiting on another run
     at capacity returns a retryable error recognized by [is_at_capacity]; the
-    client stays usable. Terminal results and errors free their slots, and
-    client shutdown interrupts pending waits. *)
+    client stays usable. Terminal results and errors free their slots. A
+    pending wait does not delay other calls on the client, and client
+    shutdown ends it with the closed-client error. *)
 val wait :
   ('input, 'output) handle ->
   ('output terminal_result, Error.t) result
@@ -563,7 +579,8 @@ val is_start_outcome_uncertain : Error.t -> bool
 
 (** Returns [true] when [error] means the native client refused a [start] or
     [wait] because its bounded set of in-flight operations was full (64 starts
-    or 64 distinct waited runs). Nothing was sent to Temporal, the client
+    or 64 distinct waited runs), or any other call because 4,096 calls were
+    already in flight on the client. Nothing was sent to Temporal, the client
     remains connected, and the same call may be retried after another
     operation on this client finishes, for example with a backoff. Such an
     error has category [`Bridge], is not marked non-retryable, and has
@@ -637,10 +654,11 @@ val is_query_failed : Error.t -> bool
     same cached result, including a terminal teardown error, after the first
     shutdown request has consumed or invalidated the backend resources.
 
-    Shutdown does not fail because another Domain or thread is still inside
-    [start]. A native start whose request was already handed to the transport
-    is aborted; that [start] call returns the error recognized by
+    Shutdown does not wait for, or fail because of, calls still in flight on
+    other Domains or threads. It aborts them: a native start whose request
+    was already handed to the transport returns the error recognized by
     {!is_start_outcome_uncertain}, with the workflow and request IDs needed
-    to reconcile it. A start that had not
-    yet been admitted returns the ordinary shut-down error. *)
+    to reconcile it, and every other in-flight call (including a pending
+    {!wait} or {!wait_update}) returns the ordinary shut-down error. A start
+    that had not yet been admitted returns the ordinary shut-down error. *)
 val shutdown : t -> (unit, Error.t) result

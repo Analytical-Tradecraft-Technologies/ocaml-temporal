@@ -168,6 +168,39 @@ let () =
   | Error { status = Invalid_state; message } ->
       assert (String.length message > 0)
   | _ -> failwith "combined readiness wait without a worker was accepted");
+  (* A submitted client call (#807) validates its document, then needs a
+     connected client; neither failure registers a call. *)
+  (match Bridge.client_submit_json runtime Bridge.Call_wait Bytes.empty with
+  | Error { status = Protocol; message } -> assert (String.length message > 0)
+  | _ -> failwith "malformed submitted wait was accepted");
+  (match
+     Bridge.client_submit_json runtime Bridge.Call_signal
+       (Bytes.of_string
+          {|{"namespace":"default","workflow_id":"w","run_id":"r","signal_name":"s","request_id":"q","input":[]}|})
+   with
+  | Error { status = Invalid_state; message } -> assert (String.length message > 0)
+  | _ -> failwith "submitted signal without a client was accepted");
+  (* Handles are "<owner>.<call>" with both parts positive. Awaiting a
+     well-formed handle Rust never issued, for any owner, reports the closed
+     state at once rather than waiting or exposing another owner's call. *)
+  List.iter
+    (fun text ->
+      if Bridge.parse_client_call text <> None then
+        failwith ("malformed call handle accepted: " ^ text))
+    [ ""; "7"; "0.1"; "1.0"; "-1.2"; "1.2.3"; "a.b" ];
+  List.iter
+    (fun text ->
+      match Bridge.parse_client_call text with
+      | None -> failwith ("well-formed call handle rejected: " ^ text)
+      | Some handle -> (
+          match Bridge.client_await_call handle ~timeout_ms:60_000 with
+          | Error { status = Invalid_state; _ } -> (
+              (* Releasing a call that is not registered is a no-op. *)
+              match Bridge.client_release_call handle with
+              | Ok () -> ()
+              | Error _ -> failwith "releasing an unissued call handle failed")
+          | _ -> failwith "an unissued call handle was not reported closed"))
+    [ "1.4611686018427387903"; "4611686018427387903.1" ];
   (match Bridge.worker_complete_workflow_json runtime Bytes.empty with
   | Error { status = Protocol; message } ->
       assert (String.length message > 0)

@@ -66,15 +66,16 @@ in_dev() {
 rm -rf "$evidence"
 mkdir -p "$evidence"
 
-# Four fixtures predate the dedicated SDK namespace and use `default`, which
-# the plain server image does not create (temporal-start registers only
-# temporal-sdk-test, the split-worker fixture's default). Reuse the bounded health/namespace
-# probe so registration is idempotent and propagation is awaited.
+# Several fixtures use the `default` namespace, which the plain server image
+# does not create (temporal-start registers only temporal-sdk-test, the
+# namespace the remaining fixtures default to). Reuse the bounded
+# health/namespace probe so registration is idempotent and propagation is
+# awaited.
 compose run --rm --no-deps -T --env TEMPORAL_NAMESPACE=default \
   --entrypoint /bin/sh temporal-admin-tools /scripts/check-temporal-stack.sh
 
-# Three fixtures inspect or delete only their own executions through the
-# official CLI. Copy the pinned admin-tools binary into the ignored build tree
+# Some fixtures inspect or delete only their own executions through the
+# official CLI (those dispatched with cli_argument below). Copy the pinned admin-tools binary into the ignored build tree
 # instead of installing another CLI into the development image, then prove it
 # runs there before any regression depends on it.
 # The single quotes are deliberate: the substitution runs in the container.
@@ -92,6 +93,7 @@ for executable in "$@"; do
     test/integration/bounded_shutdown/regression.exe|\
     test/integration/client_request_ids/regression.exe|\
     test/integration/completed_queries/regression.exe|\
+    test/integration/concurrent_client/regression.exe|\
     test/integration/split_worker_task_types/regression.exe|\
     test/integration/worker_resource_options/regression.exe)
       cli_argument='' ;;

@@ -569,7 +569,7 @@ test-temporal-diagnostics-contract:
 # CI executes (#795). Every entry must also be in scripts/ci-smoke-executables.txt,
 # and test/smoke/test_live_regressions_contract.sh fails when a regression
 # executable under test/integration is neither here nor otherwise run by CI.
-LIVE_REGRESSION_EXECUTABLES := test/integration/activity_cancellation/regression.exe test/integration/bounded_shutdown/regression.exe test/integration/client_policies/regression.exe test/integration/client_request_ids/regression.exe test/integration/completed_queries/regression.exe test/integration/interaction_recovery/regression.exe test/integration/local_activity_cancellation/regression.exe test/integration/split_worker_task_types/regression.exe test/integration/transport_interruption/regression.exe test/integration/update_outcomes/regression.exe test/integration/worker_resource_options/regression.exe
+LIVE_REGRESSION_EXECUTABLES := test/integration/activity_cancellation/regression.exe test/integration/bounded_shutdown/regression.exe test/integration/client_policies/regression.exe test/integration/client_request_ids/regression.exe test/integration/completed_queries/regression.exe test/integration/concurrent_client/regression.exe test/integration/interaction_recovery/regression.exe test/integration/local_activity_cancellation/regression.exe test/integration/split_worker_task_types/regression.exe test/integration/transport_interruption/regression.exe test/integration/update_outcomes/regression.exe test/integration/worker_resource_options/regression.exe
 # Seconds for each regression process; the suites normally finish in seconds.
 LIVE_REGRESSION_TIMEOUT_SECONDS ?= 180
 
@@ -946,6 +946,11 @@ test-activity-cancellation-live:
 .PHONY: test-bounded-shutdown-live
 test-bounded-shutdown-live:
 	$(RUN) dune exec $(DUNE_BUILD_ARGS) test/integration/bounded_shutdown/regression.exe -- check $(TEMPORAL_CLIENT_TEST_URL)
+
+# Requires a disposable server with a `default` namespace (#807).
+.PHONY: test-concurrent-client-live
+test-concurrent-client-live:
+	$(RUN) dune exec $(DUNE_BUILD_ARGS) test/integration/concurrent_client/regression.exe -- check $(TEMPORAL_CLIENT_TEST_URL)
 
 # Requires a disposable server and an explicit official Temporal CLI path.
 .PHONY: test-update-outcomes-live

@@ -15,6 +15,67 @@ implementation when a later entry documents that work as complete. The
 records the current tested source, named assertions and successful CI job for
 the Temporal acceptance controllers.
 
+## 2026-10-10: Concurrent calls on one client (#807)
+
+One `Client.t` served every call on its supervisor Domain one at a time, and
+that Domain waited for the network inside each call: a pending `Client.wait`
+held it for 100 ms per turn, and a query, update admission, or update poll
+for up to 30 s, so every other call on the client, including shutdown,
+queued behind them. Every client RPC is now submit-and-complete. The owner
+Domain only resolves the RPC deadline, encodes the request, and calls the new
+`ocaml_temporal_core_v4_client_submit_json`, which validates it, registers a
+completion cell, spawns one Tokio task, and returns an `<owner>.<call>`
+handle. The caller then waits on its own Domain through
+`ocaml_temporal_core_v4_client_await_call(owner, call, timeout_ms)`, which
+takes no runtime pointer (the pair names a cell in a process-wide registry)
+and runs with the OCaml lock released. A call is served only to the random
+owner identity of the graph that submitted it; any other owner is answered
+like an unknown call and cannot consume or observe it. A call counts
+against the runtime's 4,096-call ceiling until its cell is retired (read,
+released through the new `ocaml_temporal_core_v4_client_release_call`, or
+closed with the runtime), not merely until its RPC ends, and the OCaml
+await loop releases its call from a `Fun.protect` finalizer when it is
+interrupted, so abandoned outcomes cannot grow the registry without bound. Tasks never call OCaml or touch the runtime graph; a
+task that panics or is dropped settles its cell through a guard.
+
+Disconnect and close (including the GC fallback) close every pending cell
+first, so waiters get `Invalid_state`, mapped to the supervisor's typed
+`Closed` and then to the public closed-client error (an uncertain start for
+a start that may have been sent), and then abort and join the tasks before
+the connection and Core are dropped. The #499 deadline rule is unchanged: an
+expired request is completed by the owner and never reaches Rust. The
+64-run wait and 64-request-ID start limits keep their slot sharing, and a
+4,096-call ceiling bounds the task registry. Both symbols are additive, so
+the ABI stays at version 4; the synchronous and ticket symbols remain for
+direct bridge callers, and the eight bounded synchronous RPC methods now
+share the submitted path's request decoding and futures. The generic
+`Sdk_supervisor.Client_call` await loop and the `Native.Client_submit`
+operation, `await_client_call`, and `call` are private.
+
+Evidence: eight Rust tests over a callback gRPC transport (a pending wait and
+query do not delay a signal and a start, which complete through their own
+cells; disconnect wakes a blocked waiter with the closed status and drops
+both transport futures; the GC close path releases calls; validation before
+registration; distinct-run wait capacity; a panicking task settles its
+cell; awaiting with another owner is refused as unknown and leaves the call
+for its submitter; 4,096 finished but unread calls fill the ceiling until one
+is released or read), a Rust ABI test and C harness assertions for the new symbols, four
+deterministic supervisor tests over `Sdk_supervisor.Make` with a fake
+completion source (an interrupted await releases its call exactly once
+while a completed one is never released; a wait and a query pending on
+other Domains do not delay
+signals and starts, shutdown closes calls in flight, each completion reaches
+only its caller, and a deadline that expires while queued completes without
+submitting), a native supervisor test of submission, expired deadlines, and
+closed admission, and the new `concurrent_client` live regression in
+`make test-temporal-live-regressions`. Against the Compose server it kept 24
+waits and a query stuck on a killed worker pending while ten signals and ten
+starts on the same client finished with a worst latency of 10 ms (bound
+1.5 s); terminating the workflows released every wait, the query ended at
+its 8 s deadline, and shutting down a second client ended its in-flight
+wait at once. The `client_request_ids` and `completed_queries` live
+regressions also passed locally.
+
 ## 2026-10-10: Bounded worker shutdown with outstanding work (#495)
 
 `Temporal.Worker.shutdown` now returns within the worker's grace period plus

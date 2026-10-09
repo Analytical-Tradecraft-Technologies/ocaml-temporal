@@ -6,8 +6,10 @@ use ocaml_temporal_core_bridge::worker_bridge::{
 };
 use ocaml_temporal_core_bridge::{
     ABI_VERSION, Buffer, Result as AbiResult, STATUS_ABI_MISMATCH, STATUS_INVALID_ARGUMENT,
-    STATUS_INVALID_STATE, STATUS_OK, STATUS_PANIC, STATUS_PROTOCOL, STATUS_RETRYABLE,
-    ocaml_temporal_core_v4_check_abi_version, ocaml_temporal_core_v4_conformance_wait_ms,
+    STATUS_INVALID_STATE, STATUS_NOT_READY, STATUS_OK, STATUS_PANIC, STATUS_PROTOCOL,
+    STATUS_RETRYABLE, ocaml_temporal_core_v4_check_abi_version,
+    ocaml_temporal_core_v4_client_await_call, ocaml_temporal_core_v4_client_release_call,
+    ocaml_temporal_core_v4_client_submit_json, ocaml_temporal_core_v4_conformance_wait_ms,
     ocaml_temporal_core_v4_echo, ocaml_temporal_core_v4_result_free,
     ocaml_temporal_core_v4_runtime_dispose, ocaml_temporal_core_v4_runtime_free,
     ocaml_temporal_core_v4_runtime_new, ocaml_temporal_core_v4_worker_complete_activity_json,
@@ -543,6 +545,65 @@ fn contains_rust_panics_as_owned_errors() {
     assert_eq!(result.status, STATUS_PANIC);
     assert!(result.value.ptr.is_null());
     assert!(!bytes(&result.error).is_empty());
+    assert_eq!(
+        unsafe { ocaml_temporal_core_v4_result_free(&mut result) },
+        STATUS_OK
+    );
+}
+
+#[test]
+/// Submitted client calls (#807) reject a null runtime, and awaiting a call
+/// is bounded: an identifier that was never issued reports the closed
+/// invalid-state status without blocking, and an over-long wait is refused.
+fn submitted_client_calls_validate_their_arguments() {
+    let wait = br#"{"namespace":"default","workflow_id":"w","run_id":"r"}"#;
+    let mut result = empty_result();
+    assert_eq!(
+        unsafe {
+            ocaml_temporal_core_v4_client_submit_json(
+                ptr::null_mut(),
+                2,
+                wait.as_ptr(),
+                wait.len(),
+                &mut result,
+            )
+        },
+        STATUS_INVALID_ARGUMENT
+    );
+    assert_eq!(
+        unsafe { ocaml_temporal_core_v4_result_free(&mut result) },
+        STATUS_OK
+    );
+    assert_eq!(
+        unsafe { ocaml_temporal_core_v4_client_await_call(1, u64::MAX, 0, &mut result) },
+        STATUS_INVALID_STATE
+    );
+    assert!(!bytes(&result.error).is_empty());
+    assert_eq!(
+        unsafe { ocaml_temporal_core_v4_result_free(&mut result) },
+        STATUS_OK
+    );
+    assert_ne!(
+        unsafe { ocaml_temporal_core_v4_client_await_call(1, u64::MAX, 60_000, &mut result) },
+        STATUS_NOT_READY
+    );
+    assert_eq!(
+        unsafe { ocaml_temporal_core_v4_result_free(&mut result) },
+        STATUS_OK
+    );
+    assert_eq!(
+        unsafe { ocaml_temporal_core_v4_client_await_call(1, 1, 60_001, &mut result) },
+        STATUS_INVALID_ARGUMENT
+    );
+    assert_eq!(
+        unsafe { ocaml_temporal_core_v4_result_free(&mut result) },
+        STATUS_OK
+    );
+    // Releasing an unknown call is a successful, silent no-op.
+    assert_eq!(
+        unsafe { ocaml_temporal_core_v4_client_release_call(1, u64::MAX, &mut result) },
+        STATUS_OK
+    );
     assert_eq!(
         unsafe { ocaml_temporal_core_v4_result_free(&mut result) },
         STATUS_OK

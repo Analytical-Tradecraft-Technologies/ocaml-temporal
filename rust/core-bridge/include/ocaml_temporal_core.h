@@ -228,6 +228,56 @@ ocaml_temporal_core_status ocaml_temporal_core_v4_client_wait_workflow_json(
     ocaml_temporal_core_runtime *runtime, const uint8_t *input,
     size_t input_len, ocaml_temporal_core_result *output);
 
+/* Closed selectors for ocaml_temporal_core_v4_client_submit_json (#807). Each
+ * takes the request document of the matching synchronous operation. */
+enum {
+  OCAML_TEMPORAL_CORE_CLIENT_CALL_START = 1,
+  OCAML_TEMPORAL_CORE_CLIENT_CALL_WAIT = 2,
+  OCAML_TEMPORAL_CORE_CLIENT_CALL_CANCEL = 3,
+  OCAML_TEMPORAL_CORE_CLIENT_CALL_TERMINATE = 4,
+  OCAML_TEMPORAL_CORE_CLIENT_CALL_RESET = 5,
+  OCAML_TEMPORAL_CORE_CLIENT_CALL_SIGNAL = 6,
+  OCAML_TEMPORAL_CORE_CLIENT_CALL_QUERY = 7,
+  OCAML_TEMPORAL_CORE_CLIENT_CALL_UPDATE = 8,
+  OCAML_TEMPORAL_CORE_CLIENT_CALL_POLL_UPDATE = 9,
+  OCAML_TEMPORAL_CORE_CLIENT_CALL_VISIBILITY = 10
+};
+
+/* Submit one client RPC without waiting for Temporal (#807). Only the
+ * runtime's owner thread may call this. A call counts against the ceiling
+ * until it is read, released, or its runtime closes. On success the value is
+ * the call
+ * handle "<owner>.<call>" in ASCII decimal: the submitting graph's random
+ * owner identity and the call identifier. The RPC runs on a Rust task. Starts and waits
+ * keep their 64-entry limits and every call shares a 4,096-entry ceiling;
+ * admission beyond a limit returns RESOURCE_EXHAUSTED (status 15). */
+ocaml_temporal_core_status ocaml_temporal_core_v4_client_submit_json(
+    ocaml_temporal_core_runtime *runtime, uint32_t kind, const uint8_t *input,
+    size_t input_len, ocaml_temporal_core_result *output);
+
+/* Wait at most timeout_ms (up to 60000) for a submitted call's outcome.
+ * owner and call come from the submission handle; a call is reachable only
+ * through the owner that submitted it. Any thread may call this; it takes no
+ * runtime. The first terminal result retires the call and is the
+ * operation's own value or failure (a start yields the
+ * accepted/rejected/unknown outcome document). NOT_READY (status 10) means
+ * the interval elapsed. INVALID_STATE (status 5) means the call can no longer
+ * complete because its runtime disconnected or closed, the identifier is
+ * unknown, or owner does not match; these cases are indistinguishable and a
+ * mismatched owner leaves the call untouched. Bindings must release their
+ * runtime lock. */
+ocaml_temporal_core_status ocaml_temporal_core_v4_client_await_call(
+    uint64_t owner, uint64_t call, uint32_t timeout_ms,
+    ocaml_temporal_core_result *output);
+
+/* Abandon a submitted call without reading it, freeing its slot in the
+ * 4,096-call ceiling (an unread completed call keeps counting until it is
+ * read, released, or its runtime closes). Any published outcome is dropped.
+ * Takes no runtime; a mismatched owner, retired call, or unknown identifier
+ * is a successful no-op. */
+ocaml_temporal_core_status ocaml_temporal_core_v4_client_release_call(
+    uint64_t owner, uint64_t call, ocaml_temporal_core_result *output);
+
 /* Complete an activity after WillCompleteAsync through the namespace-bound
  * client. The worker task-token ledger is intentionally not consulted. */
 ocaml_temporal_core_status

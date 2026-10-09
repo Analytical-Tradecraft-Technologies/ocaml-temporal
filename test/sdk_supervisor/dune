@@ -30,3 +30,9 @@
  (name test_bounded_shutdown)
  (modules test_bounded_shutdown)
  (libraries temporal_sdk_supervisor temporal_runtime threads unix))
+
+; Submit-and-complete client calls (#807) over a fake completion source.
+(test
+ (name test_concurrent_client_calls)
+ (modules test_concurrent_client_calls)
+ (libraries temporal_sdk_supervisor temporal_protocol threads unix))

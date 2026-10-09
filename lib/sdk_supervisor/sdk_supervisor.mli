@@ -81,6 +81,52 @@ module Make (Backend : Backend) : sig
   val shutdown : t -> (unit, error) result
 end
 
+(** Caller-side completion of submitted client calls (#807).
+
+    A client request is submitted by the owner Domain, which returns at once;
+    the caller then waits for the outcome on its own Domain. The owner never
+    blocks on the network, so a pending wait, query, or update poll cannot
+    delay other requests on the same supervisor. *)
+module Client_call : sig
+  (** A submitted call. [Completed] is an outcome produced without any RPC,
+      such as a deadline that expired before dispatch. [In_flight] is a
+      completion handle plus the pure decoder of its terminal native result;
+      the decoder runs on the awaiting caller's Domain. *)
+  type ('value, 'ticket) t =
+    | Completed of ('value, Temporal_core_bridge.Native_bridge.error) result
+    | In_flight of {
+        ticket : 'ticket;
+        decode :
+          (bytes, Temporal_core_bridge.Native_bridge.error) result ->
+          ('value, Temporal_core_bridge.Native_bridge.error) result;
+      }
+
+  (** [Closed]: the supervisor shut down while the call was in flight, so it
+      will never complete. [Failed]: any other bridge failure. *)
+  type failure = Closed | Failed of Temporal_core_bridge.Native_bridge.error
+
+  (** Default length in milliseconds of one bounded completion wait. *)
+  val default_slice_ms : int
+
+  (** [await ~poll ~release call] blocks the calling thread until [call]
+      completes. [poll ticket ~timeout_ms] performs one bounded wait:
+      [Not_ready] repeats it, [Invalid_state] is {!Closed}, and any other
+      result is decoded; a terminal poll retires the call. If the wait is
+      left by an exception instead (including an asynchronous one),
+      [release ticket] is called once so the abandoned call frees its
+      capacity slot, and the exception propagates. It must not run on a
+      workflow scheduler Domain or on the supervisor owner Domain. *)
+  val await :
+    poll:
+      ('ticket ->
+      timeout_ms:int ->
+      (bytes, Temporal_core_bridge.Native_bridge.error) result) ->
+    release:('ticket -> (unit, Temporal_core_bridge.Native_bridge.error) result) ->
+    ?slice_ms:int ->
+    ('value, 'ticket) t ->
+    ('value, failure) result
+end
+
 (** The production supervisor over one native runtime-client-worker graph. *)
 module Native : sig
   (** Pure conversion functions at the native-worker boundary. Keeping these
@@ -234,6 +280,16 @@ module Native : sig
         [Ok None] so poll and bounded-wait callers can retry without treating
         an in-flight request as a failure. *)
 
+    val decode_client_submitted_start_outcome :
+      Temporal_protocol.Client_protocol.start_request ->
+      (bytes, Temporal_core_bridge.Native_bridge.error) result ->
+      ( Temporal_protocol.Client_protocol.start_outcome,
+        Temporal_core_bridge.Native_bridge.error )
+      result
+    (** Decodes a submitted start's terminal outcome document, correlated
+        with its request (#807). Native failures are preserved; the caller
+        treats them as an uncertain start. *)
+
     val decode_client_wait_result :
       Temporal_protocol.Client_protocol.wait_request ->
       (bytes, Temporal_core_bridge.Native_bridge.error) result ->
@@ -340,6 +396,61 @@ module Native : sig
 
   (** Validated workflow-only worker settings whose representation is private. *)
   type worker_config
+
+  (** A client request submitted through the owner (#807), indexed by the
+      typed value its caller receives: a start yields its closed
+      accepted/rejected/unknown outcome, and every other request yields the
+      same value as the matching synchronous operation below. *)
+  type _ client_rpc =
+    | Rpc_start :
+        Temporal_protocol.Client_protocol.start_request ->
+        Temporal_protocol.Client_protocol.start_outcome client_rpc
+    | Rpc_wait :
+        Temporal_protocol.Client_protocol.wait_request ->
+        ( Temporal_protocol.Client_protocol.wait_response,
+          Temporal_protocol.Client_protocol.client_error )
+        result
+        client_rpc
+    | Rpc_cancel :
+        Temporal_protocol.Client_protocol.cancel_request ->
+        (unit, Temporal_protocol.Client_protocol.client_error) result client_rpc
+    | Rpc_terminate :
+        Temporal_protocol.Client_protocol.terminate_request ->
+        (unit, Temporal_protocol.Client_protocol.client_error) result client_rpc
+    | Rpc_reset :
+        Temporal_protocol.Client_protocol.reset_request ->
+        ( Temporal_protocol.Client_protocol.reset_response,
+          Temporal_protocol.Client_protocol.client_error )
+        result
+        client_rpc
+    | Rpc_signal :
+        Temporal_protocol.Client_protocol.signal_request ->
+        (unit, Temporal_protocol.Client_protocol.client_error) result client_rpc
+    | Rpc_query :
+        Temporal_protocol.Client_protocol.query_request ->
+        ( Temporal_protocol.Client_protocol.payload list,
+          Temporal_protocol.Client_protocol.client_error )
+        result
+        client_rpc
+    | Rpc_update :
+        Temporal_protocol.Client_protocol.update_request ->
+        ( Temporal_protocol.Client_protocol.update_response,
+          Temporal_protocol.Client_protocol.client_error )
+        result
+        client_rpc
+    | Rpc_poll_update :
+        Temporal_protocol.Client_protocol.poll_update_request ->
+        ( Temporal_protocol.Client_protocol.poll_update_response,
+          Temporal_protocol.Client_protocol.client_error )
+        result
+        client_rpc
+    | Rpc_visibility :
+        Temporal_protocol.Client_protocol.visibility_request ->
+        Temporal_protocol.Client_protocol.visibility_page client_rpc
+
+  (** A submitted native call, awaited with {!await_client_call}. *)
+  type 'value client_call =
+    ('value, Temporal_core_bridge.Native_bridge.client_call) Client_call.t
 
   (** Typed lifecycle operations serialized by the owner Domain. *)
   type _ operation =
@@ -490,6 +601,12 @@ module Native : sig
         (** Records progress for an admitted asynchronous activity. *)
     | Shutdown_worker : unit operation
     | Disconnect_client : unit operation
+    | Client_submit : 'value client_rpc -> 'value client_call operation
+        (** Submits one client request without waiting for Temporal (#807).
+            The owner resolves the request's RPC deadline, validates and
+            encodes it, and spawns native work; a deadline that expired in
+            the mailbox completes the call at once and sends nothing. The
+            caller then awaits the result with {!await_client_call}. *)
 
   (** Production lifecycle and bridge failures. *)
   type error =
@@ -543,6 +660,20 @@ module Native : sig
   (** Runs one typed bridge operation on the sole owner Domain. Network waits
       enter Rust through C stubs which release the OCaml runtime lock. *)
   val perform : t -> 'result operation -> ('result, error) result
+
+  (** Awaits one submitted call on the calling Domain with the OCaml runtime
+      lock released during each bounded wait. A call closed because the
+      supervisor shut down while it was in flight is the typed [Closed]
+      error; any other failure is a [Backend] error. Must not be called on a
+      workflow scheduler Domain. [slice_ms] defaults to
+      {!Client_call.default_slice_ms}. *)
+  val await_client_call :
+    ?slice_ms:int -> 'value client_call -> ('value, error) result
+
+  (** [call supervisor rpc] submits [rpc] with [perform] and then awaits it
+      with {!await_client_call}. Only submission occupies the owner Domain,
+      so concurrent calls from other Domains proceed independently. *)
+  val call : t -> 'value client_rpc -> ('value, error) result
 
   (** Closes operation admission without waiting for native teardown. This is
       an internal lifecycle seam; application code should call [shutdown]. *)
