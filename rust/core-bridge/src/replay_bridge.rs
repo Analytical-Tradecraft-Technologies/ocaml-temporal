@@ -33,7 +33,8 @@ use tokio::runtime::Handle;
 
 use crate::protocol::{self, MAX_PAYLOAD_BYTES, MAX_STRING_BYTES};
 use crate::worker_bridge::{
-    AdmitError, PollLaneError, PollLanes, ReadinessWait, ReadyTask, WorkerBridgeError,
+    AdmitError, PollLaneError, PollLanes, REPLAY_CORE_WAIT_TIMEOUT, ReadinessWait, ReadyTask,
+    WorkerBridgeError,
 };
 
 /// Closed validation categories used internally before a history can reach
@@ -210,6 +211,9 @@ pub(crate) enum ReplayWorkerError {
     PollLane(PollLaneError),
     /// Core could not finalize after all lanes were joined.
     Finalization(WorkerBridgeError),
+    /// A bounded wait on Core elapsed. The payload names the operation with a
+    /// static, input-free label so diagnostics never echo history data.
+    TimedOut(&'static str),
 }
 
 impl fmt::Display for ReplayWorkerError {
@@ -249,8 +253,18 @@ impl fmt::Display for ReplayWorkerError {
                     WorkerBridgeError::OutstandingTasks(_) => "worker has outstanding tasks",
                     WorkerBridgeError::LostPollLease => "worker has an uncompleted poll lease",
                     WorkerBridgeError::WorkerStillShared => "worker ownership was not released",
+                    WorkerBridgeError::CompletionStranded => {
+                        "workflow completion was not processed before Core shut down"
+                    }
+                    WorkerBridgeError::CoreWaitTimedOut => "Core did not respond within its bound",
                 };
                 formatter.write_str(category)
+            }
+            Self::TimedOut(operation) => {
+                write!(
+                    formatter,
+                    "replay {operation} did not finish within its bound"
+                )
             }
         }
     }
@@ -313,7 +327,10 @@ impl ReplayWorker {
     /// The bounded `HistoryFeeder::feed` future is driven on Core's runtime;
     /// no Tokio task retains an OCaml pointer or mutates this owner. The
     /// future may wait for the one-slot queue to drain, which is intentional
-    /// backpressure rather than an unbounded allocation path.
+    /// backpressure rather than an unbounded allocation path. That wait is
+    /// capped by [`REPLAY_CORE_WAIT_TIMEOUT`]: a feeder that Core never drains
+    /// returns [`ReplayWorkerError::TimedOut`] and the history is dropped
+    /// unsent, instead of blocking the supervisor Domain forever.
     pub(crate) fn feed_json(
         &mut self,
         handle: &Handle,
@@ -324,9 +341,13 @@ impl ReplayWorker {
             .feeder
             .as_ref()
             .ok_or(ReplayWorkerError::FeederClosed)?;
-        handle
-            .block_on(feeder.feed(history))
-            .map_err(|_| ReplayWorkerError::FeederClosed)
+        match handle.block_on(async {
+            tokio::time::timeout(REPLAY_CORE_WAIT_TIMEOUT, feeder.feed(history)).await
+        }) {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err(ReplayWorkerError::FeederClosed),
+            Err(_elapsed) => Err(ReplayWorkerError::TimedOut("history feed")),
+        }
     }
 
     /// Closes the history stream. Core will finish queued histories and then
@@ -358,12 +379,19 @@ impl ReplayWorker {
     }
 
     /// Completes one activation and retires its Core completion debt.
+    ///
+    /// Core's reply is awaited through the bounded replay path (see
+    /// `worker_bridge::complete_workflow_unless_stranded`). An empty
+    /// acknowledgement that Core's terminating replay stream stranded is
+    /// success; any other stranded or overdue completion is a typed
+    /// [`ReplayWorkerError::Finalization`] error rather than a hang
+    /// (issue #965).
     pub(crate) async fn complete_workflow(
         &self,
         completion: WorkflowActivationCompletion,
     ) -> Result<(), ReplayWorkerError> {
         self.lanes
-            .complete_workflow(completion)
+            .complete_replay_workflow(completion)
             .await
             .map_err(ReplayWorkerError::Finalization)
     }
@@ -383,7 +411,7 @@ impl ReplayWorker {
         reason: &'static str,
     ) -> Result<(), ReplayWorkerError> {
         self.lanes
-            .reject_workflow_delivery_with_reason(run_id, reason)
+            .reject_replay_workflow_delivery(run_id, reason)
             .await
             .map_err(ReplayWorkerError::Finalization)
     }
@@ -408,6 +436,18 @@ impl ReplayWorker {
         mut self,
         handle: &Handle,
     ) -> Result<(), (Self, ReplayWorkerError)> {
+        if self.lanes.replay_join_timed_out() {
+            // An earlier join timed out, so Core never confirmed shutdown and
+            // its finalizer may block forever. Finalization is success
+            // evidence and cannot be claimed; the caller must dispose, which
+            // releases the worker without Core's finalizer.
+            return Err((
+                self,
+                ReplayWorkerError::PollLane(PollLaneError::Core(
+                    "workflow poll lane did not stop within its bound".to_owned(),
+                )),
+            ));
+        }
         let input_finished = self.feeder.is_none();
         let workflow_shutdown_observed = self.workflow_shutdown_observed;
         let outstanding_tasks = self.lanes.has_outstanding_tasks();
@@ -426,10 +466,15 @@ impl ReplayWorker {
         // replay work. `mark_natural_shutdown` deliberately does not call
         // Core's shutdown token a second time.
         self.lanes.mark_natural_shutdown();
-        let join_result = self.lanes.join_poll_lanes().await;
+        // The lane has already returned after Core's `ShutDown`, so this join
+        // normally completes at once. The replay-aware join is still used for
+        // its bound: a lane that unexpectedly keeps running is aborted and
+        // reported instead of blocking finalization forever.
+        let join_result = self.lanes.join_replay_poll_lane().await;
         if let Err(error) = join_result {
-            // `join_poll_lanes` has already awaited every producer, so no
-            // Tokio task can publish another activation. The lane error still
+            // `join_replay_poll_lane` has consumed the lane handle (aborting
+            // it if it overran its bound), so no Tokio task can publish
+            // another activation. The lane error still
             // requires an explicit disposal sequence: initiate Core shutdown
             // and retire any ledger debt, then return the intact owner to the
             // caller instead of dropping an unfinalized native graph.
@@ -443,6 +488,13 @@ impl ReplayWorker {
             self.lanes.abandon_replay_for_dispose().await;
             return Err((self, ReplayWorkerError::PollLane(error)));
         }
+        // Core's terminal finalizer is awaited without a timeout because the
+        // bound would have to drop the consumed Core worker mid-finalization.
+        // It terminates on this path: Core's workflow processing thread has
+        // left its stream loop (the lane observed `ShutDown`), the replay
+        // worker has no activity or local-activity work, Core's own
+        // `ShutdownWorker` RPC goes to the in-process mock client, and Core
+        // caps its final slot-permit wait at five seconds.
         self.lanes.finalize().await.map_err(|(lanes, error)| {
             (
                 Self {
@@ -469,6 +521,15 @@ impl ReplayWorker {
     /// worker is returned with the typed error instead of being dropped; the
     /// caller must retry disposal or take another explicit ownership-preserving
     /// recovery action.
+    ///
+    /// One case never reaches Core's finalizer. If a lane join hit its bound
+    /// (see `PollLanes::join_replay_poll_lane`), that attempt returns the
+    /// typed lane error, and the next `dispose` releases the graph by
+    /// deliberately leaking the Core worker and returns `Ok`. The leak is
+    /// bounded and documented on `PollLanes::leak_after_replay_join_timeout`.
+    /// The alternative, running Core's unbounded finalizer for a worker whose
+    /// workflow thread did not stop, could block the supervisor or
+    /// `drop_runtime_graph` forever.
     // The error deliberately returns the worker itself so ownership is never
     // lost on failure; boxing it would only move the same value to the heap.
     #[allow(clippy::result_large_err)]
@@ -477,6 +538,14 @@ impl ReplayWorker {
         handle: &Handle,
     ) -> Result<(), (Self, ReplayWorkerError)> {
         self.finish_input();
+        if self.lanes.replay_join_timed_out() {
+            // A previous attempt's lane join hit its bound. Core's finalizer
+            // could block forever, so release the graph by leaking the Core
+            // worker instead (see `PollLanes::leak_after_replay_join_timeout`).
+            // That earlier attempt already returned the typed lane error.
+            self.lanes.leak_after_replay_join_timeout();
+            return Ok(());
+        }
         self.lanes.abandon_replay_for_dispose().await;
         {
             let _runtime_guard = handle.enter();
@@ -535,6 +604,17 @@ impl ReplayWorker {
     #[cfg(test)]
     pub(crate) async fn abort_workflow_lane_for_test(&mut self) {
         self.lanes.abort_workflow_lane_for_test().await;
+    }
+
+    /// Installs a workflow lane that never finishes and shortens the replay
+    /// join bound to `bound`, forcing disposal down its join-timeout path.
+    #[cfg(test)]
+    pub(crate) async fn install_stuck_workflow_lane_for_test(
+        &mut self,
+        bound: std::time::Duration,
+    ) {
+        self.lanes.install_stuck_workflow_lane_for_test().await;
+        self.lanes.set_replay_join_bound_for_test(bound);
     }
 
     /// Exposes the ledger's reject-completion ordering probes so a test can
