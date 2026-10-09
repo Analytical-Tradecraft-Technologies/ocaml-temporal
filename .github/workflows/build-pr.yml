@@ -127,6 +127,8 @@ jobs:
         uses: actions/checkout@v7
       - name: Audit dependency licenses
         run: make license-check OCAML_VERSION=5.2
+      - name: Test dependency inventory drift detection
+        run: make test-dependency-inventory-contract
       - name: Test Cargo license policy
         run: |
           docker run --rm --network none \

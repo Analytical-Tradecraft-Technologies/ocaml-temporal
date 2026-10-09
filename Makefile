@@ -1080,8 +1080,19 @@ docs:
 	OCAML_IMAGE=$(OCAML_IMAGE) $(COMPOSE) --profile docs --progress quiet run --rm --user $(HOST_UID):$(HOST_GID) docs \
 		opam exec -- dune build $(DUNE_BUILD_ARGS) @doc
 
-license-check:
+# The OPAM licence audit first confirms that docs/dependencies.md still lists
+# exactly the locked and pinned inputs, so the reviewed inventory cannot drift
+# from what is built (#783). The inventory check is host-only POSIX shell.
+license-check: check-dependency-inventory
 	$(COMPOSE_RUN) sh scripts/check-licenses.sh
+
+.PHONY: check-dependency-inventory test-dependency-inventory-contract
+check-dependency-inventory:
+	sh scripts/check-dependency-inventory.sh .
+
+# Proves the inventory check rejects drift in each source it compares.
+test-dependency-inventory-contract:
+	sh test/smoke/test_dependency_inventory_contract.sh .
 
 audit: license-check
 
