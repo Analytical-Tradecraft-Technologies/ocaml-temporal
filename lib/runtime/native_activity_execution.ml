@@ -1846,6 +1846,17 @@ module Make (Supervisor : SUPERVISOR) = struct
   let callback_running adapter =
     with_delivery adapter (fun () -> Option.is_some adapter.running)
 
+  (** Counts admitted async leases under [async_mutex] only, which a running
+      callback never holds. That lock can be held across an async RPC, so it
+      is only tried: a held lock proves a lease is outstanding. *)
+  let outstanding_async_leases adapter =
+    if Mutex.try_lock adapter.async_mutex then
+      Some
+        (Fun.protect
+           ~finally:(fun () -> Mutex.unlock adapter.async_mutex)
+           (fun () -> Token_map.cardinal adapter.async_leases))
+    else None
+
   (** Serializes pending-completion retry, native polling, implementation
       execution, and completion submission. A retained lease blocks new tasks
       and is resubmitted only after an explicitly retryable failure. The mutex

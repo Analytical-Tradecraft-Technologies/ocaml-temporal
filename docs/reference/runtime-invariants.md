@@ -439,13 +439,24 @@ and bridge, read the [documentation guide](../README.md) first.
     native release error are an `Error`, after the graph is released. Retired
     leases with nothing abandoned stay an `Error`, so a lost lease is never a
     false success.
+  - Admitted asynchronous activity leases belong to external code, not to
+    any callback. When the activity drain is busy (an abandoned callback
+    holds the adapter lock), shutdown still counts them through the separate
+    async lock (tried, never waited for) until the deadline. Any still
+    admitted then make the outcome an `Error` naming them, so the leases the
+    bridge retires are never attributed to the abandoned callback and an
+    unrelated handle is never closed behind an `Ok` report.
   - Abandoned code is never interrupted. Its eventual completion reaches a
     closed supervisor and is rejected as `Closed`, so it cannot complete a
     task the bridge already retired. Adapter discard after the release uses
-    `try_discard`; an adapter still held by abandoned code is marked
-    `discard_pending` and discarded at the next `run` exit, or left to the
-    garbage collector with the worker value. No native resource depends on
-    it.
+    `try_discard` under a deferred-discard flag that is raised before each
+    attempt and cleared only by a successful one. When abandoned code still
+    holds an adapter lock, the next thread to release one performs the
+    discard: the detached activity lane on its own Domain right after its
+    callback returns, or `run` after its workflow lane returns. The late
+    completion bytes and adapter state are therefore dropped as soon as the
+    lock is free, not left to the garbage collector. No native resource
+    depends on them.
 - A returned native `Error` from `Native.shutdown` is still
   release-complete by the supervisor contract, so OCaml adapter maps are
   discarded only after the result is observed. If native shutdown raises

@@ -87,6 +87,8 @@ let operations supervisor =
     workflow_activation_in_flight = (fun () -> false);
     drain_workflow = (fun () -> Shutdown.Drained);
     drain_activity = (fun () -> Shutdown.Drained);
+    outstanding_async_leases = (fun () -> 0);
+    async_leases_error = string_of_int;
     release =
       (fun () ->
         match Supervisor.shutdown supervisor with

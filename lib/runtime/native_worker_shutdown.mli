@@ -119,6 +119,14 @@ type 'error operations = {
       (** Whether a workflow activation is between poll and completion now. *)
   drain_workflow : unit -> 'error drain;
   drain_activity : unit -> 'error drain;
+  outstanding_async_leases : unit -> int;
+      (** Admitted asynchronous activity leases, read without the activity
+          adapter lock. Consulted only when the activity drain reported
+          [Busy]: such a drain cannot see these leases, and they belong to
+          external code, not to the abandoned callback. Must never wait. *)
+  async_leases_error : int -> 'error;
+      (** The error reporting this many async leases still admitted when the
+          grace period ended. *)
   release : unit -> 'error release;
       (** Releases the native graph and discards adapter state it proved
           retired. An exception means the release outcome is unknown; the
@@ -135,7 +143,12 @@ type 'error outcome =
           work, and the release succeeded or retired only abandoned work. *)
   | Completion_lost of { error : 'error; report : report }
       (** A retained completion could not be delivered before the deadline,
-          or failed permanently. The graph was still force-released. *)
+          or failed permanently, or an asynchronous activity lease admitted
+          before shutdown was still outstanding at the deadline while the
+          activity adapter was held by an abandoned callback. The graph was
+          still force-released, so such a handle can no longer complete;
+          the leases the bridge retired are therefore never attributed to
+          the abandoned callback alone. *)
   | Release_error of { error : 'error; report : report }
       (** The release reported a failure, or it retired leases although no
           lane was abandoned (which would otherwise be a false success). *)
@@ -156,3 +169,32 @@ val run :
   teardown_timeout_s:float ->
   'error operations ->
   'error outcome
+
+(** Deferred adapter discard (#495). After the native release, the copied
+    adapter state (retained completions, run maps, async handles) must be
+    discarded, but an abandoned callback or activation may still hold an
+    adapter lock. The release then leaves the discard pending, and whichever
+    thread next releases an adapter lock retries it: the detached activity
+    lane after its callback returns, or [run] after its workflow lane
+    returns. The flag is raised {e before} each attempt and cleared only by a
+    successful one, so a lane that unlocks while the release is failing its
+    attempt still observes the flag afterwards and no retry is lost.
+    [try_discard] must be idempotent and non-blocking. *)
+module Deferred_discard : sig
+  (** The pending flag of one worker. *)
+  type t
+
+  (** No discard pending. *)
+  val create : unit -> t
+
+  (** Called once the native release has returned: raises the flag and
+      attempts [try_discard] at once. *)
+  val request : t -> try_discard:(unit -> bool) -> unit
+
+  (** Called by a lane after it released an adapter lock: attempts
+      [try_discard] only if a discard is pending. *)
+  val retry : t -> try_discard:(unit -> bool) -> unit
+
+  (** Whether a discard is still pending. *)
+  val pending : t -> bool
+end

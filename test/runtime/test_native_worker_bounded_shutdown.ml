@@ -86,10 +86,11 @@ let try_drain lock drained () =
     Fun.protect ~finally:(fun () -> Mutex.unlock lock) drained
   else Shutdown.Busy
 
-(** Operations over [worker]. [drain_activity] and [release] can be replaced
-    per scenario; the default release succeeds unless a lane was abandoned,
-    in which case it reports retired leases, as the bridge does. *)
-let operations ?drain_activity ?release worker =
+(** Operations over [worker]. [drain_activity], [release] and the count of
+    admitted async leases can be replaced per scenario; the default release
+    succeeds unless a lane was abandoned, in which case it reports retired
+    leases, as the bridge does. *)
+let operations ?drain_activity ?release ?(async_leases = fun () -> 0) worker =
   let release =
     match release with
     | Some release -> release
@@ -112,6 +113,8 @@ let operations ?drain_activity ?release worker =
     drain_activity =
       Option.value drain_activity
         ~default:(try_drain worker.activity_lock (fun () -> Shutdown.Drained));
+    outstanding_async_leases = async_leases;
+    async_leases_error = Printf.sprintf "%d async leases";
     release =
       (fun () ->
         ignore (Atomic.fetch_and_add worker.releases 1);
@@ -309,6 +312,123 @@ let test_stuck_workflow_activation () =
   await "run returned after the activation" (fun () -> Atomic.get returned);
   require (Atomic.get worker.releases = 1) "a late activation caused a release"
 
+(** #495 review: an async lease admitted before shutdown belongs to external
+    code, not to a callback that is abandoned meanwhile. The busy activity
+    drain cannot see it, so it is probed separately: if it is still admitted
+    when the grace period ends, the outcome is a lost completion naming it,
+    never a clean report that silently closes its handle. *)
+let test_async_lease_with_stuck_callback () =
+  let worker = fake () in
+  let release_callback = gate () in
+  let entered = Atomic.make false in
+  let started = Unix.gettimeofday () in
+  let _returned =
+    start_run worker
+      ~deadline:(fun () -> started +. 0.3)
+      ~poll_workflow:idle
+      ~poll_activity:
+        (activity_once worker (fun () ->
+             Atomic.set entered true;
+             block_on release_callback))
+  in
+  await "callback entered" (fun () -> Atomic.get entered);
+  let outcome, elapsed =
+    shutdown ~lanes_deadline:(started +. 0.3) worker
+      (operations ~async_leases:(fun () -> 1) worker)
+  in
+  require_bound ~grace:0.3 ~teardown:0.3 elapsed;
+  (match outcome with
+  | Shutdown.Completion_lost { error = "1 async leases"; report } ->
+      require (report.abandoned_activity_callbacks = 1)
+        "the abandoned callback was not counted next to the async lease";
+      require (not report.lanes_stopped) "async lease: lanes"
+  | Shutdown.Shut_down _ ->
+      failwith "an outstanding async lease was reported as a clean shutdown"
+  | _ -> failwith "an outstanding async lease was not reported");
+  require (Atomic.get worker.releases = 1) "async lease: release count";
+  open_gate release_callback
+
+(** An async lease that external code completes within the grace period is
+    not lost, even while a callback is abandoned. *)
+let test_async_lease_completed_in_grace () =
+  let worker = fake () in
+  let release_callback = gate () in
+  let entered = Atomic.make false in
+  let started = Unix.gettimeofday () in
+  let _returned =
+    start_run worker
+      ~deadline:(fun () -> started +. 0.3)
+      ~poll_workflow:idle
+      ~poll_activity:
+        (activity_once worker (fun () ->
+             Atomic.set entered true;
+             block_on release_callback))
+  in
+  await "callback entered" (fun () -> Atomic.get entered);
+  let completes_at = started +. 0.4 in
+  let async_leases () = if Unix.gettimeofday () < completes_at then 1 else 0 in
+  let outcome, _elapsed =
+    shutdown ~lanes_deadline:(started +. 0.3) worker
+      (operations ~async_leases worker)
+  in
+  let report = shut_down outcome in
+  require (report.abandoned_activity_callbacks = 1) "completed async: count";
+  open_gate release_callback
+
+(** #495 review: when the release runs while a detached callback still holds
+    the activity adapter lock, the discard is left pending, and the lane
+    itself performs it after the callback returns and the lock is free, on
+    its own Domain. Nothing else needs to run for the copied state to go. *)
+let test_detached_callback_performs_pending_discard () =
+  let worker = fake () in
+  let pending = Shutdown.Deferred_discard.create () in
+  let discards = Atomic.make 0 in
+  let try_discard () =
+    if Mutex.try_lock worker.activity_lock then begin
+      Mutex.unlock worker.activity_lock;
+      ignore (Atomic.fetch_and_add discards 1);
+      true
+    end
+    else false
+  in
+  let release_callback = gate () in
+  let entered = Atomic.make false in
+  let lane_exited = Atomic.make false in
+  let started = Unix.gettimeofday () in
+  let poll = activity_once worker (fun () ->
+      Atomic.set entered true;
+      block_on release_callback)
+  in
+  let returned =
+    start_run worker
+      ~deadline:(fun () -> started +. 0.2)
+      ~poll_workflow:idle
+      ~poll_activity:(fun () ->
+        (* The native worker's lane wrapper. *)
+        Fun.protect
+          ~finally:(fun () ->
+            Shutdown.Deferred_discard.retry pending ~try_discard;
+            if Atomic.get worker.closed then Atomic.set lane_exited true)
+          poll)
+  in
+  await "callback entered" (fun () -> Atomic.get entered);
+  Atomic.set worker.closed true;
+  await "run detached the lane" (fun () -> Atomic.get returned);
+  (* The release has returned; the callback still holds the lock. *)
+  Shutdown.Deferred_discard.request pending ~try_discard;
+  require (Shutdown.Deferred_discard.pending pending)
+    "a discard ran while the callback held the adapter lock";
+  require (Atomic.get discards = 0) "discarded under a held lock";
+  open_gate release_callback;
+  await "the detached lane performed the discard" (fun () ->
+      not (Shutdown.Deferred_discard.pending pending));
+  require (Atomic.get discards = 1) "pending discard count";
+  await "the lane observed the stop after its retry" (fun () ->
+      Atomic.get lane_exited);
+  (* A later retry finds nothing pending. *)
+  Shutdown.Deferred_discard.retry pending ~try_discard;
+  require (Atomic.get discards = 1) "a cleared discard ran again"
+
 (** A retained completion that fails retryably is retried with the exact
     same completion until it is accepted; the shutdown is then clean. *)
 let test_pending_completion_retried () =
@@ -481,6 +601,10 @@ let () =
       ("cooperative activity", test_cooperative_activity);
       ("stuck activity callback", test_stuck_activity_callback);
       ("stuck workflow activation", test_stuck_workflow_activation);
+      ("async lease with stuck callback", test_async_lease_with_stuck_callback);
+      ("async lease completed in grace", test_async_lease_completed_in_grace);
+      ( "detached callback performs pending discard",
+        test_detached_callback_performs_pending_discard );
       ("pending completion retried", test_pending_completion_retried);
       ("pending completion exhausted", test_pending_completion_exhausted);
       ("permanent completion failure", test_permanent_completion_failure);

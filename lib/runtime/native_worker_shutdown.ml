@@ -43,6 +43,8 @@ type 'error operations = {
   workflow_activation_in_flight : unit -> bool;
   drain_workflow : unit -> 'error drain;
   drain_activity : unit -> 'error drain;
+  outstanding_async_leases : unit -> int;
+  async_leases_error : int -> 'error;
   release : unit -> 'error release;
   exception_error : exn -> 'error;
 }
@@ -121,6 +123,26 @@ let drain_until ~clock ~give_up operations drain =
   in
   loop ()
 
+(** After an activity drain found the adapter busy, waits until the
+    deadline for admitted async leases, which belong to external code rather
+    than to the abandoned callback, to be completed. Returns [Busy] when none
+    remain, and otherwise a failed drain naming them, so the leases the
+    bridge then retires are reported rather than attributed to the abandoned
+    callback (#495). *)
+let await_async_leases ~clock ~give_up operations =
+  let rec loop () =
+    let outstanding = probe 0 operations.outstanding_async_leases in
+    if outstanding <= 0 then Busy
+    else if clock.now () >= give_up then
+      Drain_failed
+        { error = operations.async_leases_error outstanding; retryable = false }
+    else begin
+      clock.sleep drain_retry_interval_s;
+      loop ()
+    end
+  in
+  loop ()
+
 (** The first failed drain, workflow before activity, matching drain order. *)
 let first_drain_failure workflow activity =
   match (workflow, activity) with
@@ -148,10 +170,15 @@ let sequence ~clock ~lanes_deadline operations progress =
       Fun.protect ~finally:(fun () -> probe () operations.release_lanes) drains
     else drains ()
   in
+  let activity_busy = activity = Busy in
+  let activity =
+    if activity_busy then await_async_leases ~clock ~give_up operations
+    else activity
+  in
   (* A busy adapter is held by abandoned code; the probes say whether that
      code is user code or a native call made on its behalf. *)
   let activity_callbacks =
-    if activity = Busy && probe false operations.activity_callback_running
+    if activity_busy && probe false operations.activity_callback_running
     then 1
     else 0
   in
@@ -168,7 +195,7 @@ let sequence ~clock ~lanes_deadline operations progress =
     {
       stopped =
         acquired && (not detached_and_running) && workflow <> Busy
-        && activity <> Busy;
+        && not activity_busy;
       activity_callbacks;
       workflow_activations;
     }
@@ -291,3 +318,23 @@ let run ?(clock = system_clock) ~lanes_deadline ~teardown_timeout_s operations =
           outcome_of ~elapsed_s:(elapsed ()) ~teardown:Detached lanes final
   in
   wait ()
+
+module Deferred_discard = struct
+  type t = bool Atomic.t
+
+  let create () = Atomic.make false
+
+  (** Clears the flag only after a successful attempt. A concurrent attempt
+      that also succeeds is harmless because discard is idempotent. *)
+  let attempt pending ~try_discard =
+    if probe false try_discard then Atomic.set pending false
+
+  let request pending ~try_discard =
+    Atomic.set pending true;
+    attempt pending ~try_discard
+
+  let retry pending ~try_discard =
+    if Atomic.get pending then attempt pending ~try_discard
+
+  let pending = Atomic.get
+end

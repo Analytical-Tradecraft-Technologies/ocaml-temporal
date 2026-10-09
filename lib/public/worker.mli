@@ -416,7 +416,10 @@ val health : t -> Health.t
     should restart a process whose report shows abandoned work, because that
     code is still running. [Error] means a completion was lost (a retained
     completion could not be delivered, or failed permanently) or native
-    teardown reported a failure; native resources are still released.
+    teardown reported a failure; native resources are still released. An
+    asynchronous activity handle that external code had not completed by
+    the end of the grace period counts as a lost completion: its handle is
+    closed with the worker.
     Abandoned work that Temporal retries is not an error.
 
     Repeated calls are safe and return the same cached terminal result.

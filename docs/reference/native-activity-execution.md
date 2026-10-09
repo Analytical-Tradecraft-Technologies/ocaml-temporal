@@ -299,7 +299,10 @@ finds an admitted asynchronous lease treats its retryable outstanding-lease
 diagnostic like any retryable retained completion: it retries the drain until
 the grace period ends, so external code can still finish the handle. If the
 lease is still admitted then, shutdown releases the native graph, closes the
-handle, and returns an `Error` (#495); Temporal then times the activity out
+handle, and returns an `Error` (#495). This holds even while an unrelated
+synchronous callback is abandoned and holds the adapter lock: the lease is
+counted through the separate async lock, so it is never mistaken for the
+callback's own lease; Temporal then times the activity out
 under its own timeouts. Before #495 shutdown returned at once and left the
 worker open for a manual retry.
 

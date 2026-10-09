@@ -370,11 +370,13 @@ type t = {
       (** Set when a [run] returned without joining its activity Domain
           because a callback outlived [lanes_deadline]. That callback still
           holds the activity adapter's lock. *)
-  discard_pending : bool Atomic.t;
-      (** Set when the native release could not discard an adapter's copied
-          state because abandoned code still held its lock. A later [run]
-          exit, the first point at which the workflow lane is known to be
-          idle, retries the discard. *)
+  discard_pending : Bounded_shutdown.Deferred_discard.t;
+      (** Raised once the native release returned, cleared by the first
+          successful discard of both adapters' copied state. When abandoned
+          code still held an adapter lock, the discard is retried by the next
+          thread to release one: the detached activity lane after its
+          callback returns (see [run_lanes]), or [run] after its workflow
+          lane returns. *)
 }
 (** Native worker lifecycle state. The [closed] and [stop_requested] atomics
     are the only state observed by the polling lanes from [shutdown] and
@@ -572,6 +574,17 @@ let try_discard_adapters worker =
   let activity_discarded = Activity.try_discard worker.activities in
   workflow_discarded && activity_discarded
 
+(** Starts the deferred discard after the native release returned. *)
+let request_discard worker =
+  Bounded_shutdown.Deferred_discard.request worker.discard_pending
+    ~try_discard:(fun () -> try_discard_adapters worker)
+
+(** Retries a pending discard after the calling lane released its adapter
+    lock; a no-op unless the release left one pending. *)
+let retry_discard worker =
+  Bounded_shutdown.Deferred_discard.retry worker.discard_pending
+    ~try_discard:(fun () -> try_discard_adapters worker)
+
 (** Runs both lanes through the generic loop and converts an escaped lane
     exception into a defect result. *)
 let run_lanes worker =
@@ -581,7 +594,13 @@ let run_lanes worker =
       ~poll_workflow:(fun () -> poll_workflow worker)
       ~poll_activity:(fun () ->
         Owner.enter_activity worker.owner;
-        poll_activity worker)
+        (* The poll holds the activity adapter lock while it runs a callback.
+           Once it returns, that lock is free, so a discard the native
+           release had to skip because this callback was abandoned can now
+           run, here on the lane's own Domain (#495). *)
+        Fun.protect
+          ~finally:(fun () -> retry_discard worker)
+          (fun () -> poll_activity worker))
       ~wait_for_lane:(fun ~workflow_lane ~native_wait ->
         wait_for_lane worker ~workflow_lane ~native_wait)
       ~retry_pending:(fun ~workflow_lane -> retry_pending worker ~workflow_lane)
@@ -617,8 +636,7 @@ let run worker =
           (* The workflow lane has returned, so a discard the native release
              had to skip can now proceed for it (and for the activity
              adapter too, unless its callback is still detached). *)
-          if Atomic.get worker.discard_pending && try_discard_adapters worker
-          then Atomic.set worker.discard_pending false;
+          retry_discard worker;
           Mutex.unlock worker.run_mutex)
         (fun () ->
           report Logs.Info ~operation:"worker_run_started" ();
@@ -658,8 +676,7 @@ let terminal_cleanup_once worker =
        force-release boundary. Only now may copied completions and paused
        workflow continuations be discarded; an adapter still held by
        abandoned code is left to the next [run] exit. *)
-    if not (try_discard_adapters worker) then
-      Atomic.set worker.discard_pending true;
+    request_discard worker;
     Atomic.set worker.terminal_cleanup_pending false;
     true
   with _ ->
@@ -692,7 +709,7 @@ let schedule_terminal_cleanup worker =
     including one still held by an abandoned callback or activation).
     Discarding after either result shuts down every remaining scheduler and
     continuation deterministically; an adapter whose lock abandoned code
-    still holds is skipped and recorded in [discard_pending]. Only an
+    still holds is left pending in [discard_pending]. Only an
     exception leaves the release outcome unproven: the adapters are then
     retained and the detached terminal-cleanup path becomes responsible for
     the retry. *)
@@ -705,8 +722,7 @@ let release_native worker =
       schedule_terminal_cleanup worker;
       raise exception_
   | result -> (
-      if not (try_discard_adapters worker) then
-        Atomic.set worker.discard_pending true;
+      request_discard worker;
       match result with
       | Ok () -> Bounded_shutdown.Released
       | Error
@@ -762,6 +778,20 @@ let shutdown_operations worker =
       (fun () -> Workflow.activation_in_flight worker.workflows);
     drain_workflow = drain_workflow worker;
     drain_activity = drain_activity worker;
+    outstanding_async_leases =
+      (fun () ->
+        Option.value ~default:1
+          (Activity.outstanding_async_leases worker.activities));
+    async_leases_error =
+      (fun count ->
+        Base_error.make ~category:`Bridge
+          ~message:
+            (Printf.sprintf
+               "activity completion drain failed: %d asynchronous activity \
+                completion(s) remained admitted when the grace period ended; \
+                their handles were closed with the worker"
+               count)
+          ());
     release = (fun () -> release_native worker);
     exception_error =
       (fun _exception ->
@@ -1020,7 +1050,7 @@ let create ?max_cached_workflows
           Int64.to_float shutdown_teardown_timeout_ms /. 1_000.;
         lanes_deadline = Atomic.make None;
         activity_detached = Atomic.make false;
-        discard_pending = Atomic.make false;
+        discard_pending = Bounded_shutdown.Deferred_discard.create ();
       }
   in
   match setup with

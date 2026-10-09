@@ -207,6 +207,15 @@ module Make (Supervisor : SUPERVISOR) : sig
       only the short delivery lock, never the adapter lock that the callback
       holds, so it is safe from any thread while the callback runs. *)
   val callback_running : t -> bool
+
+  (** The number of admitted asynchronous activity leases ([WillCompleteAsync]
+      handoffs Core accepted that external code has not yet completed), read
+      without the adapter lock that a running callback holds (#495). These
+      leases belong to no callback, so bounded shutdown must not attribute
+      them to an abandoned one. [None] means the separate async lock is held
+      right now, i.e. a request on an admitted lease is in flight, so at
+      least one lease is outstanding; the probe never waits for it. *)
+  val outstanding_async_leases : t -> int option
 end
 
 val register :

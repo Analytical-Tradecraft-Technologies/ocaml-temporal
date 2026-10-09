@@ -41,17 +41,27 @@ an unreachable server yields a `` `Detached `` report while that thread still
 completes the one release. Abandonment is an `Ok` report; a lost completion
 or a native release failure is an `Error` after the graph is released, and
 retired leases with nothing abandoned stay an `Error`, so no false success.
+Admitted asynchronous activity leases are counted through their own lock
+even while an abandoned callback holds the activity adapter, so one still
+admitted at the deadline is reported as an `Error` instead of being retired
+behind the abandoned callback's `Ok` report. Adapter discard after the
+release is deferred while abandoned code holds an adapter lock and is
+performed by the detached activity lane itself once its callback returns
+(or by `run` after its workflow lane returns).
 The orchestration lives in the new private `Native_worker_shutdown` module,
 generic over injected effects. The old drain-retry admission reopening and
 its policy helpers are removed. No Rust, C or ABI change; the bridge's own 90 s
 drain and 30 s finalize bounds are unchanged.
 
-Evidence: 13 focused tests over the real lane scheduler with fake adapters
+Evidence: 16 focused tests over the real lane scheduler with fake adapters
 (idle, cooperative and stuck activity callbacks, a stuck workflow activation,
 retained completions retried, exhausted and permanently failing, an
 unreachable server during release and during a drain, retired leases without
-abandonment, a raising release, a past deadline, and the unchanged join
-without detach); three supervisor tests over `Sdk_supervisor.Make` with a fake
+abandonment, an async lease outstanding or completed beside a stuck callback,
+the detached lane performing a pending discard, a raising release, a past
+deadline, and the unchanged join without detach); an adapter test showing an
+admitted async lease stays counted while a synchronous callback holds the
+adapter; three supervisor tests over `Sdk_supervisor.Make` with a fake
 backend that blocks like an unreachable server, including a late operation
 rejected as `Closed`; option and mock-report unit tests; and the new
 `bounded_shutdown` live regression in `make test-temporal-live-regressions`,
