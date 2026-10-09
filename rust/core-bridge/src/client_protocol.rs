@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 use temporalio_client::grpc::WorkflowService;
 use temporalio_client::request_extensions::{NoRetryOnMatching, RetryConfigForCall};
+use temporalio_client::tonic::metadata::MetadataValue;
 use temporalio_client::tonic::{Code, IntoRequest, Request, Status};
 use temporalio_client::{Connection, RetryOptions};
 use temporalio_common::protos::temporal::api::{
@@ -1120,6 +1121,22 @@ pub fn encode_visibility_response(
 /// the wait.
 const WAIT_MAX_ATTEMPTS: usize = 30;
 
+/// gRPC metadata key through which a client lists the optional Temporal
+/// protocol features it understands (Temporal Server `headers` package).
+pub const SUPPORTED_FEATURES_HEADER: &str = "supported-features";
+
+/// Temporal feature name declaring that the client follows the
+/// `new_execution_run_id` of a completed, failed, or timed-out close event.
+///
+/// Without it Temporal Server rewrites such a close event, when the history
+/// request filters for the close event only, into a synthetic
+/// `WorkflowExecutionContinuedAsNew` event for compatibility with SDKs from
+/// before 2021 (#971). The rewrite would make a run that a retry policy or
+/// cron schedule chained to a successor indistinguishable from an explicit
+/// continue-as-new and would discard the run's failure. `wait` already maps
+/// every successor-bearing close event, so it always advertises the feature.
+pub const FOLLOWS_NEXT_RUN_ID_FEATURE: &str = "follows-next-run-id";
+
 /// Core retry policy for the exact-run history long poll behind `wait`.
 ///
 /// Core measures its elapsed-time limit from the start of the call, and a
@@ -2037,6 +2054,12 @@ pub async fn start_workflow(
 /// Waits for the run named by `request`, or for the workflow's current run
 /// when its run ID is empty, never following successors.
 ///
+/// Each poll advertises [`FOLLOWS_NEXT_RUN_ID_FEATURE`], so Temporal returns
+/// the run's real close event: a run that a retry policy or cron schedule
+/// chained to a successor reports `Failed`, `TimedOut`, or `Completed` with
+/// that successor, and only an explicit continue-as-new reports
+/// `ContinuedAsNew`.
+///
 /// With an empty run ID Temporal resolves the current run on the first poll
 /// and pins later pages to it through the continuation token. If a long poll
 /// ends with neither an event nor a token, the next poll resolves the current
@@ -2073,6 +2096,13 @@ pub async fn wait_workflow(
         // only the retry window documented on `wait_retry_options`.
         poll.extensions_mut()
             .insert(RetryConfigForCall(wait_retry_options()));
+        // Ask Temporal for the true close event rather than its legacy
+        // continued-as-new rewrite (#971). Core's retry path copies request
+        // metadata, so every transport attempt carries the header.
+        poll.metadata_mut().insert(
+            SUPPORTED_FEATURES_HEADER,
+            MetadataValue::from_static(FOLLOWS_NEXT_RUN_ID_FEATURE),
+        );
         let response = service
             .get_workflow_execution_history(poll)
             .await
@@ -3722,6 +3752,77 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    /// Keeps the close event's own kind when Temporal links it to a successor
+    /// run (#971): a retried failure stays `Failed`, a retried timeout stays
+    /// `TimedOut`, and a cron completion stays `Completed`, each carrying the
+    /// successor. Only a continue-as-new event produces `ContinuedAsNew`.
+    fn successor_bearing_close_events_keep_their_kind() {
+        use temporalio_common::protos::temporal::api::{
+            failure::v1::Failure,
+            history::v1::{
+                WorkflowExecutionCompletedEventAttributes, WorkflowExecutionFailedEventAttributes,
+                WorkflowExecutionTimedOutEventAttributes,
+            },
+        };
+        let next = SuccessorRef {
+            namespace: "default".to_owned(),
+            workflow_id: "id".to_owned(),
+            run_id: "run-2".to_owned(),
+        };
+        let outcome = |attributes| {
+            outcome_from_event(
+                HistoryEvent {
+                    attributes: Some(attributes),
+                    ..Default::default()
+                },
+                "default",
+                "id",
+            )
+            .unwrap()
+        };
+
+        let failed = outcome(Attributes::WorkflowExecutionFailedEventAttributes(
+            WorkflowExecutionFailedEventAttributes {
+                failure: Some(Failure {
+                    message: "retried".to_owned(),
+                    ..Default::default()
+                }),
+                new_execution_run_id: "run-2".to_owned(),
+                ..Default::default()
+            },
+        ));
+        let WorkflowOutcome::Failed { failure, successor } = failed else {
+            panic!("a retried failure must remain a failed outcome");
+        };
+        assert_eq!(failure.message, "retried");
+        assert_eq!(successor, Some(next.clone()));
+
+        assert_eq!(
+            outcome(Attributes::WorkflowExecutionTimedOutEventAttributes(
+                WorkflowExecutionTimedOutEventAttributes {
+                    new_execution_run_id: "run-2".to_owned(),
+                    ..Default::default()
+                },
+            )),
+            WorkflowOutcome::TimedOut {
+                successor: Some(next.clone()),
+            }
+        );
+        assert_eq!(
+            outcome(Attributes::WorkflowExecutionCompletedEventAttributes(
+                WorkflowExecutionCompletedEventAttributes {
+                    new_execution_run_id: "run-2".to_owned(),
+                    ..Default::default()
+                },
+            )),
+            WorkflowOutcome::Completed {
+                result: Vec::new(),
+                successor: Some(next),
+            }
+        );
     }
 
     #[test]

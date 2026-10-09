@@ -15,6 +15,31 @@ implementation when a later entry documents that work as complete. The
 records the current tested source, named assertions and successful CI job for
 the Temporal acceptance controllers.
 
+## 2026-10-10: Exact-run wait reports retried runs by their real close event (#971)
+
+An exact-run `Client.wait` on a run that its workflow retry policy retried
+now returns `Failed { error; successor = Some _ }` with the failure that
+caused the retry, instead of `Continued_as_new`. Temporal Server rewrites a
+completed, failed, or timed-out close event that links a successor into a
+synthetic continue-as-new event, in close-event-only history responses, for
+any client that does not send the `supported-features: follows-next-run-id`
+gRPC header. The bridge's close-event long poll now sends that header on
+every request (Core's retry path copies it to each attempt), so a retried
+failure is `Failed`, a retried timeout is `Timed_out`, and a cron completion
+is `Completed`, each with its successor, while an explicit continue-as-new
+is still `Continued_as_new`. The header is per request; the ABI stays at v4.
+
+Evidence: a Rust unit test maps failed, timed-out, and completed close events
+that carry `new_execution_run_id` to their own outcome with the successor; an
+in-memory gRPC test checks that every history poll, including later pages and
+current-run waits, carries the header; the OCaml terminal-adapter test now
+requires each exact wait to keep its close event's kind and a retried
+failure's error. The `client_policies` live regression no longer accepts
+`Continued_as_new` for a retried run, and adds a retried run timeout
+(`Timed_out` with a successor) and an explicit continue-as-new. Cron
+schedules cannot be started from this client, so the cron `Completed` case is
+unit-tested only.
+
 ## 2026-10-09: Cooperative activity cancellation and shutdown signal (#494)
 
 A running synchronous activity can now observe cancellation and worker
