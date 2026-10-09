@@ -25,6 +25,10 @@ let leave owner =
   Atomic.set owner.run None;
   Atomic.set owner.activity None
 
+(** Clears only the workflow-lane slot, leaving a detached activity lane's
+    identity published. *)
+let leave_run owner = Atomic.set owner.run None
+
 (** Whether a published slot names exactly [self]. *)
 let owns self = function
   | None -> false

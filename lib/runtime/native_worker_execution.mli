@@ -289,6 +289,20 @@ module Make (Supervisor : SUPERVISOR) : sig
       it never attempts another completion. *)
   val discard : t -> unit
 
+  (** [drain] without waiting (#495): [None] when the adapter lock is held,
+      which means the workflow lane is still between poll and completion
+      (running workflow code or a supervisor call for it). Bounded shutdown
+      uses it so an abandoned activation can never block the drain. *)
+  val try_drain : t -> (unit, error_view) result option
+
+  (** [discard] without waiting: [false] when the adapter lock is held, in
+      which case nothing was discarded. *)
+  val try_discard : t -> bool
+
+  (** Whether an activation is between poll and completion now, including
+      one whose lease the watchdog already released while its code still
+      runs. A lock-free read, safe from any thread. *)
+  val activation_in_flight : t -> bool
 end
 
 (** Wraps a public workflow definition in the private existential registration

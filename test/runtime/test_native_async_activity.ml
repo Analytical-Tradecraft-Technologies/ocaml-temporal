@@ -1770,6 +1770,73 @@ let test_unactivated_handles_close () =
   if !(supervisor.async_completion_calls) <> 0 then
     failwith "unactivated async handle reached the client"
 
+(** #495 review: an admitted async lease must stay visible to bounded
+    shutdown while an unrelated synchronous callback holds the adapter lock.
+    [try_drain] reports the adapter busy without waiting, and
+    [outstanding_async_leases] still counts the lease through the separate
+    async lock, so shutdown cannot attribute it to the abandoned callback. *)
+let test_async_lease_visible_while_callback_runs () =
+  let supervisor = fake_supervisor () in
+  let async_activity =
+    Temporal.Activity.define_async ~name:"async_lease_visibility"
+      ~input:Temporal.Codec.unit ~output:Temporal.Codec.string
+      (fun context () ->
+        Temporal.Activity.Will_complete_async
+          (Temporal.Activity.Async_context.handle context))
+  in
+  let entered = Atomic.make false in
+  let release = Atomic.make false in
+  let blocking =
+    Temporal_base.Definition.make ~name:"sync_blocking_callback"
+      ~input:(base_codec Temporal.Codec.unit)
+      ~output:(base_codec Temporal.Codec.string)
+      ~implementation:
+        (Some
+           (fun _context () ->
+             Atomic.set entered true;
+             while not (Atomic.get release) do
+               Thread.delay 0.005
+             done;
+             Ok "late"))
+  in
+  enqueue supervisor
+    (start_task ~token:(Bytes.of_string "async-visible-token")
+       ~activity_type:"async_lease_visibility"
+       ~input:[ encode_input Temporal.Codec.unit () ]);
+  let worker =
+    worker supervisor
+      [ Adapter.register_async async_activity; Raw_adapter.register blocking ]
+  in
+  expect_deferred (Worker.poll worker);
+  if Worker.outstanding_async_leases worker <> Some 1 then
+    failwith "the admitted async lease was not counted";
+  enqueue supervisor
+    (start_task ~token:(Bytes.of_string "sync-blocking-token")
+       ~activity_type:"sync_blocking_callback"
+       ~input:[ encode_input Temporal.Codec.unit () ]);
+  let lane = Domain.spawn (fun () -> Worker.poll worker) in
+  let deadline = Unix.gettimeofday () +. 5. in
+  while not (Atomic.get entered) do
+    if Unix.gettimeofday () > deadline then failwith "callback never entered";
+    Thread.delay 0.005
+  done;
+  if not (Worker.callback_running worker) then
+    failwith "the running callback was not reported";
+  if Worker.try_drain worker <> None then
+    failwith "try_drain did not report the held adapter as busy";
+  if Worker.try_discard worker then
+    failwith "try_discard discarded under a held adapter lock";
+  if Worker.outstanding_async_leases worker <> Some 1 then
+    failwith "the async lease was hidden by the busy adapter";
+  Atomic.set release true;
+  ignore (Domain.join lane);
+  if Worker.callback_running worker then
+    failwith "a returned callback was still reported running";
+  if not (Worker.try_discard worker) then
+    failwith "try_discard failed on an idle adapter";
+  if Worker.outstanding_async_leases worker <> Some 0 then
+    failwith "discard did not close the async lease"
+
 (** Runs the isolated async lifecycle assertions. *)
 let () =
   test_base_state_machine ();
@@ -1797,4 +1864,5 @@ let () =
   test_stale_handle_rejected ();
   test_completion_racing_handoff_is_retryable ();
   test_completer_domain_retries_until_handoff ();
-  test_unactivated_handles_close ()
+  test_unactivated_handles_close ();
+  test_async_lease_visible_while_callback_runs ()

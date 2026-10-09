@@ -60,6 +60,10 @@ module Native_worker_observer = Temporal_runtime.Native_worker_observer
     yield. *)
 module Native_worker_watchdog = Temporal_runtime.Native_worker_watchdog
 
+(** Bounded worker shutdown orchestration over injected lane, drain, and
+    native-release operations (#495). *)
+module Native_worker_shutdown = Temporal_runtime.Native_worker_shutdown
+
 (** Callback representation underlying the public abstract future type. *)
 module Future = Temporal_future_kernel
 

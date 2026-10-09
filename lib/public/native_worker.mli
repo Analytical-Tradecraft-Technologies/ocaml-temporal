@@ -79,12 +79,18 @@ type t
     all-Core-defaults) are the public worker resource options of #498. They
     are validated by {!Temporal_sdk_kernel.Bridge.worker_config} before any
     native resource is allocated. Activity slot counts are deliberately not
-    parameters: the bridge pins them to the serial OCaml executor (#777). *)
+    parameters: the bridge pins them to the serial OCaml executor (#777).
+
+    The grace period also bounds how long [run] and [shutdown] wait for a
+    stopping lane, and [shutdown_teardown_timeout_ms] (default 60000) how
+    long [shutdown] then waits for the native release (#495). The caller
+    validates both; neither reaches the bridge except the grace period. *)
 val create :
   ?max_cached_workflows:int ->
   ?max_outstanding_workflow_tasks:int ->
   ?max_concurrent_workflow_task_polls:int ->
   ?graceful_shutdown_timeout_ms:int64 ->
+  ?shutdown_teardown_timeout_ms:int64 ->
   ?tuning:Temporal_sdk_kernel.Bridge.worker_tuning ->
   ?io_threads:int ->
   ?runtime:Temporal_sdk_kernel.Shared_runtime.t ->
@@ -105,7 +111,9 @@ val create :
     it runs on its own Domain for the duration of this call; an activation
     abandoned by the watchdog is reported as a rejected task when its code
     eventually returns, so the loop continues. The loop itself cannot return
-    while workflow code refuses to yield. *)
+    while workflow code refuses to yield. Once a stop is observed it waits
+    for an activity callback only until the grace period has elapsed, then
+    returns and leaves that callback running on its detached Domain (#495). *)
 val run : t -> (unit, Temporal_base.Error.t) result
 
 (** The first workflow activation the watchdog abandoned because it ran past
@@ -130,15 +138,25 @@ val is_execution_thread : t -> bool
     release the native graph. *)
 val request_stop : t -> unit
 
-(** Requests stop, waits for an active run loop to leave the adapter, and then
-    releases the supervisor's worker, client, and Rust runtime graph exactly
-    once. Repeated calls are idempotent. A call from an execution thread
+(** Requests stop and runs the bounded shutdown of
+    {!Temporal_sdk_kernel.Native_worker_shutdown}: it waits at most the grace
+    period for the run loop to leave the adapters, drains retained
+    completions, and releases the supervisor's worker, client, and Rust
+    runtime graph exactly once, waiting at most the teardown timeout for that
+    release. [Ok report] says what was abandoned and whether the release was
+    still in progress on its own thread when the call returned. [Error] means
+    a retained completion was lost or the release failed; the graph is still
+    released. Repeated calls are idempotent. A call from an execution thread
     cannot wait for its own loop: it posts [request_stop] and returns a
     retryable defect without starting teardown. *)
-val shutdown : t -> (unit, Temporal_base.Error.t) result
+val shutdown :
+  t ->
+  ( Temporal_sdk_kernel.Native_worker_shutdown.report,
+    Temporal_base.Error.t )
+  result
 
-(** Returns [true] only when the most recent shutdown failure occurred while
-    retrying an OCaml-owned completion. In that state native teardown has not
-    started and the caller may retry; a native teardown error returns [false]
-    because the supervisor graph is already terminal. *)
+(** Returns [true] only when the most recent shutdown failure was the
+    execution-thread admission defect. In that state teardown has not
+    started and another thread may retry; every admitted shutdown is
+    terminal and returns [false]. *)
 val shutdown_retryable : t -> bool

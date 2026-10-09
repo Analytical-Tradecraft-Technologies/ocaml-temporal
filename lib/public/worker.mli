@@ -100,12 +100,23 @@ module Options : sig
         the server offers it to any worker. It has no effect when the cache
         is disabled.
 
-      Shutdown:
+      Shutdown (#495; see {!shutdown_with_report} for the whole contract):
       - [graceful_shutdown_period] (default 30 s, zero to one day) is how long
-        Temporal Core waits after shutdown begins before it cancels
-        outstanding activity tasks. {!shutdown} first lets the in-flight
-        callback finish, so the period bounds only activity tasks Core still
-        holds at that point.
+        work already running may continue after shutdown begins. Activity
+        callbacks see {!Activity.Context.is_worker_shutting_down} turn [true]
+        at once. A callback or workflow activation still running when the
+        period ends is abandoned, and Temporal retries its task elsewhere.
+        Temporal Core receives the same period for the activity tasks it
+        still holds.
+      - [shutdown_teardown_timeout] (default 60 s, zero to one day) is how
+        long {!shutdown} then waits for native teardown: retiring abandoned
+        tasks with the server, deregistering the worker, and releasing the
+        runtime. When it elapses first, {!shutdown} returns and the teardown
+        finishes in the background. The default covers an ordinary
+        teardown, including one server long poll.
+      Together they bound {!shutdown}: it returns within
+      [graceful_shutdown_period + shutdown_teardown_timeout] plus a fraction
+      of a second.
 
       Activities:
       - [max_heartbeat_throttle_interval] (default 60 s) and
@@ -140,6 +151,7 @@ module Options : sig
     ?workflow_task_pollers:workflow_task_pollers ->
     ?sticky_queue_schedule_to_start_timeout:Duration.t ->
     ?graceful_shutdown_period:Duration.t ->
+    ?shutdown_teardown_timeout:Duration.t ->
     ?max_heartbeat_throttle_interval:Duration.t ->
     ?default_heartbeat_throttle_interval:Duration.t ->
     ?max_worker_activities_per_second:float ->
@@ -167,6 +179,9 @@ module Options : sig
 
   (** The configured shutdown grace period, or its default. *)
   val graceful_shutdown_period : t -> Duration.t
+
+  (** The configured native teardown timeout, or its default. *)
+  val shutdown_teardown_timeout : t -> Duration.t
 
   (** The configured maximum heartbeat throttle interval, or Core's default. *)
   val max_heartbeat_throttle_interval : t -> Duration.t
@@ -216,6 +231,42 @@ module Health : sig
   (** [Healthy] until the watchdog detects a stuck activation; afterwards
       [Stuck_workflow_activation] for the life of the worker. *)
   type t = Healthy | Stuck_workflow_activation of stuck_workflow_activation
+end
+
+(** What a bounded {!shutdown_with_report} left behind (#495). *)
+module Shutdown_report : sig
+  (** Whether native teardown finished before {!shutdown_with_report}
+      returned. [`Detached] means the teardown timeout elapsed first: the
+      teardown continues on an SDK-owned background thread, which still
+      releases every native resource exactly once. A process that exits
+      right away may cut it short; Temporal then recovers the worker's
+      tasks through its ordinary timeouts. *)
+  type teardown = [ `Completed | `Detached ]
+
+  (** Counts are taken when the grace period ended.
+      - [elapsed] is how long the call that performed shutdown took.
+        Repeated calls return the same report.
+      - [lanes_stopped] is [true] when the workflow and activity lanes both
+        returned within the grace period. [false] means at least one was
+        abandoned: it was running the user code counted below, or was
+        blocked in a call into Temporal Core on that code's behalf.
+      - [abandoned_activity_callbacks] counts activity callbacks still
+        running. The worker fails each one's task retryably, so Temporal
+        schedules the next attempt under the activity's retry policy,
+        normally on another worker.
+      - [abandoned_workflow_activations] counts workflow activations still
+        running. Their workflow tasks are failed, so Temporal retries them,
+        normally on another worker. *)
+  type t = {
+    elapsed : Duration.t;
+    lanes_stopped : bool;
+    abandoned_activity_callbacks : int;
+    abandoned_workflow_activations : int;
+    native_teardown : teardown;
+  }
+
+  (** [true] when nothing was abandoned and teardown completed. *)
+  val is_clean : t -> bool
 end
 
 (** Packs a typed workflow definition for a worker registration list. [signals]
@@ -295,7 +346,12 @@ val create :
 (** Runs the workflow and activity poll loops until [shutdown] or
     [request_shutdown] is requested. After [request_shutdown], [run] returns
     [Ok ()] once both lanes have finished their current task, and a later
-    [run] returns [Ok ()] without polling.
+    [run] returns [Ok ()] without polling. An activity callback still
+    running when the grace period ends ({!Options.make}) no longer delays
+    [run]: it returns and leaves that callback running on its own Domain,
+    which {!shutdown_with_report} then reports as abandoned. A workflow
+    activation runs on the thread that called [run], so a non-yielding one
+    keeps [run] from returning (see {!health}).
     Each accepted task is decoded, dispatched to its registered OCaml function,
     encoded, and completed before the next task is admitted. This is a blocking
     call: invoke it from an ordinary dedicated Domain or system thread, not
@@ -318,8 +374,10 @@ val options : t -> Options.t
     stuck workflow task (Temporal then retries it, normally on another worker)
     and marks this worker unhealthy. The stuck code keeps the workflow lane
     busy until it returns on its own, so no other workflow task on this worker
-    makes progress meanwhile, and {!shutdown} cannot complete while it is
-    stuck. Recovery is a process restart by an external supervisor
+    makes progress meanwhile, and [run] cannot return while it is stuck.
+    {!shutdown}, called from another thread, still returns within its bound
+    and reports the activation as abandoned; the stuck code itself keeps
+    running. Recovery is a process restart by an external supervisor
     (Kubernetes, systemd, or similar). Once reported, the state is sticky:
     even if the code later returns, the process may hold inconsistent state
     and should be replaced.
@@ -333,32 +391,70 @@ val options : t -> Options.t
     the probe too. The mock backend always reports [Healthy]. *)
 val health : t -> Health.t
 
-(** Initiates graceful worker shutdown. Repeated calls are safe and return the
-    same cached terminal result. A permanent native teardown error is retained
-    so later callers observe [Error] rather than a spurious [Ok]. Retryable
-    failures leave the worker open for another attempt.
+(** Shuts the worker down within a bound and reports what it abandoned
+    (#495). Admission closes at once: both lanes stop polling and activity
+    contexts report {!Activity.Context.is_worker_shutting_down}. Then:
 
-    [shutdown] may be called from any Domain or system thread other than the
-    one running a workflow or activity callback of this worker, including a
-    sibling system thread on the Domain that hosts [run]. It blocks until the
-    run loop has stopped and the worker is released. Concurrent callers are
-    serialized: one performs the teardown and the others wait for and return
-    the same cached result. A call from the thread running [run], such as a
-    workflow or activity callback of this worker or an OCaml signal handler
-    that the runtime happens to execute on that thread, cannot wait for its
-    own loop to stop. It calls [request_shutdown], so [run] returns, and
-    returns a defect [Error] immediately without releasing anything; call
-    [shutdown] again after [run] returns.
+    + Work already running may finish until the grace period
+      ({!Options.make}) elapses. Retained completions are delivered.
+    + Anything still running at that point is abandoned rather than awaited,
+      because OCaml cannot interrupt it. An activity callback is detached:
+      it keeps running on its activity Domain, its task is failed
+      retryably so Temporal schedules the next attempt (normally on another
+      worker), and the result it eventually returns is discarded without
+      reaching Temporal. A non-yielding workflow activation keeps running on
+      the thread that called {!run}; its workflow task is failed. The
+      abandoned code keeps any OCaml values it uses alive until it returns;
+      the worker's native resources do not depend on it.
+    + Native teardown then runs for at most the teardown timeout. It may
+      instead be left to finish in the background, as the report states.
 
-    [shutdown] takes locks and blocks, so do not call it from a signal
-    handler; use [request_shutdown] there. *)
+    The call therefore returns within the grace period plus the teardown
+    timeout, plus a fraction of a second, even when a callback ignores
+    cancellation or the server is unreachable. [Ok report] describes a
+    shutdown that delivered every completion it could; a process supervisor
+    should restart a process whose report shows abandoned work, because that
+    code is still running. [Error] means a completion was lost (a retained
+    completion could not be delivered, or failed permanently) or native
+    teardown reported a failure; native resources are still released. An
+    asynchronous activity handle that external code had not completed by
+    the end of the grace period counts as a lost completion: its handle is
+    closed with the worker.
+    Abandoned work that Temporal retries is not an error.
+
+    Repeated calls are safe and return the same cached terminal result.
+    A call from an execution thread is the only retryable failure (below).
+
+    [shutdown_with_report] may be called from any Domain or system thread
+    other than the one running a workflow or activity callback of this
+    worker, including a sibling system thread on the Domain that hosts
+    [run]. Concurrent callers are serialized: one performs the shutdown and
+    the others wait for and return the same cached result. A call from the
+    thread running [run], such as a workflow or activity callback of this
+    worker or an OCaml signal handler that the runtime happens to execute on
+    that thread, cannot wait for its own loop to stop. It calls
+    [request_shutdown], so [run] returns, and returns a defect [Error]
+    immediately without releasing anything; call it again after [run]
+    returns.
+
+    [shutdown_with_report] takes locks and blocks, so do not call it from a
+    signal handler; use [request_shutdown] there. The mock backend has
+    nothing to abandon and reports a clean shutdown. *)
+val shutdown_with_report : t -> (Shutdown_report.t, Error.t) result
+
+(** {!shutdown_with_report} without the report: the same bounded shutdown
+    and the same cached result. *)
 val shutdown : t -> (unit, Error.t) result
 
 (** Asks [run] to stop and returns immediately. The request is sticky and
     idempotent: an active [run] returns [Ok ()] once each lane finishes its
-    current task (within the bounded native readiness wait when idle), and a
-    later [run] returns [Ok ()] without polling. Nothing is drained or
-    released, so call [shutdown] after [run] returns.
+    current task (within the bounded native readiness wait when idle), or
+    once the grace period has elapsed for an activity callback that has not
+    finished, and a later [run] returns [Ok ()] without polling. Nothing is
+    drained or released, so call [shutdown_with_report] after [run]
+    returns. The grace period starts when the run loop observes this
+    request, so the following shutdown does not grant the callback a second
+    one.
 
     This is the function to call from a [SIGTERM] or [SIGINT] handler. It
     performs only atomic writes, with no lock, I/O, logging, or native call,
@@ -378,7 +474,19 @@ val shutdown : t -> (unit, Error.t) result
             Sys.set_signal Sys.sigint previous_int)
           (fun () ->
             let run_result = Temporal.Worker.run worker in
-            let shutdown_result = Temporal.Worker.shutdown worker in
-            Result.bind run_result (fun () -> shutdown_result))
-    ]} *)
+            let shutdown_result = Temporal.Worker.shutdown_with_report worker in
+            (match shutdown_result with
+            | Ok report when not (Temporal.Worker.Shutdown_report.is_clean report)
+              ->
+                (* Abandoned code is still running: exit, so the process
+                   supervisor replaces this process. *)
+                prerr_endline "worker shutdown abandoned in-flight work"
+            | Ok _ | Error _ -> ());
+            Result.bind run_result (fun () -> Result.map ignore shutdown_result))
+    ]}
+
+    A service behind a load balancer or orchestrator should first stop
+    advertising readiness (for example fail its readiness probe), then call
+    [request_shutdown], and keep its liveness probe on {!health} until the
+    process exits. *)
 val request_shutdown : t -> unit

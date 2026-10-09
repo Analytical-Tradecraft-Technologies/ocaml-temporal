@@ -113,8 +113,10 @@ make test-transport-interruption-live RUN='opam exec --' \
 
 The following parts of #504 are not covered by this suite:
 
-- Worker shutdown while the transport is unavailable. This depends on the
-  bounded shutdown work in #495.
+- Worker shutdown while the transport is unavailable, live. #495 bounds
+  shutdown and covers an unreachable server with focused tests over a
+  blocking fake backend; a live transport fault during shutdown is not yet
+  part of this suite.
 - Faults on authenticated (TLS) connections. This depends on #496.
 - Workflow task completion loss as its own targeted scenario. It is exercised
   only indirectly here, through lost poll responses during the activity

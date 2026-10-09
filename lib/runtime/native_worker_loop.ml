@@ -77,16 +77,30 @@ let run_lane ~stopped ~poll ~wait ~retry_pending ~busy ~sibling_busy
   in
   loop ()
 
+type activity_detach = {
+  now : unit -> float;
+  deadline : unit -> float;
+  on_detached : unit -> unit;
+}
+
+(** Interval at which a bounded join checks whether the activity lane has
+    finished. [Thread.delay] releases the runtime lock meanwhile. *)
+let join_poll_interval_s = 0.01
+
 (** Runs the workflow and capacity-one activity lanes concurrently. The caller
     joins the activity Domain on every ordinary result before returning; its
     owner can therefore hold the worker lifecycle mutex until neither lane can
-    use an adapter or the native supervisor. An activity callback that never
-    returns also prevents this join and remains a bounded-shutdown limitation. *)
-let run ~closed ~poll_workflow ~poll_activity ~wait_for_lane ~retry_pending =
+    use an adapter or the native supervisor. With [detach], an activity
+    callback that outlives the deadline is left running on its Domain instead
+    of blocking this join forever (#495); the [finished] flag is set by that
+    Domain as its last action, so a [true] read means the join is immediate. *)
+let run ~detach ~closed ~poll_workflow ~poll_activity ~wait_for_lane
+    ~retry_pending =
   let stop = Atomic.make false in
   let first_failure = Atomic.make None in
   let workflow_busy = Atomic.make false in
   let activity_busy = Atomic.make false in
+  let activity_finished = Atomic.make false in
   let wait_token = Atomic.make false in
   let prefer_workflow = Atomic.make true in
   let wait_epoch = Atomic.make 0 in
@@ -109,12 +123,34 @@ let run ~closed ~poll_workflow ~poll_activity ~wait_for_lane ~retry_pending =
   in
   let activity_domain =
     Domain.spawn (fun () ->
-      guarded ~poll:poll_activity ~workflow_lane:false ~busy:activity_busy
-        ~sibling_busy:workflow_busy)
+      Fun.protect
+        ~finally:(fun () -> Atomic.set activity_finished true)
+        (fun () ->
+          guarded ~poll:poll_activity ~workflow_lane:false ~busy:activity_busy
+            ~sibling_busy:workflow_busy))
   in
   guarded ~poll:poll_workflow ~workflow_lane:true ~busy:workflow_busy
     ~sibling_busy:activity_busy;
-  Domain.join activity_domain;
+  let joined =
+    match detach with
+    | None -> true
+    | Some { now; deadline; on_detached } ->
+        if not (Atomic.get activity_finished) then begin
+          let deadline = deadline () in
+          while (not (Atomic.get activity_finished)) && now () < deadline do
+            Thread.delay join_poll_interval_s
+          done
+        end;
+        if Atomic.get activity_finished then true
+        else begin
+          (* The callback holds the activity lane past its deadline. The
+             Domain is not joined; it ends by itself after the callback,
+             because [stop] or [closed] is already set. *)
+          on_detached ();
+          false
+        end
+  in
+  if joined then Domain.join activity_domain;
   match Atomic.get first_failure with
   | None -> Ok ()
   | Some (Source_error error) -> Error error

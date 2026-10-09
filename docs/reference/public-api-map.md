@@ -199,6 +199,10 @@ for those rules.
   supervisor graph, runs the poll loops, and performs idempotent shutdown.
   `Worker.request_shutdown` is the signal-handler-safe way to make `run`
   return; call `Worker.shutdown` afterwards to release the worker.
+  `Worker.shutdown_with_report` is the same bounded shutdown (#495) returning
+  a `Worker.Shutdown_report.t`: elapsed time, whether both lanes stopped,
+  the abandoned activity callbacks and workflow activations, and whether
+  native teardown completed or was left `` `Detached `` in the background.
   `Temporal.Worker.Options` provides typed, immutable resource and worker
   routing settings, including legacy build-ID and deployment-based versioning;
   see the [worker versioning reference](worker-versioning.md).
@@ -206,7 +210,7 @@ for those rules.
   `?max_concurrent_workflow_tasks`, `?workflow_task_pollers`
   (`Fixed n` or `Autoscaling { minimum; maximum; initial }`),
   `?sticky_queue_schedule_to_start_timeout`, `?graceful_shutdown_period`,
-  `?max_heartbeat_throttle_interval`, `?default_heartbeat_throttle_interval`
+  `?shutdown_teardown_timeout` (#495), `?max_heartbeat_throttle_interval`, `?default_heartbeat_throttle_interval`
   (each a `Duration.t`), `?max_worker_activities_per_second` and
   `?max_task_queue_activities_per_second`. Each invalid, overflowing or
   contradictory value is a typed defect returned before anything is

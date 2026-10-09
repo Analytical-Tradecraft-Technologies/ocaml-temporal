@@ -370,9 +370,8 @@ and bridge, read the [documentation guide](../README.md) first.
 - The workflow execution Domain and capacity-one activity execution Domain
   share the same serialized supervisor mailbox. The activity adapter retains
   exclusive ownership of an attempt and its completion retry. Worker shutdown
-  joins that Domain before draining either adapter or releasing native handles;
-  a callback that never returns therefore leaves shutdown waiting without an
-  overall deadline (tracked by #495).
+  waits for that Domain only until the grace period ends; see the bounded
+  shutdown invariants below (#495).
 - A retained activity completion may be retried only after the OCaml source
   receives the explicit bridge `Retryable` status. The pinned Core completion
   implementation removes the activity lease before suppressing generic network
@@ -404,22 +403,74 @@ and bridge, read the [documentation guide](../README.md) first.
   `Invalid_state` and closes the handle. The adapter removes the lease exactly
   once: on an accepted terminal operation or a retiring error. This decision
   does not change Core worker completion retry policy.
-- Adapter shutdown reopens admission only for an explicitly retryable activity
-  drain. Workflow-drain errors and permanent activity errors invoke the
-  supervisor's `Native.shutdown`/`runtime_close` path before leaving the private
-  worker closed and the public wrapper terminal; runtime disposal force-retires
-  any remaining native leases. A returned native `Error` is still
-  release-complete by that contract, so OCaml adapter maps are discarded only
-  after the result is observed. If native shutdown raises before returning, the
-  maps remain retained, a terminal-cleanup-pending flag schedules a detached
-  retry, and the worker finalizer remains a last-resort path. A shutdown
-  defect from either execution lane's own system thread is different: it
+- Worker shutdown is bounded (#495). Its end-to-end budget is the grace
+  period (`Worker.Options.graceful_shutdown_period`, default 30 s) plus the
+  teardown timeout (`shutdown_teardown_timeout`, default 60 s) plus 250 ms of
+  lanes slack; no step waits on user code or the server beyond it:
+  - Admission closes at once (`closed`), so both lanes stop polling and
+    activity contexts report a worker shutdown. One lanes deadline (now plus
+    the grace period) is published with a compare-and-set; whichever of
+    `shutdown` and a stopping `run` computes it first wins, so the two agree.
+  - `run` joins its activity Domain only until that deadline. A callback
+    still running then is detached: the Domain is not joined, keeps the
+    activity adapter lock, keeps its execution-thread identity, and exits on
+    its own after the callback returns. `run` then returns. A non-yielding
+    workflow activation runs on `run`'s own thread, so it keeps `run` (and
+    the lifecycle lock) until it returns.
+  - The rest of shutdown runs on one dedicated shutdown thread, which owns
+    each step: it takes `run_mutex` with `try_lock` until the deadline plus
+    the slack, drains each adapter only through a non-blocking `try_drain`
+    (an adapter whose lock abandoned code still holds is reported busy, never
+    waited for), retries an explicitly retryable retained completion until
+    the same deadline, releases `run_mutex` on the same thread, and only then
+    calls `Native.shutdown`. The bridge fails every task still leased to
+    OCaml (an abandoned activity retryably, an abandoned activation as a
+    failed workflow task), so Temporal retries it on another worker.
+  - The caller only waits for the shutdown thread's published outcome, at
+    most the teardown timeout after the release began. If the release has
+    not finished, the caller returns a report with teardown `Detached`; the
+    shutdown thread still owns and completes the one release, bounded by the
+    bridge's own Core waits below. If no thread can be created, the sequence
+    runs on the caller and only the bridge bounds it.
+  - The typed outcome distinguishes abandonment from failure. Abandoned
+    callbacks and activations, and the `Outstanding_tasks` status for the
+    leases they held, are an `Ok` report. A retained completion that could
+    not be delivered (permanently, or still retryable at the deadline) and a
+    native release error are an `Error`, after the graph is released. Retired
+    leases with nothing abandoned stay an `Error`, so a lost lease is never a
+    false success.
+  - Admitted asynchronous activity leases belong to external code, not to
+    any callback. When the activity drain is busy (an abandoned callback
+    holds the adapter lock), shutdown still counts them through the separate
+    async lock (tried, never waited for) until the deadline. Any still
+    admitted then make the outcome an `Error` naming them, so the leases the
+    bridge retires are never attributed to the abandoned callback and an
+    unrelated handle is never closed behind an `Ok` report.
+  - Abandoned code is never interrupted. Its eventual completion reaches a
+    closed supervisor and is rejected as `Closed`, so it cannot complete a
+    task the bridge already retired. Adapter discard after the release uses
+    `try_discard` under a deferred-discard flag that is raised before each
+    attempt and cleared only by a successful one. When abandoned code still
+    holds an adapter lock, the next thread to release one performs the
+    discard: the detached activity lane on its own Domain right after its
+    callback returns, or `run` after its workflow lane returns. The late
+    completion bytes and adapter state are therefore dropped as soon as the
+    lock is free, not left to the garbage collector. No native resource
+    depends on them.
+- A returned native `Error` from `Native.shutdown` is still
+  release-complete by the supervisor contract, so OCaml adapter maps are
+  discarded only after the result is observed. If native shutdown raises
+  before returning, the maps remain retained, a terminal-cleanup-pending flag
+  schedules a detached retry, and the worker finalizer remains a last-resort
+  path. A shutdown defect from either execution lane's own system thread is
+  different: it
   cannot wait for its own lane to finish, but no teardown has started, so it
   remains retryable for a later call from any other thread. Lane identity is
   the system thread (Domain plus `Thread.id`), so a sibling thread on a lane's
   Domain is an ordinary caller. The public wrapper checks this before
   acquiring its shutdown mutex to avoid a deadlock against a concurrent
-  shutdown that holds that mutex while waiting for the loop. That rejected
+  shutdown that holds that mutex while waiting (now boundedly) for the loop.
+  That rejected
   call, and `Worker.request_shutdown`, set a separate sticky stop-request
   atomic that both lanes observe like the shutdown flag but that never admits
   teardown, so the loop returns and a later `shutdown` (from any thread,

@@ -8,10 +8,6 @@
     do not use a Core worker lease and are classified separately by
     [async_operation_disposition]. *)
 
-type drain_failure =
-  | Workflow_drain
-  | Activity_drain of bool
-
 (** Returns whether a native activity-completion error proves that the lease
     remains available for another submission. The current Core bridge can only
     make that claim through the dedicated bilateral status. *)
@@ -44,17 +40,6 @@ let async_operation_disposition = function
   | Temporal_core_bridge.Native_bridge.Configuration -> Rejected_live
   | _ -> Retired
 
-(** Returns whether a failed adapter drain can safely reopen worker admission.
-    A same-Domain shutdown admission defect is handled before a drain and is
-    intentionally separate from this predicate. *)
-let shutdown_retryable = function
-  | Activity_drain true -> true
-  | Workflow_drain | Activity_drain false -> false
-
-(** Permanent drain failures cannot be retried safely, so the native graph must
-    be disposed even though the adapter error remains the public result. *)
-let needs_native_cleanup failure = not (shutdown_retryable failure)
-
 type closed_flag_action =
   | Leave_unchanged
   | Write of bool
@@ -73,18 +58,3 @@ type closed_flag_action =
     perform the real drain-then-native-shutdown once the loop exits. *)
 let reentrant_same_domain_shutdown : closed_flag_action * bool =
   (Leave_unchanged, true)
-
-(** Keeps a terminal adapter failure authoritative while making native cleanup
-    observable to the caller through callbacks. The cleanup callback is
-    deliberately injected so the policy can be tested without constructing a
-    live Temporal worker or depending on a server. *)
-let retain_original_error ~cleanup ~on_cleanup_error ~on_cleanup_exception
-    original =
-  match cleanup () with
-  | Ok _ -> (true, original)
-  | Error error ->
-      on_cleanup_error error;
-      (true, original)
-  | exception exception_ ->
-      on_cleanup_exception exception_;
-      (false, original)

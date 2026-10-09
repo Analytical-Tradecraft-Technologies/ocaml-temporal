@@ -892,7 +892,9 @@ original decode failure stays primary with the rejection category appended.
 Shutdown first closes ledger admission and both readiness signals, then asks
 Core to wake both polls. From that point the supervisor Domain is blocked in
 the shutdown call and OCaml has already stopped its run loop and drained its
-retained completions, so no language completion can arrive. Core, however,
+retained completions, or abandoned a lane still running user code when its
+grace period ended (#495), so no language completion can arrive: a late one
+reaches a closed supervisor and is rejected. Core, however,
 returns `ShutDown` from a poll only after every task it produced has been
 completed, so joining the lanes without completing those tasks hung forever
 (issue #769). `PollLanes::drain_and_join_for_shutdown` therefore completes each

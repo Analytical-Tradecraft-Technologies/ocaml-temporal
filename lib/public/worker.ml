@@ -41,6 +41,7 @@ module Options = struct
     workflow_task_pollers : workflow_task_pollers option;
     sticky_queue_schedule_to_start_timeout : Duration.t option;
     graceful_shutdown_period : Duration.t option;
+    shutdown_teardown_timeout : Duration.t option;
     max_heartbeat_throttle_interval : Duration.t option;
     default_heartbeat_throttle_interval : Duration.t option;
     max_worker_activities_per_second : float option;
@@ -71,6 +72,11 @@ module Options = struct
   (** Grace period the native worker has always passed to Core. *)
   let default_graceful_shutdown_period = Duration.of_ms 30_000L
 
+  (** How long shutdown waits for native teardown after the grace period
+      (#495). It covers an ordinary teardown, including one server long poll;
+      the private native worker applies the same value. *)
+  let default_shutdown_teardown_timeout = Duration.of_ms 60_000L
+
   (** Temporal Core's default longest heartbeat throttle interval. *)
   let default_max_heartbeat_throttle_interval = Duration.of_ms 60_000L
 
@@ -87,6 +93,7 @@ module Options = struct
       workflow_task_pollers = None;
       sticky_queue_schedule_to_start_timeout = None;
       graceful_shutdown_period = None;
+      shutdown_teardown_timeout = None;
       max_heartbeat_throttle_interval = None;
       default_heartbeat_throttle_interval = None;
       max_worker_activities_per_second = None;
@@ -261,7 +268,8 @@ module Options = struct
       heartbeat throttle interval to the maximum, so an explicit default above
       an explicit maximum is a contradiction reported rather than hidden. *)
   let validate_timing ~sticky_queue_schedule_to_start_timeout
-      ~graceful_shutdown_period ~max_heartbeat_throttle_interval
+      ~graceful_shutdown_period ~shutdown_teardown_timeout
+      ~max_heartbeat_throttle_interval
       ~default_heartbeat_throttle_interval ~max_worker_activities_per_second
       ~max_task_queue_activities_per_second =
     let ( let* ) = Result.bind in
@@ -272,6 +280,10 @@ module Options = struct
     let* () =
       validate_duration ~minimum_ms:0L "graceful_shutdown_period"
         graceful_shutdown_period
+    in
+    let* () =
+      validate_duration ~minimum_ms:0L "shutdown_teardown_timeout"
+        shutdown_teardown_timeout
     in
     let* () =
       validate_duration ~minimum_ms:1L "max_heartbeat_throttle_interval"
@@ -356,7 +368,8 @@ module Options = struct
       ?(workflow_activation_deadline = default_workflow_activation_deadline)
       ?max_concurrent_workflow_tasks ?workflow_task_pollers
       ?sticky_queue_schedule_to_start_timeout ?graceful_shutdown_period
-      ?max_heartbeat_throttle_interval ?default_heartbeat_throttle_interval
+      ?shutdown_teardown_timeout ?max_heartbeat_throttle_interval
+      ?default_heartbeat_throttle_interval
       ?max_worker_activities_per_second ?max_task_queue_activities_per_second
       () =
     let ( let* ) = Result.bind in
@@ -369,9 +382,9 @@ module Options = struct
     in
     let* () =
       validate_timing ~sticky_queue_schedule_to_start_timeout
-        ~graceful_shutdown_period ~max_heartbeat_throttle_interval
-        ~default_heartbeat_throttle_interval ~max_worker_activities_per_second
-        ~max_task_queue_activities_per_second
+        ~graceful_shutdown_period ~shutdown_teardown_timeout
+        ~max_heartbeat_throttle_interval ~default_heartbeat_throttle_interval
+        ~max_worker_activities_per_second ~max_task_queue_activities_per_second
     in
     Ok
       {
@@ -382,6 +395,7 @@ module Options = struct
         workflow_task_pollers;
         sticky_queue_schedule_to_start_timeout;
         graceful_shutdown_period;
+        shutdown_teardown_timeout;
         max_heartbeat_throttle_interval;
         default_heartbeat_throttle_interval;
         max_worker_activities_per_second;
@@ -409,6 +423,10 @@ module Options = struct
   let graceful_shutdown_period options =
     Option.value options.graceful_shutdown_period
       ~default:default_graceful_shutdown_period
+
+  let shutdown_teardown_timeout options =
+    Option.value options.shutdown_teardown_timeout
+      ~default:default_shutdown_teardown_timeout
 
   let max_heartbeat_throttle_interval options =
     Option.value options.max_heartbeat_throttle_interval
@@ -476,6 +494,50 @@ module Health = struct
   }
 
   type t = Healthy | Stuck_workflow_activation of stuck_workflow_activation
+end
+
+(** What a bounded worker shutdown abandoned (#495). *)
+module Shutdown_report = struct
+  type teardown = [ `Completed | `Detached ]
+
+  type t = {
+    elapsed : Duration.t;
+    lanes_stopped : bool;
+    abandoned_activity_callbacks : int;
+    abandoned_workflow_activations : int;
+    native_teardown : teardown;
+  }
+
+  (** The report of a backend with nothing to abandon, such as the mock. *)
+  let clean ~elapsed =
+    {
+      elapsed;
+      lanes_stopped = true;
+      abandoned_activity_callbacks = 0;
+      abandoned_workflow_activations = 0;
+      native_teardown = `Completed;
+    }
+
+  let is_clean report =
+    report.lanes_stopped
+    && report.abandoned_activity_callbacks = 0
+    && report.abandoned_workflow_activations = 0
+    && report.native_teardown = `Completed
+
+  (** Converts the private orchestration report. Elapsed time is rounded up
+      to whole milliseconds so a non-zero wait never reads as zero. *)
+  let of_native (report : Temporal_sdk_kernel.Native_worker_shutdown.report) =
+    {
+      elapsed =
+        Duration.of_ms (Int64.of_float (Float.ceil (report.elapsed_s *. 1_000.)));
+      lanes_stopped = report.lanes_stopped;
+      abandoned_activity_callbacks = report.abandoned_activity_callbacks;
+      abandoned_workflow_activations = report.abandoned_workflow_activations;
+      native_teardown =
+        (match report.teardown with
+        | Temporal_sdk_kernel.Native_worker_shutdown.Completed -> `Completed
+        | Temporal_sdk_kernel.Native_worker_shutdown.Detached -> `Detached);
+    }
 end
 
 (** Heterogeneous activity registration package. *)
@@ -570,8 +632,9 @@ type t = {
      result, matching [Client.shutdown]. *)
   shutdown_mutex : Mutex.t;
   (* The first terminal shutdown outcome is retained so every caller observes
-     the same result, including a permanent native teardown error. *)
-  mutable shutdown_result : (unit, Error.t) result option;
+     the same result, including a permanent native teardown error and the
+     report of what a bounded shutdown abandoned (#495). *)
+  mutable shutdown_result : (Shutdown_report.t, Error.t) result option;
 }
 
 (** Rejects empty or NUL-containing worker settings before backend allocation. *)
@@ -810,6 +873,9 @@ let create ?identity ?options ?max_cached_workflows ?io_threads ?runtime
                             ~graceful_shutdown_timeout_ms:
                               (Duration.to_ms
                                  (Options.graceful_shutdown_period options))
+                            ~shutdown_teardown_timeout_ms:
+                              (Duration.to_ms
+                                 (Options.shutdown_teardown_timeout options))
                             ~tuning:(Options.native_tuning options)
                             ?io_threads ?runtime ?activation_deadline_ms
                             ~versioning:native_versioning ~target_url
@@ -1069,8 +1135,10 @@ let request_shutdown worker =
     check is per system thread rather than per Domain (#763), so a sibling
     thread of the run loop's Domain proceeds and waits like any other caller.
     Callers that pass the check are serialized by the mutex: the first one
-    performs teardown and later ones return its cached terminal result. *)
-let shutdown worker =
+    performs teardown and later ones return its cached terminal result. The
+    native teardown is bounded (#495), so the mutex is never held longer than
+    the worker's grace period plus its teardown timeout. *)
+let shutdown_with_report worker =
   if
     match worker.backend with
     | Native_backend backend -> Native_worker.is_execution_thread backend
@@ -1101,7 +1169,7 @@ let shutdown worker =
             match worker.backend with
             | Mock_backend backend -> (
                 match Backend.worker_shutdown backend with
-                | Ok () as result -> result
+                | Ok () -> Ok (Shutdown_report.clean ~elapsed:(Duration.of_ms 0L))
                 | Error _ as error ->
                     (* The mock backend can retry a failed shutdown admission. *)
                     Atomic.set worker.closed false;
@@ -1109,13 +1177,15 @@ let shutdown worker =
             | Native_backend backend -> (
                 let result =
                   Native_worker.shutdown backend
+                  |> Result.map Shutdown_report.of_native
                   |> Result.map_error Error_private.of_base
                 in
                 match result with
-                | Ok () as result -> result
+                | Ok _ as result -> result
                 | Error _ as error ->
-                    (* Native adapter-drain failures are retryable only when the
-                       private supervisor explicitly says teardown did not begin. *)
+                    (* Only the execution-thread admission defect is
+                       retryable: every admitted bounded shutdown is
+                       terminal. *)
                     if Native_worker.shutdown_retryable backend then
                       Atomic.set worker.closed false;
                     error)
@@ -1125,3 +1195,7 @@ let shutdown worker =
           if Atomic.get worker.closed then worker.shutdown_result <- Some result;
           result)
   end
+
+(** The report-free form of {!shutdown_with_report}, sharing its cached
+    terminal result. *)
+let shutdown worker = Result.map ignore (shutdown_with_report worker)
