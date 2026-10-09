@@ -416,7 +416,10 @@ let enqueue supervisor task = Queue.add task supervisor.queue
 (** Creates an adapter worker and turns setup failures into readable test
     failures. *)
 let worker supervisor activities =
-  match Worker.create ~supervisor ~activities with
+  match
+    Worker.create ~supervisor ~activities
+      ~worker_shutting_down:(fun () -> false)
+  with
   | Ok worker -> worker
   | Error (error : Raw_adapter.error_view) ->
       failwith

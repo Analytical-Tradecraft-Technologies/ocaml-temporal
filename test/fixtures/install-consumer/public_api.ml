@@ -134,6 +134,34 @@ let _activity_context_info :
     T.Activity.context -> (T.Activity.Info.t, T.Error.t) result =
   T.Activity.Context.info
 
+let _activity_context_cancellation :
+    T.Activity.context -> T.Activity.Cancellation.t option =
+  T.Activity.Context.cancellation
+
+let _activity_context_is_worker_shutting_down : T.Activity.context -> bool =
+  T.Activity.Context.is_worker_shutting_down
+
+let _activity_cancellation_reason :
+    T.Activity.Cancellation.t -> T.Activity.Cancellation.reason =
+  T.Activity.Cancellation.reason
+
+let _activity_cancellation_reasons :
+    T.Activity.Cancellation.t -> T.Activity.Cancellation.reason list =
+  T.Activity.Cancellation.reasons
+
+let _activity_cancellation_to_error : T.Activity.Cancellation.t -> T.Error.t =
+  T.Activity.Cancellation.to_error
+
+(* The reason variant is closed and exhaustively matchable. *)
+let _activity_cancellation_reason_label :
+    T.Activity.Cancellation.reason -> string = function
+  | T.Activity.Cancellation.Requested -> "requested"
+  | Timed_out -> "timed_out"
+  | Not_found -> "not_found"
+  | Worker_shutdown -> "worker_shutdown"
+  | Paused -> "paused"
+  | Reset -> "reset"
+
 let _activity_info_namespace : T.Activity.Info.t -> string =
   T.Activity.Info.namespace
 

@@ -298,10 +298,87 @@ module Async_context : sig
   val info : 'output t -> (Info.t, Error.t) result
 end
 
+(** A request from Temporal that a running activity attempt stop.
+
+    Cancellation is cooperative: the worker never interrupts activity code. A
+    synchronous activity defined with {!define_with_context} observes it at
+    its heartbeats, the same channel through which Temporal delivers it to the
+    worker. Once a cancellation has been delivered, {!Context.cancellation}
+    returns it and every later {!Context.heartbeat} returns an [Error] in the
+    [`Cancelled] category. Returning such an error from the activity (for
+    example by propagating the heartbeat's error, or [to_error]) completes the
+    attempt as cancelled, which a workflow using [Wait_cancellation_completed]
+    observes as a [`Cancelled] activity error. Returning [Ok] still completes
+    the attempt successfully.
+
+    A cancellation can only reach an activity that heartbeats: Temporal
+    returns it in the response to a heartbeat, and the worker delivers it
+    when the activity next heartbeats. Configure a [heartbeat_timeout] when
+    scheduling an activity that must react promptly.
+
+    {[
+      let process_batch =
+        Temporal.Activity.define_with_context ~name:"process_batch"
+          ~input:Temporal.Codec.int ~output:Temporal.Codec.int
+          (fun context count ->
+            let open Temporal.Result_syntax in
+            let rec loop index =
+              if index = count then Ok count
+              else
+                (* Returns [Error] in the [`Cancelled] category once the
+                   workflow cancels the activity. *)
+                let* () =
+                  Temporal.Activity.Context.heartbeat context
+                    Temporal.Codec.int index
+                in
+                process_item index;
+                loop (index + 1)
+            in
+            match loop 0 with
+            | Error error when Temporal.Activity.Context.cancellation context <> None ->
+                (* Undo partial work, then report the cancellation. Cleanup
+                   must be idempotent: the attempt may be redelivered. *)
+                release_reservations ();
+                Error error
+            | result -> result)
+    ]} *)
+module Cancellation : sig
+  (** Why Temporal asked the attempt to stop. *)
+  type reason = Temporal_base.Activity_context.cancel_reason =
+    | Requested
+        (** Workflow code or a client requested cancellation of the
+            activity. *)
+    | Timed_out
+        (** Temporal timed out the attempt, for example after a missed
+            heartbeat. *)
+    | Not_found
+        (** The server no longer knows the attempt: it already completed,
+            timed out, or was retried. The attempt's result is discarded. *)
+    | Worker_shutdown  (** Temporal Core is shutting the worker down. *)
+    | Paused  (** An operator paused the activity. *)
+    | Reset  (** An operator reset the activity. *)
+
+  (** One observed cancellation request. Immutable. *)
+  type t
+
+  (** Returns the primary reason Temporal reported. *)
+  val reason : t -> reason
+
+  (** Returns every independent reason Temporal reported, primary first and
+      without duplicates. Newer servers can report more than one, for example
+      a pause together with a cancellation request. *)
+  val reasons : t -> reason list
+
+  (** Builds the non-retryable [`Cancelled] error that an activity returns to
+      acknowledge this cancellation. *)
+  val to_error : t -> Error.t
+end
+
 (** Encodes and submits one typed heartbeat value for the current activity. The
     payload is copied before crossing into the private runtime, and stale or
     unavailable contexts return typed errors rather than retaining a released
-    task token. *)
+    task token. After a cancellation has been delivered it returns an [Error]
+    in the [`Cancelled] category; see {!Cancellation}. *)
 val heartbeat : context -> 'a Codec.t -> 'a -> (unit, Error.t) result
 
 (** Operations available to a contextual activity attempt. *)
@@ -309,12 +386,36 @@ module Context : sig
   (** The attempt-scoped context passed to contextual activity helpers. *)
   type t = context
 
-  (** Sends one typed heartbeat value and returns a typed error if this attempt
-      is no longer active. *)
+  (** Sends one typed heartbeat value. The details are submitted (Temporal
+      Core throttles what reaches the server) and any cancellation already
+      waiting for this attempt is delivered. Returns an [Error] in the
+      [`Cancelled] category once a cancellation has been delivered, a
+      [`Bridge] error if this attempt is no longer active or the heartbeat
+      could not be recorded, and a [`Codec] error if the value cannot be
+      encoded. *)
   val heartbeat : t -> 'a Codec.t -> 'a -> (unit, Error.t) result
 
-  (** Sends already encoded detail payloads in order. *)
+  (** Sends already encoded detail payloads in order, with the same result
+      contract as {!heartbeat}. *)
   val heartbeat_payloads : t -> Payload.t list -> (unit, Error.t) result
+
+  (** Returns the cancellation delivered to this attempt, or [None]. It is a
+      non-blocking read that never contacts the server: cancellations arrive
+      through {!heartbeat}, so poll this between heartbeats rather than in
+      place of them. The first delivered cancellation stays fixed for the
+      attempt. It may be called from any Domain and remains readable after
+      the attempt completes. Contexts outside a native worker, such as the
+      in-process test backend, are never cancelled. *)
+  val cancellation : t -> Cancellation.t option
+
+  (** Returns [true] once the worker running this attempt has begun to stop,
+      because [Temporal.Worker.shutdown] or [Temporal.Worker.request_shutdown]
+      was called. The worker waits for the running callback before it drains
+      and closes, so an activity that checks this flag can stop early, for
+      example by returning a retryable error so that Temporal retries the
+      attempt on another worker. It never contacts the server, may be called from any
+      Domain, and is always [false] outside a native worker. *)
+  val is_worker_shutting_down : t -> bool
 
   (** Returns a copied list of the last heartbeat details recorded by the
       previous attempt of this activity, or [[]] on a first attempt or when

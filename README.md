@@ -55,7 +55,7 @@ platforms does not establish live compatibility there.
 | Area | Current evidence and boundary |
 | --- | --- |
 | Workflow authoring | Typed definitions, codecs, direct-style suspension, futures, conditions, deterministic time/randomness, and cancellation scopes have focused unit/runtime tests. Live fixtures exercise timer/activity/child waits and selected replay paths. |
-| Activities | Remote execution, retries, heartbeat details/timeouts, non-immediate retry, and retained asynchronous completion have live scenarios. `smoke.local_activity` live-verifies local activity success; local retry/backoff and cancellation variants have focused tests, not a complete live conformance suite. |
+| Activities | Remote execution, retries, heartbeat details/timeouts, non-immediate retry, retained asynchronous completion, and cooperative cancellation observed at heartbeats (with a worker-shutdown flag) have live scenarios. `smoke.local_activity` live-verifies local activity success; local retry/backoff and cancellation variants have focused tests, not a complete live conformance suite. |
 | Child workflows | Success, propagated failure, explicit child cancellation, child retry, and duplicate-ID start failure are live-tested. Separate controllers verify exact parent/child replay after worker replacement and a child failing after replay while its parent recovers. |
 | Client and interactions | Exact-run start/wait/cancel/terminate, continue-as-new following, direct and external signals, both query forms, typed update completion, unknown-handler rejection, and external cancellation have live assertions. External signal rejection against a completed target and wrong-run cancellation rejection are also exercised. Reset, visibility, and interaction recovery/deadline coverage remain incomplete. |
 | Recovery and patching | Live controllers exercise graceful replacement, forced crash recovery, sticky-cache eviction, parent/child recovery, and marker-free to active, active to deprecated, and deprecated to removed patch histories. These fixtures do not establish arbitrary-history compatibility. |
@@ -70,10 +70,11 @@ platforms does not establish live compatibility there.
 - HTTP(S) endpoint configuration exists, but public authentication, custom
   trust/mTLS/API-key configuration and secure-endpoint acceptance remain work.
   The live fixture uses a local plaintext Temporal endpoint.
-- Running activity callbacks are serialized. Scope cancellation commands,
-  activity task cancellation, and worker shutdown are separate mechanisms;
-  application-visible cooperative callback cancellation and bounded operational
-  shutdown qualification remain incomplete.
+- Running activity callbacks are serialized. A synchronous callback observes
+  cancellation only cooperatively, at its heartbeats, and worker shutdown
+  through `Activity.Context.is_worker_shutting_down`; asynchronous handles are
+  not notified of cancellation, and bounded operational shutdown qualification
+  remains incomplete.
 - Offline replay of binary histories is available through
   [`Temporal.Replay`](docs/guides/workflows.md#replay-recorded-histories-before-deploying)
   and the copyable [replay command example](examples/README.md#replay-recorded-histories-before-deploying);

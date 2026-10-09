@@ -39,6 +39,15 @@ and bridge, read the [documentation guide](../README.md) first.
   still releases the run and acknowledges its native lease with no command.
 - Eviction emits no workflow command. A later replay creates a fresh execution
   rather than reusing native continuations.
+- One synchronous activity attempt runs at a time on the activity Domain,
+  under the adapter mutex. Its cancellation cell is written only by a
+  heartbeat delivery sweep, at most once, and read lock-free from any Domain;
+  the running-attempt record and deferred-task FIFO are guarded by a separate
+  delivery mutex, taken after a context's own mutex; no adapter or context
+  lock is taken while it is held. The running attempt is cleared only after its context is
+  invalidated, so a Core cancellation can never become a second completion
+  for a token whose completion is already owned (#494). See
+  [native activities](native-activity-execution.md#cooperative-cancellation-of-a-running-callback).
 - The focused runtime regression
   [`test_eviction_allows_fresh_replay_execution`](../../test/runtime/test_native_worker_execution.ml)
   checks both halves of that rule: the evicted generation is not invoked again,

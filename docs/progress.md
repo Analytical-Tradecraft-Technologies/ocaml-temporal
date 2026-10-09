@@ -15,6 +15,40 @@ implementation when a later entry documents that work as complete. The
 records the current tested source, named assertions and successful CI job for
 the Temporal acceptance controllers.
 
+## 2026-10-09: Cooperative activity cancellation and shutdown signal (#494)
+
+A running synchronous activity can now observe cancellation and worker
+shutdown. `Activity.Context.cancellation` returns the delivered
+`Activity.Cancellation.t`, with Core's primary reason and every flagged
+reason as a closed variant (`Requested`, `Timed_out`, `Not_found`,
+`Worker_shutdown`, `Paused`, `Reset`); heartbeats return a non-retryable
+`` `Cancelled `` error once one is delivered; and an activity that returns a
+`` `Cancelled `` error after a delivered cancellation completes as cancelled
+(otherwise it is an ordinary failure, and `Ok` still completes).
+`Context.is_worker_shutting_down` reads the worker's `closed` and
+`stop_requested` flags. The serial executor keeps its adapter lock for the
+whole callback, so delivery rides on the heartbeat: each heartbeat ends with a
+bounded, non-blocking sweep of the supervisor's ready activity tasks that
+publishes the running attempt's cancellation to a single-assignment atomic
+cell and defers every other task, in order, to later polls. A deferred start
+whose cancellation was also deferred completes as cancelled without running,
+and shutdown drain fails an undispatched deferred start retryably without
+running user code. No Rust, C or ABI change.
+
+Evidence: eight focused adapter tests (context cell lifecycle; delivery with
+reasons and details; outcome precedence; cancellation before admission and
+after completion; shutdown flag; drain of deferred starts; deferred poll
+errors) and the new `activity_cancellation` live regression in
+`make test-temporal-live-regressions`, which passed locally against the
+Compose server: a workflow-cancelled heartbeating activity observed
+`Requested` and the workflow saw a `` `Cancelled `` result under
+`Wait_cancellation_completed`; a stalled single-attempt activity observed a
+`Not_found` cancellation after its heartbeat timeout; and an activity on an
+activity-only worker observed the shutdown flag while that worker shut down,
+with its completion still accepted. Asynchronous handles are not yet
+notified of cancellation, and bounded shutdown for callbacks that ignore the
+signal remains #495.
+
 ## 2026-10-07: Shared runtime across clients and workers (#832)
 
 Following the maintainer decision on #832, several clients and workers can

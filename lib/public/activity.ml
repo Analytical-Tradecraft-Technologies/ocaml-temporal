@@ -401,11 +401,46 @@ let heartbeat (context : context) (codec : 'a Codec.t) (value : 'a) =
       Temporal_base.Activity_context.heartbeat context [ payload ]
       |> Result.map_error Error_private.of_base
 
+(** Public view of the cancellation the native adapter publishes to an
+    attempt's private context. The record is immutable and holds no native
+    state, so it is shared rather than copied. *)
+module Cancellation = struct
+  (** The base variant, re-exported so no conversion is needed. *)
+  type reason = Temporal_base.Activity_context.cancel_reason =
+    | Requested
+    | Timed_out
+    | Not_found
+    | Worker_shutdown
+    | Paused
+    | Reset
+
+  (** Abstract in the interface so fields can be added compatibly. *)
+  type t = Temporal_base.Activity_context.cancellation
+
+  (** Primary reason. *)
+  let reason (cancellation : t) = cancellation.reason
+
+  (** Every reported reason, primary first. *)
+  let reasons (cancellation : t) = cancellation.reasons
+
+  (** The same error a cancelled heartbeat returns, copied to a public value. *)
+  let to_error cancellation =
+    Error_private.of_base
+      (Temporal_base.Activity_context.cancelled_error cancellation)
+end
+
 (** Safe operations exposed to contextual activity implementations. *)
 module Context = struct
   (** Alias used by contextual activity helpers; the private context controls
       attempt lifetime and copies payloads at every public boundary. *)
   type t = context
+
+  (** Reads the adapter-published cancellation cell without blocking. *)
+  let cancellation context = Temporal_base.Activity_context.cancellation context
+
+  (** Reads the owning worker's stop flags without blocking. *)
+  let is_worker_shutting_down context =
+    Temporal_base.Activity_context.worker_shutting_down context
 
   (** Sends one typed heartbeat value. *)
   let heartbeat context codec value = heartbeat context codec value

@@ -885,8 +885,16 @@ let create ?max_cached_workflows ?io_threads ?runtime
         ~supervisor ~workflows ()
       |> Result.map_error (public_adapter_error "workflow registration")
     in
+    let closed = Atomic.make false in
+    let stop_requested = Atomic.make false in
+    (* Activity contexts report a worker shutdown as soon as either lifecycle
+       flag is set, i.e. while a running callback still holds the activity
+       lane and [shutdown] waits for it (#494). *)
+    let worker_shutting_down () =
+      Atomic.get closed || Atomic.get stop_requested
+    in
     let* activities =
-      Activity.create ~supervisor ~activities
+      Activity.create ~supervisor ~activities ~worker_shutting_down
       |> Result.map_error (public_activity_error "activity registration")
     in
     Ok
@@ -895,8 +903,8 @@ let create ?max_cached_workflows ?io_threads ?runtime
         workflows;
         activities;
         workflow_tasks;
-        closed = Atomic.make false;
-        stop_requested = Atomic.make false;
+        closed;
+        stop_requested;
         shutdown_retryable = Atomic.make false;
         terminal_cleanup_pending = Atomic.make false;
         terminal_cleanup_scheduled = Atomic.make false;

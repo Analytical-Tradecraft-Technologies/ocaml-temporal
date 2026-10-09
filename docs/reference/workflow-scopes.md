@@ -160,7 +160,7 @@ invoke scope cancellation, so it is not direct live evidence for `~scope`.
 
 A successful hook buffers a command; it does not wait for a server terminal
 outcome or preempt an OCaml activity callback. Activity task cancellation and
-worker shutdown use separate lifecycle paths. The public activity context has
-no cooperative callback cancellation probe at the audited baseline, and the
-serialized adapter cannot drain a cancellation update while its callback is
-still executing. See [native activity cancellation](native-activity-execution.md#cancellation).
+worker shutdown use separate lifecycle paths. A running callback observes the
+resulting activity cancellation only cooperatively, at its next heartbeat
+(`Temporal.Activity.Context.cancellation`, #494). See
+[native activity cancellation](native-activity-execution.md#cooperative-cancellation-of-a-running-callback).
