@@ -154,12 +154,21 @@ type t
     Workflow and activity code never runs on these threads. Each worker and
     each client has its own threads, so the bound applies per instance. It
     must be between 1 and 256; any other value returns a typed defect before
-    anything is allocated, for every target including [mock://]. *)
+    anything is allocated, for every target including [mock://].
+
+    [runtime] instead runs the worker on a shared {!Runtime.t}, whose
+    background threads it shares with every other client and worker
+    attached to it. The worker stays attached until {!shutdown} has
+    completed its native teardown, and {!Runtime.shutdown} fails while it
+    is. Passing both [runtime] and [io_threads] is a typed defect (set the
+    bound on {!Runtime.create}), and so is a runtime that was already shut
+    down. A [mock://] worker attaches too. *)
 val create :
   ?identity:string ->
   ?options:Options.t ->
   ?max_cached_workflows:int ->
   ?io_threads:int ->
+  ?runtime:Runtime.t ->
   target_url:string ->
   namespace:string ->
   task_queue:string ->

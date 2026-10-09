@@ -805,8 +805,9 @@ let cleanup_abandoned worker =
     [Native.create] enters [cleanup], which joins the supervisor owner Domain
     and closes all native resources before returning. Successful construction
     attaches a GC finalizer so abandoned workers still drain leases. *)
-let create ?max_cached_workflows ?io_threads ?(versioning = Bridge.No_versioning)
-    ?activation_deadline_ms ~target_url ~namespace
+let create ?max_cached_workflows ?io_threads ?runtime
+    ?(versioning = Bridge.No_versioning) ?activation_deadline_ms ~target_url
+    ~namespace
     ~identity ~task_queue ~workflows ~activities () =
   let max_cached_workflows =
     Option.value max_cached_workflows ~default:default_max_cached_workflows
@@ -846,8 +847,24 @@ let create ?max_cached_workflows ?io_threads ?(versioning = Bridge.No_versioning
       ~workflow_tasks ~activity_tasks ()
     |> Result.map_error (public_bridge_error "worker configuration")
   in
+  (* The lease is acquired only after every local validation, so no
+     earlier failure can strand it; [Native.create] owns it from here and
+     releases it on failure or after closing the graph (#832). *)
+  let* lease =
+    match runtime with
+    | None -> Ok None
+    | Some runtime -> (
+        match Temporal_sdk_kernel.Shared_runtime.acquire runtime with
+        | Some lease -> Ok (Some lease)
+        | None ->
+            Error
+              (Base_error.defect
+                 ~message:
+                   "the runtime passed as ~runtime has already been shut down"))
+  in
   let* supervisor =
-    Native.create ?runtime_threads:io_threads ~capacity:supervisor_capacity ()
+    Native.create ?runtime_threads:io_threads ?runtime:lease
+      ~capacity:supervisor_capacity ()
     |> Result.map_error (public_native_error "native runtime creation")
   in
   let cleanup error =

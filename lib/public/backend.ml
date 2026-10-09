@@ -9,6 +9,7 @@
 
 module Bridge = Temporal_sdk_kernel.Bridge
 module Native = Temporal_sdk_kernel.Supervisor
+module Shared_runtime = Temporal_sdk_kernel.Shared_runtime
 module Client_protocol = Temporal_sdk_kernel.Client_protocol
 module Workflow_protocol = Temporal_sdk_kernel.Workflow_protocol
 module Failure_diagnostic = Temporal_sdk_kernel.Failure_diagnostic
@@ -287,6 +288,11 @@ type mock_service = {
 type mock_client = {
   service : mock_service;
   mutable closed : bool;
+  (** Attachment to a shared runtime (#832). The mock uses no native
+      resources, but it holds a lease exactly like a native client so the
+      [Runtime.shutdown] ordering rule is the same for every target. It is
+      released once, when [closed] first becomes true. *)
+  lease : Shared_runtime.lease option;
 }
 
 (** Serializes creation and retirement of process-local mock services. A
@@ -330,6 +336,9 @@ type mock_worker = {
   outstanding_activities : (string, unit) Hashtbl.t;
   mutable idle_workflow_polls : int;
   mutable idle_activity_polls : int;
+  (** Shared-runtime attachment, released once on the first shutdown; see
+      [mock_client.lease]. *)
+  lease : Shared_runtime.lease option;
 }
 
 (** The private worker representation leaves room for the supervisor adapter. *)
@@ -846,6 +855,31 @@ let validate_io_threads io_threads =
            (Printf.sprintf "io_threads must be between 1 and %d"
               Bridge.max_runtime_worker_threads))
 
+(** Rejects [?runtime] together with [?io_threads] (#832): a shared runtime
+    already fixes its thread bound, so accepting both would silently ignore
+    one. Called before any allocation. *)
+let validate_runtime_source ~io_threads ~runtime =
+  match (io_threads, runtime) with
+  | Some _, Some _ ->
+      Error
+        (defect
+           "~runtime and ~io_threads are mutually exclusive; set io_threads \
+            on Runtime.create instead")
+  | _ -> Ok ()
+
+(** Reserves one attachment on an optional shared runtime. The caller owns
+    the returned lease and must hand it to exactly one owner (a mock value
+    or [Native.create]) or release it. A shut-down runtime is a defect. *)
+let acquire_runtime_lease = function
+  | None -> Ok None
+  | Some runtime -> (
+      match Shared_runtime.acquire runtime with
+      | Some lease -> Ok (Some lease)
+      | None ->
+          Error
+            (defect
+               "the runtime passed as ~runtime has already been shut down"))
+
 (** Acquires the shared deterministic ledger for one mock endpoint. The
     registry lock protects the service reference count; operations on the
     returned service use its own mutex so unrelated endpoints can progress
@@ -895,22 +929,28 @@ let release_mock_service (service : mock_service) =
     Native creation first validates the endpoint, then creates the complete
     supervisor graph, connects the official Rust client, and cleans up the
     graph if any step fails. No partially connected value is published. *)
-let client_create ?io_threads config =
+let client_create ?io_threads ?runtime config =
   match validate_config config with
   | Error error -> Error error
   | Ok () ->
       match validate_io_threads io_threads with
       | Error error -> Error error
       | Ok () ->
+      match validate_runtime_source ~io_threads ~runtime with
+      | Error error -> Error error
+      | Ok () ->
       if String.starts_with ~prefix:"mock://" config.target_url then
-        Ok
-          (Mock_client
-             {
-               service =
-                 acquire_mock_service ~target_url:config.target_url
-                   ~namespace:config.namespace;
-               closed = false;
-             })
+        Result.map
+          (fun lease ->
+            Mock_client
+              {
+                service =
+                  acquire_mock_service ~target_url:config.target_url
+                    ~namespace:config.namespace;
+                closed = false;
+                lease;
+              })
+          (acquire_runtime_lease runtime)
       else
         match
           Native.client_config ~target_url:config.target_url
@@ -918,7 +958,15 @@ let client_create ?io_threads config =
         with
         | Error error -> Error (bridge_error (Printf.sprintf "native client configuration failed: %s" error.message))
         | Ok native_config -> (
-            match Native.create ?runtime_threads:io_threads ~capacity:32 () with
+            match acquire_runtime_lease runtime with
+            | Error error -> Error error
+            | Ok lease ->
+            (* [Native.create] owns [lease] from here: it releases it on
+               failure, or after closing the graph during shutdown. *)
+            match
+              Native.create ?runtime_threads:io_threads ?runtime:lease
+                ~capacity:32 ()
+            with
             | Error error -> Error (native_supervisor_error error)
             | Ok supervisor -> (
                 match Native.perform supervisor (Native.Connect_client native_config) with
@@ -1926,7 +1974,9 @@ let client_shutdown = function
               client.closed <- true;
               true))
       in
-      if should_release then release_mock_service service;
+      if should_release then (
+        release_mock_service service;
+        Option.iter Shared_runtime.release client.lease);
       Ok ()
   | Native_client client ->
       if Atomic.exchange client.closed true then Ok ()
@@ -1941,7 +1991,7 @@ let unit_payload =
 
 (** Registers one mock task per local definition. The input is [unit] so tests
     can observe dispatch without adding a test-only payload protocol. *)
-let worker_create config ~workflow_names ~activity_names =
+let worker_create ?runtime config ~workflow_names ~activity_names =
   match validate_config config with
   | Error error -> Error error
   | Ok () ->
@@ -1974,8 +2024,9 @@ let worker_create config ~workflow_names ~activity_names =
               }
               activity_tasks)
           activity_names;
-        Ok
-          (Mock_worker
+        Result.map
+          (fun lease ->
+            Mock_worker
              {
                _namespace = config.namespace;
                _task_queue = Option.get config.task_queue;
@@ -1987,7 +2038,9 @@ let worker_create config ~workflow_names ~activity_names =
                outstanding_activities = Hashtbl.create 16;
                idle_workflow_polls = 0;
                idle_activity_polls = 0;
+               lease;
              })
+          (acquire_runtime_lease runtime)
 
 (** Polls the workflow queue and records ownership before exposing a task. *)
 let worker_poll_workflow (Mock_worker worker) =
@@ -2070,5 +2123,6 @@ let worker_shutdown (Mock_worker worker) =
   Fun.protect
     ~finally:(fun () -> Mutex.unlock worker.mutex)
     (fun () ->
+      if not worker.closed then Option.iter Shared_runtime.release worker.lease;
       worker.closed <- true;
       Ok ())
