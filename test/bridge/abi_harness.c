@@ -137,6 +137,11 @@ int main(void) {
          OCAML_TEMPORAL_CORE_STATUS_INVALID_STATE);
   assert(ocaml_temporal_core_v4_result_free(&result) ==
          OCAML_TEMPORAL_CORE_STATUS_OK);
+  /* Releasing an unknown call is a successful no-op. */
+  assert(ocaml_temporal_core_v4_client_release_call(1, UINT64_MAX, &result) ==
+         OCAML_TEMPORAL_CORE_STATUS_OK);
+  assert(ocaml_temporal_core_v4_result_free(&result) ==
+         OCAML_TEMPORAL_CORE_STATUS_OK);
   const uint8_t malformed_completion[] = "{}";
   assert(ocaml_temporal_core_v4_worker_complete_workflow_json(
              runtime, malformed_completion, sizeof(malformed_completion) - 1,

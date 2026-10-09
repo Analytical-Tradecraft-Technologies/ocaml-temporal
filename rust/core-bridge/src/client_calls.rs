@@ -12,9 +12,15 @@
 //! # Ownership
 //!
 //! * The process-wide registry owns one `Arc<CallSlot>` per live call
-//!   identifier. A call is removed by exactly one of two paths: the caller's
-//!   terminal read in [`await_call`], or [`release_owner`] when the runtime
-//!   that created it disconnects or closes.
+//!   identifier. A call is removed by exactly one of three paths: the
+//!   caller's terminal read in [`await_call`], the caller abandoning it with
+//!   [`release_call`] (the OCaml await loop does this when it is interrupted
+//!   before the terminal read), or [`release_owner`] when the runtime that
+//!   created it disconnects or closes.
+//! * A call counts against its runtime's capacity from registration until
+//!   that removal, whether or not its task has finished. A completed but
+//!   unread outcome therefore keeps its slot, so abandoned calls cannot grow
+//!   the registry past the runtime's ceiling ([`registered_calls`]).
 //! * The Tokio task owns a second reference through a [`CompletionGuard`]. It
 //!   never touches the runtime graph, the registry, or OCaml; it only writes
 //!   its slot and wakes the waiter. Its join handle stays in the runtime's own
@@ -76,11 +82,37 @@ struct RegisteredCall {
     slot: Arc<CallSlot>,
 }
 
+/// Registered calls plus a per-owner count of them, kept in step under one
+/// mutex so admission can check a runtime's outstanding calls in O(1).
+#[derive(Default)]
+struct Registry {
+    calls: HashMap<u64, RegisteredCall>,
+    per_owner: HashMap<u64, usize>,
+}
+
+impl Registry {
+    /// Removes `call` if `owner` (when given) matches, keeping the per-owner
+    /// count exact; the only way an entry leaves the registry.
+    fn remove(&mut self, call: u64, owner: Option<u64>) -> Option<RegisteredCall> {
+        match self.calls.get(&call) {
+            Some(registered) if owner.is_none_or(|owner| owner == registered.owner) => {}
+            Some(_) | None => return None,
+        }
+        let removed = self.calls.remove(&call)?;
+        if let Some(count) = self.per_owner.get_mut(&removed.owner) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.per_owner.remove(&removed.owner);
+            }
+        }
+        Some(removed)
+    }
+}
+
 /// Process-wide map from call identifier to slot. It is shared by every
 /// runtime so that a caller can await its call without borrowing the runtime
 /// graph, which only its owner Domain may touch.
-static CALLS: LazyLock<Mutex<HashMap<u64, RegisteredCall>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+static CALLS: LazyLock<Mutex<Registry>> = LazyLock::new(|| Mutex::new(Registry::default()));
 
 /// Next call identifier. Identifiers are never reused within a process.
 static NEXT_CALL: AtomicU64 = AtomicU64::new(1);
@@ -198,12 +230,17 @@ pub(crate) fn register(owner: u64) -> std::result::Result<(u64, CompletionGuard)
         });
     }
     let slot = Arc::new(CallSlot::new());
-    let mut calls = lock(&CALLS);
-    calls.try_reserve(1).map_err(|_| Failure {
+    let mut registry = lock(&CALLS);
+    let reserved = registry
+        .calls
+        .try_reserve(1)
+        .and_then(|()| registry.per_owner.try_reserve(1));
+    reserved.map_err(|_| Failure {
         status: STATUS_INTERNAL,
         message: "could not reserve a Temporal client call slot".to_owned(),
     })?;
-    calls.insert(
+    *registry.per_owner.entry(owner).or_insert(0) += 1;
+    registry.calls.insert(
         call,
         RegisteredCall {
             owner,
@@ -219,19 +256,35 @@ pub(crate) fn register(owner: u64) -> std::result::Result<(u64, CompletionGuard)
 /// aborted task's guard finds its slot already closed.
 pub(crate) fn release_owner(owner: u64) {
     let released = {
-        let mut calls = lock(&CALLS);
-        let ids = calls
+        let mut registry = lock(&CALLS);
+        let ids = registry
+            .calls
             .iter()
             .filter(|(_, call)| call.owner == owner)
             .map(|(id, _)| *id)
             .collect::<Vec<_>>();
         ids.into_iter()
-            .filter_map(|id| calls.remove(&id))
+            .filter_map(|id| registry.remove(id, Some(owner)))
             .collect::<Vec<_>>()
     };
     // Close outside the registry lock to respect the lock order.
     for call in released {
         call.slot.close();
+    }
+}
+
+/// Abandons the call named by `(owner, call)` without reading it: the call
+/// is unregistered, which frees its capacity slot and drops any outcome
+/// already published, and a still-running task later finds its cell closed.
+/// The task itself is not aborted here (only the owner Domain may touch the
+/// runtime's task registry); it ends at its own RPC deadline or at shutdown.
+/// A mismatched owner, a retired call, or an unknown identifier is a no-op,
+/// so callers may release unconditionally and learn nothing about other
+/// owners' calls. Any thread may call this.
+pub(crate) fn release_call(owner: u64, call: u64) {
+    let released = lock(&CALLS).remove(call, Some(owner));
+    if let Some(released) = released {
+        released.slot.close();
     }
 }
 
@@ -247,7 +300,7 @@ pub(crate) fn release_owner(owner: u64) {
 /// settles, nor retires the call. Any thread may call this; it never touches a
 /// runtime graph. The C stub releases the OCaml runtime lock around it.
 pub(crate) fn await_call(owner: u64, call: u64, timeout: Duration) -> Operation {
-    let slot = match lock(&CALLS).get(&call) {
+    let slot = match lock(&CALLS).calls.get(&call) {
         Some(registered) if registered.owner == owner => Arc::clone(&registered.slot),
         Some(_) | None => return Err(closed_failure()),
     };
@@ -271,16 +324,13 @@ pub(crate) fn await_call(owner: u64, call: u64, timeout: Duration) -> Operation 
     // Retire the identifier after releasing the slot lock (lock order). A
     // concurrent release may already have removed it, which is harmless. The
     // owner was verified above and identifiers are never reused.
-    lock(&CALLS).remove(&call);
+    lock(&CALLS).remove(call, Some(owner));
     terminal
 }
 
-/// Reports how many calls `owner` still has registered. Test-only
-/// observation of the release paths.
-#[cfg(test)]
+/// Reports how many calls `owner` has registered: submitted and not yet
+/// read, released, or closed, whether or not their tasks have finished. The
+/// runtime's admission ceiling is checked against this count.
 pub(crate) fn registered_calls(owner: u64) -> usize {
-    lock(&CALLS)
-        .values()
-        .filter(|call| call.owner == owner)
-        .count()
+    lock(&CALLS).per_owner.get(&owner).copied().unwrap_or(0)
 }

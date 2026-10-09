@@ -293,6 +293,14 @@ val client_submit_json :
 val client_await_call :
   client_call -> timeout_ms:int -> (bytes, error) result
 
+(** Abandons one submitted call without reading it (#807). A call counts
+    against its runtime's 4,096-call ceiling until it is read, released, or
+    the runtime closes, even after its RPC has finished; a caller that stops
+    awaiting (for example because of an exception) releases it here. Any
+    published outcome is dropped, and releasing a call that was already
+    read, released, or closed is a no-op. Borrows no runtime. *)
+val client_release_call : client_call -> (unit, error) result
+
 (** Completes an activity already handed off with [WillCompleteAsync] through
     the namespace-bound Temporal client. This does not touch the worker's
     outstanding-task ledger. *)

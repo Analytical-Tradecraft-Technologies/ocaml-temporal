@@ -244,7 +244,9 @@ enum {
 };
 
 /* Submit one client RPC without waiting for Temporal (#807). Only the
- * runtime's owner thread may call this. On success the value is the call
+ * runtime's owner thread may call this. A call counts against the ceiling
+ * until it is read, released, or its runtime closes. On success the value is
+ * the call
  * handle "<owner>.<call>" in ASCII decimal: the submitting graph's random
  * owner identity and the call identifier. The RPC runs on a Rust task. Starts and waits
  * keep their 64-entry limits and every call shares a 4,096-entry ceiling;
@@ -267,6 +269,14 @@ ocaml_temporal_core_status ocaml_temporal_core_v4_client_submit_json(
 ocaml_temporal_core_status ocaml_temporal_core_v4_client_await_call(
     uint64_t owner, uint64_t call, uint32_t timeout_ms,
     ocaml_temporal_core_result *output);
+
+/* Abandon a submitted call without reading it, freeing its slot in the
+ * 4,096-call ceiling (an unread completed call keeps counting until it is
+ * read, released, or its runtime closes). Any published outcome is dropped.
+ * Takes no runtime; a mismatched owner, retired call, or unknown identifier
+ * is a successful no-op. */
+ocaml_temporal_core_status ocaml_temporal_core_v4_client_release_call(
+    uint64_t owner, uint64_t call, ocaml_temporal_core_result *output);
 
 /* Complete an activity after WillCompleteAsync through the namespace-bound
  * client. The worker task-token ledger is intentionally not consulted. */

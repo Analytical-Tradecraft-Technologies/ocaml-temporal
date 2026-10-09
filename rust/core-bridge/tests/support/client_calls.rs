@@ -347,3 +347,47 @@ fn awaiting_requires_the_submitting_owner() {
     assert_eq!(runtime.close(true), STATUS_OK);
     assert_eq!(other.close(true), STATUS_OK);
 }
+
+/// Completed calls keep counting against the runtime's ceiling until their
+/// cells are retired (Codex review on #976). Abandoning every call without
+/// reading it fills the ceiling even though every task has finished, so the
+/// next submission is refused with the capacity status; releasing one call,
+/// or reading one, frees exactly one slot.
+#[test]
+fn unread_completed_calls_hold_capacity_until_retired() {
+    let (mut runtime, probe) = connected_runtime();
+    let owner = runtime.call_owner;
+    let mut handles = (0..MAX_PENDING_CALLS)
+        .map(|_| submit(&mut runtime, ClientCallKind::Signal, SIGNAL))
+        .collect::<Vec<_>>();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while probe.signals.load(Ordering::SeqCst) < MAX_PENDING_CALLS {
+        assert!(Instant::now() < deadline, "signals never completed");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(registered_calls(owner), MAX_PENDING_CALLS);
+    let refused = runtime
+        .submit_client_call(6, SIGNAL)
+        .expect_err("ceiling reached by unread outcomes");
+    assert_eq!(refused.status, STATUS_RESOURCE_EXHAUSTED);
+
+    // An interrupted caller releases its call: one slot is freed and the
+    // released call can no longer be read.
+    let released = handles.pop().expect("a submitted call");
+    crate::client_calls::release_call(released.0, released.1);
+    let gone = await_call(released, Duration::ZERO).expect_err("released call");
+    assert_eq!(gone.status, STATUS_INVALID_STATE);
+    assert_eq!(registered_calls(owner), MAX_PENDING_CALLS - 1);
+    let admitted = submit(&mut runtime, ClientCallKind::Signal, SIGNAL);
+    assert!(runtime.submit_client_call(6, SIGNAL).is_err());
+
+    // Reading a call retires it too; a foreign release changes nothing.
+    crate::client_calls::release_call(owner ^ 1, admitted.1);
+    outcome(admitted, Duration::from_secs(5)).expect("admitted signal");
+    assert_eq!(registered_calls(owner), MAX_PENDING_CALLS - 1);
+    submit(&mut runtime, ClientCallKind::Signal, SIGNAL);
+
+    assert!(runtime.disconnect_client().is_ok());
+    assert_eq!(registered_calls(owner), 0);
+    assert_eq!(runtime.close(true), STATUS_OK);
+}

@@ -70,6 +70,17 @@ let poll cell ~timeout_ms =
   in
   loop ()
 
+(** Number of cells released by an abandoned await, across all tests. *)
+let releases = Atomic.make 0
+
+(** The fake [release] given to [Client_call.await]: an abandoned call frees
+    its cell (like the native release, which unregisters and closes it) and
+    is counted so a test can prove the await loop retired it. *)
+let release cell =
+  Atomic.incr releases;
+  close cell;
+  Ok ()
+
 (** A manually opened gate used to hold the owner Domain inside one
     operation. *)
 type gate = { gate_mutex : Mutex.t; opened : Condition.t; mutable open_ : bool }
@@ -165,7 +176,7 @@ let call supervisor operation =
   | Error Supervisor.Closed -> Error `Closed
   | Error _ -> Error `Supervisor
   | Ok submitted -> (
-      match Client_call.await ~poll ~slice_ms:20 submitted with
+      match Client_call.await ~poll ~release ~slice_ms:20 submitted with
       | Ok value -> Ok value
       | Error Client_call.Closed -> Error `Closed
       | Error (Client_call.Failed error) -> Error (`Failed error))
@@ -180,7 +191,7 @@ let spawn_long supervisor name =
         | Error _ -> Error `Supervisor
         | Ok submitted_call -> (
             Atomic.set submitted true;
-            match Client_call.await ~poll ~slice_ms:20 submitted_call with
+            match Client_call.await ~poll ~release ~slice_ms:20 submitted_call with
             | Ok value -> Ok value
             | Error Client_call.Closed -> Error `Closed
             | Error (Client_call.Failed error) -> Error (`Failed error)))
@@ -235,7 +246,7 @@ let test_completion_reaches_only_its_caller () =
   in
   let first = submit "first" and second = submit "second" in
   let await submitted =
-    Domain.spawn (fun () -> Client_call.await ~poll ~slice_ms:20 submitted)
+    Domain.spawn (fun () -> Client_call.await ~poll ~release ~slice_ms:20 submitted)
   in
   let first_waiter = await first and second_waiter = await second in
   complete (List.assoc "first" !cells) (Ok (Bytes.of_string "first done"));
@@ -281,7 +292,43 @@ let test_deadline_expires_while_queued () =
   check "shutdown" (Supervisor.shutdown supervisor = Ok ());
   check "only the live request was submitted" (!submitted = [ "live" ])
 
+(** An await interrupted by an exception (here raised by the completion
+    source after the first bounded wait, as an asynchronous exception would
+    be) releases its call exactly once and propagates the exception, so an
+    abandoned call cannot keep its capacity slot. A call that completes
+    normally is retired by its terminal read and is never released. *)
+let test_interrupted_await_releases_its_call () =
+  let supervisor = Result.get_ok (Supervisor.create ~capacity:4 (ref [])) in
+  let submitted =
+    Result.get_ok (Supervisor.perform supervisor (Backend.Submit_long "interrupted"))
+  in
+  let cell =
+    match submitted with
+    | Client_call.In_flight { ticket; _ } -> ticket
+    | Client_call.Completed _ -> failwith "long call was not in flight"
+  in
+  let polls = ref 0 in
+  let interrupting cell ~timeout_ms =
+    incr polls;
+    if !polls > 1 then raise Exit else poll cell ~timeout_ms
+  in
+  let before = Atomic.get releases in
+  (match Client_call.await ~poll:interrupting ~release ~slice_ms:5 submitted with
+  | exception Exit -> ()
+  | _ -> failwith "an interrupted await did not propagate its exception");
+  check "interrupted call released once" (Atomic.get releases = before + 1);
+  check "released cell is closed" (with_cell cell (fun () -> cell.state = `Closed));
+  let completed =
+    Result.get_ok
+      (Supervisor.perform supervisor (Backend.Submit_short ("completed", None)))
+  in
+  check "completed call"
+    (Client_call.await ~poll ~release ~slice_ms:5 completed = Ok "completed ok");
+  check "a terminal read is not released" (Atomic.get releases = before + 1);
+  check "shutdown" (Supervisor.shutdown supervisor = Ok ())
+
 let () =
+  test_interrupted_await_releases_its_call ();
   test_long_calls_do_not_delay_short_calls ();
   test_completion_reaches_only_its_caller ();
   test_deadline_expires_while_queued ();

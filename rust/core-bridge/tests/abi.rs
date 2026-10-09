@@ -8,11 +8,11 @@ use ocaml_temporal_core_bridge::{
     ABI_VERSION, Buffer, Result as AbiResult, STATUS_ABI_MISMATCH, STATUS_INVALID_ARGUMENT,
     STATUS_INVALID_STATE, STATUS_NOT_READY, STATUS_OK, STATUS_PANIC, STATUS_PROTOCOL,
     STATUS_RETRYABLE, ocaml_temporal_core_v4_check_abi_version,
-    ocaml_temporal_core_v4_client_await_call, ocaml_temporal_core_v4_client_submit_json,
-    ocaml_temporal_core_v4_conformance_wait_ms, ocaml_temporal_core_v4_echo,
-    ocaml_temporal_core_v4_result_free, ocaml_temporal_core_v4_runtime_dispose,
-    ocaml_temporal_core_v4_runtime_free, ocaml_temporal_core_v4_runtime_new,
-    ocaml_temporal_core_v4_worker_complete_activity_json,
+    ocaml_temporal_core_v4_client_await_call, ocaml_temporal_core_v4_client_release_call,
+    ocaml_temporal_core_v4_client_submit_json, ocaml_temporal_core_v4_conformance_wait_ms,
+    ocaml_temporal_core_v4_echo, ocaml_temporal_core_v4_result_free,
+    ocaml_temporal_core_v4_runtime_dispose, ocaml_temporal_core_v4_runtime_free,
+    ocaml_temporal_core_v4_runtime_new, ocaml_temporal_core_v4_worker_complete_activity_json,
     ocaml_temporal_core_v4_worker_complete_workflow_json,
     ocaml_temporal_core_v4_worker_record_activity_heartbeat_json,
     ocaml_temporal_core_v4_worker_reject_activity_json,
@@ -594,6 +594,15 @@ fn submitted_client_calls_validate_their_arguments() {
     assert_eq!(
         unsafe { ocaml_temporal_core_v4_client_await_call(1, 1, 60_001, &mut result) },
         STATUS_INVALID_ARGUMENT
+    );
+    assert_eq!(
+        unsafe { ocaml_temporal_core_v4_result_free(&mut result) },
+        STATUS_OK
+    );
+    // Releasing an unknown call is a successful, silent no-op.
+    assert_eq!(
+        unsafe { ocaml_temporal_core_v4_client_release_call(1, u64::MAX, &mut result) },
+        STATUS_OK
     );
     assert_eq!(
         unsafe { ocaml_temporal_core_v4_result_free(&mut result) },

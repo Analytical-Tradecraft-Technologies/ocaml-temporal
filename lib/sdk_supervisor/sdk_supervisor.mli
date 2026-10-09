@@ -108,16 +108,20 @@ module Client_call : sig
   (** Default length in milliseconds of one bounded completion wait. *)
   val default_slice_ms : int
 
-  (** [await ~poll call] blocks the calling thread until [call] completes.
-      [poll ticket ~timeout_ms] performs one bounded wait: [Not_ready]
-      repeats it, [Invalid_state] is {!Closed}, and any other result is
-      decoded. It must not run on a workflow scheduler Domain or on the
-      supervisor owner Domain. *)
+  (** [await ~poll ~release call] blocks the calling thread until [call]
+      completes. [poll ticket ~timeout_ms] performs one bounded wait:
+      [Not_ready] repeats it, [Invalid_state] is {!Closed}, and any other
+      result is decoded; a terminal poll retires the call. If the wait is
+      left by an exception instead (including an asynchronous one),
+      [release ticket] is called once so the abandoned call frees its
+      capacity slot, and the exception propagates. It must not run on a
+      workflow scheduler Domain or on the supervisor owner Domain. *)
   val await :
     poll:
       ('ticket ->
       timeout_ms:int ->
       (bytes, Temporal_core_bridge.Native_bridge.error) result) ->
+    release:('ticket -> (unit, Temporal_core_bridge.Native_bridge.error) result) ->
     ?slice_ms:int ->
     ('value, 'ticket) t ->
     ('value, failure) result

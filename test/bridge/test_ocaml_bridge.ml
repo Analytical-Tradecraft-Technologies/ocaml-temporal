@@ -194,7 +194,11 @@ let () =
       | None -> failwith ("well-formed call handle rejected: " ^ text)
       | Some handle -> (
           match Bridge.client_await_call handle ~timeout_ms:60_000 with
-          | Error { status = Invalid_state; _ } -> ()
+          | Error { status = Invalid_state; _ } -> (
+              (* Releasing a call that is not registered is a no-op. *)
+              match Bridge.client_release_call handle with
+              | Ok () -> ()
+              | Error _ -> failwith "releasing an unissued call handle failed")
           | _ -> failwith "an unissued call handle was not reported closed"))
     [ "1.4611686018427387903"; "4611686018427387903.1" ];
   (match Bridge.worker_complete_workflow_json runtime Bytes.empty with

@@ -337,9 +337,20 @@ being waited on and 64 distinct start request IDs in flight, where repeats of
 an in-flight run or request ID share a slot (Temporal deduplicates the
 request ID, so concurrent identical starts report the same run). A start
 whose request ID is in flight for a different request is rejected with
-`PROTOCOL`. All submitted calls together are capped at 4,096, a ceiling that
-only stops a defect from growing the task registry without bound: every
-other call ends at its own RPC deadline and is awaited by one blocked caller.
+`PROTOCOL`. All submitted calls of one runtime together are capped at 4,096.
+A call counts from submission until its completion cell is retired, not
+merely until its RPC finishes: a finished but unread outcome keeps its slot,
+so callers that abandon calls cannot grow the process-wide registry without
+bound. A cell is retired by the caller's terminal read, by
+`ocaml_temporal_core_v4_client_release_call(owner, call)`, or by disconnect
+or close. The OCaml await loop calls the release symbol from a
+`Fun.protect` finalizer whenever it is left without a terminal read (an
+exception, including an asynchronous one), so in practice only a caller that
+never awaits at all holds a slot until shutdown; there is no time-based
+reclaim of such cells. Releasing drops any published outcome and frees the
+slot; a still-running task finishes into the closed cell at its own
+deadline. Release, like await, takes no runtime, and a mismatched owner or
+unknown call is a silent no-op.
 Admission beyond a bound returns `RESOURCE_EXHAUSTED` (status `15`) before
 any task exists, which the public client reports as `Client.is_at_capacity`.
 
@@ -363,7 +374,7 @@ ordinary closed-client error, or as an uncertain start when the request may
 already have been sent.
 
 The synchronous symbols and the start ticket symbols remain in ABI version 4
-for direct bridge callers and tests. The two new symbols are additive: an
+for direct bridge callers and tests. The three new symbols are additive: an
 older OCaml object never calls them, so the ABI version is unchanged.
 
 ## Address the current run of a workflow

@@ -245,6 +245,9 @@ external client_submit_json_raw : runtime -> int -> bytes -> response
 external client_await_call_raw : int -> int -> int -> response
   = "ocaml_temporal_client_await_call"
 
+external client_release_call_raw : int -> int -> response
+  = "ocaml_temporal_client_release_call"
+
 external client_complete_async_activity_json_raw : runtime -> bytes -> response
   = "ocaml_temporal_client_complete_async_activity_json"
 
@@ -953,6 +956,14 @@ let client_await_call { owner; call } ~timeout_ms =
     invalid_arg "Native_bridge.client_await_call: timeout out of range";
   bridge_call "client_await_call" (fun () ->
       decode (client_await_call_raw owner call timeout_ms))
+
+(** Abandons one submitted call without reading it, freeing its slot in the
+    runtime's call ceiling and dropping any published outcome. Releasing a
+    call that was already read, released, or closed is a no-op. Like
+    {!client_await_call} it borrows no runtime and may run on any thread. *)
+let client_release_call { owner; call } =
+  bridge_call "client_release_call" (fun () ->
+      Result.map ignore (decode (client_release_call_raw owner call)))
 
 (** Completes an admitted asynchronous activity through Rust's official
     namespace-bound client. The input is strict activity-completion JSON and is

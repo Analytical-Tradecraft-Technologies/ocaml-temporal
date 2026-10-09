@@ -177,14 +177,16 @@ const MAX_PENDING_STARTS: usize = 64;
 /// Maximum time spent in one wait-ticket ABI call before the owner regains
 /// control of its mailbox and can service lifecycle messages.
 const START_WAIT_TIMEOUT: Duration = Duration::from_millis(100);
-/// Hard ceiling on submitted client calls in flight on one runtime (#807).
+/// Hard ceiling on submitted client calls outstanding on one runtime (#807).
 ///
-/// Starts and exact-run waits keep their own documented limits above. Every
-/// other submitted call is bounded in time by its RPC deadline (at most one
-/// minute) and is awaited by one blocked caller thread, so the live count is
-/// naturally limited by the application's concurrency. This ceiling only
-/// stops a defect from turning the task registry into an unbounded one;
-/// admission beyond it returns `STATUS_RESOURCE_EXHAUSTED` before any RPC.
+/// A call counts from submission until its completion cell is retired: read
+/// by its caller, released by an interrupted caller, or closed with the
+/// runtime. A finished but unread call still counts, so abandoned outcomes
+/// cannot grow the process-wide registry without bound. Tasks whose cells
+/// were released but which are still running are bounded by the same value
+/// through the task registry. Starts and exact-run waits keep their own
+/// documented limits above. Admission beyond the ceiling returns
+/// `STATUS_RESOURCE_EXHAUSTED` before any RPC.
 const MAX_PENDING_CALLS: usize = 4_096;
 /// Longest single wait on a submitted call's completion cell. The wait wakes
 /// as soon as the outcome is published or the runtime releases the call; the
@@ -1309,7 +1311,9 @@ impl Runtime {
             }
             _ => CallScope::Bounded,
         };
-        if self.pending_calls.len() >= MAX_PENDING_CALLS {
+        if self.pending_calls.len() >= MAX_PENDING_CALLS
+            || crate::client_calls::registered_calls(self.call_owner) >= MAX_PENDING_CALLS
+        {
             return Err(Failure {
                 status: STATUS_RESOURCE_EXHAUSTED,
                 message: format!(
@@ -4623,6 +4627,36 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_client_await_call(
                 call,
                 Duration::from_millis(u64::from(timeout_ms)),
             )
+        })
+    }
+}
+
+/// Abandon one submitted client call without reading its outcome (#807).
+///
+/// The OCaml await loop calls this when it is interrupted before the terminal
+/// read, so an abandoned call does not keep counting against its runtime's
+/// ceiling. The completion cell is unregistered and closed and any published
+/// outcome is dropped; a still-running task finishes into the closed cell at
+/// its own RPC deadline or is aborted at shutdown. Like the await symbol it
+/// takes no runtime, and a mismatched owner, retired call, or unknown
+/// identifier is a successful no-op, so it reveals nothing about other
+/// owners' calls.
+///
+/// # Safety
+///
+/// `output` follows the same contract as
+/// [`ocaml_temporal_core_v4_check_abi_version`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ocaml_temporal_core_v4_client_release_call(
+    owner: u64,
+    call: u64,
+    output: *mut Result,
+) -> Status {
+    // SAFETY: The output-pointer contract is forwarded unchanged to `invoke`.
+    unsafe {
+        invoke(output, || {
+            crate::client_calls::release_call(owner, call);
+            Ok(Vec::new())
         })
     }
 }

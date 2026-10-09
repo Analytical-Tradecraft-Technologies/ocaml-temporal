@@ -70,11 +70,15 @@ handle `<owner>.<call>`: the submitting graph's random owner identity and the
 call identifier. `ocaml_temporal_core_v4_client_await_call(owner, call,
 timeout_ms)` takes that pair, not a runtime, and serves only the owner that
 submitted the call; any other owner gets the same `INVALID_STATE` as an
-unknown call and leaves the call untouched. It waits a bounded interval for
-the outcome, which is the
+unknown call and leaves the call untouched.
+`ocaml_temporal_core_v4_client_release_call(owner, call)` abandons a call
+without reading it; a call counts against the runtime's 4,096-call ceiling
+until it is read, released, or its runtime closes, even after its RPC ends.
+The await symbol waits a bounded interval for the outcome, which is the
 same document or failure the synchronous symbol returns (a start yields the
 ticket path's outcome document). No document, status value, or existing
-symbol changes, and an older OCaml object never calls the new symbols, so
+symbol changes, and an older OCaml object never calls the three new
+symbols, so
 the version and symbol prefix stay at 4. The completion registry, its
 ownership, and its shutdown behavior are described in the
 [client protocol](client-protocol.md#submitted-client-calls-807).

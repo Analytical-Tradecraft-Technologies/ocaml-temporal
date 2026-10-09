@@ -30,7 +30,12 @@ handle. The caller then waits on its own Domain through
 takes no runtime pointer (the pair names a cell in a process-wide registry)
 and runs with the OCaml lock released. A call is served only to the random
 owner identity of the graph that submitted it; any other owner is answered
-like an unknown call and cannot consume or observe it. Tasks never call OCaml or touch the runtime graph; a
+like an unknown call and cannot consume or observe it. A call counts
+against the runtime's 4,096-call ceiling until its cell is retired (read,
+released through the new `ocaml_temporal_core_v4_client_release_call`, or
+closed with the runtime), not merely until its RPC ends, and the OCaml
+await loop releases its call from a `Fun.protect` finalizer when it is
+interrupted, so abandoned outcomes cannot grow the registry without bound. Tasks never call OCaml or touch the runtime graph; a
 task that panics or is dropped settles its cell through a guard.
 
 Disconnect and close (including the GC fallback) close every pending cell
@@ -47,15 +52,18 @@ share the submitted path's request decoding and futures. The generic
 `Sdk_supervisor.Client_call` await loop and the `Native.Client_submit`
 operation, `await_client_call`, and `call` are private.
 
-Evidence: seven Rust tests over a callback gRPC transport (a pending wait and
+Evidence: eight Rust tests over a callback gRPC transport (a pending wait and
 query do not delay a signal and a start, which complete through their own
 cells; disconnect wakes a blocked waiter with the closed status and drops
 both transport futures; the GC close path releases calls; validation before
 registration; distinct-run wait capacity; a panicking task settles its
 cell; awaiting with another owner is refused as unknown and leaves the call
-for its submitter), a Rust ABI test and C harness assertions for the new symbols, three
+for its submitter; 4,096 finished but unread calls fill the ceiling until one
+is released or read), a Rust ABI test and C harness assertions for the new symbols, four
 deterministic supervisor tests over `Sdk_supervisor.Make` with a fake
-completion source (a wait and a query pending on other Domains do not delay
+completion source (an interrupted await releases its call exactly once
+while a completed one is never released; a wait and a query pending on
+other Domains do not delay
 signals and starts, shutdown closes calls in flight, each completion reaches
 only its caller, and a deadline that expires while queued completes without
 submitting), a native supervisor test of submission, expired deadlines, and

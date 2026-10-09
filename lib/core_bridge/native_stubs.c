@@ -875,6 +875,31 @@ CAMLprim value ocaml_temporal_client_submit_json(value runtime, value kind,
   CAMLreturn(response);
 }
 
+/* Abandon one submitted call without reading it (#807), freeing its slot in
+ * the runtime's call ceiling. Like the await stub it borrows no runtime and
+ * never blocks on the network: Rust only unregisters and closes the cell
+ * under its registry mutex. Negative values map to UINT64_MAX, which Rust
+ * treats as unknown (a no-op). */
+CAMLprim value ocaml_temporal_client_release_call(value owner, value call) {
+  CAMLparam2(owner, call);
+  CAMLlocal1(response);
+  intnat requested_owner = Long_val(owner);
+  intnat requested_call = Long_val(call);
+  uint64_t native_owner =
+      requested_owner < 0 ? UINT64_MAX : (uint64_t)requested_owner;
+  uint64_t native_call =
+      requested_call < 0 ? UINT64_MAX : (uint64_t)requested_call;
+  ocaml_temporal_core_result native_result = {0};
+
+  response = alloc_response();
+  caml_enter_blocking_section();
+  (void)ocaml_temporal_core_v4_client_release_call(native_owner, native_call,
+                                                   &native_result);
+  caml_leave_blocking_section();
+  Response_val(response)->result = native_result;
+  CAMLreturn(response);
+}
+
 /* Wait a bounded interval for one submitted call's outcome (#807). No
  * runtime is borrowed: the (owner, call) pair from the submission handle
  * names a Rust-owned completion cell, so the submitting caller may wait here

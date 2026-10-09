@@ -303,24 +303,37 @@ module Client_call = struct
   (** Waits for [call] on the calling Domain. [poll ticket ~timeout_ms]
       performs one bounded wait: [Not_ready] repeats it, [Invalid_state]
       means the call was closed, and any other result is terminal and is
-      passed to the call's decoder. Must not run on a workflow scheduler
-      Domain or on the supervisor's owner Domain: it blocks the calling
-      thread until the call completes or is closed. *)
-  let await ~poll ?(slice_ms = default_slice_ms) call =
+      passed to the call's decoder. A terminal poll retires the call in the
+      completion source. If the loop is left any other way (an exception
+      from [poll] or the decoder, or an asynchronous exception between
+      waits), [release ticket] is called exactly once before the exception
+      propagates, so an abandoned call does not keep its capacity slot; its
+      result is ignored because the exception is the primary outcome. Must
+      not run on a workflow scheduler Domain or on the supervisor's owner
+      Domain: it blocks the calling thread until the call completes or is
+      closed. *)
+  let await ~poll ~release ?(slice_ms = default_slice_ms) call =
     match call with
     | Completed (Ok value) -> Ok value
     | Completed (Error error) -> Error (Failed error)
     | In_flight { ticket; decode } ->
+        let retired = ref false in
         let rec loop () =
           match poll ticket ~timeout_ms:slice_ms with
           | Error { Bridge.status = Not_ready; _ } -> loop ()
-          | Error { Bridge.status = Invalid_state; _ } -> Error Closed
+          | Error { Bridge.status = Invalid_state; _ } ->
+              retired := true;
+              Error Closed
           | outcome -> (
+              retired := true;
               match decode outcome with
               | Ok value -> Ok value
               | Error error -> Error (Failed error))
         in
-        loop ()
+        Fun.protect
+          ~finally:(fun () ->
+            if not !retired then try ignore (release ticket) with _ -> ())
+          loop
 end
 
 (** Converts between OCaml-owned native bytes and the closed semantic protocol
@@ -1508,7 +1521,8 @@ module Native = struct
       error. *)
   let await_client_call ?slice_ms call =
     match
-      Client_call.await ~poll:Native_backend.Bridge.client_await_call ?slice_ms call
+      Client_call.await ~poll:Native_backend.Bridge.client_await_call
+        ~release:Native_backend.Bridge.client_release_call ?slice_ms call
     with
     | Ok value -> Ok value
     | Error Client_call.Closed -> Error Closed
