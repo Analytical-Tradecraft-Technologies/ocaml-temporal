@@ -100,3 +100,8 @@
  (deps
   (glob_files ../fixtures/history-corpus/histories/*.pb))
  (libraries temporal-sdk temporal_history_corpus_definitions))
+
+; Worker resource and shutdown option encoding and validation (#498).
+(test
+ (name test_worker_tuning)
+ (libraries temporal_core_bridge))

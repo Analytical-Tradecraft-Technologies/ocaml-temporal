@@ -1,11 +1,10 @@
 #!/bin/sh
 set -eu
 
-# Runs the fixed-bug and recovery live regressions (#530, #545, #546, #548,
-# #567, #805) and the transport interruption fault suite (#504) against the
-# already-started Compose Temporal/PostgreSQL stack (#795). The caller owns the
-# server lifecycle; each regression executable owns its worker processes, uses
-# a unique task queue, and terminates the workflow executions it creates.
+# Runs the live regressions for fixed bugs, features and recovery paths against
+# the already-started Compose Temporal/PostgreSQL stack (#795). The caller owns
+# the server lifecycle; each regression executable owns its worker processes,
+# uses a unique task queue, and terminates the workflow executions it creates.
 #
 # Arguments are repository-relative executables. Each must already exist under
 # _build/default: the Makefile target compiles them locally, and CI unpacks the
@@ -91,7 +90,8 @@ for executable in "$@"; do
   case "$executable" in
     test/integration/client_request_ids/regression.exe|\
     test/integration/completed_queries/regression.exe|\
-    test/integration/split_worker_task_types/regression.exe)
+    test/integration/split_worker_task_types/regression.exe|\
+    test/integration/worker_resource_options/regression.exe)
       cli_argument='' ;;
     test/integration/interaction_recovery/regression.exe|\
     test/integration/local_activity_cancellation/regression.exe|\

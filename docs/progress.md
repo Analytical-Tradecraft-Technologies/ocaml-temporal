@@ -58,6 +58,85 @@ in [transport fault qualification](reference/transport-fault-qualification.md#re
 worker shutdown while the server is unavailable, faults over TLS, and the
 external idempotency example.
 
+## 2026-10-09: Validated worker resource and shutdown options (#498)
+
+`Temporal.Worker.Options.make` now accepts the worker's resource and shutdown
+settings as labelled optional arguments:
+
+- `max_concurrent_workflow_tasks` and `workflow_task_pollers`, which is
+  `Fixed n` or `Autoscaling { minimum; maximum; initial }`;
+- `sticky_queue_schedule_to_start_timeout` and `graceful_shutdown_period`;
+- `max_heartbeat_throttle_interval` and `default_heartbeat_throttle_interval`;
+- `max_worker_activities_per_second` and
+  `max_task_queue_activities_per_second`.
+
+Times are `Duration.t` values bounded to one day. Rates must be positive
+finite floats, and the worker rate must be at least one per day because Core
+converts its reciprocal into a `Duration` and would otherwise panic during
+worker construction. Counts must be between 1 and 1,000,000.
+
+Every invalid value is a typed defect returned before anything is allocated.
+That includes zero, negative, overflowing, NaN, infinite and subnormal
+values, as well as these contradictions:
+
+- a caching worker with fewer than two workflow task slots or two fixed
+  pollers;
+- unordered autoscaling bounds;
+- an explicit default heartbeat interval above an explicit maximum.
+
+One accessor per setting reports the effective value, with its default, and
+the new `Worker.options` returns a worker's options. Omitted settings keep the
+values the worker used before:
+
+- 1,000 workflow tasks and 2 fixed pollers;
+- a 30 s grace period;
+- Core's 10 s sticky timeout and 60 s / 30 s heartbeat throttles;
+- no rate limits.
+
+Activity and local-activity slot counts remain pinned to one because the
+OCaml activity executor is serial (#777), so they are deliberately not
+options. The rate limits can only lower throughput. Core applies
+`max_worker_activities_per_second` only to polled tasks, so an eagerly
+dispatched activity bypasses it; the interface documents this.
+
+The settings reach Core through an optional, closed `tuning` member of the
+private worker document. OCaml omits it when nothing is set, so a default
+worker's document is unchanged and the ABI stays at version 4. An archive
+built before this change rejects only a tuned worker, with a typed
+configuration error. An autoscaling maximum must equal
+`max_concurrent_workflow_task_polls`. Core splits a fixed poller count
+between the sticky and normal queues but applies autoscaling bounds to each
+queue separately, so the bounds are documented as per-queue and the
+two-poller cache rule applies only to fixed counts. The Rust mapping test
+asserts the per-buffer poller behaviors.
+
+Evidence:
+
+- `test/unit/test_worker_options.ml` checks defaults, explicit values,
+  boundary and contradiction defects, the reported options of a mock worker,
+  and that fully tuned options pass native worker configuration (an
+  unreachable port then fails at the client connection).
+- `test/bridge/test_worker_tuning.ml` asserts the exact tuned, default and
+  partial documents, every sender-side rejection, and that Rust accepts the
+  tuned document through the C entry point.
+- `rust/core-bridge/tests/support/worker_tuning.rs` decodes the same tuned
+  document and checks every resulting `WorkerConfig` field. That includes
+  autoscaling pollers, durations, rates, the cache-limited workflow slots and
+  the pinned activity slots. It also covers the Rust-side rejections.
+- `test/integration/worker_resource_options/regression.exe` is a new
+  entry in `make test-temporal-live-regressions`. It runs a worker with a
+  one-workflow cache, two slots and two pollers, 1 s sticky and 2 s grace
+  timeouts, and one activity per second through six concurrent executions.
+  Against the Compose Temporal 1.32.0/PostgreSQL stack (macOS arm64, OCaml
+  5.4.1) every execution and a later recovery execution completed. The
+  activity starts spanned 4.97 to 4.98 s over three runs. With the rate limit
+  removed the same burst spanned 0.20 s and the check failed, as intended.
+
+The grace period's effect on in-flight work is not live-qualified. `shutdown`
+lets the running callback finish before native teardown, so the period only
+bounds activity tasks Core still holds afterwards. The end-to-end shutdown
+bound remains #495.
+
 ## 2026-10-09: Dependency inventory checked against its pinned sources (#783)
 
 `docs/dependencies.md` had drifted from what is built: it still named the
