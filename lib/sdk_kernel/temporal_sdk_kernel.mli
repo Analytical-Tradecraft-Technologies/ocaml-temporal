@@ -13,6 +13,9 @@ module Bridge = Temporal_core_bridge.Native_bridge
 (** One-owner-Domain supervisor for the complete native resource graph. *)
 module Supervisor = Sdk_supervisor.Native
 
+(** Shareable Core runtime and its attachment leases (#832). *)
+module Shared_runtime = Sdk_shared_runtime
+
 (** Strict client control-protocol documents exchanged with the Rust bridge. *)
 module Client_protocol = Temporal_protocol.Client_protocol
 
