@@ -6,6 +6,7 @@
   test_error
   test_workflow_authoring
   test_client_worker
+  test_worker_options
   test_activity_retry_policy
   test_interactions
   test_condition

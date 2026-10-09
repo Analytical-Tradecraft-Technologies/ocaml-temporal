@@ -38,25 +38,112 @@ module Options : sig
       interrupts the stuck code; see {!health} for the recovery contract. *)
   type activation_deadline = [ `After of Duration.t | `Disabled ]
 
+  (** How many concurrent workflow-task polls the worker keeps open against
+      the server. While the sticky cache is enabled the worker polls two
+      queues, its own sticky queue and the shared normal queue, and the two
+      variants treat them differently:
+
+      - [Fixed n] is a total of [n] polls that Temporal Core splits between
+        the queues: [max 1 (n / 5)] on the normal queue and the rest, at
+        least one, on the sticky queue. A caching worker therefore needs
+        [n >= 2]. Core applies the same normal-queue share without the
+        cache, so an uncached worker keeps [max 1 (n / 5)] polls open.
+      - [Autoscaling] bounds apply to {e each} queue separately: Core scales
+        every queue between [minimum] and [maximum] polls from server
+        feedback, starting at [initial], and requires
+        [1 <= minimum <= initial <= maximum]. A caching worker can thus
+        keep up to [2 * maximum] polls open, and at least [2 * minimum].
+        Without the cache there is only the normal queue.
+
+      A poll is only issued when a workflow-task slot is free, so polls
+      beyond [max_concurrent_workflow_tasks] just wait. *)
+  type workflow_task_pollers =
+    | Fixed of int
+    | Autoscaling of { minimum : int; maximum : int; initial : int }
+
   (** A validated set of optional worker resource and routing settings. *)
   type t
 
   (** Existing worker defaults: no routing versioning, the standard sticky
-      cache bound, and a two-second workflow activation deadline. *)
+      cache bound, a two-second workflow activation deadline, and the
+      resource defaults listed on [make]. *)
   val default : t
 
-  (** Validates and constructs options. A supplied cache value overrides the
-      normal worker default; [0] disables sticky workflow caching. Legacy build
-      IDs must be non-empty, NUL-free, and within the bridge transport limit.
-      Deployment versioning returns a defect when [use_worker_versioning] and
-      [default_versioning_behavior] disagree as described on [versioning].
-      [workflow_activation_deadline] defaults to [`After] two seconds (the
-      Python SDK's deadlock timeout; Go uses one second); a zero deadline or
-      one above one hour returns a defect. *)
+  (** Validates and constructs options. Every check happens here, before any
+      native resource exists; the private bridge repeats them at its own
+      boundary. Each invalid value returns a defect whose message names the
+      option. Counts are capped at 1,000,000 and durations at one day.
+
+      Routing and liveness:
+      - [versioning] defaults to [No_versioning]. Legacy build IDs must be
+        non-empty, NUL-free, and within the bridge transport limit.
+        Deployment versioning returns a defect when [use_worker_versioning]
+        and [default_versioning_behavior] disagree as described on
+        [versioning].
+      - [workflow_activation_deadline] defaults to [`After] two seconds (the
+        Python SDK's deadlock timeout; Go uses one second); a zero deadline or
+        one above one hour returns a defect.
+
+      Workflow resources (#498):
+      - [max_cached_workflows] (default 1000) bounds the sticky workflow
+        cache; [0] disables sticky caching.
+      - [max_concurrent_workflow_tasks] (default 1000, at least 1) bounds the
+        workflow tasks Core holds at once. While the cache is enabled it must
+        be at least 2, and Core admits at most [max 2 max_cached_workflows]
+        tasks, so a smaller cache also lowers the effective limit. The OCaml
+        workflow lane still runs one activation at a time; this limit bounds
+        tasks waiting for it, not parallel execution.
+      - [workflow_task_pollers] defaults to [Fixed 2]; see
+        {!type-workflow_task_pollers}.
+      - [sticky_queue_schedule_to_start_timeout] (default 10 s, 1 ms to one
+        day) is how long a task may wait on this worker's sticky queue before
+        the server offers it to any worker. It has no effect when the cache
+        is disabled.
+
+      Shutdown:
+      - [graceful_shutdown_period] (default 30 s, zero to one day) is how long
+        Temporal Core waits after shutdown begins before it cancels
+        outstanding activity tasks. {!shutdown} first lets the in-flight
+        callback finish, so the period bounds only activity tasks Core still
+        holds at that point.
+
+      Activities:
+      - [max_heartbeat_throttle_interval] (default 60 s) and
+        [default_heartbeat_throttle_interval] (default 30 s), each 1 ms to one
+        day, bound how often activity heartbeats are sent to the server.
+        Activities with a heartbeat timeout use 80% of it, capped by the
+        maximum; others use the default. An explicit default above an
+        explicit maximum returns a defect.
+      - [max_worker_activities_per_second] limits how many remote activity
+        tasks this worker polls per second. It must be at least one per day
+        ([1. /. 86400.]), because Core turns its reciprocal into the
+        interval between polls. Core applies it to polled tasks
+        only; an activity dispatched eagerly with its workflow task
+        bypasses it unless the activity sets [~do_not_eagerly_execute:true].
+        [max_task_queue_activities_per_second] asks the server to limit
+        dispatch for the whole task queue: workers that set different values
+        overwrite each other, and setting it disables eager activity
+        execution. Both must be positive finite numbers and are unset by
+        default.
+
+      Remote and local activity slots are deliberately not configurable. The
+      OCaml activity executor runs one callback at a time, so the worker
+      grants Temporal Core exactly one remote and one local activity slot.
+      A larger value would let the server start activity timeouts for tasks
+      that can only wait in a queue. The rate limits above can only lower
+      throughput and therefore cannot contradict that executor. *)
   val make :
     ?versioning:versioning ->
     ?max_cached_workflows:int ->
     ?workflow_activation_deadline:activation_deadline ->
+    ?max_concurrent_workflow_tasks:int ->
+    ?workflow_task_pollers:workflow_task_pollers ->
+    ?sticky_queue_schedule_to_start_timeout:Duration.t ->
+    ?graceful_shutdown_period:Duration.t ->
+    ?max_heartbeat_throttle_interval:Duration.t ->
+    ?default_heartbeat_throttle_interval:Duration.t ->
+    ?max_worker_activities_per_second:float ->
+    ?max_task_queue_activities_per_second:float ->
     unit ->
     (t, Error.t) result
 
@@ -68,6 +155,31 @@ module Options : sig
 
   (** Returns the workflow activation watchdog setting. *)
   val workflow_activation_deadline : t -> activation_deadline
+
+  (** The configured workflow-task limit, or its default. *)
+  val max_concurrent_workflow_tasks : t -> int
+
+  (** The configured workflow poller behavior, or its default. *)
+  val workflow_task_pollers : t -> workflow_task_pollers
+
+  (** The configured sticky-queue timeout, or Core's default. *)
+  val sticky_queue_schedule_to_start_timeout : t -> Duration.t
+
+  (** The configured shutdown grace period, or its default. *)
+  val graceful_shutdown_period : t -> Duration.t
+
+  (** The configured maximum heartbeat throttle interval, or Core's default. *)
+  val max_heartbeat_throttle_interval : t -> Duration.t
+
+  (** The default heartbeat throttle interval Core applies: the configured
+      value or Core's default, capped by the effective maximum. *)
+  val default_heartbeat_throttle_interval : t -> Duration.t
+
+  (** The per-worker activity rate limit, or [None] when unlimited. *)
+  val max_worker_activities_per_second : t -> float option
+
+  (** The task-queue activity rate limit, or [None] when unset. *)
+  val max_task_queue_activities_per_second : t -> float option
 end
 
 (** Worker liveness as observed by the workflow activation watchdog. *)
@@ -142,7 +254,10 @@ type t
     bridge. [max_cached_workflows] optionally bounds Core's sticky workflow
     cache; omitting it preserves the default, while a small positive bound can
     cause explicit cache-eviction activations that the worker acknowledges with
-    an empty completion. An explicit [identity] is used unchanged and must be
+    an empty completion. Passing both [options] and [max_cached_workflows] is
+    a typed defect. Every other resource and shutdown setting comes from
+    [options] and is validated by {!Options.make}; {!options} reports the
+    effective values. An explicit [identity] is used unchanged and must be
     non-empty and NUL-free. When omitted, the
     identity defaults to [<pid>@<hostname>], matching the official Temporal
     SDKs, computed once when the worker is created so pollers from different
@@ -188,6 +303,13 @@ val create :
     release the OCaml runtime lock and return periodically so shutdown cannot
     be stranded, but releasing that lock does not make [run] non-blocking. *)
 val run : t -> (unit, Error.t) result
+
+(** The options the worker was created with. The [Options] accessors report
+    each effective setting, defaults included, and none of them carries a
+    credential, so the result is safe to log for diagnostics. A worker
+    created with [~max_cached_workflows] alone reports options holding that
+    bound. *)
+val options : t -> Options.t
 
 (** Reports whether the workflow activation watchdog has detected workflow
     code that stopped yielding (see {!Options.activation_deadline}).

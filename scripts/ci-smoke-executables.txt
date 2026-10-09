@@ -25,3 +25,4 @@ test/integration/temporal/worker/smoke_worker.exe
 test/integration/test_core_lifecycle.exe
 test/integration/update_outcomes/regression.exe
 test/integration/worker_poll_isolation/regression.exe
+test/integration/worker_resource_options/regression.exe

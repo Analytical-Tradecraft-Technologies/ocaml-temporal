@@ -76,6 +76,33 @@ type worker_versioning =
 
 let ( let* ) = Result.bind
 
+(** Autoscaling bounds for Core's workflow-task pollers (#498). *)
+type poller_autoscaling = { minimum : int; maximum : int; initial : int }
+
+(** Optional Core worker settings added after the original worker document
+    (#498). [None] leaves Core's own default in force, and an all-[None]
+    value is not serialized at all, so default workers keep sending the
+    exact document that older bridge archives accept. *)
+type worker_tuning = {
+  workflow_task_poller_autoscaling : poller_autoscaling option;
+  sticky_queue_schedule_to_start_timeout_ms : int64 option;
+  max_heartbeat_throttle_interval_ms : int64 option;
+  default_heartbeat_throttle_interval_ms : int64 option;
+  max_worker_activities_per_second : float option;
+  max_task_queue_activities_per_second : float option;
+}
+
+(** Leaves every tuning setting at Core's default. *)
+let default_worker_tuning =
+  {
+    workflow_task_poller_autoscaling = None;
+    sticky_queue_schedule_to_start_timeout_ms = None;
+    max_heartbeat_throttle_interval_ms = None;
+    default_heartbeat_throttle_interval_ms = None;
+    max_worker_activities_per_second = None;
+    max_task_queue_activities_per_second = None;
+  }
+
 (** Validated workflow-only worker settings retained as ordinary OCaml data
     until the supervisor serializes worker construction. *)
 type worker_config = {
@@ -87,6 +114,8 @@ type worker_config = {
   max_outstanding_workflow_tasks : int;
   max_concurrent_workflow_task_polls : int;
   graceful_shutdown_timeout_ms : int64;
+  tuning : worker_tuning;
+      (** Optional Core settings; see {!worker_tuning}. *)
   workflow_tasks : bool;
       (** Poll workflow tasks. False only when no workflow is registered. *)
   activity_tasks : bool;
@@ -110,6 +139,12 @@ let min_cached_workflow_polls = 2
 
 (** Maximum accepted graceful shutdown period in milliseconds. *)
 let max_graceful_shutdown_timeout_ms = 86_400_000L
+
+(** Maximum accepted sticky-queue timeout and heartbeat throttle interval in
+    milliseconds (one day), mirrored by the Rust bridge. A longer value is far
+    more likely to be a unit mistake than a deliberate policy, and the bound
+    keeps every value representable as a protobuf duration. *)
+let max_worker_tuning_duration_ms = 86_400_000L
 
 (** Largest explicit Tokio worker-thread count for one runtime. Mirrors
     [MAX_RUNTIME_WORKER_THREADS] in the Rust bridge, which rejects larger
@@ -373,12 +408,109 @@ let client_config ~target_url ~identity =
         (fun () -> { target_url; identity })
         (validate_identifier "identity" identity)
 
+(** Checks one optional positive tuning duration against
+    [max_worker_tuning_duration_ms]. *)
+let validate_tuning_duration name = function
+  | None -> Ok ()
+  | Some value
+    when Int64.compare value 0L > 0
+         && Int64.compare value max_worker_tuning_duration_ms <= 0 ->
+      Ok ()
+  | Some _ ->
+      configuration_error
+        (Printf.sprintf "%s must be between 1 and %Ld" name
+           max_worker_tuning_duration_ms)
+
+(** Checks one optional rate: Core rejects zero, negative, NaN, infinite and
+    subnormal worker rates, and the task-queue rate is held to the same rule
+    because the server treats it as a positive dispatch limit. *)
+let validate_rate name = function
+  | None -> Ok ()
+  | Some value when Float.classify_float value = FP_normal && value > 0.0 ->
+      Ok ()
+  | Some _ -> configuration_error (name ^ " must be a positive finite number")
+
+(** Smallest accepted per-worker activity rate: one poll per day. *)
+let min_worker_rate = 1.0 /. 86_400.0
+
+(** Checks the per-worker rate. Core computes its poll interval as
+    [Duration::from_secs_f64 (1 / rate)], which panics inside worker
+    construction when the reciprocal overflows, so the reciprocal is bounded
+    to one day. The task-queue rate is only forwarded to the server. *)
+let validate_worker_rate name value =
+  let* () = validate_rate name value in
+  match value with
+  | Some rate when rate < min_worker_rate ->
+      configuration_error (name ^ " must be at least one per day (1/86400)")
+  | _ -> Ok ()
+
+(** Validates the optional settings together with the poller maximum they
+    must agree with. An autoscaling poller's maximum is carried in
+    [max_concurrent_workflow_task_polls], so the two can never disagree. *)
+let validate_tuning ~max_concurrent_workflow_task_polls tuning =
+  let* () =
+    match tuning.workflow_task_poller_autoscaling with
+    | None -> Ok ()
+    | Some { minimum; maximum; initial } ->
+        let* () =
+          validate_count ~allow_zero:false
+            "workflow_task_poller_autoscaling.minimum" minimum
+        in
+        let* () =
+          validate_count ~allow_zero:false
+            "workflow_task_poller_autoscaling.maximum" maximum
+        in
+        if maximum < minimum then
+          configuration_error
+            "workflow_task_poller_autoscaling.maximum must be at least minimum"
+        else if initial < minimum || initial > maximum then
+          configuration_error
+            "workflow_task_poller_autoscaling.initial must be between minimum \
+             and maximum"
+        else if maximum <> max_concurrent_workflow_task_polls then
+          configuration_error
+            "workflow_task_poller_autoscaling.maximum must equal \
+             max_concurrent_workflow_task_polls"
+        else Ok ()
+  in
+  let* () =
+    validate_tuning_duration "sticky_queue_schedule_to_start_timeout_ms"
+      tuning.sticky_queue_schedule_to_start_timeout_ms
+  in
+  let* () =
+    validate_tuning_duration "max_heartbeat_throttle_interval_ms"
+      tuning.max_heartbeat_throttle_interval_ms
+  in
+  let* () =
+    validate_tuning_duration "default_heartbeat_throttle_interval_ms"
+      tuning.default_heartbeat_throttle_interval_ms
+  in
+  let* () =
+    (* Core silently clips the default interval to the maximum; reject the
+       explicit contradiction instead of hiding it. *)
+    match
+      ( tuning.default_heartbeat_throttle_interval_ms,
+        tuning.max_heartbeat_throttle_interval_ms )
+    with
+    | Some default, Some maximum when Int64.compare default maximum > 0 ->
+        configuration_error
+          "default_heartbeat_throttle_interval_ms must not exceed \
+           max_heartbeat_throttle_interval_ms"
+    | _ -> Ok ()
+  in
+  let* () =
+    validate_worker_rate "max_worker_activities_per_second"
+      tuning.max_worker_activities_per_second
+  in
+  validate_rate "max_task_queue_activities_per_second"
+    tuning.max_task_queue_activities_per_second
+
 (** Creates workflow-only worker settings after validating every field. *)
 let worker_config ~namespace ~task_queue ~build_id ?(versioning = No_versioning)
     ~max_cached_workflows
     ~max_outstanding_workflow_tasks ~max_concurrent_workflow_task_polls
-    ~graceful_shutdown_timeout_ms ?(workflow_tasks = true)
-    ?(activity_tasks = true) () =
+    ~graceful_shutdown_timeout_ms ?(tuning = default_worker_tuning)
+    ?(workflow_tasks = true) ?(activity_tasks = true) () =
   let validations =
     [
       (if workflow_tasks || activity_tasks then Ok ()
@@ -427,8 +559,12 @@ let worker_config ~namespace ~task_queue ~build_id ?(versioning = No_versioning)
         max_outstanding_workflow_tasks;
       validate_count ~allow_zero:false "max_concurrent_workflow_task_polls"
         max_concurrent_workflow_task_polls;
+      (* Core splits only a fixed poller count between the sticky and normal
+         queues; autoscaling bounds apply to each queue, so the two-poller
+         rule does not apply to them. *)
       (if
          max_cached_workflows > 0
+         && Option.is_none tuning.workflow_task_poller_autoscaling
          && max_concurrent_workflow_task_polls < min_cached_workflow_polls
        then
          configuration_error
@@ -443,6 +579,7 @@ let worker_config ~namespace ~task_queue ~build_id ?(versioning = No_versioning)
        else
          configuration_error
            "graceful_shutdown_timeout_ms must be between 0 and 86400000");
+      validate_tuning ~max_concurrent_workflow_task_polls tuning;
     ]
   in
   match List.find_opt Result.is_error validations with
@@ -459,6 +596,7 @@ let worker_config ~namespace ~task_queue ~build_id ?(versioning = No_versioning)
           max_outstanding_workflow_tasks;
           max_concurrent_workflow_task_polls;
           graceful_shutdown_timeout_ms;
+          tuning;
           workflow_tasks;
           activity_tasks;
         }
@@ -472,10 +610,43 @@ let encode_client_config config =
     ]
   |> Yojson.Safe.to_string |> Bytes.of_string
 
+(** Encodes the optional [tuning] member, listing only explicit settings.
+    Returns [None] for an all-default value so the member is omitted and the
+    document stays byte-for-byte identical to the pre-#498 encoding. *)
+let encode_worker_tuning tuning =
+  let duration name = Option.map (fun ms -> (name, `Intlit (Int64.to_string ms))) in
+  let rate name = Option.map (fun value -> (name, `Float value)) in
+  let fields =
+    List.filter_map Fun.id
+      [
+        Option.map
+          (fun { minimum; maximum; initial } ->
+            ( "workflow_task_poller_autoscaling",
+              `Assoc
+                [
+                  ("minimum", `Int minimum);
+                  ("maximum", `Int maximum);
+                  ("initial", `Int initial);
+                ] ))
+          tuning.workflow_task_poller_autoscaling;
+        duration "sticky_queue_schedule_to_start_timeout_ms"
+          tuning.sticky_queue_schedule_to_start_timeout_ms;
+        duration "max_heartbeat_throttle_interval_ms"
+          tuning.max_heartbeat_throttle_interval_ms;
+        duration "default_heartbeat_throttle_interval_ms"
+          tuning.default_heartbeat_throttle_interval_ms;
+        rate "max_worker_activities_per_second"
+          tuning.max_worker_activities_per_second;
+        rate "max_task_queue_activities_per_second"
+          tuning.max_task_queue_activities_per_second;
+      ]
+  in
+  match fields with [] -> None | fields -> Some ("tuning", `Assoc fields)
+
 (** Encodes the exact strict workflow-worker document accepted by Rust. *)
-let encode_worker_config config =
+let worker_config_document config =
   `Assoc
-    [
+    ([
       ("namespace", `String config.namespace);
       ("task_queue", `String config.task_queue);
       ("build_id", `String config.build_id);
@@ -517,7 +688,11 @@ let encode_worker_config config =
             ("activities", `Bool config.activity_tasks);
           ] );
     ]
-  |> Yojson.Safe.to_string |> Bytes.of_string
+    @ Option.to_list (encode_worker_tuning config.tuning))
+  |> Yojson.Safe.to_string
+
+(** The worker document as the bytes handed to the C stub. *)
+let encode_worker_config config = Bytes.of_string (worker_config_document config)
 
 (** Returns one closed protocol error for malformed replay input. The Rust
     side repeats the complete checks; this sender-side copy rejects bad JSON
