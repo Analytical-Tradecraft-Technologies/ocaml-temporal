@@ -1234,7 +1234,8 @@ impl Runtime {
     ///
     /// The owner Domain only validates the request, checks capacity,
     /// registers a completion cell, and spawns one Tokio task that owns a
-    /// connection clone. The identifier is returned as ASCII decimal bytes.
+    /// connection clone. The handle is returned as ASCII `<owner>.<call>`
+    /// (two decimal numbers); both are needed to await the call.
     /// The task publishes exactly one outcome (the bytes or failure the
     /// operation's synchronous symbol would return) into the cell and never
     /// touches this runtime or OCaml; the submitting caller collects it with
@@ -1324,7 +1325,9 @@ impl Runtime {
             message: "could not reserve a Temporal client call slot".to_owned(),
         })?;
         let (call, guard) = crate::client_calls::register(self.call_owner)?;
-        let encoded = call.to_string().into_bytes();
+        // The handle is `<owner>.<call>`: awaiting requires both, so only the
+        // graph that submitted the call can collect its outcome.
+        let encoded = format!("{}.{call}", self.call_owner).into_bytes();
         let future = rpc.into_future(connection);
         let task = handle.spawn(async move {
             let outcome = future.await;
@@ -4544,7 +4547,8 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_client_wait_workflow_json(
 /// `kind` selects the operation with the closed values documented in the C
 /// header (`1` start through `10` visibility) and `input` is that
 /// operation's usual request document. On success the value is the call
-/// identifier as ASCII decimal digits; the RPC then runs on a Tokio task and
+/// handle `<owner>.<call>` in ASCII decimal: the identity of this runtime
+/// graph and the call identifier. The RPC then runs on a Tokio task and
 /// its outcome is collected with
 /// [`ocaml_temporal_core_v4_client_await_call`]. The call returns as soon as
 /// the task is spawned, so the owner Domain never waits for the network.
@@ -4581,14 +4585,17 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_client_submit_json(
 
 /// Wait at most `timeout_ms` for a submitted client call's outcome (#807).
 ///
-/// This symbol takes no runtime: the call identifier names a process-wide
-/// completion cell, so any thread may await its own call while the runtime
-/// owner keeps serving other requests. The first terminal result retires
-/// the call and is returned unchanged: the operation's value or failure.
-/// `STATUS_NOT_READY` means the interval elapsed and the call may be awaited
-/// again. `STATUS_INVALID_STATE` means the call can no longer complete: its
-/// runtime disconnected or closed, or the identifier was already consumed or
-/// never issued. `timeout_ms` above one minute is rejected.
+/// This symbol takes no runtime: `(owner, call)`, both from the submission
+/// handle, names a process-wide completion cell, so the submitting caller
+/// may await its call from any thread while the runtime owner keeps serving
+/// other requests. The first terminal result retires the call and is
+/// returned unchanged: the operation's value or failure. `STATUS_NOT_READY`
+/// means the interval elapsed and the call may be awaited again.
+/// `STATUS_INVALID_STATE` means the call can no longer complete: its runtime
+/// disconnected or closed, the identifier was already consumed or never
+/// issued, or `owner` is not the graph that submitted it. These cases are
+/// indistinguishable, and a mismatched owner leaves the call untouched.
+/// `timeout_ms` above one minute is rejected.
 ///
 /// # Safety
 ///
@@ -4597,6 +4604,7 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_client_submit_json(
 /// any language runtime lock, since the call blocks.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ocaml_temporal_core_v4_client_await_call(
+    owner: u64,
     call: u64,
     timeout_ms: u32,
     output: *mut Result,
@@ -4610,7 +4618,11 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_client_await_call(
                     message: "client call await cannot exceed 60000 ms".to_owned(),
                 });
             }
-            crate::client_calls::await_call(call, Duration::from_millis(u64::from(timeout_ms)))
+            crate::client_calls::await_call(
+                owner,
+                call,
+                Duration::from_millis(u64::from(timeout_ms)),
+            )
         })
     }
 }

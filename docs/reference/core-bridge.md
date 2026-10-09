@@ -65,9 +65,13 @@ response.
 Submitted client calls (#807) are also additive within version 4.
 `ocaml_temporal_core_v4_client_submit_json` takes a closed `uint32_t`
 operation selector (`OCAML_TEMPORAL_CORE_CLIENT_CALL_*`) and the operation's
-existing request document, spawns the RPC on a Tokio task, and returns a call
-identifier. `ocaml_temporal_core_v4_client_await_call` takes that identifier,
-not a runtime, and waits a bounded interval for the outcome, which is the
+existing request document, spawns the RPC on a Tokio task, and returns the
+handle `<owner>.<call>`: the submitting graph's random owner identity and the
+call identifier. `ocaml_temporal_core_v4_client_await_call(owner, call,
+timeout_ms)` takes that pair, not a runtime, and serves only the owner that
+submitted the call; any other owner gets the same `INVALID_STATE` as an
+unknown call and leaves the call untouched. It waits a bounded interval for
+the outcome, which is the
 same document or failure the synchronous symbol returns (a start yields the
 ticket path's outcome document). No document, status value, or existing
 symbol changes, and an older OCaml object never calls the new symbols, so

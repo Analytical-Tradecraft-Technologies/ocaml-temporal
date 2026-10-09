@@ -24,11 +24,13 @@ for up to 30 s, so every other call on the client, including shutdown,
 queued behind them. Every client RPC is now submit-and-complete. The owner
 Domain only resolves the RPC deadline, encodes the request, and calls the new
 `ocaml_temporal_core_v4_client_submit_json`, which validates it, registers a
-completion cell, spawns one Tokio task, and returns a call identifier. The
-caller then waits on its own Domain through
-`ocaml_temporal_core_v4_client_await_call`, which takes no runtime pointer
-(the identifier names a cell in a process-wide registry) and runs with the
-OCaml lock released. Tasks never call OCaml or touch the runtime graph; a
+completion cell, spawns one Tokio task, and returns an `<owner>.<call>`
+handle. The caller then waits on its own Domain through
+`ocaml_temporal_core_v4_client_await_call(owner, call, timeout_ms)`, which
+takes no runtime pointer (the pair names a cell in a process-wide registry)
+and runs with the OCaml lock released. A call is served only to the random
+owner identity of the graph that submitted it; any other owner is answered
+like an unknown call and cannot consume or observe it. Tasks never call OCaml or touch the runtime graph; a
 task that panics or is dropped settles its cell through a guard.
 
 Disconnect and close (including the GC fallback) close every pending cell
@@ -45,12 +47,13 @@ share the submitted path's request decoding and futures. The generic
 `Sdk_supervisor.Client_call` await loop and the `Native.Client_submit`
 operation, `await_client_call`, and `call` are private.
 
-Evidence: six Rust tests over a callback gRPC transport (a pending wait and
+Evidence: seven Rust tests over a callback gRPC transport (a pending wait and
 query do not delay a signal and a start, which complete through their own
 cells; disconnect wakes a blocked waiter with the closed status and drops
 both transport futures; the GC close path releases calls; validation before
 registration; distinct-run wait capacity; a panicking task settles its
-cell), a Rust ABI test and C harness assertions for the new symbols, three
+cell; awaiting with another owner is refused as unknown and leaves the call
+for its submitter), a Rust ABI test and C harness assertions for the new symbols, three
 deterministic supervisor tests over `Sdk_supervisor.Make` with a fake
 completion source (a wait and a query pending on other Domains do not delay
 signals and starts, shutdown closes calls in flight, each completion reaches

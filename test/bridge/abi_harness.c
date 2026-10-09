@@ -118,8 +118,8 @@ int main(void) {
 
   /* Submitted client calls (#807): an unknown selector is rejected before the
    * document is read, a valid call needs a connected client, and awaiting an
-   * identifier that was never issued reports the closed state instead of
-   * blocking. */
+   * identifier that was never issued (under any owner) reports the closed
+   * state instead of blocking. */
   const uint8_t wait_request[] =
       "{\"namespace\":\"default\",\"workflow_id\":\"w\",\"run_id\":\"r\"}";
   assert(ocaml_temporal_core_v4_client_submit_json(
@@ -133,7 +133,7 @@ int main(void) {
              &result) == OCAML_TEMPORAL_CORE_STATUS_INVALID_STATE);
   assert(ocaml_temporal_core_v4_result_free(&result) ==
          OCAML_TEMPORAL_CORE_STATUS_OK);
-  assert(ocaml_temporal_core_v4_client_await_call(UINT64_MAX, 0, &result) ==
+  assert(ocaml_temporal_core_v4_client_await_call(1, UINT64_MAX, 0, &result) ==
          OCAML_TEMPORAL_CORE_STATUS_INVALID_STATE);
   assert(ocaml_temporal_core_v4_result_free(&result) ==
          OCAML_TEMPORAL_CORE_STATUS_OK);

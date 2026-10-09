@@ -180,6 +180,23 @@ let () =
    with
   | Error { status = Invalid_state; message } -> assert (String.length message > 0)
   | _ -> failwith "submitted signal without a client was accepted");
+  (* Handles are "<owner>.<call>" with both parts positive. Awaiting a
+     well-formed handle Rust never issued, for any owner, reports the closed
+     state at once rather than waiting or exposing another owner's call. *)
+  List.iter
+    (fun text ->
+      if Bridge.parse_client_call text <> None then
+        failwith ("malformed call handle accepted: " ^ text))
+    [ ""; "7"; "0.1"; "1.0"; "-1.2"; "1.2.3"; "a.b" ];
+  List.iter
+    (fun text ->
+      match Bridge.parse_client_call text with
+      | None -> failwith ("well-formed call handle rejected: " ^ text)
+      | Some handle -> (
+          match Bridge.client_await_call handle ~timeout_ms:60_000 with
+          | Error { status = Invalid_state; _ } -> ()
+          | _ -> failwith "an unissued call handle was not reported closed"))
+    [ "1.4611686018427387903"; "4611686018427387903.1" ];
   (match Bridge.worker_complete_workflow_json runtime Bytes.empty with
   | Error { status = Protocol; message } ->
       assert (String.length message > 0)

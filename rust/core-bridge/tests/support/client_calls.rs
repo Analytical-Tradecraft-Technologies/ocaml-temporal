@@ -7,7 +7,15 @@
 //! that disconnect and close release pending calls deterministically.
 
 use super::*;
-use crate::client_calls::{await_call, registered_calls};
+use crate::client_calls::registered_calls;
+
+/// A submission handle: the owning graph's identity and the call identifier.
+type Handle = (u64, u64);
+
+/// Awaits the call `handle` names, as its submitting caller would.
+fn await_call(handle: Handle, timeout: Duration) -> Operation {
+    crate::client_calls::await_call(handle.0, handle.1, timeout)
+}
 use prost::Message;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
@@ -106,8 +114,8 @@ const SIGNAL: &[u8] = br#"{"namespace":"default","workflow_id":"workflow-1","run
 /// A start that the transport accepts at once.
 const START: &[u8] = br#"{"request_id":"start-1","namespace":"default","workflow_id":"workflow-2","workflow_type":"Workflow","task_queue":"queue","input":[]}"#;
 
-/// Submits one call and parses the identifier the ABI returns.
-fn submit(runtime: &mut Runtime, kind: ClientCallKind, input: &[u8]) -> u64 {
+/// Submits one call and parses the `<owner>.<call>` handle the ABI returns.
+fn submit(runtime: &mut Runtime, kind: ClientCallKind, input: &[u8]) -> Handle {
     let selector = match kind {
         ClientCallKind::Start => 1,
         ClientCallKind::Wait => 2,
@@ -118,14 +126,18 @@ fn submit(runtime: &mut Runtime, kind: ClientCallKind, input: &[u8]) -> u64 {
     let bytes = runtime
         .submit_client_call(selector, input)
         .expect("call admitted");
-    std::str::from_utf8(&bytes)
-        .expect("ASCII identifier")
-        .parse()
-        .expect("decimal identifier")
+    let text = std::str::from_utf8(&bytes).expect("ASCII handle");
+    let (owner, call) = text.split_once('.').expect("owner.call handle");
+    let handle = (
+        owner.parse().expect("decimal owner"),
+        call.parse().expect("decimal call"),
+    );
+    assert_eq!(handle.0, runtime.call_owner);
+    handle
 }
 
 /// Awaits one call within `bound`, retrying the bounded native wait.
-fn outcome(call: u64, bound: Duration) -> Operation {
+fn outcome(call: Handle, bound: Duration) -> Operation {
     let deadline = Instant::now() + bound;
     loop {
         match await_call(call, Duration::from_millis(50)) {
@@ -290,13 +302,48 @@ fn wait_capacity_counts_distinct_runs() {
 /// stranding the waiter.
 #[test]
 fn panicking_task_settles_its_cell() {
-    let (call, guard) = crate::client_calls::register(crate::client_calls::new_owner_id())
-        .expect("registered call");
+    let owner = crate::client_calls::new_owner_id();
+    let (call, guard) = crate::client_calls::register(owner).expect("registered call");
     let task = std::thread::spawn(move || {
         let _guard = guard;
         panic!("synthetic client task panic");
     });
     assert!(task.join().is_err());
-    let failure = await_call(call, Duration::ZERO).expect_err("panicked call");
+    let failure = await_call((owner, call), Duration::ZERO).expect_err("panicked call");
     assert_eq!(failure.status, STATUS_PANIC);
+}
+
+/// A call can be awaited only through the owner that submitted it. Another
+/// runtime's owner identity, or an arbitrary one, gets the same closed/unknown
+/// status as an identifier that was never issued, and neither waits on,
+/// consumes, nor settles the call: its submitter still receives the outcome.
+#[test]
+fn awaiting_requires_the_submitting_owner() {
+    let (mut runtime, _probe) = connected_runtime();
+    let (other, _other_probe) = connected_runtime();
+    assert_ne!(runtime.call_owner, other.call_owner);
+    let wait = submit(&mut runtime, ClientCallKind::Wait, WAIT);
+    let signal = submit(&mut runtime, ClientCallKind::Signal, SIGNAL);
+    let unknown = crate::client_calls::await_call(other.call_owner, u64::MAX, Duration::ZERO)
+        .expect_err("unknown call");
+    for foreign in [other.call_owner, 0, runtime.call_owner ^ 1] {
+        for call in [wait.1, signal.1] {
+            let started = Instant::now();
+            let refused = crate::client_calls::await_call(foreign, call, Duration::from_secs(5))
+                .expect_err("foreign owner refused");
+            assert_eq!(refused.status, unknown.status);
+            assert_eq!(refused.message, unknown.message);
+            assert!(
+                started.elapsed() < Duration::from_secs(1),
+                "a foreign owner must not wait on the call"
+            );
+        }
+    }
+    // The submitter still gets the signal's outcome and the pending wait.
+    outcome(signal, Duration::from_secs(5)).expect("signal outcome kept for its owner");
+    let pending = await_call(wait, Duration::ZERO).expect_err("still pending");
+    assert_eq!(pending.status, STATUS_NOT_READY);
+    assert!(runtime.disconnect_client().is_ok());
+    assert_eq!(runtime.close(true), STATUS_OK);
+    assert_eq!(other.close(true), STATUS_OK);
 }

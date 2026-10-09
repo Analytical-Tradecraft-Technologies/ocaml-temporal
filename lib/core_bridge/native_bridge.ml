@@ -242,7 +242,7 @@ external client_wait_workflow_json_raw : runtime -> bytes -> response
 external client_submit_json_raw : runtime -> int -> bytes -> response
   = "ocaml_temporal_client_submit_json"
 
-external client_await_call_raw : int -> int -> response
+external client_await_call_raw : int -> int -> int -> response
   = "ocaml_temporal_client_await_call"
 
 external client_complete_async_activity_json_raw : runtime -> bytes -> response
@@ -893,8 +893,11 @@ type client_call_kind =
   | Call_poll_update
   | Call_visibility
 
-(** Identifier of one submitted call, issued by Rust and positive. *)
-type client_call = int
+(** Handle of one submitted call: the random identity of the runtime graph
+    that submitted it and the call identifier, both issued by Rust and
+    positive. Rust serves an await only when both match, so the handle is
+    the capability to collect the outcome. *)
+type client_call = { owner : int; call : int }
 
 (** The closed numeric selector of [kind] in ABI version 4; it must match
     [OCAML_TEMPORAL_CORE_CLIENT_CALL_*] in the C header. *)
@@ -913,21 +916,31 @@ let client_call_selector = function
 (** Longest single native wait accepted by Rust for one await. *)
 let max_client_await_ms = 60_000
 
-(** Submits one client RPC through the runtime owner and parses the decimal
-    call identifier Rust returns. A malformed identifier is a bridge
-    protocol defect reported as [Protocol]; it cannot be awaited. *)
+(** Parses the [<owner>.<call>] handle Rust returns; both parts must be
+    positive decimal integers. *)
+let parse_client_call text =
+  match String.split_on_char '.' text with
+  | [ owner; call ] -> (
+      match (int_of_string_opt owner, int_of_string_opt call) with
+      | Some owner, Some call when owner > 0 && call > 0 -> Some { owner; call }
+      | _ -> None)
+  | _ -> None
+
+(** Submits one client RPC through the runtime owner and parses the call
+    handle Rust returns. A malformed handle is a bridge protocol defect
+    reported as [Protocol]; it cannot be awaited. *)
 let client_submit_json runtime kind input =
   bridge_call "client_submit_json" (fun () ->
       match decode (client_submit_json_raw runtime (client_call_selector kind) input) with
       | Error _ as error -> error
       | Ok bytes -> (
-          match int_of_string_opt (Bytes.to_string bytes) with
-          | Some call when call > 0 -> Ok call
-          | Some _ | None ->
+          match parse_client_call (Bytes.to_string bytes) with
+          | Some handle -> Ok handle
+          | None ->
               Error
                 {
                   status = Protocol;
-                  message = "client call submission returned an invalid identifier";
+                  message = "client call submission returned an invalid handle";
                 }))
 
 (** Waits at most [timeout_ms] for one submitted call's outcome. The C stub
@@ -935,11 +948,11 @@ let client_submit_json runtime kind input =
     may run on any Domain or thread. An elapsed interval ([Not_ready]) is
     ordinary pending state and is logged at debug level only. An invalid
     [timeout_ms] is a programmer error. *)
-let client_await_call call ~timeout_ms =
+let client_await_call { owner; call } ~timeout_ms =
   if timeout_ms < 0 || timeout_ms > max_client_await_ms then
     invalid_arg "Native_bridge.client_await_call: timeout out of range";
   bridge_call "client_await_call" (fun () ->
-      decode (client_await_call_raw call timeout_ms))
+      decode (client_await_call_raw owner call timeout_ms))
 
 (** Completes an admitted asynchronous activity through Rust's official
     namespace-bound client. The input is strict activity-completion JSON and is

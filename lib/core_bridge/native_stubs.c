@@ -876,17 +876,22 @@ CAMLprim value ocaml_temporal_client_submit_json(value runtime, value kind,
 }
 
 /* Wait a bounded interval for one submitted call's outcome (#807). No
- * runtime is borrowed: the identifier names a Rust-owned completion cell, so
- * a caller on any Domain or thread may wait here while the supervisor owner
- * keeps serving other requests. The OCaml lock is released for the whole
- * wait and only C-stack storage is written during it. Negative identifiers
- * map to UINT64_MAX, which Rust reports as unknown; an oversized timeout
- * maps to UINT32_MAX, which Rust rejects. */
-CAMLprim value ocaml_temporal_client_await_call(value call, value timeout_ms) {
-  CAMLparam2(call, timeout_ms);
+ * runtime is borrowed: the (owner, call) pair from the submission handle
+ * names a Rust-owned completion cell, so the submitting caller may wait here
+ * from any Domain or thread while the supervisor owner keeps serving other
+ * requests. Rust answers a mismatched owner like an unknown call. The OCaml
+ * lock is released for the whole wait and only C-stack storage is written
+ * during it. Negative values map to UINT64_MAX, which Rust reports as
+ * unknown; an oversized timeout maps to UINT32_MAX, which Rust rejects. */
+CAMLprim value ocaml_temporal_client_await_call(value owner, value call,
+                                                value timeout_ms) {
+  CAMLparam3(owner, call, timeout_ms);
   CAMLlocal1(response);
+  intnat requested_owner = Long_val(owner);
   intnat requested_call = Long_val(call);
   intnat requested_timeout = Long_val(timeout_ms);
+  uint64_t native_owner =
+      requested_owner < 0 ? UINT64_MAX : (uint64_t)requested_owner;
   uint64_t native_call =
       requested_call < 0 ? UINT64_MAX : (uint64_t)requested_call;
   uint32_t native_timeout =
@@ -897,8 +902,8 @@ CAMLprim value ocaml_temporal_client_await_call(value call, value timeout_ms) {
 
   response = alloc_response();
   caml_enter_blocking_section();
-  (void)ocaml_temporal_core_v4_client_await_call(native_call, native_timeout,
-                                                 &native_result);
+  (void)ocaml_temporal_core_v4_client_await_call(
+      native_owner, native_call, native_timeout, &native_result);
   caml_leave_blocking_section();
   Response_val(response)->result = native_result;
   CAMLreturn(response);

@@ -312,12 +312,13 @@ update poll, and visibility) as a submitted call:
    `6` signal, `7` query, `8` update, `9` update poll, `10` visibility) and
    the operation's usual request document.
 2. Rust validates the document, checks capacity, registers one completion
-   cell under a fresh numeric call identifier, spawns one Tokio task that
-   owns a connection clone and the validated request, and returns the
-   identifier as ASCII decimal digits. The owner returns at once.
+   cell under a fresh numeric call identifier bound to the runtime graph's
+   owner identity, spawns one Tokio task that owns a connection clone and
+   the validated request, and returns the handle `<owner>.<call>` as ASCII
+   decimal digits. The owner returns at once.
 3. The caller waits on its own Domain with
-   `ocaml_temporal_core_v4_client_await_call(call, timeout_ms)`. That symbol
-   takes no runtime pointer: the identifier names a cell in a process-wide
+   `ocaml_temporal_core_v4_client_await_call(owner, call, timeout_ms)`. That
+   symbol takes no runtime pointer: the pair names a cell in a process-wide
    registry, so the wait never touches the owner's graph. The C stub releases
    the OCaml runtime lock for the whole wait, which ends as soon as the
    task publishes its outcome. `NOT_READY` means the bounded interval (at
@@ -347,7 +348,16 @@ fallback) release every call of that runtime: they first close each pending
 cell, which wakes its waiter with `INVALID_STATE` (status `5`), then abort the
 tasks and join them before the connection and Core are dropped. An await on a
 retired or unknown identifier also reports `INVALID_STATE`; no submitted
-operation produces that status from inside its task. The OCaml supervisor maps
+operation produces that status from inside its task.
+
+A call is reachable only through the graph that submitted it. Each runtime
+graph draws a random 62-bit owner identity when it is created; the registry
+records it with every call, and an await whose owner does not match is
+answered exactly like an unknown identifier (`INVALID_STATE`, same message)
+without waiting on, settling, or retiring the call. A caller therefore cannot
+read or consume another client's outcome, nor learn whether another
+client's call exists, by guessing identifiers. The handle stays inside the
+private supervisor and backend; public callers never see it. The OCaml supervisor maps
 it to its typed `Closed` error, which the public client reports as the
 ordinary closed-client error, or as an uncertain start when the request may
 already have been sent.

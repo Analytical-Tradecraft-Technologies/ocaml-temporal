@@ -575,7 +575,7 @@ fn submitted_client_calls_validate_their_arguments() {
         STATUS_OK
     );
     assert_eq!(
-        unsafe { ocaml_temporal_core_v4_client_await_call(u64::MAX, 0, &mut result) },
+        unsafe { ocaml_temporal_core_v4_client_await_call(1, u64::MAX, 0, &mut result) },
         STATUS_INVALID_STATE
     );
     assert!(!bytes(&result.error).is_empty());
@@ -584,7 +584,7 @@ fn submitted_client_calls_validate_their_arguments() {
         STATUS_OK
     );
     assert_ne!(
-        unsafe { ocaml_temporal_core_v4_client_await_call(u64::MAX, 60_000, &mut result) },
+        unsafe { ocaml_temporal_core_v4_client_await_call(1, u64::MAX, 60_000, &mut result) },
         STATUS_NOT_READY
     );
     assert_eq!(
@@ -592,7 +592,7 @@ fn submitted_client_calls_validate_their_arguments() {
         STATUS_OK
     );
     assert_eq!(
-        unsafe { ocaml_temporal_core_v4_client_await_call(1, 60_001, &mut result) },
+        unsafe { ocaml_temporal_core_v4_client_await_call(1, 1, 60_001, &mut result) },
         STATUS_INVALID_ARGUMENT
     );
     assert_eq!(

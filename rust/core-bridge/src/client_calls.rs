@@ -23,6 +23,18 @@
 //!   identifier, so a caller racing shutdown can never dereference a released
 //!   graph: it simply observes that its call was closed.
 //!
+//! # Access control
+//!
+//! A call is addressed by the pair `(owner, call)`, never by the call
+//! identifier alone. The owner is the identity of the runtime graph that
+//! submitted the call; [`register`] binds it into the registry entry and the
+//! submission returns both values to that graph's client only. [`await_call`]
+//! answers a pair whose owner does not match exactly like an identifier that
+//! was never issued (the closed/unknown failure), so a caller can neither
+//! read nor consume another graph's outcome, nor learn whether such a call
+//! exists. Owner identities are drawn at random from a 62-bit space rather
+//! than a counter, so they are not guessable from one's own identity.
+//!
 //! Lock order: the registry mutex is never held while a slot mutex is taken.
 
 use crate::abi::{
@@ -72,9 +84,6 @@ static CALLS: LazyLock<Mutex<HashMap<u64, RegisteredCall>>> =
 
 /// Next call identifier. Identifiers are never reused within a process.
 static NEXT_CALL: AtomicU64 = AtomicU64::new(1);
-
-/// Next runtime-owner identity used to release a runtime's calls together.
-static NEXT_OWNER: AtomicU64 = AtomicU64::new(1);
 
 /// Locks a mutex whose protected data stays consistent even if a holder
 /// panicked: every critical section here is a single assignment or map edit.
@@ -162,9 +171,19 @@ impl Drop for CompletionGuard {
     }
 }
 
-/// Allocates the identity a runtime uses to release all of its calls.
+/// Allocates the identity a runtime graph uses to own, await, and release
+/// its calls. It is random, nonzero, and below [`MAX_CALL_ID`] so OCaml can
+/// carry it as a positive native `int`; a collision between two live graphs
+/// would need two equal 62-bit random draws and would still only let each
+/// graph address calls whose identifiers it was handed.
 pub(crate) fn new_owner_id() -> u64 {
-    NEXT_OWNER.fetch_add(1, Ordering::Relaxed)
+    loop {
+        let (high, _) = uuid::Uuid::new_v4().as_u64_pair();
+        let owner = high & (MAX_CALL_ID - 1);
+        if owner != 0 {
+            return owner;
+        }
+    }
 }
 
 /// Registers a new pending call for `owner` and returns its identifier and
@@ -216,18 +235,21 @@ pub(crate) fn release_owner(owner: u64) {
     }
 }
 
-/// Blocks the calling thread for at most `timeout` until `call` has an
-/// outcome, then retires the call and returns that outcome unchanged.
+/// Blocks the calling thread for at most `timeout` until the call named by
+/// `(owner, call)` has an outcome, then retires the call and returns that
+/// outcome unchanged.
 ///
 /// Returns `STATUS_NOT_READY` when the interval elapses first; the call stays
 /// registered and may be awaited again. Returns the closed failure
-/// (`STATUS_INVALID_STATE`) when the runtime released the call or the
-/// identifier is unknown. Any thread may call this; it never touches a
+/// (`STATUS_INVALID_STATE`) when the runtime released the call, the
+/// identifier is unknown, or the call belongs to a different owner; the
+/// three cases are indistinguishable, and a mismatched owner neither waits on,
+/// settles, nor retires the call. Any thread may call this; it never touches a
 /// runtime graph. The C stub releases the OCaml runtime lock around it.
-pub(crate) fn await_call(call: u64, timeout: Duration) -> Operation {
+pub(crate) fn await_call(owner: u64, call: u64, timeout: Duration) -> Operation {
     let slot = match lock(&CALLS).get(&call) {
-        Some(registered) => Arc::clone(&registered.slot),
-        None => return Err(closed_failure()),
+        Some(registered) if registered.owner == owner => Arc::clone(&registered.slot),
+        Some(_) | None => return Err(closed_failure()),
     };
     let state = lock(&slot.state);
     let (mut state, _) = slot
@@ -247,7 +269,8 @@ pub(crate) fn await_call(call: u64, timeout: Duration) -> Operation {
     };
     drop(state);
     // Retire the identifier after releasing the slot lock (lock order). A
-    // concurrent release may already have removed it, which is harmless.
+    // concurrent release may already have removed it, which is harmless. The
+    // owner was verified above and identifiers are never reused.
     lock(&CALLS).remove(&call);
     terminal
 }

@@ -256,10 +256,18 @@ type client_call_kind =
   | Call_poll_update
   | Call_visibility
 
-(** Identifier of one submitted client call. It names a Rust-owned
+(** Handle of one submitted client call: the identity of the runtime graph
+    that submitted it plus the call identifier. It names a Rust-owned
     completion cell, not a pointer, and is only meaningful to
-    {!client_await_call}. *)
-type client_call = private int
+    {!client_await_call}. Rust serves an await only for the submitting
+    graph's identity, so a call cannot be collected by another client. *)
+type client_call
+
+(** Parses the ASCII [<owner>.<call>] handle that Rust returns from a
+    submission; both parts must be positive decimal integers. Exposed so
+    the handle format can be tested; a parsed handle that Rust did not issue
+    to this graph is answered as an unknown call. *)
+val parse_client_call : string -> client_call option
 
 (** Longest [timeout_ms] {!client_await_call} accepts: one minute. *)
 val max_client_await_ms : int
@@ -280,7 +288,7 @@ val client_submit_json :
     C stub releases the OCaml runtime lock while waiting. [Not_ready] means
     the interval elapsed and the call may be awaited again. [Invalid_state]
     means the call will never complete: its runtime disconnected or closed,
-    or the identifier was already consumed. Raises [Invalid_argument] when
+    or the call was already consumed or is not this handle's. Raises [Invalid_argument] when
     [timeout_ms] is negative or above {!max_client_await_ms}. *)
 val client_await_call :
   client_call -> timeout_ms:int -> (bytes, error) result

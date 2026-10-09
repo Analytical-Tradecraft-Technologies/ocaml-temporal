@@ -245,22 +245,28 @@ enum {
 
 /* Submit one client RPC without waiting for Temporal (#807). Only the
  * runtime's owner thread may call this. On success the value is the call
- * identifier in ASCII decimal; the RPC runs on a Rust task. Starts and waits
+ * handle "<owner>.<call>" in ASCII decimal: the submitting graph's random
+ * owner identity and the call identifier. The RPC runs on a Rust task. Starts and waits
  * keep their 64-entry limits and every call shares a 4,096-entry ceiling;
  * admission beyond a limit returns RESOURCE_EXHAUSTED (status 15). */
 ocaml_temporal_core_status ocaml_temporal_core_v4_client_submit_json(
     ocaml_temporal_core_runtime *runtime, uint32_t kind, const uint8_t *input,
     size_t input_len, ocaml_temporal_core_result *output);
 
-/* Wait at most timeout_ms (up to 60000) for a submitted call's outcome. Any
- * thread may call this; it takes no runtime. The first terminal result
- * retires the call and is the operation's own value or failure (a start
- * yields the accepted/rejected/unknown outcome document). NOT_READY (status
- * 10) means the interval elapsed. INVALID_STATE (status 5) means the call
- * can no longer complete because its runtime disconnected or closed, or the
- * identifier is unknown. Bindings must release their runtime lock. */
+/* Wait at most timeout_ms (up to 60000) for a submitted call's outcome.
+ * owner and call come from the submission handle; a call is reachable only
+ * through the owner that submitted it. Any thread may call this; it takes no
+ * runtime. The first terminal result retires the call and is the
+ * operation's own value or failure (a start yields the
+ * accepted/rejected/unknown outcome document). NOT_READY (status 10) means
+ * the interval elapsed. INVALID_STATE (status 5) means the call can no longer
+ * complete because its runtime disconnected or closed, the identifier is
+ * unknown, or owner does not match; these cases are indistinguishable and a
+ * mismatched owner leaves the call untouched. Bindings must release their
+ * runtime lock. */
 ocaml_temporal_core_status ocaml_temporal_core_v4_client_await_call(
-    uint64_t call, uint32_t timeout_ms, ocaml_temporal_core_result *output);
+    uint64_t owner, uint64_t call, uint32_t timeout_ms,
+    ocaml_temporal_core_result *output);
 
 /* Complete an activity after WillCompleteAsync through the namespace-bound
  * client. The worker task-token ledger is intentionally not consulted. */
