@@ -666,8 +666,44 @@ assemble these strings themselves. The client document contains exactly
 `target_url` and `identity`. The worker document contains exactly `namespace`,
 `task_queue`, `build_id`, `versioning`, `max_cached_workflows`,
 `max_outstanding_workflow_tasks`, `max_concurrent_workflow_task_polls`, and
-`graceful_shutdown_timeout_ms`, plus `task_types`. Closed Draft 2020-12
-schemas live under `docs/schemas/bridge/`.
+`graceful_shutdown_timeout_ms`, plus `task_types` and an optional `tuning`
+object. Closed Draft 2020-12 schemas live under `docs/schemas/bridge/`.
+
+`tuning` (#498) carries the optional Core settings from the public
+`Worker.Options`: `workflow_task_poller_autoscaling` (`minimum`, `maximum`,
+`initial`), `sticky_queue_schedule_to_start_timeout_ms`,
+`max_heartbeat_throttle_interval_ms`, `default_heartbeat_throttle_interval_ms`,
+`max_worker_activities_per_second` and
+`max_task_queue_activities_per_second`. Every member is optional, and an
+absent member keeps Core's default. The OCaml encoder omits the whole object
+when no member is set, so a default worker sends exactly the pre-#498
+document. Both sides validate it:
+
+- durations are 1 ms to one day;
+- rates must be positive normal numbers;
+- the worker rate must also be at least one per day, because Core's
+  `PollRateLimiter::new` converts its reciprocal with
+  `Duration::from_secs_f64` and panics during worker construction when that
+  overflows (the task-queue rate is only forwarded to the server);
+- an explicit default heartbeat interval must not exceed an explicit
+  maximum;
+- autoscaling bounds must satisfy `minimum <= initial <= maximum`, with
+  `maximum` equal to `max_concurrent_workflow_task_polls`.
+
+Core's `wft_poller_behavior` splits a fixed `max_concurrent_workflow_task_polls`
+between the normal and sticky poll buffers, but hands an autoscaling behavior
+unchanged to each buffer. Autoscaling bounds are therefore per queue: a
+caching worker may keep up to twice `maximum` polls open. The two-poller
+cache rule applies only to a fixed count, since autoscaling always gives
+each queue at least one poll. The object is closed like every other
+document. The change is additive within ABI version 4. An older OCaml object
+never sends `tuning`. A newer object paired with an archive built before #498
+gets a typed configuration error at worker start, and only when it sets a
+tuning option. Activity and local-activity slot counts are deliberately not
+in the document: they stay pinned to the serial OCaml executor (#777).
+`rust/core-bridge/tests/support/worker_tuning.rs` decodes the exact document
+that `test/bridge/test_worker_tuning.ml` asserts the OCaml encoder produces,
+and checks each resulting `WorkerConfig` field.
 
 `task_types` is a closed `{ "workflows": bool, "activities": bool }` object
 that the OCaml worker derives from its registrations: a kind with no

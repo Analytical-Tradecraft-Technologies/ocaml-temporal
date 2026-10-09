@@ -1045,6 +1045,14 @@ let _worker_options_make :
     ?versioning:T.Worker.Options.versioning ->
     ?max_cached_workflows:int ->
     ?workflow_activation_deadline:T.Worker.Options.activation_deadline ->
+    ?max_concurrent_workflow_tasks:int ->
+    ?workflow_task_pollers:T.Worker.Options.workflow_task_pollers ->
+    ?sticky_queue_schedule_to_start_timeout:T.Duration.t ->
+    ?graceful_shutdown_period:T.Duration.t ->
+    ?max_heartbeat_throttle_interval:T.Duration.t ->
+    ?default_heartbeat_throttle_interval:T.Duration.t ->
+    ?max_worker_activities_per_second:float ->
+    ?max_task_queue_activities_per_second:float ->
     unit -> (T.Worker.Options.t, T.Error.t) result =
   T.Worker.Options.make
 
@@ -1058,6 +1066,47 @@ let _worker_options_max_cached_workflows : T.Worker.Options.t -> int option =
 let _worker_options_workflow_activation_deadline :
     T.Worker.Options.t -> [ `After of T.Duration.t | `Disabled ] =
   T.Worker.Options.workflow_activation_deadline
+
+(* Worker resource and shutdown options (#498). The poller variant is
+   matched exhaustively so a new constructor is a visible API change. *)
+let _worker_options_workflow_task_pollers :
+    T.Worker.Options.t -> T.Worker.Options.workflow_task_pollers =
+  T.Worker.Options.workflow_task_pollers
+
+let _worker_options_workflow_task_pollers_shape :
+    T.Worker.Options.workflow_task_pollers -> int * int * int = function
+  | T.Worker.Options.Fixed count -> (count, count, count)
+  | T.Worker.Options.Autoscaling { minimum; maximum; initial } ->
+      (minimum, maximum, initial)
+
+let _worker_options_max_concurrent_workflow_tasks : T.Worker.Options.t -> int =
+  T.Worker.Options.max_concurrent_workflow_tasks
+
+let _worker_options_sticky_queue_schedule_to_start_timeout :
+    T.Worker.Options.t -> T.Duration.t =
+  T.Worker.Options.sticky_queue_schedule_to_start_timeout
+
+let _worker_options_graceful_shutdown_period :
+    T.Worker.Options.t -> T.Duration.t =
+  T.Worker.Options.graceful_shutdown_period
+
+let _worker_options_max_heartbeat_throttle_interval :
+    T.Worker.Options.t -> T.Duration.t =
+  T.Worker.Options.max_heartbeat_throttle_interval
+
+let _worker_options_default_heartbeat_throttle_interval :
+    T.Worker.Options.t -> T.Duration.t =
+  T.Worker.Options.default_heartbeat_throttle_interval
+
+let _worker_options_max_worker_activities_per_second :
+    T.Worker.Options.t -> float option =
+  T.Worker.Options.max_worker_activities_per_second
+
+let _worker_options_max_task_queue_activities_per_second :
+    T.Worker.Options.t -> float option =
+  T.Worker.Options.max_task_queue_activities_per_second
+
+let _worker_options : T.Worker.t -> T.Worker.Options.t = T.Worker.options
 
 (* Workflow activation watchdog health for liveness probes. *)
 let _worker_health : T.Worker.t -> T.Worker.Health.t = T.Worker.health

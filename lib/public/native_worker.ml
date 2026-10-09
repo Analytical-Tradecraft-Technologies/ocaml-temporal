@@ -295,8 +295,9 @@ let register_async_activity definition =
   Activity_adapter.register_async definition
 
 (** Default native worker resource settings. They are deliberately explicit and
-    stable so every worker has bounded Core resource usage even before a richer
-    public options record is added. *)
+    stable so every worker has bounded Core resource usage; the public
+    [Worker.Options] layer documents the same values as its defaults and may
+    override each one (#498). *)
 let default_build_id = "ocaml-temporal"
 
 let default_max_cached_workflows = 1_000
@@ -805,10 +806,14 @@ let cleanup_abandoned worker =
     [Native.create] enters [cleanup], which joins the supervisor owner Domain
     and closes all native resources before returning. Successful construction
     attaches a GC finalizer so abandoned workers still drain leases. *)
-let create ?max_cached_workflows ?io_threads ?runtime
-    ?(versioning = Bridge.No_versioning) ?activation_deadline_ms ~target_url
-    ~namespace
-    ~identity ~task_queue ~workflows ~activities () =
+let create ?max_cached_workflows
+    ?(max_outstanding_workflow_tasks = default_max_outstanding_workflow_tasks)
+    ?(max_concurrent_workflow_task_polls =
+      default_max_concurrent_workflow_task_polls)
+    ?(graceful_shutdown_timeout_ms = default_graceful_shutdown_timeout_ms)
+    ?tuning ?io_threads ?runtime ?(versioning = Bridge.No_versioning)
+    ?activation_deadline_ms ~target_url ~namespace ~identity ~task_queue
+    ~workflows ~activities () =
   let max_cached_workflows =
     Option.value max_cached_workflows ~default:default_max_cached_workflows
   in
@@ -839,11 +844,8 @@ let create ?max_cached_workflows ?io_threads ?runtime
   in
   let* worker_config =
     Native.worker_config ~namespace ~task_queue ~build_id ~versioning
-      ~max_cached_workflows
-      ~max_outstanding_workflow_tasks:default_max_outstanding_workflow_tasks
-      ~max_concurrent_workflow_task_polls:
-        default_max_concurrent_workflow_task_polls
-      ~graceful_shutdown_timeout_ms:default_graceful_shutdown_timeout_ms
+      ~max_cached_workflows ~max_outstanding_workflow_tasks
+      ~max_concurrent_workflow_task_polls ~graceful_shutdown_timeout_ms ?tuning
       ~workflow_tasks ~activity_tasks ()
     |> Result.map_error (public_bridge_error "worker configuration")
   in

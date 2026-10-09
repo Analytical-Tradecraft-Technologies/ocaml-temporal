@@ -71,9 +71,21 @@ type t
     validates that [io_threads] and [runtime] are not both given.
     [activation_deadline_ms] enables the non-yielding workflow
     watchdog with that positive deadline; omitting it disables the watchdog
-    (the public [Worker.Options] layer supplies the default). *)
+    (the public [Worker.Options] layer supplies the default).
+
+    [max_outstanding_workflow_tasks] (default 1000),
+    [max_concurrent_workflow_task_polls] (default 2),
+    [graceful_shutdown_timeout_ms] (default 30000) and [tuning] (default
+    all-Core-defaults) are the public worker resource options of #498. They
+    are validated by {!Temporal_sdk_kernel.Bridge.worker_config} before any
+    native resource is allocated. Activity slot counts are deliberately not
+    parameters: the bridge pins them to the serial OCaml executor (#777). *)
 val create :
   ?max_cached_workflows:int ->
+  ?max_outstanding_workflow_tasks:int ->
+  ?max_concurrent_workflow_task_polls:int ->
+  ?graceful_shutdown_timeout_ms:int64 ->
+  ?tuning:Temporal_sdk_kernel.Bridge.worker_tuning ->
   ?io_threads:int ->
   ?runtime:Temporal_sdk_kernel.Shared_runtime.t ->
   ?versioning:Temporal_sdk_kernel.Bridge.worker_versioning ->

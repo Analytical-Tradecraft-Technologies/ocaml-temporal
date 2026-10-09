@@ -486,8 +486,9 @@ module Native : sig
     target_url:string -> identity:string -> (client_config, Temporal_core_bridge.Native_bridge.error) result
 
   (** Validates explicit worker resource settings without network access.
-      [workflow_tasks] and [activity_tasks] select the task kinds Core polls;
-      see {!Temporal_core_bridge.Native_bridge.val-worker_config}. *)
+      [workflow_tasks] and [activity_tasks] select the task kinds Core polls
+      and [tuning] carries the optional Core settings of #498; see
+      {!Temporal_core_bridge.Native_bridge.val-worker_config}. *)
   val worker_config :
     namespace:string ->
     task_queue:string ->
@@ -497,6 +498,7 @@ module Native : sig
     max_outstanding_workflow_tasks:int ->
     max_concurrent_workflow_task_polls:int ->
     graceful_shutdown_timeout_ms:int64 ->
+    ?tuning:Temporal_core_bridge.Native_bridge.worker_tuning ->
     ?workflow_tasks:bool ->
     ?activity_tasks:bool ->
     unit ->

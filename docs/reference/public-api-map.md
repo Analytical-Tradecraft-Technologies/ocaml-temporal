@@ -196,6 +196,22 @@ for those rules.
   `Temporal.Worker.Options` provides typed, immutable resource and worker
   routing settings, including legacy build-ID and deployment-based versioning;
   see the [worker versioning reference](worker-versioning.md).
+  `Options.make` also takes the resource and shutdown settings of #498:
+  `?max_concurrent_workflow_tasks`, `?workflow_task_pollers`
+  (`Fixed n` or `Autoscaling { minimum; maximum; initial }`),
+  `?sticky_queue_schedule_to_start_timeout`, `?graceful_shutdown_period`,
+  `?max_heartbeat_throttle_interval`, `?default_heartbeat_throttle_interval`
+  (each a `Duration.t`), `?max_worker_activities_per_second` and
+  `?max_task_queue_activities_per_second`. Each invalid, overflowing or
+  contradictory value is a typed defect returned before anything is
+  allocated. For example, a caching worker with fewer than two workflow task
+  slots or two fixed pollers is rejected, and so is a per-worker activity
+  rate below one per day. A fixed poller count is a total that Core splits
+  between the sticky and normal queues, while autoscaling bounds apply to
+  each queue. One accessor per setting reports the
+  effective value, defaults included, and `Worker.options` returns the
+  options a worker was created with. Activity slot counts are not options:
+  the serial activity executor fixes them at one (#777).
   `Options.make ?workflow_activation_deadline` (`` `After `` a positive
   `Duration.t` up to one hour, default two seconds, or `` `Disabled ``)
   configures the non-yielding workflow watchdog, and the lock-free
