@@ -411,17 +411,23 @@ Core (in a heartbeat response):
 3. Once a cancellation is in the cell, `Context.cancellation` returns it (a
    lock-free atomic read, from any Domain) and every heartbeat returns a
    non-retryable `` `Cancelled `` error after still recording its details.
-4. The callback's result decides the outcome. `Ok` completes the attempt; an
-   `Error` in the `` `Cancelled `` category completes it as cancelled (a
-   Temporal `Canceled` failure carrying the error's detail payloads, with
-   Core's reason and flags kept as outcome metadata) only when a cancellation
-   was delivered, and is an ordinary application failure otherwise; any other
-   `Error` fails it, and an exception fails it as a defect.
-5. After the callback returns, the context is invalidated (waiting for a
-   heartbeat in flight) and only then is the running attempt cleared, so no
-   sweep can route a cancellation to an attempt whose completion is already
-   owned. A cancellation that arrives later is a stale update the Rust ledger
-   discards.
+4. When the callback returns or raises, the adapter captures its outcome
+   (and, for an exception, its backtrace) without acting on it. It then
+   invalidates the context, which waits for a heartbeat still in flight, for
+   example one sent from a Domain the callback spawned, and only then clears
+   the running attempt. From that point no sweep can write the cell, so the
+   cancellation it holds is final.
+5. Only then does the captured result decide the outcome and is the terminal
+   completion submitted. `Ok` completes the attempt; an `Error` in the
+   `` `Cancelled `` category completes it as cancelled (a Temporal `Canceled`
+   failure carrying the error's detail payloads, with Core's reason and flags
+   kept as outcome metadata) only when a cancellation was delivered, and is an
+   ordinary application failure otherwise; any other `Error` fails it, and an
+   exception fails it as a defect. Classifying before step 4 would race a
+   heartbeat that delivers the cancellation after the callback returned its
+   `` `Cancelled `` error. Because the attempt is cleared before its one
+   completion is built, a cancellation that arrives later can never become a
+   second completion; it is a stale update the Rust ledger discards.
 
 Ownership and threading: the executor Domain owns the running-attempt record
 and the deferred FIFO; the delivery mutex guards them because a callback may
@@ -457,8 +463,9 @@ shutdown for callbacks that ignore it is [#495].
 The focused tests in
 [`test_native_activity_execution.ml`](../../test/runtime/test_native_activity_execution.ml)
 cover delivery and reasons, outcome precedence, cancellation before admission
-and after completion, the shutdown flag, drain of deferred starts and deferred
-poll errors. The [`activity_cancellation`](../../test/integration/activity_cancellation/regression.ml)
+and after completion, the shutdown flag, drain of deferred starts, deferred
+poll errors, and a cancellation delivered by a cross-Domain heartbeat after the
+callback returned (forced deterministically through the fake source). The [`activity_cancellation`](../../test/integration/activity_cancellation/regression.ml)
 live regression runs a workflow-requested cancellation of a heartbeating
 activity under `Wait_cancellation_completed` (the activity observes
 `Requested` and the workflow sees a `` `Cancelled `` activity error), a

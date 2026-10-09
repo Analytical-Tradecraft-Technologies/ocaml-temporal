@@ -1324,10 +1324,17 @@ module Make (Supervisor : SUPERVISOR) = struct
     reject_task_with_failure adapter ~token ~activity_type
       ~failure:(failure_of_error error) error
 
-  (** Retires a task whose application callback raised. Must be called directly
-      from the exception handler so the captured backtrace is the callback's. *)
-  let reject_callback_exception adapter ~token ~activity_type exception_ =
-    let backtrace = Printexc.get_raw_backtrace () in
+  (** Retires a task whose application callback raised. Without [backtrace]
+      it must be called directly from the exception handler so the captured
+      backtrace is the callback's; a caller that does other work first passes
+      the backtrace it captured in the handler. *)
+  let reject_callback_exception ?backtrace adapter ~token ~activity_type
+      exception_ =
+    let backtrace =
+      match backtrace with
+      | Some backtrace -> backtrace
+      | None -> Printexc.get_raw_backtrace ()
+    in
     let backtrace =
       try Printexc.raw_backtrace_to_string backtrace with _ -> ""
     in
@@ -1539,32 +1546,42 @@ module Make (Supervisor : SUPERVISOR) = struct
                     activity_context adapter ~token ~signal
                       ~info:(task_info start) ~details ~heartbeat_timeout
                   in
-                  (* Invalidation waits for a heartbeat in flight, so once it
-                     returns no sweep can still be routing to this attempt;
-                     only then is [running] cleared. *)
-                  Fun.protect
-                    ~finally:(fun () ->
-                      Activity_context.invalidate context;
-                      with_delivery adapter (fun () -> adapter.running <- None))
-                    (fun () ->
-                      match implementation context input with
-                      | exception exception_ ->
-                          reject_callback_exception adapter ~token
+                  (* Capture the callback's outcome, then end the attempt
+                     before classifying it. Invalidation waits for a heartbeat
+                     in flight (possibly on a Domain the callback spawned), so
+                     once it returns no sweep can still be routing to this
+                     attempt; only then is [running] cleared and the
+                     cancellation cell read. Classifying earlier would race a
+                     sweep that delivers the cancellation after the callback
+                     returned its [`Cancelled] error. The exception backtrace
+                     is captured in the handler, before any other work. *)
+                  let returned =
+                    Fun.protect
+                      ~finally:(fun () ->
+                        Activity_context.invalidate context;
+                        with_delivery adapter (fun () ->
+                            adapter.running <- None))
+                      (fun () ->
+                        match implementation context input with
+                        | result -> Ok result
+                        | exception exception_ ->
+                            Error (exception_, Printexc.get_raw_backtrace ()))
+                  in
+                  (* No writer remains, so this is the final value. *)
+                  let delivered = observed_cancel adapter running in
+                  (match returned with
+                      | Error (exception_, backtrace) ->
+                          reject_callback_exception ~backtrace adapter ~token
                             ~activity_type exception_
-                      | Error implementation_error
+                      | Ok (Error implementation_error)
                         when is_cancelled_error implementation_error
-                             && Option.is_some
-                                  (observed_cancel adapter running) ->
+                             && Option.is_some delivered ->
                           (* The callback acknowledged a cancellation that
-                             Core actually requested: report it as one. The
-                             cell is written at most once, so the guard's
-                             [Some] is still present. *)
-                          let cancel =
-                            Option.get (observed_cancel adapter running)
-                          in
+                             Core actually requested: report it as one. *)
                           complete_acknowledged_cancellation adapter ~token
-                            ~activity_type cancel implementation_error
-                      | Error implementation_error ->
+                            ~activity_type (Option.get delivered)
+                            implementation_error
+                      | Ok (Error implementation_error) ->
                           let diagnostic =
                             application_error ~path:"$.implementation"
                               implementation_error
@@ -1580,7 +1597,7 @@ module Make (Supervisor : SUPERVISOR) = struct
                                 reject_task_with_failure adapter ~token
                                   ~activity_type ~failure diagnostic
                           end
-                      | Ok output ->
+                      | Ok (Ok output) ->
                           (match
                              Codec.encode (Definition.output definition) output
                            with

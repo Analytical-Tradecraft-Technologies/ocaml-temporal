@@ -44,9 +44,11 @@ and bridge, read the [documentation guide](../README.md) first.
   heartbeat delivery sweep, at most once, and read lock-free from any Domain;
   the running-attempt record and deferred-task FIFO are guarded by a separate
   delivery mutex, taken after a context's own mutex; no adapter or context
-  lock is taken while it is held. The running attempt is cleared only after its context is
-  invalidated, so a Core cancellation can never become a second completion
-  for a token whose completion is already owned (#494). See
+  lock is taken while it is held. The running attempt is cleared only after
+  its context is invalidated, and the callback's result is classified only
+  after that, so the observed cancellation is final and a Core cancellation
+  can never become a second completion for a token whose completion is
+  already owned (#494). See
   [native activities](native-activity-execution.md#cooperative-cancellation-of-a-running-callback).
 - The focused runtime regression
   [`test_eviction_allows_fresh_replay_execution`](../../test/runtime/test_native_worker_execution.ml)

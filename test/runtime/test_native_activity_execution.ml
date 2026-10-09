@@ -129,6 +129,11 @@ type fake_supervisor = {
   raise_next_completion_uncertain : bool ref;
   (* Optional source poll failure, modelling a lower-layer typed rejection. *)
   poll_error : source_error option ref;
+  (* Runs at the start of every heartbeat record, before the adapter's
+     delivery sweep. A test uses it to hold a heartbeat from another Domain
+     while the callback returns, forcing a cross-Domain interleaving
+     deterministically. *)
+  heartbeat_hook : (unit -> unit) ref;
 }
 (** Mutable fake-supervisor state. The adapter itself serializes access to all
     fields through its poll mutex; assertions inspect them only after a poll
@@ -147,6 +152,7 @@ let fake_supervisor () =
     reject_next_completion_permanently = ref false;
     raise_next_completion_uncertain = ref false;
     poll_error = ref None;
+    heartbeat_hook = ref ignore;
   }
 
 (** Copies a validated completion by traversing the same strict JSON semantic
@@ -261,6 +267,7 @@ module Fake_supervisor = struct
       dispatch tests do not retain heartbeat bodies; the lease check still
       verifies that the adapter never sends a heartbeat after completion. *)
   let record_activity_heartbeat supervisor (heartbeat : Protocol.heartbeat) =
+    !(supervisor.heartbeat_hook) ();
     if
       List.exists
         (fun token -> Bytes.equal token heartbeat.Protocol.task_token)
@@ -1792,6 +1799,84 @@ let test_sweep_poll_error_is_deferred () =
   | Error (error : Adapter.error_view) when error.code = "poll_failed" -> ()
   | _ -> failwith "a sweep poll error was not reported by the next poll"
 
+(** Regression for the review of #494: a heartbeat sent from a Domain the
+    callback spawned can still be in flight, before its delivery sweep, when
+    the callback returns its [`Cancelled] error. The adapter must end the
+    attempt (waiting for that heartbeat) before it classifies the result, so
+    the cancellation that the sweep then delivers still makes the result a
+    cancellation.
+
+    The heartbeat is held inside the source's record call until either the
+    adapter attempts a completion (which only the racy ordering can do while
+    it is held) or 200 ms pass, so the interleaving is forced both ways and
+    the assertion is deterministic. *)
+let test_late_sweep_delivery_is_classified () =
+  let supervisor = fake_supervisor () in
+  let token = Bytes.of_string "late-sweep" in
+  let in_heartbeat = Atomic.make false in
+  let gate = Atomic.make false in
+  (* Holds only the first heartbeat record, the spawned Domain's. *)
+  let hold_first_heartbeat () =
+    if not (Atomic.get in_heartbeat) then begin
+      Atomic.set in_heartbeat true;
+      while not (Atomic.get gate) do
+        Unix.sleepf 0.001
+      done
+    end
+  in
+  let heartbeater = ref None in
+  let activity =
+    Temporal.Activity.define_with_context ~name:"late_sweep"
+      ~input:Temporal.Codec.unit ~output:Temporal.Codec.unit (fun context () ->
+        supervisor.heartbeat_hook := hold_first_heartbeat;
+        heartbeater :=
+          Some
+            (Domain.spawn (fun () ->
+                 Temporal.Activity.Context.heartbeat context Temporal.Codec.int 1));
+        while not (Atomic.get in_heartbeat) do
+          Unix.sleepf 0.001
+        done;
+        (* The heartbeat is now held before its sweep can deliver. *)
+        Error
+          (Temporal.Error.make ~non_retryable:true ~category:`Cancelled
+             ~message:"stopping" ()))
+  in
+  let releaser =
+    Domain.spawn (fun () ->
+        while not (Atomic.get in_heartbeat) do
+          Unix.sleepf 0.001
+        done;
+        let deadline = Unix.gettimeofday () +. 0.2 in
+        while
+          !(supervisor.completion_attempts) = []
+          && Unix.gettimeofday () < deadline
+        do
+          Unix.sleepf 0.001
+        done;
+        Atomic.set gate true)
+  in
+  enqueue supervisor
+    (start_task ~token ~activity_type:"late_sweep"
+       ~input:[ encode_input Temporal.Codec.unit () ]);
+  enqueue supervisor
+    (cancel_task_with ~reason:Protocol.Cancellation_requested token);
+  let worker = worker supervisor [ Adapter.register activity ] in
+  let outcome = Worker.poll worker in
+  Domain.join releaser;
+  let heartbeat = Domain.join (Option.get !heartbeater) in
+  supervisor.heartbeat_hook := ignore;
+  expect_cancelled_heartbeat heartbeat;
+  begin match outcome with
+  | Ok (Adapter.Completed { kind = Adapter.Cancelled; _ }) -> ()
+  | _ ->
+      failwith
+        "a cancellation delivered after the callback returned was not \
+         classified as a cancellation"
+  end;
+  match (latest_completion supervisor).Protocol.result with
+  | Protocol.Cancelled _ -> ()
+  | _ -> failwith "a late-delivered cancellation was submitted as a failure"
+
 (** Runs every adapter assertion with a stable test-process failure. *)
 let () =
   test_successful_dispatch ();
@@ -1819,4 +1904,5 @@ let () =
   test_cancellation_after_completion ();
   test_worker_shutdown_signal ();
   test_drain_retires_deferred_starts ();
-  test_sweep_poll_error_is_deferred ()
+  test_sweep_poll_error_is_deferred ();
+  test_late_sweep_delivery_is_classified ()

@@ -161,7 +161,11 @@ module Make (Supervisor : SUPERVISOR) : sig
       taken; a deferred start whose cancellation was deferred too completes as
       cancelled without running its callback.
 
-      Outcome precedence for a running attempt: [Ok] completes it; an
+      The callback's result is classified only after its context has been
+      invalidated (which waits for a heartbeat in flight, including one from a
+      Domain the callback spawned) and the running attempt cleared, so the
+      cancellation it reads is final. Outcome precedence for a running
+      attempt: [Ok] completes it; an
       [Error] in the [`Cancelled] category completes it as cancelled only when
       a cancellation was delivered to its context, and is an ordinary failure
       otherwise; any other [Error] fails it; an exception fails it as a
