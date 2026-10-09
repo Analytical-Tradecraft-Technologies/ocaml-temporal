@@ -94,6 +94,44 @@ lets the running callback finish before native teardown, so the period only
 bounds activity tasks Core still holds afterwards. The end-to-end shutdown
 bound remains #495.
 
+## 2026-10-09: Bounded replay completions (#965)
+
+`replay_worker_accepts_one_history_document` hung intermittently on Windows CI
+until the job timeout. Running the unit tests in parallel loops on macOS
+reproduced it 3 times in about 2,500 runs, all under parallel load. In all three, the test thread was
+blocked in the final eviction acknowledgement, and Core's workflow processing
+thread had already exited.
+
+The cause is a race between Core's natural replay shutdown and that
+acknowledgement. Core's completion reply sender can be stranded in a Tokio
+channel whose receiver has dropped, and Core's `Workflows` keeps the sender
+alive. The [replay bridge reference](reference/replay-bridge.md#bounded-core-waits)
+explains the mechanism.
+
+Changes:
+
+- Replay completions, rejections, and disposal acknowledgements now await
+  Core with a bound. An empty acknowledgement still pending 250 ms after the
+  workflow lane observed Core's `ShutDown` is treated as accepted, which is
+  what Core does for an empty completion that reaches a closed stream.
+- The feeder send and the replay lane join are bounded at 60 seconds, so
+  other stalls become typed `WORKER` failures, and hence `Replay_error`. The
+  join bound wraps the whole join, so an acknowledgement inside it cannot
+  extend it.
+- After a lane join times out, the worker never reaches Core's unbounded
+  finalizer. `finalize` refuses, and the next `dispose`, or
+  `drop_runtime_graph`, deliberately leaks the Core worker with a counter and
+  one stderr line. Running the finalizer could block forever, and detaching it
+  would hang the Tokio runtime drop instead. The
+  [reference](reference/replay-bridge.md#bounded-core-waits) documents the
+  trade-off. Tests force both timeout paths with a 200 ms injected bound.
+- The test runs under a 30-second deadline that reports the blocked step.
+
+After the fix, 3,200 runs of the same loops passed with no hang. Temporary
+instrumentation recorded two stranded acknowledgements in those runs, and
+both were released by the new bound. Also verified with `cargo test --locked`,
+clippy, rustfmt, and the bridge and history-corpus dune tests.
+
 ## 2026-10-07: Shared runtime across clients and workers (#832)
 
 Following the maintainer decision on #832, several clients and workers can
