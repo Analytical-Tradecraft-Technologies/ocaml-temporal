@@ -43,6 +43,21 @@ let failing =
                ~message:(Printf.sprintf "attempt %d" (Workflow.Info.attempt info))
                ())))
 
+(** The continue-as-new target of [continuing], named by type so the
+    definition can refer to its own workflow type. *)
+let continuing_target =
+  Workflow.remote ~name:"client-policies-continuing" ~input:Codec.string
+    ~output:Codec.string
+
+(** Continues as new once from an empty input, and the successor run then
+    completes with its input, so an explicit continue-as-new can be told
+    apart from a retry or cron link (#971). *)
+let continuing =
+  Workflow.define ~name:"client-policies-continuing" ~input:Codec.string
+    ~output:Codec.string (fun input ->
+      if input = "" then Workflow.continue_as_new continuing_target "continued"
+      else Ok input)
+
 (** Answers whether the blocked workflow is still running. *)
 let alive = Query.define ~name:"alive" ~output:Codec.string
 
@@ -58,6 +73,7 @@ let worker address queue =
                ~queries:[ Query.Handler.make alive (fun () -> Ok "alive") ];
              Worker.workflow quick;
              Worker.workflow failing;
+             Worker.workflow continuing;
            ]
          ())
   in
@@ -206,23 +222,24 @@ let check_reuse_policies context =
   if Client.started attached || Client.run_id attached <> Client.run_id open_run
   then fail "use_existing with reject_duplicate did not attach to the open run"
 
+(** Retries a closed run once after half a second, so each retry check sees
+    exactly one retry run that ends the chain. *)
+let retry_policy =
+  get
+    (Activity.Retry_policy.make ~initial_interval:(ms 500L)
+       ~backoff_coefficient:1.0 ~maximum_interval:(ms 500L)
+       ~maximum_attempts:2 ())
+
 (** A workflow retry policy makes Temporal retry a failed run as a new run of
     the same workflow ID: the first run reports attempt 1 and links the
     successor, whose own failure reports attempt 2 and ends the chain. A
     current-run handle is tracked so cleanup reaches whichever run is open.
 
-    The pinned server reports a retried run's close event to this client as
-    continue-as-new rather than as a failure with a successor, presumably
-    because the client does not advertise Temporal's follows-next-run-id
-    feature, so both forms of the link are accepted here; the attempt numbers
-    still prove that the server applied the retry policy. *)
+    The exact-run wait must report the first run as [Failed] with its own
+    error and the successor, never as [Continued_as_new]: the client
+    advertises Temporal's follows-next-run-id feature, without which the
+    server rewrites the retried close event as continue-as-new (#971). *)
 let check_retry_policy context =
-  let retry_policy =
-    get
-      (Activity.Retry_policy.make ~initial_interval:(ms 500L)
-         ~backoff_coefficient:1.0 ~maximum_interval:(ms 500L)
-         ~maximum_attempts:2 ())
-  in
   let id = workflow_id context "retry" in
   let first =
     get
@@ -236,7 +253,8 @@ let check_retry_policy context =
         if not (String.starts_with ~prefix:"attempt 1 " (Error.message error)) then
           fail ("first run reported " ^ Error.message error);
         successor
-    | Ok (Client.Continued_as_new successor) -> successor
+    | Ok (Client.Continued_as_new _) ->
+        fail "retried run was reported as continue-as-new instead of Failed"
     | Ok (Client.Failed { successor = None; _ }) ->
         fail "retry policy did not start a retry run"
     | Ok _ -> fail "first run did not fail"
@@ -251,6 +269,56 @@ let check_retry_policy context =
   | Ok (Client.Failed { error; _ }) ->
       fail ("retry run reported " ^ Error.message error)
   | _ -> fail "retry run did not end the chain with a failure"
+
+(** A workflow retry policy also retries a run that hit its run timeout. The
+    exact-run wait reports the first run as [Timed_out] with the retry run as
+    its successor rather than as continue-as-new (#971), and the retry run's
+    own timeout ends the chain. *)
+let check_timeout_retry context =
+  let id = workflow_id context "timeout-retry" in
+  let first =
+    get
+      (Client.start context.client ~workflow:blocked ~retry_policy
+         ~run_timeout:(ms 1_000L) ~task_queue:context.queue ~id ~input:"" ())
+  in
+  ignore (track context (get (Client.get_handle context.client ~workflow:blocked ~id ())));
+  let successor =
+    match Client.wait first with
+    | Ok (Client.Timed_out { successor = Some successor; _ }) -> successor
+    | Ok (Client.Continued_as_new _) ->
+        fail "timed-out retried run was reported as continue-as-new"
+    | Ok (Client.Timed_out { successor = None; _ }) ->
+        fail "retry policy did not retry a timed-out run"
+    | Ok _ -> fail "first run did not time out"
+    | Error error -> fail ("waiting for the timed-out run failed: " ^ Error.message error)
+  in
+  if Some successor.Client.run_id = Client.run_id first then
+    fail "timeout retry run reused the first run";
+  let retried = get (Client.follow context.client ~workflow:blocked successor) in
+  match Client.wait retried with
+  | Ok (Client.Timed_out { successor = None; _ }) -> ()
+  | _ -> fail "timeout retry run did not end the chain with a timeout"
+
+(** An explicit continue-as-new is still reported as [Continued_as_new] with
+    the new run, unlike a retry link, and the successor run completes with
+    the input it was continued with. *)
+let check_continue_as_new context =
+  let first =
+    track context
+      (get
+         (Client.start context.client ~workflow:continuing ~task_queue:context.queue
+            ~id:(workflow_id context "continue-as-new") ~input:"" ()))
+  in
+  let successor =
+    match Client.wait first with
+    | Ok (Client.Continued_as_new successor) -> successor
+    | Ok _ -> fail "explicit continue-as-new was not reported as Continued_as_new"
+    | Error error -> fail ("waiting for the continuing run failed: " ^ Error.message error)
+  in
+  let next = track context (get (Client.follow context.client ~workflow:continuing successor)) in
+  match Client.wait next with
+  | Ok (Client.Completed { output = "continued"; successor = None }) -> ()
+  | _ -> fail "continued run did not complete with its new input"
 
 (** A start whose 1 ms deadline expires after it was sent is reported as an
     uncertain outcome: Temporal may or may not have created the run. If it
@@ -309,6 +377,8 @@ let check address cli =
       check_timeouts context ~cli address;
       check_reuse_policies context;
       check_retry_policy context;
+      check_timeout_retry context;
+      check_continue_as_new context;
       check_uncertain_start context;
       print_endline "client policies live regression: ok")
 

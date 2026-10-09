@@ -180,7 +180,10 @@ let test_public_wait_follow kind =
     (Backend.mock_set_wait_outcome_for_test backend wait_request terminal);
   let successor =
     match (kind, unwrap "wait on original run" (Client.wait original)) with
-    | "failed", Client.Failed { successor = Some successor; _ }
+    (* A retried failure keeps the error that caused the retry (#971). *)
+    | "failed", Client.Failed { successor = Some successor; error }
+      when String.starts_with ~prefix:"failed" (Temporal.Error.message error) ->
+        successor
     | "timed_out", Client.Timed_out { successor = Some successor; _ }
     | "completed", Client.Completed { successor = Some successor; _ }
     | "continued_as_new", Client.Continued_as_new successor ->
@@ -266,13 +269,15 @@ let test_current_run_wait_follows kind =
        { workflow_id; run_id = current_run.run_id }
        terminal);
   let exact = unwrap "follow current run" (Client.follow client ~workflow current_run) in
-  (match unwrap "exact wait" (Client.wait exact) with
-  | Client.Completed { successor = Some _; _ }
-  | Client.Failed { successor = Some _; _ }
-  | Client.Timed_out { successor = Some _; _ }
-  | Client.Continued_as_new _ ->
+  (* The exact wait keeps the close event's own kind: a retry or cron link
+     is never reported as continue-as-new (#971). *)
+  (match (kind, unwrap "exact wait" (Client.wait exact)) with
+  | "completed", Client.Completed { successor = Some _; _ }
+  | "failed", Client.Failed { successor = Some _; _ }
+  | "timed_out", Client.Timed_out { successor = Some _; _ }
+  | "continued_as_new", Client.Continued_as_new _ ->
       ()
-  | _ -> failwith (kind ^ " exact wait followed or lost its link"));
+  | _ -> failwith (kind ^ " exact wait followed, lost, or changed its link"));
   let by_id =
     unwrap "get current-run handle"
       (Client.get_handle client ~workflow ~id:workflow_id ())

@@ -25,10 +25,18 @@ the policies `Client.start` exposes for #499:
   After a failure, `` `Reject_duplicate `` still refuses the ID and
   `` `Allow_duplicate_failed_only `` reuses it. `` `Use_existing `` with
   `` `Reject_duplicate `` attaches to an open run.
-- A workflow retry policy retries a failing run once. The retry run reports
-  attempt 2 and ends the chain. The pinned server reports the first run's
-  link to this client as continue-as-new rather than as a failure with a
-  successor, so the test accepts both forms.
+- A workflow retry policy retries a failing run once. An exact-run wait on
+  the first run returns `Failed` with its attempt-1 error and the retry run as
+  its successor; `Continued_as_new` fails the test (#971). The retry run
+  reports attempt 2 and ends the chain.
+- The same retry policy retries a run that hit its run timeout. The first
+  run's exact-run wait returns `Timed_out` with the retry run as its
+  successor, and the retry run's own timeout ends the chain.
+- An explicit continue-as-new is still reported as `Continued_as_new`, and
+  the successor run completes with the input it was continued with.
+- Cron schedules cannot be started through this client, so a cron
+  `Completed` successor is covered by the Rust and OCaml unit tests rather
+  than here.
 - A start with a 1 ms `?rpc_timeout` is accepted, reported as uncertain
   (`Client.is_start_outcome_uncertain`) when it expired after being sent, or
   rejected with `` `Deadline_exceeded `` when it expired before being sent.

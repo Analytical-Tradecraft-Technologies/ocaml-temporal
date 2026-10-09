@@ -34,6 +34,9 @@ enum Reply {
 #[derive(Default)]
 struct Probe {
     requests: Mutex<Vec<GetWorkflowExecutionHistoryRequest>>,
+    /// `supported-features` header of each history request, in arrival order;
+    /// `None` records a request that omitted the header.
+    features: Mutex<Vec<Option<String>>>,
     cancellations: Mutex<Vec<RequestCancelWorkflowExecutionRequest>>,
     completed: AtomicUsize,
     dropped: AtomicUsize,
@@ -76,6 +79,12 @@ fn connected_runtime(reply: Reply) -> (Runtime, Arc<Probe>) {
                     });
                 }
                 assert_eq!(request.rpc, "GetWorkflowExecutionHistory");
+                probe.features.lock().unwrap().push(
+                    request
+                        .headers
+                        .get(crate::client_protocol::SUPPORTED_FEATURES_HEADER)
+                        .map(|value| value.to_str().expect("ASCII header").to_owned()),
+                );
                 let request = GetWorkflowExecutionHistoryRequest::decode(request.proto)
                     .expect("valid history request");
                 probe.requests.lock().unwrap().push(request.clone());
@@ -221,6 +230,35 @@ fn pagination_survives_multiple_owner_windows() {
         );
     }
     drop(requests);
+    assert_eq!(runtime.close(true), STATUS_OK);
+}
+
+/// Every history poll, including follow-up pages and current-run waits,
+/// advertises `follows-next-run-id` so Temporal returns the real close event
+/// instead of rewriting a retried or cron-chained run as continued-as-new
+/// (#971).
+#[test]
+fn history_polls_advertise_follows_next_run_id() {
+    let (mut runtime, probe) = connected_runtime(Reply::Paginated);
+    terminal(&mut runtime, &request("paginated-run")).expect("terminal result");
+    terminal(&mut runtime, &request("")).expect("current-run terminal result");
+    let features = probe.features.lock().unwrap();
+    assert_eq!(features.len(), 4);
+    for feature in features.iter() {
+        assert_eq!(
+            feature.as_deref(),
+            Some(crate::client_protocol::FOLLOWS_NEXT_RUN_ID_FEATURE)
+        );
+    }
+    drop(features);
+    assert_eq!(
+        crate::client_protocol::FOLLOWS_NEXT_RUN_ID_FEATURE,
+        "follows-next-run-id"
+    );
+    assert_eq!(
+        crate::client_protocol::SUPPORTED_FEATURES_HEADER,
+        "supported-features"
+    );
     assert_eq!(runtime.close(true), STATUS_OK);
 }
 
