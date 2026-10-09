@@ -1297,23 +1297,26 @@ module Make (Supervisor : SUPERVISOR) = struct
       whose earlier failure was not classified retryable is not resubmitted:
       [finish_pending] returns its recorded error, which the worker treats as a
       terminal drain failure before force-releasing the native graph. *)
+  let drain_locked adapter : (unit, error_view) result =
+    (* [min_binding_opt] gives retries a stable order. The loop stops on the
+       first error, retaining that completion and every later one; a
+       fail-closed entry stops it without any native call. *)
+    let rec loop () =
+      match Run_map.min_binding_opt adapter.pending with
+      | None -> Ok ()
+      | Some (_, pending) -> (
+          match finish_pending adapter pending with
+          | Ok _ -> loop ()
+          | Error error -> Error error)
+    in
+    loop ()
+
+  (** Takes the adapter mutex for [drain_locked]. *)
   let drain adapter : (unit, error_view) result =
     Mutex.lock adapter.mutex;
     Fun.protect
       ~finally:(fun () -> Mutex.unlock adapter.mutex)
-      (fun () ->
-        (* [min_binding_opt] gives retries a stable order. The loop stops on
-           the first error, retaining that completion and every later one;
-           a fail-closed entry stops it without any native call. *)
-        let rec loop () =
-          match Run_map.min_binding_opt adapter.pending with
-          | None -> Ok ()
-          | Some (_, pending) -> (
-              match finish_pending adapter pending with
-              | Ok _ -> loop ()
-              | Error error -> Error error)
-        in
-        loop ())
+      (fun () -> drain_locked adapter)
 
   (** Discards OCaml-owned executions and retained completion bytes after the
       native graph has been force-released by terminal worker shutdown. This
@@ -1321,17 +1324,40 @@ module Make (Supervisor : SUPERVISOR) = struct
       leases, and retrying a retained completion would risk a duplicate. Each
       execution is explicitly shut down so paused workflow continuations and
       scheduler state do not wait for a later garbage collection cycle. *)
+  let discard_locked adapter =
+    Run_map.iter
+      (fun _ (Run { execution; _ }) ->
+        (try Execution.shutdown execution with _ -> ()))
+      adapter.runs;
+    adapter.runs <- Run_map.empty;
+    adapter.pending <- Run_map.empty
+
+  (** Takes the adapter mutex for [discard_locked]. *)
   let discard adapter =
     Mutex.lock adapter.mutex;
     Fun.protect
       ~finally:(fun () -> Mutex.unlock adapter.mutex)
-      (fun () ->
-        Run_map.iter
-          (fun _ (Run { execution; _ }) ->
-            (try Execution.shutdown execution with _ -> ()))
-          adapter.runs;
-        adapter.runs <- Run_map.empty;
-        adapter.pending <- Run_map.empty)
+      (fun () -> discard_locked adapter)
+
+  (** Runs [f] with the adapter mutex only if it is free right now. The
+      workflow lane holds that mutex from poll through completion, so [None]
+      is the non-blocking signal that an activation is still in progress. *)
+  let if_idle adapter f =
+    if Mutex.try_lock adapter.mutex then
+      Some (Fun.protect ~finally:(fun () -> Mutex.unlock adapter.mutex) f)
+    else None
+
+  (** Non-blocking [drain] for bounded shutdown (#495). *)
+  let try_drain adapter = if_idle adapter (fun () -> drain_locked adapter)
+
+  (** Non-blocking [discard] for bounded shutdown (#495). *)
+  let try_discard adapter =
+    Option.is_some (if_idle adapter (fun () -> discard_locked adapter))
+
+  (** Lock-free read of the lane's in-flight slot, set from poll until the
+      completion is submitted, whether or not the watchdog has already
+      claimed the activation's lease. *)
+  let activation_in_flight adapter = Option.is_some (Atomic.get adapter.in_flight)
 
   (** Serializes one poll/execute/complete transaction. A mutex is required in
       addition to supervisor serialization because the run map and scheduler

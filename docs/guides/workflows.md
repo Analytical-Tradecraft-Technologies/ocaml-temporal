@@ -937,8 +937,10 @@ To stop a worker from a `SIGTERM` or `SIGINT` handler, call
 lock, I/O, or native call, so it is safe whichever Domain or thread the OCaml
 runtime uses to run the handler, including the thread blocked in
 `Temporal.Worker.run` in a single-Domain program. `run` then returns `Ok ()`
-once each lane finishes its current task, and the application calls
-`Temporal.Worker.shutdown` to drain and release the worker. Do not call the
+once each lane finishes its current task, or once the worker's grace period
+has elapsed for an activity callback that has not finished, and the
+application calls `Temporal.Worker.shutdown` (or `shutdown_with_report`) to
+drain and release the worker within its bound (#495). Do not call the
 blocking `shutdown` from the handler itself.
 
 ```ocaml

@@ -878,6 +878,33 @@ let _workflow_info_parent_fields
 
 let _worker_run : T.Worker.t -> (unit, T.Error.t) result = T.Worker.run
 let _worker_shutdown : T.Worker.t -> (unit, T.Error.t) result = T.Worker.shutdown
+
+(* Bounded shutdown report (#495). The record is destructured and the
+   teardown variant matched exhaustively, so a changed field or a new
+   constructor is a visible API change. *)
+let _worker_shutdown_with_report :
+    T.Worker.t -> (T.Worker.Shutdown_report.t, T.Error.t) result =
+  T.Worker.shutdown_with_report
+
+let _worker_shutdown_report_is_clean : T.Worker.Shutdown_report.t -> bool =
+  T.Worker.Shutdown_report.is_clean
+
+let _worker_shutdown_report_fields
+    ({
+       elapsed;
+       lanes_stopped;
+       abandoned_activity_callbacks;
+       abandoned_workflow_activations;
+       native_teardown;
+     } :
+      T.Worker.Shutdown_report.t) =
+  ignore (elapsed : T.Duration.t);
+  ignore (lanes_stopped : bool);
+  ignore (abandoned_activity_callbacks : int);
+  ignore (abandoned_workflow_activations : int);
+  match (native_teardown : T.Worker.Shutdown_report.teardown) with
+  | `Completed -> "completed"
+  | `Detached -> "detached"
 let _worker_request_shutdown : T.Worker.t -> unit = T.Worker.request_shutdown
 
 (* The remaining small modules still participate in the public contract. *)
@@ -1072,6 +1099,7 @@ let _worker_options_make :
     ?workflow_task_pollers:T.Worker.Options.workflow_task_pollers ->
     ?sticky_queue_schedule_to_start_timeout:T.Duration.t ->
     ?graceful_shutdown_period:T.Duration.t ->
+    ?shutdown_teardown_timeout:T.Duration.t ->
     ?max_heartbeat_throttle_interval:T.Duration.t ->
     ?default_heartbeat_throttle_interval:T.Duration.t ->
     ?max_worker_activities_per_second:float ->
@@ -1112,6 +1140,10 @@ let _worker_options_sticky_queue_schedule_to_start_timeout :
 let _worker_options_graceful_shutdown_period :
     T.Worker.Options.t -> T.Duration.t =
   T.Worker.Options.graceful_shutdown_period
+
+let _worker_options_shutdown_teardown_timeout :
+    T.Worker.Options.t -> T.Duration.t =
+  T.Worker.Options.shutdown_teardown_timeout
 
 let _worker_options_max_heartbeat_throttle_interval :
     T.Worker.Options.t -> T.Duration.t =

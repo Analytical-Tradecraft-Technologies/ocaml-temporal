@@ -23,3 +23,10 @@
    OCAMLRUNPARAM
    d=2
    (run %{test}))))
+
+; Bounded worker shutdown (#495) over a supervisor whose fake backend blocks
+; like an unreachable Temporal server.
+(test
+ (name test_bounded_shutdown)
+ (modules test_bounded_shutdown)
+ (libraries temporal_sdk_supervisor temporal_runtime threads unix))

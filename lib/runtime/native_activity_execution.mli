@@ -191,6 +191,22 @@ module Make (Supervisor : SUPERVISOR) : sig
       irreversible and must be called only after the supervisor has
       force-retired its native task-token leases; it never attempts a retry. *)
   val discard : t -> unit
+
+  (** [drain] without waiting (#495): [None] when the adapter lock is held,
+      which means a callback (or a supervisor call made for it) is still
+      running on the activity lane. Bounded shutdown uses it so an abandoned
+      callback can never block the drain. *)
+  val try_drain : t -> (unit, error_view) result option
+
+  (** [discard] without waiting: [false] when the adapter lock is held, in
+      which case nothing was discarded and the caller must retry later or
+      leave the copies to the garbage collector. *)
+  val try_discard : t -> bool
+
+  (** Whether a synchronous activity callback is executing now. It takes
+      only the short delivery lock, never the adapter lock that the callback
+      holds, so it is safe from any thread while the callback runs. *)
+  val callback_running : t -> bool
 end
 
 val register :

@@ -1752,38 +1752,41 @@ module Make (Supervisor : SUPERVISOR) = struct
       shutdown takes the terminal force-release path. Work a delivery sweep
       deferred is first recorded as completions by [retire_deferred], so a
       start the executor never dispatched does not outlive the worker. *)
+  let drain_locked adapter : (unit, error_view) result =
+    let* () = retire_deferred adapter in
+    (* Retry the smallest token first for deterministic shutdown behavior;
+       stop at the first failure and retain that lease. A fail-closed lease
+       stops the loop without any native call. *)
+    let rec loop () =
+      match Token_map.min_binding_opt adapter.leases with
+      | None -> Ok ()
+      | Some (_, lease) -> (
+          match finish_lease adapter lease with
+          | Ok _ -> loop ()
+          | Error error -> Error error)
+    in
+    match loop () with
+    | Error error -> Error error
+    | Ok () ->
+        Mutex.lock adapter.async_mutex;
+        Fun.protect
+          ~finally:(fun () -> Mutex.unlock adapter.async_mutex)
+          (fun () ->
+            if Token_map.is_empty adapter.async_leases then Ok ()
+            else
+              let error =
+                make_error ~path:"$.async_leases" ~retryable:true
+                  "outstanding_async_leases"
+                  "asynchronous activity completions remain admitted"
+              in
+              Error error)
+
+  (** Takes the adapter mutex for [drain_locked]. *)
   let drain adapter : (unit, error_view) result =
     Mutex.lock adapter.mutex;
     Fun.protect
       ~finally:(fun () -> Mutex.unlock adapter.mutex)
-      (fun () ->
-        let* () = retire_deferred adapter in
-        (* Retry the smallest token first for deterministic shutdown behavior;
-           stop at the first failure and retain that lease. A fail-closed lease
-           stops the loop without any native call. *)
-        let rec loop () =
-          match Token_map.min_binding_opt adapter.leases with
-          | None -> Ok ()
-          | Some (_, lease) -> (
-              match finish_lease adapter lease with
-              | Ok _ -> loop ()
-              | Error error -> Error error)
-        in
-        match loop () with
-        | Error error -> Error error
-        | Ok () ->
-            Mutex.lock adapter.async_mutex;
-            Fun.protect
-              ~finally:(fun () -> Mutex.unlock adapter.async_mutex)
-              (fun () ->
-                if Token_map.is_empty adapter.async_leases then Ok ()
-                else
-                  let error =
-                    make_error ~path:"$.async_leases" ~retryable:true
-                      "outstanding_async_leases"
-                      "asynchronous activity completions remain admitted"
-                  in
-                  Error error))
+      (fun () -> drain_locked adapter)
 
   (** Drops copied activity completions after terminal native cleanup. The Rust
       runtime has already force-retired its leases, so retaining or retrying
@@ -1791,34 +1794,57 @@ module Make (Supervisor : SUPERVISOR) = struct
       reserved for an unaccepted handoff or already admitted, are closed so
       retained copies stop reporting retryable errors. The mutex keeps discard
       ordered with any final adapter operation. *)
+  let discard_locked adapter =
+    (* Deferred tasks were force-retired with the rest of the native
+       graph; dispatching or completing them now would duplicate that. *)
+    with_delivery adapter (fun () -> Queue.clear adapter.deferred);
+    (* A handoff that was never accepted leaves its handle reserved in
+       [Handoff_pending]. Close it so external code retrying the
+       retryable "not active yet" error observes a terminal error instead
+       of waiting for an activation that can no longer happen. *)
+    Token_map.iter
+      (fun _ lease ->
+        match lease.accepted_result with
+        | Async_handoff handle -> ignore (Async_activity.close handle)
+        | Completed_result _ | Rejected_result _ -> ())
+      adapter.leases;
+    adapter.leases <- Token_map.empty;
+    Mutex.lock adapter.async_mutex;
+    Fun.protect
+      ~finally:(fun () -> Mutex.unlock adapter.async_mutex)
+      (fun () ->
+        Token_map.iter
+          (fun _ (Async_lease lease) ->
+            ignore (Async_activity.close lease.handle))
+          adapter.async_leases;
+        adapter.async_leases <- Token_map.empty)
+
+  (** Takes the adapter mutex for [discard_locked]. *)
   let discard adapter =
     Mutex.lock adapter.mutex;
     Fun.protect
       ~finally:(fun () -> Mutex.unlock adapter.mutex)
-      (fun () ->
-        (* Deferred tasks were force-retired with the rest of the native
-           graph; dispatching or completing them now would duplicate that. *)
-        with_delivery adapter (fun () -> Queue.clear adapter.deferred);
-        (* A handoff that was never accepted leaves its handle reserved in
-           [Handoff_pending]. Close it so external code retrying the
-           retryable "not active yet" error observes a terminal error instead
-           of waiting for an activation that can no longer happen. *)
-        Token_map.iter
-          (fun _ lease ->
-            match lease.accepted_result with
-            | Async_handoff handle -> ignore (Async_activity.close handle)
-            | Completed_result _ | Rejected_result _ -> ())
-          adapter.leases;
-        adapter.leases <- Token_map.empty;
-        Mutex.lock adapter.async_mutex;
-        Fun.protect
-          ~finally:(fun () -> Mutex.unlock adapter.async_mutex)
-          (fun () ->
-            Token_map.iter
-              (fun _ (Async_lease lease) ->
-                ignore (Async_activity.close lease.handle))
-              adapter.async_leases;
-            adapter.async_leases <- Token_map.empty))
+      (fun () -> discard_locked adapter)
+
+  (** Runs [f] with the adapter mutex only if it is free right now. A running
+      callback holds that mutex for its whole duration, so [None] is the
+      non-blocking signal that the activity lane is still occupied. *)
+  let if_idle adapter f =
+    if Mutex.try_lock adapter.mutex then
+      Some (Fun.protect ~finally:(fun () -> Mutex.unlock adapter.mutex) f)
+    else None
+
+  (** Non-blocking [drain] for bounded shutdown (#495). *)
+  let try_drain adapter = if_idle adapter (fun () -> drain_locked adapter)
+
+  (** Non-blocking [discard] for bounded shutdown (#495). *)
+  let try_discard adapter =
+    Option.is_some (if_idle adapter (fun () -> discard_locked adapter))
+
+  (** Reads the running attempt under the short delivery lock, which no
+      callback holds while it runs. *)
+  let callback_running adapter =
+    with_delivery adapter (fun () -> Option.is_some adapter.running)
 
   (** Serializes pending-completion retry, native polling, implementation
       execution, and completion submission. A retained lease blocks new tasks

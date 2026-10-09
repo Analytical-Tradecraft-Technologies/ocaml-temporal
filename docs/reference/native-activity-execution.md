@@ -294,11 +294,14 @@ If Core has already timed out an attempt, the synchronous adapter has no stale
 completion recovery. An asynchronous handle remains owned by the SDK until a
 terminal client operation is accepted or a confirmed terminal bridge failure
 closes it. Neither an uncertain heartbeat RPC outcome nor a definitive
-non-`NotFound` heartbeat rejection can retire that lease. A shutdown attempt
-that finds an admitted asynchronous lease returns a
-retryable outstanding-lease error and leaves the worker graph and handle
-usable; the caller must finish the handle and retry shutdown. Only terminal
-cleanup after a non-retryable failure closes an admitted handle.
+non-`NotFound` heartbeat rejection can retire that lease. A shutdown that
+finds an admitted asynchronous lease treats its retryable outstanding-lease
+diagnostic like any retryable retained completion: it retries the drain until
+the grace period ends, so external code can still finish the handle. If the
+lease is still admitted then, shutdown releases the native graph, closes the
+handle, and returns an `Error` (#495); Temporal then times the activity out
+under its own timeouts. Before #495 shutdown returned at once and left the
+worker open for a manual retry.
 
 ### Heartbeat-timeout retry ownership
 
@@ -456,9 +459,13 @@ handle's heartbeat does not report cancellation.
 
 `Context.is_worker_shutting_down` reads the public worker's `closed` and
 `stop_requested` flags. Because the worker waits for the running callback
-before it drains and closes Core, Core's own `WorkerShutdown` cancellation
-cannot reach a running callback; this flag is the shutdown signal. Bounding
-shutdown for callbacks that ignore it is [#495].
+(for up to the grace period) before it drains and closes Core, Core's own
+`WorkerShutdown` cancellation cannot reach a running callback; this flag is
+the shutdown signal. A callback that ignores it is abandoned when the grace
+period ends: the worker stops waiting for it, the bridge fails its task
+retryably so Temporal runs the next attempt elsewhere, and its eventual
+result is discarded ([#495]; see the bounded-shutdown section of the
+[native worker reference](native-worker-execution.md#bounded-shutdown)).
 
 The focused tests in
 [`test_native_activity_execution.ml`](../../test/runtime/test_native_activity_execution.ml)
@@ -504,23 +511,25 @@ same lease concurrently.  The mutex is an OCaml state guard; it does not hold
 the OCaml runtime lock while Rust waits.  The concrete supervisor is
 responsible for releasing that runtime lock in its C boundary.
 
-The private worker shutdown path calls the adapter's `drain` operation before
-closing native Core. It retries retained completions while holding the same
-mutex and starts teardown only after the token map is empty. The public
-worker reopens admission only when the drain failure is explicitly classified
-as `Retryable`. Generic `Connection`, `Not_ready`, and other failures are
-fail-closed because this Core revision may already have consumed the lease;
-the native graph is cleaned up rather than blindly resubmitting the same
-completion. The lease records its first non-retryable failure (including an
+The private worker shutdown path calls the adapter's non-blocking `try_drain`
+before closing native Core (#495). It takes the same mutex only if it is free:
+a callback still running holds it, and is then abandoned rather than waited
+for. A drain retries retained completions while holding the mutex. Shutdown
+repeats a drain that failed with an explicitly `Retryable` classification
+until the grace period ends, then releases the native graph regardless and
+reports the lost completion as an `Error`. Generic `Connection`,
+`Not_ready`, and other failures are fail-closed because this Core revision
+may already have consumed the lease; the native graph is cleaned up rather
+than blindly resubmitting the same completion. The lease records its first non-retryable failure (including an
 async handle admission that fails after Core accepted `WillCompleteAsync`),
 and neither a later `poll`, a second `Worker.run`, nor `drain` submits that
 completion again: each returns the recorded error without a native call
 until terminal `discard` (issue #843). An explicitly retryable failure
-preserves the exact completion and the native graph for a later attempt. An
-admitted asynchronous handle is such a case: the adapter marks the
-outstanding-lease diagnostic retryable, so normal shutdown cannot
-force-discard the handle while user code still owns its completion
-capability.
+preserves the exact completion and the native graph for a later attempt
+within the grace period. An admitted asynchronous handle is such a case: the
+adapter marks the outstanding-lease diagnostic retryable, so shutdown keeps
+the handle usable while user code may still complete it during the grace
+period, and closes it only at the deadline.
 
 ### Worker-loop retry policy
 

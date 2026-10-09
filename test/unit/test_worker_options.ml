@@ -48,6 +48,8 @@ let test_defaults () =
         (Options.sticky_queue_schedule_to_start_timeout options));
     assert (same_duration (ms 30_000L) (Options.graceful_shutdown_period options));
     assert (
+      same_duration (ms 60_000L) (Options.shutdown_teardown_timeout options));
+    assert (
       same_duration (ms 60_000L) (Options.max_heartbeat_throttle_interval options));
     assert (
       same_duration (ms 30_000L)
@@ -67,6 +69,7 @@ let test_explicit_settings () =
            (Options.Autoscaling { minimum = 2; maximum = 6; initial = 3 })
          ~sticky_queue_schedule_to_start_timeout:(ms 2_500L)
          ~graceful_shutdown_period:(ms 0L)
+         ~shutdown_teardown_timeout:(ms 0L)
          ~max_heartbeat_throttle_interval:(ms 20_000L)
          ~default_heartbeat_throttle_interval:(ms 5_000L)
          ~max_worker_activities_per_second:2.5
@@ -81,6 +84,7 @@ let test_explicit_settings () =
     same_duration (ms 2_500L)
       (Options.sticky_queue_schedule_to_start_timeout options));
   assert (same_duration (ms 0L) (Options.graceful_shutdown_period options));
+  assert (same_duration (ms 0L) (Options.shutdown_teardown_timeout options));
   assert (
     same_duration (ms 20_000L) (Options.max_heartbeat_throttle_interval options));
   assert (
@@ -147,7 +151,8 @@ let test_invalid_autoscaling () =
   expect_defect "initial must be between minimum and maximum"
     (autoscaling 2 4 5)
 
-(** Durations are bounded to one day; only the grace period may be zero. *)
+(** Durations are bounded to one day; only the two shutdown bounds may be
+    zero. *)
 let test_invalid_durations () =
   let one_day_plus = ms 86_400_001L in
   expect_defect "sticky_queue_schedule_to_start_timeout"
@@ -156,6 +161,8 @@ let test_invalid_durations () =
     (Options.make ~sticky_queue_schedule_to_start_timeout:one_day_plus ());
   expect_defect "graceful_shutdown_period"
     (Options.make ~graceful_shutdown_period:one_day_plus ());
+  expect_defect "shutdown_teardown_timeout"
+    (Options.make ~shutdown_teardown_timeout:one_day_plus ());
   expect_defect "max_heartbeat_throttle_interval"
     (Options.make ~max_heartbeat_throttle_interval:(ms 0L) ());
   expect_defect "default_heartbeat_throttle_interval"
@@ -168,6 +175,7 @@ let test_invalid_durations () =
   ignore
     (unwrap
        (Options.make ~graceful_shutdown_period:(ms 86_400_000L)
+          ~shutdown_teardown_timeout:(ms 86_400_000L)
           ~max_heartbeat_throttle_interval:(ms 1_000L)
           ~default_heartbeat_throttle_interval:(ms 1_000L) ()))
 

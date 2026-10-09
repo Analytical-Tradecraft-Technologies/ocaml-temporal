@@ -33,6 +33,12 @@ val leave : t -> unit
 (** Clears both slots after the run loop has joined its activity Domain and
     before the run mutex is released. *)
 
+val leave_run : t -> unit
+(** Clears only the workflow-lane slot. A run loop that returns without
+    joining a detached activity Domain (#495) calls this instead of [leave],
+    so the callback still running on that Domain keeps being recognized as
+    an execution thread. *)
+
 val is_execution_thread : t -> bool
 (** Returns [true] only when the calling system thread currently owns a lane,
     which is exactly the context in which a blocking lifecycle call would

@@ -15,6 +15,56 @@ implementation when a later entry documents that work as complete. The
 records the current tested source, named assertions and successful CI job for
 the Temporal acceptance controllers.
 
+## 2026-10-10: Bounded worker shutdown with outstanding work (#495)
+
+`Temporal.Worker.shutdown` now returns within the worker's grace period plus
+a new `Worker.Options` `shutdown_teardown_timeout` (default 60 s), plus
+250 ms of slack, whatever user code or the server does. The new
+`Worker.shutdown_with_report` returns a `Worker.Shutdown_report.t` with the
+elapsed time, whether both lanes stopped, the abandoned activity callbacks and
+workflow activations, and whether native teardown completed or was left
+`` `Detached `` in the background; `shutdown` is the same call without the
+report. OCaml cannot preempt a callback, so work still running when the grace
+period ends is abandoned, never awaited: `run` stops joining a stuck activity
+Domain and returns, the bridge fails the abandoned task (retryably for an
+activity) so Temporal retries it elsewhere, and the callback's late result
+reaches a closed supervisor and is discarded. A non-yielding workflow
+activation still holds the thread that called `run`; shutdown from another
+thread returns within its bound and reports it.
+
+One dedicated shutdown thread owns every step after admission: a `try_lock`
+wait for the run mutex until the shared lanes deadline, non-blocking adapter
+drains (a retryable retained completion is retried until the deadline, then
+reported lost), and the single native release. The caller only waits for its
+published outcome, at most the teardown timeout after the release began, so
+an unreachable server yields a `` `Detached `` report while that thread still
+completes the one release. Abandonment is an `Ok` report; a lost completion
+or a native release failure is an `Error` after the graph is released, and
+retired leases with nothing abandoned stay an `Error`, so no false success.
+The orchestration lives in the new private `Native_worker_shutdown` module,
+generic over injected effects. The old drain-retry admission reopening and
+its policy helpers are removed. No Rust, C or ABI change; the bridge's own 90 s
+drain and 30 s finalize bounds are unchanged.
+
+Evidence: 13 focused tests over the real lane scheduler with fake adapters
+(idle, cooperative and stuck activity callbacks, a stuck workflow activation,
+retained completions retried, exhausted and permanently failing, an
+unreachable server during release and during a drain, retired leases without
+abandonment, a raising release, a past deadline, and the unchanged join
+without detach); three supervisor tests over `Sdk_supervisor.Make` with a fake
+backend that blocks like an unreachable server, including a late operation
+rejected as `Closed`; option and mock-report unit tests; and the new
+`bounded_shutdown` live regression in `make test-temporal-live-regressions`,
+which passed repeatedly against the Compose server: an activity worker whose
+callback never heartbeats returned from shutdown after about 2.0 s (grace
+2 s, teardown 20 s) reporting one abandoned callback with teardown completed,
+its `run` had already returned, and Temporal ran attempt 2 to completion on a
+second worker. The `activity_cancellation` and `split_worker_task_types` live
+regressions also passed. Remaining limits: abandoned code keeps running (and
+holding its Domain and memory) until it returns or the process exits, so a
+process whose report shows abandoned work must be restarted; and a live
+transport fault during shutdown is not yet part of the #504 suite.
+
 ## 2026-10-09: Cooperative activity cancellation and shutdown signal (#494)
 
 A running synchronous activity can now observe cancellation and worker

@@ -410,11 +410,15 @@ module Context : sig
 
   (** Returns [true] once the worker running this attempt has begun to stop,
       because [Temporal.Worker.shutdown] or [Temporal.Worker.request_shutdown]
-      was called. The worker waits for the running callback before it drains
-      and closes, so an activity that checks this flag can stop early, for
-      example by returning a retryable error so that Temporal retries the
-      attempt on another worker. It never contacts the server, may be called from any
-      Domain, and is always [false] outside a native worker. *)
+      was called. The worker waits for the running callback only until its
+      graceful shutdown period ends (see [Temporal.Worker.Options.make]);
+      after that the callback is abandoned, its attempt is failed
+      retryably, and whatever it later returns is discarded. An activity
+      that checks this flag can therefore stop early and decide its own
+      outcome, for example by returning a retryable error so that Temporal
+      retries the attempt on another worker. It never contacts the server,
+      may be called from any Domain, and is always [false] outside a native
+      worker. *)
   val is_worker_shutting_down : t -> bool
 
   (** Returns a copied list of the last heartbeat details recorded by the

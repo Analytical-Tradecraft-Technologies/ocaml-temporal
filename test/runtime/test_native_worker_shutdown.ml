@@ -87,7 +87,7 @@ let run worker ~poll_workflow ~poll_activity =
         Owner.leave worker.owner;
         Mutex.unlock worker.run_mutex)
       (fun () ->
-        Loop.run
+        Loop.run ~detach:None
           ~closed:(fun () ->
             Atomic.get worker.closed || Atomic.get worker.stop_requested)
           ~poll_workflow
@@ -107,7 +107,10 @@ let request_shutdown worker = Atomic.set worker.stop_requested true
 (** Mirrors [Worker.shutdown] over [Native_worker.shutdown]: the execution
     thread check runs before the public mutex and posts a stop request (#830);
     an admitted caller publishes the stop flag, waits for [run_mutex], and
-    caches the terminal result. *)
+    caches the terminal result. Production waits for [run_mutex] only until
+    the grace period ends (#495); these cases always return in time, so the
+    model's plain wait keeps the lock order without modelling that bound,
+    which [test_native_worker_bounded_shutdown.ml] covers. *)
 let shutdown worker =
   if Owner.is_execution_thread worker.owner then begin
     request_shutdown worker;

@@ -167,7 +167,7 @@ links. Keep current support wording aligned with the v1 policy decision.
 | Layer | Evidence | Important limit |
 | --- | --- | --- |
 | Workflow runtime | Focused tests for typed definitions, scheduling, futures, deterministic time/randomness, conditions and scope hooks; live timer/activity/child waits | Detailed ordering and direct scope cancellation remain focused-test evidence. |
-| Activities | Remote retry/heartbeat/timeout/async paths and local activity success pass live | Parallel activity callbacks, cooperative cancellation observation, local retry/recovery and bounded shutdown remain incomplete. |
+| Activities | Remote retry/heartbeat/timeout/async paths and local activity success pass live | Parallel activity callbacks and local retry/recovery remain incomplete. Shutdown is bounded and live-tested with a non-cooperative activity (#495), but abandoned callbacks are not interrupted. |
 | Children and recovery | Live success, failure, explicit cancellation, retry and start rejection; separate controllers prove exact parent/child replay and child failure after replay | Broader policies, races and repeated recovery combinations remain unqualified. |
 | Client/interactions | Named exact-run controls, both query forms, typed updates, direct/external signals and external cancellation pass live, including completed-target signal rejection | Reset/visibility, suspended updates, deadlines and interaction replay/eviction need additional live cases. |
 | Patching and versioning | Live patch-in/deprecation/removal histories; focused legacy/deployment routing support | Dedicated live routing, rollout and arbitrary-history compatibility remain open. |

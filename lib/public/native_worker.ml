@@ -17,6 +17,7 @@ module Worker_policy = Temporal_sdk_kernel.Native_worker_policy
 module Owner = Temporal_sdk_kernel.Native_worker_owner
 module Observer = Temporal_sdk_kernel.Native_worker_observer
 module Watchdog = Temporal_sdk_kernel.Native_worker_watchdog
+module Bounded_shutdown = Temporal_sdk_kernel.Native_worker_shutdown
 
 (** Result-bind notation keeps expected startup and lifecycle failures typed. *)
 let ( let* ) = Result.bind
@@ -307,6 +308,11 @@ let default_max_outstanding_workflow_tasks = 1_000
    caching is enabled; the bridge validates the same invariant on both sides. *)
 let default_max_concurrent_workflow_task_polls = 2
 let default_graceful_shutdown_timeout_ms = 30_000L
+
+(* How long [shutdown] waits for the native release after the grace period
+   (#495). It covers a normal teardown, including one server long poll, while
+   the bridge's own fixed bounds still end a pathological one later. *)
+let default_shutdown_teardown_timeout_ms = 60_000L
 let supervisor_capacity = 32
 
 type t = {
@@ -349,6 +355,26 @@ type t = {
   activation_deadline_ms : int option;
       (** Deadline for one workflow activation to return to the adapter, or
           [None] when the non-yielding-code watchdog is disabled (#493). *)
+  graceful_shutdown_s : float;
+      (** Seconds a stopping lane may keep running user code before shutdown
+          abandons it (#495); the same period Core receives. *)
+  teardown_timeout_s : float;
+      (** Seconds [shutdown] waits for the native release after the grace
+          period before reporting it detached (#495). *)
+  lanes_deadline : float option Atomic.t;
+      (** The absolute time, on [Unix.gettimeofday], by which every lane must
+          have returned once a stop was observed. Published once, by
+          whichever of [shutdown] and a stopping [run] computes it first, so
+          both use the same deadline. *)
+  activity_detached : bool Atomic.t;
+      (** Set when a [run] returned without joining its activity Domain
+          because a callback outlived [lanes_deadline]. That callback still
+          holds the activity adapter's lock. *)
+  discard_pending : bool Atomic.t;
+      (** Set when the native release could not discard an adapter's copied
+          state because abandoned code still held its lock. A later [run]
+          exit, the first point at which the workflow lane is known to be
+          idle, retries the discard. *)
 }
 (** Native worker lifecycle state. The [closed] and [stop_requested] atomics
     are the only state observed by the polling lanes from [shutdown] and
@@ -508,11 +534,49 @@ let start_watchdog worker =
                  ^ bounded_message message)
                ()))
 
+(** Returns the shared lanes deadline, publishing [now + grace period] if no
+    caller has published one yet. The compare-and-set makes the first writer
+    win, so [shutdown] and a stopping [run] agree on one deadline. *)
+let lanes_deadline worker =
+  match Atomic.get worker.lanes_deadline with
+  | Some deadline -> deadline
+  | None ->
+      let deadline = Unix.gettimeofday () +. worker.graceful_shutdown_s in
+      if Atomic.compare_and_set worker.lanes_deadline None (Some deadline) then
+        deadline
+      else
+        Option.value (Atomic.get worker.lanes_deadline) ~default:deadline
+
+(** Bounds the run loop's join of its activity Domain (#495). After a stop,
+    the deadline is the shared lanes deadline. After a lane failure without a
+    stop, a private deadline one grace period away is used and not
+    published, so it cannot shorten the grace period of a later shutdown. *)
+let activity_detach worker =
+  {
+    Worker_loop.now = Unix.gettimeofday;
+    deadline =
+      (fun () ->
+        if stop_observed worker then lanes_deadline worker
+        else Unix.gettimeofday () +. worker.graceful_shutdown_s);
+    on_detached =
+      (fun () ->
+        Atomic.set worker.activity_detached true;
+        report Logs.Warning ~operation:"activity_lane_detached" ());
+  }
+
+(** Discards both adapters' copied state if neither lock is held. Returns
+    [true] when both were discarded. Never waits, so it is safe while an
+    abandoned callback or activation still holds an adapter lock. *)
+let try_discard_adapters worker =
+  let workflow_discarded = Workflow.try_discard worker.workflows in
+  let activity_discarded = Activity.try_discard worker.activities in
+  workflow_discarded && activity_discarded
+
 (** Runs both lanes through the generic loop and converts an escaped lane
     exception into a defect result. *)
 let run_lanes worker =
   try
-    Worker_loop.run
+    Worker_loop.run ~detach:(Some (activity_detach worker))
       ~closed:(fun () -> stop_observed worker)
       ~poll_workflow:(fun () -> poll_workflow worker)
       ~poll_activity:(fun () ->
@@ -527,7 +591,9 @@ let run_lanes worker =
 (** Runs workflow execution on this Domain and capacity-one activity execution
     on a dedicated Domain. Both adapters continue to use the same serialized
     supervisor mailbox. [run_mutex] remains held until the activity Domain is
-    joined, so later shutdown can drain and release the graph safely. When
+    joined, so later shutdown can drain and release the graph safely, unless
+    a callback outlives the lanes deadline after a stop: the Domain is then
+    detached (#495) and shutdown treats the activity adapter as busy. When
     enabled, a watchdog Domain observes the workflow lane for the duration of
     the run and is joined before [run_mutex] is released. A configured
     watchdog that cannot start fails the run rather than silently running
@@ -545,7 +611,14 @@ let run worker =
       Owner.enter_run worker.owner;
       Fun.protect
         ~finally:(fun () ->
-          Owner.leave worker.owner;
+          (* A detached activity Domain is still an execution thread. *)
+          if Atomic.get worker.activity_detached then Owner.leave_run worker.owner
+          else Owner.leave worker.owner;
+          (* The workflow lane has returned, so a discard the native release
+             had to skip can now proceed for it (and for the activity
+             adapter too, unless its callback is still detached). *)
+          if Atomic.get worker.discard_pending && try_discard_adapters worker
+          then Atomic.set worker.discard_pending false;
           Mutex.unlock worker.run_mutex)
         (fun () ->
           report Logs.Info ~operation:"worker_run_started" ();
@@ -583,9 +656,10 @@ let terminal_cleanup_once worker =
           ~error_kind ());
     (* The result, including [Error], proves the native graph has reached the
        force-release boundary. Only now may copied completions and paused
-       workflow continuations be discarded. *)
-    Workflow.discard worker.workflows;
-    Activity.discard worker.activities;
+       workflow continuations be discarded; an adapter still held by
+       abandoned code is left to the next [run] exit. *)
+    if not (try_discard_adapters worker) then
+      Atomic.set worker.discard_pending true;
     Atomic.set worker.terminal_cleanup_pending false;
     true
   with _ ->
@@ -611,161 +685,187 @@ let schedule_terminal_cleanup worker =
     | _thread -> ()
     | exception _ -> Atomic.set worker.terminal_cleanup_scheduled false
 
-(** Stops polling first, then waits for the loop mutex so no adapter-held lease
-    remains when native worker shutdown begins. Adapter completion maps are
-    drained while that mutex is held; native teardown is started only after both
-    maps prove empty. If a drain fails, the graph remains usable and the caller
-    can retry only when the activity adapter explicitly proved that the exact
-    pending completion is still safe to submit. Other failures mark the public
-    worker terminal and immediately force-release the native graph; this
-    preserves the original adapter error without retaining Tokio/Core resources
-    behind a worker value that can no longer be retried. An execution-thread
-    admission defect is the exception: no teardown has started, so it remains
-    retryable for a later call from any other thread. That call also posts a
-    stop request so the loop returns and the same thread, or any other, can
-    then complete shutdown (#830). *)
+(** Releases the native graph on the bounded-shutdown thread and classifies
+    the result for {!Bounded_shutdown.run}. [Native.shutdown] always asks the
+    supervisor to run [runtime_close], and the bridge invalidates the runtime
+    pointer on both [Ok] and [Error] (Core force-retires every lease,
+    including one still held by an abandoned callback or activation).
+    Discarding after either result shuts down every remaining scheduler and
+    continuation deterministically; an adapter whose lock abandoned code
+    still holds is skipped and recorded in [discard_pending]. Only an
+    exception leaves the release outcome unproven: the adapters are then
+    retained and the detached terminal-cleanup path becomes responsible for
+    the retry. *)
+let release_native worker =
+  match Native.shutdown worker.supervisor with
+  | exception exception_ ->
+      Atomic.set worker.terminal_cleanup_pending true;
+      report Logs.Error ~operation:"worker_shutdown_failed"
+        ~error_kind:"exception" ();
+      schedule_terminal_cleanup worker;
+      raise exception_
+  | result -> (
+      if not (try_discard_adapters worker) then
+        Atomic.set worker.discard_pending true;
+      match result with
+      | Ok () -> Bounded_shutdown.Released
+      | Error
+          (Native.Backend { Bridge.status = Bridge.Outstanding_tasks; _ } as
+           error) ->
+          Bounded_shutdown.Released_retiring_leases
+            (public_native_error "worker shutdown" error)
+      | Error error ->
+          let error_kind, _ = native_error_view error in
+          report Logs.Error ~operation:"worker_shutdown_failed" ~error_kind ();
+          Bounded_shutdown.Release_failed
+            (public_native_error "worker shutdown" error))
+
+(** Maps a non-blocking workflow drain. A workflow drain failure is never
+    retried at shutdown: the adapter only resubmits a completion whose own
+    failure was classified retryable, and reports anything else unchanged. *)
+let drain_workflow worker () =
+  match Workflow.try_drain worker.workflows with
+  | None -> Bounded_shutdown.Busy
+  | Some (Ok ()) -> Bounded_shutdown.Drained
+  | Some (Error error) ->
+      Bounded_shutdown.Drain_failed
+        {
+          error = public_adapter_error "workflow completion drain" error;
+          retryable = false;
+        }
+
+(** Maps a non-blocking activity drain, keeping the adapter's own
+    retryability classification for the exact retained completion. *)
+let drain_activity worker () =
+  match Activity.try_drain worker.activities with
+  | None -> Bounded_shutdown.Busy
+  | Some (Ok ()) -> Bounded_shutdown.Drained
+  | Some (Error ({ retryable; _ } as error)) ->
+      Bounded_shutdown.Drain_failed
+        {
+          error = public_activity_error "activity completion drain" error;
+          retryable;
+        }
+
+(** The worker's effects for {!Bounded_shutdown.run}. The lifecycle lock is
+    [run_mutex], taken and released by the shutdown thread. The probes read
+    atomics or the activity adapter's short delivery lock only. *)
+let shutdown_operations worker =
+  {
+    Bounded_shutdown.try_acquire_lanes =
+      (fun () -> Mutex.try_lock worker.run_mutex);
+    release_lanes = (fun () -> Mutex.unlock worker.run_mutex);
+    activity_lane_detached = (fun () -> Atomic.get worker.activity_detached);
+    activity_callback_running =
+      (fun () -> Activity.callback_running worker.activities);
+    workflow_activation_in_flight =
+      (fun () -> Workflow.activation_in_flight worker.workflows);
+    drain_workflow = drain_workflow worker;
+    drain_activity = drain_activity worker;
+    release = (fun () -> release_native worker);
+    exception_error =
+      (fun _exception ->
+        Base_error.defect ~message:"worker completion drain raised");
+  }
+
+(** The report for a call that found shutdown already admitted elsewhere.
+    The public wrapper caches the admitted call's own report, so only a
+    racing finalizer-scheduled cleanup can observe this value. *)
+let already_shut_down =
+  {
+    Bounded_shutdown.elapsed_s = 0.;
+    lanes_stopped = true;
+    abandoned_activity_callbacks = 0;
+    abandoned_workflow_activations = 0;
+    teardown = Bounded_shutdown.Completed;
+  }
+
+(** Logs what a bounded shutdown left behind. No identifier is included:
+    the abandonment kind and the teardown state are the whole diagnostic. *)
+let report_shutdown (shutdown_report : Bounded_shutdown.report) =
+  if not shutdown_report.lanes_stopped then
+    report Logs.Warning ~operation:"worker_shutdown_abandoned_work"
+      ~error_kind:
+        (if shutdown_report.abandoned_activity_callbacks > 0 then
+           "activity_callback"
+         else if shutdown_report.abandoned_workflow_activations > 0 then
+           "workflow_activation"
+         else "native_call")
+      ();
+  match shutdown_report.teardown with
+  | Bounded_shutdown.Completed ->
+      report Logs.Info ~operation:"worker_shutdown" ()
+  | Bounded_shutdown.Detached ->
+      report Logs.Warning ~operation:"worker_shutdown_teardown_detached" ()
+
+(** Closes admission, then runs the bounded shutdown sequence (#495): wait
+    until the lanes deadline for the run loop to stop, drain retained
+    completions, and release the native graph, all on one dedicated thread
+    that owns those steps, while this caller waits at most the teardown
+    timeout for the release. The caller therefore returns within the grace
+    period plus the teardown timeout (plus a fraction of a second) whatever
+    user code or the server does; see {!Bounded_shutdown} for the ownership
+    rules and the outcome classification.
+
+    Every admitted call is terminal: the graph is released, or its release is
+    owned by the shutdown thread or the detached terminal-cleanup path. An
+    execution-thread admission defect is the exception: no teardown has
+    started, so it remains retryable for a later call from any other thread.
+    That call also posts a stop request so the loop returns and the same
+    thread, or any other, can then complete shutdown (#830). *)
 let shutdown worker =
   if is_execution_thread worker then begin
-      (* A call from a lane's own thread cannot wait for [run_mutex] without
-         deadlocking the loop that is making the call. Leave the private graph
-         open and mark this admission failure retryable: the public wrapper
-         reopens its admission flag, and a later call from any other thread
-         (on this or another Domain) can perform the ordinary
-         drain-then-native-shutdown path once the active loop exits.
+    (* A call from a lane's own thread cannot wait for its own loop. Leave the
+       private graph open and mark this admission failure retryable: the
+       public wrapper reopens its admission flag, and a later call from any
+       other thread (on this or another Domain) can perform the ordinary
+       bounded shutdown once the active loop exits.
 
-         Critically, this branch must NOT write [worker.closed]. It never set
-         [closed] to [true] (it returns before the gate below), so any write
-         could only undo a [true] published by a concurrent [shutdown] on
-         another thread -- clearing the stop request and stranding the loop,
-         which then holds [run_mutex] forever and deadlocks that caller. The
-         policy fixes the action to [Leave_unchanged] for exactly this reason.
-         The separate [stop_requested] flag is only ever set to [true], so
-         posting it here cannot undo another caller's request (#830). *)
-      request_stop worker;
-      let closed_action, shutdown_retryable =
-        Worker_policy.reentrant_same_domain_shutdown
-      in
-      (match closed_action with
-      | Worker_policy.Leave_unchanged -> ()
-      | Worker_policy.Write value -> Atomic.set worker.closed value);
-      Atomic.set worker.shutdown_retryable shutdown_retryable;
-      Error
-        (Base_error.defect
-           ~message:
-             "cannot shut down a worker from inside its own run loop thread; \
-              a stop was requested instead, so call shutdown again after run \
-              returns")
+       Critically, this branch must NOT write [worker.closed]. It never set
+       [closed] to [true] (it returns before the gate below), so any write
+       could only undo a [true] published by a concurrent [shutdown] on
+       another thread -- clearing the stop request and stranding the loop.
+       The policy fixes the action to [Leave_unchanged] for exactly this
+       reason. The separate [stop_requested] flag is only ever set to [true],
+       so posting it here cannot undo another caller's request (#830). *)
+    request_stop worker;
+    let closed_action, shutdown_retryable =
+      Worker_policy.reentrant_same_domain_shutdown
+    in
+    (match closed_action with
+    | Worker_policy.Leave_unchanged -> ()
+    | Worker_policy.Write value -> Atomic.set worker.closed value);
+    Atomic.set worker.shutdown_retryable shutdown_retryable;
+    Error
+      (Base_error.defect
+         ~message:
+           "cannot shut down a worker from inside its own run loop thread; a \
+            stop was requested instead, so call shutdown again after run \
+            returns")
   end
-  else
-      if Atomic.compare_and_set worker.closed false true then begin
-        Mutex.lock worker.run_mutex;
-        let drained =
-          Fun.protect
-            ~finally:(fun () -> Mutex.unlock worker.run_mutex)
-            (fun () ->
-              match Workflow.drain worker.workflows with
-              | Error error ->
-                  Error
-                    ( Worker_policy.Workflow_drain,
-                      public_adapter_error "workflow completion drain" error )
-              | Ok () -> (
-                  match Activity.drain worker.activities with
-                  | Ok () -> Ok ()
-                  | Error ({ retryable; _ } as error) ->
-                      Error
-                        ( Worker_policy.Activity_drain retryable,
-                          public_activity_error "activity completion drain"
-                            error )))
-        in
-        match drained with
-        | Error (failure_kind, error) ->
-            (* The native graph has not been touched. Reopen admission only when
-           the activity adapter proved that the retained completion is safe to
-           retry. A workflow drain or permanent activity error cannot be
-           retried safely, so close public admission and dispose the native
-           graph immediately. [Native.shutdown] force-completes any leases
-           still held by Core before dropping Tokio and the runtime; the
-           adapter's original error remains the result returned to the caller. *)
-            let retryable = Worker_policy.shutdown_retryable failure_kind in
-            Atomic.set worker.shutdown_retryable retryable;
-            Atomic.set worker.closed (not retryable);
-            if Worker_policy.needs_native_cleanup failure_kind then begin
-              Atomic.set worker.terminal_cleanup_pending true;
-              let report_cleanup_error native_error =
-                let error_kind, _ = native_error_view native_error in
-                report Logs.Error ~operation:"worker_terminal_cleanup_failed"
-                  ~error_kind ()
-              in
-              let report_cleanup_exception _exception =
-                report Logs.Error ~operation:"worker_terminal_cleanup_failed"
-                  ~error_kind:"exception" ()
-              in
-              let cleanup_returned, _original_error =
-                Worker_policy.retain_original_error
-                  ~cleanup:(fun () -> Native.shutdown worker.supervisor)
-                  ~on_cleanup_error:report_cleanup_error
-                  ~on_cleanup_exception:report_cleanup_exception error
-              in
-              if cleanup_returned then begin
-                (* Native shutdown has force-retired every Core lease before these
-               adapter maps are cleared. Keeping this ordering means a copied
-               completion is never silently discarded while Rust still expects
-               its acknowledgement. Both adapter mutexes are acquired only
-               after [run_mutex] was released above, so no run can race this
-               terminal disposal. *)
-                Workflow.discard worker.workflows;
-                Activity.discard worker.activities;
-                Atomic.set worker.terminal_cleanup_pending false
-              end
-              else
-                (* An exception means the supervisor contract did not return its
-               release result. Keep every adapter lease and arrange a detached
-               retry; the worker remains closed to new polling, but cleanup is
-               still live rather than being hidden behind [closed]. *)
-                schedule_terminal_cleanup worker
-            end;
-            Error error
-        | Ok () -> (
-            Atomic.set worker.shutdown_retryable false;
-            try
-              let native_result = Native.shutdown worker.supervisor in
-              (* [Native.shutdown] always asks the supervisor to run
-              [runtime_close], and the bridge invalidates the runtime pointer
-              on both [Ok] and [Error] (Core force-retires every lease even
-              when it reports an outstanding-task diagnostic). That includes
-              any execution still blocked awaiting an activity or timer, which
-              lives in [adapter.runs], not [adapter.pending], so the earlier
-              drain above never touched it. Discarding here -- on either
-              result -- shuts down every remaining scheduler and one-shot
-              continuation deterministically instead of leaving them for a
-              later GC cycle, matching [terminal_cleanup_once] below. Only the
-              exception path leaves the release outcome unproven and must keep
-              the adapters retained. *)
-              Workflow.discard worker.workflows;
-              Activity.discard worker.activities;
-              match native_result with
-              | Ok () as result ->
-                  report Logs.Info ~operation:"worker_shutdown" ();
-                  result
-              | Error error ->
-                  Error (public_native_error "worker shutdown" error)
-            with _ ->
-              (* [Native.shutdown] normally contains owner-domain and bridge
-              failures in its typed result. If an unexpected mailbox or
-              mutex exception escapes before that result is returned, retain
-              the already-drained adapters and make the same detached native
-              cleanup path responsible for the retry. *)
-              Atomic.set worker.terminal_cleanup_pending true;
-              report Logs.Error ~operation:"worker_shutdown_failed"
-                ~error_kind:"exception" ();
-              schedule_terminal_cleanup worker;
-              Error
-                (Base_error.defect
-                   ~message:
-                     "native worker shutdown raised before releasing the \
-                      runtime; a cleanup retry was scheduled"))
-      end
-      else Ok ()
+  else if Atomic.compare_and_set worker.closed false true then begin
+    Atomic.set worker.shutdown_retryable false;
+    let outcome =
+      Bounded_shutdown.run ~lanes_deadline:(lanes_deadline worker)
+        ~teardown_timeout_s:worker.teardown_timeout_s
+        (shutdown_operations worker)
+    in
+    match outcome with
+    | Bounded_shutdown.Shut_down shutdown_report ->
+        report_shutdown shutdown_report;
+        Ok shutdown_report
+    | Bounded_shutdown.Completion_lost { error; report = shutdown_report }
+    | Bounded_shutdown.Release_error { error; report = shutdown_report } ->
+        report_shutdown shutdown_report;
+        Error error
+    | Bounded_shutdown.Release_unproven _ ->
+        Error
+          (Base_error.defect
+             ~message:
+               "native worker shutdown raised before releasing the runtime; a \
+                cleanup retry was scheduled")
+  end
+  else Ok already_shut_down
 
 (** Schedules forgotten-worker cleanup off the GC finalizer thread. A finalizer
     must not block on [run_mutex] or the supervisor mailbox; the detached thread
@@ -811,6 +911,7 @@ let create ?max_cached_workflows
     ?(max_concurrent_workflow_task_polls =
       default_max_concurrent_workflow_task_polls)
     ?(graceful_shutdown_timeout_ms = default_graceful_shutdown_timeout_ms)
+    ?(shutdown_teardown_timeout_ms = default_shutdown_teardown_timeout_ms)
     ?tuning ?io_threads ?runtime ?(versioning = Bridge.No_versioning)
     ?activation_deadline_ms ~target_url ~namespace ~identity ~task_queue
     ~workflows ~activities () =
@@ -913,6 +1014,13 @@ let create ?max_cached_workflows
         run_mutex = Mutex.create ();
         owner = Owner.create ();
         activation_deadline_ms;
+        graceful_shutdown_s =
+          Int64.to_float graceful_shutdown_timeout_ms /. 1_000.;
+        teardown_timeout_s =
+          Int64.to_float shutdown_teardown_timeout_ms /. 1_000.;
+        lanes_deadline = Atomic.make None;
+        activity_detached = Atomic.make false;
+        discard_pending = Atomic.make false;
       }
   in
   match setup with

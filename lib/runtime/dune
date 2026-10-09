@@ -5,4 +5,5 @@
   temporal_base
   temporal_core_bridge
   temporal_protocol
-  threads))
+  threads
+  unix))

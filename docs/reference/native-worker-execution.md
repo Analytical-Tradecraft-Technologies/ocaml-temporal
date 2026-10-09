@@ -314,10 +314,31 @@ execution thread is rejected before the public shutdown mutex is acquired;
 otherwise a callback could deadlock against a concurrent shutdown waiting for
 its lane to return (#764). Admitted callers are serialized by that mutex and
 return the first caller's cached terminal result. Repeated successful shutdown
-calls are idempotent. A
-callback that never returns still makes the join and shutdown unbounded; the
-overall deadline and escalation policy are tracked in
-[#495](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/495).
+calls are idempotent.
+
+### Bounded shutdown
+
+Shutdown completes within the worker's grace period plus its teardown timeout
+(plus 250 ms of lanes slack) whatever user code or the server does
+([#495](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/495)).
+OCaml cannot preempt a callback, so the bound comes from never waiting on one
+past the grace period; the exact ownership rules are in the
+[runtime invariants](runtime-invariants.md).
+
+| Outstanding work at the grace deadline | What shutdown does | Report |
+| --- | --- | --- |
+| Activity callback that ignores cancellation and never heartbeats | `run` stops joining the activity Domain and returns; the callback keeps running there. The bridge fails its task retryably, so Temporal schedules the next attempt, normally on another worker. Its eventual result reaches a closed supervisor and is discarded. | `lanes_stopped = false`, `abandoned_activity_callbacks = 1` |
+| Non-yielding workflow activation | `run` cannot return (the activation runs on its thread). The watchdog has normally already failed the task; otherwise the bridge fails it at release. | `lanes_stopped = false`, `abandoned_workflow_activations = 1` |
+| A lane blocked in a native call on behalf of user code (for example a completion to an unreachable server) | Shutdown stops waiting for that lane. | `lanes_stopped = false`, both counts zero |
+| A retained completion that keeps failing retryably | Retried with the exact same bytes until the grace deadline, then the graph is released anyway. | `Error`: the completion was lost |
+| Native teardown that cannot finish (unreachable server) | The caller stops waiting after the teardown timeout; the shutdown thread still owns and finishes the one release within the bridge's own Core bounds. | `native_teardown = Detached` |
+
+`run` and `shutdown` share one lanes deadline. Whichever first computes it
+after a stop publishes it with a compare-and-set, so a `request_shutdown`
+followed by `run` returning and then `shutdown` grants one grace period, not
+two. A process supervisor should restart a process whose report shows
+abandoned work, because that code is still running and still holds the
+OCaml values it uses.
 
 ## Non-yielding workflow watchdog
 
@@ -371,9 +392,10 @@ the worker. OCaml offers no safe way to interrupt that code, so the policy
   `temporal.duration_ms`; no payload or failure text is logged.
 - **Limits.** While the code is stuck, workflow tasks that Core has already
   received for this worker are not processed; they wait for the workflow-task
-  timeout and are then retried elsewhere. `shutdown` waits for the run mutex and
-  cannot complete while the lane is stuck (#495), so the process must be
-  terminated. If the stuck code blocks inside C without releasing the
+  timeout and are then retried elsewhere. `run` cannot return while the lane
+  is stuck. `shutdown` from another thread still returns within its bound and
+  reports the activation as abandoned (#495), but the stuck code keeps running,
+  so the process must be terminated. If the stuck code blocks inside C without releasing the
   runtime lock, other Domains, including the watchdog and the supervisor, can
   stall at the next stop-the-world collection; only an external liveness
   probe driven by a heartbeat detects that case.

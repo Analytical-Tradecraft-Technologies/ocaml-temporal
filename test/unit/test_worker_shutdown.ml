@@ -127,8 +127,37 @@ let test_signal_handler_request_stops_run () =
         assert (Result.is_ok (Temporal.Worker.shutdown worker));
         assert (Result.is_error (Temporal.Worker.run worker))))
 
+(** The mock backend abandons nothing (#495): its report is clean, and a
+    repeated call returns the same cached report through either entry
+    point. *)
+let test_mock_report_is_clean () =
+  with_watchdog "mock shutdown report" (fun () ->
+    let worker =
+      unwrap
+        (Temporal.Worker.create ~target_url:"mock://shutdown-report"
+           ~namespace:"unit-test" ~task_queue:"unit-test" ~workflows:[]
+           ~activities:[] ())
+    in
+    let report = unwrap (Temporal.Worker.shutdown_with_report worker) in
+    assert (Temporal.Worker.Shutdown_report.is_clean report);
+    assert (report.lanes_stopped);
+    assert (report.abandoned_activity_callbacks = 0);
+    assert (report.abandoned_workflow_activations = 0);
+    assert (report.native_teardown = `Completed);
+    assert (Temporal.Worker.shutdown_with_report worker = Ok report);
+    assert (Temporal.Worker.shutdown worker = Ok ());
+    assert (
+      not
+        (Temporal.Worker.Shutdown_report.is_clean
+           { report with abandoned_activity_callbacks = 1 }));
+    assert (
+      not
+        (Temporal.Worker.Shutdown_report.is_clean
+           { report with native_teardown = `Detached })))
+
 (** Repeats the race to exercise different interleavings. *)
 let () =
+  test_mock_report_is_clean ();
   for _ = 1 to 50 do
     test_concurrent_shutdowns_agree ()
   done;

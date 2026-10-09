@@ -11,6 +11,7 @@
   test_native_worker_policy
   test_native_worker_lifecycle
   test_native_worker_shutdown
+  test_native_worker_bounded_shutdown
   test_native_worker_execution
   test_native_worker_watchdog
   test_signal_policy

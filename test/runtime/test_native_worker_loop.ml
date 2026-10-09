@@ -72,7 +72,7 @@ let test_blocked_activity_does_not_block_workflow_or_overadmit () =
   in
   let runner =
     Domain.spawn (fun () ->
-        Loop.run ~closed:(fun () -> Atomic.get closed) ~poll_workflow
+        Loop.run ~detach:None ~closed:(fun () -> Atomic.get closed) ~poll_workflow
           ~poll_activity ~wait_for_lane
           ~retry_pending:(fun ~workflow_lane:_ ->
             failwith "queued activities entered completion retry"))
@@ -115,7 +115,7 @@ let test_busy_workflow_keeps_idle_activity_off_owner () =
   let activity_native_waits = Atomic.make 0 in
   let runner =
     Domain.spawn (fun () ->
-      Loop.run ~closed:(fun () -> Atomic.get closed)
+      Loop.run ~detach:None ~closed:(fun () -> Atomic.get closed)
         ~poll_workflow:(fun () ->
           Atomic.set workflow_entered true;
           await "workflow release" (fun () -> Atomic.get release_workflow);
@@ -165,7 +165,7 @@ let test_staggered_idle_polls_eventually_enter_native_wait () =
   let activity_native_wait = Atomic.make false in
   let runner =
     Domain.spawn (fun () ->
-      Loop.run ~closed:(fun () -> Atomic.get closed)
+      Loop.run ~detach:None ~closed:(fun () -> Atomic.get closed)
         ~poll_workflow:(fun () ->
           match Atomic.fetch_and_add workflow_polls 1 with
           | 0 ->
@@ -243,7 +243,7 @@ let test_idle_native_waits_share_one_token () =
   let active_waits = Atomic.make 0 in
   let runner =
     Domain.spawn (fun () ->
-      Loop.run ~closed:(fun () -> Atomic.get closed)
+      Loop.run ~detach:None ~closed:(fun () -> Atomic.get closed)
         ~poll_workflow:(fun () ->
           Atomic.set workflow_polled true;
           idle_workflow ())
@@ -306,7 +306,7 @@ let test_transient_completion_retries_and_progresses () =
     | _ -> failwith "activity lane polled after fixture completion"
   in
   begin match
-    Loop.run ~closed:(fun () -> Atomic.get closed)
+    Loop.run ~detach:None ~closed:(fun () -> Atomic.get closed)
       ~poll_workflow:idle_workflow ~poll_activity
       ~wait_for_lane:(fun ~workflow_lane ~native_wait:_ ->
         if not workflow_lane then
@@ -336,7 +336,7 @@ let test_permanent_activity_error_stops_sibling_without_shutdown () =
   let activity_polls = Atomic.make 0 in
   let error = { code = "protocol"; retryable = false } in
   begin match
-    Loop.run ~closed:(fun () -> Atomic.get closed)
+    Loop.run ~detach:None ~closed:(fun () -> Atomic.get closed)
       ~poll_workflow:(fun () ->
         Atomic.set workflow_started true;
         Ok Loop.Not_ready)
@@ -378,7 +378,7 @@ let test_rejected_delivery_keeps_workflow_lane_live () =
     end
   in
   begin match
-    Loop.run ~closed:(fun () -> Atomic.get closed) ~poll_workflow
+    Loop.run ~detach:None ~closed:(fun () -> Atomic.get closed) ~poll_workflow
       ~poll_activity:(fun () -> Ok Loop.Not_ready)
       ~wait_for_lane:(fun ~workflow_lane ~native_wait:_ ->
         if workflow_lane then ignore (Atomic.fetch_and_add workflow_waits 1)
@@ -470,7 +470,7 @@ let run_sequential_activity_workflow ~model ~steps =
     Ok ()
   in
   begin match
-    Loop.run ~closed:(fun () -> Atomic.get closed) ~poll_workflow
+    Loop.run ~detach:None ~closed:(fun () -> Atomic.get closed) ~poll_workflow
       ~poll_activity ~wait_for_lane
       ~retry_pending:(fun ~workflow_lane:_ ->
         failwith "sequential workflow fixture entered completion retry")
@@ -516,7 +516,7 @@ let test_closed_loop_does_not_poll () =
     failwith "closed worker loop waited on a backend lane"
   in
   match
-    Loop.run ~closed:(fun () -> true)
+    Loop.run ~detach:None ~closed:(fun () -> true)
       ~poll_workflow:unexpected_poll ~poll_activity:unexpected_poll
       ~wait_for_lane:unexpected_wait
       ~retry_pending:(fun ~workflow_lane:_ ->
