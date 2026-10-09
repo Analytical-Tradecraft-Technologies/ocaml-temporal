@@ -6,7 +6,7 @@ use crate::worker_bridge::{
 };
 use crate::{activity_protocol, client_protocol, diagnostics, workflow_protocol};
 use serde::Deserialize;
-use std::collections::{HashMap, hash_map::Entry};
+use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::future::Future;
 use std::io::Write;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -177,6 +177,247 @@ const MAX_PENDING_STARTS: usize = 64;
 /// Maximum time spent in one wait-ticket ABI call before the owner regains
 /// control of its mailbox and can service lifecycle messages.
 const START_WAIT_TIMEOUT: Duration = Duration::from_millis(100);
+/// Hard ceiling on submitted client calls in flight on one runtime (#807).
+///
+/// Starts and exact-run waits keep their own documented limits above. Every
+/// other submitted call is bounded in time by its RPC deadline (at most one
+/// minute) and is awaited by one blocked caller thread, so the live count is
+/// naturally limited by the application's concurrency. This ceiling only
+/// stops a defect from turning the task registry into an unbounded one;
+/// admission beyond it returns `STATUS_RESOURCE_EXHAUSTED` before any RPC.
+const MAX_PENDING_CALLS: usize = 4_096;
+/// Longest single wait on a submitted call's completion cell. The wait wakes
+/// as soon as the outcome is published or the runtime releases the call; the
+/// bound only lets the calling OCaml thread regain its runtime lock
+/// periodically (for signals and asynchronous exceptions).
+const MAX_CALL_AWAIT_MS: u32 = 60_000;
+
+/// Closed numeric selector of one submitted client operation (#807). The
+/// values are part of ABI version 4 and are mirrored by the C header and the
+/// OCaml bridge; each request document is the one the operation's synchronous
+/// symbol accepts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClientCallKind {
+    Start,
+    Wait,
+    Cancel,
+    Terminate,
+    Reset,
+    Signal,
+    Query,
+    Update,
+    PollUpdate,
+    Visibility,
+}
+
+impl TryFrom<u32> for ClientCallKind {
+    type Error = Failure;
+
+    /// Accepts exactly the selectors documented in the C header.
+    fn try_from(value: u32) -> std::result::Result<Self, Failure> {
+        Ok(match value {
+            1 => Self::Start,
+            2 => Self::Wait,
+            3 => Self::Cancel,
+            4 => Self::Terminate,
+            5 => Self::Reset,
+            6 => Self::Signal,
+            7 => Self::Query,
+            8 => Self::Update,
+            9 => Self::PollUpdate,
+            10 => Self::Visibility,
+            _ => {
+                return Err(Failure {
+                    status: STATUS_INVALID_ARGUMENT,
+                    message: "unknown Temporal client call kind".to_owned(),
+                });
+            }
+        })
+    }
+}
+
+/// One validated client request, decoded on the owner Domain before any
+/// connection clone or task exists, so malformed input fails synchronously.
+enum ClientRpc {
+    Start(Arc<client_protocol::StartWorkflowRequest>),
+    Wait(client_protocol::WaitWorkflowRequest),
+    Cancel(client_protocol::CancelWorkflowRequest),
+    Terminate(client_protocol::TerminateWorkflowRequest),
+    Reset(client_protocol::ResetWorkflowRequest),
+    Signal(client_protocol::SignalWorkflowRequest),
+    Query(client_protocol::QueryWorkflowRequest),
+    Update(client_protocol::UpdateWorkflowRequest),
+    PollUpdate(client_protocol::PollWorkflowUpdateRequest),
+    Visibility(client_protocol::VisibilityRequest),
+}
+
+/// A client RPC future that owns its connection clone and produces exactly
+/// the bytes or failure the operation's synchronous symbol would return.
+type ClientRpcFuture = Pin<Box<dyn Future<Output = Operation> + Send>>;
+
+impl ClientRpc {
+    /// Strictly decodes the request document for `kind`.
+    fn decode(kind: ClientCallKind, text: &str) -> std::result::Result<Self, Failure> {
+        Ok(match kind {
+            ClientCallKind::Start => Self::Start(Arc::new(
+                client_protocol::decode_start_request(text).map_err(protocol_failure)?,
+            )),
+            ClientCallKind::Wait => {
+                Self::Wait(client_protocol::decode_wait_request(text).map_err(protocol_failure)?)
+            }
+            ClientCallKind::Cancel => Self::Cancel(
+                client_protocol::decode_cancel_request(text).map_err(protocol_failure)?,
+            ),
+            ClientCallKind::Terminate => Self::Terminate(
+                client_protocol::decode_terminate_request(text).map_err(protocol_failure)?,
+            ),
+            ClientCallKind::Reset => {
+                Self::Reset(client_protocol::decode_reset_request(text).map_err(protocol_failure)?)
+            }
+            ClientCallKind::Signal => Self::Signal(
+                client_protocol::decode_signal_request(text).map_err(protocol_failure)?,
+            ),
+            ClientCallKind::Query => {
+                Self::Query(client_protocol::decode_query_request(text).map_err(protocol_failure)?)
+            }
+            ClientCallKind::Update => Self::Update(
+                client_protocol::decode_update_request(text).map_err(protocol_failure)?,
+            ),
+            ClientCallKind::PollUpdate => Self::PollUpdate(
+                client_protocol::decode_poll_update_request(text).map_err(protocol_failure)?,
+            ),
+            ClientCallKind::Visibility => Self::Visibility(
+                client_protocol::decode_visibility_request(text).map_err(protocol_failure)?,
+            ),
+        })
+    }
+
+    /// Builds the operation's future. The future captures `connection` and
+    /// the validated request; it never touches the runtime or OCaml. Every
+    /// bounded RPC applies its own `rpc_timeout_ms` (or default budget)
+    /// inside `client_protocol`, so the future ends by itself when its
+    /// deadline expires.
+    fn into_future(self, connection: Connection) -> ClientRpcFuture {
+        match self {
+            Self::Start(request) => Box::pin(async move {
+                let result =
+                    client_protocol::start_workflow(connection, request.as_ref().clone()).await;
+                start_outcome_bytes(&request, Some(result))
+            }),
+            Self::Wait(request) => Box::pin(async move {
+                let response = client_protocol::wait_workflow(connection, request)
+                    .await
+                    .map_err(client_operation_failure)?;
+                encode_bytes(client_protocol::encode_wait_response(&response))
+            }),
+            Self::Cancel(request) => Box::pin(async move {
+                let response = client_protocol::cancel_workflow(connection, request)
+                    .await
+                    .map_err(client_operation_failure)?;
+                encode_bytes(client_protocol::encode_cancel_response(&response))
+            }),
+            Self::Terminate(request) => Box::pin(async move {
+                let response = client_protocol::terminate_workflow(connection, request)
+                    .await
+                    .map_err(client_operation_failure)?;
+                encode_bytes(client_protocol::encode_terminate_response(&response))
+            }),
+            Self::Reset(request) => Box::pin(async move {
+                let response = client_protocol::reset_workflow(connection, request)
+                    .await
+                    .map_err(client_operation_failure)?;
+                encode_bytes(client_protocol::encode_reset_response(&response))
+            }),
+            Self::Signal(request) => Box::pin(async move {
+                let response = client_protocol::signal_workflow(connection, request)
+                    .await
+                    .map_err(client_operation_failure)?;
+                encode_bytes(client_protocol::encode_signal_response(&response))
+            }),
+            Self::Query(request) => Box::pin(async move {
+                let response = client_protocol::query_workflow(connection, request)
+                    .await
+                    .map_err(client_operation_failure)?;
+                encode_bytes(client_protocol::encode_query_response(&response))
+            }),
+            Self::Update(request) => Box::pin(async move {
+                let response = client_protocol::update_workflow(connection, request)
+                    .await
+                    .map_err(client_operation_failure)?;
+                encode_bytes(client_protocol::encode_update_response(&response))
+            }),
+            Self::PollUpdate(request) => Box::pin(async move {
+                let response = client_protocol::poll_workflow_update(connection, request)
+                    .await
+                    .map_err(client_operation_failure)?;
+                encode_bytes(client_protocol::encode_poll_update_response(&response))
+            }),
+            Self::Visibility(request) => Box::pin(async move {
+                let response = client_protocol::list_visibility(connection, request)
+                    .await
+                    .map_err(client_operation_failure)?;
+                encode_bytes(client_protocol::encode_visibility_response(&response))
+            }),
+        }
+    }
+}
+
+/// Converts a validated response encoding into the ABI byte result.
+fn encode_bytes(encoded: std::result::Result<String, crate::protocol::ProtocolError>) -> Operation {
+    encoded
+        .map(|encoded| encoded.into_bytes())
+        .map_err(protocol_failure)
+}
+
+/// Encodes the closed accepted/rejected/unknown outcome of one start.
+///
+/// `None` means the task ended without a result, so acceptance is unknown.
+/// An outcome that cannot be encoded is reported as `Unknown` built from the
+/// validated request identities, which always encodes: losing an accepted or
+/// rejected start to a protocol error would be worse than an uncertain one.
+fn start_outcome_bytes(
+    request: &client_protocol::StartWorkflowRequest,
+    result: Option<
+        std::result::Result<
+            client_protocol::StartWorkflowResponse,
+            client_protocol::ClientOperationError,
+        >,
+    >,
+) -> Operation {
+    let unknown = || client_protocol::StartWorkflowOutcome::Unknown {
+        request_id: request.request_id.clone(),
+        workflow_id: request.workflow_id.clone(),
+    };
+    let outcome = match result {
+        Some(Ok(response)) => client_protocol::StartWorkflowOutcome::Accepted(response),
+        Some(Err(error)) if error.uncertain_start() => unknown(),
+        Some(Err(error)) => client_protocol::StartWorkflowOutcome::Rejected(error),
+        None => unknown(),
+    };
+    match client_protocol::encode_start_outcome(&outcome) {
+        Ok(encoded) => Ok(encoded.into_bytes()),
+        Err(_) => encode_bytes(client_protocol::encode_start_outcome(&unknown())),
+    }
+}
+
+/// Capacity class of one in-flight submitted call. Starts and waits keep
+/// the limits documented for the public client; the class also carries the
+/// identity those limits deduplicate on.
+enum CallScope {
+    /// A start; calls with the same `request_id` share one start slot.
+    Start(Arc<client_protocol::StartWorkflowRequest>),
+    /// An exact-run or current-run wait; calls on the same run share a slot.
+    Wait(client_protocol::WaitWorkflowRequest),
+    /// Any other RPC, bounded by its own deadline.
+    Bounded,
+}
+
+/// One submitted call's Tokio task, retained by the runtime owner so that
+/// disconnect and close can abort and join it.
+struct PendingCall {
+    scope: CallScope,
+    task: JoinHandle<()>,
+}
 
 /// Identifies which async-client operation failed without inferring its
 /// semantics from a diagnostic string.
@@ -406,9 +647,9 @@ const _: () = {
 
 /// Internal structured failure converted into an owned ABI diagnostic.
 #[derive(Debug)]
-struct Failure {
-    status: Status,
-    message: String,
+pub(crate) struct Failure {
+    pub(crate) status: Status,
+    pub(crate) message: String,
 }
 
 /// Owns the native graph (client, worker, and their bookkeeping) for one SDK
@@ -436,6 +677,13 @@ pub struct Runtime {
     activity_tasks: HashMap<Vec<u8>, Vec<activity_protocol::ActivityTask>>,
     pending_starts: HashMap<String, PendingStart>,
     pending_waits: HashMap<client_protocol::WaitWorkflowRequest, PendingWait>,
+    /// Identity under which this runtime registers submitted client calls in
+    /// the process-wide completion registry (#807); disconnect and close
+    /// release every call registered under it.
+    call_owner: u64,
+    /// Tasks of submitted client calls that may still be running, keyed by
+    /// call identifier. Finished tasks are pruned on each submission.
+    pending_calls: HashMap<u64, PendingCall>,
     cleanup: std::sync::mpsc::Sender<RuntimeCleanup>,
 }
 
@@ -617,7 +865,7 @@ struct RuntimeCleanup {
     client: Option<Connection>,
     worker: Option<PollLanes>,
     replay_worker: Option<ReplayWorker>,
-    /// Aborted asynchronous-start tasks whose join handles must be awaited
+    /// Aborted asynchronous-start and submitted-call tasks whose join handles must be awaited
     /// before the Core runtime and its connection clones are dropped.  The
     /// non-blocking OCaml finalizer transfers these handles here instead of
     /// dropping them on the caller thread, which would detach the tasks.
@@ -765,6 +1013,8 @@ impl Runtime {
             activity_tasks: HashMap::new(),
             pending_starts: HashMap::new(),
             pending_waits: HashMap::new(),
+            call_owner: crate::client_calls::new_owner_id(),
+            pending_calls: HashMap::new(),
             cleanup,
         })
     }
@@ -894,52 +1144,14 @@ impl Runtime {
     /// the C stub releases the OCaml runtime lock while Tokio waits, and no
     /// Rust task retains an OCaml pointer after this method returns.
     fn cancel_workflow_json(&mut self, input: &[u8]) -> Operation {
-        let text = decode_semantic_input(input)?;
-        let request = client_protocol::decode_cancel_request(text).map_err(protocol_failure)?;
-        let connection = self.client.as_ref().cloned().ok_or_else(|| Failure {
-            status: STATUS_INVALID_STATE,
-            message: "Temporal client is not connected".to_owned(),
-        })?;
-        let handle = self
-            .core
-            .as_ref()
-            .ok_or_else(|| Failure {
-                status: STATUS_INVALID_STATE,
-                message: "Temporal runtime is already closed".to_owned(),
-            })?
-            .tokio_handle();
-        let response = handle
-            .block_on(client_protocol::cancel_workflow(connection, request))
-            .map_err(client_operation_failure)?;
-        client_protocol::encode_cancel_response(&response)
-            .map(|encoded| encoded.into_bytes())
-            .map_err(protocol_failure)
+        self.client_rpc_blocking(ClientCallKind::Cancel, input)
     }
 
     /// Terminates one exact workflow run through the official Temporal
     /// service. The bounded RPC runs on Tokio while the C shim releases the
     /// OCaml runtime lock, and only an owned acknowledgement crosses back.
     fn terminate_workflow_json(&mut self, input: &[u8]) -> Operation {
-        let text = decode_semantic_input(input)?;
-        let request = client_protocol::decode_terminate_request(text).map_err(protocol_failure)?;
-        let connection = self.client.as_ref().cloned().ok_or_else(|| Failure {
-            status: STATUS_INVALID_STATE,
-            message: "Temporal client is not connected".to_owned(),
-        })?;
-        let handle = self
-            .core
-            .as_ref()
-            .ok_or_else(|| Failure {
-                status: STATUS_INVALID_STATE,
-                message: "Temporal runtime is already closed".to_owned(),
-            })?
-            .tokio_handle();
-        let response = handle
-            .block_on(client_protocol::terminate_workflow(connection, request))
-            .map_err(client_operation_failure)?;
-        client_protocol::encode_terminate_response(&response)
-            .map(|encoded| encoded.into_bytes())
-            .map_err(protocol_failure)
+        self.client_rpc_blocking(ClientCallKind::Terminate, input)
     }
 
     /// Resets one exact workflow run through Temporal's official workflow
@@ -947,52 +1159,14 @@ impl Runtime {
     /// performs the bounded RPC; no Tokio task or native callback retains an
     /// OCaml pointer after this method returns.
     fn reset_workflow_json(&mut self, input: &[u8]) -> Operation {
-        let text = decode_semantic_input(input)?;
-        let request = client_protocol::decode_reset_request(text).map_err(protocol_failure)?;
-        let connection = self.client.as_ref().cloned().ok_or_else(|| Failure {
-            status: STATUS_INVALID_STATE,
-            message: "Temporal client is not connected".to_owned(),
-        })?;
-        let handle = self
-            .core
-            .as_ref()
-            .ok_or_else(|| Failure {
-                status: STATUS_INVALID_STATE,
-                message: "Temporal runtime is already closed".to_owned(),
-            })?
-            .tokio_handle();
-        let response = handle
-            .block_on(client_protocol::reset_workflow(connection, request))
-            .map_err(client_operation_failure)?;
-        client_protocol::encode_reset_response(&response)
-            .map(|encoded| encoded.into_bytes())
-            .map_err(protocol_failure)
+        self.client_rpc_blocking(ClientCallKind::Reset, input)
     }
 
     /// Sends one signal to one exact workflow run through the connected
     /// Temporal client. The request is validated before the connection lookup
     /// and the positive response is revalidated before crossing the ABI.
     fn signal_workflow_json(&mut self, input: &[u8]) -> Operation {
-        let text = decode_semantic_input(input)?;
-        let request = client_protocol::decode_signal_request(text).map_err(protocol_failure)?;
-        let connection = self.client.as_ref().cloned().ok_or_else(|| Failure {
-            status: STATUS_INVALID_STATE,
-            message: "Temporal client is not connected".to_owned(),
-        })?;
-        let handle = self
-            .core
-            .as_ref()
-            .ok_or_else(|| Failure {
-                status: STATUS_INVALID_STATE,
-                message: "Temporal runtime is already closed".to_owned(),
-            })?
-            .tokio_handle();
-        let response = handle
-            .block_on(client_protocol::signal_workflow(connection, request))
-            .map_err(client_operation_failure)?;
-        client_protocol::encode_signal_response(&response)
-            .map(|encoded| encoded.into_bytes())
-            .map_err(protocol_failure)
+        self.client_rpc_blocking(ClientCallKind::Signal, input)
     }
 
     /// Executes one output-only query against one exact workflow run. Query
@@ -1000,85 +1174,33 @@ impl Runtime {
     /// by cancellation and signal operations; successful payloads are
     /// revalidated before crossing the ABI.
     fn query_workflow_json(&mut self, input: &[u8]) -> Operation {
-        let text = decode_semantic_input(input)?;
-        let request = client_protocol::decode_query_request(text).map_err(protocol_failure)?;
-        let connection = self.client.as_ref().cloned().ok_or_else(|| Failure {
-            status: STATUS_INVALID_STATE,
-            message: "Temporal client is not connected".to_owned(),
-        })?;
-        let handle = self
-            .core
-            .as_ref()
-            .ok_or_else(|| Failure {
-                status: STATUS_INVALID_STATE,
-                message: "Temporal runtime is already closed".to_owned(),
-            })?
-            .tokio_handle();
-        let response = handle
-            .block_on(client_protocol::query_workflow(connection, request))
-            .map_err(client_operation_failure)?;
-        client_protocol::encode_query_response(&response)
-            .map(|encoded| encoded.into_bytes())
-            .map_err(protocol_failure)
+        self.client_rpc_blocking(ClientCallKind::Query, input)
     }
 
     /// Starts one named workflow update and returns its durable update handle.
     /// Completion is observed through the separate bounded poll operation.
     fn update_workflow_json(&mut self, input: &[u8]) -> Operation {
-        let text = decode_semantic_input(input)?;
-        let request = client_protocol::decode_update_request(text).map_err(protocol_failure)?;
-        let connection = self.client.as_ref().cloned().ok_or_else(|| Failure {
-            status: STATUS_INVALID_STATE,
-            message: "Temporal client is not connected".to_owned(),
-        })?;
-        let handle = self
-            .core
-            .as_ref()
-            .ok_or_else(|| Failure {
-                status: STATUS_INVALID_STATE,
-                message: "Temporal runtime is already closed".to_owned(),
-            })?
-            .tokio_handle();
-        let response = handle
-            .block_on(client_protocol::update_workflow(connection, request))
-            .map_err(client_operation_failure)?;
-        client_protocol::encode_update_response(&response)
-            .map(|encoded| encoded.into_bytes())
-            .map_err(protocol_failure)
+        self.client_rpc_blocking(ClientCallKind::Update, input)
     }
 
     /// Polls one admitted update until completion or the bounded poll budget
     /// expires. A missing outcome is a normal pending result.
     fn poll_update_workflow_json(&mut self, input: &[u8]) -> Operation {
-        let text = decode_semantic_input(input)?;
-        let request =
-            client_protocol::decode_poll_update_request(text).map_err(protocol_failure)?;
-        let connection = self.client.as_ref().cloned().ok_or_else(|| Failure {
-            status: STATUS_INVALID_STATE,
-            message: "Temporal client is not connected".to_owned(),
-        })?;
-        let handle = self
-            .core
-            .as_ref()
-            .ok_or_else(|| Failure {
-                status: STATUS_INVALID_STATE,
-                message: "Temporal runtime is already closed".to_owned(),
-            })?
-            .tokio_handle();
-        let response = handle
-            .block_on(client_protocol::poll_workflow_update(connection, request))
-            .map_err(client_operation_failure)?;
-        client_protocol::encode_poll_update_response(&response)
-            .map(|encoded| encoded.into_bytes())
-            .map_err(protocol_failure)
+        self.client_rpc_blocking(ClientCallKind::PollUpdate, input)
     }
 
     /// Lists one bounded visibility page through Temporal's official client.
     /// The Rust owner performs protobuf conversion and returns only the
     /// validated JSON page; no server-owned bytes or handles cross the ABI.
     fn list_visibility_json(&mut self, input: &[u8]) -> Operation {
-        let text = decode_semantic_input(input)?;
-        let request = client_protocol::decode_visibility_request(text).map_err(protocol_failure)?;
+        self.client_rpc_blocking(ClientCallKind::Visibility, input)
+    }
+
+    /// Returns the connected client and Core's Tokio handle, or the typed
+    /// lifecycle failure every client operation reports without them.
+    fn client_and_handle(
+        &self,
+    ) -> std::result::Result<(Connection, tokio::runtime::Handle), Failure> {
         let connection = self.client.as_ref().cloned().ok_or_else(|| Failure {
             status: STATUS_INVALID_STATE,
             message: "Temporal client is not connected".to_owned(),
@@ -1091,12 +1213,156 @@ impl Runtime {
                 message: "Temporal runtime is already closed".to_owned(),
             })?
             .tokio_handle();
-        let response = handle
-            .block_on(client_protocol::list_visibility(connection, request))
-            .map_err(client_operation_failure)?;
-        client_protocol::encode_visibility_response(&response)
-            .map(|encoded| encoded.into_bytes())
-            .map_err(protocol_failure)
+        Ok((connection, handle))
+    }
+
+    /// Runs one bounded client RPC to completion on the calling owner thread.
+    ///
+    /// This is the synchronous ABI path kept for direct bridge callers; the
+    /// public OCaml client submits the same operation through
+    /// [`Runtime::submit_client_call`] instead, so its owner Domain never
+    /// waits for the network (#807). The request is validated before the
+    /// connection lookup, matching the asynchronous path.
+    fn client_rpc_blocking(&mut self, kind: ClientCallKind, input: &[u8]) -> Operation {
+        let text = decode_semantic_input(input)?;
+        let rpc = ClientRpc::decode(kind, text)?;
+        let (connection, handle) = self.client_and_handle()?;
+        handle.block_on(rpc.into_future(connection))
+    }
+
+    /// Submits one client RPC and returns its call identifier at once (#807).
+    ///
+    /// The owner Domain only validates the request, checks capacity,
+    /// registers a completion cell, and spawns one Tokio task that owns a
+    /// connection clone. The identifier is returned as ASCII decimal bytes.
+    /// The task publishes exactly one outcome (the bytes or failure the
+    /// operation's synchronous symbol would return) into the cell and never
+    /// touches this runtime or OCaml; the submitting caller collects it with
+    /// [`ocaml_temporal_core_v4_client_await_call`] from its own thread.
+    ///
+    /// Starts and waits keep their documented limits (64 distinct request IDs
+    /// and 64 distinct runs; repeats share a slot) and every class shares the
+    /// [`MAX_PENDING_CALLS`] ceiling. Admission beyond a limit returns
+    /// `STATUS_RESOURCE_EXHAUSTED` before any task or RPC exists. A start
+    /// whose `request_id` is in flight for a different request is rejected
+    /// with `STATUS_PROTOCOL`, as on the ticket path. Disconnect and close
+    /// release every call: waiters observe the closed failure and the tasks
+    /// are aborted and joined.
+    fn submit_client_call(&mut self, kind: u32, input: &[u8]) -> Operation {
+        let kind = ClientCallKind::try_from(kind)?;
+        let text = decode_semantic_input(input)?;
+        let rpc = ClientRpc::decode(kind, text)?;
+        let (connection, handle) = self.client_and_handle()?;
+        // Dropping a finished task's handle cannot detach live work: its
+        // future, and with it the connection clone, has already completed.
+        self.pending_calls
+            .retain(|_, call| !call.task.is_finished());
+        let scope = match &rpc {
+            ClientRpc::Start(request) => {
+                let mut distinct = HashSet::new();
+                for call in self.pending_calls.values() {
+                    if let CallScope::Start(pending) = &call.scope {
+                        if pending.request_id == request.request_id
+                            && !client_protocol::same_start_request(pending, request)
+                        {
+                            return Err(Failure {
+                                status: STATUS_PROTOCOL,
+                                message:
+                                    "start request_id is already pending for a different request"
+                                        .to_owned(),
+                            });
+                        }
+                        distinct.insert(pending.request_id.as_str());
+                    }
+                }
+                if distinct.len() >= MAX_PENDING_STARTS
+                    && !distinct.contains(request.request_id.as_str())
+                {
+                    return Err(Failure {
+                        status: STATUS_RESOURCE_EXHAUSTED,
+                        message: format!(
+                            "too many Temporal workflow starts are pending (limit {MAX_PENDING_STARTS})"
+                        ),
+                    });
+                }
+                CallScope::Start(Arc::clone(request))
+            }
+            ClientRpc::Wait(request) => {
+                let distinct = self
+                    .pending_calls
+                    .values()
+                    .filter_map(|call| match &call.scope {
+                        CallScope::Wait(pending) => Some(pending),
+                        _ => None,
+                    })
+                    .collect::<HashSet<_>>();
+                if distinct.len() >= MAX_PENDING_WAITS && !distinct.contains(request) {
+                    return Err(Failure {
+                        status: STATUS_RESOURCE_EXHAUSTED,
+                        message: format!(
+                            "too many Temporal workflow waits are pending (limit {MAX_PENDING_WAITS})"
+                        ),
+                    });
+                }
+                CallScope::Wait(request.clone())
+            }
+            _ => CallScope::Bounded,
+        };
+        if self.pending_calls.len() >= MAX_PENDING_CALLS {
+            return Err(Failure {
+                status: STATUS_RESOURCE_EXHAUSTED,
+                message: format!(
+                    "too many Temporal client calls are pending (limit {MAX_PENDING_CALLS})"
+                ),
+            });
+        }
+        // Reserve the task-registry entry before the call exists, so no
+        // allocation can unwind between spawning the task and registering
+        // its handle for shutdown.
+        self.pending_calls.try_reserve(1).map_err(|_| Failure {
+            status: STATUS_INTERNAL,
+            message: "could not reserve a Temporal client call slot".to_owned(),
+        })?;
+        let (call, guard) = crate::client_calls::register(self.call_owner)?;
+        let encoded = call.to_string().into_bytes();
+        let future = rpc.into_future(connection);
+        let task = handle.spawn(async move {
+            let outcome = future.await;
+            guard.complete(outcome);
+        });
+        self.pending_calls.insert(call, PendingCall { scope, task });
+        Ok(encoded)
+    }
+
+    /// Releases every submitted call and returns task handles still to join.
+    ///
+    /// Waiters are woken with the closed failure first, so an aborted task's
+    /// completion guard finds its cell already closed. Explicit disconnect or
+    /// close (`wait = true`) then joins the aborted tasks on the owner thread
+    /// with the OCaml runtime lock released; the GC fallback (`wait = false`)
+    /// hands them to the cleanup thread instead. No task is detached while it
+    /// still owns a connection clone.
+    fn abort_pending_calls(&mut self, wait: bool) -> Vec<JoinHandle<()>> {
+        crate::client_calls::release_owner(self.call_owner);
+        let tasks = self
+            .pending_calls
+            .drain()
+            .map(|(_, call)| call.task)
+            .collect::<Vec<_>>();
+        for task in &tasks {
+            task.abort();
+        }
+        match (wait, self.core.as_ref()) {
+            (true, Some(core)) => {
+                core.tokio_handle().block_on(async {
+                    for task in tasks {
+                        let _ = task.await;
+                    }
+                });
+                Vec::new()
+            }
+            _ => tasks,
+        }
     }
 
     /// Begins one workflow start without waiting for the RPC response.
@@ -1280,37 +1546,7 @@ impl Runtime {
             pending.task.abort();
         }
 
-        let request_id = pending.request.request_id.clone();
-        let workflow_id = pending.request.workflow_id.clone();
-        let outcome = match result {
-            Some(Ok(response)) => client_protocol::StartWorkflowOutcome::Accepted(response),
-            Some(Err(error)) if error.uncertain_start() => {
-                client_protocol::StartWorkflowOutcome::Unknown {
-                    request_id: request_id.clone(),
-                    workflow_id: workflow_id.clone(),
-                }
-            }
-            Some(Err(error)) => client_protocol::StartWorkflowOutcome::Rejected(error),
-            None => client_protocol::StartWorkflowOutcome::Unknown {
-                request_id: request_id.clone(),
-                workflow_id: workflow_id.clone(),
-            },
-        };
-        // The ticket is already retired. Prefer an always-encodable Unknown
-        // outcome built from the validated request identities over returning a
-        // protocol error that permanently loses an accepted or rejected start.
-        match client_protocol::encode_start_outcome(&outcome) {
-            Ok(encoded) => Ok(encoded.into_bytes()),
-            Err(_) => {
-                let fallback = client_protocol::StartWorkflowOutcome::Unknown {
-                    request_id,
-                    workflow_id,
-                };
-                client_protocol::encode_start_outcome(&fallback)
-                    .map(|encoded| encoded.into_bytes())
-                    .map_err(protocol_failure)
-            }
-        }
+        start_outcome_bytes(&pending.request, result)
     }
 
     /// Aborts every in-flight start and returns handles that need cleanup.
@@ -2390,6 +2626,11 @@ impl Runtime {
         // returns no deferred handles for the cleanup thread.
         let remaining = self.abort_pending_starts(true);
         debug_assert!(remaining.is_empty());
+        // Submitted calls are released the same way: their waiters observe
+        // the closed failure and their tasks are joined before the
+        // connection is dropped (#807).
+        let remaining = self.abort_pending_calls(true);
+        debug_assert!(remaining.is_empty());
         self.client.take();
         Ok(Vec::new())
     }
@@ -2403,7 +2644,10 @@ impl Runtime {
         // Cancel borrowed history futures before transferring their executor
         // and connection to the cleanup thread, including GC fallback close.
         self.pending_waits.clear();
-        let pending_start_tasks = self.abort_pending_starts(wait);
+        let mut pending_start_tasks = self.abort_pending_starts(wait);
+        // Submitted client calls follow the same abort/join rule; their
+        // unjoined handles share the cleanup thread's join list (#807).
+        pending_start_tasks.extend(self.abort_pending_calls(wait));
         let Some(core) = self.core.take() else {
             return STATUS_OK;
         };
@@ -3266,7 +3510,7 @@ fn validate_count(name: &str, value: u32, allow_zero: bool) -> std::result::Resu
 }
 
 /// Byte-producing operation accepted by the shared panic/ownership wrapper.
-type Operation = std::result::Result<Vec<u8>, Failure>;
+pub(crate) type Operation = std::result::Result<Vec<u8>, Failure>;
 
 /// Constructs the only valid successful result shape.
 fn success(value: Vec<u8>) -> Result {
@@ -4295,6 +4539,82 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_client_wait_workflow_json(
     }
 }
 
+/// Submit one client RPC without waiting for Temporal (#807).
+///
+/// `kind` selects the operation with the closed values documented in the C
+/// header (`1` start through `10` visibility) and `input` is that
+/// operation's usual request document. On success the value is the call
+/// identifier as ASCII decimal digits; the RPC then runs on a Tokio task and
+/// its outcome is collected with
+/// [`ocaml_temporal_core_v4_client_await_call`]. The call returns as soon as
+/// the task is spawned, so the owner Domain never waits for the network.
+/// A start's outcome is the closed accepted/rejected/unknown document of the
+/// ticket path; every other outcome is exactly what the operation's
+/// synchronous symbol returns.
+///
+/// # Safety
+///
+/// `runtime` must be a live runtime handle used only by its owner thread.
+/// The input span is borrowed only for this call and `output` follows the
+/// standard initialized-result contract.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ocaml_temporal_core_v4_client_submit_json(
+    runtime: *mut Runtime,
+    kind: u32,
+    input: *const u8,
+    input_len: usize,
+    output: *mut Result,
+) -> Status {
+    unsafe {
+        invoke(output, || {
+            let input = input_span(input, input_len, crate::protocol::MAX_DOCUMENT_BYTES)?;
+            runtime
+                .as_mut()
+                .ok_or_else(|| Failure {
+                    status: STATUS_INVALID_ARGUMENT,
+                    message: "runtime pointer is null".to_owned(),
+                })?
+                .submit_client_call(kind, input)
+        })
+    }
+}
+
+/// Wait at most `timeout_ms` for a submitted client call's outcome (#807).
+///
+/// This symbol takes no runtime: the call identifier names a process-wide
+/// completion cell, so any thread may await its own call while the runtime
+/// owner keeps serving other requests. The first terminal result retires
+/// the call and is returned unchanged: the operation's value or failure.
+/// `STATUS_NOT_READY` means the interval elapsed and the call may be awaited
+/// again. `STATUS_INVALID_STATE` means the call can no longer complete: its
+/// runtime disconnected or closed, or the identifier was already consumed or
+/// never issued. `timeout_ms` above one minute is rejected.
+///
+/// # Safety
+///
+/// `output` follows the same contract as
+/// [`ocaml_temporal_core_v4_check_abi_version`]. The caller should release
+/// any language runtime lock, since the call blocks.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ocaml_temporal_core_v4_client_await_call(
+    call: u64,
+    timeout_ms: u32,
+    output: *mut Result,
+) -> Status {
+    // SAFETY: The output-pointer contract is forwarded unchanged to `invoke`.
+    unsafe {
+        invoke(output, || {
+            if timeout_ms > MAX_CALL_AWAIT_MS {
+                return Err(Failure {
+                    status: STATUS_INVALID_ARGUMENT,
+                    message: "client call await cannot exceed 60000 ms".to_owned(),
+                });
+            }
+            crate::client_calls::await_call(call, Duration::from_millis(u64::from(timeout_ms)))
+        })
+    }
+}
+
 /// Start and validate one workflow-only official Core worker from strict JSON.
 /// Success is not exposed until the namespace validation RPC completes.
 ///
@@ -5264,6 +5584,10 @@ mod persistent_client_wait_tests;
 #[cfg(test)]
 #[path = "../tests/support/client_start.rs"]
 mod client_start_retry_tests;
+
+#[cfg(test)]
+#[path = "../tests/support/client_calls.rs"]
+mod submitted_client_call_tests;
 
 #[cfg(test)]
 mod async_activity_error_tests {

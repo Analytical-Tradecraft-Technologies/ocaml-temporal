@@ -5,6 +5,7 @@
 
 mod abi;
 pub mod activity_protocol;
+mod client_calls;
 mod client_protocol;
 #[doc(hidden)]
 pub mod diagnostics;

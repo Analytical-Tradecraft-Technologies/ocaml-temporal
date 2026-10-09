@@ -71,6 +71,8 @@ Stateful native resources are owned as one graph by an OCaml supervisor actor pe
 
 The supervisor does not poll Rust on a timer. Rust signals an internal condition/event primitive whenever Core work becomes ready, and the supervisor's dedicated Domain/OS thread waits through a blocking C stub with its OCaml runtime lock released. Workflow effect continuations and general cooperative schedulers never execute this blocking wait. The call returns normally to OCaml to drain work. This provides callback-like wakeup latency without allowing arbitrary Tokio threads to enter the OCaml runtime; shutdown uses the same signal to unblock the wait safely.
 
+Client RPCs follow the same rule without occupying the owner at all (#807). The owner only submits a request; Rust runs the RPC on a Tokio task that publishes its outcome into a per-call completion cell, and the calling Domain waits on that cell through a blocking C stub that borrows no runtime handle. A pending workflow wait, query, or update poll therefore never delays other requests to the same SDK instance, and graph shutdown closes every in-flight cell before aborting and joining its task. See [submitted client calls](../reference/client-protocol.md#submitted-client-calls-807).
+
 Throughput optimization is deliberately deferred until correctness benchmarks
 justify it. A later implementation may pipeline native transport, JSON
 validation/codec work, and workflow execution on dedicated lanes, but the

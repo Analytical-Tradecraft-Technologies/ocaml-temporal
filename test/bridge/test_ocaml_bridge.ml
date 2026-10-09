@@ -168,6 +168,18 @@ let () =
   | Error { status = Invalid_state; message } ->
       assert (String.length message > 0)
   | _ -> failwith "combined readiness wait without a worker was accepted");
+  (* A submitted client call (#807) validates its document, then needs a
+     connected client; neither failure registers a call. *)
+  (match Bridge.client_submit_json runtime Bridge.Call_wait Bytes.empty with
+  | Error { status = Protocol; message } -> assert (String.length message > 0)
+  | _ -> failwith "malformed submitted wait was accepted");
+  (match
+     Bridge.client_submit_json runtime Bridge.Call_signal
+       (Bytes.of_string
+          {|{"namespace":"default","workflow_id":"w","run_id":"r","signal_name":"s","request_id":"q","input":[]}|})
+   with
+  | Error { status = Invalid_state; message } -> assert (String.length message > 0)
+  | _ -> failwith "submitted signal without a client was accepted");
   (match Bridge.worker_complete_workflow_json runtime Bytes.empty with
   | Error { status = Protocol; message } ->
       assert (String.length message > 0)

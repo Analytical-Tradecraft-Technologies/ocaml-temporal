@@ -241,6 +241,50 @@ val client_wait_start_workflow_json : runtime -> bytes -> (bytes, error) result
     implicitly. *)
 val client_wait_workflow_json : runtime -> bytes -> (bytes, error) result
 
+(** The client operation performed by one submitted call (#807). Each
+    selects the request document of the matching synchronous operation
+    above. *)
+type client_call_kind =
+  | Call_start
+  | Call_wait
+  | Call_cancel
+  | Call_terminate
+  | Call_reset
+  | Call_signal
+  | Call_query
+  | Call_update
+  | Call_poll_update
+  | Call_visibility
+
+(** Identifier of one submitted client call. It names a Rust-owned
+    completion cell, not a pointer, and is only meaningful to
+    {!client_await_call}. *)
+type client_call = private int
+
+(** Longest [timeout_ms] {!client_await_call} accepts: one minute. *)
+val max_client_await_ms : int
+
+(** Submits one client RPC without waiting for Temporal. Only the runtime's
+    owner Domain may call this. Rust validates the request document, checks
+    capacity ([Resource_exhausted] beyond the start, wait, or overall
+    limits), and spawns one task that performs the RPC, then returns the call
+    identifier at once. A start's eventual outcome is the
+    accepted/rejected/unknown outcome document; every other outcome is what
+    the matching synchronous operation returns. *)
+val client_submit_json :
+  runtime -> client_call_kind -> bytes -> (client_call, error) result
+
+(** Waits at most [timeout_ms] for one submitted call's outcome and retires
+    the call when it is terminal. It borrows no runtime, so any Domain or
+    thread may await its own call while the owner serves other requests; the
+    C stub releases the OCaml runtime lock while waiting. [Not_ready] means
+    the interval elapsed and the call may be awaited again. [Invalid_state]
+    means the call will never complete: its runtime disconnected or closed,
+    or the identifier was already consumed. Raises [Invalid_argument] when
+    [timeout_ms] is negative or above {!max_client_await_ms}. *)
+val client_await_call :
+  client_call -> timeout_ms:int -> (bytes, error) result
+
 (** Completes an activity already handed off with [WillCompleteAsync] through
     the namespace-bound Temporal client. This does not touch the worker's
     outstanding-task ledger. *)

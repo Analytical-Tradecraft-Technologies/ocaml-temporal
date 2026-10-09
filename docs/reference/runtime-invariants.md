@@ -605,14 +605,33 @@ and bridge, read the [documentation guide](../README.md) first.
   releases the client/Core graph. A result already queued for an abandoned
   ticket is discarded with its receiver; it cannot cause a second task join or
   a second native free.
-- Exact-run client waits retain their history future and pagination state
-  across bounded owner turns. The runtime admits at most 64 distinct pending
-  executions and at most 64 outstanding start tickets, retiring each on a
-  terminal result or error. Admission beyond either bound returns
-  `Resource_exhausted` without side effects and leaves the client usable; it
-  never reuses `Invalid_state`, which callers treat as a closed graph. Disconnect and
-  runtime shutdown cancel all retained futures before releasing Core; no
-  background wait task outlives the owner.
+- Client RPCs are submit-and-complete (#807). The owner Domain only
+  validates, encodes, and submits a request; Rust spawns one Tokio task per
+  call that owns a connection clone and publishes exactly one outcome into
+  that call's completion cell. The caller awaits the cell on its own Domain
+  through a runtime-free C stub with the OCaml lock released, so the owner
+  never waits for the network and a pending wait, query, or update poll
+  cannot delay any other request, including shutdown admission.
+- A completion cell has one owner (the process-wide call registry) and one
+  release path: the caller's terminal read, or disconnect/close of the
+  runtime that created it. Disconnect and close first close every pending
+  cell, waking its waiter with `Invalid_state` (the typed `Closed` error in
+  OCaml), then abort the tasks and join them before the connection and Core
+  are released; the GC fallback hands the aborted handles to the cleanup
+  thread. A task that panics or is dropped without an outcome settles its
+  cell through a guard, so no waiter is stranded. Tasks never call OCaml and
+  never touch the runtime graph.
+- Deadlines keep the #499 rule: a request whose deadline expired in the
+  mailbox is completed by the owner without reaching Rust, and a live
+  deadline is lowered to the remaining budget and enforced inside the task.
+- The runtime admits at most 64 distinct waited executions, 64 distinct
+  in-flight start request IDs, and 4,096 submitted calls in total (plus at
+  most 64 outstanding tickets on the retained ticket path). Admission beyond a
+  bound returns `Resource_exhausted` without side effects and leaves the
+  client usable; it never reuses `Invalid_state`, which callers treat as a
+  closed graph. The retained synchronous wait path keeps its history futures
+  across bounded owner turns and is cancelled by disconnect and shutdown in
+  the same way.
 - A backend shutdown result, including `Error`, means the graph has been
   consumed or invalidated. A retryable operation must not masquerade as
   terminal shutdown while it still owns live resources.

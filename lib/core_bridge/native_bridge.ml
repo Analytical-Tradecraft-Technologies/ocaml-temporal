@@ -239,6 +239,12 @@ external client_wait_start_workflow_json_raw : runtime -> bytes -> response
 external client_wait_workflow_json_raw : runtime -> bytes -> response
   = "ocaml_temporal_client_wait_workflow_json"
 
+external client_submit_json_raw : runtime -> int -> bytes -> response
+  = "ocaml_temporal_client_submit_json"
+
+external client_await_call_raw : int -> int -> response
+  = "ocaml_temporal_client_await_call"
+
 external client_complete_async_activity_json_raw : runtime -> bytes -> response
   = "ocaml_temporal_client_complete_async_activity_json"
 
@@ -873,6 +879,67 @@ let client_wait_start_workflow_json runtime input =
 let client_wait_workflow_json runtime input =
   bridge_call "client_wait_workflow_json" (fun () ->
       decode (client_wait_workflow_json_raw runtime input))
+
+(** Selects the client operation a submitted call performs (#807). *)
+type client_call_kind =
+  | Call_start
+  | Call_wait
+  | Call_cancel
+  | Call_terminate
+  | Call_reset
+  | Call_signal
+  | Call_query
+  | Call_update
+  | Call_poll_update
+  | Call_visibility
+
+(** Identifier of one submitted call, issued by Rust and positive. *)
+type client_call = int
+
+(** The closed numeric selector of [kind] in ABI version 4; it must match
+    [OCAML_TEMPORAL_CORE_CLIENT_CALL_*] in the C header. *)
+let client_call_selector = function
+  | Call_start -> 1
+  | Call_wait -> 2
+  | Call_cancel -> 3
+  | Call_terminate -> 4
+  | Call_reset -> 5
+  | Call_signal -> 6
+  | Call_query -> 7
+  | Call_update -> 8
+  | Call_poll_update -> 9
+  | Call_visibility -> 10
+
+(** Longest single native wait accepted by Rust for one await. *)
+let max_client_await_ms = 60_000
+
+(** Submits one client RPC through the runtime owner and parses the decimal
+    call identifier Rust returns. A malformed identifier is a bridge
+    protocol defect reported as [Protocol]; it cannot be awaited. *)
+let client_submit_json runtime kind input =
+  bridge_call "client_submit_json" (fun () ->
+      match decode (client_submit_json_raw runtime (client_call_selector kind) input) with
+      | Error _ as error -> error
+      | Ok bytes -> (
+          match int_of_string_opt (Bytes.to_string bytes) with
+          | Some call when call > 0 -> Ok call
+          | Some _ | None ->
+              Error
+                {
+                  status = Protocol;
+                  message = "client call submission returned an invalid identifier";
+                }))
+
+(** Waits at most [timeout_ms] for one submitted call's outcome. The C stub
+    borrows no runtime and releases the OCaml lock for the whole wait, so it
+    may run on any Domain or thread. An elapsed interval ([Not_ready]) is
+    ordinary pending state and is logged at debug level only. An invalid
+    [timeout_ms] is a programmer error. *)
+let client_await_call call ~timeout_ms =
+  if timeout_ms < 0 || timeout_ms > max_client_await_ms then
+    invalid_arg "Native_bridge.client_await_call: timeout out of range";
+  bridge_call "client_await_call" (fun () ->
+      decode (client_await_call_raw call timeout_ms))
 
 (** Completes an admitted asynchronous activity through Rust's official
     namespace-bound client. The input is strict activity-completion JSON and is

@@ -832,6 +832,78 @@ CAMLprim value ocaml_temporal_client_wait_workflow_json(value runtime,
       runtime, input, ocaml_temporal_core_v4_client_wait_workflow_json);
 }
 
+/* Submit one client RPC (#807). This mirrors [invoke_runtime_json] with the
+ * extra closed operation selector: the input is copied before the lock is
+ * released and the runtime borrow is counted. Rust only validates, registers
+ * a completion cell, and spawns a task, so this returns without waiting for
+ * Temporal. A selector outside uint32_t maps to 0, which Rust rejects. */
+CAMLprim value ocaml_temporal_client_submit_json(value runtime, value kind,
+                                                 value input) {
+  CAMLparam3(runtime, kind, input);
+  CAMLlocal1(response);
+  owned_runtime *owned = Runtime_val(runtime);
+  ocaml_temporal_core_runtime *native_runtime = NULL;
+  size_t input_length = caml_string_length(input);
+  uint8_t *input_copy = NULL;
+  ocaml_temporal_core_result native_result = {0};
+  intnat requested = Long_val(kind);
+  uint32_t native_kind =
+      requested < 0 || (uintnat)requested > UINT32_MAX ? 0 : (uint32_t)requested;
+  int admitted;
+
+  response = alloc_response();
+  if (input_length > 0) {
+    input_copy = malloc(input_length);
+    if (input_copy == NULL) {
+      caml_raise_out_of_memory();
+    }
+    memcpy(input_copy, Bytes_val(input), input_length);
+  }
+
+  admitted = acquire_runtime(owned, &native_runtime);
+  caml_enter_blocking_section();
+  (void)ocaml_temporal_core_v4_client_submit_json(
+      native_runtime, native_kind, input_copy, input_length, &native_result);
+  if (admitted) {
+    /* As in [invoke_runtime_json], release the borrow before reacquiring
+     * the OCaml lock. */
+    release_runtime(owned);
+  }
+  caml_leave_blocking_section();
+  free(input_copy);
+  Response_val(response)->result = native_result;
+  CAMLreturn(response);
+}
+
+/* Wait a bounded interval for one submitted call's outcome (#807). No
+ * runtime is borrowed: the identifier names a Rust-owned completion cell, so
+ * a caller on any Domain or thread may wait here while the supervisor owner
+ * keeps serving other requests. The OCaml lock is released for the whole
+ * wait and only C-stack storage is written during it. Negative identifiers
+ * map to UINT64_MAX, which Rust reports as unknown; an oversized timeout
+ * maps to UINT32_MAX, which Rust rejects. */
+CAMLprim value ocaml_temporal_client_await_call(value call, value timeout_ms) {
+  CAMLparam2(call, timeout_ms);
+  CAMLlocal1(response);
+  intnat requested_call = Long_val(call);
+  intnat requested_timeout = Long_val(timeout_ms);
+  uint64_t native_call =
+      requested_call < 0 ? UINT64_MAX : (uint64_t)requested_call;
+  uint32_t native_timeout =
+      requested_timeout < 0 || (uintnat)requested_timeout > UINT32_MAX
+          ? UINT32_MAX
+          : (uint32_t)requested_timeout;
+  ocaml_temporal_core_result native_result = {0};
+
+  response = alloc_response();
+  caml_enter_blocking_section();
+  (void)ocaml_temporal_core_v4_client_await_call(native_call, native_timeout,
+                                                 &native_result);
+  caml_leave_blocking_section();
+  Response_val(response)->result = native_result;
+  CAMLreturn(response);
+}
+
 /* Complete an activity that has already returned WillCompleteAsync. Rust
  * routes this JSON through the namespace-bound client, not the worker ledger. */
 CAMLprim value
