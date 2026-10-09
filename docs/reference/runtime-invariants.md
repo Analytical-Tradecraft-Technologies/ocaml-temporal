@@ -520,6 +520,15 @@ and bridge, read the [documentation guide](../README.md) first.
 - Exactly one dedicated owner Domain creates, uses, and closes the complete
   runtime/client/worker graph for an SDK instance. Individual native handles do
   not receive their own actors.
+- A graph attached to a shared runtime (#832) is still owned only by its own
+  supervisor; what is shared is a reference-counted Core (Tokio executor), not
+  mutable graph state. Core is destroyed exactly once, by the last of the
+  shared handle and its attached graphs to release it, so no release order
+  can free it under a live graph. Each attachment is one lease, released
+  exactly once after its graph's `runtime_close` returns (or immediately if
+  creation fails). `Runtime.shutdown` refuses with a typed defect while any
+  lease is outstanding and otherwise returns only after Core's threads are
+  gone.
 - Backend state never appears in a producer-facing operation or result. Typed
   GADT operations may expose ordinary copied values but cannot return a raw
   native handle.

@@ -11,7 +11,7 @@ where application code normally uses them.
 | Context | Modules | Use them for |
 | --- | --- | --- |
 | Workflow code | `Temporal.Workflow`, `Temporal.Activity`, `Temporal.Child_workflow`, `Temporal.Future`, `Temporal.Condition`, `Temporal.Scope`, `Temporal.Workflow_context`, `Temporal.Time`, `Temporal.Duration` | Defining deterministic work, making replay-safe time and pseudo-random choices, scheduling Temporal operations, waiting for results, and keeping execution-local state |
-| Application startup and shutdown | `Temporal.Client`, `Temporal.Worker`, `Temporal.Runtime_info` | Connecting to Temporal, registering executable definitions, running the worker, and checking the linked bridge |
+| Application startup and shutdown | `Temporal.Client`, `Temporal.Worker`, `Temporal.Runtime`, `Temporal.Runtime_info` | Connecting to Temporal, registering executable definitions, running the worker, optionally sharing background I/O threads, and checking the linked bridge |
 | Values crossing a Temporal boundary | `Temporal.Codec`, `Temporal.Payload`, `Temporal.Error`, `Temporal.Result_syntax` | Encoding typed values, inspecting opaque payloads, representing expected failures, and composing `result` values |
 | Signals, queries, and updates | `Temporal.Signal`, `Temporal.Query`, `Temporal.Update`, `Temporal.Interaction` | Defining typed interactions, registering handlers, and testing deterministic local dispatch |
 | Application tests | `Temporal.Testing` | Running registered workflows and activities in-process with a time-skipping virtual clock, stubbing activities and child workflows, and driving signals, queries, updates, and cancellation without a Temporal Server |
@@ -179,6 +179,16 @@ for those rules.
   available parallelism capped at 4; a value outside 1..256 is a typed defect
   returned before anything is allocated. The bound applies per client and per
   worker.
+- `Temporal.Runtime` is an explicit, shareable background I/O runtime (#832).
+  `Runtime.create ?io_threads ()` starts it, and passing it as `?runtime` to
+  `Client.create` and `Worker.create` makes those instances share its threads
+  instead of starting their own (`?runtime` together with `?io_threads` is a
+  typed defect). Each attached client or worker stays attached until its own
+  `shutdown` returns; `Runtime.attached` reports the count, and
+  `Runtime.shutdown` returns a typed defect while it is non-zero, so
+  instances must be shut down before their runtime. A shut-down runtime
+  rejects new attachments with a typed defect. Without `?runtime`, behavior
+  is unchanged.
 - `Temporal.Worker` registers workflows, activities, and the signal, query, and
   update handlers attached to each workflow registration. It owns one
   supervisor graph, runs the poll loops, and performs idempotent shutdown.

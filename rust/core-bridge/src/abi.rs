@@ -257,8 +257,61 @@ const _: () = assert!(size_of::<Status>() == 4);
 
 /// Monotonic test instrumentation for successfully exposed runtime owners.
 static RUNTIMES_CREATED: AtomicU64 = AtomicU64::new(0);
-/// Monotonic test instrumentation for Core instances whose destructor ran.
+/// Monotonic test instrumentation for instance graphs whose cleanup
+/// completed. For an owned runtime this includes Core's destructor; for a
+/// graph attached to a [`SharedRuntime`] it includes Core's destructor only
+/// when that graph held the last reference.
 static RUNTIMES_CLEANED: AtomicU64 = AtomicU64::new(0);
+/// Monotonic test instrumentation for [`SharedRuntime`] handles exposed.
+static SHARED_RUNTIMES_CREATED: AtomicU64 = AtomicU64::new(0);
+/// Monotonic test instrumentation for Core runtimes whose destructor
+/// returned, counted by [`CoreDropMarker`] after Core and its log writer.
+static CORE_RUNTIMES_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// Zero-sized marker declared last in [`SharedCore`] so its destructor runs
+/// only after Core and the log writer have been dropped.
+struct CoreDropMarker;
+
+impl Drop for CoreDropMarker {
+    /// Publishes Core destruction for the isolated ownership tests.
+    fn drop(&mut self) {
+        CORE_RUNTIMES_DROPPED.fetch_add(1, Ordering::Release);
+    }
+}
+
+/// One Temporal Core runtime (its Tokio executor, telemetry, and optional
+/// Core log writer), reference-counted between its users (#832).
+///
+/// Every instance graph ([`Runtime`]) holds one `Arc` clone, and a
+/// [`SharedRuntime`] handle holds one more while it is open. Core is
+/// therefore destroyed exactly once, by whichever holder drops the last
+/// reference, and can never be released while a client or worker created on
+/// it still exists. Every holder drops its reference on a plain OS thread
+/// (a cleanup thread or an OCaml thread outside the runtime lock), never on
+/// a Tokio worker, because dropping a Tokio runtime inside its own context
+/// panics.
+///
+/// Field order is load-bearing: Rust drops fields in declaration order, so
+/// Core is dropped before the log writer (which then flushes Core's shutdown
+/// records within `CORE_LOG_CLOSE_TIMEOUT`), and the drop marker last.
+pub(crate) struct SharedCore {
+    core: CoreRuntime,
+    /// Writer thread draining Core's log queue to stderr, absent when Core
+    /// logging is `off`; see [`diagnostics::CoreLogWriter`]. The writer owns
+    /// a non-`Sync` receiver, and the mutex is what lets an `Arc` of this
+    /// struct cross threads; it is locked only by the test log-sink helper.
+    core_log: std::sync::Mutex<Option<diagnostics::CoreLogWriter>>,
+    _dropped: CoreDropMarker,
+}
+
+impl std::ops::Deref for SharedCore {
+    type Target = CoreRuntime;
+
+    /// Lets holders use Core exactly as they used an owned `CoreRuntime`.
+    fn deref(&self) -> &CoreRuntime {
+        &self.core
+    }
+}
 
 /// Borrows one exact-run history future for a bounded owner interval.
 ///
@@ -353,12 +406,16 @@ struct Failure {
     message: String,
 }
 
-/// Owns the Tokio executor and shared Temporal Core runtime for one SDK instance.
+/// Owns the native graph (client, worker, and their bookkeeping) for one SDK
+/// instance, plus one reference to the Temporal Core runtime it runs on.
 ///
-/// The type is opaque to C. Higher-level client and worker handles will retain
-/// the same runtime owner rather than creating independent executors.
+/// The type is opaque to C. The Core reference is either the only one (a
+/// runtime created by [`ocaml_temporal_core_v4_runtime_new_with_worker_threads`])
+/// or a clone shared with a [`SharedRuntime`] and its other attached graphs
+/// (created by [`ocaml_temporal_core_v4_runtime_new_attached`]). Either way
+/// the graph's children are dropped before its Core reference.
 pub struct Runtime {
-    core: Option<CoreRuntime>,
+    core: Option<Arc<SharedCore>>,
     client: Option<Connection>,
     worker: Option<PollLanes>,
     /// Optional workflow-only replay graph. It is mutually exclusive with the
@@ -375,10 +432,121 @@ pub struct Runtime {
     pending_starts: HashMap<String, PendingStart>,
     pending_waits: HashMap<client_protocol::WaitWorkflowRequest, PendingWait>,
     cleanup: std::sync::mpsc::Sender<RuntimeCleanup>,
-    /// Writer thread draining Core's log queue to stderr, absent when Core
-    /// logging is `off`. Close transfers it to the cleanup thread, which
-    /// closes it after Core is dropped; see [`diagnostics::CoreLogWriter`].
-    core_log: Option<diagnostics::CoreLogWriter>,
+}
+
+/// Opaque handle to a Core runtime that several instance graphs share (#832).
+///
+/// The handle owns one reference to its [`SharedCore`]; every graph created
+/// from it by [`ocaml_temporal_core_v4_runtime_new_attached`] owns another.
+/// Releasing the handle therefore never invalidates an attached graph: Core
+/// is destroyed only when the handle and every attached graph have released
+/// their references, in any order. Callers that need Core destroyed when the
+/// handle is released (the OCaml `Runtime.shutdown` contract) must release
+/// every attached graph first; the OCaml layer enforces that ordering with a
+/// typed error before reaching this ABI.
+///
+/// Like [`Runtime`], the handle starts its own cleanup thread before it is
+/// published, so the non-blocking GC fallback can hand a possibly-last
+/// reference to a plain OS thread instead of destroying Tokio inside an
+/// OCaml finalizer.
+pub struct SharedRuntime {
+    core: Option<Arc<SharedCore>>,
+    cleanup: std::sync::mpsc::Sender<SharedRuntimeCleanup>,
+}
+
+/// Reference transfer consumed by a [`SharedRuntime`]'s cleanup thread.
+struct SharedRuntimeCleanup {
+    core: Arc<SharedCore>,
+    /// Present for explicit release, which waits until the reference (and,
+    /// when it was the last one, Core itself) has been dropped.
+    completed: Option<SyncSender<Status>>,
+}
+
+#[cfg(test)]
+impl Runtime {
+    /// Test-only graph that owns `core` alone, with Core logging off. Unit
+    /// tests build Core with custom options, then wrap it exactly as
+    /// [`create_runtime`] would.
+    fn with_owned_core(core: CoreRuntime) -> std::result::Result<Self, Failure> {
+        Self::new(Arc::new(SharedCore {
+            core,
+            core_log: std::sync::Mutex::new(None),
+            _dropped: CoreDropMarker,
+        }))
+    }
+}
+
+impl SharedRuntime {
+    /// Starts the cleanup thread before exposing a handle, mirroring
+    /// [`Runtime::new`]: every published handle has a non-blocking release
+    /// path.
+    fn new(core: SharedCore) -> std::result::Result<Self, Failure> {
+        let (cleanup, receiver) = channel();
+        std::thread::Builder::new()
+            .name("ocaml-temporal-shared-runtime-cleanup".to_owned())
+            .spawn(move || run_shared_runtime_cleanup(receiver))
+            .map_err(|error| Failure {
+                status: STATUS_INTERNAL,
+                message: format!("could not start Temporal runtime cleanup thread: {error}"),
+            })?;
+        SHARED_RUNTIMES_CREATED.fetch_add(1, Ordering::Relaxed);
+        Ok(Self {
+            core: Some(Arc::new(core)),
+            cleanup,
+        })
+    }
+
+    /// Creates one instance graph holding a new reference to this Core.
+    fn attach(&self) -> std::result::Result<Runtime, Failure> {
+        let core = self.core.as_ref().ok_or_else(|| Failure {
+            status: STATUS_INVALID_STATE,
+            message: "shared Temporal runtime is already released".to_owned(),
+        })?;
+        Runtime::new(Arc::clone(core))
+    }
+
+    /// Transfers this handle's Core reference to the cleanup thread and
+    /// optionally waits until it has been dropped. A release with attached
+    /// graphs still alive only decrements the count; Core then outlives this
+    /// handle until the last graph is closed.
+    fn release(mut self, wait: bool) -> Status {
+        let Some(core) = self.core.take() else {
+            return STATUS_OK;
+        };
+        let (completed, receiver) = if wait {
+            let (sender, receiver) = sync_channel(1);
+            (Some(sender), Some(receiver))
+        } else {
+            (None, None)
+        };
+        if let Err(error) = self.cleanup.send(SharedRuntimeCleanup { core, completed }) {
+            // The receiver exits only after a message, so this is a defect in
+            // the cleanup thread. Reclaim here to preserve the no-leak rule;
+            // both callers run outside any Tokio context.
+            drop(error.0.core);
+            return STATUS_INTERNAL;
+        }
+        match receiver {
+            Some(receiver) => receiver.recv().unwrap_or(STATUS_INTERNAL),
+            None => STATUS_OK,
+        }
+    }
+}
+
+/// Drops one shared-runtime reference away from OCaml's collector and
+/// reports completion when asked. A panic in Core's destructor is contained.
+fn run_shared_runtime_cleanup(receiver: Receiver<SharedRuntimeCleanup>) {
+    let Ok(SharedRuntimeCleanup { core, completed }) = receiver.recv() else {
+        return;
+    };
+    let status = if catch_unwind(AssertUnwindSafe(|| drop(core))).is_ok() {
+        STATUS_OK
+    } else {
+        STATUS_PANIC
+    };
+    if let Some(completed) = completed {
+        let _ = completed.send(status);
+    }
 }
 
 /// One exact-run history observation, polled only by its runtime owner.
@@ -440,7 +608,7 @@ enum StartRead {
 
 /// Ownership transfer consumed by the runtime's dedicated cleanup thread.
 struct RuntimeCleanup {
-    core: CoreRuntime,
+    core: Arc<SharedCore>,
     client: Option<Connection>,
     worker: Option<PollLanes>,
     replay_worker: Option<ReplayWorker>,
@@ -449,10 +617,6 @@ struct RuntimeCleanup {
     /// non-blocking OCaml finalizer transfers these handles here instead of
     /// dropping them on the caller thread, which would detach the tasks.
     pending_start_tasks: Vec<JoinHandle<()>>,
-    /// Core log writer, closed only after Core has been dropped so its
-    /// shutdown records are flushed. Its bounded close detaches a writer
-    /// blocked on stderr instead of delaying runtime close indefinitely.
-    core_log: Option<diagnostics::CoreLogWriter>,
     completed: Option<SyncSender<Status>>,
 }
 
@@ -528,10 +692,7 @@ enum WorkerVersioningInput {
 impl Runtime {
     /// Starts the cleanup thread before exposing a handle, so every successful
     /// runtime allocation already has a non-blocking GC fallback path.
-    fn new(
-        core: CoreRuntime,
-        core_log: Option<diagnostics::CoreLogWriter>,
-    ) -> std::result::Result<Self, Failure> {
+    fn new(core: Arc<SharedCore>) -> std::result::Result<Self, Failure> {
         let (cleanup, receiver) = channel();
         std::thread::Builder::new()
             .name("ocaml-temporal-runtime-cleanup".to_owned())
@@ -552,7 +713,6 @@ impl Runtime {
             pending_starts: HashMap::new(),
             pending_waits: HashMap::new(),
             cleanup,
-            core_log,
         })
     }
 
@@ -2206,7 +2366,6 @@ impl Runtime {
             worker: self.worker.take(),
             replay_worker: self.replay_worker.take(),
             pending_start_tasks,
-            core_log: self.core_log.take(),
             completed,
         };
 
@@ -2222,7 +2381,6 @@ impl Runtime {
                 message.replay_worker,
                 message.pending_start_tasks,
             );
-            drop(message.core_log);
             RUNTIMES_CLEANED.fetch_add(1, Ordering::Release);
             return STATUS_INTERNAL;
         }
@@ -2257,7 +2415,6 @@ fn run_runtime_cleanup(receiver: Receiver<RuntimeCleanup>) {
         worker,
         replay_worker,
         pending_start_tasks,
-        core_log,
         completed,
     } = message;
     let status = if catch_unwind(AssertUnwindSafe(|| {
@@ -2269,27 +2426,24 @@ fn run_runtime_cleanup(receiver: Receiver<RuntimeCleanup>) {
     } else {
         STATUS_PANIC
     };
-    // Core is gone, so no further records reach this runtime's queue except
-    // through a stale subscriber, which the close disconnects. The close
-    // flushes queued shutdown records but waits at most
-    // `CORE_LOG_CLOSE_TIMEOUT`, detaching a writer blocked on stderr.
-    if let Some(core_log) = core_log {
-        let _ = core_log.close(diagnostics::CORE_LOG_CLOSE_TIMEOUT);
-    }
-    // Release publishes completion after Core's destructor has returned. The
-    // matching Acquire load is used only by the isolated ownership test.
+    // When this graph held Core's last reference, `drop_runtime_graph` has
+    // already dropped Core and then closed its log writer (see the field
+    // order of `SharedCore`); otherwise Core stays alive for its other
+    // holders. Release publishes completion after that drop has returned.
+    // The matching Acquire load is used only by the isolated ownership test.
     RUNTIMES_CLEANED.fetch_add(1, Ordering::Release);
     if let Some(completed) = completed {
         let _ = completed.send(status);
     }
 }
 
-/// Releases aborted start tasks, then worker, client, and Core on the runtime
-/// cleanup thread.  Awaiting the transferred handles is essential: dropping a
+/// Releases aborted start tasks, then worker, client, and this graph's Core
+/// reference on the runtime cleanup thread (Core itself is destroyed only if
+/// that was its last reference).  Awaiting the transferred handles is essential: dropping a
 /// Tokio [`JoinHandle`] after `abort` would detach its task, allowing the task
 /// to retain a cloned `Connection` beyond the lifetime of the runtime graph.
 fn drop_runtime_graph(
-    core: CoreRuntime,
+    core: Arc<SharedCore>,
     client: Option<Connection>,
     worker: Option<PollLanes>,
     replay_worker: Option<ReplayWorker>,
@@ -2330,8 +2484,10 @@ fn drop_runtime_graph(
                 // is the last-resort reclaim path.
                 drop(worker);
             }
-            // A detached finalizer still owns the worker; dropping Core below
-            // shuts down its Tokio runtime, which ends that task.
+            // A detached finalizer still owns the worker; dropping the last
+            // Core reference shuts down its Tokio runtime, which ends that
+            // task. On a shared runtime the task ends when the last holder
+            // releases Core, still bounded by that runtime's lifetime.
             BoundedFinalize::Finalized | BoundedFinalize::Panicked | BoundedFinalize::Detached => {}
         }
     }
@@ -3094,6 +3250,17 @@ fn create_runtime(
     worker_threads: usize,
     spawn_log: impl FnOnce() -> std::io::Result<diagnostics::CoreLogWriter>,
 ) -> std::result::Result<Runtime, Failure> {
+    let core = create_shared_core(log_level, worker_threads, spawn_log)?;
+    Runtime::new(Arc::new(core))
+}
+
+/// Builds one Core runtime and its optional log writer without any instance
+/// graph; see [`create_runtime`] for the logging and failure contract.
+fn create_shared_core(
+    log_level: Option<diagnostics::CoreLogLevel>,
+    worker_threads: usize,
+    spawn_log: impl FnOnce() -> std::io::Result<diagnostics::CoreLogWriter>,
+) -> std::result::Result<SharedCore, Failure> {
     let core_log = match log_level {
         Some(level) => {
             let writer = spawn_log().map_err(|error| Failure {
@@ -3133,7 +3300,11 @@ fn create_runtime(
             message: "could not create Temporal Core runtime".to_owned(),
         }
     })?;
-    Runtime::new(core, core_log.map(|(_, writer)| writer))
+    Ok(SharedCore {
+        core,
+        core_log: std::sync::Mutex::new(core_log.map(|(_, writer)| writer)),
+        _dropped: CoreDropMarker,
+    })
 }
 
 /// Resolves the Tokio worker-thread count for one runtime (#832).
@@ -3252,6 +3423,179 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_runtime_new_with_worker_threads(
             Ok(Vec::new())
         })
     }
+}
+
+/// Create a Core runtime that several instance graphs can share (#832).
+///
+/// `worker_threads` has exactly the contract of
+/// [`ocaml_temporal_core_v4_runtime_new_with_worker_threads`]; an invalid
+/// count fails before anything is allocated. On success, `shared` receives
+/// one owned opaque handle that must eventually be passed to
+/// [`ocaml_temporal_core_v4_shared_runtime_free`] (or, from a GC finalizer,
+/// [`ocaml_temporal_core_v4_shared_runtime_dispose`]). The handle carries no
+/// client or worker; graphs are created on it with
+/// [`ocaml_temporal_core_v4_runtime_new_attached`].
+///
+/// # Safety
+///
+/// `shared` must be null or point to writable storage for one handle pointer
+/// that does not already contain a live handle. `output` follows the result
+/// contract of [`ocaml_temporal_core_v4_check_abi_version`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ocaml_temporal_core_v4_shared_runtime_new(
+    worker_threads: u32,
+    shared: *mut *mut SharedRuntime,
+    output: *mut Result,
+) -> Status {
+    // Canonicalize the slot first, as in `runtime_new_with_worker_threads`,
+    // so every failing return leaves a known null value.
+    if !shared.is_null() {
+        // SAFETY: A non-null slot promises writable pointer storage.
+        unsafe { ptr::write(shared, ptr::null_mut()) };
+    }
+    if output.is_null() {
+        return STATUS_INVALID_ARGUMENT;
+    }
+    // SAFETY: The result pointer was checked above; the slot is checked in
+    // the closure before it is written.
+    unsafe {
+        invoke(output, || {
+            if shared.is_null() {
+                return Err(Failure {
+                    status: STATUS_INVALID_ARGUMENT,
+                    message: "shared runtime output pointer is null".to_owned(),
+                });
+            }
+            let worker_threads = runtime_worker_threads(worker_threads)?;
+            let log_level = diagnostics::core_log_level_from_env().map_err(|message| Failure {
+                status: STATUS_CONFIGURATION,
+                message,
+            })?;
+            let core = create_shared_core(
+                log_level,
+                worker_threads,
+                diagnostics::CoreLogWriter::spawn_stderr,
+            )?;
+            let owned = Box::into_raw(Box::new(SharedRuntime::new(core)?));
+            // SAFETY: The slot was validated above and is exclusively owned
+            // by this call until it returns.
+            ptr::write(shared, owned);
+            Ok(Vec::new())
+        })
+    }
+}
+
+/// Create an instance graph that runs on a shared Core runtime (#832).
+///
+/// The new graph behaves exactly like one from
+/// [`ocaml_temporal_core_v4_runtime_new`] (one client, one worker, its own
+/// cleanup thread, released through
+/// [`ocaml_temporal_core_v4_runtime_free`]), except that it holds a
+/// reference to `shared`'s Core instead of building its own. That reference
+/// keeps Core alive until the graph is released, even if `shared` is
+/// released first. A `shared` handle that was already released fails with
+/// `STATUS_INVALID_STATE`; a null one with `STATUS_INVALID_ARGUMENT`.
+///
+/// # Safety
+///
+/// `shared` must be null or a live handle from
+/// [`ocaml_temporal_core_v4_shared_runtime_new`] that is not concurrently
+/// released; concurrent attaches on one handle are permitted. `runtime` and
+/// `output` follow [`ocaml_temporal_core_v4_runtime_new_with_worker_threads`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ocaml_temporal_core_v4_runtime_new_attached(
+    shared: *const SharedRuntime,
+    runtime: *mut *mut Runtime,
+    output: *mut Result,
+) -> Status {
+    if !runtime.is_null() {
+        // SAFETY: A non-null runtime argument promises writable pointer storage.
+        unsafe { ptr::write(runtime, ptr::null_mut()) };
+    }
+    if output.is_null() {
+        return STATUS_INVALID_ARGUMENT;
+    }
+    // SAFETY: The result pointer was checked above; both input pointers are
+    // checked in the closure before use.
+    unsafe {
+        invoke(output, || {
+            if runtime.is_null() {
+                return Err(Failure {
+                    status: STATUS_INVALID_ARGUMENT,
+                    message: "runtime output pointer is null".to_owned(),
+                });
+            }
+            // SAFETY: The caller promises a null or live, unreleased handle.
+            let shared = shared.as_ref().ok_or_else(|| Failure {
+                status: STATUS_INVALID_ARGUMENT,
+                message: "shared runtime handle is null".to_owned(),
+            })?;
+            let owned = Box::into_raw(Box::new(shared.attach()?));
+            // SAFETY: The slot was validated above.
+            ptr::write(runtime, owned);
+            Ok(Vec::new())
+        })
+    }
+}
+
+/// Release a shared-runtime handle and clear the caller's slot, waiting
+/// until its Core reference has been dropped.
+///
+/// When no attached graph remains, this destroys Core (and its Tokio pool)
+/// before returning. When graphs are still attached, it only releases this
+/// handle's reference and Core is destroyed by the last graph's release.
+/// Calling again with the now-null slot is safe.
+///
+/// # Safety
+///
+/// `shared` must be null or point to a slot initialized by
+/// [`ocaml_temporal_core_v4_shared_runtime_new`]. The slot must not be
+/// accessed concurrently, and the caller must not be on a Tokio worker.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ocaml_temporal_core_v4_shared_runtime_free(
+    shared: *mut *mut SharedRuntime,
+) -> Status {
+    // SAFETY: The slot contract is forwarded unchanged.
+    unsafe { release_shared_runtime_slot(shared, true) }
+}
+
+/// Transfer a shared-runtime handle's reference to its cleanup thread
+/// without waiting. Reserved for the OCaml custom-block finalizer.
+///
+/// # Safety
+///
+/// As for [`ocaml_temporal_core_v4_shared_runtime_free`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ocaml_temporal_core_v4_shared_runtime_dispose(
+    shared: *mut *mut SharedRuntime,
+) -> Status {
+    // SAFETY: The slot contract is forwarded unchanged.
+    unsafe { release_shared_runtime_slot(shared, false) }
+}
+
+/// Shared body of the two shared-runtime release exports: clears the slot
+/// before releasing, contains panics, and is idempotent on a null slot.
+///
+/// # Safety
+///
+/// As for [`ocaml_temporal_core_v4_shared_runtime_free`].
+unsafe fn release_shared_runtime_slot(shared: *mut *mut SharedRuntime, wait: bool) -> Status {
+    if shared.is_null() {
+        return STATUS_INVALID_ARGUMENT;
+    }
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: The caller guarantees exclusive writable access to the slot.
+        let owned = unsafe { ptr::replace(shared, ptr::null_mut()) };
+        if owned.is_null() {
+            STATUS_OK
+        } else {
+            // SAFETY: Non-null values in this slot originate from
+            // `Box::into_raw` in `shared_runtime_new` and are consumed once.
+            let shared = unsafe { Box::from_raw(owned) };
+            shared.release(wait)
+        }
+    }));
+    outcome.unwrap_or(STATUS_PANIC)
 }
 
 /// Connect the runtime graph's single official Temporal client from strict
@@ -4511,6 +4855,48 @@ pub fn test_runtime_cleanup_counts() -> (u64, u64) {
     )
 }
 
+/// Returns process-local shared-runtime counts for the isolated sharing
+/// test: shared handles created, and Core runtimes whose destructor (and log
+/// writer close) returned. Not part of the C ABI.
+#[doc(hidden)]
+pub fn test_core_runtime_counts() -> (u64, u64) {
+    (
+        SHARED_RUNTIMES_CREATED.load(Ordering::Acquire),
+        CORE_RUNTIMES_DROPPED.load(Ordering::Acquire),
+    )
+}
+
+/// Reports whether two live instance graphs run on the same Core runtime,
+/// or `None` if either handle is null or already released. Not part of the
+/// C ABI; it lets tests prove attachment shares rather than copies Core.
+///
+/// # Safety
+///
+/// Both pointers must be null or live handles not used concurrently.
+#[doc(hidden)]
+pub unsafe fn test_runtimes_share_core(
+    left: *const Runtime,
+    right: *const Runtime,
+) -> Option<bool> {
+    // SAFETY: The caller promises null or live, unshared handles.
+    let (left, right) = unsafe { (left.as_ref()?, right.as_ref()?) };
+    Some(Arc::ptr_eq(left.core.as_ref()?, right.core.as_ref()?))
+}
+
+/// Returns the number of live references to a shared handle's Core (the
+/// handle's own plus one per attached graph), or `None` for a null or
+/// released handle. Not part of the C ABI.
+///
+/// # Safety
+///
+/// `shared` must be null or a live handle that is not released concurrently.
+#[doc(hidden)]
+pub unsafe fn test_shared_runtime_references(shared: *const SharedRuntime) -> Option<usize> {
+    // SAFETY: The caller promises a null or live handle.
+    let shared = unsafe { shared.as_ref() }?;
+    shared.core.as_ref().map(Arc::strong_count)
+}
+
 /// Creates a runtime whose Core log writer drains into `sink` instead of
 /// stderr, returning the owned handle and a producer for its log queue.
 ///
@@ -4531,9 +4917,14 @@ pub fn test_runtime_new_with_core_log_sink(
     )
     .map_err(|failure| failure.message)?;
     let queue = runtime
-        .core_log
+        .core
         .as_ref()
-        .map(diagnostics::CoreLogWriter::queue)
+        .and_then(|core| {
+            core.core_log
+                .lock()
+                .ok()
+                .and_then(|writer| writer.as_ref().map(diagnostics::CoreLogWriter::queue))
+        })
         .ok_or_else(|| "runtime has no Core log writer".to_owned())?;
     Ok((Box::into_raw(Box::new(runtime)), queue))
 }

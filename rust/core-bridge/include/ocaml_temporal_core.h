@@ -50,6 +50,9 @@ typedef struct ocaml_temporal_core_result {
 
 /* Opaque handle types reserved by ABI v3 for the worker implementation. */
 typedef struct ocaml_temporal_core_runtime ocaml_temporal_core_runtime;
+/* A Core runtime (Tokio executor) shared by several runtime graphs (#832). */
+typedef struct ocaml_temporal_core_shared_runtime
+    ocaml_temporal_core_shared_runtime;
 typedef struct ocaml_temporal_core_client ocaml_temporal_core_client;
 typedef struct ocaml_temporal_core_worker ocaml_temporal_core_worker;
 
@@ -101,6 +104,28 @@ ocaml_temporal_core_status ocaml_temporal_core_v4_runtime_new(
 ocaml_temporal_core_status ocaml_temporal_core_v4_runtime_new_with_worker_threads(
     uint32_t worker_threads, ocaml_temporal_core_runtime **runtime,
     ocaml_temporal_core_result *output);
+
+/*
+ * Create a Core runtime that several runtime graphs can share (#832).
+ * worker_threads has the contract of runtime_new_with_worker_threads. On
+ * success `*shared` receives an owned handle carrying no client or worker;
+ * release it with ocaml_temporal_core_v4_shared_runtime_free.
+ */
+ocaml_temporal_core_status ocaml_temporal_core_v4_shared_runtime_new(
+    uint32_t worker_threads, ocaml_temporal_core_shared_runtime **shared,
+    ocaml_temporal_core_result *output);
+
+/*
+ * Create a runtime graph that runs on `shared`'s Core instead of its own.
+ * The graph is used and released exactly like one from runtime_new. It holds
+ * its own reference to the shared Core, so Core outlives the graph even if
+ * `shared` is released first. A released `shared` fails with
+ * OCAML_TEMPORAL_CORE_STATUS_INVALID_STATE and leaves `*runtime` NULL.
+ * Concurrent attaches on one live handle are permitted.
+ */
+ocaml_temporal_core_status ocaml_temporal_core_v4_runtime_new_attached(
+    const ocaml_temporal_core_shared_runtime *shared,
+    ocaml_temporal_core_runtime **runtime, ocaml_temporal_core_result *output);
 
 /*
  * Strictly decode one UTF-8 JSON client configuration, connect through the
@@ -377,6 +402,22 @@ ocaml_temporal_core_status ocaml_temporal_core_v4_runtime_free(
  */
 ocaml_temporal_core_status ocaml_temporal_core_v4_runtime_dispose(
     ocaml_temporal_core_runtime **runtime);
+
+/*
+ * Release a shared-runtime handle, clear the slot, and wait until its Core
+ * reference is dropped. Core is destroyed here only if no attached graph
+ * remains; otherwise the last graph's release destroys it. Calling again
+ * with the now-null slot is safe.
+ */
+ocaml_temporal_core_status ocaml_temporal_core_v4_shared_runtime_free(
+    ocaml_temporal_core_shared_runtime **shared);
+
+/*
+ * GC fallback that transfers a shared-runtime handle's reference to its
+ * Rust cleanup thread without waiting.
+ */
+ocaml_temporal_core_status ocaml_temporal_core_v4_shared_runtime_dispose(
+    ocaml_temporal_core_shared_runtime **shared);
 
 ocaml_temporal_core_status ocaml_temporal_core_v4_result_free(
     ocaml_temporal_core_result *result);

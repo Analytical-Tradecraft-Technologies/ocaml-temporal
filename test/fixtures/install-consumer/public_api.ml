@@ -23,6 +23,7 @@ module Payload = T.Payload
 module Query = T.Query
 module Replay = T.Replay
 module Result_syntax = T.Result_syntax
+module Runtime = T.Runtime
 module Runtime_info = T.Runtime_info
 module Scope = T.Scope
 module Signal = T.Signal
@@ -610,6 +611,7 @@ let _interaction_update :
 let _client_create :
     ?identity:string ->
     ?io_threads:int ->
+    ?runtime:T.Runtime.t ->
     target_url:string ->
     namespace:string ->
     unit -> (T.Client.t, T.Error.t) result =
@@ -775,6 +777,7 @@ let _worker_create :
     ?options:T.Worker.Options.t ->
     ?max_cached_workflows:int ->
     ?io_threads:int ->
+    ?runtime:T.Runtime.t ->
     target_url:string ->
     namespace:string ->
     task_queue:string ->
@@ -859,6 +862,14 @@ let _condition_wait_until_result :
 
 let _runtime_abi_version : unit -> (int32, T.Error.t) result =
   T.Runtime_info.native_bridge_abi_version
+
+(* A shared runtime is an explicit resource: created, counted, and shut down
+   by the application, with typed results on every path (#832). *)
+let _runtime_create : ?io_threads:int -> unit -> (T.Runtime.t, T.Error.t) result =
+  T.Runtime.create
+let _runtime_attached : T.Runtime.t -> int = T.Runtime.attached
+let _runtime_shutdown : T.Runtime.t -> (unit, T.Error.t) result =
+  T.Runtime.shutdown
 
 let _scope_create : unit -> (T.Scope.t, T.Error.t) result = T.Scope.create
 let _scope_with_scope :
