@@ -45,6 +45,11 @@ type ('input, 'output) handle = {
     workflow ID whose current run is still open. *)
 type id_conflict_policy = [ `Fail | `Use_existing | `Terminate_existing ]
 
+(** Temporal's workflow ID reuse policy, applied when a start names a
+    workflow ID whose latest run has already closed. *)
+type id_reuse_policy =
+  [ `Allow_duplicate | `Allow_duplicate_failed_only | `Reject_duplicate ]
+
 (** A client-side handle for one admitted workflow update. It retains the
     update definition and encoded input so completion polls cannot be confused
     with another request or require any native pointer ownership. *)
@@ -227,12 +232,118 @@ let validate_start_metadata ~memo ~search_attributes =
   Result.bind (validate "memo" memo) (fun () ->
       validate "search attribute" search_attributes)
 
+(** The private protocol's bounds and deadline representation, shared so the
+    mock and the native bridge reject the same values at the public
+    boundary. *)
+module Client_protocol = Temporal_sdk_kernel.Client_protocol
+
+(** Validates an optional caller RPC timeout and turns it into an absolute
+    deadline on the process's monotonic clock, read now, at the public entry
+    point. The timeout bounds the whole client call, including the time the
+    request waits in the supervisor's FIFO mailbox behind earlier calls on
+    the same client (#807): the owner Domain sends only the budget that
+    remains when it dispatches the request, and fails the call with the typed
+    [Deadline_exceeded] error without sending it if none remains. The timeout
+    must be at least 1 ms and at most one minute, because control RPCs hold
+    the owner Domain for their whole budget. Violations are typed defects,
+    so every backend (including the mock, which ignores the deadline) rejects
+    the same values before any request is sent. *)
+let rpc_deadline = function
+  | None -> Ok None
+  | Some timeout ->
+      let milliseconds = Duration.to_ms timeout in
+      if
+        Int64.compare milliseconds 1L < 0
+        || Int64.compare milliseconds Client_protocol.max_rpc_timeout_ms > 0
+      then
+        Error
+          (Error.defect
+             ~message:"rpc_timeout must be between 1 ms and 60 seconds")
+      else
+        Ok
+          (Some
+             (Client_protocol.rpc_deadline
+                ~now_ns:(Temporal_sdk_kernel.Bridge.monotonic_now_ns ())
+                ~timeout_ms:milliseconds))
+
+(** Validated server-side execution policies of one start, in the
+    millisecond form the backend carries. *)
+type start_policies = {
+  execution_timeout_ms : int64 option;
+  run_timeout_ms : int64 option;
+  task_timeout_ms : int64 option;
+  start_rpc_deadline : Client_protocol.rpc_deadline option;
+}
+
+(** Validates a start's workflow timeouts and RPC deadline before encoding
+    input, mirroring the protocol encoder and the
+    Rust bridge so the mock rejects the same requests. A zero timeout is
+    rejected because Temporal reads zero as "unset" and would silently apply
+    its default; a task timeout above 120 seconds or above the run timeout
+    (the execution timeout when there is no run timeout) and a run timeout
+    above the execution timeout are rejected because Temporal would silently
+    lower them. Every combination of the reuse and conflict policies is
+    valid. Negative and overflowing values cannot be built as [Duration.t]. *)
+let validate_start_policies ~execution_timeout ~run_timeout ~task_timeout
+    ~rpc_timeout =
+  let timeout label maximum = function
+    | None -> Ok None
+    | Some duration ->
+        let milliseconds = Duration.to_ms duration in
+        if Int64.compare milliseconds 0L <= 0 then
+          Error (Error.defect ~message:(label ^ " must be positive"))
+        else if Int64.compare milliseconds maximum > 0 then
+          Error (Error.defect ~message:(label ^ " exceeds its maximum"))
+        else Ok (Some milliseconds)
+  in
+  let ( let* ) = Result.bind in
+  let* execution_timeout_ms =
+    timeout "execution_timeout" Client_protocol.max_workflow_timeout_ms
+      execution_timeout
+  in
+  let* run_timeout_ms =
+    timeout "run_timeout" Client_protocol.max_workflow_timeout_ms run_timeout
+  in
+  let* task_timeout_ms =
+    timeout "task_timeout (at most 120 seconds)"
+      Client_protocol.max_workflow_task_timeout_ms task_timeout
+  in
+  let* () =
+    match (execution_timeout_ms, run_timeout_ms) with
+    | Some execution, Some run when Int64.compare run execution > 0 ->
+        Error
+          (Error.defect ~message:"run_timeout exceeds execution_timeout")
+    | _ -> Ok ()
+  in
+  let* () =
+    (* A run without its own timeout is bounded by the execution timeout. *)
+    let run =
+      match run_timeout_ms with Some _ -> run_timeout_ms | None -> execution_timeout_ms
+    in
+    match (task_timeout_ms, run) with
+    | Some task, Some run when Int64.compare task run > 0 ->
+        Error
+          (Error.defect
+             ~message:"task_timeout exceeds the run (or execution) timeout")
+    | _ -> Ok ()
+  in
+  let* start_rpc_deadline = rpc_deadline rpc_timeout in
+  Ok
+    {
+      execution_timeout_ms;
+      run_timeout_ms;
+      task_timeout_ms;
+      start_rpc_deadline;
+    }
+
 (** Starts a workflow after encoding its typed input and checking the backend's
     response still refers to the request. The response check prevents an
     adapter bug from creating a handle for a different execution. *)
 let start client ?request_id ?(memo = []) ?(search_attributes = [])
-    ?(id_conflict_policy : id_conflict_policy = `Fail) ~workflow ~task_queue ~id
-    ~input () =
+    ?(id_conflict_policy : id_conflict_policy = `Fail)
+    ?(id_reuse_policy : id_reuse_policy = `Allow_duplicate) ?execution_timeout
+    ?run_timeout ?task_timeout ?retry_policy ?rpc_timeout ~workflow ~task_queue
+    ~id ~input () =
   if Atomic.get client.closed then
     Error
       (Error.make ~category:`Bridge ~message:"client is shut down" ())
@@ -243,9 +354,14 @@ let start client ?request_id ?(memo = []) ?(search_attributes = [])
     with
     | Error error -> Error error
     | Ok () -> (
-        match validate_start_metadata ~memo ~search_attributes with
+        match
+          Result.bind (validate_start_metadata ~memo ~search_attributes)
+            (fun () ->
+              validate_start_policies ~execution_timeout ~run_timeout
+                ~task_timeout ~rpc_timeout)
+        with
         | Error error -> Error error
-        | Ok () -> (
+        | Ok policies -> (
             match Codec.encode (Workflow.input workflow) input with
         | Error error -> Error error
         | Ok encoded_input ->
@@ -259,6 +375,13 @@ let start client ?request_id ?(memo = []) ?(search_attributes = [])
                 memo;
                 search_attributes;
                 id_conflict_policy;
+                id_reuse_policy;
+                execution_timeout_ms = policies.execution_timeout_ms;
+                run_timeout_ms = policies.run_timeout_ms;
+                task_timeout_ms = policies.task_timeout_ms;
+                retry_policy =
+                  Option.map Retry_policy_private.to_runtime retry_policy;
+                rpc_deadline = policies.start_rpc_deadline;
               }
             in
             Result.bind (Backend.client_start client.backend request) (fun response ->
@@ -464,15 +587,18 @@ let generated_cancel_request_id (handle : ('input, 'output) handle) =
 (** Sends a cancellation request for the run [handle] addresses and returns only after the
     server acknowledgement has been decoded. This operation is deliberately
     separate from [wait], because Temporal cancellation is asynchronous. *)
-let cancel ?request_id ?(reason = "")
+let cancel ?request_id ?(reason = "") ?rpc_timeout
     (handle : ('workflow_input, 'workflow_output) handle) =
   if Atomic.get handle.client.closed then
     Error
       (Error.make ~category:`Bridge ~message:"client is shut down" ())
   else
-    match validate_cancel_fields ~request_id ~reason with
+    match
+      Result.bind (validate_cancel_fields ~request_id ~reason) (fun () ->
+          rpc_deadline rpc_timeout)
+    with
     | Error error -> Error error
-    | Ok () ->
+    | Ok rpc_deadline ->
         let request_id =
           match request_id with
           | Some request_id -> request_id
@@ -484,6 +610,7 @@ let cancel ?request_id ?(reason = "")
             run_id = run_selector handle;
             request_id;
             reason;
+            rpc_deadline;
           }
         in
         Backend.client_cancel handle.client.backend request
@@ -501,19 +628,23 @@ let validate_terminate_reason reason =
 
 (** Terminates the run [handle] addresses. The acknowledgement is deliberately separate
     from [wait], which observes the server's terminal history event. *)
-let terminate ?(reason = "") (handle : ('input, 'output) handle) =
+let terminate ?(reason = "") ?rpc_timeout (handle : ('input, 'output) handle) =
   if Atomic.get handle.client.closed then
     Error
       (Error.make ~category:`Bridge ~message:"client is shut down" ())
   else
-    match validate_terminate_reason reason with
+    match
+      Result.bind (validate_terminate_reason reason) (fun () ->
+          rpc_deadline rpc_timeout)
+    with
     | Error error -> Error error
-    | Ok () ->
+    | Ok rpc_deadline ->
         let request : Backend.terminate_request =
           {
             workflow_id = handle.workflow_id;
             run_id = run_selector handle;
             reason;
+            rpc_deadline;
           }
         in
         Backend.client_terminate handle.client.backend request
@@ -551,17 +682,19 @@ let generated_reset_request_id = Temporal_base.Client_request_id.create
 (** Resets the run [handle] addresses and returns the new execution identity. A successful
     acknowledgement does not imply the new run has completed; use [follow] and
     [wait] to observe it explicitly. *)
-let reset ?request_id ?(reason = "") ~workflow_task_finish_event_id
+let reset ?request_id ?(reason = "") ?rpc_timeout ~workflow_task_finish_event_id
     (handle : ('input, 'output) handle) =
   if Atomic.get handle.client.closed then
     Error
       (Error.make ~category:`Bridge ~message:"client is shut down" ())
   else
     match
-      validate_reset_fields ~request_id ~reason ~workflow_task_finish_event_id
+      Result.bind
+        (validate_reset_fields ~request_id ~reason ~workflow_task_finish_event_id)
+        (fun () -> rpc_deadline rpc_timeout)
     with
     | Error error -> Error error
-    | Ok () ->
+    | Ok rpc_deadline ->
         let request_id =
           match request_id with
           | Some request_id -> request_id
@@ -574,6 +707,7 @@ let reset ?request_id ?(reason = "") ~workflow_task_finish_event_id
             request_id;
             reason;
             workflow_task_finish_event_id;
+            rpc_deadline;
           }
         in
         (match Backend.client_reset handle.client.backend request with
@@ -595,16 +729,19 @@ let generated_signal_request_id = Temporal_base.Client_request_id.create
 (** Sends one typed signal to the run [handle] addresses. The input is
     encoded before the backend call, and success means only that Temporal
     acknowledged the RPC; workflow code may process it asynchronously. *)
-let signal ?request_id
+let signal ?request_id ?rpc_timeout
     (handle : ('workflow_input, 'workflow_output) handle)
     ~(signal : 'signal Signal.t) ~input =
   if Atomic.get handle.client.closed then
     Error
       (Error.make ~category:`Bridge ~message:"client is shut down" ())
   else
-    match validate_signal_fields ~request_id with
+    match
+      Result.bind (validate_signal_fields ~request_id) (fun () ->
+          rpc_deadline rpc_timeout)
+    with
     | Error error -> Error error
-    | Ok () -> (
+    | Ok rpc_deadline -> (
         match Codec.encode (Signal.input signal) input with
         | Error error -> Error error
         | Ok encoded_input ->
@@ -620,6 +757,7 @@ let signal ?request_id
                 signal_name = Signal.name signal;
                 request_id;
                 input = encoded_input;
+                rpc_deadline;
               }
             in
             Backend.client_signal handle.client.backend request)
@@ -629,27 +767,37 @@ let signal ?request_id
     workflow-side [Query] definition is already output-only, and the result is
     decoded with the definition's codec only after the native bridge has
     validated the response payload. *)
-let query (handle : ('workflow_input, 'workflow_output) handle)
+let query ?rpc_timeout (handle : ('workflow_input, 'workflow_output) handle)
     ~(query : 'query Query.t) =
   if Atomic.get handle.client.closed then
     Error
       (Error.make ~category:`Bridge ~message:"client is shut down" ())
   else
-    let request : Backend.query_request =
-      {
-        workflow_id = handle.workflow_id;
-        run_id = run_selector handle;
-        query_name = Query.name query;
-        input = [];
-      }
-    in
-    Result.bind (Backend.client_query handle.client.backend request) (fun payload ->
-        Codec.decode (Query.output query) payload)
+    match rpc_deadline rpc_timeout with
+    | Error error -> Error error
+    | Ok rpc_deadline ->
+        let request : Backend.query_request =
+          {
+            workflow_id = handle.workflow_id;
+            run_id = run_selector handle;
+            query_name = Query.name query;
+            input = [];
+            rpc_deadline;
+          }
+        in
+        Result.bind (Backend.client_query handle.client.backend request)
+          (fun payload -> Codec.decode (Query.output query) payload)
 
 (** Lists one bounded visibility page through the client's backend. The public
     layer validates caller-controlled query metadata before the request enters
     either the deterministic mock or the native supervisor. *)
-let list_visibility ?(page_size = 100) ?page_token client ~query () =
+let list_visibility ?(page_size = 100) ?page_token ?rpc_timeout client ~query
+    () =
+  (* The deadline is checked before the closed flag, so a malformed deadline
+     is reported as a defect even on a closed client. *)
+  match rpc_deadline rpc_timeout with
+  | Error error -> Error error
+  | Ok rpc_deadline ->
   if Atomic.get client.closed then
     Error (Error.make ~category:`Bridge ~message:"client is shut down" ())
   else if page_size < 1 || page_size > 1_000 then
@@ -673,7 +821,12 @@ let list_visibility ?(page_size = 100) ?page_token client ~query () =
             | Error error -> Error error
             | Ok () ->
                 let request : Backend.visibility_request =
-                  { query; page_size; next_page_token = Some token }
+                  {
+                    query;
+                    page_size;
+                    next_page_token = Some token;
+                    rpc_deadline;
+                  }
                 in
                 Result.map
                   (fun (page : Backend.visibility_page) ->
@@ -694,7 +847,7 @@ let list_visibility ?(page_size = 100) ?page_token client ~query () =
                   (Backend.client_list_visibility client.backend request))
         | None ->
             let request : Backend.visibility_request =
-              { query; page_size; next_page_token = None }
+              { query; page_size; next_page_token = None; rpc_deadline }
             in
             Result.map
               (fun (page : Backend.visibility_page) ->
@@ -716,21 +869,28 @@ let list_visibility ?(page_size = 100) ?page_token client ~query () =
 
 (** Executes a one-input typed query against the run [handle] addresses. Encoding happens before transport, so invalid input cannot
     consume a native request or become an ambiguous empty query. *)
-let query_with_input (handle : ('workflow_input, 'workflow_output) handle)
+let query_with_input ?rpc_timeout
+    (handle : ('workflow_input, 'workflow_output) handle)
     ~(query : ('input, 'query) Query.typed) ~input =
   if Atomic.get handle.client.closed then
     Error
       (Error.make ~category:`Bridge ~message:"client is shut down" ())
   else
-    match Codec.encode (Query.input query) input with
+    match
+      Result.bind (rpc_deadline rpc_timeout) (fun rpc_deadline ->
+          Result.map
+            (fun encoded_input -> (rpc_deadline, encoded_input))
+            (Codec.encode (Query.input query) input))
+    with
     | Error error -> Error error
-    | Ok encoded_input ->
+    | Ok (rpc_deadline, encoded_input) ->
         let request : Backend.query_request =
           {
             workflow_id = handle.workflow_id;
             run_id = run_selector handle;
             query_name = Query.name_with_input query;
             input = [ encoded_input ];
+            rpc_deadline;
           }
         in
         Result.bind
@@ -762,7 +922,7 @@ let decode_update_output definition = function
 (** Starts one typed update and returns once Temporal has accepted it. This
     acceptance/completion split lets callers issue several updates before
     waiting, while the supervisor still serializes every native operation. *)
-let start_update ?update_id
+let start_update ?update_id ?rpc_timeout
     (handle : ('workflow_input, 'workflow_output) handle)
     ~(update : ('input, 'output) Update.t) ~input () =
   if Atomic.get handle.client.closed then
@@ -774,9 +934,12 @@ let start_update ?update_id
       | Some update_id -> update_id
       | None -> generated_update_id ()
     in
-    match validate_name "update id" update_id with
+    match
+      Result.bind (validate_name "update id" update_id) (fun () ->
+          rpc_deadline rpc_timeout)
+    with
     | Error error -> Error error
-    | Ok () -> (
+    | Ok rpc_deadline -> (
         match Codec.encode (Update.input update) input with
         | Error error -> Error error
         | Ok encoded_input ->
@@ -787,6 +950,7 @@ let start_update ?update_id
                 update_id;
                 update_name = Update.name update;
                 input = encoded_input;
+                rpc_deadline;
               }
             in
             Result.bind
@@ -825,6 +989,9 @@ let wait_update handle =
             update_id = handle.update_id;
             update_name = Update.name handle.definition;
             input = handle.input;
+            (* Completion polls keep their own bounded window; see
+               [Client.wait_update]. *)
+            rpc_deadline = None;
           }
         in
         let rec poll () =
@@ -858,6 +1025,13 @@ let already_started error =
   Option.map
     (fun (namespace, workflow_id, run_id) -> { namespace; workflow_id; run_id })
     (Backend.already_started_execution error)
+
+(** Recognizes the uncertain-start error by its structural fields rather than
+    its diagnostic message. *)
+let is_start_outcome_uncertain error =
+  let view = Error.view error in
+  view.category = `Bridge && view.non_retryable
+  && view.error_type = Some Backend.start_outcome_uncertain_error_type
 
 (** Recognizes the backend's capacity rejection by its structural fields
     rather than its diagnostic message, so wording changes cannot alter the

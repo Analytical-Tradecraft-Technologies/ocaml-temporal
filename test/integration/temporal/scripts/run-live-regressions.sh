@@ -93,6 +93,7 @@ for executable in "$@"; do
     test/integration/split_worker_task_types/regression.exe|\
     test/integration/worker_resource_options/regression.exe)
       cli_argument='' ;;
+    test/integration/client_policies/regression.exe|\
     test/integration/interaction_recovery/regression.exe|\
     test/integration/local_activity_cancellation/regression.exe|\
     test/integration/transport_interruption/regression.exe|\

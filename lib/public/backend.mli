@@ -36,6 +36,21 @@ type start_request = {
   (* What to do when [workflow_id] already has an open run; see
      [Client.id_conflict_policy]. Part of the mock's request-ID fingerprint. *)
   id_conflict_policy : [ `Fail | `Use_existing | `Terminate_existing ];
+  (* What to do when [workflow_id]'s latest run is closed; see
+     [Client.id_reuse_policy]. Part of the mock's request-ID fingerprint. *)
+  id_reuse_policy :
+    [ `Allow_duplicate | `Allow_duplicate_failed_only | `Reject_duplicate ];
+  (* Server-side workflow timeouts in milliseconds, already validated by
+     [Client.start]; [None] keeps Temporal's default. *)
+  execution_timeout_ms : int64 option;
+  run_timeout_ms : int64 option;
+  task_timeout_ms : int64 option;
+  (* Server-side workflow retry policy; [None] means no retry. *)
+  retry_policy : Temporal_sdk_kernel.Activation.retry_policy option;
+  (* Caller deadline of the start RPC, fixed on the monotonic clock when the
+     call began. It bounds one call, not the workflow, so it is not part of
+     the request-ID fingerprint. *)
+  rpc_deadline : Temporal_sdk_kernel.Client_protocol.rpc_deadline option;
 }
 
 (** The server-issued identity returned by a successful start. [started] is
@@ -64,6 +79,13 @@ type cancel_request = {
   run_id : string;
   request_id : string;
   reason : string;
+  rpc_deadline : Temporal_sdk_kernel.Client_protocol.rpc_deadline option;
+      (** Caller deadline of this RPC, validated by the public client and
+          fixed on the monotonic clock when the call began; the native
+          supervisor sends only the budget left at dispatch and fails an
+          expired request without sending it. [None] keeps the operation's
+          default budget. The mock ledger answers immediately and ignores
+          it. *)
 }
 
 (** Exact workflow/run pair and operator metadata for immediate termination. *)
@@ -71,6 +93,13 @@ type terminate_request = {
   workflow_id : string;
   run_id : string;
   reason : string;
+  rpc_deadline : Temporal_sdk_kernel.Client_protocol.rpc_deadline option;
+      (** Caller deadline of this RPC, validated by the public client and
+          fixed on the monotonic clock when the call began; the native
+          supervisor sends only the budget left at dispatch and fails an
+          expired request without sending it. [None] keeps the operation's
+          default budget. The mock ledger answers immediately and ignores
+          it. *)
 }
 
 (** Exact workflow/run pair and event boundary for a reset request. *)
@@ -80,6 +109,13 @@ type reset_request = {
   request_id : string;
   reason : string;
   workflow_task_finish_event_id : int64;
+  rpc_deadline : Temporal_sdk_kernel.Client_protocol.rpc_deadline option;
+      (** Caller deadline of this RPC, validated by the public client and
+          fixed on the monotonic clock when the call began; the native
+          supervisor sends only the budget left at dispatch and fails an
+          expired request without sending it. [None] keeps the operation's
+          default budget. The mock ledger answers immediately and ignores
+          it. *)
 }
 
 (** New run identity returned by a successful reset. *)
@@ -94,6 +130,13 @@ type signal_request = {
   signal_name : string;
   request_id : string;
   input : Payload.t;
+  rpc_deadline : Temporal_sdk_kernel.Client_protocol.rpc_deadline option;
+      (** Caller deadline of this RPC, validated by the public client and
+          fixed on the monotonic clock when the call began; the native
+          supervisor sends only the budget left at dispatch and fails an
+          expired request without sending it. [None] keeps the operation's
+          default budget. The mock ledger answers immediately and ignores
+          it. *)
 }
 
 (** Exact workflow/run identity and encoded query arguments. Output-only
@@ -105,6 +148,13 @@ type query_request = {
   run_id : string;
   query_name : string;
   input : Payload.t list;
+  rpc_deadline : Temporal_sdk_kernel.Client_protocol.rpc_deadline option;
+      (** Caller deadline of this RPC, validated by the public client and
+          fixed on the monotonic clock when the call began; the native
+          supervisor sends only the budget left at dispatch and fails an
+          expired request without sending it. [None] keeps the operation's
+          default budget. The mock ledger answers immediately and ignores
+          it. *)
 }
 
 (** One bounded visibility query. The continuation token is opaque to callers
@@ -113,6 +163,13 @@ type visibility_request = {
   query : string;
   page_size : int;
   next_page_token : string option;
+  rpc_deadline : Temporal_sdk_kernel.Client_protocol.rpc_deadline option;
+      (** Caller deadline of this RPC, validated by the public client and
+          fixed on the monotonic clock when the call began; the native
+          supervisor sends only the budget left at dispatch and fails an
+          expired request without sending it. [None] keeps the operation's
+          default budget. The mock ledger answers immediately and ignores
+          it. *)
 }
 
 (** Stable visibility metadata returned for one execution. *)
@@ -137,6 +194,13 @@ type update_request = {
   update_id : string;
   update_name : string;
   input : Payload.t;
+  rpc_deadline : Temporal_sdk_kernel.Client_protocol.rpc_deadline option;
+      (** Caller deadline of this RPC, validated by the public client and
+          fixed on the monotonic clock when the call began; the native
+          supervisor sends only the budget left at dispatch and fails an
+          expired request without sending it. [None] keeps the operation's
+          default budget. The mock ledger answers immediately and ignores
+          it. *)
 }
 
 (** Terminal update outcome returned by the native protocol. *)
@@ -275,6 +339,13 @@ val client_at_capacity_error_type : string
     non-retryable [`Workflow] error returned when a [`Fail] start finds an open
     run with the same workflow ID. *)
 val already_started_error_type : string
+
+(** The [Error.error_type] (["StartOutcomeUncertain"]) of the non-retryable
+    [`Bridge] error returned when Temporal did not prove whether a native
+    start was accepted, for example because the start's RPC deadline expired
+    or the client shut down while the request was in flight.
+    [Client.is_start_outcome_uncertain] recognizes it. *)
+val start_outcome_uncertain_error_type : string
 
 (** Typed classification of a client RPC failure; see [Client.rpc_status]. *)
 type rpc_status =

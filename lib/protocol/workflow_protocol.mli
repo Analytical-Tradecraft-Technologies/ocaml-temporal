@@ -613,4 +613,8 @@ module Internal : sig
 
   val failure_json : failure -> (Yojson.Safe.t, error) result
   (** Encodes the supported recursive Temporal failure model. *)
+
+  val retry_policy_json : retry_policy -> (Yojson.Safe.t, error) result
+  (** Encodes and validates a retry policy in the shape used by commands, so
+      the client start request carries a workflow retry policy losslessly. *)
 end

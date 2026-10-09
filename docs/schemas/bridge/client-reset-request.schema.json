@@ -12,6 +12,12 @@
     "run_id": {"type": "string", "maxLength": 65536, "pattern": "^[^\\u0000]*$", "description": "Exact run ID, or the empty string to select the workflow's current run, which Temporal resolves when it handles the request (#791)."},
     "request_id": {"type": "string", "minLength": 1, "maxLength": 65536, "pattern": "^[^\\u0000]+$"},
     "reason": {"type": "string", "maxLength": 65536, "pattern": "^[^\\u0000]*$"},
-    "workflow_task_finish_event_id": {"type": "integer", "minimum": 2}
+    "workflow_task_finish_event_id": {"type": "integer", "minimum": 2},
+    "rpc_timeout_ms": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 60000,
+      "description": "Optional caller deadline for this RPC in milliseconds (#499), covering Core's transport retries. It replaces the operation's default budget, bounds only the client call, and never affects the workflow. Omitted means the default."
+    }
   }
 }

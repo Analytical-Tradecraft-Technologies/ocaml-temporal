@@ -1,0 +1,3 @@
+(executable
+ (name regression)
+ (libraries temporal-sdk temporal_base unix))

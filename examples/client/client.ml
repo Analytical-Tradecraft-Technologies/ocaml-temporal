@@ -50,6 +50,26 @@ let display_terminal = function
         (Temporal.Error.defect
            ~message:"the example client does not automatically follow continue-as-new")
 
+(** Starts the example workflow with a stable idempotency request ID, a
+    one-hour workflow execution timeout, and a five-second deadline on the
+    start call itself (#499). When that deadline expires Temporal may or may
+    not have created the run, so the start is retried once with the same
+    request ID: Temporal returns the run if the first attempt created it, and
+    creates it exactly once otherwise. Any other error is returned as is. *)
+let start_reconciled client ~task_queue ~id ~input =
+  let start () =
+    Temporal.Client.start client
+      ~request_id:("ocaml-temporal-example-start:" ^ id)
+      ~execution_timeout:(Temporal.Duration.of_ms 3_600_000L)
+      ~rpc_timeout:(Temporal.Duration.of_ms 5_000L)
+      ~workflow:Example_support.Definitions.remote_compose_message ~task_queue
+      ~id ~input ()
+  in
+  match start () with
+  | Error error when Temporal.Client.is_start_outcome_uncertain error ->
+      start ()
+  | result -> result
+
 (** Connects, starts one workflow with a stable idempotency request ID, waits
     for the exact returned run, and displays its typed terminal outcome. *)
 let run () =
@@ -59,10 +79,7 @@ let run () =
   let* id = workflow_id () in
   Example_support.Lifecycle.with_client config (fun client ->
       let* handle =
-        Temporal.Client.start client
-          ~request_id:("ocaml-temporal-example-start:" ^ id)
-          ~workflow:Example_support.Definitions.remote_compose_message
-          ~task_queue:config.task_queue ~id ~input:name ()
+        start_reconciled client ~task_queue:config.task_queue ~id ~input:name
       in
       let* terminal = Temporal.Client.wait handle in
       display_terminal terminal)

@@ -161,6 +161,7 @@ fn signal(
             signal_name: "poke".to_owned(),
             request_id: "signal-request-1".to_owned(),
             input: Vec::new(),
+            rpc_timeout_ms: None,
         },
     ))
 }
@@ -177,6 +178,7 @@ fn terminate(
             workflow_id: "workflow-1".to_owned(),
             run_id: "run-1".to_owned(),
             reason: "test".to_owned(),
+            rpc_timeout_ms: None,
         },
     ))
 }
@@ -290,6 +292,41 @@ fn persistent_signal_failure_stays_within_the_control_budget() {
     assert!(probe.count() > 1, "Core must retry inside the budget");
 }
 
+/// A caller-selected RPC timeout (#499) replaces the control budget: against
+/// a server that stays unavailable the signal ends well inside the default
+/// three seconds, and the failure keeps its typed RPC classification.
+#[test]
+fn caller_rpc_timeout_replaces_the_control_budget() {
+    let (core, connection, _probe) = scripted_connection(
+        usize::MAX,
+        Code::Unavailable,
+        SignalWorkflowExecutionResponse::default().encode_to_vec(),
+    );
+    let started = Instant::now();
+    let result = core.tokio_handle().block_on(signal_workflow(
+        connection,
+        SignalWorkflowRequest {
+            namespace: "default".to_owned(),
+            workflow_id: "workflow-1".to_owned(),
+            run_id: "run-1".to_owned(),
+            signal_name: "poke".to_owned(),
+            request_id: "signal-request-1".to_owned(),
+            input: Vec::new(),
+            rpc_timeout_ms: Some(300),
+        },
+    ));
+    let elapsed = started.elapsed();
+    assert!(elapsed < Duration::from_millis(1_500), "took {elapsed:?}");
+    let error = result.expect_err("an unavailable server cannot acknowledge");
+    assert!(
+        matches!(
+            &error,
+            ClientOperationError::Rpc { code } if code == "unavailable" || code == "deadline_exceeded"
+        ),
+        "unexpected error {error:?}"
+    );
+}
+
 /// Core waits its separate throttle backoff (1 s +/-20%) before re-sending
 /// after `resource_exhausted`. The control budget must leave room for that
 /// wait, so a signal rejected once by the server's rate limiter is delivered
@@ -335,6 +372,7 @@ fn query_retries_a_transient_failure() {
                 run_id: "run-1".to_owned(),
                 query_type: "state".to_owned(),
                 input: Vec::new(),
+                rpc_timeout_ms: None,
             },
         ))
         .expect("query answered after one transient failure");
@@ -361,6 +399,7 @@ fn cancel_retries_a_transient_failure() {
                 run_id: "run-1".to_owned(),
                 request_id: "cancel-request-1".to_owned(),
                 reason: String::new(),
+                rpc_timeout_ms: None,
             },
         ))
         .expect("cancellation acknowledged");
@@ -391,6 +430,7 @@ fn reset_retries_a_transient_failure() {
                 request_id: "reset-request-1".to_owned(),
                 reason: "test".to_owned(),
                 workflow_task_finish_event_id: 4,
+                rpc_timeout_ms: None,
             },
         ))
         .expect("reset answered");
@@ -511,6 +551,7 @@ fn visibility_retries_a_transient_failure() {
                 query: String::new(),
                 page_size: 10,
                 next_page_token: None,
+                rpc_timeout_ms: None,
             },
         ))
         .expect("visibility page");
@@ -548,6 +589,7 @@ fn update_retries_a_transient_failure() {
                 update_id: "update-1".to_owned(),
                 update_name: "set_state".to_owned(),
                 input: Vec::new(),
+                rpc_timeout_ms: None,
             },
             Duration::from_secs(10),
         ))

@@ -569,7 +569,7 @@ test-temporal-diagnostics-contract:
 # CI executes (#795). Every entry must also be in scripts/ci-smoke-executables.txt,
 # and test/smoke/test_live_regressions_contract.sh fails when a regression
 # executable under test/integration is neither here nor otherwise run by CI.
-LIVE_REGRESSION_EXECUTABLES := test/integration/client_request_ids/regression.exe test/integration/completed_queries/regression.exe test/integration/interaction_recovery/regression.exe test/integration/local_activity_cancellation/regression.exe test/integration/split_worker_task_types/regression.exe test/integration/transport_interruption/regression.exe test/integration/update_outcomes/regression.exe test/integration/worker_resource_options/regression.exe
+LIVE_REGRESSION_EXECUTABLES := test/integration/client_policies/regression.exe test/integration/client_request_ids/regression.exe test/integration/completed_queries/regression.exe test/integration/interaction_recovery/regression.exe test/integration/local_activity_cancellation/regression.exe test/integration/split_worker_task_types/regression.exe test/integration/transport_interruption/regression.exe test/integration/update_outcomes/regression.exe test/integration/worker_resource_options/regression.exe
 # Seconds for each regression process; the suites normally finish in seconds.
 LIVE_REGRESSION_TIMEOUT_SECONDS ?= 180
 
@@ -987,13 +987,7 @@ history-corpus-capture: test-temporal-config
 	HISTORY_CORPUS_TEMPORAL_CLI='$(TEMPORAL_COMPOSE) run --rm --no-deps -T temporal-admin-tools temporal' \
 	sh test/history_corpus/scripts/capture-history-corpus.sh
 
-# Requires a disposable running Temporal server with the default namespace and
-# an explicit official Temporal CLI path. The regression owns an in-process TCP
-# fault proxy, its worker, and a unique task queue; it terminates its workflow
-# executions on exit (#504).
-.PHONY: test-transport-interruption-live
-test-transport-interruption-live:
-	$(RUN) dune exec $(DUNE_BUILD_ARGS) test/integration/transport_interruption/regression.exe -- check $(TEMPORAL_CLIENT_TEST_URL) $(TEMPORAL_TEST_CLI)
+# Live regressions for fixed bugs, features and recovery paths
 
 # Requires a disposable running Temporal server. The regression owns its worker,
 # uses a unique task queue, and terminates its workflow executions on exit.

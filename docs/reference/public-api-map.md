@@ -119,7 +119,13 @@ for those rules.
   already has a running execution: a typed already-started error whose
   existing run `Client.already_started` returns, a handle for the running
   execution (`Client.started` is `false`), or termination of that execution
-  and a new run. The client retains the exact workflow/run identity, rebuilds a
+  and a new run. `?id_reuse_policy` (`` `Allow_duplicate `` by default,
+  `` `Allow_duplicate_failed_only ``, or `` `Reject_duplicate ``) decides
+  whether a closed run's ID may be reused, and `?execution_timeout`,
+  `?run_timeout`, `?task_timeout`, and `?retry_policy` set server-side
+  execution policies (#499). Start and the other bounded operations accept a
+  per-call `?rpc_timeout`; an expired start deadline is recognized by
+  `Client.is_start_outcome_uncertain`. The client retains the exact workflow/run identity, rebuilds a
   typed handle for a successor (from `Continued_as_new`, or the optional
   `successor` of `Completed { output; successor }`, `Failed`, or `Timed_out`)
   with `Client.follow`, and requests cancellation, reset, or termination.

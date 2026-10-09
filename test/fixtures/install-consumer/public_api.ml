@@ -623,6 +623,12 @@ let _client_start :
     ?memo:(string * T.Payload.t) list ->
     ?search_attributes:(string * T.Payload.t) list ->
     ?id_conflict_policy:T.Client.id_conflict_policy ->
+    ?id_reuse_policy:T.Client.id_reuse_policy ->
+    ?execution_timeout:T.Duration.t ->
+    ?run_timeout:T.Duration.t ->
+    ?task_timeout:T.Duration.t ->
+    ?retry_policy:T.Activity.Retry_policy.t ->
+    ?rpc_timeout:T.Duration.t ->
     workflow:('input, 'output) T.Workflow.t ->
     task_queue:string ->
     id:string ->
@@ -637,6 +643,13 @@ let _client_id_conflict_policy_name : T.Client.id_conflict_policy -> string =
   | `Fail -> "fail"
   | `Use_existing -> "use_existing"
   | `Terminate_existing -> "terminate_existing"
+
+(* The reuse policy is closed in the same way (#499). *)
+let _client_id_reuse_policy_name : T.Client.id_reuse_policy -> string =
+  function
+  | `Allow_duplicate -> "allow_duplicate"
+  | `Allow_duplicate_failed_only -> "allow_duplicate_failed_only"
+  | `Reject_duplicate -> "reject_duplicate"
 
 let _client_follow :
     T.Client.t ->
@@ -673,6 +686,7 @@ let _client_wait :
 let _client_cancel :
     ?request_id:string ->
     ?reason:string ->
+    ?rpc_timeout:T.Duration.t ->
     ('input, 'output) T.Client.handle ->
     (unit, T.Error.t) result =
   T.Client.cancel
@@ -680,6 +694,7 @@ let _client_cancel :
 let _client_reset :
     ?request_id:string ->
     ?reason:string ->
+    ?rpc_timeout:T.Duration.t ->
     workflow_task_finish_event_id:int64 ->
     ('input, 'output) T.Client.handle ->
     (T.Client.execution, T.Error.t) result =
@@ -687,6 +702,7 @@ let _client_reset :
 
 let _client_signal :
     ?request_id:string ->
+    ?rpc_timeout:T.Duration.t ->
     ('workflow_input, 'workflow_output) T.Client.handle ->
     signal:'signal T.Signal.t ->
     input:'signal ->
@@ -694,12 +710,14 @@ let _client_signal :
   T.Client.signal
 
 let _client_query :
+    ?rpc_timeout:T.Duration.t ->
     ('workflow_input, 'workflow_output) T.Client.handle ->
     query:'query T.Query.t ->
     ('query, T.Error.t) result =
   T.Client.query
 
 let _client_query_with_input :
+    ?rpc_timeout:T.Duration.t ->
     ('workflow_input, 'workflow_output) T.Client.handle ->
     query:('input, 'query) T.Query.typed ->
     input:'input -> ('query, T.Error.t) result =
@@ -715,6 +733,8 @@ let _client_started : ('input, 'output) T.Client.handle -> bool = T.Client.start
 let _client_already_started : T.Error.t -> T.Client.execution option =
   T.Client.already_started
 let _client_is_at_capacity : T.Error.t -> bool = T.Client.is_at_capacity
+let _client_is_start_outcome_uncertain : T.Error.t -> bool =
+  T.Client.is_start_outcome_uncertain
 let _client_is_query_failed : T.Error.t -> bool = T.Client.is_query_failed
 let _client_rpc_status : T.Error.t -> T.Client.rpc_status option =
   T.Client.rpc_status
@@ -964,12 +984,14 @@ let _activity_execute_local :
 (* Client termination, visibility listing, and workflow updates. *)
 let _client_terminate :
     ?reason:string ->
+    ?rpc_timeout:T.Duration.t ->
     ('input, 'output) T.Client.handle -> (unit, T.Error.t) result =
   T.Client.terminate
 
 let _client_list_visibility :
     ?page_size:int ->
     ?page_token:string ->
+    ?rpc_timeout:T.Duration.t ->
     T.Client.t ->
     query:string ->
     unit -> (T.Client.visibility_page, T.Error.t) result =
@@ -989,6 +1011,7 @@ let _client_visibility_page_fields (page : T.Client.visibility_page) :
 
 let _client_start_update :
     ?update_id:string ->
+    ?rpc_timeout:T.Duration.t ->
     ('workflow_input, 'workflow_output) T.Client.handle ->
     update:('input, 'output) T.Update.t ->
     input:'input ->

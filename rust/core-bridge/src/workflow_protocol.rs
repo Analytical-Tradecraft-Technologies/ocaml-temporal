@@ -1099,7 +1099,7 @@ fn validate_uint64_decimal(value: &str, path: &str) -> Result<u64, ProtocolError
 
 /// Validates the retry policy constraints shared by the OCaml and Rust
 /// semantic layers before a command can reach Temporal Core.
-fn validate_retry_policy(value: &RetryPolicy, path: &str) -> Result<(), ProtocolError> {
+pub(crate) fn validate_retry_policy(value: &RetryPolicy, path: &str) -> Result<(), ProtocolError> {
     validate_time(
         value.initial_interval.seconds,
         value.initial_interval.nanoseconds,
@@ -3437,7 +3437,7 @@ pub(crate) fn duration_from_core(
 
 /// Converts a validated semantic retry policy into Temporal Core's protobuf
 /// policy without changing the coefficient's floating-point bits.
-fn retry_policy_to_core(
+pub(crate) fn retry_policy_to_core(
     value: &RetryPolicy,
 ) -> Result<api_common::RetryPolicy, CoreConversionError> {
     validate_retry_policy(value, "$.commands.retry_policy")

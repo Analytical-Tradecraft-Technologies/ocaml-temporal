@@ -74,6 +74,14 @@ val check_abi_version : int32 -> (unit, error) result
     exists to test memory ownership; workflow code does not use it. *)
 val echo : bytes -> (bytes, error) result
 
+(** Returns a monotonic clock reading in nanoseconds with an arbitrary
+    origin. Readings are only meaningful relative to each other in one
+    process; client RPC deadlines (#499) use them so the time a request spends
+    queued in the supervisor counts against its budget and wall-clock changes
+    cannot move a deadline. Raises [Failure] only if the platform has no
+    monotonic clock, which is a host defect. *)
+val monotonic_now_ns : unit -> int64
+
 (** Waits in Rust for at most 1,000 milliseconds while allowing other OCaml
     Domains to run. This tests the blocking-call design used by future worker
     polling. Values outside 0 through 1,000 return an error. *)

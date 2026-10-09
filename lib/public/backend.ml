@@ -37,6 +37,21 @@ type start_request = {
   (* What to do when [workflow_id] already has an open run; see
      [Client.id_conflict_policy]. Part of the mock's request-ID fingerprint. *)
   id_conflict_policy : [ `Fail | `Use_existing | `Terminate_existing ];
+  (* What to do when [workflow_id]'s latest run is closed; see
+     [Client.id_reuse_policy]. Part of the mock's request-ID fingerprint. *)
+  id_reuse_policy :
+    [ `Allow_duplicate | `Allow_duplicate_failed_only | `Reject_duplicate ];
+  (* Server-side workflow timeouts in milliseconds, already validated by
+     [Client.start]; [None] keeps Temporal's default. *)
+  execution_timeout_ms : int64 option;
+  run_timeout_ms : int64 option;
+  task_timeout_ms : int64 option;
+  (* Server-side workflow retry policy; [None] means no retry. *)
+  retry_policy : Temporal_sdk_kernel.Activation.retry_policy option;
+  (* Caller deadline of the start RPC, fixed on the monotonic clock when the
+     call began. It bounds one call, not the workflow, so it is not part of
+     the request-ID fingerprint. *)
+  rpc_deadline : Client_protocol.rpc_deadline option;
 }
 
 (** The server-issued identity returned by a successful start. [started] is
@@ -64,6 +79,13 @@ type cancel_request = {
   run_id : string;
   request_id : string;
   reason : string;
+  rpc_deadline : Client_protocol.rpc_deadline option;
+      (** Caller deadline of this RPC, validated by the public client and
+          fixed on the monotonic clock when the call began; the native
+          supervisor sends only the budget left at dispatch and fails an
+          expired request without sending it. [None] keeps the operation's
+          default budget. The mock ledger answers immediately and ignores
+          it. *)
 }
 
 (** Exact workflow/run pair and operator metadata for immediate termination. *)
@@ -71,6 +93,13 @@ type terminate_request = {
   workflow_id : string;
   run_id : string;
   reason : string;
+  rpc_deadline : Client_protocol.rpc_deadline option;
+      (** Caller deadline of this RPC, validated by the public client and
+          fixed on the monotonic clock when the call began; the native
+          supervisor sends only the budget left at dispatch and fails an
+          expired request without sending it. [None] keeps the operation's
+          default budget. The mock ledger answers immediately and ignores
+          it. *)
 }
 
 (** Exact workflow/run pair and event boundary for a reset request. *)
@@ -80,6 +109,13 @@ type reset_request = {
   request_id : string;
   reason : string;
   workflow_task_finish_event_id : int64;
+  rpc_deadline : Client_protocol.rpc_deadline option;
+      (** Caller deadline of this RPC, validated by the public client and
+          fixed on the monotonic clock when the call began; the native
+          supervisor sends only the budget left at dispatch and fails an
+          expired request without sending it. [None] keeps the operation's
+          default budget. The mock ledger answers immediately and ignores
+          it. *)
 }
 
 (** Exact workflow/run pair and typed payload for one signal operation. *)
@@ -89,6 +125,13 @@ type signal_request = {
   signal_name : string;
   request_id : string;
   input : Payload.t;
+  rpc_deadline : Client_protocol.rpc_deadline option;
+      (** Caller deadline of this RPC, validated by the public client and
+          fixed on the monotonic clock when the call began; the native
+          supervisor sends only the budget left at dispatch and fails an
+          expired request without sending it. [None] keeps the operation's
+          default budget. The mock ledger answers immediately and ignores
+          it. *)
 }
 
 (** Exact workflow/run identity and encoded arguments for one read-only
@@ -99,6 +142,13 @@ type query_request = {
   run_id : string;
   query_name : string;
   input : Payload.t list;
+  rpc_deadline : Client_protocol.rpc_deadline option;
+      (** Caller deadline of this RPC, validated by the public client and
+          fixed on the monotonic clock when the call began; the native
+          supervisor sends only the budget left at dispatch and fails an
+          expired request without sending it. [None] keeps the operation's
+          default budget. The mock ledger answers immediately and ignores
+          it. *)
 }
 
 (** One bounded visibility query. The continuation token is opaque to callers
@@ -107,6 +157,13 @@ type visibility_request = {
   query : string;
   page_size : int;
   next_page_token : string option;
+  rpc_deadline : Client_protocol.rpc_deadline option;
+      (** Caller deadline of this RPC, validated by the public client and
+          fixed on the monotonic clock when the call began; the native
+          supervisor sends only the budget left at dispatch and fails an
+          expired request without sending it. [None] keeps the operation's
+          default budget. The mock ledger answers immediately and ignores
+          it. *)
 }
 
 (** Stable visibility metadata returned for one execution. *)
@@ -131,6 +188,13 @@ type update_request = {
   update_id : string;
   update_name : string;
   input : Payload.t;
+  rpc_deadline : Client_protocol.rpc_deadline option;
+      (** Caller deadline of this RPC, validated by the public client and
+          fixed on the monotonic clock when the call began; the native
+          supervisor sends only the budget left at dispatch and fails an
+          expired request without sending it. [None] keeps the operation's
+          default budget. The mock ledger answers immediately and ignores
+          it. *)
 }
 
 (** Update completion preserves multiple payloads until the public codec
@@ -372,6 +436,11 @@ let equal_start_request (left : start_request) (right : start_request) =
   in
   left.request_id = right.request_id
   && left.id_conflict_policy = right.id_conflict_policy
+  && left.id_reuse_policy = right.id_reuse_policy
+  && left.execution_timeout_ms = right.execution_timeout_ms
+  && left.run_timeout_ms = right.run_timeout_ms
+  && left.task_timeout_ms = right.task_timeout_ms
+  && left.retry_policy = right.retry_policy
   && String.equal left.workflow_name right.workflow_name
   && String.equal left.workflow_id right.workflow_id
   && String.equal left.task_queue right.task_queue
@@ -984,6 +1053,28 @@ let client_create ?io_threads ?runtime config =
                     ignore (Native.shutdown supervisor);
                     Error (native_supervisor_error error)))
 
+(** Converts a whole number of milliseconds into the protocol's exact
+    seconds/nanoseconds duration. Callers pass values the public retry policy
+    has already validated as non-negative. *)
+let protocol_duration milliseconds : Workflow_protocol.duration =
+  {
+    seconds = Int64.div milliseconds 1_000L;
+    nanoseconds = Int64.to_int (Int64.mul (Int64.rem milliseconds 1_000L) 1_000_000L);
+  }
+
+(** Converts a validated public retry policy, already copied into its
+    millisecond runtime form, into the semantic protocol record shared with
+    workflow commands. The coefficient keeps its exact IEEE-754 bits. *)
+let protocol_retry_policy (policy : Temporal_sdk_kernel.Activation.retry_policy) :
+    Workflow_protocol.retry_policy =
+  {
+    initial_interval = protocol_duration policy.initial_interval;
+    backoff_coefficient_bits = policy.backoff_coefficient_bits;
+    maximum_interval = protocol_duration policy.maximum_interval;
+    maximum_attempts = policy.maximum_attempts;
+    non_retryable_error_types = policy.non_retryable_error_types;
+  }
+
 (** Converts one public start request to the closed native protocol value. *)
 let native_start_request client (request : start_request) : Client_protocol.start_request =
   let request_id =
@@ -1011,7 +1102,21 @@ let native_start_request client (request : start_request) : Client_protocol.star
       | `Fail -> Client_protocol.Fail
       | `Use_existing -> Client_protocol.Use_existing
       | `Terminate_existing -> Client_protocol.Terminate_existing);
+    id_reuse_policy =
+      (match request.id_reuse_policy with
+      | `Allow_duplicate -> Client_protocol.Allow_duplicate
+      | `Allow_duplicate_failed_only -> Client_protocol.Allow_duplicate_failed_only
+      | `Reject_duplicate -> Client_protocol.Reject_duplicate);
+    execution_timeout_ms = request.execution_timeout_ms;
+    run_timeout_ms = request.run_timeout_ms;
+    task_timeout_ms = request.task_timeout_ms;
+    retry_policy = Option.map protocol_retry_policy request.retry_policy;
+    rpc_deadline = request.rpc_deadline;
   }
+
+(** The [Error.error_type] that marks a start whose acceptance Temporal did
+    not prove; [Client.is_start_outcome_uncertain] recognizes it. *)
+let start_outcome_uncertain_error_type = "StartOutcomeUncertain"
 
 (** Builds the non-retryable bridge error for a start whose acceptance was
     not observed. The request and workflow IDs identify the logical operation
@@ -1021,6 +1126,7 @@ let native_start_request client (request : start_request) : Client_protocol.star
 let uncertain_start_error ?reason ~request_id ~workflow_id () =
   let suffix = match reason with None -> "" | Some reason -> ": " ^ reason in
   Error.make ~non_retryable:true ~category:`Bridge
+    ~error_type:start_outcome_uncertain_error_type
     ~message:
       (Printf.sprintf
          "Temporal did not prove whether workflow start %S was accepted (request_id=%S)%s"
@@ -1128,8 +1234,12 @@ let mock_start_new_run service (request : start_request) =
     already-started error, [`Use_existing] returns the pending run with
     [started = false] (without recording the request ID, since it created
     nothing), and [`Terminate_existing] marks the pending run terminated before
-    starting a new one. A closed current run is always replaced. Exact old runs
-    remain in [history] after the current slot is replaced. *)
+    starting a new one. A closed current run is replaced unless the reuse
+    policy forbids it: [`Reject_duplicate] always, and
+    [`Allow_duplicate_failed_only] when the run completed successfully; the
+    rejection is the already-started error naming the closed run, as
+    Temporal reports it. Exact old runs remain in [history] after the current
+    slot is replaced. *)
 let mock_client_start (client : mock_client) (request : start_request) =
   let service = client.service in
   Mutex.lock service.mutex;
@@ -1154,12 +1264,37 @@ let mock_client_start (client : mock_client) (request : start_request) =
                  ~message:"start request ID was already used for different start data"
                  ())
         | None -> (
+            let current = Hashtbl.find_opt service.executions request.workflow_id in
             let open_run =
-              match Hashtbl.find_opt service.executions request.workflow_id with
+              match current with
               | Some ({ terminal = Mock_pending; _ } as execution) -> Some execution
               | Some _ | None -> None
             in
+            let reject_closed (closed : mock_execution) =
+              let namespace = snd service.key in
+              Error
+                (already_started_error ~namespace ~workflow_id:request.workflow_id
+                   ~existing_run_id:(Some closed.run_id))
+            in
             match (open_run, request.id_conflict_policy) with
+            | None, (`Fail | `Use_existing | `Terminate_existing) -> (
+                (* Temporal's reuse policy for a closed current run: the
+                   rejection is the same already-started error, naming the
+                   closed run. Only a successful completion counts as
+                   completed for [`Allow_duplicate_failed_only]. *)
+                match (current, request.id_reuse_policy) with
+                | Some closed, `Reject_duplicate -> reject_closed closed
+                | ( Some
+                      ({
+                         terminal =
+                           Mock_completed | Mock_completed_with_successor _;
+                         _;
+                       } as closed),
+                    `Allow_duplicate_failed_only ) ->
+                    reject_closed closed
+                | (Some _ | None), (`Allow_duplicate | `Allow_duplicate_failed_only)
+                | None, `Reject_duplicate ->
+                    mock_start_new_run service request)
             | Some existing, `Fail ->
                 let namespace = snd service.key in
                 Error
@@ -1175,8 +1310,6 @@ let mock_client_start (client : mock_client) (request : start_request) =
                   }
             | Some existing, `Terminate_existing ->
                 existing.terminal <- Mock_terminated;
-                mock_start_new_run service request
-            | None, (`Fail | `Use_existing | `Terminate_existing) ->
                 mock_start_new_run service request))
 
 
@@ -1331,6 +1464,7 @@ let native_cancel_request client (request : cancel_request) :
       };
     request_id = request.request_id;
     reason = request.reason;
+    rpc_deadline = request.rpc_deadline;
   }
 
 (** Requests cancellation through the serialized supervisor operation. The
@@ -1362,6 +1496,7 @@ let native_client_terminate (client : native_client)
             run_id = request.run_id;
           };
         reason = request.reason;
+        rpc_deadline = request.rpc_deadline;
       }
     in
     match Native.perform client.supervisor (Native.Client_terminate_workflow request) with
@@ -1382,6 +1517,7 @@ let native_reset_request client (request : reset_request) :
     request_id = request.request_id;
     reason = request.reason;
     workflow_task_finish_event_id = request.workflow_task_finish_event_id;
+    rpc_deadline = request.rpc_deadline;
   }
 
 (** Resets one exact run through the serialized supervisor operation. The
@@ -1415,6 +1551,7 @@ let native_signal_request client (request : signal_request) :
     signal_name = request.signal_name;
     request_id = request.request_id;
     input = protocol_input request.input;
+    rpc_deadline = request.rpc_deadline;
   }
 
 (** Sends one signal through the serialized supervisor operation. The result is
@@ -1445,6 +1582,7 @@ let native_query_request client (request : query_request) :
     };
     query_type = request.query_name;
     input = List.map protocol_payload request.input;
+    rpc_deadline = request.rpc_deadline;
   }
 
 (** Sends one output-only query through the serialized supervisor operation.
@@ -1701,6 +1839,7 @@ let native_visibility_request client (request : visibility_request) :
     query = request.query;
     page_size = request.page_size;
     next_page_token = request.next_page_token;
+    rpc_deadline = request.rpc_deadline;
   }
 
 (** Lists one visibility page through the serialized supervisor operation.
@@ -1715,6 +1854,16 @@ let native_client_list_visibility (client : native_client)
         (Native.Client_list_visibility_workflows
            (native_visibility_request client request))
     with
+    | Error (Native.Backend { Bridge.status = Bridge.Connection; message } as error)
+      -> (
+        (* Visibility has no structured error channel of its own, so a gRPC
+           failure, including an expired RPC deadline (#499), arrives as the
+           closed [rpc] document with the [Connection] status. Decode it so
+           [Client.rpc_status] classifies it like every other operation. *)
+        match Client_protocol.decode_client_error message with
+        | Ok (Client_protocol.Rpc _ as client_error) ->
+            Error (native_client_error ~namespace:client.namespace client_error)
+        | Ok _ | Error _ -> Error (native_supervisor_error error))
     | Error error -> Error (native_supervisor_error error)
     | Ok page ->
         Ok
@@ -1871,6 +2020,7 @@ let native_update_request client (request : update_request) :
     update_id = request.update_id;
     update_name = request.update_name;
     input = protocol_input request.input;
+    rpc_deadline = request.rpc_deadline;
   }
 
 (** Converts one protocol update outcome into public payloads or a typed
