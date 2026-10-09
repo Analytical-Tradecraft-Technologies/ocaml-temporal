@@ -124,9 +124,10 @@ pub const DEFAULT_RUNTIME_WORKER_THREADS_CAP: u32 = 4;
 /// from the server, which starts its start-to-close clock, only for the task to
 /// wait in the bridge queue where it can time out and where other workers on
 /// the task queue cannot take it. Keep this equal to the executor's real
-/// concurrency until activity execution becomes concurrent and configurable
-/// (#498). An asynchronously completed activity releases its slot once the
-/// callback returns `WillCompleteAsync`.
+/// concurrency until activity execution becomes concurrent (#492); the public
+/// worker options (#498) therefore expose no activity slot count. An
+/// asynchronously completed activity releases its slot once the callback
+/// returns `WillCompleteAsync`.
 const DEFAULT_MAX_OUTSTANDING_ACTIVITIES: usize = 1;
 /// Local-activity slots granted to Core, for the same reason as remote
 /// activities: local activities share the same serial OCaml executor. Core's
@@ -146,6 +147,10 @@ const DEFAULT_MAX_CONCURRENT_ACTIVITY_POLLS: usize = DEFAULT_MAX_OUTSTANDING_ACT
 const MIN_CACHED_WORKFLOW_POLLS: u32 = 2;
 /// Prevents an unbounded graceful-shutdown duration from entering Core.
 const MAX_GRACEFUL_SHUTDOWN_MS: u64 = 24 * 60 * 60 * 1_000;
+/// Upper bound for the sticky-queue timeout and heartbeat throttle intervals
+/// (#498). It mirrors the OCaml validators and keeps every value far inside
+/// the protobuf duration that Core converts the sticky timeout into.
+const MAX_WORKER_TUNING_DURATION_MS: u64 = 24 * 60 * 60 * 1_000;
 /// Maximum time one exact-run client wait may occupy the supervisor owner.
 ///
 /// The Temporal history request remains a close-event long poll, but the
@@ -645,6 +650,54 @@ struct WorkerConfigInput {
     /// sends the field explicitly.
     #[serde(default)]
     task_types: WorkerTaskTypesInput,
+    /// Optional Core settings exposed by the public worker options (#498).
+    /// The OCaml encoder omits the member when every setting is at its
+    /// default, so default workers send the pre-#498 document unchanged.
+    #[serde(default)]
+    tuning: WorkerTuningInput,
+}
+
+/// Optional worker settings layered on the original worker document (#498).
+///
+/// Each absent field keeps Temporal Core's default. Durations are whole
+/// milliseconds and rates are tasks per second. Remote and local activity
+/// slot counts are intentionally absent: they stay pinned to the serial OCaml
+/// executor (#777), and the rates here can only lower throughput.
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkerTuningInput {
+    /// Replaces the fixed workflow poller count with Core autoscaling. Its
+    /// maximum must equal `max_concurrent_workflow_task_polls`, so the
+    /// original field keeps one meaning for every document.
+    #[serde(default)]
+    workflow_task_poller_autoscaling: Option<PollerAutoscalingInput>,
+    /// Sticky-queue schedule-to-start timeout (Core default 10 s).
+    #[serde(default)]
+    sticky_queue_schedule_to_start_timeout_ms: Option<u64>,
+    /// Longest activity heartbeat throttle interval (Core default 60 s).
+    #[serde(default)]
+    max_heartbeat_throttle_interval_ms: Option<u64>,
+    /// Heartbeat throttle interval without a heartbeat timeout (default 30 s).
+    #[serde(default)]
+    default_heartbeat_throttle_interval_ms: Option<u64>,
+    /// Remote activity starts per second for this worker.
+    #[serde(default)]
+    max_worker_activities_per_second: Option<f64>,
+    /// Server-side activity dispatch rate for the whole task queue.
+    #[serde(default)]
+    max_task_queue_activities_per_second: Option<f64>,
+}
+
+/// Core workflow-poller autoscaling bounds carried in [`WorkerTuningInput`].
+#[derive(Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PollerAutoscalingInput {
+    /// Polls Core always keeps open while slots are available.
+    minimum: u32,
+    /// Most polls Core ever keeps open.
+    maximum: u32,
+    /// Polls opened before scaling feedback arrives.
+    initial: u32,
 }
 
 /// Task kinds a live worker polls, derived on the OCaml side from whether any
@@ -2935,15 +2988,22 @@ impl WorkerConfigInput {
             status: STATUS_CONFIGURATION,
             message: "max_outstanding_workflow_tasks exceeds platform capacity".to_owned(),
         })?;
+        let workflow_task_poller_behavior = self
+            .tuning
+            .workflow_task_poller_behavior(self.max_concurrent_workflow_task_polls)?;
+        let tuning = self.tuning.validated()?;
 
         WorkerConfig::builder()
             .namespace(self.namespace)
             .task_queue(self.task_queue)
-            .max_cached_workflows(self.max_cached_workflows as usize)
+            .max_cached_workflows(to_usize("max_cached_workflows", self.max_cached_workflows)?)
             .max_outstanding_workflow_tasks(workflow_task_slots)
-            .workflow_task_poller_behavior(PollerBehavior::SimpleMaximum(
-                self.max_concurrent_workflow_task_polls as usize,
-            ))
+            .workflow_task_poller_behavior(workflow_task_poller_behavior)
+            .sticky_queue_schedule_to_start_timeout(tuning.sticky_queue_schedule_to_start_timeout)
+            .max_heartbeat_throttle_interval(tuning.max_heartbeat_throttle_interval)
+            .default_heartbeat_throttle_interval(tuning.default_heartbeat_throttle_interval)
+            .maybe_max_worker_activities_per_second(tuning.max_worker_activities_per_second)
+            .maybe_max_task_queue_activities_per_second(tuning.max_task_queue_activities_per_second)
             .graceful_shutdown_period(Duration::from_millis(self.graceful_shutdown_timeout_ms))
             .versioning_strategy(versioning_strategy)
             .max_outstanding_activities(DEFAULT_MAX_OUTSTANDING_ACTIVITIES)
@@ -2966,6 +3026,177 @@ impl WorkerConfigInput {
                 status: STATUS_CONFIGURATION,
                 message: format!("Temporal workflow worker configuration is invalid: {message}"),
             })
+    }
+}
+
+/// Core's default sticky-queue schedule-to-start timeout, restated so an
+/// absent setting still reaches the builder as an explicit, testable value.
+const CORE_DEFAULT_STICKY_QUEUE_SCHEDULE_TO_START_MS: u64 = 10_000;
+/// Core's default longest heartbeat throttle interval.
+const CORE_DEFAULT_MAX_HEARTBEAT_THROTTLE_MS: u64 = 60_000;
+/// Core's default heartbeat throttle interval without a heartbeat timeout.
+const CORE_DEFAULT_HEARTBEAT_THROTTLE_MS: u64 = 30_000;
+
+/// Tuning values after bridge validation, ready for the Core builder.
+struct ValidatedTuning {
+    /// Sticky-queue schedule-to-start timeout handed to Core.
+    sticky_queue_schedule_to_start_timeout: Duration,
+    /// Longest heartbeat throttle interval handed to Core.
+    max_heartbeat_throttle_interval: Duration,
+    /// Default heartbeat throttle interval handed to Core.
+    default_heartbeat_throttle_interval: Duration,
+    /// Per-worker remote activity rate, when limited.
+    max_worker_activities_per_second: Option<f64>,
+    /// Task-queue activity dispatch rate, when requested.
+    max_task_queue_activities_per_second: Option<f64>,
+}
+
+impl WorkerTuningInput {
+    /// Selects Core's workflow poller behavior. Without autoscaling this is
+    /// the historical fixed maximum; with it, the bounds must be ordered and
+    /// the maximum must equal the document's `max_concurrent_workflow_task_polls`
+    /// so the cache-poller invariant checked on that field still applies.
+    fn workflow_task_poller_behavior(
+        &self,
+        max_concurrent_workflow_task_polls: u32,
+    ) -> std::result::Result<PollerBehavior, Failure> {
+        let Some(autoscaling) = self.workflow_task_poller_autoscaling else {
+            return Ok(PollerBehavior::SimpleMaximum(to_usize(
+                "max_concurrent_workflow_task_polls",
+                max_concurrent_workflow_task_polls,
+            )?));
+        };
+        validate_count(
+            "workflow_task_poller_autoscaling.minimum",
+            autoscaling.minimum,
+            false,
+        )?;
+        validate_count(
+            "workflow_task_poller_autoscaling.maximum",
+            autoscaling.maximum,
+            false,
+        )?;
+        if autoscaling.maximum < autoscaling.minimum {
+            return Err(configuration_failure(
+                "workflow_task_poller_autoscaling.maximum must be at least minimum",
+            ));
+        }
+        if autoscaling.initial < autoscaling.minimum || autoscaling.initial > autoscaling.maximum {
+            return Err(configuration_failure(
+                "workflow_task_poller_autoscaling.initial must be between minimum and maximum",
+            ));
+        }
+        if autoscaling.maximum != max_concurrent_workflow_task_polls {
+            return Err(configuration_failure(
+                "workflow_task_poller_autoscaling.maximum must equal max_concurrent_workflow_task_polls",
+            ));
+        }
+        Ok(PollerBehavior::Autoscaling {
+            minimum: to_usize(
+                "workflow_task_poller_autoscaling.minimum",
+                autoscaling.minimum,
+            )?,
+            maximum: to_usize(
+                "workflow_task_poller_autoscaling.maximum",
+                autoscaling.maximum,
+            )?,
+            initial: to_usize(
+                "workflow_task_poller_autoscaling.initial",
+                autoscaling.initial,
+            )?,
+        })
+    }
+
+    /// Validates every duration and rate, filling Core's defaults for absent
+    /// durations. Core clips the default heartbeat interval to the maximum
+    /// silently; an explicit contradiction is rejected instead. Core rejects
+    /// a non-normal worker rate only at build time and never checks the task
+    /// queue rate, so both are checked here with the same rule.
+    fn validated(&self) -> std::result::Result<ValidatedTuning, Failure> {
+        let sticky = tuning_duration(
+            "sticky_queue_schedule_to_start_timeout_ms",
+            self.sticky_queue_schedule_to_start_timeout_ms,
+            CORE_DEFAULT_STICKY_QUEUE_SCHEDULE_TO_START_MS,
+        )?;
+        let max_heartbeat = tuning_duration(
+            "max_heartbeat_throttle_interval_ms",
+            self.max_heartbeat_throttle_interval_ms,
+            CORE_DEFAULT_MAX_HEARTBEAT_THROTTLE_MS,
+        )?;
+        let default_heartbeat = tuning_duration(
+            "default_heartbeat_throttle_interval_ms",
+            self.default_heartbeat_throttle_interval_ms,
+            CORE_DEFAULT_HEARTBEAT_THROTTLE_MS,
+        )?;
+        if let (Some(default), Some(maximum)) = (
+            self.default_heartbeat_throttle_interval_ms,
+            self.max_heartbeat_throttle_interval_ms,
+        ) && default > maximum
+        {
+            return Err(configuration_failure(
+                "default_heartbeat_throttle_interval_ms must not exceed max_heartbeat_throttle_interval_ms",
+            ));
+        }
+        Ok(ValidatedTuning {
+            sticky_queue_schedule_to_start_timeout: sticky,
+            max_heartbeat_throttle_interval: max_heartbeat,
+            default_heartbeat_throttle_interval: default_heartbeat,
+            max_worker_activities_per_second: tuning_rate(
+                "max_worker_activities_per_second",
+                self.max_worker_activities_per_second,
+            )?,
+            max_task_queue_activities_per_second: tuning_rate(
+                "max_task_queue_activities_per_second",
+                self.max_task_queue_activities_per_second,
+            )?,
+        })
+    }
+}
+
+/// Builds a configuration failure with a static message.
+fn configuration_failure(message: &str) -> Failure {
+    Failure {
+        status: STATUS_CONFIGURATION,
+        message: message.to_owned(),
+    }
+}
+
+/// Converts a validated JSON count to Core's `usize` without a lossy cast.
+fn to_usize(name: &str, value: u32) -> std::result::Result<usize, Failure> {
+    usize::try_from(value).map_err(|_| Failure {
+        status: STATUS_CONFIGURATION,
+        message: format!("{name} exceeds platform capacity"),
+    })
+}
+
+/// Validates one optional tuning duration (1 ms to one day) or returns the
+/// Core default when it is absent.
+fn tuning_duration(
+    name: &str,
+    value: Option<u64>,
+    default_ms: u64,
+) -> std::result::Result<Duration, Failure> {
+    match value {
+        None => Ok(Duration::from_millis(default_ms)),
+        Some(milliseconds) if (1..=MAX_WORKER_TUNING_DURATION_MS).contains(&milliseconds) => {
+            Ok(Duration::from_millis(milliseconds))
+        }
+        Some(_) => Err(Failure {
+            status: STATUS_CONFIGURATION,
+            message: format!("{name} must be between 1 and {MAX_WORKER_TUNING_DURATION_MS}"),
+        }),
+    }
+}
+
+/// Accepts only positive, finite, normal rates.
+fn tuning_rate(name: &str, value: Option<f64>) -> std::result::Result<Option<f64>, Failure> {
+    match value {
+        None => Ok(None),
+        Some(rate) if rate.is_normal() && rate.is_sign_positive() => Ok(Some(rate)),
+        Some(_) => Err(Failure {
+            status: STATUS_CONFIGURATION,
+            message: format!("{name} must be a positive finite number"),
+        }),
     }
 }
 
@@ -5187,6 +5418,7 @@ mod worker_config_tests {
             max_concurrent_workflow_task_polls: pollers,
             graceful_shutdown_timeout_ms: 1_000,
             task_types: Default::default(),
+            tuning: Default::default(),
         }
     }
 
@@ -5386,6 +5618,10 @@ mod worker_slot_limits;
 #[cfg(test)]
 #[path = "../tests/support/worker_task_types.rs"]
 mod worker_task_types;
+
+#[cfg(test)]
+#[path = "../tests/support/worker_tuning.rs"]
+mod worker_tuning;
 
 /// SDK name reported to Temporal as the `client-name` RPC header and recorded
 /// in `WorkflowTaskCompleted.sdk_metadata`. Core would otherwise attribute

@@ -90,6 +90,28 @@
           "activities": { "const": false }
         }
       }
+    },
+    "tuning": {
+      "description": "Optional Core settings from the public worker options (#498). Every member is optional and an absent member keeps Core's default; the OCaml encoder omits the whole object when no member is set. Runtime validators also require default_heartbeat_throttle_interval_ms not to exceed max_heartbeat_throttle_interval_ms when both are present, autoscaling minimum <= initial <= maximum, and autoscaling maximum to equal max_concurrent_workflow_task_polls. Activity slot counts are intentionally absent (#777).",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "workflow_task_poller_autoscaling": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["minimum", "maximum", "initial"],
+          "properties": {
+            "minimum": { "type": "integer", "minimum": 1, "maximum": 1000000 },
+            "maximum": { "type": "integer", "minimum": 1, "maximum": 1000000 },
+            "initial": { "type": "integer", "minimum": 1, "maximum": 1000000 }
+          }
+        },
+        "sticky_queue_schedule_to_start_timeout_ms": { "type": "integer", "minimum": 1, "maximum": 86400000 },
+        "max_heartbeat_throttle_interval_ms": { "type": "integer", "minimum": 1, "maximum": 86400000 },
+        "default_heartbeat_throttle_interval_ms": { "type": "integer", "minimum": 1, "maximum": 86400000 },
+        "max_worker_activities_per_second": { "type": "number", "exclusiveMinimum": 0 },
+        "max_task_queue_activities_per_second": { "type": "number", "exclusiveMinimum": 0 }
+      }
     }
   },
   "allOf": [
