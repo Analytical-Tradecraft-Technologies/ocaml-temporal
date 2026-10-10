@@ -200,7 +200,7 @@ jobs:
           make test-temporal-start-metadata-live
       - name: Retain synthetic workflow start metadata evidence
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: workflow-start-metadata-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
@@ -216,7 +216,7 @@ jobs:
         run: make test-temporal-task-failure-live
       - name: Retain exact-run task failure recovery evidence
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: workflow-task-failure-${{ github.run_id }}-${{ github.run_attempt }}
           path: _build/task-failure-live/
@@ -233,7 +233,7 @@ jobs:
         if: always()
         id: live-artifacts
         continue-on-error: true
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: live-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
           path: _build/live-diagnostics/
@@ -315,7 +315,7 @@ jobs:
         run: make test-history-corpus-upgrade HISTORY_CORPUS_SDK_COMMIT="$GITHUB_SHA"
       - name: Upload the replay history corpus upgrade report
         if: ${{ !cancelled() && matrix.runner == 'ubuntu-24.04' && matrix.ocaml == '5.5.1' }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: history-corpus-report-linux-amd64-ocaml-${{ matrix.ocaml }}
           path: _build/history-corpus/report.json
@@ -326,7 +326,7 @@ jobs:
           OCAML_VERSION: ${{ matrix.ocaml }}
         run: make library-artifact
       - name: Upload the verified OCaml library
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: ocaml-sdk-linux-${{ matrix.runner == 'ubuntu-24.04-arm' && 'arm64' || 'amd64' }}-ocaml-${{ matrix.ocaml }}
           path: _build/ocaml-library-artifact/
@@ -342,7 +342,7 @@ jobs:
           python3 scripts/smoke-artifact.py pack --directory _build/smoke-artifact --commit "$GITHUB_SHA" --ocaml "$OCAML_VERSION"
       - name: Upload compiled smoke executables
         if: matrix.runner == 'ubuntu-24.04' && matrix.ocaml == '5.5.1'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: temporal-smoke-linux-amd64-ocaml-5.5.1
           path: _build/smoke-artifact/
@@ -409,7 +409,7 @@ jobs:
         shell: bash
         run: make native-library-artifact OCAML_ARTIFACT_PLATFORM=macos-arm64 PYTHON=python3
       - name: Upload the verified OCaml library
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: ocaml-sdk-macos-arm64-ocaml-${{ matrix.ocaml }}
           path: _build/ocaml-library-artifact/
@@ -490,7 +490,7 @@ jobs:
         shell: bash
         run: make native-library-artifact OCAML_ARTIFACT_PLATFORM=windows-amd64 PYTHON=python
       - name: Upload the verified OCaml library
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: ocaml-sdk-windows-amd64-ocaml-${{ matrix.ocaml }}
           path: _build/ocaml-library-artifact/
