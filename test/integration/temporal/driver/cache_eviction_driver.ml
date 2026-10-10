@@ -1,19 +1,23 @@
 (** Driver for the live sticky-cache eviction acceptance.
 
     The client starts two exact runs while the worker is configured with one
-    Core cache slot. Each run schedules a long deterministic timer, so the
-    first task reaches a durable pending boundary. Before admitting B, the
+    Core cache slot. A parks on a signal condition and B schedules a long
+    deterministic timer; each initial task reaches a durable pending boundary.
+    Before admitting B, the
     driver waits for the worker's payload-free completion marker for A. This
     marker is written only after Core acknowledges A's initial activation, so
     the cache transition is synchronized without issuing a control-plane query
     that can wait on a separate poller during cache pressure. The driver then
     requires the worker's payload-free eviction marker. The second run's
-    normal-completion marker is retained only as timeout diagnostics: pinned
-    Core ordering buffers B until A's [RemoveFromCache(CacheFull)] activation
-    has been acknowledged, so B is never evidence that eviction has happened.
-    It cancels both exact runs and requires each to reach Temporal's typed
-    cancellation outcome. The client never registers or executes workflow
-    code. *)
+    initial-completion marker is retained as timeout diagnostics while waiting
+    for eviction: pinned Core ordering buffers B until A's
+    [RemoveFromCache(CacheFull)] activation has been acknowledged, so B is
+    never evidence that eviction has happened. After the eviction marker, B's
+    acknowledgement is required before A is signaled to establish that B has
+    reached its pending timer boundary.
+    It then signals the evicted exact run A and requires normal completion
+    while B remains outstanding; B must reach Temporal's typed cancellation
+    outcome. The client never registers or executes workflow code. *)
 
 module Client = Temporal.Client
 module Error = Temporal.Error
@@ -120,16 +124,42 @@ let require_cancelled label = function
              (Printf.sprintf "%s continued as new at run %s" label
                 execution.run_id))
 
+(** Requires the previously evicted exact run to resume and complete with the
+    release signal's deterministic value. A terminal error or another payload
+    cannot establish forward progress after the cache-full removal. *)
+let require_completed label expected = function
+  | Client.Completed actual when String.equal actual expected -> Ok ()
+  | Client.Completed actual ->
+      Error
+        (Error.defect
+           ~message:
+             (Printf.sprintf "%s completed with %S instead of %S" label actual
+                expected))
+  | Client.Failed { error; _ }
+  | Client.Terminated error
+  | Client.Timed_out { error; _ }
+  | Client.Cancelled error ->
+      Error
+        (Error.defect
+           ~message:
+             (Printf.sprintf "%s ended as %s: %s" label (Error.kind error)
+                (Error.message error)))
+  | Client.Continued_as_new execution ->
+      Error
+        (Error.defect
+           ~message:
+             (Printf.sprintf "%s continued as new at run %s" label
+                execution.run_id))
+
 (** Cancels one exact run with a distinct idempotency key. *)
 let cancel handle ~request_id =
   Client.cancel ~request_id ~reason:"cache eviction acceptance requested" handle
 
-(** Starts two exact executions against the one-slot worker cache. The
-    cache-only workflow has no durable command before it parks, so each initial
-    workflow task can complete as an empty non-terminal activation while Core
-    retains the execution in its sticky cache. Admitting the second execution
-    then forces a real cache-full eviction; the driver observes that marker and
-    proves cancellation still reaches each exact run. *)
+(** Starts two exact executions against the one-slot worker cache. A parks on
+    a replay-safe signal condition; B retains the long timer from the original
+    eviction fixture. A's acknowledged initial task is the admission barrier
+    for B. Only after Core's cache-full marker does the driver signal A, prove
+    its normal completion, and cancel B. *)
 let run () =
   match Sys.getenv_opt "TEMPORAL_TWO_BINARY_LIVE" with
   | Some "1" ->
@@ -168,7 +198,7 @@ let run () =
         let* () = clear_marker second_ready in
         phase "start_a" "begin";
         let* first =
-          Client.start client ~workflow:Definitions.cache_eviction
+          Client.start client ~workflow:Definitions.cache_eviction_resumable
             ~task_queue:Definitions.task_queue
             ~id:"two-binary-cache-eviction-a" ~input:"first" ()
         in
@@ -197,6 +227,26 @@ let run () =
             ~second_ready ~timeout
         in
         phase "eviction_marker" "observed";
+        phase "pending_b" "begin";
+        let* () =
+          wait_for_marker ~path:second_ready ~expected:"initial-completion\n"
+            ~timeout
+        in
+        phase "pending_b" "observed";
+        phase "signal_a" "begin";
+        let* () =
+          Client.signal ~request_id:"two-binary-cache-eviction-resume-a" first
+            ~signal:Definitions.signal_value ~input:"resume"
+        in
+        phase "signal_a" "ok";
+        phase "wait_a" "begin";
+        let* first_outcome = Client.wait first in
+        phase "wait_a" "ok";
+        let* () =
+          require_completed "cache eviction run A" "SMOKE:CACHE:FIRST:RESUME"
+            first_outcome
+        in
+        execution_phase "wait_a" "completed" first;
         phase "cancel_b" "begin";
         let* () = cancel second ~request_id:"two-binary-cache-eviction-cancel-b" in
         phase "cancel_b" "ok";
@@ -205,14 +255,6 @@ let run () =
         phase "wait_b" "ok";
         let* () = require_cancelled "cache eviction run B" second_outcome in
         execution_phase "wait_b" "cancelled" second;
-        phase "cancel_a" "begin";
-        let* () = cancel first ~request_id:"two-binary-cache-eviction-cancel-a" in
-        phase "cancel_a" "ok";
-        phase "wait_a" "begin";
-        let* first_outcome = Client.wait first in
-        phase "wait_a" "ok";
-        let* () = require_cancelled "cache eviction run A" first_outcome in
-        execution_phase "wait_a" "cancelled" first;
         Ok ()
       in
       finish result

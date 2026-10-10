@@ -122,6 +122,51 @@ sh "$normalizer" --workflow-id "$workflow_id" --run-id "$run_id" \
 jq -e '.events[1].type == "WorkflowTaskTimedOut"' \
   "$tmp/normalized-sticky-timeout.json" >/dev/null
 
+# A post-eviction signal is a durable server event, but its input payload must
+# not enter the retained history projection. Accept the canonical protobuf
+# enum and reject a misspelling rather than broadening the closed event map.
+jq '.history.events += [{eventId:"4",eventType:"EVENT_TYPE_WORKFLOW_EXECUTION_SIGNALED",
+      workflowExecutionSignaledEventAttributes:{signalName:"resume",input:"private-signal-input"}}]' \
+  "$tmp/cli-history.json" >"$tmp/cli-history-signaled.json"
+sh "$normalizer" --workflow-id "$workflow_id" --run-id "$run_id" \
+  --output "$tmp/normalized-signaled.json" <"$tmp/cli-history-signaled.json"
+jq -e '.events[3] == {event_id:"4",type:"WorkflowExecutionSignaled"}
+  and ([.events[] | keys | sort] | all(. == ["event_id", "type"]))' \
+  "$tmp/normalized-signaled.json" >/dev/null
+if grep -F 'private-signal-input' "$tmp/normalized-signaled.json" >/dev/null; then
+  echo 'signal input leaked into normalized history' >&2
+  exit 1
+fi
+jq '.history.events[3].eventType = "EVENT_TYPE_WORKFLOW_EXECUTION_SIGNALLED"' \
+  "$tmp/cli-history-signaled.json" >"$tmp/cli-history-misspelled-signal.json"
+expect_failure sh "$normalizer" --workflow-id "$workflow_id" --run-id "$run_id" \
+  --output "$tmp/normalized-misspelled-signal.json" \
+  <"$tmp/cli-history-misspelled-signal.json"
+[ ! -e "$tmp/normalized-misspelled-signal.json" ]
+
+# A client cancellation request also appears in B's exact server history.
+# Preserve that event name while keeping its reason outside the projection;
+# an unknown near-match must still fail without publishing an output file.
+jq '.history.events += [{eventId:"4",eventType:"EVENT_TYPE_WORKFLOW_EXECUTION_CANCEL_REQUESTED",
+      workflowExecutionCancelRequestedEventAttributes:{cause:"private-cancel-reason"}}]' \
+  "$tmp/cli-history.json" >"$tmp/cli-history-cancel-requested.json"
+sh "$normalizer" --workflow-id "$workflow_id" --run-id "$run_id" \
+  --output "$tmp/normalized-cancel-requested.json" \
+  <"$tmp/cli-history-cancel-requested.json"
+jq -e '.events[3] == {event_id:"4",type:"WorkflowExecutionCancelRequested"}
+  and ([.events[] | keys | sort] | all(. == ["event_id", "type"]))' \
+  "$tmp/normalized-cancel-requested.json" >/dev/null
+if grep -F 'private-cancel-reason' "$tmp/normalized-cancel-requested.json" >/dev/null; then
+  echo 'cancellation reason leaked into normalized history' >&2
+  exit 1
+fi
+jq '.history.events[3].eventType = "EVENT_TYPE_WORKFLOW_EXECUTION_CANCELLATION_REQUESTED"' \
+  "$tmp/cli-history-cancel-requested.json" >"$tmp/cli-history-misspelled-cancel.json"
+expect_failure sh "$normalizer" --workflow-id "$workflow_id" --run-id "$run_id" \
+  --output "$tmp/normalized-misspelled-cancel.json" \
+  <"$tmp/cli-history-misspelled-cancel.json"
+[ ! -e "$tmp/normalized-misspelled-cancel.json" ]
+
 # The real Temporal CLI emits this top-level shape, without workflow/run
 # metadata around the history. The first event carries the workflow ID in its
 # started-event attributes; the controller obtains the exact run ID from the

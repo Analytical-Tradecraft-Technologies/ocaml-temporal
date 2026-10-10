@@ -76,6 +76,7 @@ if ! "$jq_bin" -e \
       | sub("^eventtype"; "")
       | sub("^historyeventtype"; "")
       | if . == "workflowexecutionstarted" then "WorkflowExecutionStarted"
+        elif . == "workflowexecutionsignaled" then "WorkflowExecutionSignaled"
         elif . == "workflowtaskscheduled" then "WorkflowTaskScheduled"
         elif . == "workflowtaskstarted" then "WorkflowTaskStarted"
         elif . == "workflowtaskcompleted" then "WorkflowTaskCompleted"
@@ -89,6 +90,7 @@ if ! "$jq_bin" -e \
         elif . == "activitytaskcompleted" then "ActivityTaskCompleted"
         elif . == "activitytaskfailed" then "ActivityTaskFailed"
         elif . == "activitytaskcanceled" then "ActivityTaskCanceled"
+        elif . == "workflowexecutioncancelrequested" then "WorkflowExecutionCancelRequested"
         elif . == "workflowexecutioncompleted" then "WorkflowExecutionCompleted"
         elif . == "workflowexecutionfailed" then "WorkflowExecutionFailed"
         elif . == "workflowexecutioncanceled" then "WorkflowExecutionCanceled"

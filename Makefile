@@ -36,6 +36,8 @@ SMOKE_CACHE_EVICTION_CONTAINER_FILE := /workspace/test/integration/temporal/.cac
 SMOKE_CACHE_EVICTION_READY_CONTAINER_FILE := /workspace/test/integration/temporal/.cache-eviction-ready
 SMOKE_CACHE_EVICTION_SECOND_READY_CONTAINER_FILE := /workspace/test/integration/temporal/.cache-eviction-second-ready
 SMOKE_CACHE_EVICTION_DRIVER_LOG_FILE := $(TEMPORAL_FIXTURE_DIR)/.cache-eviction-driver.log
+SMOKE_CACHE_EVICTION_HISTORY_A := $(TEMPORAL_FIXTURE_DIR)/.cache-eviction-history-a.json
+SMOKE_CACHE_EVICTION_HISTORY_B := $(TEMPORAL_FIXTURE_DIR)/.cache-eviction-history-b.json
 SMOKE_DRIVER_CONTAINER := $(TEMPORAL_COMPOSE_PROJECT)-smoke-driver
 SMOKE_RESTART_DRIVER_CONTAINER := $(TEMPORAL_COMPOSE_PROJECT)-smoke-restart-driver
 SMOKE_WORKER_GENERATION ?= 1
@@ -528,7 +530,10 @@ temporal-stop:
 		"$(SMOKE_RESTART_CONTROLLER_FILE)" "$(SMOKE_CACHE_EVICTION_FILE)" \
 		"$(SMOKE_CACHE_EVICTION_READY_FILE)" "$(SMOKE_CACHE_EVICTION_SECOND_READY_FILE)" \
 		"$(SMOKE_CACHE_EVICTION_DRIVER_LOG_FILE)" \
-		"$(SMOKE_POLL_ISOLATION_LOG_FILE)"
+		"$(SMOKE_POLL_ISOLATION_LOG_FILE)" \
+		"$(SMOKE_CACHE_EVICTION_HISTORY_A)" "$(SMOKE_CACHE_EVICTION_HISTORY_B)" \
+		"$(SMOKE_CACHE_EVICTION_HISTORY_A).raw" \
+		"$(SMOKE_CACHE_EVICTION_HISTORY_A).describe.json"
 
 temporal-clean:
 	$(TEMPORAL_COMPOSE) down --volumes --remove-orphans
@@ -542,7 +547,10 @@ temporal-clean:
 		"$(SMOKE_RESTART_CONTROLLER_FILE)" "$(SMOKE_CACHE_EVICTION_FILE)" \
 		"$(SMOKE_CACHE_EVICTION_READY_FILE)" "$(SMOKE_CACHE_EVICTION_SECOND_READY_FILE)" \
 		"$(SMOKE_CACHE_EVICTION_DRIVER_LOG_FILE)" \
-		"$(SMOKE_POLL_ISOLATION_LOG_FILE)"
+		"$(SMOKE_POLL_ISOLATION_LOG_FILE)" \
+		"$(SMOKE_CACHE_EVICTION_HISTORY_A)" "$(SMOKE_CACHE_EVICTION_HISTORY_B)" \
+		"$(SMOKE_CACHE_EVICTION_HISTORY_A).raw" \
+		"$(SMOKE_CACHE_EVICTION_HISTORY_A).describe.json"
 
 # CI uses the same controllers as local acceptance, each with a bounded log
 # wrapper. A failed scenario stops the suite; workflow finalizers upload all
@@ -669,7 +677,8 @@ test-temporal-worker-crash-recovery-contract:
 # then waits for the worker's exact RemoveFromCache marker. It does not require
 # a second-run completion callback because that callback can be withheld while
 # Core evicts the first run; waiting for it would deadlock the eviction proof.
-# Both exact runs are then cancelled and checked for typed terminal outcomes.
+# The evicted exact run A resumes on a signal and completes normally; the
+# timer-backed run B is cancelled and checked for its typed outcome.
 test-temporal-worker-cache-eviction:
 	$(MAKE) test-temporal-worker-cache-eviction-contract
 	SMOKE_WORKER_MAX_CACHED_WORKFLOWS=1 \
@@ -733,6 +742,17 @@ test-temporal-parent-child-failure-replay-live: test-temporal-config
 
 test-temporal-worker-cache-eviction-live: test-temporal-config
 	@set -eu; \
+	workflow_a=two-binary-cache-eviction-a; \
+	workflow_b=two-binary-cache-eviction-b; \
+	history_a="$(SMOKE_CACHE_EVICTION_HISTORY_A)"; \
+	history_b="$(SMOKE_CACHE_EVICTION_HISTORY_B)"; \
+	raw_history="$(SMOKE_CACHE_EVICTION_HISTORY_A).raw"; \
+	describe_file="$(SMOKE_CACHE_EVICTION_HISTORY_A).describe.json"; \
+	marker="$(SMOKE_CACHE_EVICTION_FILE)"; \
+	driver_log="$(SMOKE_CACHE_EVICTION_DRIVER_LOG_FILE)"; \
+	normalizer=test/integration/temporal/scripts/normalize-history.sh; \
+	identity_validator=test/integration/temporal/scripts/validate-restart-replay-identity.sh; \
+	validator=test/integration/temporal/scripts/validate-cache-eviction-progress.sh; \
 	driver_container="$(TEMPORAL_COMPOSE_PROJECT)-smoke-cache-eviction-driver"; \
 	cleanup_driver() { \
 		docker rm -f "$$driver_container" >/dev/null 2>&1 || true; \
@@ -741,11 +761,64 @@ test-temporal-worker-cache-eviction-live: test-temporal-config
 	cleanup_cache_worker() { \
 		$(TEMPORAL_COMPOSE) rm --stop --force smoke-cache-eviction-worker >/dev/null 2>&1 || true; \
 	}; \
+	run_from_log() { \
+		role=$$1; \
+		if [ -f "$$driver_log" ]; then \
+			sed -n "s/^cache eviction execution=$$role workflow_id=two-binary-cache-eviction-$$role run_id=//p" "$$driver_log"; \
+		fi; \
+		return 0; \
+	}; \
+	valid_run_id() { \
+		[ "$$(printf '%s\n' "$$1" | wc -l | tr -d ' ')" -eq 1 ] && \
+		printf '%s\n' "$$1" | LC_ALL=C grep -Eq '^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$$'; \
+	}; \
+	capture_history() { \
+		workflow_id=$$1; run_id=$$2; destination=$$3; \
+		valid_run_id "$$run_id" || return 1; \
+		if ! timeout --signal=TERM --kill-after=5s 60s env $(TEMPORAL_COMPOSE) run --rm --no-deps temporal-admin-tools \
+			temporal workflow describe --workflow-id "$$workflow_id" --run-id "$$run_id" \
+			--namespace temporal-sdk-test --output json >"$$describe_file" 2>/dev/null; then \
+			rm -f "$$describe_file"; return 1; \
+		fi; \
+		if ! sh "$$identity_validator" --input "$$describe_file" \
+			--workflow-id "$$workflow_id" --run-id "$$run_id" >/dev/null; then \
+			rm -f "$$describe_file"; return 1; \
+		fi; \
+		rm -f "$$describe_file"; \
+		if ! timeout --signal=TERM --kill-after=5s 60s env $(TEMPORAL_COMPOSE) run --rm --no-deps temporal-admin-tools \
+			temporal workflow show --workflow-id "$$workflow_id" --run-id "$$run_id" \
+			--namespace temporal-sdk-test --output json >"$$raw_history" 2>/dev/null; then \
+			rm -f "$$raw_history"; return 1; \
+		fi; \
+		if ! sh "$$normalizer" --workflow-id "$$workflow_id" --run-id "$$run_id" \
+			--output "$$destination" <"$$raw_history"; then \
+			rm -f "$$raw_history"; return 1; \
+		fi; \
+		rm -f "$$raw_history"; \
+	}; \
 	cleanup() { \
 		status=$$?; \
 		trap - EXIT HUP INT TERM; \
+		if [ "$$status" -ne 0 ]; then \
+			for role in a b; do \
+				if [ "$$role" = a ]; then workflow_id=$$workflow_a; destination=$$history_a; \
+				else workflow_id=$$workflow_b; destination=$$history_b; fi; \
+				run_id=$$(run_from_log "$$role"); \
+				if [ ! -s "$$destination" ] && valid_run_id "$$run_id"; then \
+					capture_history "$$workflow_id" "$$run_id" "$$destination" || \
+						echo "exact history unavailable for outstanding run: workflow_id=$$workflow_id run_id=$$run_id" >&2; \
+				fi; \
+			done; \
+		fi; \
+		rm -f "$$raw_history" "$$describe_file"; \
 		sh test/integration/temporal/scripts/collect-live-diagnostics.sh cleanup || echo "live diagnostic snapshot failed" >&2; \
-		if [ "$$status" -ne 0 ]; then cat "$(SMOKE_CACHE_EVICTION_DRIVER_LOG_FILE)" 2>/dev/null || true; $(TEMPORAL_COMPOSE) logs --no-color --tail 200 smoke-cache-eviction-worker 2>/dev/null || true; $(MAKE) temporal-logs || true; fi; \
+		if [ "$$status" -ne 0 ]; then \
+			echo 'cache eviction recovery failed; exact run IDs and last phases follow' >&2; \
+			grep -E '^cache eviction (execution=|phase=)' "$$driver_log" 2>/dev/null || true; \
+			cat "$$driver_log" 2>/dev/null || true; \
+			$(TEMPORAL_COMPOSE) logs --no-color --tail 200 smoke-cache-eviction-worker 2>/dev/null || true; \
+			$(MAKE) temporal-logs || true; \
+		fi; \
 		cleanup_driver; \
 		cleanup_cache_worker; \
 		$(MAKE) temporal-clean || true; \
@@ -756,19 +829,26 @@ test-temporal-worker-cache-eviction-live: test-temporal-config
 	trap 'exit 130' INT; \
 	trap 'exit 143' TERM; \
 	$(MAKE) temporal-clean; \
-	rm -f "$(SMOKE_CACHE_EVICTION_FILE)" "$(SMOKE_CACHE_EVICTION_READY_FILE)" "$(SMOKE_CACHE_EVICTION_SECOND_READY_FILE)" "$(SMOKE_CACHE_EVICTION_DRIVER_LOG_FILE)"; \
+	rm -f "$$marker" "$(SMOKE_CACHE_EVICTION_READY_FILE)" "$(SMOKE_CACHE_EVICTION_SECOND_READY_FILE)" "$$driver_log" "$$history_a" "$$history_b" "$$raw_history" "$$describe_file"; \
 	$(MAKE) temporal-start; \
 	$(TEMPORAL_COMPOSE) up --force-recreate --detach --build --wait smoke-cache-eviction-worker; \
 	docker rm -f "$$driver_container" >/dev/null 2>&1 || true; \
 	status=0; \
-	$(TEMPORAL_COMPOSE) run --build --rm --name "$$driver_container" --no-deps smoke-cache-eviction-driver >"$(SMOKE_CACHE_EVICTION_DRIVER_LOG_FILE)" 2>&1 || status=$$?; \
-	cat "$(SMOKE_CACHE_EVICTION_DRIVER_LOG_FILE)"; \
+	$(TEMPORAL_COMPOSE) run --build --rm --name "$$driver_container" --no-deps smoke-cache-eviction-driver >"$$driver_log" 2>&1 || status=$$?; \
+	cat "$$driver_log"; \
 	if [ "$$status" -ne 0 ]; then exit "$$status"; fi; \
 	command -v jq >/dev/null 2>&1; \
-	jq -e --arg workflow_id two-binary-cache-eviction-a \
-		--arg reason cache_full \
-		'type == "object" and (keys | sort) == ["reason", "run_id", "workflow_id"] and .workflow_id == $$workflow_id and .run_id != "" and .reason == $$reason' \
-		"$(SMOKE_CACHE_EVICTION_FILE)" >/dev/null
+	run_a=$$(jq -er '.run_id' "$$marker"); \
+	run_b=$$(run_from_log b); \
+	valid_run_id "$$run_b" || { echo 'cache eviction run B has no valid exact run ID' >&2; exit 1; }; \
+	for role in a b; do \
+		if [ "$$role" = a ]; then workflow_id=$$workflow_a; run_id=$$run_a; destination=$$history_a; \
+		else workflow_id=$$workflow_b; run_id=$$run_b; destination=$$history_b; fi; \
+		capture_history "$$workflow_id" "$$run_id" "$$destination" || \
+			{ echo "exact history capture failed: workflow_id=$$workflow_id run_id=$$run_id" >&2; exit 1; }; \
+	done; \
+	sh "$$validator" "$$marker" "$$history_a" "$$history_b" "$$run_b"; \
+	sh test/integration/temporal/scripts/collect-live-diagnostics.sh validated || echo 'live diagnostic snapshot failed' >&2
 
 test-temporal-worker-restart-live: test-temporal-config
 	@set -eu; \
@@ -854,6 +934,9 @@ test-temporal-worker-restart-live: test-temporal-config
 		sleep 1; \
 	done; \
 	[ -n "$$initial_count" ] || { echo "restart workflow never reached its pending timer history" >&2; exit 1; }; \
+	if [ -s "$$result_file" ] || ! kill -0 "$$driver_pid" 2>/dev/null; then \
+		echo "restart run was no longer outstanding before worker fault: workflow_id=$$workflow_id run_id=$$run_id" >&2; exit 1; \
+	fi; \
 	generation_one_container=$$($(TEMPORAL_COMPOSE) ps -q smoke-worker); \
 	[ -n "$$generation_one_container" ] || { echo "generation one container ID is missing" >&2; exit 1; }; \
 	if [ "$$replacement_mode" = crash ]; then \
@@ -871,9 +954,14 @@ test-temporal-worker-restart-live: test-temporal-config
 		fi; \
 		generation_one_shutdown_marker=false; \
 	else \
-		$(MAKE) temporal-stop-worker; \
+		if ! $(MAKE) temporal-stop-worker; then \
+			echo "bounded shutdown failed with outstanding run: workflow_id=$$workflow_id run_id=$$run_id" >&2; exit 1; \
+		fi; \
 		generation_one_exit_code=0; \
 		generation_one_shutdown_marker=true; \
+	fi; \
+	if [ -s "$$result_file" ] || ! kill -0 "$$driver_pid" 2>/dev/null; then \
+		echo "restart run was no longer outstanding after worker fault: workflow_id=$$workflow_id run_id=$$run_id" >&2; exit 1; \
 	fi; \
 	sh test/integration/temporal/scripts/collect-live-diagnostics.sh pre-worker-removal || echo "live diagnostic snapshot failed" >&2; \
 	$(TEMPORAL_COMPOSE) rm --force smoke-worker >/dev/null; \
