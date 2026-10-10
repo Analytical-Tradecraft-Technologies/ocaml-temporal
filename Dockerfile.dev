@@ -14,10 +14,10 @@ RUN rustup component add clippy rustfmt
 # in this form so Dependabot's docker ecosystem can refresh the digests.
 # BuildKit only resolves the stage selected by OCAML_IMAGE. Keep the series in
 # step with scripts/ci-matrix.py.
-FROM ocaml/opam:debian-12-ocaml-5.2@sha256:b06c7348b6ed3e83b5f66267254504a8f066ec9be9c020c30a8e28ce10ab3ef6 AS ocaml-5.2
-FROM ocaml/opam:debian-12-ocaml-5.3@sha256:bbaac53e502f6602013d8967c3a54cfcb898b556f453ab72e8e23966c3c681df AS ocaml-5.3
-FROM ocaml/opam:debian-12-ocaml-5.4@sha256:ba37cf7a29709fa2f19124fda8f4cabdea3156a648276fc98c9d528998ae2e59 AS ocaml-5.4
-FROM ocaml/opam:debian-12-ocaml-5.5@sha256:57f87030c6082e3f46f59988fbf12a84947945baf2974d4567a9dcee85780090 AS ocaml-5.5
+FROM ocaml/opam:debian-12-ocaml-5.6@sha256:8c3ce980cd6f56e6c16c9ac1d42f6b8346245b7c1e59ea5f460f68eb48683e82 AS ocaml-5.2
+FROM ocaml/opam:debian-12-ocaml-5.6@sha256:8c3ce980cd6f56e6c16c9ac1d42f6b8346245b7c1e59ea5f460f68eb48683e82 AS ocaml-5.3
+FROM ocaml/opam:debian-12-ocaml-5.6@sha256:8c3ce980cd6f56e6c16c9ac1d42f6b8346245b7c1e59ea5f460f68eb48683e82 AS ocaml-5.4
+FROM ocaml/opam:debian-12-ocaml-5.6@sha256:8c3ce980cd6f56e6c16c9ac1d42f6b8346245b7c1e59ea5f460f68eb48683e82 AS ocaml-5.5
 
 FROM ${OCAML_IMAGE} AS dev
 
