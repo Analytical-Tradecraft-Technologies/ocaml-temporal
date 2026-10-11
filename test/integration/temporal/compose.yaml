@@ -526,6 +526,35 @@ services:
       - test/integration/temporal/driver/parent_child_restart_driver.exe
     init: true
 
+  # Official-SDK side of the sdk_interop live regression (#517). It reuses the
+  # digest-pinned Python image already used by the CI license audit, so the
+  # OCaml development image never gains Python. run-driver.sh installs only
+  # the hash-locked official Temporal Python SDK closure into a throwaway
+  # virtual environment; run-live-regressions.sh starts this one-shot service
+  # while the OCaml regression process hosts the workflow worker.
+  sdk-interop-python:
+    profiles: [temporal]
+    image: python:3.14-slim-bookworm@sha256:4ff4b92a68355dbdb52584ab3391dff8d371a61d4e063468bfd0130e3189c6d9
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    environment:
+      HOME: /tmp
+      TEMPORAL_ADDRESS: temporal:7233
+      SDK_INTEROP_EVIDENCE_DIR: /workspace/_build/live-regressions/sdk_interop
+      OCAML_SDK_VERSION: "${OCAML_SDK_VERSION:-}"
+    volumes:
+      - ../../..:/workspace
+    working_dir: /tmp
+    networks:
+      - temporal-network
+    command:
+      - timeout
+      - --signal=TERM
+      - --kill-after=10s
+      - "${SDK_INTEROP_TIMEOUT_SECONDS:-170}"
+      - sh
+      - /workspace/test/integration/sdk_interop/python/run-driver.sh
+    init: true
+
 networks:
   temporal-network:
     driver: bridge

@@ -27,6 +27,7 @@ here. It uses only POSIX tools and needs neither OPAM, Cargo, nor Docker.
 | [Per-compiler lock overrides](#per-compiler-lock-overrides) | `scripts/opam-lock-overrides.txt` |
 | [Linking-exception scope](#linking-exception-scope) | The locked versions of `ocaml`, `ocaml-base-compiler`, and `ocamlbuild` in `temporal-sdk.opam.locked`, and of `tyxml`, `re`, and `camlp-streams` in `scripts/docs-tools.locked` |
 | [CI-only documentation tooling](#ci-only-documentation-tooling) | `scripts/docs-tools.locked` |
+| [CI-only interoperability tooling](#ci-only-interoperability-tooling) | Every `name==version` line of `test/integration/sdk_interop/python/requirements.lock` |
 | [Builder image tooling](#builder-image-tooling), [toolchain and CI images](#toolchain-and-ci-images), and [local integration service images](#local-integration-service-images) | Every digest-pinned image reference in `Dockerfile.dev`, `Dockerfile.rust-ci`, `test/integration/temporal/compose.yaml`, and the GitHub workflows and composite actions |
 | [Locked Cargo closure](#locked-cargo-closure) | The `[[package]]` count in `rust/Cargo.lock` and the Temporal Core revision in `rust/Cargo.toml` |
 | [Direct Rust dependencies](#direct-rust-dependencies) | Every crate in `[workspace.dependencies]` in `rust/Cargo.toml` or declared by the bridge (inherited or directly), every locked version of each crate in `rust/Cargo.lock`, and the bridge's normal and dev dependency sections; any other bridge dependency table fails the check |
@@ -168,6 +169,34 @@ Packages the docs stage reuses from the SDK lock (`dune`, `ocamlfind`,
 | re | 1.14.0 | LGPL-2.1-or-later WITH OCaml-LGPL-linking-exception | Regular expressions used by tyxml (see [linking-exception scope](#linking-exception-scope)) |
 | camlp-streams | 5.0.1 | LGPL-2.1-only WITH OCaml-LGPL-linking-exception | Stream compatibility library used by odoc-parser (see [linking-exception scope](#linking-exception-scope)) |
 
+## CI-only interoperability tooling
+
+The [official-SDK interoperability regression](../test/integration/sdk_interop/README.md)
+(#517) drives OCaml workflows from the official Temporal Python SDK. The
+SDK and its runtime dependencies are installed only inside the digest-pinned
+`python:3.14-slim-bookworm` image listed under
+[toolchain and CI images](#toolchain-and-ci-images), into a throwaway virtual
+environment, by `test/integration/sdk_interop/python/run-driver.sh`. That
+script installs `test/integration/sdk_interop/python/requirements.lock` with
+`--require-hashes --no-deps --only-binary :all:`, so every distribution is
+pinned by version and SHA-256 digest, nothing outside the lock is resolved,
+and no package build code runs. None of these packages is an SDK dependency:
+they are absent from `temporal-sdk.opam` and its lock, are never installed in
+the OCaml development image, and are not linked into or redistributed with
+any SDK artifact. `make license-check` therefore does not audit them; a lock
+change must update this table, which `make check-dependency-inventory`
+enforces, and each new or changed license must be reviewed from the package
+metadata. The Python Software Foundation license of `typing-extensions` is a
+permissive, non-copyleft license, the same family as the CPython image itself.
+
+| Package | Exact version | License | Role |
+|---|---:|---|---|
+| temporalio | 1.33.0 | MIT | Official Temporal Python SDK (client, worker, default data converter); its wheels embed the official Rust Temporal Core |
+| nexus-rpc | 1.4.0 | MIT | Nexus RPC types imported by the SDK |
+| protobuf | 7.36.2 | BSD-3-Clause | Protocol Buffers runtime for the SDK's API messages |
+| types-protobuf | 7.35.1.20260906 | Apache-2.0 | Typing stubs that the SDK declares as a runtime requirement |
+| typing-extensions | 4.16.0 | PSF-2.0 | Typing backports used by the SDK and nexus-rpc |
+
 ## Builder image tooling
 
 The development image starts from one `ocaml/opam:debian-12-ocaml-<series>`
@@ -241,14 +270,18 @@ the eventual minimal runtime image.
 The Cargo license policy script runs in a separate official Python image in
 the standalone GitHub Actions audit job, and the release preflight uses the
 same image to generate and audit the Cargo SBOM. These containers have no
-network access and mount the source read-only. Python is not installed in the development or
-eventual runtime image, and nothing from the Python image is linked into or
-redistributed with the SDK.
+network access and mount the source read-only. The
+[official-SDK interoperability regression](#ci-only-interoperability-tooling)
+runs the same image as the `sdk-interop-python` Compose service; that test
+container joins the Compose network, downloads only the hash-locked wheels,
+and writes its evidence report under the ignored `_build` tree. Python is not
+installed in the development or eventual runtime image, and nothing from the
+Python image is linked into or redistributed with the SDK.
 
 | Image | Manifest index digest | Used by | Native platforms | License |
 |---|---|---|---|---|
 | `rust:1.99-bookworm` | `sha256:59037199c44290f2befcdd58dcc540164763fc296950255aaefeef096a1866b0` | `Dockerfile.dev` Rust toolchain stage and `Dockerfile.rust-ci` | Linux amd64 and arm64/v8 | Rust is Apache-2.0 OR MIT; image packaging (`rust-lang/docker-rust`) is Apache-2.0 OR MIT |
-| `python:3.14-slim-bookworm` | `sha256:4ff4b92a68355dbdb52584ab3391dff8d371a61d4e063468bfd0130e3189c6d9` | Cargo license audit and release-preflight Cargo SBOM generation and audit (CI-only) | Linux amd64, arm64/v8, and additional official architectures | CPython's PSF license stack (SPDX `Python-2.0`); image packaging (`docker-library/python`) is MIT |
+| `python:3.14-slim-bookworm` | `sha256:4ff4b92a68355dbdb52584ab3391dff8d371a61d4e063468bfd0130e3189c6d9` | Cargo license audit, release-preflight Cargo SBOM generation and audit, and the official-SDK interoperability driver (CI-only) | Linux amd64, arm64/v8, and additional official architectures | CPython's PSF license stack (SPDX `Python-2.0`); image packaging (`docker-library/python`) is MIT |
 
 `ocamlformat` is deliberately absent. Version 0.28.1 is MIT licensed, but its
 build closure includes ordinary GPL packages (`menhir` and `fix`), which this
