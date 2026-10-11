@@ -4,6 +4,7 @@ module Client = Temporal_protocol.Client_protocol
 module Workflow = Temporal_protocol.Workflow_protocol
 module Activity = Temporal_protocol.Activity_protocol
 module Encoded_completion = Temporal_protocol.Encoded_workflow_completion
+module Encoded_activity = Temporal_protocol.Encoded_activity_completion
 
 (** Requires two structural values to be equal and identifies the violated
     native-worker contract if they differ. *)
@@ -172,12 +173,15 @@ let test_protocol_serialization () =
   let activity_completion : Activity.completion =
     { task_token = Bytes.of_string "\000\001\002"; result = Will_complete_async }
   in
+  (* Activity completions follow the same single-encode contract (issue
+     #995): the adapter's encoder pass yields the exact bytes the supervisor
+     copies into the C call, so the wire document is unchanged. *)
   expect "activity completion JSON"
     (Bytes.of_string
        {|{"result":{"kind":"will_complete_async"},"task_token":"AAEC"}|})
-    (require_bridge
-       (Supervisor.Protocol_adapter.encode_activity_completion
-          activity_completion))
+    (match Encoded_activity.encode activity_completion with
+    | Ok encoded -> Encoded_activity.to_bytes encoded
+    | Error _ -> failwith "valid activity completion was not encoded")
 
 (** Invalid incoming and outgoing semantic documents are converted to the
     stable bridge [Protocol] status without including source payload bytes in
@@ -543,14 +547,19 @@ let test_native_lifecycle_guards () =
   let invalid_activity_completion : Activity.completion =
     { task_token = Bytes.empty; result = Will_complete_async }
   in
-  (match
-     Supervisor.perform supervisor
-       (Supervisor.Complete_activity invalid_activity_completion)
-   with
-  | Error (Supervisor.Backend { Bridge.status = Protocol; _ }) -> ()
-  | _ -> failwith "invalid activity completion reached the native worker");
-  let activity_completion : Activity.completion =
-    { task_token = Bytes.of_string "token"; result = Will_complete_async }
+  (* As for workflows, the encoder is the only constructor of a submittable
+     activity completion, so an invalid one cannot reach the native worker. *)
+  (match Encoded_activity.encode invalid_activity_completion with
+  | Error _ -> ()
+  | Ok _ -> failwith "invalid activity completion was encoded for the native worker");
+  let activity_completion =
+    match
+      Encoded_activity.encode
+        ({ task_token = Bytes.of_string "token"; result = Will_complete_async }
+          : Activity.completion)
+    with
+    | Ok encoded -> encoded
+    | Error _ -> failwith "valid activity completion was not encoded"
   in
   (match
      Supervisor.perform supervisor

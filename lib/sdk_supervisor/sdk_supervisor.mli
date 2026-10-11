@@ -182,11 +182,6 @@ module Native : sig
         [None], so one undecodable task cannot end [Worker.run]. A failed
         rejection keeps the [Protocol] error. *)
 
-    val encode_activity_completion :
-      Temporal_protocol.Activity_protocol.completion ->
-      (bytes, Temporal_core_bridge.Native_bridge.error) result
-    (** Canonically serializes and reparses one remote activity completion. *)
-
     val encode_activity_heartbeat :
       Temporal_protocol.Activity_protocol.heartbeat ->
       (bytes, Temporal_core_bridge.Native_bridge.error) result
@@ -585,12 +580,17 @@ module Native : sig
             owner Domain performs it while the C stub releases the OCaml
             runtime lock. *)
     | Complete_activity :
-        Temporal_protocol.Activity_protocol.completion -> unit operation
-        (** Validates and submits one typed remote activity completion. *)
+        Temporal_protocol.Encoded_activity_completion.t -> unit operation
+        (** Submits one remote activity completion as the canonical bytes from
+            its single encoder pass. The value can only be built by
+            [Encoded_activity_completion.encode], so it is already validated;
+            the supervisor copies it into the C call without encoding it
+            again (issue #995). *)
     | Complete_async_activity :
-        Temporal_protocol.Activity_protocol.completion -> unit operation
+        Temporal_protocol.Encoded_activity_completion.t -> unit operation
         (** Completes an activity after a [WillCompleteAsync] handoff through
-            the namespace-bound client path. *)
+            the namespace-bound client path, with the same single-encode
+            contract as [Complete_activity]. *)
     | Record_activity_heartbeat :
         Temporal_protocol.Activity_protocol.heartbeat -> unit operation
         (** Records progress for a leased activity without retiring it. The
