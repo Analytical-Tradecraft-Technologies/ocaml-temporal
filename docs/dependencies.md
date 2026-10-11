@@ -9,6 +9,9 @@ standalone GitHub Actions license job streams locked metadata emitted by
 official Python container. `make cargo-metadata` only emits the locked Cargo
 metadata; it does not run the scanner. Cargo license scanning deliberately
 does not run in the compiler/architecture matrix or as a Makefile target.
+`make license-check` also audits the CI-only official Python SDK closure of
+the interoperability regression in the pinned Python image; see
+[CI-only interoperability tooling](#ci-only-interoperability-tooling).
 The Makefile's `quality` target is a separate contributor/CI gate for RustSec,
 unused-dependency, and spelling checks.
 
@@ -27,6 +30,7 @@ here. It uses only POSIX tools and needs neither OPAM, Cargo, nor Docker.
 | [Per-compiler lock overrides](#per-compiler-lock-overrides) | `scripts/opam-lock-overrides.txt` |
 | [Linking-exception scope](#linking-exception-scope) | The locked versions of `ocaml`, `ocaml-base-compiler`, and `ocamlbuild` in `temporal-sdk.opam.locked`, and of `tyxml`, `re`, and `camlp-streams` in `scripts/docs-tools.locked` |
 | [CI-only documentation tooling](#ci-only-documentation-tooling) | `scripts/docs-tools.locked` |
+| [CI-only interoperability tooling](#ci-only-interoperability-tooling) | Every `name==version` line of `test/integration/sdk_interop/python/requirements.lock` |
 | [Builder image tooling](#builder-image-tooling), [toolchain and CI images](#toolchain-and-ci-images), and [local integration service images](#local-integration-service-images) | Every digest-pinned image reference in `Dockerfile.dev`, `Dockerfile.rust-ci`, `test/integration/temporal/compose.yaml`, and the GitHub workflows and composite actions |
 | [Locked Cargo closure](#locked-cargo-closure) | The `[[package]]` count in `rust/Cargo.lock` and the Temporal Core revision in `rust/Cargo.toml` |
 | [Direct Rust dependencies](#direct-rust-dependencies) | Every crate in `[workspace.dependencies]` in `rust/Cargo.toml` or declared by the bridge (inherited or directly), every locked version of each crate in `rust/Cargo.lock`, and the bridge's normal and dev dependency sections; any other bridge dependency table fails the check |
@@ -168,6 +172,59 @@ Packages the docs stage reuses from the SDK lock (`dune`, `ocamlfind`,
 | re | 1.14.0 | LGPL-2.1-or-later WITH OCaml-LGPL-linking-exception | Regular expressions used by tyxml (see [linking-exception scope](#linking-exception-scope)) |
 | camlp-streams | 5.0.1 | LGPL-2.1-only WITH OCaml-LGPL-linking-exception | Stream compatibility library used by odoc-parser (see [linking-exception scope](#linking-exception-scope)) |
 
+## CI-only interoperability tooling
+
+The [official-SDK interoperability regression](../test/integration/sdk_interop/README.md)
+(#517) drives OCaml workflows from the official Temporal Python SDK. The
+SDK and its runtime dependencies are installed only inside the digest-pinned
+`python:3.14-slim-bookworm` image listed under
+[toolchain and CI images](#toolchain-and-ci-images), into a throwaway virtual
+environment, by `test/integration/sdk_interop/python/run-driver.sh`. That
+script installs `test/integration/sdk_interop/python/requirements.lock` with
+`--require-hashes --no-deps --only-binary :all:`, so every distribution is
+pinned by version and SHA-256 digest, nothing outside the lock is resolved,
+and no package build code runs. None of these packages is an SDK dependency:
+they are absent from `temporal-sdk.opam` and its lock, are never installed in
+the OCaml development image, and are not linked into or redistributed with
+any SDK artifact.
+
+`make license-check` audits the closure itself through
+`make python-license-check`, so the standalone license job covers it. In the
+same pinned Python image, `scripts/check-python-licenses.sh` installs the lock
+with its hashes into a throwaway virtual environment created without pip, and
+`scripts/check-python-licenses.py` reads each installed distribution's own
+metadata with `importlib.metadata`: the PEP 639 `License-Expression`, every
+`License ::` classifier, the free-text `License` field, and each declared
+`License-File`, which must be present. Expressions are evaluated with the SPDX
+parser and permissive allowlist shared with the Cargo scanner
+(`scripts/check-cargo-licenses.py`). A missing, unknown, malformed, copyleft
+or ambiguous license fails, as does a declared license file that is absent, a
+copyleft classifier, or a classifier that contradicts the expression. The
+installed set must equal the lock exactly, so an unlocked or differently
+versioned distribution also fails. `test/smoke/test_python_license_policy.sh`
+runs first and proves these rules on the small fake distributions under
+`test/fixtures/python-licenses`, without the network.
+
+The only overrides are the reviewed entries below, which are keyed by exact
+package and version and also pin the observed metadata value, so an upgrade
+or a metadata change fails until it is reviewed again:
+
+| Package | Version | Observed metadata | Concluded license | Reason |
+|---|---|---|---|---|
+| protobuf | 7.36.2 | `License: 3-Clause BSD License` (free text, no expression or classifier) | BSD-3-Clause | The upstream `protocolbuffers/protobuf` license is BSD-3-Clause |
+| typing-extensions | 4.16.0 | `License-Expression: PSF-2.0` | PSF-2.0 | The Python Software Foundation license is permissive and non-copyleft, the same family as the CPython image itself, but outside the shared allowlist; this package is CI-only and never redistributed |
+
+A lock change must also update the table below, which
+`make check-dependency-inventory` enforces.
+
+| Package | Exact version | License | Role |
+|---|---:|---|---|
+| temporalio | 1.33.0 | MIT | Official Temporal Python SDK (client, worker, default data converter); its wheels embed the official Rust Temporal Core |
+| nexus-rpc | 1.4.0 | MIT | Nexus RPC types imported by the SDK |
+| protobuf | 7.36.2 | BSD-3-Clause | Protocol Buffers runtime for the SDK's API messages |
+| types-protobuf | 7.35.1.20260906 | Apache-2.0 | Typing stubs that the SDK declares as a runtime requirement |
+| typing-extensions | 4.16.0 | PSF-2.0 | Typing backports used by the SDK and nexus-rpc |
+
 ## Builder image tooling
 
 The development image starts from one `ocaml/opam:debian-12-ocaml-<series>`
@@ -241,14 +298,18 @@ the eventual minimal runtime image.
 The Cargo license policy script runs in a separate official Python image in
 the standalone GitHub Actions audit job, and the release preflight uses the
 same image to generate and audit the Cargo SBOM. These containers have no
-network access and mount the source read-only. Python is not installed in the development or
-eventual runtime image, and nothing from the Python image is linked into or
-redistributed with the SDK.
+network access and mount the source read-only. The
+[official-SDK interoperability regression](#ci-only-interoperability-tooling)
+runs the same image as the `sdk-interop-python` Compose service; that test
+container joins the Compose network, downloads only the hash-locked wheels,
+and writes its evidence report under the ignored `_build` tree. Python is not
+installed in the development or eventual runtime image, and nothing from the
+Python image is linked into or redistributed with the SDK.
 
 | Image | Manifest index digest | Used by | Native platforms | License |
 |---|---|---|---|---|
 | `rust:1.99-bookworm` | `sha256:59037199c44290f2befcdd58dcc540164763fc296950255aaefeef096a1866b0` | `Dockerfile.dev` Rust toolchain stage and `Dockerfile.rust-ci` | Linux amd64 and arm64/v8 | Rust is Apache-2.0 OR MIT; image packaging (`rust-lang/docker-rust`) is Apache-2.0 OR MIT |
-| `python:3.14-slim-bookworm` | `sha256:4ff4b92a68355dbdb52584ab3391dff8d371a61d4e063468bfd0130e3189c6d9` | Cargo license audit and release-preflight Cargo SBOM generation and audit (CI-only) | Linux amd64, arm64/v8, and additional official architectures | CPython's PSF license stack (SPDX `Python-2.0`); image packaging (`docker-library/python`) is MIT |
+| `python:3.14-slim-bookworm` | `sha256:4ff4b92a68355dbdb52584ab3391dff8d371a61d4e063468bfd0130e3189c6d9` | Cargo license audit, release-preflight Cargo SBOM generation and audit, the official-SDK interoperability driver, and its Python license audit (CI-only) | Linux amd64, arm64/v8, and additional official architectures | CPython's PSF license stack (SPDX `Python-2.0`); image packaging (`docker-library/python`) is MIT |
 
 `ocamlformat` is deliberately absent. Version 0.28.1 is MIT licensed, but its
 build closure includes ordinary GPL packages (`menhir` and `fix`), which this

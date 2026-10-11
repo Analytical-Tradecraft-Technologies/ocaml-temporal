@@ -582,7 +582,7 @@ test-temporal-diagnostics-contract:
 # CI executes (#795). Every entry must also be in scripts/ci-smoke-executables.txt,
 # and test/smoke/test_live_regressions_contract.sh fails when a regression
 # executable under test/integration is neither here nor otherwise run by CI.
-LIVE_REGRESSION_EXECUTABLES := test/integration/activity_cancellation/regression.exe test/integration/bounded_shutdown/regression.exe test/integration/client_policies/regression.exe test/integration/client_request_ids/regression.exe test/integration/completed_queries/regression.exe test/integration/concurrent_client/regression.exe test/integration/interaction_recovery/regression.exe test/integration/local_activity_cancellation/regression.exe test/integration/split_worker_task_types/regression.exe test/integration/transport_interruption/regression.exe test/integration/update_outcomes/regression.exe test/integration/worker_resource_options/regression.exe test/integration/workflow_start_info/regression.exe
+LIVE_REGRESSION_EXECUTABLES := test/integration/activity_cancellation/regression.exe test/integration/bounded_shutdown/regression.exe test/integration/client_policies/regression.exe test/integration/client_request_ids/regression.exe test/integration/completed_queries/regression.exe test/integration/concurrent_client/regression.exe test/integration/interaction_recovery/regression.exe test/integration/local_activity_cancellation/regression.exe test/integration/sdk_interop/regression.exe test/integration/split_worker_task_types/regression.exe test/integration/transport_interruption/regression.exe test/integration/update_outcomes/regression.exe test/integration/worker_resource_options/regression.exe test/integration/workflow_start_info/regression.exe
 # Seconds for each regression process; the suites normally finish in seconds.
 LIVE_REGRESSION_TIMEOUT_SECONDS ?= 180
 
@@ -1110,8 +1110,20 @@ docs:
 # The OPAM licence audit first confirms that docs/dependencies.md still lists
 # exactly the locked and pinned inputs, so the reviewed inventory cannot drift
 # from what is built (#783). The inventory check is host-only POSIX shell.
+# It then audits the CI-only official Python SDK closure (#517).
 license-check: check-dependency-inventory
 	$(COMPOSE_RUN) sh scripts/check-licenses.sh
+	$(MAKE) python-license-check
+
+# Installs test/integration/sdk_interop/python/requirements.lock with its
+# hashes in the digest-pinned image of the sdk-interop-python Compose service
+# and audits each installed distribution's own license metadata; the policy
+# contract on fake distributions runs first. Python never enters the OCaml
+# development image, and this target starts no Temporal service.
+.PHONY: python-license-check
+python-license-check:
+	$(TEMPORAL_COMPOSE) run --rm --no-deps -T sdk-interop-python \
+		sh /workspace/scripts/check-python-licenses.sh
 
 .PHONY: check-dependency-inventory test-dependency-inventory-contract
 check-dependency-inventory:
