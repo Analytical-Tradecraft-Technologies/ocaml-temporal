@@ -38,9 +38,15 @@ for those rules.
   available; it is diagnostic metadata, not a replacement for replay-safe
   patching. `info ()` returns an abstract `Workflow.Info.t` with the run's
   identity (workflow and run IDs, first run ID, type, namespace, task queue,
-  attempt, parent, start time) and the current activation's replay flag, history
-  length and size, and continue-as-new suggestion and its reasons, all taken
-  from Temporal's activations; `is_replaying ()` is the shorthand for replay-aware logging.
+  attempt, parent, start time), the start policy recorded for the run
+  (`execution_timeout`, `run_timeout`, `task_timeout`, and `retry_policy` as
+  an `Activity.Retry_policy.t`), its continuation provenance
+  (`continued_from_run_id` and `continuation_initiator`: `` `Continue_as_new ``,
+  `` `Retry ``, or the reserved `` `Cron_schedule ``), and the current
+  activation's replay flag, history length and size, and continue-as-new
+  suggestion and its reasons, all taken from Temporal's activations (#512).
+  `start_metadata ()` returns the start memo, search attributes, and execution
+  expiration. `is_replaying ()` is the shorthand for replay-aware logging.
   `upsert_search_attributes` merges encoded values into the
   execution's indexed search attributes; the update becomes visible after the
   workflow task is accepted. `continue_as_new` ends the current run and starts

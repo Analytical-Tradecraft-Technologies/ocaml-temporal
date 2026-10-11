@@ -833,7 +833,13 @@ ID of the chain, type, namespace, task queue, retry attempt, parent, and start
 time), taken from Temporal's activations and the worker's own configuration
 (the namespace and task queue) rather than host state. Identity is fixed
 for the run; history facts and `Info.is_replaying` describe the activation
-current when `info` was called, so call it again after a suspension.
+current when `info` was called, so call it again after a suspension. It also
+carries the start policy the client recorded: `Info.execution_timeout`,
+`Info.run_timeout`, `Info.task_timeout`, and `Info.retry_policy`. A successor
+run names its predecessor through `Info.continued_from_run_id`, and
+`Info.continuation_initiator` tells a `` `Retry `` apart from a
+`` `Continue_as_new ``. Start memo and search attributes come from
+`Temporal.Workflow.start_metadata` ([start metadata](../reference/workflow-start-metadata.md)).
 `Temporal.Workflow.is_replaying ()` is the shorthand for side effects outside
 workflow state, such as suppressing duplicate log lines during replay. Never
 choose a workflow command from the replay flag: replay must take the same

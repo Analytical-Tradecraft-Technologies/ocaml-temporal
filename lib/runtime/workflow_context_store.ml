@@ -7,8 +7,8 @@ type start_metadata = {
   execution_expiration_time : Temporal_protocol.Workflow_protocol.timestamp option;
 }
 
-(** Run-stable identity reported by Core's initialization job; see the
-    interface. *)
+(** Run-stable identity and start policy reported by Core's initialization
+    job; see the interface. *)
 type run_info = {
   workflow_id : string;
   run_id : string;
@@ -17,6 +17,13 @@ type run_info = {
   first_execution_run_id : string;
   parent : Temporal_protocol.Workflow_protocol.namespaced_workflow_execution option;
   start_time : Temporal_protocol.Workflow_protocol.timestamp option;
+  execution_timeout : Temporal_protocol.Workflow_protocol.duration option;
+  run_timeout : Temporal_protocol.Workflow_protocol.duration option;
+  task_timeout : Temporal_protocol.Workflow_protocol.duration option;
+  retry_policy : Temporal_protocol.Workflow_protocol.retry_policy option;
+  continued_from :
+    (string * Temporal_protocol.Workflow_protocol.continue_as_new_initiator)
+    option;
 }
 
 (** History facts reported with one activation; see the interface. *)
