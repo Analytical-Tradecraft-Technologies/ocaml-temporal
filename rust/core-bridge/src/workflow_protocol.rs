@@ -4378,6 +4378,13 @@ pub fn completion_from_core(
     value: &core_completion::WorkflowActivationCompletion,
 ) -> Result<Completion, CoreConversionError> {
     use core_completion::workflow_activation_completion::Status;
+    // External-storage metrics belong to the completion, not to one status,
+    // so they are rejected before either branch can return.
+    if value.payload_download_metrics.is_some() || value.payload_upload_metrics.is_some() {
+        return Err(unsupported(
+            "Core completion metadata is not represented by this protocol slice",
+        ));
+    }
     let success = match value
         .status
         .as_ref()
@@ -4406,11 +4413,7 @@ pub fn completion_from_core(
             return Ok(completion);
         }
     };
-    if !success.used_internal_flags.is_empty()
-        || success.versioning_behavior != 0
-        || value.payload_download_metrics.is_some()
-        || value.payload_upload_metrics.is_some()
-    {
+    if !success.used_internal_flags.is_empty() || success.versioning_behavior != 0 {
         return Err(unsupported(
             "Core completion metadata is not represented by this protocol slice",
         ));

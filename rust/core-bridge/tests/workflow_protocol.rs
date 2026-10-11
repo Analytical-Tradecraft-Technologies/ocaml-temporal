@@ -3668,6 +3668,49 @@ fn rejects_omitted_required_nullable_fields() {
     );
 }
 
+/// External-storage metrics (Core 1.x) belong to the whole completion, so
+/// the strict reverse conversion rejects them on a failed task as well as on
+/// a successful one instead of dropping them on the failure path.
+#[test]
+fn external_storage_metrics_are_rejected_for_both_completion_statuses() {
+    let failed = workflow_protocol::completion_to_core(
+        &workflow_protocol::decode_completion(&fixture(&["valid", "task-failure.input.json"]))
+            .unwrap(),
+    )
+    .unwrap();
+    let successful = core_completion::WorkflowActivationCompletion {
+        run_id: "run-metrics".to_owned(),
+        status: Some(
+            core_completion::workflow_activation_completion::Status::Successful(
+                core_completion::Success::default(),
+            ),
+        ),
+        payload_download_metrics: None,
+        payload_upload_metrics: None,
+    };
+    for base in [failed, successful] {
+        assert!(workflow_protocol::completion_from_core(&base).is_ok());
+        for upload in [false, true] {
+            let mut core = base.clone();
+            let metrics = Some(core_common::ExternalStorageMetrics {
+                payload_count: 1,
+                ..Default::default()
+            });
+            if upload {
+                core.payload_upload_metrics = metrics;
+            } else {
+                core.payload_download_metrics = metrics;
+            }
+            assert_eq!(
+                workflow_protocol::completion_from_core(&core)
+                    .unwrap_err()
+                    .code,
+                workflow_protocol::CoreConversionErrorCode::Unsupported
+            );
+        }
+    }
+}
+
 /// The bilateral fixture represents Core's failed status, never a successful
 /// FailWorkflowExecution command. A poisoned activation cannot leak commands,
 /// and query/eviction leases retain their operation-specific acknowledgements.
