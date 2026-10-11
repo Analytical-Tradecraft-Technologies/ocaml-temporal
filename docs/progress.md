@@ -26,7 +26,11 @@ case a `wait_update` already in flight, a later `wait_update` on the same
 handle, and a `start_update` re-attaching by update ID all return the
 server's non-retryable `Update` failure of type
 `AcceptedUpdateCompletedWorkflow`. History shows the acceptance and no
-completion. A fourth case terminates a run while an update is admitted but
+completion. The run is closed only after the SDK's `temporal.sdk.bridge`
+debug records show the in-flight caller's poll submitted and still
+unanswered after a full one-second await slice, so that caller is provably
+blocked on an outstanding poll RPC, although the server's receipt of the
+poll is not observable. A fourth case terminates a run while an update is admitted but
 not accepted. The driver makes admission observable, without timing, by
 stopping the only worker first and waiting for the speculative workflow task
 in `describe`. That caller, and a later one with the same update ID, receive

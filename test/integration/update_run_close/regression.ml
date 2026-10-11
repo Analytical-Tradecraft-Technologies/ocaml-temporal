@@ -12,10 +12,12 @@
 
     One process plays two roles. [worker] runs a public [Temporal.Worker] on
     a unique task queue. [check] owns the client, spawns and reaps the worker
-    processes, and synchronizes only on observable server state: the update
-    acceptance returned by the client, exact run histories, and the pending
+    processes, and synchronizes only on observable state: the update
+    acceptance returned by the client, exact run histories and the pending
     workflow task reported by [describe], both read through the official
-    Temporal CLI. *)
+    Temporal CLI, and the SDK's documented [temporal.sdk.bridge] debug
+    records, which show when a waiter's poll is outstanding (see
+    {!Bridge_probe}). *)
 open Temporal
 
 (** Reports setup and client failures through their public diagnostic. *)
@@ -72,6 +74,76 @@ let caller_bound = 10.
 
 (** Seconds allowed for one server-state observation to become true. *)
 let observation_seconds = 30.
+
+(** Driver-side observation of client calls through the SDK's documented
+    bridge debug records ([docs/reference/observability.md]).
+
+    Every client call is submitted to the native transport by the client's
+    supervisor, which reports a [Debug] record with operation
+    [client_submit_json] once Rust has taken the RPC. The calling thread then
+    waits for the outcome in bounded one-second slices; each slice that ends
+    with no outcome reports operation [client_await_call] with bridge status
+    [not_ready]. A submission followed by a [not_ready] slice therefore proves
+    that a call is in flight in the native transport and has had no answer
+    for at least one full slice.
+
+    The records do not name the call kind, so the probe is meaningful only
+    while the driver issues no other client call: callers snapshot it, start
+    exactly one call, and touch the client again only after the probe has
+    advanced. Counters are atomics because the submission record is reported
+    on the supervisor's Domain and the slice record on the waiting thread. *)
+module Bridge_probe = struct
+  (** Completed submissions of any client call to the native transport. *)
+  let submitted = Atomic.make 0
+
+  (** Await slices that ended with the call still outstanding. *)
+  let outstanding = Atomic.make 0
+
+  (** Counts the two records of interest from a bridge record's tags. A
+      failed submission also carries a bridge status and is not counted. *)
+  let observe tags =
+    let module Tag = Temporal_base.Observability.Tag in
+    match Logs.Tag.find Tag.operation tags, Logs.Tag.find Tag.bridge_status tags with
+    | Some "client_submit_json", None -> Atomic.incr submitted
+    | Some "client_await_call", Some "not_ready" -> Atomic.incr outstanding
+    | _ -> ()
+
+  (** A reporter that only counts bridge records. It formats nothing, so it is
+      safe to call from any Domain, and it discards every other record. *)
+  let reporter =
+    let report src _level ~over k msgf =
+      let finish () = over (); k () in
+      if Logs.Src.equal src Temporal_base.Observability.Source.bridge then
+        msgf (fun ?header:_ ?tags fmt ->
+          Option.iter observe tags;
+          Format.ikfprintf (fun _ -> finish ()) Format.err_formatter fmt)
+      else finish () in
+    { Logs.report }
+
+  (** Installs the reporter and enables the bridge's debug records. Called
+      only by the [check] role, so worker processes keep the default. *)
+  let install () =
+    Logs.set_reporter reporter;
+    Logs.Src.set_level Temporal_base.Observability.Source.bridge (Some Logs.Debug)
+
+  (** The counters before a call is started. *)
+  let snapshot () = (Atomic.get submitted, Atomic.get outstanding)
+
+  (** Waits until, after [snapshot], a call was submitted and an await slice
+      then ended with no outcome. Fails with [label] after
+      {!observation_seconds}. *)
+  let await_outstanding label (submitted_before, outstanding_before) =
+    let started = Unix.gettimeofday () in
+    let deadline = started +. observation_seconds in
+    let rec poll () =
+      if Atomic.get submitted > submitted_before
+         && Atomic.get outstanding > outstanding_before then
+        Printf.printf "%s: poll outstanding after %.2f s\n%!" label
+          (Unix.gettimeofday () -. started)
+      else if Unix.gettimeofday () < deadline then (Unix.sleepf 0.01; poll ())
+      else failwith (label ^ ": the poll was never observed outstanding") in
+    poll ()
+end
 
 (** Polls [attempt] until it returns [Ok], and fails with [label] and the
     last reason when the deadline passes. *)
@@ -219,26 +291,40 @@ let admitted_outcome = {
 }
 
 (** One call running on its own system thread, with the cell its rendered
-    result lands in. A client call blocks only its own thread, with the
-    OCaml runtime lock released (#807). *)
-type background = { thread : Thread.t; result : string option ref; lock : Mutex.t }
+    result and completion time land in. A client call blocks only its own
+    thread, with the OCaml runtime lock released (#807). *)
+type background = {
+  thread : Thread.t;
+  result : (string * float) option ref;
+  lock : Mutex.t;
+}
 
-(** Starts [operation] on a new thread, timing it as {!bounded} does. *)
-let background label operation =
+(** Starts [operation] on a new thread. The call is expected to stay blocked
+    until the driver closes the run, so its latency is measured from that
+    close by {!join}, not from the start. *)
+let background operation =
   let result = ref None and lock = Mutex.create () in
   let thread = Thread.create (fun () ->
-    let rendered = try bounded label operation with Failure message -> "FAILED " ^ message in
-    Mutex.protect lock (fun () -> result := Some rendered)) () in
+    let rendered = try render (operation ()) with exn -> "RAISED " ^ Printexc.to_string exn in
+    let finished = Unix.gettimeofday () in
+    Mutex.protect lock (fun () -> result := Some (rendered, finished))) () in
   { thread; result; lock }
 
-(** Joins a background call that must already be finishing, bounded by
-    {!caller_bound}: a call still running then is reported as a hang rather
-    than blocking the driver until the process alarm. *)
-let join label call =
-  let deadline = Unix.gettimeofday () +. caller_bound in
+(** Joins a background call and returns its rendered result. [closed_at] is
+    when the driver's close request returned; the call must finish within
+    {!caller_bound} seconds of it. A call still running then is reported as
+    a hang rather than blocking the driver until the process alarm. *)
+let join label ~closed_at call =
+  let deadline = closed_at +. caller_bound in
   let rec poll () =
     match Mutex.protect call.lock (fun () -> !(call.result)) with
-    | Some result -> Thread.join call.thread; result
+    | Some (result, finished) ->
+        Thread.join call.thread;
+        let latency = Float.max 0. (finished -. closed_at) in
+        if latency > caller_bound then
+          failwith (Printf.sprintf "%s returned %.1f s after the close: %s" label latency result);
+        Printf.printf "%s (%.2f s after the close): %s\n%!" label latency result;
+        result
     | None when Unix.gettimeofday () < deadline -> Unix.sleepf 0.02; poll ()
     | None -> failwith (label ^ ": caller still blocked after the run closed") in
   poll ()
@@ -290,7 +376,17 @@ let expected_history close =
     caller is already polling when the run closes, a second polls the same
     handle afterwards, and a third re-attaches by update ID afterwards. All
     three must return the same typed failure within the bound, and the
-    history must show the acceptance with no completion. *)
+    history must show the acceptance with no completion.
+
+    Synchronization point for the in-flight caller: the run is closed only
+    after {!Bridge_probe} has seen that caller's poll submitted to the
+    native transport and then outstanding, with no outcome, for a full
+    one-second await slice. The driver makes no other client call in that
+    window, so the records can only be that poll's. This proves the close is
+    sent while [wait_update] is blocked on an outstanding poll RPC. It does
+    not prove that the server had registered that poll: Temporal exposes no
+    pending update polls, but a poll left unanswered for a second against a
+    local server has, in practice, reached it. *)
 let accepted_case ~cli ~address ~client ~queue ~track close =
   let label = "accepted+" ^ close_name close in
   let run = track (get (Client.start client ~workflow ~task_queue:queue
@@ -299,11 +395,15 @@ let accepted_case ~cli ~address ~client ~queue ~track close =
   expect_history (label ^ " before close")
     ["WORKFLOW_EXECUTION_STARTED"; "WORKFLOW_EXECUTION_UPDATE_ACCEPTED"]
     (history cli address run);
-  let in_flight = background (label ^ " in-flight wait_update")
-    (fun () -> Client.wait_update pending) in
+  let before = Bridge_probe.snapshot () in
+  let in_flight = background (fun () -> Client.wait_update pending) in
+  Bridge_probe.await_outstanding (label ^ " in-flight wait_update") before;
+  if Mutex.protect in_flight.lock (fun () -> Option.is_some !(in_flight.result)) then
+    failwith (label ^ ": wait_update returned before the run closed");
   close_run close run;
+  let closed_at = Unix.gettimeofday () in
+  let during = join (label ^ " in-flight wait_update") ~closed_at in_flight in
   expect (label ^ " terminal") (expected_terminal close) (terminal run);
-  let during = join (label ^ " in-flight wait_update") in_flight in
   let after = bounded (label ^ " later wait_update") (fun () -> Client.wait_update pending) in
   let reattached = bounded (label ^ " re-attached start_update") (fun () ->
     Result.bind (Client.start_update ~update_id:"held" run ~update:hold ~input:1 ())
@@ -332,7 +432,7 @@ let admitted_case ~cli ~address ~target_url ~client ~queue ~track =
    | Ok false -> ()
    | Ok true -> failwith (label ^ ": a workflow task is pending before the update")
    | Error message -> failwith (label ^ ": describe failed: " ^ message));
-  let caller = background (label ^ " start_update") (fun () ->
+  let caller = background (fun () ->
     Result.bind (Client.start_update ~update_id:"admitted" run ~update:hold ~input:1 ())
       Client.wait_update) in
   await "admitted update's workflow task" (fun () ->
@@ -341,8 +441,9 @@ let admitted_case ~cli ~address ~target_url ~client ~queue ~track =
     | Ok false -> Error "no pending workflow task"
     | Error message -> Error message);
   close_run Terminate run;
+  let closed_at = Unix.gettimeofday () in
+  let during = join (label ^ " start_update") ~closed_at caller in
   expect (label ^ " terminal") "terminated" (terminal run);
-  let during = join (label ^ " start_update") caller in
   let late = bounded (label ^ " late start_update") (fun () ->
     Result.bind (Client.start_update ~update_id:"admitted" run ~update:hold ~input:1 ())
       Client.wait_update) in
@@ -384,5 +485,6 @@ let () = match Array.to_list Sys.argv with
   | [_; "check"; address; cli] ->
       Sys.set_signal Sys.sigalrm (Sys.Signal_handle (fun _ -> failwith "fixture timed out"));
       ignore (Unix.alarm 150);
+      Bridge_probe.install ();
       Fun.protect ~finally:(fun () -> ignore (Unix.alarm 0)) (fun () -> check address cli)
   | _ -> failwith "usage: regression check http://localhost:7233 /path/to/temporal"

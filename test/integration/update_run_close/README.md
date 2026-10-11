@@ -16,8 +16,15 @@ that each returns within 10 seconds.
 
 - **Accepted, then completed / cancelled / terminated.** After `start_update`
   returns an accepted handle, one `wait_update` is started on a separate
-  thread and the run is closed by the `finish` signal, `Client.cancel`, or
-  `Client.terminate`. `Client.wait` must report `Completed`, `Cancelled` or
+  thread. The driver waits until the SDK's `temporal.sdk.bridge` debug
+  records show that call's poll submitted to the native transport and then
+  outstanding, with no outcome, for a full one-second await slice; it makes
+  no other client call meanwhile, so the records are that poll's. Only then
+  is the run closed by the `finish` signal, `Client.cancel`, or
+  `Client.terminate`. This proves `wait_update` is blocked on an outstanding
+  poll RPC when the close is sent. It does not prove the server had
+  registered the poll, which Temporal does not expose. The in-flight
+  caller's latency is measured from the close. `Client.wait` must report `Completed`, `Cancelled` or
   `Terminated`. The in-flight caller, a later `wait_update` on the same
   handle, and a `start_update` that re-attaches with the same update ID must
   all return the server's non-retryable `Update` failure of type

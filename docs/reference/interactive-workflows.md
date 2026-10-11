@@ -510,7 +510,13 @@ with the message "Workflow Update failed because the Workflow completed before
 the Update completed." The same result is returned to a `wait_update` that was
 already polling when the run closed, to a later `wait_update` on the same
 handle, and to a `start_update` that re-attaches with the same update ID after
-the close. History records the acceptance and no completion.
+the close. History records the acceptance and no completion. The suite closes
+the run only after the SDK's `temporal.sdk.bridge` debug records show the
+first caller's poll submitted to the native transport and still unanswered
+after a full one-second await slice, with no other client call in between.
+That proves `wait_update` is blocked on an outstanding poll RPC when the close
+is sent. It does not prove the server had registered the poll, because
+Temporal does not expose pending update polls.
 
 For an admitted update the server aborts the in-flight request ("workflow
 update was aborted by closing workflow", gRPC `aborted`). Temporal Core's
