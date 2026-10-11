@@ -21,7 +21,13 @@
     JSON copy is dropped. Because the public replay API reports no identity on
     success, the manifest must reject the entry from the protobuf bytes alone:
     the runner must exit 1 with the entry's workflow type and run ID
-    mismatches as report problems, and replay nothing. *)
+    mismatches as report problems, and replay nothing.
+
+    {b Wrong failure reason.} [negative-lifecycle-multi-patched-on-removed]
+    still reports nondeterminism, but its declared [expected_message] is
+    replaced by a fragment of a different real Core mismatch. The runner must
+    fail exactly that case, so a negative control cannot pass for a reason
+    other than the documented one (issue #531). *)
 
 (** The two mutated entries, in manifest order, with their new definition
     sets. *)
@@ -132,6 +138,26 @@ let swap_protobuf ~directory manifest =
         members)
     manifest
 
+(** Negative control whose declared failure reason the reason scenario
+    replaces. Its history has a non-deprecated patch marker that the removed
+    generation never consumes. *)
+let reason_entry = "negative-lifecycle-multi-patched-on-removed"
+
+(** A fragment of Core's activity-type mismatch text, which is a real
+    nondeterminism reason but not the one {!reason_entry} produces. *)
+let wrong_reason = "Activity type of scheduled event"
+
+(** Reason scenario: declares {!wrong_reason} for {!reason_entry}. *)
+let mutate_reason manifest =
+  edit_entries [ reason_entry ]
+    (fun _ members ->
+      List.map
+        (function
+          | "expected_message", _ -> ("expected_message", `String wrong_reason)
+          | member -> member)
+        members)
+    manifest
+
 (** Runs [program] with [arguments], redirecting standard output and error to
     files in [directory], and returns the exit code with both outputs. *)
 let run_capturing ~directory program arguments =
@@ -238,6 +264,28 @@ let check_swap ~status ~stdout ~stderr ~expected_problems report =
   if report |> member "cases" |> to_list <> [] then
     fail "an invalid manifest must not replay any case"
 
+(** Checks the reason scenario: only {!reason_entry} fails, its actual
+    outcome is still nondeterminism, and the diagnostic names the declared
+    fragment. *)
+let check_reason ~status ~stdout ~stderr report =
+  let open Yojson.Safe.Util in
+  if status <> 1 then fail "runner exited %d, expected 1\n%s\n%s" status stdout stderr;
+  if
+    not
+      (contains stderr
+         ("FAIL history corpus: 1 mismatched case(s): " ^ reason_entry))
+  then fail "stderr does not list %s:\n%s" reason_entry stderr;
+  if List.map to_string (report |> member "failing_cases" |> to_list) <> [ reason_entry ]
+  then fail "report failing_cases is not exactly %s" reason_entry;
+  let case =
+    report |> member "cases" |> to_list
+    |> List.find (fun case -> string_at [ "id" ] case = reason_entry)
+  in
+  if string_at [ "actual" ] case <> "nondeterminism" then
+    fail "%s: the replay outcome itself must be unchanged" reason_entry;
+  if not (contains (string_at [ "message" ] case) "expected failure text containing")
+  then fail "%s: diagnostic does not name the declared reason" reason_entry
+
 (** Copies the corpus next to [manifest_path] into a fresh temporary
     directory, lets [prepare] edit the copy and return the manifest to write,
     runs [runner] on it, and passes the outcome and report to [check]. The
@@ -310,4 +358,9 @@ let () =
     ~prepare:(fun ~directory manifest -> swap_protobuf ~directory manifest)
     (check_swap ~expected_problems);
   print_endline
-    "PASS history corpus runner rejects a swapped protobuf without a JSON copy"
+    "PASS history corpus runner rejects a swapped protobuf without a JSON copy";
+  run_scenario ~runner ~manifest_path ~cargo_lock
+    ~prepare:(fun ~directory:_ manifest -> mutate_reason manifest)
+    check_reason;
+  print_endline
+    "PASS history corpus runner rejects a negative control with the wrong reason"

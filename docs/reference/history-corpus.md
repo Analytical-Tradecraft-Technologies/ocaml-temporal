@@ -36,8 +36,11 @@ entry ID, when:
   `workflow_type` and `run_id` (`original_execution_run_id`, the run's own
   ID), or the optional JSON copy disagrees with them;
 - a required feature (activity, timer, activity retry, signal, update,
-  child workflow, continue-as-new, marker-free/active/deprecated patch,
-  workflow failure, workflow-task failure recovery) has no `replays_ok` entry,
+  child workflow, continue-as-new, marker-free/active/deprecated/removed
+  patch, multiple patches, a patch in a loop, in a signal handler and in an
+  update handler, a mid-run patch upgrade, patch upgrade and rollback
+  compatibility, workflow failure, workflow-task failure recovery) has no
+  `replays_ok` entry,
   or there is no nondeterminism negative control (queries are not a required
   feature: they record no history events, so replay never exercises a query
   handler, and query behaviour is covered by the live completed-query
@@ -46,7 +49,8 @@ entry ID, when:
   with only the entry's workflow type registered from its definition set
   (so a history recorded for another type cannot pass); or
 - a `nondeterminism` entry does not return `Nondeterminism` for the entry's
-  run ID.
+  run ID, or its public failure text does not contain the entry's optional
+  `expected_message`.
 
 The SHA-256 implementation is a small test helper checked against the FIPS
 180-4 vectors before any manifest is read, because the OCaml standard library
@@ -176,7 +180,11 @@ input; `json` is the Temporal CLI export it was encoded from), the
 `replay_definitions` set, and the `expected` verdict (`replays_ok` or
 `nondeterminism`). A `nondeterminism` entry must set `negative_control_of` to
 the `replays_ok` entry whose history it reuses, so the failure is attributable
-to the definitions rather than to a different history.
+to the definitions rather than to a different history. It may also set
+`expected_message`, a fragment of Core's failure reason that the replay
+failure text must contain; the lifecycle negative controls use it so that,
+for example, a removed patch is reported as an unconsumed marker rather than
+as an unrelated command mismatch.
 
 Several entries may share one history file; they must agree on its checksum.
 
@@ -187,6 +195,7 @@ Several entries may share one history file; they must agree on its checksum.
 | `live-2026-10-08` | `activity`, `timer`, `activity-retry`, `interaction` (signal, update, condition), `parent`, `child`, `continue-as-new-first`, `continue-as-new-second`, `patch-marker-free`, `patch-active`, `patch-deprecated` | Captured for this corpus with `capture-history-corpus.sh` against Temporal Server 1.32.0 (Compose stack, digest-pinned), Core `95e97686`, OCaml 5.4.1. The worker ran natively on macOS against the Compose server; the Make target runs the same program in the development container. |
 | `task-failure-2026-09-20` | `task-failure-body`, `-encoder`, `-missing`, `-business-retryable`, `-business-permanent` | Copied byte for byte from the [#511 workflow-task failure gate](workflow-failures.md) (`make test-temporal-task-failure-live`), whose own manifest retains run IDs and binary hashes. |
 | `initial-signals-synthetic` | `initial-signals` | The synthetic history from the [#694 regression](../../test/integration/temporal/initial_signals/README.md); not from a server. |
+| `live-2026-10-11` | `lifecycle-{multi,loop,handlers}-{legacy,patched,deprecated,removed}`, `lifecycle-handover` | Captured for [#531](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/531) with only the four `corpus-lifecycle-*` generations, against Temporal Server 1.32.0 (Compose stack, digest-pinned), Core `95e97686`, OCaml 5.4.1, from a clean tree at the recorded `sdk_commit`. The worker ran natively on macOS. The handover run was started by the legacy process and finished by a fresh patched process. |
 
 Derived cases reuse those histories against other definition sets:
 `compat-patch-marker-free-on-patched` (a pre-patch history replays on the
@@ -196,6 +205,13 @@ patched generation, where `Workflow.patched` reports `false`),
 `negative-timer-removed` (the timer workflow without its timer) and
 `negative-patch-active-on-legacy` (a patched history on the pre-patch
 generation). Core reports both as `[TMPRL1100]` nondeterminism.
+
+The `live-2026-10-11` histories are each replayed against every other
+lifecycle generation: `compat-lifecycle-<workflow>-<history stage>-on-<code
+stage>` entries must replay and `negative-lifecycle-...` entries must report
+nondeterminism with their declared reason. The complete matrix and what it
+establishes about patch upgrade, removal and rollback are in the
+[patching reference](workflow-patching.md#lifecycle-replay-matrix).
 
 The patch-replay, restart-replay and parent/child fixtures under
 `test/integration/temporal/fixtures/` are normalized, payload-free
@@ -215,7 +231,11 @@ line-ending conversion (see `.gitattributes`).
 defines named definition sets: `corpus-v1` (all current workflows with the
 patched `corpus.patch`), `corpus-v1-patch-legacy`,
 `corpus-v1-patch-deprecated`, `negative-timer-removed`,
-`task-failure-corrected` and `initial-signals`. The same values are registered
+`task-failure-corrected`, `initial-signals` and the four patch lifecycle
+generations `corpus-lifecycle-legacy`, `-patched`, `-deprecated` and
+`-removed`. The lifecycle generations share one body per workflow type and
+differ only in a single gate function, so the stage is the only variable in
+their replay matrix. The same values are registered
 by the live capture worker and by the replay test, so capture and replay use
 identical application code. They use only the public `Temporal` API.
 
@@ -234,7 +254,8 @@ make history-corpus-capture HISTORY_CORPUS_CAPTURE_ID=live-YYYY-MM-DD
 
 The target starts the stack (`make temporal-start`), builds
 `history_corpus_capture.exe` in the development container, runs the
-`corpus-v1-patch-legacy`, `corpus-v1-patch-deprecated` and `corpus-v1` worker
+`corpus-v1-patch-legacy`, `corpus-v1-patch-deprecated`, `corpus-v1` and
+`corpus-lifecycle-legacy`, `-patched`, `-deprecated`, `-removed` worker
 generations in that order (each process hosts one worker generation and a
 client with fixed workflow IDs), exports every recorded run with
 `temporal workflow show --output json` from the pinned admin-tools image, and
@@ -243,6 +264,11 @@ set compiled by `protoc` from the pinned Core protos. The export step runs on
 the host and needs `python3` with the `protobuf` package, `protoc`, and `cargo`
 (or `HISTORY_CORPUS_CORE_PROTOS`). Output is staged in
 `.history-corpus-capture/` with a `manifest.fragment.json` for review.
+`HISTORY_CORPUS_GENERATIONS` limits a capture to the named generations (in
+order), so new definition sets can be captured without re-recording existing
+cases; `corpus-lifecycle-legacy` must precede `corpus-lifecycle-patched`,
+because it leaves the parked handover run that the patched generation
+finishes.
 
 To append the staged histories, add `HISTORY_CORPUS_INSTALL=test/fixtures/history-corpus`.
 Installation is append-only: it refuses an existing capture ID, entry ID or
@@ -269,7 +295,9 @@ disposable server.
 #518 seeded the corpus and #524 runs it through the public replay API as the
 SDK/Core upgrade gate. The corpus does not yet add malformed-history negative
 controls beyond the bridge's and `Temporal.Replay`'s own validation tests, or
-qualify every supported feature for #503. Every current capture was produced
+qualify every supported feature for #503. The lifecycle matrix covers
+replay compatibility only; concurrent mixed-version workers and version
+routing are outside the corpus. Every current capture was produced
 at Core `95e97686`; the first Core pin bump is the first true cross-revision
 replay, and its report is the evidence to retain. Cancellation,
 timeouts, local activities, external signals and search-attribute histories

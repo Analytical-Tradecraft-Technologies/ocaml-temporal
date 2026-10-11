@@ -69,6 +69,49 @@ val patch_workflow_type : string
     generations. *)
 val patch_id : string
 
+(** {1 Patch lifecycle workflow types (issue #531)}
+
+    Each type below exists in four generations, one per patch lifecycle
+    stage: [corpus-lifecycle-legacy] (no patch call, legacy branch),
+    [corpus-lifecycle-patched] ([Temporal.Workflow.patched] chooses),
+    [corpus-lifecycle-deprecated] ([Temporal.Workflow.deprecate_patch], then
+    the new branch) and [corpus-lifecycle-removed] (no patch call, new
+    branch). The legacy branch schedules activity [corpus.lifecycle.legacy];
+    the new branch schedules [corpus.lifecycle.new]. *)
+
+(** [corpus.lifecycle.multi]: three independent patches in one workflow,
+    around an activity (activity type), a timer (added by the new branch) and
+    a child workflow (child type). *)
+val lifecycle_multi_workflow_type : string
+
+(** [corpus.lifecycle.loop]: one patch ID consulted once per iteration of a
+    three-iteration activity loop. *)
+val lifecycle_loop_workflow_type : string
+
+(** [corpus.lifecycle.handlers]: one patch inside a signal handler and
+    another inside an update handler; each handler runs the chosen activity.
+    The root waits for both results. *)
+val lifecycle_handlers_workflow_type : string
+
+(** [corpus.lifecycle.handover]: parks before its patch point until
+    {!lifecycle_handover_release} arrives. Captured as a run started on the
+    legacy generation and finished on the patched generation. *)
+val lifecycle_handover_workflow_type : string
+
+(** Signal handled by [corpus.lifecycle.handlers]'s patched signal handler. *)
+val lifecycle_signal : string Temporal.Signal.t
+
+(** Update handled by [corpus.lifecycle.handlers]'s patched update handler;
+    returns the activity result. *)
+val lifecycle_update : (string, string) Temporal.Update.definition
+
+(** Releases a parked [corpus.lifecycle.handover] run. *)
+val lifecycle_handover_release : unit Temporal.Signal.t
+
+(** Returns ["parked"] until the handover run has been released. Used to
+    learn that the first workflow task completed. *)
+val lifecycle_handover_status : string Temporal.Query.definition
+
 (** {1 Interaction handler names}
 
     Used by the capture driver to send the interactions recorded in history. *)
@@ -106,7 +149,11 @@ val definition_set_names : string list
       [test/integration/temporal/task_failure] fixture, reused for its
       retained live histories.
     - ["initial-signals"]: the [initial-signals] workflow of the synthetic
-      [test/integration/temporal/initial_signals] fixture. *)
+      [test/integration/temporal/initial_signals] fixture.
+    - ["corpus-lifecycle-legacy"], ["corpus-lifecycle-patched"],
+      ["corpus-lifecycle-deprecated"], ["corpus-lifecycle-removed"]: the four
+      patch lifecycle generations of every [corpus.lifecycle.*] workflow,
+      each with both lifecycle child workflow types. *)
 val definition_set : string -> workflow list option
 
 (** Activities registered by the live capture worker. Every activity used by a

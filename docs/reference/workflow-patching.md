@@ -153,6 +153,75 @@ successful real-server invocation of the two original patch-in scenarios. The
 complete [PR #356 run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29469232271)
 also verifies the active-to-deprecated and deprecated-to-removed transitions.
 
+## Lifecycle replay matrix
+
+Issue [#531](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/531)
+extends the evidence above with recorded histories in the
+[replay history corpus](history-corpus.md), so every boundary below is
+checked offline by `dune runtest` through the public `Temporal.Replay` API.
+Four source generations of each `corpus.lifecycle.*` workflow differ only at
+their patch gates: **legacy** (no patch call, legacy branch), **patched**
+(`patched` chooses), **deprecated** (`deprecate_patch`, then the new branch)
+and **removed** (no patch call, new branch). The legacy and new branches
+schedule different activity types, so a branch change is visible to Core.
+
+| Workflow | Patch placement |
+| --- | --- |
+| `corpus.lifecycle.multi` | Three independent patch IDs in one workflow: one swaps an activity type, one adds a durable timer, one swaps a child workflow type. |
+| `corpus.lifecycle.loop` | One patch ID consulted in each of three loop iterations, after the previous iteration's activity resolved. |
+| `corpus.lifecycle.handlers` | One patch inside a signal handler and another inside an update handler; each handler runs the chosen activity and the root waits for both. |
+| `corpus.lifecycle.handover` | A run started and parked by a legacy worker, then released on a fresh patched worker that reaches the patch point for the first time. |
+
+Each of the first three workflows has one history per stage and is replayed
+against all four generations. The observed verdicts, identical for all three
+workflows, are:
+
+| History recorded by \ replayed on | legacy | patched | deprecated | removed |
+| --- | --- | --- | --- | --- |
+| legacy (no marker, legacy branch) | ok | ok | **nondeterminism** (activity type) | **nondeterminism** (activity type) |
+| patched (active marker) | **nondeterminism** (unconsumed marker) | ok | ok | **nondeterminism** (unconsumed marker) |
+| deprecated (deprecated marker) | **nondeterminism** (activity type) | ok | ok | ok |
+| removed (no marker, new branch) | **nondeterminism** (activity type) | **nondeterminism** (activity type) | ok | ok |
+
+Each negative control also declares the Core reason it must fail with (for
+example `Non-deprecated patch marker encountered for change ...`), so a
+removal is reported for the documented cause rather than any mismatch. What
+the matrix establishes for this SDK and the pinned Core:
+
+- **Upgrade order is safe.** Legacy histories replay on patched code, active
+  markers on deprecated code, deprecated markers on removed code. This holds
+  for several patches in one workflow, for a patch consulted repeatedly in a
+  loop (the first answer is retained for the run), and for patches inside
+  signal and update handlers.
+- **Each gate is necessary.** Deprecating while marker-free legacy runs remain
+  fails on the legacy-branch history (the first gate), and deleting a
+  `patched` call without the deprecation step fails on every active-marker
+  history (the second gate).
+- **Rollback is stage-dependent.** Code at the deprecated stage can roll back
+  to the patched generation (a deprecated marker satisfies `patched`), and the
+  removed stage can roll back to the deprecated generation. Rolling back to
+  the legacy generation fails for every history written by a later generation,
+  and rolling back from removed to patched fails because `patched` reports
+  `false` without a marker.
+
+The handover history models one step of a rolling deploy: the run was created
+by the old worker, which completed its first task, and finished on a new
+worker. Because that run had not yet reached the patch point, `patched`
+returned `true` on the new worker and recorded its marker after a
+marker-free prefix. That history replays on the patched and deprecated
+generations, but not on the legacy or removed ones. A run that reaches a
+patch point on a new worker therefore cannot safely return to an old worker,
+which is why an old worker must not keep polling the task queue once new
+workers serve it. Concurrent old and new workers on one task queue, where the
+server may hand any task to either build, are not exercised: their outcome
+depends on task routing rather than SDK behavior, and the SDK makes no
+routing claim (see [worker versioning](worker-versioning.md)).
+
+The capture program `history_corpus_capture.exe` records these histories from
+a disposable Temporal Server; the
+[corpus reference](history-corpus.md#capturing-and-adding-histories) documents
+the command and the provenance retained for the `live-2026-10-11` capture.
+
 ## Focused evidence and remaining boundary
 
 Focused OCaml runtime tests cover patch-in decisions, deprecated marker
@@ -166,9 +235,16 @@ and round trips through the pinned Core protobuf types. The expanded live target
 adds exact server-history and worker-replacement evidence for lifecycle
 transitions once its complete CI run succeeds.
 
+The [lifecycle replay matrix](#lifecycle-replay-matrix) adds recorded
+histories for multiple patches, loops, signal and update handlers, removal,
+rollback between stages and a mid-run upgrade.
+
 Worker routing, including legacy build-ID and deployment-based versioning, is
 configured separately through `Temporal.Worker.Options`; see
-[worker versioning](worker-versioning.md). Side effects, arbitrary historical
-compatibility, automated migration safety analysis, and histories that have not
-passed both documented gates remain separate roadmap work. For the overall
+[worker versioning](worker-versioning.md). Version routing is deferred by the
+[v1 support policy](v1-support-policy.md), so no corpus case or live test
+claims that a particular build receives an execution. Side effects, arbitrary
+historical compatibility, concurrent mixed-version workers on one task queue,
+automated migration safety analysis, and histories that have not passed both
+documented gates remain separate roadmap work. For the overall
 evidence boundary, read [live acceptance coverage](live-acceptance-coverage.md).
