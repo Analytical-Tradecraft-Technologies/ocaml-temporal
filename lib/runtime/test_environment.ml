@@ -490,6 +490,20 @@ let create_run environment chain ~workflow_type ~input =
                        })
                      chain.parent;
                  start_time = Some (protocol_timestamp environment.now_ms);
+                 (* The environment records no workflow timeouts or retry
+                    policy, matching a server start without those options. *)
+                 execution_timeout = None;
+                 run_timeout = None;
+                 task_timeout = None;
+                 retry_policy = None;
+                 (* [chain.current] still names the predecessor here: it is
+                    replaced only after this run is built, and the
+                    environment's only successor path is continue-as-new. *)
+                 continued_from =
+                   Option.map
+                     (fun (previous : run) ->
+                       (previous.run_id, Protocol.Continue_as_new_workflow))
+                     chain.current;
                });
           let run =
             {

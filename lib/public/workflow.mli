@@ -185,6 +185,48 @@ module Info : sig
   (** Returns the 1-based workflow retry attempt of this run. *)
   val attempt : t -> int
 
+  (** How Temporal created this run from an earlier run of the same
+      workflow ID.
+      - [`Continue_as_new]: the previous run called {!continue_as_new}.
+      - [`Retry]: the previous run failed or timed out and the workflow
+        retry policy started this run.
+      - [`Cron_schedule]: a cron schedule fired. OCaml workers currently
+        reject cron-initiated runs before workflow code starts, so this
+        constructor is reserved and is not observed today. *)
+  type continuation_initiator = [ `Continue_as_new | `Retry | `Cron_schedule ]
+
+  (** Returns the run ID this run was continued or retried from, or [None]
+      for the first run of a chain. *)
+  val continued_from_run_id : t -> string option
+
+  (** Returns why Temporal started this run from {!continued_from_run_id},
+      or [None] for a first run or when Temporal did not report a reason. *)
+  val continuation_initiator : t -> continuation_initiator option
+
+  (** Returns the execution timeout recorded when the chain started
+      ([?execution_timeout] on [Client.start]). It bounds the whole chain,
+      across retries and continue-as-new. [None] means Temporal recorded no
+      limit. Durations are rounded up to whole milliseconds. These timeout
+      accessors are recorded metadata: the server enforces them, and reading
+      one schedules nothing. *)
+  val execution_timeout : t -> Duration.t option
+
+  (** Returns this run's run timeout ([?run_timeout] on [Client.start]), or
+      [None] when Temporal recorded no limit. *)
+  val run_timeout : t -> Duration.t option
+
+  (** Returns the workflow task timeout ([?task_timeout] on [Client.start]).
+      Temporal normally records its 10 second default when the starter
+      supplied none, so this is usually [Some _]. *)
+  val task_timeout : t -> Duration.t option
+
+  (** Returns the workflow retry policy ([?retry_policy] on [Client.start]),
+      or [None] when the run is not retried. Temporal fills omitted policy
+      fields with its defaults before recording the start event, so the
+      result is the effective policy rather than the literal request.
+      Intervals are rounded up to whole milliseconds. *)
+  val retry_policy : t -> Activity.Retry_policy.t option
+
   (** Returns the parent workflow, or [None] for a top-level workflow. *)
   val parent : t -> parent option
 

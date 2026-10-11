@@ -840,6 +840,33 @@ let _workflow_info_task_queue : T.Workflow.Info.t -> string =
 
 let _workflow_info_attempt : T.Workflow.Info.t -> int = T.Workflow.Info.attempt
 
+let _workflow_info_continued_from_run_id : T.Workflow.Info.t -> string option =
+  T.Workflow.Info.continued_from_run_id
+
+let _workflow_info_continuation_initiator :
+    T.Workflow.Info.t -> T.Workflow.Info.continuation_initiator option =
+  T.Workflow.Info.continuation_initiator
+
+(* Exhaustive match: adding an initiator must be a visible API change. *)
+let _workflow_info_continuation_initiator_name :
+    T.Workflow.Info.continuation_initiator -> string = function
+  | `Continue_as_new -> "continue-as-new"
+  | `Retry -> "retry"
+  | `Cron_schedule -> "cron"
+
+let _workflow_info_execution_timeout : T.Workflow.Info.t -> T.Duration.t option =
+  T.Workflow.Info.execution_timeout
+
+let _workflow_info_run_timeout : T.Workflow.Info.t -> T.Duration.t option =
+  T.Workflow.Info.run_timeout
+
+let _workflow_info_task_timeout : T.Workflow.Info.t -> T.Duration.t option =
+  T.Workflow.Info.task_timeout
+
+let _workflow_info_retry_policy :
+    T.Workflow.Info.t -> T.Activity.Retry_policy.t option =
+  T.Workflow.Info.retry_policy
+
 let _workflow_info_parent : T.Workflow.Info.t -> T.Workflow.Info.parent option =
   T.Workflow.Info.parent
 

@@ -162,9 +162,9 @@ type failure = {
   info : failure_info;
 }
 
-(** How Core created a successor workflow run. The value is retained even
-    though the public workflow API does not currently expose continuation
-    provenance. *)
+(** How Core created a successor workflow run. The public
+    [Workflow.Info.continuation_initiator] projects it, reporting
+    [Continue_as_new_unspecified] as no reason. *)
 type continue_as_new_initiator =
   | Continue_as_new_unspecified
   | Continue_as_new_workflow

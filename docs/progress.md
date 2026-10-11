@@ -15,6 +15,37 @@ implementation when a later entry documents that work as complete. The
 records the current tested source, named assertions and successful CI job for
 the Temporal acceptance controllers.
 
+## 2026-10-11: Workflow start policy in `Workflow.Info` (#512)
+
+`Client.start` sets execution, run, and task timeouts and a workflow retry
+policy (#499), and the bridge already carried each of them, with
+continuation provenance, in the private `InitializeWorkflow` context, but
+workflow code could read none of them. `Workflow.Info` now exposes
+`execution_timeout`, `run_timeout`, and `task_timeout` as `Duration.t option`
+(rounded up to whole milliseconds and clamped like the activity timeouts),
+`retry_policy` as an `Activity.Retry_policy.t option` rebuilt from the
+bridge-validated record with the exact coefficient bits, and
+`continued_from_run_id` with `continuation_initiator`
+(`` `Continue_as_new | `Retry | `Cron_schedule ``; the unspecified Core value
+is `None`). The values are copied once into the run's immutable
+`run_info` from the initialization job, so replay observes the same values.
+`Temporal.Testing` reports the predecessor of its continue-as-new runs. No
+Rust, C, or protocol change: the ABI stays at v4.
+
+Runtime tests feed `InitializeWorkflow` jobs carrying every field, live and
+replaying, for every continuation initiator, and check rounding, clamping,
+and absent values. The new [start info live regression](../test/integration/workflow_start_info/README.md),
+added to `LIVE_REGRESSION_EXECUTABLES`, passed against the Compose Temporal
+1.32.0/PostgreSQL 18.6 stack. A root run, a retry run, and a continue-as-new
+successor each reported exactly what the client sent, before and after worker
+replacement forced a replay. Temporal carries the run and task timeouts,
+retry policy, and memo over to a continue-as-new successor when the command
+overrides none of them.
+
+Still open under #512: cron and nonzero root start delay remain rejected,
+the predecessor's failure and completion payloads are not public, and
+cache-full eviction (#501/#555), the replay corpus (#503), and conformance
+(#505) qualification are tracked separately.
 ## 2026-10-11: Patch lifecycle replay matrix (#531)
 
 The history corpus now records the patch lifecycle beyond the single
