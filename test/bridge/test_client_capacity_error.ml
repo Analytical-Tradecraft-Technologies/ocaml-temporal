@@ -41,6 +41,23 @@ let test_capacity_error_is_retryable_and_recognized () =
   if not (contains ~needle:"limit 64" message) then
     failwith ("capacity diagnostic was lost: " ^ message)
 
+(** A configured limit (#796), for example [~max_pending_waits:2] or
+    [~max_in_flight_calls:3], is refused with the same status and therefore
+    the same public classification, and the diagnostic names the configured
+    value rather than a default. *)
+let test_configured_limit_is_recognized () =
+  List.iter
+    (fun message ->
+      let error = public_error Bridge.Resource_exhausted message in
+      assert (Client.is_at_capacity error);
+      if not (contains ~needle:message (Error.message error)) then
+        failwith ("configured limit diagnostic was lost: " ^ Error.message error))
+    [
+      "too many Temporal workflow waits are pending (limit 2)";
+      "too many Temporal workflow starts are pending (limit 1)";
+      "too many Temporal client calls are pending (limit 3)";
+    ]
+
 (** Closed-client, lifecycle, and unrelated failures must not be mistaken for
     a transient capacity condition, including a forged error that only copies
     the error type onto a non-retryable or non-bridge failure. *)
@@ -66,4 +83,5 @@ let test_other_failures_are_not_capacity () =
 (** Runs the capacity classification regressions. *)
 let () =
   test_capacity_error_is_retryable_and_recognized ();
+  test_configured_limit_is_recognized ();
   test_other_failures_are_not_capacity ()

@@ -12,8 +12,9 @@
     worker has been killed, and meanwhile requires every signal and start on
     the same client to finish within a latency bound. It then shows that
     terminating the workflows releases the waits promptly, that the stuck
-    query ends at its own deadline, and that shutting the client down with a
-    wait in flight ends that wait with the closed-client error. The parent
+    query ends at its own deadline, that shutting the client down with a
+    wait in flight ends that wait with the closed-client error, and that a
+    configured [max_pending_waits] (#796) is enforced as a capacity error. The parent
     owns and reaps its worker, uses a unique task queue, and terminates every
     execution it starts. *)
 open Temporal
@@ -250,7 +251,50 @@ let check_shutdown_in_flight main cleanups address queue =
   | Error error -> fail ("in-flight wait ended with " ^ Error.message error)
   | Ok _ -> fail "an in-flight wait completed after shutdown"
 
-(** Starts the worker process, runs both checks, and terminates every
+(** A client created with [~max_pending_waits:2] (#796) refuses a wait on a
+    third distinct run at once with the retryable capacity error, while its
+    two admitted waits stay pending; shutting it down ends them. *)
+let check_configured_wait_limit main cleanups address queue =
+  let started =
+    List.init 3 (fun index ->
+        start_blocked main cleanups queue (Printf.sprintf "limited-%d" index))
+  in
+  let client =
+    get (Client.create ~max_pending_waits:2 ~target_url:address ~namespace:"default" ())
+  in
+  Fun.protect
+    ~finally:(fun () -> ignore (Client.shutdown client))
+    (fun () ->
+      let handles =
+        List.map
+          (fun handle ->
+            get
+              (Client.get_handle client ~workflow:blocked ?run_id:(Client.run_id handle)
+                 ~id:(Client.workflow_id handle) ()))
+          started
+      in
+      let admitted =
+        List.map (fun handle -> background (fun () -> Client.wait handle))
+          [ List.nth handles 0; List.nth handles 1 ]
+      in
+      Unix.sleepf 1.0;
+      if List.exists finished admitted then fail "an admitted wait finished early";
+      (match timed (fun () -> Client.wait (List.nth handles 2)) with
+      | elapsed, Error error when Client.is_at_capacity error ->
+          if elapsed > latency_bound then
+            fail (Printf.sprintf "the capacity refusal took %.3f s" elapsed)
+      | _, Error error -> fail ("third wait failed with " ^ Error.message error)
+      | _, Ok _ -> fail "a wait beyond max_pending_waits was admitted");
+      get (Client.shutdown client);
+      await_all ~seconds:10.0 "limited waits after shutdown" admitted;
+      List.iter
+        (fun call ->
+          match join call with
+          | Error _ -> ()
+          | Ok _ -> fail "a limited wait completed after shutdown")
+        admitted)
+
+(** Starts the worker process, runs every check, and terminates every
     fixture execution and the worker even when a check fails. *)
 let check address =
   let queue = "concurrent-client-" ^ Temporal_base.Client_request_id.create () in
@@ -266,6 +310,7 @@ let check address =
     (fun () ->
       check_concurrency client cleanups address queue;
       check_shutdown_in_flight client cleanups address queue;
+      check_configured_wait_limit client cleanups address queue;
       print_endline "concurrent client live regression: ok")
 
 (** The supplied URL must identify a disposable test namespace/server. *)

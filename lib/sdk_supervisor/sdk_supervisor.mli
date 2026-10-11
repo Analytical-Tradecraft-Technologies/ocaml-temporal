@@ -618,9 +618,15 @@ module Native : sig
   (** An abstract SDK instance which owns the complete Rust handle graph. *)
   type t
 
-  (** Validates client settings without network access. *)
+  (** Validates client settings without network access. [limits] carries the
+      optional admission limits of #796; see
+      {!Temporal_core_bridge.Native_bridge.type-client_limits}. *)
   val client_config :
-    target_url:string -> identity:string -> (client_config, Temporal_core_bridge.Native_bridge.error) result
+    ?limits:Temporal_core_bridge.Native_bridge.client_limits ->
+    target_url:string ->
+    identity:string ->
+    unit ->
+    (client_config, Temporal_core_bridge.Native_bridge.error) result
 
   (** Validates explicit worker resource settings without network access.
       [workflow_tasks] and [activity_tasks] select the task kinds Core polls

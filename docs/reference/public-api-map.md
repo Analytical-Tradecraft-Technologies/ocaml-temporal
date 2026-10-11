@@ -172,10 +172,13 @@ for those rules.
   aborted, and that caller receives a non-retryable `bridge` error saying
   Temporal did not prove whether the start was accepted, including its
   workflow and request IDs for reconciliation. One native client keeps at
-  most 64 starts in flight and waits on at most 64 distinct runs at once; a
-  call beyond either bound is rejected before reaching Temporal with a
-  retryable `bridge` error that `Client.is_at_capacity` recognizes, and the
-  client stays usable. A Temporal RPC failure is classified by
+  most 64 starts in flight, waits on at most 64 distinct runs, and has at
+  most 4,096 calls in flight at once; `Client.create ?max_pending_starts
+  ?max_pending_waits ?max_in_flight_calls` changes these per client (#796;
+  1..4,096, 1..4,096, and 1..65,536, otherwise a typed defect). A call beyond
+  a bound is rejected before reaching Temporal with a retryable `bridge`
+  error that `Client.is_at_capacity` recognizes, and the client stays
+  usable. A Temporal RPC failure is classified by
   `Client.rpc_status` (one variant per gRPC status, plus
   `` `Termination_outcome_uncertain ``); the same error carries a stable
   PascalCase `Error.error_type` such as `"NotFound"` and is `non_retryable`

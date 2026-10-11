@@ -30,7 +30,7 @@ let () =
   Domain.join waiter;
   assert (Atomic.get progressed);
   let runtime = unwrap (Bridge.runtime_create ()) in
-  (match Bridge.client_config ~target_url:"not a URL" ~identity:"worker" with
+  (match Bridge.client_config ~target_url:"not a URL" ~identity:"worker" () with
   | Error { status = Configuration; message } ->
       assert (String.length message > 0)
   | _ -> failwith "invalid client configuration was accepted");

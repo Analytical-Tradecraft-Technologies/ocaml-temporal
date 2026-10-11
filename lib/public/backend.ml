@@ -937,6 +937,14 @@ let validate_io_threads io_threads =
            (Printf.sprintf "io_threads must be between 1 and %d"
               Bridge.max_runtime_worker_threads))
 
+(** Validates the optional client admission limits (#796) before any backend
+    is selected, so [mock://] and native targets accept exactly the same
+    values. The bridge's message already names the field and its range. *)
+let validate_client_limits limits =
+  match Bridge.validate_client_limits limits with
+  | Ok () -> Ok ()
+  | Error { message; _ } -> Error (defect message)
+
 (** Rejects [?runtime] together with [?io_threads] (#832): a shared runtime
     already fixes its thread bound, so accepting both would silently ignore
     one. Called before any allocation. *)
@@ -1010,8 +1018,12 @@ let release_mock_service (service : mock_service) =
 (** Constructs either the deterministic mock ledger or the real native client.
     Native creation first validates the endpoint, then creates the complete
     supervisor graph, connects the official Rust client, and cleans up the
-    graph if any step fails. No partially connected value is published. *)
-let client_create ?io_threads ?runtime config =
+    graph if any step fails. No partially connected value is published.
+    [limits] (#796) is validated for every target but only the native client
+    enforces it: the mock ledger answers every call at once, so it never holds
+    an operation in flight. *)
+let client_create ?io_threads ?runtime ?(limits = Bridge.default_client_limits)
+    config =
   match validate_config config with
   | Error error -> Error error
   | Ok () ->
@@ -1019,6 +1031,9 @@ let client_create ?io_threads ?runtime config =
       | Error error -> Error error
       | Ok () ->
       match validate_runtime_source ~io_threads ~runtime with
+      | Error error -> Error error
+      | Ok () ->
+      match validate_client_limits limits with
       | Error error -> Error error
       | Ok () ->
       if String.starts_with ~prefix:"mock://" config.target_url then
@@ -1035,8 +1050,8 @@ let client_create ?io_threads ?runtime config =
           (acquire_runtime_lease runtime)
       else
         match
-          Native.client_config ~target_url:config.target_url
-            ~identity:config.identity
+          Native.client_config ~limits ~target_url:config.target_url
+            ~identity:config.identity ()
         with
         | Error error -> Error (bridge_error (Printf.sprintf "native client configuration failed: %s" error.message))
         | Ok native_config -> (
