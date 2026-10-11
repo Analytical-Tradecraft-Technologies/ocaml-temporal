@@ -168,15 +168,16 @@ module Activity_source = struct
   let try_poll_activity supervisor =
     Native.perform supervisor Native.Try_poll_activity
 
-  (** Submits one semantic activity completion through the supervisor mailbox.
-  *)
-  let complete_activity supervisor completion =
-    Native.perform supervisor (Native.Complete_activity completion)
+  (** Submits one activity completion, already encoded once by the adapter,
+      through the supervisor mailbox. *)
+  let complete_activity supervisor encoded =
+    Native.perform supervisor (Native.Complete_activity encoded)
 
   (** Completes an admitted asynchronous activity through the namespace-bound
-      client path, never the worker task-token ledger. *)
-  let complete_async_activity supervisor completion =
-    Native.perform supervisor (Native.Complete_async_activity completion)
+      client path, never the worker task-token ledger. The completion arrives
+      already encoded once by the adapter. *)
+  let complete_async_activity supervisor encoded =
+    Native.perform supervisor (Native.Complete_async_activity encoded)
 
   (** Records progress for the currently leased activity through the same
       supervisor mailbox as polling and completion. *)
