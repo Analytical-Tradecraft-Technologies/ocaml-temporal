@@ -632,9 +632,13 @@ and bridge, read the [documentation guide](../README.md) first.
 - Deadlines keep the #499 rule: a request whose deadline expired in the
   mailbox is completed by the owner without reaching Rust, and a live
   deadline is lowered to the remaining budget and enforced inside the task.
-- The runtime admits at most 64 distinct waited executions, 64 distinct
-  in-flight start request IDs, and 4,096 submitted calls in total (plus at
-  most 64 outstanding tickets on the retained ticket path). Admission beyond a
+- The runtime admits at most `max_pending_waits` distinct waited executions,
+  `max_pending_starts` distinct in-flight start request IDs, and
+  `max_in_flight_calls` submitted calls in total (plus at most
+  `max_pending_starts` outstanding tickets on the retained ticket path). The
+  defaults are 64, 64, and 4,096; a connection may configure other values,
+  validated on both sides of the bridge and fixed for its lifetime (#796).
+  Admission beyond a
   bound returns `Resource_exhausted` without side effects and leaves the
   client usable; it never reuses `Invalid_state`, which callers treat as a
   closed graph. The retained synchronous wait path keeps its history futures

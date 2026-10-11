@@ -87,11 +87,58 @@ val monotonic_now_ns : unit -> int64
     polling. Values outside 0 through 1,000 return an error. *)
 val conformance_wait_ms : int -> (unit, error) result
 
+(** Admission limits of one client connection (#796). Each [None] keeps the
+    bridge default; an explicit value must be at least 1 and at most the
+    matching [max_configurable_*] bound.
+
+    - [max_pending_waits] (default 64) bounds the distinct exact runs being
+      waited on; repeated waits on one run share its slot.
+    - [max_pending_starts] (default 64) bounds the distinct start request IDs
+      in flight; a retry with the same request ID shares its slot.
+    - [max_in_flight_calls] (default 4,096) bounds every submitted call of
+      the client, counted until its outcome is read or released.
+
+    Admission beyond a limit is refused with [Resource_exhausted] before
+    anything is sent to Temporal. *)
+type client_limits = {
+  max_pending_waits : int option;
+  max_pending_starts : int option;
+  max_in_flight_calls : int option;
+}
+
+(** Every client limit set to [None]. *)
+val default_client_limits : client_limits
+
+(** Largest accepted [max_pending_waits] (4,096), mirrored by the Rust bridge. *)
+val max_configurable_pending_waits : int
+
+(** Largest accepted [max_pending_starts] (4,096), mirrored by the Rust bridge. *)
+val max_configurable_pending_starts : int
+
+(** Largest accepted [max_in_flight_calls] (65,536), mirrored by the Rust
+    bridge. *)
+val max_configurable_in_flight_calls : int
+
+(** Returns a [Configuration] error naming the first limit outside its
+    accepted range; all-[None] limits are always valid. *)
+val validate_client_limits : client_limits -> (unit, error) result
+
 (** Validates connection settings without opening a connection. The bridge
     applies only transport-safety checks; Core and Temporal Server retain
-    authority over namespace-configurable semantic limits. *)
+    authority over namespace-configurable semantic limits. [limits] defaults
+    to {!default_client_limits}. *)
 val client_config :
-  target_url:string -> identity:string -> (client_config, error) result
+  ?limits:client_limits ->
+  target_url:string ->
+  identity:string ->
+  unit ->
+  (client_config, error) result
+
+(** Returns the exact JSON document {!client_connect} sends for [config]. An
+    explicit limit is appended after [identity]; a client with default limits
+    produces the document accepted before #796, byte for byte. Exposed for
+    encoding tests. *)
+val client_config_document : client_config -> string
 
 (** Autoscaling bounds for Core's workflow-task pollers: at least [minimum]
     and at most [maximum] concurrent polls, starting from [initial]. *)
@@ -294,7 +341,8 @@ val client_await_call :
   client_call -> timeout_ms:int -> (bytes, error) result
 
 (** Abandons one submitted call without reading it (#807). A call counts
-    against its runtime's 4,096-call ceiling until it is read, released, or
+    against its connection's [max_in_flight_calls] ceiling (4,096 by default;
+    see {!type-client_limits}) until it is read, released, or
     the runtime closes, even after its RPC has finished; a caller that stops
     awaiting (for example because of an exception) releases it here. Any
     published outcome is dropped, and releasing a call that was already

@@ -73,7 +73,7 @@ let test_bridge_sharing () =
   bridge_ok "repeated shared close" (Bridge.shared_runtime_close shared);
   let config =
     bridge_ok "client config"
-      (Bridge.client_config ~target_url:refused_target ~identity:"unit-test")
+      (Bridge.client_config ~target_url:refused_target ~identity:"unit-test" ())
   in
   List.iter
     (fun runtime ->

@@ -72,7 +72,9 @@ timeout_ms)` takes that pair, not a runtime, and serves only the owner that
 submitted the call; any other owner gets the same `INVALID_STATE` as an
 unknown call and leaves the call untouched.
 `ocaml_temporal_core_v4_client_release_call(owner, call)` abandons a call
-without reading it; a call counts against the runtime's 4,096-call ceiling
+without reading it; a call counts against the connection's in-flight ceiling
+(`max_in_flight_calls`, 4,096 by default; see
+[client admission limits](client-protocol.md#client-admission-limits-796))
 until it is read, released, or its runtime closes, even after its RPC ends.
 The await symbol waits a bounded interval for the outcome, which is the
 same document or failure the synchronous symbol returns (a start yields the
@@ -224,8 +226,8 @@ the entire request, including `request_id`, and share the existing ten-second
 overall deadline. A definitive rejection remains terminal; an unanswered
 request remains uncertain when the deadline expires. Callback-transport tests
 under `tests/support/client_start.rs` cover recovery, request identity,
-non-retryable rejection, cancellation of a hung request, and the 64-ticket
-admission bound.
+non-retryable rejection, cancellation of a hung request, the default 64-ticket
+admission bound, and a configured bound of two (#796).
 
 Every other client RPC (wait, signal, query, cancel, terminate, reset,
 update, update poll, and visibility listing) goes through the same retrying
@@ -268,17 +270,34 @@ and pagination state: 100 ms bounds owner occupancy, not RPC lifetime. Slow
 successful requests therefore make progress across calls while the owner can
 still admit shutdown and other lifecycle messages.
 
-At most 64 distinct exact-run observations may be retained per runtime. Calls
+At most `max_pending_waits` distinct exact-run observations (64 by default)
+may be retained per runtime. Calls
 with the same namespace, workflow ID, and run ID share an in-flight future;
 admitting a new identity at capacity returns status `15`
 (`RESOURCE_EXHAUSTED`). That status is reserved for a full bounded
 client-operation registry: nothing was sent to Temporal and the client stays
 connected, so it is distinct from the `INVALID_STATE` returned for a closed
-client or runtime. The same status and bound of 64 apply to outstanding
-asynchronous start tickets. The public adapter maps it to a retryable
+client or runtime. The same status applies to outstanding asynchronous start
+tickets, bounded by `max_pending_starts` (64 by default), and to the
+submitted-call ceiling `max_in_flight_calls` (4,096 by default).
+
+The three limits are fixed per connection (#796). The client connect document
+may carry each one as an optional integer field; `connect_client` validates
+them through `client_calls::ClientLimits::from_config` (1 to 4,096 for waits
+and starts, 1 to 65,536 for calls, otherwise `CONFIGURATION`) before any
+network access, and stores the result on the runtime only when the
+connection succeeds. Every admission check reads the runtime's
+`client_limits` instead of a constant, and the capacity message names the
+configured value. An omitted field keeps the default, and the OCaml encoder
+omits defaults, so the document and behavior of a default client are
+unchanged and ABI version 4 still applies; see
+[client admission limits](client-protocol.md#client-admission-limits-796).
+The public adapter maps the status to a retryable
 `bridge` error with `error_type` `resource_exhausted`, which
-`Client.is_at_capacity` recognizes. A terminal
-result or error removes its entry before returning to OCaml. A later wait may
+`Client.is_at_capacity` recognizes.
+
+A terminal wait result or error removes its retained observation before
+returning to OCaml. A later wait may
 observe the same closed run again through a fresh request; this table is not
 a result cache. Client disconnect and both explicit and finalizer runtime
 close cancel all retained futures before releasing the connection and Core.
