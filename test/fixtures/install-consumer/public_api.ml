@@ -640,6 +640,9 @@ let _client_create :
     ?identity:string ->
     ?io_threads:int ->
     ?runtime:T.Runtime.t ->
+    ?max_pending_waits:int ->
+    ?max_pending_starts:int ->
+    ?max_in_flight_calls:int ->
     target_url:string ->
     namespace:string ->
     unit -> (T.Client.t, T.Error.t) result =

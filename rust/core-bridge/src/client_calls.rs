@@ -44,7 +44,8 @@
 //! Lock order: the registry mutex is never held while a slot mutex is taken.
 
 use crate::abi::{
-    Failure, Operation, STATUS_INTERNAL, STATUS_INVALID_STATE, STATUS_NOT_READY, STATUS_PANIC,
+    Failure, Operation, STATUS_CONFIGURATION, STATUS_INTERNAL, STATUS_INVALID_STATE,
+    STATUS_NOT_READY, STATUS_PANIC,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -333,4 +334,109 @@ pub(crate) fn await_call(owner: u64, call: u64, timeout: Duration) -> Operation 
 /// runtime's admission ceiling is checked against this count.
 pub(crate) fn registered_calls(owner: u64) -> usize {
     lock(&CALLS).per_owner.get(&owner).copied().unwrap_or(0)
+}
+
+/// Largest accepted `max_pending_waits` (#796). Each distinct waited run holds
+/// one Tokio task and one open history long poll, so the bound keeps a typo
+/// from turning one client into thousands of server long polls.
+pub(crate) const MAX_CONFIGURABLE_PENDING_WAITS: u32 = 4_096;
+/// Largest accepted `max_pending_starts` (#796), for the same reason as
+/// [`MAX_CONFIGURABLE_PENDING_WAITS`]: each start holds one task and request.
+pub(crate) const MAX_CONFIGURABLE_PENDING_STARTS: u32 = 4_096;
+/// Largest accepted `max_in_flight_calls` (#796). The ceiling bounds the
+/// process-wide completion registry and task set of one runtime; much beyond
+/// it, a leak of abandoned calls would no longer be caught in practice.
+pub(crate) const MAX_CONFIGURABLE_IN_FLIGHT_CALLS: u32 = 65_536;
+
+/// Admission limits of one connected client (#796).
+///
+/// The runtime owner reads these when it admits a start, an exact-run wait,
+/// or any submitted call; admission beyond a limit returns
+/// `STATUS_RESOURCE_EXHAUSTED` before any task or RPC exists. The values are
+/// fixed for the lifetime of one connection: [`ClientLimits::from_config`]
+/// validates the optional fields of the client connect document, and a
+/// runtime without a connection keeps the defaults. All three are counts and
+/// every value is at least one. The in-flight ceiling applies on top of the
+/// start and wait limits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ClientLimits {
+    /// Distinct exact runs being waited on; repeated waits share one slot.
+    pub(crate) pending_waits: usize,
+    /// Distinct start request IDs in flight; a retry shares its slot.
+    pub(crate) pending_starts: usize,
+    /// Submitted calls of every kind outstanding until their cells retire.
+    pub(crate) in_flight_calls: usize,
+}
+
+impl Default for ClientLimits {
+    /// The limits used before they became configurable: 64 waits, 64
+    /// starts, and 4,096 calls. A connect document without limit fields
+    /// therefore behaves exactly as it did before #796.
+    fn default() -> Self {
+        Self {
+            pending_waits: crate::abi::MAX_PENDING_WAITS,
+            pending_starts: crate::abi::MAX_PENDING_STARTS,
+            in_flight_calls: crate::abi::MAX_PENDING_CALLS,
+        }
+    }
+}
+
+impl ClientLimits {
+    /// Validates the optional connect-document limits and fills omitted ones
+    /// with the defaults. A value outside `1..=maximum` is a
+    /// `STATUS_CONFIGURATION` failure naming the field; OCaml validates the
+    /// same bounds first, so this is the defense-in-depth check.
+    pub(crate) fn from_config(
+        pending_waits: Option<u32>,
+        pending_starts: Option<u32>,
+        in_flight_calls: Option<u32>,
+    ) -> std::result::Result<Self, Failure> {
+        let defaults = Self::default();
+        Ok(Self {
+            pending_waits: limit(
+                "max_pending_waits",
+                pending_waits,
+                MAX_CONFIGURABLE_PENDING_WAITS,
+                defaults.pending_waits,
+            )?,
+            pending_starts: limit(
+                "max_pending_starts",
+                pending_starts,
+                MAX_CONFIGURABLE_PENDING_STARTS,
+                defaults.pending_starts,
+            )?,
+            in_flight_calls: limit(
+                "max_in_flight_calls",
+                in_flight_calls,
+                MAX_CONFIGURABLE_IN_FLIGHT_CALLS,
+                defaults.in_flight_calls,
+            )?,
+        })
+    }
+}
+
+/// Checks one optional limit against `1..=maximum`, returning `default` when
+/// it is absent.
+fn limit(
+    name: &str,
+    value: Option<u32>,
+    maximum: u32,
+    default: usize,
+) -> std::result::Result<usize, Failure> {
+    match value {
+        None => Ok(default),
+        Some(value) if (1..=maximum).contains(&value) => {
+            usize::try_from(value).map_err(|_| limit_failure(name, maximum))
+        }
+        Some(_) => Err(limit_failure(name, maximum)),
+    }
+}
+
+/// The configuration failure for an out-of-range limit. The message carries
+/// only the field name and the accepted range, never the rejected value.
+fn limit_failure(name: &str, maximum: u32) -> Failure {
+    Failure {
+        status: STATUS_CONFIGURATION,
+        message: format!("client {name} must be between 1 and {maximum}"),
+    }
 }

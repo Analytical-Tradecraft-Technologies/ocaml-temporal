@@ -56,7 +56,7 @@ let () =
   let client =
     require
       (Native.client_config ~target_url:address
-         ~identity:"ocaml-temporal-live-lifecycle")
+         ~identity:"ocaml-temporal-live-lifecycle" ())
   in
   let worker =
     require

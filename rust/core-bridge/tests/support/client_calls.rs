@@ -391,3 +391,145 @@ fn unread_completed_calls_hold_capacity_until_retired() {
     assert_eq!(registered_calls(owner), 0);
     assert_eq!(runtime.close(true), STATUS_OK);
 }
+
+/// Builds the wait document for the exact run of `workflow_id`.
+fn wait_for(workflow_id: &str) -> Vec<u8> {
+    format!(r#"{{"namespace":"default","workflow_id":"{workflow_id}","run_id":"run-1"}}"#)
+        .into_bytes()
+}
+
+/// A configured wait limit of two (#796) replaces the default of 64: a third
+/// distinct run is refused with the retryable capacity status naming the
+/// configured limit, while another wait on an admitted run still shares its
+/// slot.
+#[test]
+fn configured_wait_limit_is_enforced() {
+    let (mut runtime, _probe) = connected_runtime();
+    runtime.client_limits =
+        crate::client_calls::ClientLimits::from_config(Some(2), None, None).expect("valid limits");
+    submit(&mut runtime, ClientCallKind::Wait, &wait_for("workflow-a"));
+    submit(&mut runtime, ClientCallKind::Wait, &wait_for("workflow-b"));
+    let over = runtime
+        .submit_client_call(2, &wait_for("workflow-c"))
+        .expect_err("third distinct run beyond the configured limit");
+    assert_eq!(over.status, STATUS_RESOURCE_EXHAUSTED);
+    assert!(over.message.contains("limit 2"), "{}", over.message);
+    submit(&mut runtime, ClientCallKind::Wait, &wait_for("workflow-a"));
+    assert!(runtime.disconnect_client().is_ok());
+    assert_eq!(runtime.close(true), STATUS_OK);
+}
+
+/// A configured in-flight ceiling of three (#796) refuses a fourth call of
+/// any kind, here a signal behind three pending queries.
+#[test]
+fn configured_in_flight_limit_is_enforced() {
+    let (mut runtime, _probe) = connected_runtime();
+    runtime.client_limits =
+        crate::client_calls::ClientLimits::from_config(None, None, Some(3)).expect("valid limits");
+    for _ in 0..3 {
+        submit(&mut runtime, ClientCallKind::Query, QUERY);
+    }
+    let over = runtime
+        .submit_client_call(6, SIGNAL)
+        .expect_err("fourth call beyond the configured ceiling");
+    assert_eq!(over.status, STATUS_RESOURCE_EXHAUSTED);
+    assert!(over.message.contains("limit 3"), "{}", over.message);
+    assert!(runtime.disconnect_client().is_ok());
+    assert_eq!(runtime.close(true), STATUS_OK);
+}
+
+/// Omitted limits keep the pre-#796 values, both for a fresh runtime and for
+/// a connect document without limit fields.
+#[test]
+fn omitted_client_limits_keep_the_defaults() {
+    let defaults = crate::client_calls::ClientLimits::default();
+    assert_eq!(defaults.pending_waits, 64);
+    assert_eq!(defaults.pending_starts, 64);
+    assert_eq!(defaults.in_flight_calls, 4_096);
+    assert_eq!(
+        crate::client_calls::ClientLimits::from_config(None, None, None).expect("defaults"),
+        defaults
+    );
+    let config: ClientConfig =
+        serde_json::from_str(r#"{"target_url":"http://localhost:7233","identity":"test"}"#)
+            .expect("pre-#796 document");
+    assert_eq!(
+        (
+            config.max_pending_waits,
+            config.max_pending_starts,
+            config.max_in_flight_calls
+        ),
+        (None, None, None)
+    );
+    let (runtime, _probe) = connected_runtime();
+    assert_eq!(runtime.client_limits, defaults);
+    assert_eq!(runtime.close(true), STATUS_OK);
+}
+
+/// Each limit accepts exactly `1..=maximum`; zero or a value above the
+/// documented maximum is a configuration failure naming the field, and
+/// connect rejects it before any network access, leaving no client.
+#[test]
+fn invalid_client_limits_are_rejected() {
+    use crate::client_calls::{
+        ClientLimits, MAX_CONFIGURABLE_IN_FLIGHT_CALLS, MAX_CONFIGURABLE_PENDING_STARTS,
+        MAX_CONFIGURABLE_PENDING_WAITS,
+    };
+    let accepted = ClientLimits::from_config(
+        Some(MAX_CONFIGURABLE_PENDING_WAITS),
+        Some(1),
+        Some(MAX_CONFIGURABLE_IN_FLIGHT_CALLS),
+    )
+    .expect("boundary values");
+    assert_eq!(accepted.pending_waits, 4_096);
+    assert_eq!(accepted.pending_starts, 1);
+    assert_eq!(accepted.in_flight_calls, 65_536);
+    for (limits, field) in [
+        ((Some(0), None, None), "max_pending_waits"),
+        (
+            (Some(MAX_CONFIGURABLE_PENDING_WAITS + 1), None, None),
+            "max_pending_waits",
+        ),
+        ((None, Some(0), None), "max_pending_starts"),
+        (
+            (None, Some(MAX_CONFIGURABLE_PENDING_STARTS + 1), None),
+            "max_pending_starts",
+        ),
+        ((None, None, Some(0)), "max_in_flight_calls"),
+        (
+            (None, None, Some(MAX_CONFIGURABLE_IN_FLIGHT_CALLS + 1)),
+            "max_in_flight_calls",
+        ),
+    ] {
+        let error = ClientLimits::from_config(limits.0, limits.1, limits.2)
+            .expect_err("out-of-range limit");
+        assert_eq!(error.status, STATUS_CONFIGURATION);
+        assert!(error.message.contains(field), "{}", error.message);
+    }
+
+    let options = RuntimeOptions::builder().build().expect("runtime options");
+    let core = CoreRuntime::new(options, TokioRuntimeBuilder::default()).expect("Core runtime");
+    let mut runtime = Runtime::with_owned_core(core).expect("runtime cleanup thread");
+    let config: ClientConfig = serde_json::from_str(
+        r#"{"target_url":"http://localhost:7233","identity":"test","max_pending_waits":0}"#,
+    )
+    .expect("strictly typed document");
+    let error = runtime
+        .connect_client(config)
+        .expect_err("zero limit rejected before connecting");
+    assert_eq!(error.status, STATUS_CONFIGURATION);
+    assert!(runtime.client.is_none());
+    assert_eq!(runtime.client_limits, ClientLimits::default());
+    for document in [
+        r#"{"target_url":"http://localhost:7233","identity":"test","max_pending_waits":-1}"#,
+        r#"{"target_url":"http://localhost:7233","identity":"test","max_pending_starts":"2"}"#,
+        r#"{"target_url":"http://localhost:7233","identity":"test","max_in_flight_calls":4294967296}"#,
+        r#"{"target_url":"http://localhost:7233","identity":"test","max_pending":2}"#,
+    ] {
+        assert!(
+            serde_json::from_str::<ClientConfig>(document).is_err(),
+            "{document}"
+        );
+    }
+    assert_eq!(runtime.close(true), STATUS_OK);
+}

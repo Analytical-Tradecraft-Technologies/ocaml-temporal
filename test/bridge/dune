@@ -105,3 +105,8 @@
 (test
  (name test_worker_tuning)
  (libraries temporal_core_bridge))
+
+; Client admission limit encoding and validation (#796).
+(test
+ (name test_client_limits)
+ (libraries temporal-sdk temporal_core_bridge))

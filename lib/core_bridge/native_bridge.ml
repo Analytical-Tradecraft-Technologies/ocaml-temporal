@@ -50,11 +50,20 @@ type runtime
     Core, so closing this value never frees Core under a live graph. *)
 type shared_runtime
 
+(** Optional admission limits of one client connection (#796). [None] keeps
+    the bridge default (64 waits, 64 starts, 4,096 calls). *)
+type client_limits = {
+  max_pending_waits : int option;
+  max_pending_starts : int option;
+  max_in_flight_calls : int option;
+}
+
 (** Validated client connection settings. The concrete JSON representation is
     private so callers cannot bypass sender-side checks. *)
 type client_config = {
   target_url : string;
   identity : string;
+  limits : client_limits;
 }
 
 (** Selects whether Core should use no worker versioning or its legacy build-ID
@@ -412,14 +421,54 @@ let validate_count ~allow_zero name value =
          max_worker_count)
   else Ok ()
 
+(** Leaves every client limit at the bridge default. *)
+let default_client_limits =
+  { max_pending_waits = None; max_pending_starts = None; max_in_flight_calls = None }
+
+(** Largest accepted [max_pending_waits], mirroring
+    [MAX_CONFIGURABLE_PENDING_WAITS] in the Rust bridge. Each distinct waited
+    run holds one open history long poll, so far larger values are much more
+    likely to be a mistake than a deliberate setting. *)
+let max_configurable_pending_waits = 4_096
+
+(** Largest accepted [max_pending_starts], mirroring
+    [MAX_CONFIGURABLE_PENDING_STARTS] in the Rust bridge. *)
+let max_configurable_pending_starts = 4_096
+
+(** Largest accepted [max_in_flight_calls], mirroring
+    [MAX_CONFIGURABLE_IN_FLIGHT_CALLS] in the Rust bridge. *)
+let max_configurable_in_flight_calls = 65_536
+
+(** Checks one optional limit against [1..maximum]. The message names the
+    field and the accepted range, matching the Rust bridge's wording. *)
+let validate_limit name maximum = function
+  | None -> Ok ()
+  | Some value when value >= 1 && value <= maximum -> Ok ()
+  | Some _ ->
+      configuration_error
+        (Printf.sprintf "client %s must be between 1 and %d" name maximum)
+
+(** Validates every explicit client limit; the Rust bridge checks the same
+    ranges again when it decodes the connect document. *)
+let validate_client_limits
+    { max_pending_waits; max_pending_starts; max_in_flight_calls } =
+  let* () =
+    validate_limit "max_pending_waits" max_configurable_pending_waits
+      max_pending_waits
+  in
+  let* () =
+    validate_limit "max_pending_starts" max_configurable_pending_starts
+      max_pending_starts
+  in
+  validate_limit "max_in_flight_calls" max_configurable_in_flight_calls
+    max_in_flight_calls
+
 (** Creates client settings only after all sender-side invariants hold. *)
-let client_config ~target_url ~identity =
-  match validate_target_url target_url with
-  | Error _ as error -> error
-  | Ok () ->
-      Result.map
-        (fun () -> { target_url; identity })
-        (validate_identifier "identity" identity)
+let client_config ?(limits = default_client_limits) ~target_url ~identity () =
+  let* () = validate_target_url target_url in
+  let* () = validate_identifier "identity" identity in
+  let* () = validate_client_limits limits in
+  Ok { target_url; identity; limits }
 
 (** Checks one optional positive tuning duration against
     [max_worker_tuning_duration_ms]. *)
@@ -614,14 +663,30 @@ let worker_config ~namespace ~task_queue ~build_id ?(versioning = No_versioning)
           activity_tasks;
         }
 
-(** Encodes the exact strict client document accepted by the Rust adapter. *)
-let encode_client_config config =
+(** Renders the exact strict client document accepted by the Rust adapter.
+    Each explicit limit is appended after [identity] in a fixed order; an
+    omitted one is not serialized, so a client with default limits sends the
+    document byte-for-byte as before #796. *)
+let client_config_document config =
+  let limit name = Option.map (fun value -> (name, `Int value)) in
+  let { max_pending_waits; max_pending_starts; max_in_flight_calls } =
+    config.limits
+  in
   `Assoc
-    [
-      ("target_url", `String config.target_url);
-      ("identity", `String config.identity);
-    ]
-  |> Yojson.Safe.to_string |> Bytes.of_string
+    ([
+       ("target_url", `String config.target_url);
+       ("identity", `String config.identity);
+     ]
+    @ List.filter_map Fun.id
+        [
+          limit "max_pending_waits" max_pending_waits;
+          limit "max_pending_starts" max_pending_starts;
+          limit "max_in_flight_calls" max_in_flight_calls;
+        ])
+  |> Yojson.Safe.to_string
+
+(** Encodes {!client_config_document} as the bytes sent to Rust. *)
+let encode_client_config config = Bytes.of_string (client_config_document config)
 
 (** Encodes the optional [tuning] member, listing only explicit settings.
     Returns [None] for an all-default value so the member is omitted and the

@@ -15,6 +15,38 @@ implementation when a later entry documents that work as complete. The
 records the current tested source, named assertions and successful CI job for
 the Temporal acceptance controllers.
 
+## 2026-10-11: Configurable client admission limits (#796)
+
+The native client's three admission limits were fixed constants in the Rust
+bridge: 64 distinct waited runs, 64 in-flight start request IDs, and 4,096
+submitted calls. A process serving more concurrent callers than that through
+one client had to create several clients, each with its own runtime.
+`Client.create` now takes `?max_pending_waits`, `?max_pending_starts`, and
+`?max_in_flight_calls`. Each must be between 1 and 4,096, 4,096, and 65,536
+respectively; any other value is a typed defect returned before anything is
+allocated, for every target including `mock://`. Omitted values keep the
+previous defaults.
+
+The values travel as optional additive fields of the existing client connect
+document, after `identity`, and the OCaml encoder omits every limit left at
+its default, so a default client sends the pre-#796 document byte for byte
+and ABI version 4 is unchanged. Rust decodes the fields strictly, validates
+the same ranges again in `client_calls::ClientLimits::from_config` before any
+network access, and stores them on the runtime when the connection succeeds.
+The submitted-call path, the start-ticket path, and the retained wait path
+read the per-connection limits instead of the constants, and the
+`RESOURCE_EXHAUSTED` message names the configured value. Capacity errors
+still surface as the retryable error `Client.is_at_capacity` recognizes.
+
+Rust callback-transport tests enforce configured limits of two waits, two
+starts on both start paths, and three calls in total, keep the defaults for
+documents without limits, and reject zero, over-maximum, mistyped, and
+unknown fields. An OCaml bridge test checks the exact encoded documents,
+sender-side rejection, Rust's acceptance of a limited document, and typed
+defects from `Client.create`; the capacity classification test covers the
+configured-limit messages. The concurrent client live regression now also
+refuses a third wait on a client created with `~max_pending_waits:2`.
+
 ## 2026-10-10: Concurrent calls on one client (#807)
 
 One `Client.t` served every call on its supervisor Domain one at a time, and
@@ -1179,8 +1211,8 @@ retryable `bridge` error with `error_type` `resource_exhausted`, recognized by
 the new `Client.is_at_capacity`. Both bounds are documented on `Client.start`
 and `Client.wait`. Rust callback-transport tests prove both bounds, ticket
 reuse at capacity, and re-admission after a slot is freed; an OCaml bridge
-test proves the public classification. The bounds remain fixed; making them
-configurable is left for a follow-up.
+test proves the public classification. The bounds were fixed at the time;
+the 2026-10-11 entry above makes them configurable.
 
 ## 2026-10-05: Activity timeout and duration bounds (#812)
 
