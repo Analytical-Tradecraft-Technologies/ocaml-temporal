@@ -295,6 +295,11 @@ type worker
     and the bridge maximum; [None] is always valid. *)
 val validate_io_threads : int option -> (unit, Error.t) result
 
+(** Returns a defect naming the first client admission limit (#796) outside
+    its accepted range; all-[None] limits are always valid. *)
+val validate_client_limits :
+  Temporal_sdk_kernel.Bridge.client_limits -> (unit, Error.t) result
+
 (** Returns a defect when both [io_threads] and [runtime] are given (#832);
     the shared runtime already fixes its own thread bound. *)
 val validate_runtime_source :
@@ -317,10 +322,14 @@ val acquire_runtime_lease :
     maps it to the private runtime's Tokio worker pool. It is validated for
     every target. With [runtime] (exclusive with [io_threads]) the client is
     attached to that shared runtime until [client_shutdown]: a native
-    client's supervisor owns the lease, a mock client holds it itself. *)
+    client's supervisor owns the lease, a mock client holds it itself.
+    [limits] (#796) is validated for every target and enforced only by the
+    native client, whose bridge refuses admissions beyond it as
+    [Resource_exhausted]; it defaults to the bridge defaults. *)
 val client_create :
   ?io_threads:int ->
   ?runtime:Temporal_sdk_kernel.Shared_runtime.t ->
+  ?limits:Temporal_sdk_kernel.Bridge.client_limits ->
   config ->
   (client, Error.t) result
 

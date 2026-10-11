@@ -23,6 +23,10 @@ a time and that Domain waited for the network inside each call:
 - Shutting down a second client while a `Client.wait` is in flight on it
   returns promptly, and the wait ends with the closed-client error instead of
   staying blocked.
+- A third client created with `~max_pending_waits:2` (#796) keeps two waits
+  pending and refuses a wait on a third distinct run at once with an error
+  recognized by `Client.is_at_capacity`; shutting it down ends the two
+  admitted waits.
 
 The test terminates every workflow it creates, including after an assertion
 failure.

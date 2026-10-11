@@ -131,8 +131,14 @@ let validate_name field value =
 (** Builds the private backend configuration after checking every user-facing
     connection field. Routine configuration failures remain [result] values.
     An omitted identity is derived once here as [<pid>@<hostname>]; this runs
-    outside workflow code, so reading process state is replay-safe. *)
-let create ?identity ?io_threads ?runtime ~target_url ~namespace () =
+    outside workflow code, so reading process state is replay-safe. The
+    optional admission limits (#796) are validated by [Backend.client_create]
+    for every target before anything is allocated. *)
+let create ?identity ?io_threads ?runtime ?max_pending_waits
+    ?max_pending_starts ?max_in_flight_calls ~target_url ~namespace () =
+  let limits : Temporal_sdk_kernel.Bridge.client_limits =
+    { max_pending_waits; max_pending_starts; max_in_flight_calls }
+  in
   let identity = Temporal_base.Process_identity.resolve identity in
   match Backend.validate_io_threads io_threads with
   | Error error -> Error error
@@ -158,7 +164,7 @@ let create ?identity ?io_threads ?runtime ~target_url ~namespace () =
                 shutdown_mutex = Mutex.create ();
                 shutdown_result = None;
               })
-            (Backend.client_create ?io_threads ?runtime config))
+            (Backend.client_create ?io_threads ?runtime ~limits config))
 
 (** Validates the optional Temporal idempotency key, workflow type, durable
     workflow ID, and task queue before encoding input or constructing a native

@@ -186,6 +186,29 @@ type visibility_page = {
     {!Runtime.create}), and so is a runtime that was already shut down.
     A [mock://] client attaches too, so ordering errors match every target.
 
+    Three admission limits bound the operations one native client keeps in
+    flight. Each is a count, applies per client, and may be set to any value
+    from 1 up to its maximum; any other value returns a typed defect before
+    anything is allocated, for every target including [mock://].
+
+    - [max_pending_waits] (default 64, at most 4,096) bounds the distinct runs
+      being waited on with {!wait}; concurrent waits on the same run share
+      one slot.
+    - [max_pending_starts] (default 64, at most 4,096) bounds the distinct
+      start request IDs in flight with {!start}; retrying a start that is
+      still in flight with the same [request_id] shares its slot.
+    - [max_in_flight_calls] (default 4,096, at most 65,536) bounds every call
+      in flight on the client, of any kind, including starts and waits. A
+      call counts until its caller has received its result.
+
+    A call beyond a limit is refused before anything is sent to Temporal with
+    a retryable error recognized by {!is_at_capacity}; the client stays
+    connected and the call may be retried once another one finishes. Raise a
+    limit when one client serves more concurrent callers; each waited run
+    keeps one history long poll open against the server. A [mock://] client
+    validates the limits but never reaches them, because it answers every
+    call at once.
+
     A [mock://] target selects an in-memory ledger for testing client plumbing
     only. It runs no workflow code: [wait] echoes the encoded start input back
     as the output, completing only when the workflow's output codec can
@@ -196,6 +219,9 @@ val create :
   ?identity:string ->
   ?io_threads:int ->
   ?runtime:Runtime.t ->
+  ?max_pending_waits:int ->
+  ?max_pending_starts:int ->
+  ?max_in_flight_calls:int ->
   target_url:string ->
   namespace:string ->
   unit ->
@@ -283,8 +309,8 @@ val create :
     Server-applied workflow/retry continuation backoff, timeouts, and
     execution expiration metadata are preserved.
 
-    The native client keeps at most 64 starts in flight at once. A start
-    beyond that bound is rejected before anything is sent to Temporal, with a
+    The native client keeps at most [max_pending_starts] starts in flight at
+    once (64 unless set on {!create}). A start beyond that bound is rejected before anything is sent to Temporal, with a
     retryable error recognized by [is_at_capacity]; the client stays usable
     and the start may be retried once another one finishes. Retrying a start
     that is still in flight with the same [request_id] does not use another
@@ -375,7 +401,8 @@ val get_handle :
     follows one implicitly. On a current-run handle from {!get_handle} the
     wait follows the run chain to its last run, as described there.
 
-    The native client retains at most 64 distinct runs being waited on.
+    The native client retains at most [max_pending_waits] distinct runs being
+    waited on (64 unless set on {!create}).
     Concurrent waits on the same run share one slot. Waiting on another run
     at capacity returns a retryable error recognized by [is_at_capacity]; the
     client stays usable. Terminal results and errors free their slots. A
@@ -583,9 +610,11 @@ val already_started : Error.t -> execution option
 val is_start_outcome_uncertain : Error.t -> bool
 
 (** Returns [true] when [error] means the native client refused a [start] or
-    [wait] because its bounded set of in-flight operations was full (64 starts
-    or 64 distinct waited runs), or any other call because 4,096 calls were
-    already in flight on the client. Nothing was sent to Temporal, the client
+    [wait] because its bounded set of in-flight operations was full
+    ([max_pending_starts] starts or [max_pending_waits] distinct waited runs,
+    64 each by default), or any call because [max_in_flight_calls] calls
+    (4,096 by default) were already in flight on the client; see {!create}.
+    Nothing was sent to Temporal, the client
     remains connected, and the same call may be retried after another
     operation on this client finishes, for example with a backoff. Such an
     error has category [`Bridge], is not marked non-retryable, and has
