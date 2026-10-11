@@ -1148,11 +1148,10 @@ pub const FOLLOWS_NEXT_RUN_ID_FEATURE: &str = "follows-next-run-id";
 /// Core's transient status codes are retried; a definitive rejection such as
 /// `not_found` still ends the wait on its first occurrence.
 fn wait_retry_options() -> RetryOptions {
-    RetryOptions {
-        max_elapsed_time: None,
-        max_retries: WAIT_MAX_ATTEMPTS,
-        ..RetryOptions::default()
-    }
+    RetryOptions::builder()
+        .max_elapsed_time(None)
+        .max_retries(WAIT_MAX_ATTEMPTS)
+        .build()
 }
 
 /// Total budget of one control-plane RPC (signal, cancel, reset, terminate),
@@ -1199,12 +1198,11 @@ const CONTROL_RPC_TIMEOUT: Duration = Duration::from_secs(3);
 fn budgeted_request<T>(message: T, budget: Duration) -> Request<T> {
     let mut request = message.into_request();
     request.set_timeout(budget);
-    request
-        .extensions_mut()
-        .insert(RetryConfigForCall(RetryOptions {
-            max_elapsed_time: Some(budget),
-            ..RetryOptions::default()
-        }));
+    request.extensions_mut().insert(RetryConfigForCall(
+        RetryOptions::builder()
+            .max_elapsed_time(Some(budget))
+            .build(),
+    ));
     request
 }
 

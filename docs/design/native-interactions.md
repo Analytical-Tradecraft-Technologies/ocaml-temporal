@@ -19,7 +19,7 @@ delivery.
 ## Scope and sources of truth
 
 Temporal Core is pinned by the Rust workspace to commit
-`95e97686a079dcfe6c42e3254b2f3f5e3d97408f` of `temporalio/sdk-core`. The
+`8fe478ee179ed754614d230f39586f3edb57da71` of `temporalio/sdk-core`. The
 authoritative interaction definitions are the pinned Core
 `workflow_activation.proto` and `workflow_commands.proto` files:
 

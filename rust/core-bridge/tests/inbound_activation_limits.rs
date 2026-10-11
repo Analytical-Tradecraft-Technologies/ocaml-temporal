@@ -47,6 +47,7 @@ fn failed_activity(failure: api_failure::Failure) -> core_activation::WorkflowAc
                     status: Some(activity_result::activity_resolution::Status::Failed(
                         activity_result::Failure {
                             failure: Some(failure),
+                            cause: 0,
                         },
                     )),
                 }),
@@ -429,6 +430,7 @@ fn signal_with_unaddressable_header_keys_and_nul_identity_is_delivered() {
                     ("trace".to_owned(), payload(b"trace-value")),
                 ]
                 .into(),
+                originating_event_id: 0,
             },
         ),
     );

@@ -2982,6 +2982,14 @@ fn activity_resolution_from_core(
 
 /// Maps Core's child-start failure enum while rejecting numbers unknown to the
 /// pinned Core revision instead of silently changing the failure meaning.
+///
+/// Core 1.x added `NamespaceNotFound` and `InvalidVersioningOverride`. The
+/// previous pin could not represent either and failed the workflow task
+/// instead. The semantic protocol deliberately keeps its two-value vocabulary,
+/// so both reach OCaml as an `unspecified` start failure: the child future
+/// still resolves with a typed start failure rather than wedging the parent.
+/// The bridge never sends a child versioning override, so the second cause is
+/// reachable only if a future protocol change adds one.
 fn child_start_failure_cause_from_core(
     value: i32,
 ) -> Result<ChildWorkflowStartFailureCause, CoreConversionError> {
@@ -2990,7 +2998,9 @@ fn child_start_failure_cause_from_core(
         match Core::try_from(value)
             .map_err(|_| invalid_core("unknown Core child start failure cause"))?
         {
-            Core::Unspecified => ChildWorkflowStartFailureCause::Unspecified,
+            Core::Unspecified | Core::NamespaceNotFound | Core::InvalidVersioningOverride => {
+                ChildWorkflowStartFailureCause::Unspecified
+            }
             Core::WorkflowAlreadyExists => ChildWorkflowStartFailureCause::WorkflowAlreadyExists,
         },
     )
@@ -3660,6 +3670,10 @@ fn command_to_core(
                 .transpose()?,
             local_retry_threshold: local_retry_threshold.map(duration_to_core),
             cancellation_type: cancellation_to_core(*cancellation_type),
+            // Core 1.x can copy the arguments into the result marker. The
+            // previous pin never did, and enabling it would grow history and
+            // change the marker bytes recorded by the replay corpus.
+            include_arguments_in_marker: false,
         }),
         CompletionCommand::RequestCancelActivity { seq } => {
             Variant::RequestCancelActivity(core_commands::RequestCancelActivity { seq: *seq })
@@ -3798,7 +3812,11 @@ fn command_to_core(
             })
         }
         CompletionCommand::CancelWorkflow => {
-            Variant::CancelWorkflowExecution(core_commands::CancelWorkflowExecution {})
+            // The semantic protocol has no cancellation details; `None`
+            // matches the detail-less command of the previous Core pin.
+            Variant::CancelWorkflowExecution(core_commands::CancelWorkflowExecution {
+                details: None,
+            })
         }
         CompletionCommand::QueryResult { query_id, result } => {
             let variant = match result {
@@ -3855,6 +3873,9 @@ fn command_to_core(
     Ok(core_commands::WorkflowCommand {
         variant: Some(variant),
         user_metadata: None,
+        // Event group markers are a Core 1.x addition with no semantic
+        // protocol representation; commands carry none, as before.
+        event_group_markers: Vec::new(),
     })
 }
 
@@ -3865,6 +3886,11 @@ fn command_from_core(
     use core_commands::workflow_command::Variant;
     if value.user_metadata.is_some() {
         return Err(unsupported("Core command user metadata is not supported"));
+    }
+    if !value.event_group_markers.is_empty() {
+        return Err(unsupported(
+            "Core command event group markers are not supported",
+        ));
     }
     match value
         .variant
@@ -3925,6 +3951,11 @@ fn command_from_core(
             if !value.headers.is_empty() {
                 return Err(unsupported(
                     "Core local activity headers or user metadata are not represented by this protocol",
+                ));
+            }
+            if value.include_arguments_in_marker {
+                return Err(unsupported(
+                    "Core local activity marker arguments are not represented by this protocol",
                 ));
             }
             Ok(CompletionCommand::ScheduleLocalActivity {
@@ -4123,7 +4154,14 @@ fn command_from_core(
                     .collect::<Result<_, _>>()?,
             })
         }
-        Variant::CancelWorkflowExecution(_) => Ok(CompletionCommand::CancelWorkflow),
+        Variant::CancelWorkflowExecution(value) => {
+            if value.details.is_some() {
+                return Err(unsupported(
+                    "Core workflow cancellation details are not represented by this protocol",
+                ));
+            }
+            Ok(CompletionCommand::CancelWorkflow)
+        }
         Variant::RespondToQuery(value) => {
             let result = match value
                 .variant
@@ -4231,6 +4269,10 @@ fn completion_to_core_with_child_namespace(
                 },
             ),
         ),
+        // External payload storage is a Core 1.x feature the bridge does not
+        // enable, so there are no storage metrics to report.
+        payload_download_metrics: None,
+        payload_upload_metrics: None,
     })
 }
 
@@ -4364,7 +4406,11 @@ pub fn completion_from_core(
             return Ok(completion);
         }
     };
-    if !success.used_internal_flags.is_empty() || success.versioning_behavior != 0 {
+    if !success.used_internal_flags.is_empty()
+        || success.versioning_behavior != 0
+        || value.payload_download_metrics.is_some()
+        || value.payload_upload_metrics.is_some()
+    {
         return Err(unsupported(
             "Core completion metadata is not represented by this protocol slice",
         ));

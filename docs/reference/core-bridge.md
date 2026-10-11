@@ -92,6 +92,51 @@ executables, so a seemingly harmless enum renumbering or padding change must
 fail during compilation instead of becoming a delayed, cross-language memory
 or error-handling defect. C11 and C++11 consumers get equivalent checks.
 
+## Temporal Core revision
+
+The bridge links Temporal Core commit
+`8fe478ee179ed754614d230f39586f3edb57da71`, the commit of upstream release tags
+`v1.1.0` and `core-v0.10.0` (crates `temporalio-client`/`-common` 1.1.0 and
+`temporalio-sdk-core`/`-protos` 0.10.0). `TEMPORAL_CORE_REVISION` in
+`rust/core-bridge/src/lib.rs` records it; the weekly freshness check described
+in [dependencies](../dependencies.md#temporal-core-pin-upgrades) reports when
+upstream releases past it.
+
+The upgrade from `95e97686` (crate 0.5.0, issue #824) changed no C symbol,
+status value, `repr(C)` layout or JSON document, so the ABI stays at version 4.
+The adaptations keep the previous behaviour:
+
+- Core 1.x routes `AsyncActivityHandle` through the client data converter and
+  takes a high-level `ApplicationFailure`. Asynchronous activity completion and
+  heartbeat therefore call the four `RespondActivityTask*`/
+  `RecordActivityTaskHeartbeat` RPCs directly with the exact payloads and
+  failure decoded from OCaml, and classify `NotFound` exactly as Core did.
+- New protobuf fields are set to their previous meaning: no local-activity
+  arguments in result markers, no workflow-cancellation details, no command
+  event-group markers, no external-storage metrics, and an unspecified
+  activity failure cause. The reverse conversion rejects any non-default value.
+- The two new child-start failure causes (`NamespaceNotFound`,
+  `InvalidVersioningOverride`) reach OCaml as `unspecified`. The previous pin
+  could not represent them and failed the workflow task instead.
+- Worker heartbeats keep omitting the host environment details Core 1.x would
+  attach by default (`disable_environment_info`).
+- Workflow and activity pollers stay explicit; Core 1.x would otherwise
+  auto-enrol an unset poller behavior in autoscaling.
+
+Core 1.x enforces namespace payload limits in the worker by default: an
+oversized activity result or heartbeat becomes a `PayloadsTooLarge` activity
+failure (a heartbeat also queues a Cancel task), and an oversized workflow
+completion becomes a workflow-task failure reported on its first attempt only.
+Previously the server rejected such requests. The bridge keeps Core's default.
+Core also accepts late child results after a `TryCancel` child was cancelled
+(sdk-core #1455) and waits for in-flight activity completions during shutdown
+(sdk-core #1538); neither changes a document the bridge exchanges.
+
+Inbound fields added by Core 1.x that the semantic protocol does not carry yet
+are dropped: the failure `cause` of external signal and cancel resolutions,
+`InitializeWorkflow.original_execution_run_id`, and
+`SignalWorkflow.originating_event_id`.
+
 ## Semantic workflow adapter
 
 `rust/core-bridge/src/workflow_protocol.rs` is the Rust-only protobuf boundary
@@ -776,15 +821,18 @@ Temporal Core requires at least two workflow-task pollers when
 and the JSON Schema all enforce that relationship before worker construction;
 the public native worker default is two pollers.
 
-For the pinned Core revision `95e9768`, cache-enabled workers also cap effective
-workflow-task permits at `max(max_cached_workflows, 2)`. Core's poller balancer
-reads the slot supplier's capacity rather than that independent cap. The bridge
-therefore passes the smaller of the requested task limit and this cache-derived
-capacity to Core. Otherwise, a one-entry cache with the default 1,000-task limit
-advertises 1,000 slots while allowing only two permits, so sticky polls can
-reserve capacity needed by the normal queue. This adjustment preserves the
-capacity Core already enforces, caller limits below the cap, and uncached
-workers. Reassess it when updating Core's permit dealer or poller balancer.
+Cache-enabled workers cap effective workflow-task permits at
+`max(max_cached_workflows, 2)`. At the previous pin (`95e9768`) Core's poller
+balancer read the slot supplier's capacity rather than that independent cap,
+so a one-entry cache with the default 1,000-task limit advertised 1,000 slots
+while allowing only two permits, and sticky polls could reserve capacity needed
+by the normal queue (#555). The bridge therefore passes the smaller of the
+requested task limit and this cache-derived capacity to Core. The current pin
+(`8fe478e`, v1.1.0) bounds its balancer by the same cap and stops sticky polls
+from reserving slots once the sticky target is reached, so the clamp is no
+longer load-bearing; it is kept because it only makes the advertised capacity
+equal what Core enforces. It preserves caller limits below the cap and uncached
+workers.
 
 The regression in `rust/core-bridge/tests/support/worker_slot_limits.rs` checks
 the one-entry/default-limit combination, larger cache bounds, stricter caller

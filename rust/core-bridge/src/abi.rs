@@ -19,18 +19,24 @@ use std::sync::mpsc::{
 };
 use std::time::Duration;
 use temporalio_client::{
-    ActivityIdentifier, Client, ClientOptions, Connection, ConnectionOptions,
-    errors::AsyncActivityError,
+    Client, ClientOptions, Connection, ConnectionOptions, NamespacedClient,
+    errors::AsyncActivityError, grpc::WorkflowService, tonic::IntoRequest,
 };
 use temporalio_common::protos::coresdk::{
     ActivityHeartbeat as CoreActivityHeartbeat,
     activity_task::{self, ActivityTask as CoreActivityTask},
 };
-use temporalio_common::protos::{
-    TaskToken,
-    temporal::api::{common::v1 as api_common, enums::v1::VersioningBehavior},
+use temporalio_common::protos::temporal::api::{
+    common::v1 as api_common,
+    workflowservice::v1::{
+        RecordActivityTaskHeartbeatRequest, RespondActivityTaskCanceledRequest,
+        RespondActivityTaskCompletedRequest, RespondActivityTaskFailedRequest,
+    },
 };
 use temporalio_common::telemetry::TelemetryOptions;
+use temporalio_common::worker::{
+    VersioningBehavior, WorkerDeploymentOptions, WorkerDeploymentVersion,
+};
 use temporalio_sdk_core::{
     CoreRuntime, PollerBehavior, RuntimeOptions, TokioRuntimeBuilder, WorkerConfig,
     WorkerVersioningStrategy,
@@ -498,6 +504,24 @@ fn async_activity_failure(operation: AsyncActivityOperation, error: AsyncActivit
             status: STATUS_CONNECTION,
             message: format!("Temporal asynchronous activity {label} failed"),
         },
+    }
+}
+
+/// Classifies the status of a raw namespace-bound async activity RPC exactly
+/// as Core's `AsyncActivityHandle` did at the previous pin: `NotFound` means
+/// the task token is gone and every other status is an RPC failure for
+/// [`async_activity_failure`] to subdivide.
+///
+/// Core 1.x routes its handle through the client data converter and
+/// interceptors and takes a high-level `ApplicationFailure`. The bridge
+/// already carries exact protobuf payloads and failures decoded from OCaml, so
+/// it sends the four `RespondActivityTask*`/`RecordActivityTaskHeartbeat`
+/// requests itself to keep their bytes unchanged.
+fn async_activity_rpc_error(status: temporalio_client::tonic::Status) -> AsyncActivityError {
+    if status.code() == temporalio_client::tonic::Code::NotFound {
+        AsyncActivityError::NotFound(status)
+    } else {
+        AsyncActivityError::Rpc(status)
     }
 }
 
@@ -2497,9 +2521,9 @@ impl Runtime {
         let semantic = activity_protocol::decode_completion(text).map_err(protocol_failure)?;
         let task_token =
             activity_protocol::decode_token(&semantic.task_token).map_err(protocol_failure)?;
-        let client = self.async_activity_client()?;
-        let activity =
-            client.get_async_activity_handle(ActivityIdentifier::TaskToken(TaskToken(task_token)));
+        let mut client = self.async_activity_client()?;
+        let namespace = client.namespace();
+        let identity = client.identity();
         let handle = self
             .core
             .as_ref()
@@ -2511,12 +2535,30 @@ impl Runtime {
         let operation = match &semantic.result {
             activity_protocol::ActivityCompletionResult::Completed { result } => {
                 let payloads = Self::async_payloads(std::slice::from_ref(result))?;
-                handle.block_on(activity.complete(payloads))
+                let request = RespondActivityTaskCompletedRequest {
+                    task_token,
+                    result: payloads,
+                    identity,
+                    namespace,
+                    ..Default::default()
+                };
+                handle
+                    .block_on(client.respond_activity_task_completed(request.into_request()))
+                    .map(drop)
             }
             activity_protocol::ActivityCompletionResult::Failed { failure } => {
                 let failure =
                     workflow_protocol::failure_to_core(failure).map_err(core_conversion_failure)?;
-                handle.block_on(activity.fail(failure, None))
+                let request = RespondActivityTaskFailedRequest {
+                    task_token,
+                    failure: Some(failure),
+                    identity,
+                    namespace,
+                    ..Default::default()
+                };
+                handle
+                    .block_on(client.respond_activity_task_failed(request.into_request()))
+                    .map(drop)
             }
             activity_protocol::ActivityCompletionResult::Cancelled { failure } => {
                 let details = match &failure.info {
@@ -2532,7 +2574,16 @@ impl Runtime {
                         });
                     }
                 };
-                handle.block_on(activity.report_cancelation(details))
+                let request = RespondActivityTaskCanceledRequest {
+                    task_token,
+                    details,
+                    identity,
+                    namespace,
+                    ..Default::default()
+                };
+                handle
+                    .block_on(client.respond_activity_task_canceled(request.into_request()))
+                    .map(drop)
             }
             activity_protocol::ActivityCompletionResult::WillCompleteAsync => {
                 return Err(Failure {
@@ -2541,8 +2592,12 @@ impl Runtime {
                 });
             }
         };
-        operation
-            .map_err(|error| async_activity_failure(AsyncActivityOperation::Completion, error))?;
+        operation.map_err(|status| {
+            async_activity_failure(
+                AsyncActivityOperation::Completion,
+                async_activity_rpc_error(status),
+            )
+        })?;
         Ok(Vec::new())
     }
 
@@ -2554,9 +2609,14 @@ impl Runtime {
         let task_token =
             activity_protocol::decode_token(&semantic.task_token).map_err(protocol_failure)?;
         let details = Self::async_payloads(&semantic.details)?;
-        let client = self.async_activity_client()?;
-        let activity =
-            client.get_async_activity_handle(ActivityIdentifier::TaskToken(TaskToken(task_token)));
+        let mut client = self.async_activity_client()?;
+        let request = RecordActivityTaskHeartbeatRequest {
+            task_token,
+            details,
+            identity: client.identity(),
+            namespace: client.namespace(),
+            ..Default::default()
+        };
         let handle = self
             .core
             .as_ref()
@@ -2566,8 +2626,13 @@ impl Runtime {
             })?
             .tokio_handle();
         handle
-            .block_on(activity.heartbeat(details))
-            .map_err(|error| async_activity_failure(AsyncActivityOperation::Heartbeat, error))?;
+            .block_on(client.record_activity_task_heartbeat(request.into_request()))
+            .map_err(|status| {
+                async_activity_failure(
+                    AsyncActivityOperation::Heartbeat,
+                    async_activity_rpc_error(status),
+                )
+            })?;
         Ok(Vec::new())
     }
 
@@ -3189,15 +3254,19 @@ impl WorkerConfigInput {
                             .to_owned(),
                     });
                 }
+                // Core 1.x marks both structs non-exhaustive, so they are
+                // assembled through Core's builders; every field is still set
+                // explicitly from validated input.
                 WorkerVersioningStrategy::WorkerDeploymentBased(
-                    temporalio_common::worker::WorkerDeploymentOptions {
-                        version: temporalio_common::worker::WorkerDeploymentVersion {
-                            deployment_name,
-                            build_id,
-                        },
-                        use_worker_versioning,
-                        default_versioning_behavior,
-                    },
+                    WorkerDeploymentOptions::new(
+                        WorkerDeploymentVersion::builder()
+                            .deployment_name(deployment_name)
+                            .build_id(build_id)
+                            .build(),
+                    )
+                    .use_worker_versioning(use_worker_versioning)
+                    .maybe_default_versioning_behavior(default_versioning_behavior)
+                    .build(),
                 )
             }
         };
@@ -3231,10 +3300,13 @@ impl WorkerConfigInput {
             });
         }
 
-        // Pinned Core caps cache-enabled permit acquisition at max(cache, 2),
-        // but its sticky/normal poller balancer reads the supplier's slot count.
-        // Give both the same effective capacity so idle sticky polls cannot
-        // reserve the slots needed to discover new workflows on the normal queue.
+        // Core caps cache-enabled permit acquisition at max(cache, 2). Before
+        // Core v1.1.0 its sticky/normal poller balancer read the supplier's
+        // slot count instead, so idle sticky polls could reserve the slots
+        // needed to discover new workflows on the normal queue. The pinned
+        // balancer (v1.1.0) bounds itself by the same cap, so this clamp now
+        // only keeps the advertised capacity equal to what Core enforces; it
+        // is retained so slot metrics and the #555 regression stay unchanged.
         // Preserve stricter caller limits and the uncached worker behavior.
         let workflow_task_slots = if self.max_cached_workflows == 0 {
             self.max_outstanding_workflow_tasks
@@ -3788,8 +3860,13 @@ fn create_shared_core(
                 .map(|(level, writer)| diagnostics::core_logger(*level, writer.queue())),
         )
         .build();
+    // Core 1.x attaches detected hosting-environment and platform details to
+    // worker heartbeats by default, labelling the runtime as native Rust. The
+    // previous pin sent none, and the OCaml SDK offers no option to describe
+    // or opt into that disclosure, so it stays off.
     let options = RuntimeOptions::builder()
         .telemetry_options(telemetry)
+        .disable_environment_info(true)
         .build()
         .map_err(|_message| Failure {
             status: STATUS_INTERNAL,

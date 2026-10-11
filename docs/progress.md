@@ -15,6 +15,57 @@ implementation when a later entry documents that work as complete. The
 records the current tested source, named assertions and successful CI job for
 the Temporal acceptance controllers.
 
+## 2026-10-11: Temporal Core upgraded to v1.1.0, with a freshness check (#824)
+
+The Core pin moves from `95e97686` (crate 0.5.0, 154 commits behind) to
+`8fe478ee179ed754614d230f39586f3edb57da71`, the commit of upstream tags
+`v1.1.0` and `core-v0.10.0`. The newest stable release was chosen over
+`v1.0.0` because it also carries the sticky/normal poller balancing,
+first-attempt-only workflow-task failure reporting and local-activity replay
+grouping fixes. The lock shrinks from 322 to 306 packages: `backoff`,
+`aws-lc-rs`/`aws-lc-sys`, `quinn` and the old `rand` 0.8 line leave the graph,
+and `backon`, `ryu`, `serde_urlencoded`, `tracing-serde` and `wasm-streams`
+join it, all permissively licensed. The Core licence file is byte-identical.
+
+The C ABI, status values and every JSON document are unchanged (version 4).
+Asynchronous activity completion and heartbeat now send their
+`RespondActivityTask*`/`RecordActivityTaskHeartbeat` RPCs directly, because
+Core's handle now applies the client data converter and accepts only a
+high-level failure. New Core protobuf fields keep their previous meaning,
+worker heartbeats keep omitting host environment details, and the two new
+child-start failure causes reach OCaml as `unspecified`. The
+[Core bridge reference](reference/core-bridge.md#temporal-core-revision)
+lists each adaptation and the Core behaviour changes kept as upstream
+intends, notably worker-side payload-limit enforcement.
+
+Code comments that describe Core behaviour were rechecked against the new
+source: the fixed-poller split and `nonsticky_to_sticky_poll_ratio`, the
+`PollRateLimiter` reciprocal, replay worker shutdown ordering, the one-slot
+activity configuration, the nondeterminism text parsed by `Temporal.Replay`,
+activation job ordering, and retry/throttle timing. Only the cache slot clamp
+(#555) changed: Core's balancer now honours the cap itself, so the clamp is
+kept for parity rather than as a workaround.
+
+Nothing prompted the upgrade because Dependabot never moves a `rev =` pin.
+The weekly `Temporal Core pin freshness` workflow now compares the pin with
+the latest stable sdk-core release, opens or updates one tracking issue and
+fails while an upgrade is due; `test/smoke/test_core_pin_freshness.sh` covers
+its exit contract offline. [Dependencies](dependencies.md#temporal-core-pin-upgrades)
+records the cadence.
+
+Evidence (macOS ARM64, OCaml 5.4.1, Rust 1.97.1; CI uses the pinned
+1.99.0): `cargo test --locked` (410 tests), clippy with `-D warnings` and `cargo fmt --check`; the bridge,
+runtime, supervisor, unit, API witness, history corpus and smoke Dune suites;
+`@doc`; the Cargo licence scan and its policy fixtures; the dependency
+inventory; formatting and `typos`. `make test-history-corpus-upgrade` replayed
+all 21 corpus cases, recorded at Core `95e97686`, with expected outcomes and
+no history or expectation edits: the first cross-revision replay. Against
+Temporal Server 1.32.0 and PostgreSQL 18.6, the activity-cancellation,
+bounded-shutdown, client-request-ID, completed-query, concurrent-client,
+split-task-type and worker-resource live regressions and the two-binary smoke
+(including asynchronous activity completion) passed with native executables.
+The CLI-dependent live regressions and Linux lanes run in CI.
+
 ## 2026-10-10: Concurrent calls on one client (#807)
 
 One `Client.t` served every call on its supervisor Domain one at a time, and

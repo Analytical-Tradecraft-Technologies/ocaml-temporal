@@ -146,6 +146,7 @@ fn scripted_reply(rpc: &str, update: UpdateReply) -> Vec<u8> {
         "QueryWorkflow" => CoreQueryResponse {
             query_result: Some(Payloads::default()),
             query_rejected: None,
+            link: None,
         }
         .encode_to_vec(),
         "ResetWorkflowExecution" => ResetWorkflowExecutionResponse {

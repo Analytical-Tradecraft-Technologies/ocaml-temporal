@@ -419,6 +419,7 @@ fn rejects_invalid_patch_marker_documents() {
                     core_completion::Success {
                         commands: vec![core_commands::WorkflowCommand {
                             user_metadata: None,
+                            event_group_markers: Vec::new(),
                             variant: Some(
                                 core_commands::workflow_command::Variant::SetPatchMarker(
                                     core_commands::SetPatchMarker {
@@ -433,6 +434,8 @@ fn rejects_invalid_patch_marker_documents() {
                     },
                 ),
             ),
+            payload_download_metrics: None,
+            payload_upload_metrics: None,
         };
         assert_eq!(
             workflow_protocol::completion_from_core(&core_completion)
@@ -1424,6 +1427,7 @@ fn converts_signal_workflow_activation_losslessly() {
                 input: vec![payload.clone()],
                 identity: "séndér".to_owned(),
                 headers: [("trace".to_owned(), payload)].into(),
+                originating_event_id: 0,
             })),
         }],
         ..Default::default()
@@ -1476,6 +1480,7 @@ fn rejects_signal_identity_with_nul() {
                 input: Vec::new(),
                 identity: "sender\0".to_owned(),
                 headers: Default::default(),
+                originating_event_id: 0,
             })),
         }],
         ..Default::default()
@@ -2535,6 +2540,7 @@ fn converts_application_failure_options_in_activity_and_child_causes() {
                         status: Some(activity_result::activity_resolution::Status::Failed(
                             activity_result::Failure {
                                 failure: Some(failure),
+                                cause: 0,
                             },
                         )),
                     }),
@@ -2757,6 +2763,7 @@ fn converts_timeout_failure_info_losslessly() {
                         status: Some(activity_result::activity_resolution::Status::Failed(
                             activity_result::Failure {
                                 failure: Some(failure),
+                                cause: 0,
                             },
                         )),
                     }),
@@ -3208,6 +3215,7 @@ fn enforces_core_absence_and_eviction_invariants() {
 
     let absent_command = core_commands::WorkflowCommand {
         user_metadata: None,
+        event_group_markers: Vec::new(),
         variant: None,
     };
     let core = core_completion::WorkflowActivationCompletion {
@@ -3221,6 +3229,8 @@ fn enforces_core_absence_and_eviction_invariants() {
                 },
             ),
         ),
+        payload_download_metrics: None,
+        payload_upload_metrics: None,
     };
     assert_eq!(
         workflow_protocol::completion_from_core(&core)
@@ -3856,6 +3866,7 @@ fn activity_failure_activation_with_cause(
                         status: Some(activity_result::activity_resolution::Status::Failed(
                             activity_result::Failure {
                                 failure: Some(failure.clone()),
+                                cause: 0,
                             },
                         )),
                     }),
