@@ -341,6 +341,14 @@ let check_detection worker_a handle =
     run, and the server's failed-task event, neither carrying the secret. *)
 let check_diagnostics ~cli ~address ~secret handle =
   let run_id = Option.get (Client.run_id handle) in
+  (* The watchdog publishes health before it logs, so the record can trail
+     the health report: wait for it, then let a short settle window pass so a
+     duplicate report would be counted too. *)
+  require
+    (wait_until ~seconds:5. (fun () ->
+         records_for "workflow_activation_deadline_exceeded" <> []))
+    "no workflow_activation_deadline_exceeded record within 5s of detection";
+  Unix.sleepf 0.25;
   let deadline_records = records_for "workflow_activation_deadline_exceeded" in
   require
     (List.length deadline_records = 1)
