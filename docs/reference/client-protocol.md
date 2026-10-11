@@ -247,7 +247,9 @@ messages while Temporal performs the RPC. Rust returns an opaque ticket:
 {"ticket":"4a7c3e0e-3e3d-4b9f-9df2-6e55d3b2b4b7"}
 ```
 
-At most 64 tickets may be outstanding per runtime. A begin request whose
+At most `max_pending_starts` tickets (64 unless the connection configures
+another value; see [client admission limits](#client-admission-limits-796))
+may be outstanding per runtime. A begin request whose
 `request_id` is already pending with identical fields returns the existing
 ticket without using another slot; any other request at capacity is rejected
 with status `15` (`RESOURCE_EXHAUSTED`) before a Tokio task or RPC is created.
@@ -332,12 +334,15 @@ OCaml and never touches the runtime; it only writes its own cell. A task that
 panics or is dropped without an outcome settles its cell with `PANIC` or the
 closed status, so no waiter is stranded.
 
-Capacity is unchanged for the two long-lived kinds: at most 64 distinct runs
-being waited on and 64 distinct start request IDs in flight, where repeats of
-an in-flight run or request ID share a slot (Temporal deduplicates the
-request ID, so concurrent identical starts report the same run). A start
-whose request ID is in flight for a different request is rejected with
-`PROTOCOL`. All submitted calls of one runtime together are capped at 4,096.
+The two long-lived kinds keep their own limits: at most `max_pending_waits`
+distinct runs being waited on and `max_pending_starts` distinct start request
+IDs in flight (64 each by default), where repeats of an in-flight run or
+request ID share a slot (Temporal deduplicates the request ID, so concurrent
+identical starts report the same run). A start whose request ID is in flight
+for a different request is rejected with `PROTOCOL`. All submitted calls of
+one runtime together are capped at `max_in_flight_calls` (4,096 by default).
+The [client admission limits](#client-admission-limits-796) section describes
+how a connection configures the three values.
 A call counts from submission until its completion cell is retired, not
 merely until its RPC finishes: a finished but unread outcome keeps its slot,
 so callers that abandon calls cannot grow the process-wide registry without
@@ -376,6 +381,46 @@ already have been sent.
 The synchronous symbols and the start ticket symbols remain in ABI version 4
 for direct bridge callers and tests. The three new symbols are additive: an
 older OCaml object never calls them, so the ABI version is unchanged.
+
+## Client admission limits (#796)
+
+`Client.create ?max_pending_waits ?max_pending_starts ?max_in_flight_calls`
+sets three per-client counts. The private client connect document
+([schema](../schemas/bridge/client-config.schema.json)) carries each explicit
+value as an optional integer after `identity`:
+
+```json
+{"target_url":"http://127.0.0.1:7233","identity":"1234@host","max_pending_waits":256,"max_in_flight_calls":8192}
+```
+
+| Field | Default | Accepted | Bounds |
+| --- | --- | --- | --- |
+| `max_pending_waits` | 64 | 1 to 4,096 | Distinct exact runs being waited on; repeated waits on one run share a slot. |
+| `max_pending_starts` | 64 | 1 to 4,096 | Distinct start request IDs in flight, on the submitted-call path and the ticket path alike; a retry with the same request ID shares its slot. |
+| `max_in_flight_calls` | 4,096 | 1 to 65,536 | Submitted calls of every kind, each counted until its completion cell is retired. Applies on top of the two limits above. |
+
+The OCaml encoder omits a limit left at its default, so a client created
+without limits sends exactly the two-field document used before #796, byte
+for byte. OCaml rejects an out-of-range value as a typed defect before
+anything is allocated, for every target including `mock://`; Rust decodes the
+fields strictly (an unknown field, a non-integer, or a value outside `u32` is
+a `CONFIGURATION` failure) and checks the same ranges again in
+`connect_client` before any network access. The connection keeps the
+validated values for its lifetime; a runtime without a connection uses the
+defaults.
+
+Admission beyond any limit returns `RESOURCE_EXHAUSTED` (status `15`) before
+a task, ticket, or RPC exists, and the message names the configured limit,
+for example `too many Temporal workflow waits are pending (limit 2)`. The
+public client reports it as a retryable `bridge` error with `error_type`
+`resource_exhausted`, recognized by `Client.is_at_capacity`; the client stays
+connected. Each waited run keeps one history long poll open against the
+server, so a larger wait limit also raises the long polls one client can hold.
+
+The fields are additive optional members of an existing document, so ABI
+version 4 is unchanged: an older OCaml object never sends them, and a bridge
+built before #796 rejects them under `deny_unknown_fields` only if a newer
+OCaml object sets one explicitly.
 
 ## Address the current run of a workflow
 

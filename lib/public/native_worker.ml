@@ -963,7 +963,7 @@ let create ?max_cached_workflows
   let workflow_tasks = workflows <> [] in
   let activity_tasks = activities <> [] in
   let* client_config =
-    Native.client_config ~target_url ~identity
+    Native.client_config ~target_url ~identity ()
     |> Result.map_error (public_bridge_error "client configuration")
   in
   let* () =

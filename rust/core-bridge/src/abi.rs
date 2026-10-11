@@ -90,7 +90,9 @@ pub const STATUS_ASYNC_HEARTBEAT_REJECTED: Status = 14;
 ///
 /// Unlike `STATUS_INVALID_STATE`, the client remains connected and usable: the
 /// caller may retry once another of its in-flight operations finishes. The
-/// bounds are `MAX_PENDING_WAITS` and `MAX_PENDING_STARTS`.
+/// bounds are the connection's [`crate::client_calls::ClientLimits`], which
+/// default to `MAX_PENDING_WAITS`, `MAX_PENDING_STARTS`, and
+/// `MAX_PENDING_CALLS` (#796).
 pub const STATUS_RESOURCE_EXHAUSTED: Status = 15;
 
 /// Maximum accepted lifecycle configuration document size.
@@ -162,8 +164,10 @@ const CLIENT_WAIT_TIMEOUT: Duration = Duration::from_millis(100);
 /// Completed or failed waits release their slot; disconnect cancels all waits.
 /// Waiting on another distinct run at capacity returns
 /// `STATUS_RESOURCE_EXHAUSTED`; concurrent waits on an already retained run
-/// share its slot. The public `Client.wait` documentation repeats this value.
-const MAX_PENDING_WAITS: usize = 64;
+/// share its slot. This is the default; a connection may configure another
+/// value through `max_pending_waits` (#796). The public `Client.create`
+/// documentation repeats it.
+pub(crate) const MAX_PENDING_WAITS: usize = 64;
 /// Bounds the number of in-flight client starts retained by one supervisor.
 ///
 /// Each entry owns one Tokio task, a response channel, and the validated
@@ -171,9 +175,10 @@ const MAX_PENDING_WAITS: usize = 64;
 /// that forgets tickets from turning the supervisor into an unbounded task
 /// registry; the caller can submit more work after polling or closing
 /// completed tickets. Admission at capacity returns
-/// `STATUS_RESOURCE_EXHAUSTED` before any RPC is issued; the public
-/// `Client.start` documentation repeats this value.
-const MAX_PENDING_STARTS: usize = 64;
+/// `STATUS_RESOURCE_EXHAUSTED` before any RPC is issued. This is the default;
+/// a connection may configure another value through `max_pending_starts`
+/// (#796). The public `Client.create` documentation repeats it.
+pub(crate) const MAX_PENDING_STARTS: usize = 64;
 /// Maximum time spent in one wait-ticket ABI call before the owner regains
 /// control of its mailbox and can service lifecycle messages.
 const START_WAIT_TIMEOUT: Duration = Duration::from_millis(100);
@@ -186,8 +191,10 @@ const START_WAIT_TIMEOUT: Duration = Duration::from_millis(100);
 /// were released but which are still running are bounded by the same value
 /// through the task registry. Starts and exact-run waits keep their own
 /// documented limits above. Admission beyond the ceiling returns
-/// `STATUS_RESOURCE_EXHAUSTED` before any RPC.
-const MAX_PENDING_CALLS: usize = 4_096;
+/// `STATUS_RESOURCE_EXHAUSTED` before any RPC. This is the default; a
+/// connection may configure another value through `max_in_flight_calls`
+/// (#796).
+pub(crate) const MAX_PENDING_CALLS: usize = 4_096;
 /// Longest single wait on a submitted call's completion cell. The wait wakes
 /// as soon as the outcome is published or the runtime releases the call; the
 /// bound only lets the calling OCaml thread regain its runtime lock
@@ -686,6 +693,10 @@ pub struct Runtime {
     /// Tasks of submitted client calls that may still be running, keyed by
     /// call identifier. Finished tasks are pruned on each submission.
     pending_calls: HashMap<u64, PendingCall>,
+    /// Admission limits of the current connection (#796). Set by a successful
+    /// connect and reset to the defaults by disconnect, so a runtime without
+    /// a connection always reports the defaults.
+    client_limits: crate::client_calls::ClientLimits,
     cleanup: std::sync::mpsc::Sender<RuntimeCleanup>,
 }
 
@@ -881,6 +892,19 @@ struct RuntimeCleanup {
 struct ClientConfig {
     target_url: String,
     identity: String,
+    /// Distinct exact runs that may be waited on at once (#796). Like the two
+    /// limits below it is optional: the OCaml encoder omits each limit left at
+    /// its default, so a default client sends the pre-#796 document
+    /// unchanged, and [`crate::client_calls::ClientLimits::from_config`]
+    /// checks the ranges again.
+    #[serde(default)]
+    max_pending_waits: Option<u32>,
+    /// Distinct start request IDs that may be in flight at once (#796).
+    #[serde(default)]
+    max_pending_starts: Option<u32>,
+    /// Submitted calls of every kind that may be outstanding at once (#796).
+    #[serde(default)]
+    max_in_flight_calls: Option<u32>,
 }
 
 /// Strict workflow-only Core worker document received from OCaml as JSON.
@@ -1017,6 +1041,7 @@ impl Runtime {
             pending_waits: HashMap::new(),
             call_owner: crate::client_calls::new_owner_id(),
             pending_calls: HashMap::new(),
+            client_limits: crate::client_calls::ClientLimits::default(),
             cleanup,
         })
     }
@@ -1045,6 +1070,11 @@ impl Runtime {
             });
         }
         validate_identifier("identity", &config.identity)?;
+        let limits = crate::client_calls::ClientLimits::from_config(
+            config.max_pending_waits,
+            config.max_pending_starts,
+            config.max_in_flight_calls,
+        )?;
 
         let options = connection_options(
             target,
@@ -1070,6 +1100,7 @@ impl Runtime {
                     },
                 }
             })?;
+        self.client_limits = limits;
         self.client = Some(connection);
         Ok(Vec::new())
     }
@@ -1243,9 +1274,11 @@ impl Runtime {
     /// touches this runtime or OCaml; the submitting caller collects it with
     /// [`ocaml_temporal_core_v4_client_await_call`] from its own thread.
     ///
-    /// Starts and waits keep their documented limits (64 distinct request IDs
-    /// and 64 distinct runs; repeats share a slot) and every class shares the
-    /// [`MAX_PENDING_CALLS`] ceiling. Admission beyond a limit returns
+    /// Starts and waits keep their own limits (distinct request IDs and
+    /// distinct runs, by default 64 each; repeats share a slot) and every
+    /// class shares the in-flight ceiling (by default [`MAX_PENDING_CALLS`]),
+    /// all read from the connection's `client_limits` (#796). Admission
+    /// beyond a limit returns
     /// `STATUS_RESOURCE_EXHAUSTED` before any task or RPC exists. A start
     /// whose `request_id` is in flight for a different request is rejected
     /// with `STATUS_PROTOCOL`, as on the ticket path. Disconnect and close
@@ -1256,6 +1289,7 @@ impl Runtime {
         let text = decode_semantic_input(input)?;
         let rpc = ClientRpc::decode(kind, text)?;
         let (connection, handle) = self.client_and_handle()?;
+        let limits = self.client_limits;
         // Dropping a finished task's handle cannot detach live work: its
         // future, and with it the connection clone, has already completed.
         self.pending_calls
@@ -1278,13 +1312,14 @@ impl Runtime {
                         distinct.insert(pending.request_id.as_str());
                     }
                 }
-                if distinct.len() >= MAX_PENDING_STARTS
+                if distinct.len() >= limits.pending_starts
                     && !distinct.contains(request.request_id.as_str())
                 {
                     return Err(Failure {
                         status: STATUS_RESOURCE_EXHAUSTED,
                         message: format!(
-                            "too many Temporal workflow starts are pending (limit {MAX_PENDING_STARTS})"
+                            "too many Temporal workflow starts are pending (limit {})",
+                            limits.pending_starts
                         ),
                     });
                 }
@@ -1299,11 +1334,12 @@ impl Runtime {
                         _ => None,
                     })
                     .collect::<HashSet<_>>();
-                if distinct.len() >= MAX_PENDING_WAITS && !distinct.contains(request) {
+                if distinct.len() >= limits.pending_waits && !distinct.contains(request) {
                     return Err(Failure {
                         status: STATUS_RESOURCE_EXHAUSTED,
                         message: format!(
-                            "too many Temporal workflow waits are pending (limit {MAX_PENDING_WAITS})"
+                            "too many Temporal workflow waits are pending (limit {})",
+                            limits.pending_waits
                         ),
                     });
                 }
@@ -1311,13 +1347,14 @@ impl Runtime {
             }
             _ => CallScope::Bounded,
         };
-        if self.pending_calls.len() >= MAX_PENDING_CALLS
-            || crate::client_calls::registered_calls(self.call_owner) >= MAX_PENDING_CALLS
+        if self.pending_calls.len() >= limits.in_flight_calls
+            || crate::client_calls::registered_calls(self.call_owner) >= limits.in_flight_calls
         {
             return Err(Failure {
                 status: STATUS_RESOURCE_EXHAUSTED,
                 message: format!(
-                    "too many Temporal client calls are pending (limit {MAX_PENDING_CALLS})"
+                    "too many Temporal client calls are pending (limit {})",
+                    limits.in_flight_calls
                 ),
             });
         }
@@ -1417,11 +1454,12 @@ impl Runtime {
                 .map_err(protocol_failure)?
                 .into_bytes());
         }
-        if self.pending_starts.len() >= MAX_PENDING_STARTS {
+        if self.pending_starts.len() >= self.client_limits.pending_starts {
             return Err(Failure {
                 status: STATUS_RESOURCE_EXHAUSTED,
                 message: format!(
-                    "too many Temporal workflow starts are pending (limit {MAX_PENDING_STARTS})"
+                    "too many Temporal workflow starts are pending (limit {})",
+                    self.client_limits.pending_starts
                 ),
             });
         }
@@ -1607,11 +1645,12 @@ impl Runtime {
             })?
             .tokio_handle();
         if !self.pending_waits.contains_key(&request) {
-            if self.pending_waits.len() >= MAX_PENDING_WAITS {
+            if self.pending_waits.len() >= self.client_limits.pending_waits {
                 return Err(Failure {
                     status: STATUS_RESOURCE_EXHAUSTED,
                     message: format!(
-                        "too many Temporal workflow waits are pending (limit {MAX_PENDING_WAITS})"
+                        "too many Temporal workflow waits are pending (limit {})",
+                        self.client_limits.pending_waits
                     ),
                 });
             }
@@ -2639,6 +2678,10 @@ impl Runtime {
         let remaining = self.abort_pending_calls(true);
         debug_assert!(remaining.is_empty());
         self.client.take();
+        // Limits belong to the connection they were configured with (#796):
+        // a runtime without a connection reports the defaults again, and a
+        // later connect installs its own.
+        self.client_limits = crate::client_calls::ClientLimits::default();
         Ok(Vec::new())
     }
 
