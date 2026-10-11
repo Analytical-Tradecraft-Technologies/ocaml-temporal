@@ -17,6 +17,7 @@ temporal-sdk.opam.locked
 scripts/opam-lock-overrides.txt
 scripts/docs-tools.locked
 scripts/check-dependency-inventory.sh
+test/integration/sdk_interop/python/requirements.lock
 Dockerfile.dev
 Dockerfile.rust-ci
 test/integration/temporal/compose.yaml
@@ -134,6 +135,14 @@ expect_drift 'new compiler override' 'Per-compiler lock overrides'
 fresh_fixture
 edit scripts/docs-tools.locked 's/^odoc .*/odoc 9.9.9/'
 expect_drift 'documentation tool version' 'CI-only documentation tooling'
+
+fresh_fixture
+edit test/integration/sdk_interop/python/requirements.lock 's/^temporalio==[0-9.]*/temporalio==9.9.9/'
+expect_drift 'interoperability SDK version' 'CI-only interoperability tooling'
+
+fresh_fixture
+insert_before test/integration/sdk_interop/python/requirements.lock 'typing-extensions==' 'grpcio==1.0.0'
+expect_drift 'new interoperability package' 'CI-only interoperability tooling'
 
 fresh_fixture
 edit test/integration/temporal/compose.yaml 's/postgres:[0-9.]*-bookworm/postgres:99.9-bookworm/'
