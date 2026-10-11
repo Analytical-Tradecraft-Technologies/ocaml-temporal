@@ -1,10 +1,14 @@
 (** Private typed execution of one native Temporal activity-task lease.
 
     The native supervisor supplies already decoded semantic tasks and accepts
-    semantic completions. This adapter owns the OCaml activity registry, decodes
-    one activity input with the definition's codec, invokes the local
-    implementation, and keeps an unacknowledged completion until the supervisor
-    confirms the exact opaque task token. It is intentionally hidden from the
+    completions only as canonical pre-encoded bytes
+    ({!Temporal_protocol.Encoded_activity_completion.t}). This adapter owns the
+    OCaml activity registry, decodes one activity input with the definition's
+    codec, invokes the local implementation, encodes its completion exactly
+    once (which also validates it before it can reach the bridge, #995), and
+    keeps those bytes until the supervisor confirms the exact opaque task
+    token. A supervisor must submit the bytes it is given and never encode a
+    completion itself. It is intentionally hidden from the
     public worker API: [Temporal.Worker] supplies the supervisor operations and
     owns lifecycle while this module remains responsible only for typed
     dispatch and lease-safe completion. *)
