@@ -334,6 +334,7 @@ test:
 	$(MAKE) test-temporal-worker-readiness-contract
 	$(MAKE) test-temporal-worker-stop-contract
 	$(RUN) dune runtest $(DUNE_BUILD_ARGS)
+	$(MAKE) test-bridge-stress
 	$(if $(RUST_TEST_TARGET),$(MAKE) $(RUST_TEST_TARGET))
 	$(MAKE) test-bridge
 	$(MAKE) test-install
@@ -372,21 +373,30 @@ native-test-lifecycle-stress:
 .PHONY: test-decoder-fuzz native-test-decoder-fuzz
 test-decoder-fuzz:
 	$(COMPOSE_RUN) env $(CARGO_TEST_ENV) $(DECODER_FUZZ_ENV) cargo test --manifest-path $(CARGO_MANIFEST) --locked --test decoder_fuzz -- --nocapture
-	$(COMPOSE_RUN) env $(DECODER_FUZZ_ENV) opam exec -- dune build $(DUNE_BUILD_ARGS) @test/bridge/runtest-test_ocaml_decoder_fuzz
+	$(COMPOSE_RUN) env $(DECODER_FUZZ_ENV) opam exec -- dune build $(DUNE_BUILD_ARGS) @test/bridge/decoder-fuzz
 
 native-test-decoder-fuzz:
 	$(NATIVE_ENV) $(CARGO_TEST_ENV) $(DECODER_FUZZ_ENV) cargo test --manifest-path $(CARGO_MANIFEST) --locked --test decoder_fuzz -- --nocapture
-	$(NATIVE_ENV) $(DECODER_FUZZ_ENV) $(NATIVE_RUN) dune build $(DUNE_BUILD_ARGS) @test/bridge/runtest-test_ocaml_decoder_fuzz
+	$(NATIVE_ENV) $(DECODER_FUZZ_ENV) $(NATIVE_RUN) dune build $(DUNE_BUILD_ARGS) @test/bridge/decoder-fuzz
 
 # Concurrent lifecycle stress across threads, Domains, and shared runtimes.
-.PHONY: test-concurrent-stress native-test-concurrent-stress
+.PHONY: test-concurrent-stress native-test-concurrent-stress test-bridge-stress
+
+# The OCaml decoder fuzz and multi-Domain stress are not in `dune runtest`:
+# the stress starts several Core runtimes at once and starved timing-bound
+# runtime tests when Dune ran them side by side. `make test` and
+# `make native-test` run them with their default budgets here, after
+# `dune runtest` has finished.
+test-bridge-stress:
+	$(RUN) dune build $(DUNE_BUILD_ARGS) @test/bridge/bridge-stress
+
 test-concurrent-stress:
 	$(COMPOSE_RUN) env $(CARGO_TEST_ENV) $(CONCURRENT_STRESS_ENV) cargo test --manifest-path $(CARGO_MANIFEST) --locked --test concurrent_lifecycle_stress -- --nocapture
-	$(COMPOSE_RUN) env $(CONCURRENT_STRESS_ENV) opam exec -- dune build $(DUNE_BUILD_ARGS) @test/bridge/runtest-test_ocaml_concurrent_lifecycle_stress
+	$(COMPOSE_RUN) env $(CONCURRENT_STRESS_ENV) opam exec -- dune build $(DUNE_BUILD_ARGS) @test/bridge/concurrent-stress
 
 native-test-concurrent-stress:
 	$(NATIVE_ENV) $(CARGO_TEST_ENV) $(CONCURRENT_STRESS_ENV) cargo test --manifest-path $(CARGO_MANIFEST) --locked --test concurrent_lifecycle_stress -- --nocapture
-	$(NATIVE_ENV) $(CONCURRENT_STRESS_ENV) $(NATIVE_RUN) dune build $(DUNE_BUILD_ARGS) @test/bridge/runtest-test_ocaml_concurrent_lifecycle_stress
+	$(NATIVE_ENV) $(CONCURRENT_STRESS_ENV) $(NATIVE_RUN) dune build $(DUNE_BUILD_ARGS) @test/bridge/concurrent-stress
 
 # Scheduled long-run qualification (#506): every fuzzer and stress with a
 # budget sized for the weekly workflow, using the same targets contributors
@@ -1233,6 +1243,7 @@ native-build:
 
 native-test: $(NATIVE_RUST_TEST_TARGET) native-test-install test-quality-contract
 	$(NATIVE_ENV) $(NATIVE_RUN) dune runtest $(DUNE_BUILD_ARGS)
+	$(NATIVE_ENV) $(NATIVE_RUN) dune build $(DUNE_BUILD_ARGS) @test/bridge/bridge-stress
 
 native-test-rust:
 	$(NATIVE_ENV) $(CARGO_TEST_ENV) cargo test --manifest-path $(CARGO_MANIFEST) --locked

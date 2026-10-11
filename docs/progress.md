@@ -41,7 +41,11 @@ another Domain while their owners are inside native calls, closes a shared
 runtime during concurrent attaches, and finalizes dropped runtimes while
 other Domains collect and compact.
 
-All four run in the ordinary suites with small budgets.
+All four run in every PR with small budgets. The Rust tests are part of
+`cargo test`. The two OCaml tests run under the `@test/bridge/bridge-stress`
+alias, which `make test` and `make native-test` build after `dune runtest`.
+Running the multi-Domain stress inside `dune runtest` starved timing-bound
+runtime tests on the Windows x64 runner.
 `make test-decoder-fuzz`, `make test-concurrent-stress`, and their `native-`
 forms raise the budget. `make stress-qualification` runs every fuzzer and
 stress with long budgets, and the new `.github/workflows/stress.yml` runs it

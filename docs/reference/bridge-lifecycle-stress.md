@@ -239,6 +239,11 @@ second, and it must observe a completion, a finalization, a
 
 ### OCaml: Domains and the C borrow gates
 
+This test is not part of `dune runtest`: it runs under the
+`@test/bridge/concurrent-stress` alias, which `make test` and
+`make native-test` build only after `dune runtest` has finished (see
+[decoder fuzzing](bridge-decoder-fuzz.md) for why).
+
 `test/bridge/test_ocaml_concurrent_lifecycle_stress.ml` runs seeded rounds of
 worker Domains through `Native_bridge`. In each round:
 

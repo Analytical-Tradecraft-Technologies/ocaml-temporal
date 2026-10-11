@@ -10,9 +10,25 @@ and one set of mutation operators:
 - `test/bridge/test_ocaml_decoder_fuzz.ml` covers every OCaml decoder that
   reads a document the Rust bridge returns.
 
-Both run in the ordinary `cargo test` and `dune runtest` suites with a small
-fixed budget. A [scheduled workflow](#scheduled-qualification) runs them with
-large budgets.
+The Rust harness runs in the ordinary `cargo test`. The OCaml harness is not
+part of `dune runtest`. It runs under the `@test/bridge/decoder-fuzz` alias,
+which `make test` and `make native-test` build through
+`@test/bridge/bridge-stress` only after `dune runtest` has finished. Both use
+a small fixed budget there. A [scheduled workflow](#scheduled-qualification)
+runs them with large budgets.
+
+The OCaml multi-Domain lifecycle stress shares that arrangement. Under
+`dune runtest`, Dune ran it alongside the timing-bound runtime tests. It starts
+several Core runtimes and Tokio pools at once, and on the small Windows x64
+runner that pushed `test_native_activity_execution`,
+`test_native_worker_loop`, and `test_native_worker_bounded_shutdown` past their
+bounds. Running the stress aliases in a separate step after `dune runtest`
+keeps the same PR coverage without the overlap. To run them alone:
+
+```sh
+dune build @test/bridge/bridge-stress    # both OCaml harnesses, default budgets
+make native-test-decoder-fuzz            # Rust and OCaml decoder fuzz
+```
 
 ## Targets
 
