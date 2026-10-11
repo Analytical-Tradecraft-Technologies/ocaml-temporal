@@ -28,14 +28,19 @@ module type SUPERVISOR = sig
   *)
 
   val complete_activity :
-    t -> Temporal_protocol.Activity_protocol.completion -> (unit, error) result
-  (** Submits a semantic completion. [Ok ()] is the only proof that the native
-      side accepted and retired the task-token lease. *)
+    t -> Temporal_protocol.Encoded_activity_completion.t -> (unit, error) result
+  (** Submits a completion as the canonical bytes from its single encoder
+      pass, which the adapter performs before admitting the lease (issue
+      #995). Implementations submit those bytes without encoding the
+      completion again; a retry passes the identical value. [Ok ()] is the
+      only proof that the native side accepted and retired the task-token
+      lease. *)
 
   val complete_async_activity :
-    t -> Temporal_protocol.Activity_protocol.completion -> (unit, error) result
+    t -> Temporal_protocol.Encoded_activity_completion.t -> (unit, error) result
   (** Submits a completion for a task already handed off with
-      [WillCompleteAsync] through the namespace-bound client path. *)
+      [WillCompleteAsync] through the namespace-bound client path. It carries
+      the same single-encode bytes as [complete_activity]. *)
 
   val record_activity_heartbeat :
     t -> Temporal_protocol.Activity_protocol.heartbeat -> (unit, error) result

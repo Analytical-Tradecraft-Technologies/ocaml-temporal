@@ -9,6 +9,7 @@
 *)
 
 module Protocol = Temporal_protocol.Activity_protocol
+module Encoded = Temporal_protocol.Encoded_activity_completion
 module Raw_adapter = Temporal_runtime.Native_activity_execution
 module Base_async = Temporal_base.Async_activity
 module Bridge = Temporal_core_bridge.Native_bridge
@@ -71,16 +72,19 @@ let base_async_activity (definition : ('input, 'output) Temporal.Activity.t) =
     ~input:(base_codec (Temporal.Activity.input definition))
     ~output:(base_codec (Temporal.Activity.output definition)) ~implementation
 
-(** Copies a protocol completion through the strict semantic codec. The fake
-    therefore owns independent token and payload storage exactly as a native
-    implementation must. *)
-let copy_completion completion =
-  match Protocol.encode_completion completion with
+(** Strictly decodes the adapter's single-encode completion bytes, as the Rust
+    bridge does, and checks that they are the canonical encoding of the
+    decoded value. The fake therefore owns independent token and payload
+    storage exactly as a native implementation must, and never encodes a
+    submission itself (issue #995). *)
+let copy_completion encoded =
+  let json = Encoded.to_string encoded in
+  match Protocol.decode_completion json with
   | Error _ -> failwith "async fake received an invalid completion"
-  | Ok json -> (
-      match Protocol.decode_completion json with
-      | Ok value -> value
-      | Error _ -> failwith "async fake could not reparse its completion")
+  | Ok value ->
+      if Protocol.encode_completion value <> Ok json then
+        failwith "async fake received non-canonical completion bytes";
+      value
 
 (** Copies a protocol heartbeat through the strict codec to test ownership of
     late detail payloads as well as their semantic shape. *)
@@ -189,7 +193,8 @@ module Fake_supervisor = struct
       deferred local result before retiring its token; the optional one-shot
       transport failure checks that an ordinary local failure is retried
       without rerunning the callback. *)
-  let complete_activity supervisor (completion : Protocol.completion) =
+  let complete_activity supervisor encoded =
+    let completion = copy_completion encoded in
     let token = completion.Protocol.task_token in
     if not (has_token token !(supervisor.leased)) then
       Error (source_error "stale_lease" "worker lease is not active")
@@ -211,7 +216,7 @@ module Fake_supervisor = struct
       supervisor.leased := remaining;
       let _, remaining_local = remove_token token !(supervisor.local_leased) in
       supervisor.local_leased := remaining_local;
-      supervisor.completions := copy_completion completion :: !(supervisor.completions);
+      supervisor.completions := completion :: !(supervisor.completions);
       begin
         match completion.Protocol.result with
         | Protocol.Will_complete_async ->
@@ -228,7 +233,8 @@ module Fake_supervisor = struct
       emits for namespace-bound completions: [Invalid_state] for a server
       [NotFound], [Connection] for an ambiguous RPC outcome, and
       [Async_heartbeat_rejected] for a definitive rejection. *)
-  let complete_async_activity supervisor (completion : Protocol.completion) =
+  let complete_async_activity supervisor encoded =
+    let completion = copy_completion encoded in
     incr supervisor.async_completion_calls;
     if !(supervisor.reject_next_async_completion_terminal) then begin
       supervisor.reject_next_async_completion_terminal := false;
@@ -265,7 +271,7 @@ module Fake_supervisor = struct
       else begin
         supervisor.async_leased := remaining;
         supervisor.async_completions :=
-          copy_completion completion :: !(supervisor.async_completions);
+          completion :: !(supervisor.async_completions);
         Ok ()
       end
 
