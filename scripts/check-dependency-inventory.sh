@@ -117,6 +117,16 @@ cp "$scratch/expected" "$scratch/docs-tools"
 doc_table '## CI-only documentation tooling' | columns 1,2 > "$scratch/documented"
 compare 'CI-only documentation tooling'
 
+# CI-only official Temporal Python SDK closure for the interoperability
+# regression (#517): every `name==version` requirement line of the hash-locked
+# file that test/integration/sdk_interop/python/run-driver.sh installs.
+awk -F '==' '
+  { sub(/\r$/, "") }
+  /^[A-Za-z0-9._-]+==/ { split($2, version, /[ \\]/); print $1 "\t" version[1] }
+' "$root/test/integration/sdk_interop/python/requirements.lock" > "$scratch/expected"
+doc_table '## CI-only interoperability tooling' | columns 1,2 > "$scratch/documented"
+compare 'CI-only interoperability tooling'
+
 # Linking-exception scope: the exact packages admitted under the OCaml
 # linking exception, at the versions their locks pin. The names are the
 # reviewed policy (check-licenses.sh for the compiler and ocamlbuild, the
