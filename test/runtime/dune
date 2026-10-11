@@ -14,6 +14,7 @@
   test_native_worker_bounded_shutdown
   test_native_worker_execution
   test_native_worker_watchdog
+  test_native_worker_idle
   test_signal_policy
   test_scheduler
   test_future_retention
