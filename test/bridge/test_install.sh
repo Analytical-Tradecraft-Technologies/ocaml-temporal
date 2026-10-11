@@ -1,6 +1,21 @@
 #!/bin/sh
 set -eu
 
+# Runs `opam exec -- dune SUBCOMMAND ARGS...` and adds an explicit `-j` when
+# DUNE_JOBS is non-empty. Make exports the limit (#851), but Dune reads the
+# DUNE_JOBS environment variable only from 3.22, and the SDK supports 3.18, so
+# the flag keeps this nested build bounded on every supported release.
+# test/smoke/test_build_jobs_contract.sh runs this function with a stub Dune.
+opam_dune() {
+  dune_subcommand=$1
+  shift
+  if [ -n "${DUNE_JOBS:-}" ]; then
+    opam exec -- dune "$dune_subcommand" -j "$DUNE_JOBS" "$@"
+  else
+    opam exec -- dune "$dune_subcommand" "$@"
+  fi
+}
+
 root=$(pwd)
 install_root="$root/_build/install/default/lib"
 package_root="$install_root/temporal-sdk"
@@ -20,7 +35,7 @@ case "$(uname -s)" in
     ;;
 esac
 
-opam exec -- dune build @install
+opam_dune build @install
 
 # The wrapped [Temporal] root is the installed package's explicit public
 # module allow-list. Keep this check next to the consumer compilation so a
@@ -122,8 +137,12 @@ consumer_ocamlpath=$dune_install_root
 if [ -n "${OCAMLPATH:-}" ]; then
   consumer_ocamlpath="${dune_install_root}${path_separator}${OCAMLPATH}"
 fi
-OCAMLPATH="$consumer_ocamlpath" opam exec -- \
-  dune build --root "$dune_output_dir" ./main.exe ./worker_environment.exe
+# The subshell confines the consumer OCAMLPATH to the Dune build.
+(
+  OCAMLPATH=$consumer_ocamlpath
+  export OCAMLPATH
+  opam_dune build --root "$dune_output_dir" ./main.exe ./worker_environment.exe
+)
 "$output_dir/_build/default/main.exe"
 
 # Malformed legacy settings used to fail before native client configuration.
@@ -163,9 +182,11 @@ for forbidden_target in \
   forbidden_future_kernel \
   forbidden_worker_observer \
   forbidden_acceptance_observer; do
-  if OCAMLPATH="$consumer_ocamlpath" opam exec -- \
-    dune build --root "$dune_output_dir" \
-      "./$forbidden_target.exe" >"$output_dir/$forbidden_target.log" 2>&1; then
+  if (
+    OCAMLPATH=$consumer_ocamlpath
+    export OCAMLPATH
+    opam_dune build --root "$dune_output_dir" "./$forbidden_target.exe"
+  ) >"$output_dir/$forbidden_target.log" 2>&1; then
     echo "$forbidden_target unexpectedly compiled from the public package" >&2
     cat "$output_dir/$forbidden_target.log" >&2
     exit 1
