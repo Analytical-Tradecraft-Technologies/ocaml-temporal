@@ -42,6 +42,53 @@ and supervisor). The results and their limits are in
 Verification: `dune build @install`, the benchmark and observability tests,
 `@doc`, both live levels and the Rust benchmark, the format, spelling and
 dependency-inventory checks.
+## 2026-10-12: Live qualification of non-yielding workflow recovery (#493)
+
+PR #951 added the activation watchdog (detect, report, and fail the workflow
+task) and PR #974 (#495) bounded shutdown with a stuck activation; both were
+covered by focused tests only. The new `test/integration/non_yielding_workflow`
+live regression closes the remaining acceptance criteria against Temporal
+Server. Worker A (500 ms deadline) completes a control workflow, then runs a
+workflow that spins without yielding. The fixture checks that:
+
+- detection happens within the deadline plus one second of the code starting
+  (about 0.64 s in five local runs), and `Worker.health` names the workflow
+  type, workflow ID, run ID, a non-replaying activation, an elapsed time of at
+  least the deadline, and `` `Task_failed ``;
+- exactly one `workflow_activation_deadline_exceeded` record carries the same
+  identifiers, and neither it nor the server's `WorkflowTaskFailed` event
+  (identity `non-yielding-a`, message naming the activation deadline)
+  contains the run's secret input;
+- `shutdown_with_report` on A while the code still spins returns within the
+  grace period plus the teardown timeout (about 1.3 s with a 1 s grace
+  period) and reports one abandoned workflow activation, and A's `run` has not
+  returned;
+- worker B, the corrected build with a 3 s deadline, completes a second
+  control workflow and a legitimately heavy 1 s activation while staying
+  healthy, and Temporal's retry completes the original run with the
+  corrected code. That run's history holds exactly one failed workflow task,
+  task completions only from B, one completion, and no event the abandoned
+  code could have produced;
+- releasing the spinning code drops A's late completion exactly once and lets
+  A's `run` return.
+
+The suite is in `LIVE_REGRESSION_EXECUTABLES`, the CI smoke artifact list,
+and the `run-live-regressions.sh` dispatch (it reads history through the
+pinned CLI), and has a `make test-non-yielding-workflow-live` target. The
+workflows guide now lists the blocking operations to avoid, how to size the
+deadline for heavy activations and replay, the three diagnostic views, and how
+a failed run recovers once corrected code serves its queue; its stale claim
+that `shutdown` cannot finish while code is stuck now describes the bounded
+report. The support policy, live coverage, and native worker references link
+the regression.
+
+Verification: the regression passed five of five runs on macOS (OCaml 5.4.1)
+against the Compose Temporal/PostgreSQL stack, together with
+`dune build @install`, `@doc`, the runtime, unit and smoke tests, the
+live-regressions contract, the dependency inventory, `check-format.sh`, and
+`typos`. There are no library, Rust, C, or ABI changes; ABI version 4 is
+unchanged. Remaining limit, unchanged and documented: workflow tasks Core had
+already received for a stuck worker wait for their workflow-task timeout.
 ## 2026-10-12: Official-SDK interoperability regression (#517)
 
 A new live regression, `test/integration/sdk_interop`, drives an OCaml

@@ -983,11 +983,14 @@ failures, and a stuck eviction is acknowledged; `Stuck_workflow_activation`'s
 `abandoned` field says which happened), logs one `workflow_activation_deadline_exceeded` error naming the
 workflow type, workflow ID, and run ID, and makes `Temporal.Worker.health`
 report `Stuck_workflow_activation`. OCaml code cannot be safely interrupted,
-so the stuck code keeps running, `shutdown` cannot finish while it does, and
-the state stays unhealthy even if the code later returns. Recovery is to
-restart the process from an external supervisor (Kubernetes, systemd, or
-similar). Configure the deadline, or disable it while stepping through code
-in a debugger, with `Temporal.Worker.Options`:
+so the stuck code keeps running and `run` cannot return while it does, and
+the state stays unhealthy even if the code later returns.
+`Temporal.Worker.shutdown_with_report`, called from another thread, still
+returns within the grace period plus the teardown timeout and counts the
+activation in `abandoned_workflow_activations`, but the process must then
+exit. Recovery is to restart the process from an external supervisor
+(Kubernetes, systemd, or similar). Configure the deadline, or disable it while
+stepping through code in a debugger, with `Temporal.Worker.Options`:
 
 ```ocaml
 let options =
@@ -1022,6 +1025,57 @@ A Kubernetes `livenessProbe` can then check that the file's timestamp is a
 few seconds old at most, or the application can serve the same check from an
 HTTP endpoint. Liveness probes should restart the process; readiness probes
 alone only stop routing traffic, which a Temporal worker does not receive.
+
+#### Avoid, diagnose, and recover
+
+Never do any of the following inside workflow code, its codecs, or its
+handlers; each holds the workflow lane without yielding:
+
+- unbounded or data-dependent CPU loops, including retry loops that poll a
+  value instead of awaiting a `Temporal.Workflow` condition or timer;
+- `Unix.sleepf`, `Thread.delay`, or any other wall-clock wait (use
+  `Temporal.Workflow.sleep`);
+- network, file, or database I/O, subprocesses, and blocking C calls (use an
+  activity);
+- `Mutex.lock`, `Condition.wait`, `Domain.join`, or waiting on an Eio/Lwt
+  promise owned by another scheduler.
+
+The two-second default leaves room for legitimate CPU-heavy activations. If
+an activation really needs longer, raise the deadline for that worker rather
+than disabling it, and move the work into an activity when it grows further.
+Replay does not need a larger deadline: Core replays a history one historical
+workflow task per activation, so a long history is many short activations.
+When a stuck activation was replaying, `Stuck_workflow_activation.is_replaying`
+is `true`, which points at code that loops on recorded data rather than at a
+slow new step. The deadline only fails the workflow task; it never adds a
+command to history, so a deadline that is too short for a heavy activation
+shows up as repeated workflow-task failures, never as divergent commands.
+
+To diagnose a detected activation, use the three views of the same event:
+
+- `Temporal.Worker.health` returns the workflow type, workflow ID, run ID,
+  replay flag, and a lower bound on how long the activation had run;
+- the `workflow_activation_deadline_exceeded` log record carries the same
+  identifiers and duration as tags ([observability](../reference/observability.md));
+- the run's history in the Temporal UI or CLI shows a `WorkflowTaskFailed`
+  event from the stuck worker's identity whose failure message names the
+  activation deadline.
+
+None of them includes a payload, so the stuck run's input and state stay out
+of logs. Take a stack sample of the stuck process (for example with
+`perf`, `gdb`, or `lldb`) before it is restarted if the looping code is not
+obvious.
+
+After the task fails, Temporal schedules a new workflow-task attempt for the
+same run. The attempt replays the run from history on whichever worker polls
+it, so the run recovers as soon as a worker with corrected code (a fixed build,
+or a `Temporal.Workflow.patched` branch around the change) serves its task
+queue. Until then, every attempt that reaches broken code fails again in the
+same way. While a worker is
+stuck, workflow tasks Core had already received for it wait for their
+workflow-task timeout before they are retried elsewhere. The [non-yielding
+live regression](../../test/integration/non_yielding_workflow/regression.ml)
+exercises this sequence end to end against Temporal Server.
 
 Both `Temporal.Worker.create` and `Temporal.Client.create` accept an optional
 `~identity`, which Temporal records in history events and task-queue poller
