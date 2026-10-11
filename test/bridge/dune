@@ -110,3 +110,22 @@
 (test
  (name test_client_limits)
  (libraries temporal-sdk temporal_core_bridge))
+
+; Seeded mutation fuzzing of every OCaml protocol decoder (#506).
+(test
+ (name test_ocaml_decoder_fuzz)
+ (deps
+  (source_tree fixtures)
+  (env_var DECODER_FUZZ_SEED)
+  (env_var DECODER_FUZZ_OCAML_CASES)
+  (env_var DECODER_FUZZ_TARGET))
+ (libraries temporal_protocol))
+
+; Seeded multi-Domain close/finalizer/attach races through the C stubs (#506).
+(test
+ (name test_ocaml_concurrent_lifecycle_stress)
+ (deps
+  (env_var LIFECYCLE_STRESS_SEED)
+  (env_var CONCURRENT_STRESS_OCAML_ROUNDS)
+  (env_var CONCURRENT_STRESS_OCAML_DOMAINS))
+ (libraries temporal_core_bridge))

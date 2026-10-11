@@ -183,16 +183,129 @@ in between.
 32-bit halves to seed `Random.State`, so no bits are lost. The Make targets pass both, and Dune reruns
 the test whenever either value changes.
 
+## Concurrent stress (#506)
+
+The stresses above run every native call from one thread. Issue
+[#506](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/506)
+adds two tests in which several threads or Domains change native state at the
+same time. Each still respects the single-owner rule: only the owning thread
+or Domain makes ordinary calls on a graph.
+
+### Rust: threads and shared runtimes
+
+`rust/core-bridge/tests/concurrent_lifecycle_stress.rs` runs seeded rounds.
+In each round:
+
+1. The coordinator creates two shared runtimes with two Tokio threads each.
+2. Every worker thread concurrently attaches its graphs to those handles
+   (the ABI permits concurrent attaches). One graph in four builds its own
+   Core instead.
+3. A barrier releases the threads together. At a seeded moment the
+   coordinator releases each shared handle, through `shared_runtime_free` or
+   the GC-fallback `shared_runtime_dispose`, while the threads keep working.
+
+Each graph follows one of six seeded scripts: release idle; start a replay,
+feed a history, pump, then `runtime_free` or `runtime_dispose` (sometimes with
+a lease held); drain every activation and finalize; restart a disposed replay
+worker; or dispose a replay worker early. A pump is one bounded wait, one
+poll, and the completion of any leased activation.
+
+The test checks:
+
+- every call returns a documented status, and never `STATUS_PANIC`,
+  `STATUS_INTERNAL`, or `STATUS_INVALID_ARGUMENT` on a live handle;
+- a released slot is null;
+- a round finishes within 180 seconds, or it is reported as a hang;
+- after the last round, within 60 seconds, every graph has been cleaned
+  exactly once and every Core runtime, owned or shared, has been dropped
+  exactly once, whichever holder released it last;
+- no panic, on any thread, has a location in `rust/core-bridge/src`. A panic
+  hook records every panic, including those on Core's Tokio threads that the
+  ABI's `catch_unwind` never sees. Panics inside Temporal Core are reported
+  in the summary rather than failed; see [Findings](#findings).
+
+The default budget (3 rounds, 4 threads, 3 graphs each) runs in about half a
+second, and it must observe a completion, a finalization, a
+`runtime_dispose`, and a `runtime_free`.
+
+### OCaml: Domains and the C borrow gates
+
+`test/bridge/test_ocaml_concurrent_lifecycle_stress.ml` runs seeded rounds of
+worker Domains through `Native_bridge`. In each round:
+
+- the main Domain creates a shared runtime, and each worker Domain attaches
+  graphs to it or creates its own runtime while the main Domain closes the
+  shared runtime at a seeded moment;
+- each worker Domain makes replay calls (start, finish, wait, poll, dispose,
+  close) on the runtimes it owns;
+- each worker Domain publishes one runtime, and its neighbour may close that
+  runtime while the owner is inside, or about to enter, a blocking call;
+- every Domain runs minor and major collections and compactions between
+  calls, and drops some runtimes for the custom-block finalizer.
+
+Every result must be `Ok` or a documented typed error, never `Panic`,
+`Internal`, `Abi_mismatch`, or an unknown status. A runtime that the owner
+has seen released must keep refusing calls with `Invalid_argument`. An attach
+after the shared close must be refused.
+
+A second Domain making ordinary (non-close) calls on the same runtime is
+outside the contract. The C gate admits it, but the Rust graph would then be
+mutated from two threads. The supervisor never does this, so the stress does
+not either.
+
+### Budgets
+
+| Variable | Meaning | Default | Range |
+| --- | --- | --- | --- |
+| `CONCURRENT_STRESS_SEED` | Rust base seed | `0x0506c0c0` | any 64-bit value |
+| `CONCURRENT_STRESS_ROUNDS` | Rust rounds | 3 | 1–10,000 |
+| `CONCURRENT_STRESS_THREADS` | Rust worker threads per round | 4 | 2–64 |
+| `CONCURRENT_STRESS_GRAPHS` | Rust graphs per thread | 3 | 1–32 |
+| `CONCURRENT_STRESS_OCAML_ROUNDS` | OCaml rounds | 6 | 1–10,000 |
+| `CONCURRENT_STRESS_OCAML_DOMAINS` | OCaml worker Domains | 4 | 2–32 |
+
+The OCaml test takes its seed from `LIFECYCLE_STRESS_SEED`.
+
+```sh
+make native-test-concurrent-stress CONCURRENT_STRESS_ROUNDS=300 CONCURRENT_STRESS_THREADS=16 CONCURRENT_STRESS_GRAPHS=4 CONCURRENT_STRESS_OCAML_ROUNDS=300 CONCURRENT_STRESS_OCAML_DOMAINS=8
+```
+
+On an Apple M-series laptop, 400 Rust rounds of 16 threads with 4 graphs each
+(25,600 graphs, 7,276 Core runtimes) took about 67 seconds, and 300 OCaml
+rounds of 8 Domains took a few seconds. Thread and Domain scheduling is not
+seeded, so a failure may not reproduce exactly. A Rust failure writes the
+seed, round, rerun command, and each failing thread's call trace to
+`_build/concurrent-stress/<seed>-round<round>.txt` (override with
+`CONCURRENT_STRESS_OUTPUT_DIR`). Rust producer CI keeps that directory as a
+14-day artifact when a job fails.
+
+### Findings
+
+Long concurrent runs occasionally record one panic inside Temporal Core, at
+`crates/sdk-core/src/pollers/poll_buffer.rs:428` in the pinned revision:
+`poll_task_awaiter.await.unwrap()` on `JoinError::Cancelled`. It happens when a
+Core runtime shuts down while a worker's poll task is still running, so Tokio
+cancels the inner task and the outer task unwraps the cancellation. Tokio
+contains the panic inside its worker thread. It does not cross the ABI,
+change any status, leak a graph or a Core runtime, or break the cleanup
+counters. With the default budget it does not appear; with the large budget it
+appeared 0 to 2 times in 25,600 graphs. Release builds keep `panic = "unwind"`,
+so the containment holds there too. It is an upstream teardown-order defect,
+not a bridge memory or ownership violation. It is tracked here for
+re-evaluation after the Core upgrade in PR #989, and the stress reports any
+recurrence in its summary.
+
 ## What each tool observes
 
-| Component | Rust stress | OCaml stress | `test/bridge/test_abi.sh` |
-| --- | --- | --- | --- |
-| C ABI status, result, and slot contracts | Yes, called from Rust | Indirectly | Yes, called from C |
-| Rust bridge (`abi.rs`, `worker_bridge.rs`, `replay_bridge.rs`) | Yes: panics, debug assertions, ledgers | Through the C stubs | Linked, not instrumented |
-| Temporal Core worker and replay state machines | Yes, as linked | As linked | As linked |
-| C stubs (`native_stubs.c`) and the OCaml custom block | No | Yes | No |
-| OCaml GC and finalizer interaction | No | Yes | No |
-| AddressSanitizer and UndefinedBehaviorSanitizer | No | No | C harness code only |
+| Component | Rust stress | Rust concurrent stress | OCaml GC stress | OCaml multi-Domain stress | `test/bridge/test_abi.sh` |
+| --- | --- | --- | --- | --- | --- |
+| C ABI status, result, and slot contracts | Yes, called from Rust | Yes, from several threads | Indirectly | Indirectly | Yes, called from C |
+| Rust bridge (`abi.rs`, `worker_bridge.rs`, `replay_bridge.rs`) | Yes: panics, debug assertions, ledgers | Yes: panics on any thread, cleanup counters | Through the C stubs | Through the C stubs | Linked, not instrumented |
+| Shared Core runtimes and cross-thread release order | No | Yes | No | Yes, through the C gate | No |
+| Temporal Core worker and replay state machines | Yes, as linked | As linked | As linked | As linked | As linked |
+| C stubs (`native_stubs.c`) and the OCaml custom block | No | No | Yes | Yes, with cross-Domain close | No |
+| OCaml GC and finalizer interaction | No | No | Yes | Yes, with collections on other Domains | No |
+| AddressSanitizer and UndefinedBehaviorSanitizer | No | No | No | No | C harness code only |
 
 The stable Rust test profile gives debug assertions, overflow checks, and
 panic detection. It does not give sanitizer or coverage instrumentation, and
@@ -213,19 +326,20 @@ not measured, because those depend on the platform.
 
 ## Scope and follow-up
 
-Cases are single-threaded per runtime, which matches the ABI's single-owner
-rule. The two slots interleave on one test thread. Parent issue
+Lifecycle cases are single-threaded per runtime, which matches the ABI's
+single-owner rule; the [concurrent stress](#concurrent-stress-506) adds
+cross-thread and cross-Domain release, close, and finalizer races. The
+scheduled workflow `.github/workflows/stress.yml` runs every stress and
+fuzzer weekly with large budgets; see
+[scheduled qualification](bridge-decoder-fuzz.md#scheduled-qualification).
+
+Parent issue
 [#506](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/506)
-keeps four items:
+keeps two items:
 
-- scheduled long runs;
-- concurrent execution, cancellation, and shutdown across Domains and
-  runtimes;
 - a sanitizer-instrumented build of the Rust bridge (nightly
-  `-Zsanitizer=address` with `-Zbuild-std`);
-- the final production runtime paths.
-
-The repository has no scheduled stress job yet. The nightly master build
-reuses the cached Rust bridge and does not rerun Rust tests on a cache hit.
-Until a scheduled job exists, run the longer budget above by hand before
-releases or after lifecycle changes.
+  `-Zsanitizer=address` with `-Zbuild-std`), which the pinned stable
+  toolchain cannot provide;
+- live-worker and client paths under concurrency. The concurrent stress uses
+  replay workers, which need no server; live activity workers are covered
+  single-threaded by the gRPC double in `lifecycle_stress.rs`.

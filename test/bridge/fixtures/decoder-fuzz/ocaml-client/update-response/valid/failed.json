@@ -1,0 +1,1 @@
+{"update_id":"update-1","execution":{"namespace":"default","workflow_id":"summarize-1","run_id":"server-assigned-run-id"},"outcome":{"kind":"failed","failure":{"cause":null,"encoded_attributes":null,"info":{"details":[],"kind":"application","non_retryable":true,"type":"defect"},"message":"boom","source":"ocaml","stack_trace":""}}}

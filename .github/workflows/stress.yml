@@ -1,0 +1,82 @@
+name: Scheduled bridge stress
+
+# Long-run fuzzing and lifecycle-stress qualification (#506). Pull requests
+# and master builds already run every target with a small fixed budget inside
+# the ordinary Rust and OCaml suites; this workflow reruns the same targets
+# with large budgets and a fresh seed, on a schedule and on demand. See
+# docs/reference/bridge-decoder-fuzz.md and
+# docs/reference/bridge-lifecycle-stress.md.
+
+on:
+  schedule:
+    - cron: '30 3 * * 1'
+  workflow_dispatch:
+    inputs:
+      seed:
+        description: Base seed for every fuzzer and stress (decimal or 0x hexadecimal; empty uses the run number)
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bridge-stress-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  stress:
+    name: Fuzz and lifecycle stress (Linux amd64, OCaml 5.5)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      OCAML_VERSION: "5.5.1"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+      - name: Reclaim disposable GitHub-hosted runner disk
+        if: runner.environment == 'github-hosted'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+      - name: Select the seed
+        id: seed
+        shell: bash
+        env:
+          INPUT_SEED: ${{ inputs.seed }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          set -euo pipefail
+          seed="${INPUT_SEED:-}"
+          if [ -z "$seed" ]; then
+            seed="$(printf '0x%08x' "$RUN_NUMBER")"
+          fi
+          case "$seed" in
+            0x[0-9a-fA-F]*|[0-9]*) ;;
+            *) echo "seed must be decimal or 0x hexadecimal" >&2; exit 1 ;;
+          esac
+          echo "seed=$seed" >> "$GITHUB_OUTPUT"
+          echo "Stress seed: $seed" >> "$GITHUB_STEP_SUMMARY"
+      - name: Run every fuzzer and stress with the qualification budget
+        env:
+          SEED: ${{ steps.seed.outputs.seed }}
+        run: |
+          make stress-qualification \
+            STRUCTURED_FUZZ_SEED="$SEED" \
+            DECODER_FUZZ_SEED="$SEED" \
+            LIFECYCLE_STRESS_SEED="$SEED" \
+            CONCURRENT_STRESS_SEED="$SEED"
+      - name: Retain reproductions and reports after a failure
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: bridge-stress-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            _build/structured-fuzz/
+            _build/decoder-fuzz/
+            _build/lifecycle-stress/
+            _build/concurrent-stress/
+            _build/default/test/bridge/ocaml-*.bin
+          if-no-files-found: ignore
+          retention-days: 30

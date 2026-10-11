@@ -120,6 +120,11 @@ The [structured parser fuzz smoke](bridge-parser-fuzz.md) mutates committed
 valid and rejected fixtures against the independently callable Rust envelope,
 payload, activation, and completion decoders. Its limits and instrumentation
 scope are stated separately from the fixed-fixture and C ABI sanitizer tests.
+The [decoder fuzz](bridge-decoder-fuzz.md) applies the same approach to every
+other Rust decoder reached through the ABI (activity, client request, client
+and worker configuration, and replay history documents) and to every OCaml
+decoder of a bridge response. It also checks typed rejection statuses and
+bounded allocation.
 
 The [lifecycle stress](bridge-lifecycle-stress.md) runs seeded,
 reproducible operation sequences against the ABI. The sequences interleave
@@ -127,7 +132,9 @@ runtime, replay-worker, and live-worker operations: create, poll, complete,
 reject, shutdown, finalize, free, and GC-fallback dispose, including calls
 that misuse the ABI. A model and two ledgers check every handle and lease
 against them. A companion OCaml test runs the custom-block finalizer and
-supervisor cycles under GC pressure.
+supervisor cycles under GC pressure. A concurrent stress runs graphs on several threads
+and shared runtimes, and an OCaml test closes runtimes across Domains while
+their owners are inside native calls.
 
 There is one normal-start compatibility default in the initializer: Temporal
 Core maps the server's `first_workflow_task_backoff` to
