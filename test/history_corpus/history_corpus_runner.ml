@@ -35,6 +35,10 @@ let required_features =
     "activity"; "timer"; "activity-retry"; "signal"; "update";
     "child-workflow"; "continue-as-new"; "patch-marker-free"; "patch-active";
     "patch-deprecated"; "workflow-failure"; "workflow-task-failure-recovery";
+    (* Patch lifecycle boundaries added for issue #531. *)
+    "patch-removed"; "patch-multiple"; "patch-loop"; "patch-signal-handler";
+    "patch-update-handler"; "patch-mid-run-upgrade"; "patch-upgrade";
+    "patch-rollback";
   ]
 
 (** Checks the coverage contract and returns its failures. *)

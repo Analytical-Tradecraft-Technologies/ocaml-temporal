@@ -1,0 +1,596 @@
+{
+  "events": [
+    {
+      "eventId": "1",
+      "eventTime": "2026-10-11T07:41:25.674486420Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_EXECUTION_STARTED",
+      "taskId": "1048718",
+      "workflowExecutionStartedEventAttributes": {
+        "workflowType": {
+          "name": "corpus.lifecycle.multi"
+        },
+        "taskQueue": {
+          "name": "ocaml-temporal-history-corpus",
+          "kind": "TASK_QUEUE_KIND_NORMAL"
+        },
+        "input": {
+          "payloads": [
+            {
+              "metadata": {
+                "encoding": "anNvbi9wbGFpbg=="
+              },
+              "data": "ImRlcHJlY2F0ZWQi"
+            }
+          ]
+        },
+        "workflowTaskTimeout": "10s",
+        "originalExecutionRunId": "01a129e8-cf2a-7769-83b9-968086a65464",
+        "identity": "history-corpus-client",
+        "firstExecutionRunId": "01a129e8-cf2a-7769-83b9-968086a65464",
+        "attempt": 1,
+        "firstWorkflowTaskBackoff": "0s",
+        "workflowId": "history-corpus-lifecycle-multi-deprecated"
+      }
+    },
+    {
+      "eventId": "2",
+      "eventTime": "2026-10-11T07:41:25.674538545Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_SCHEDULED",
+      "taskId": "1048719",
+      "workflowTaskScheduledEventAttributes": {
+        "taskQueue": {
+          "name": "ocaml-temporal-history-corpus",
+          "kind": "TASK_QUEUE_KIND_NORMAL"
+        },
+        "startToCloseTimeout": "10s",
+        "attempt": 1
+      }
+    },
+    {
+      "eventId": "3",
+      "eventTime": "2026-10-11T07:41:25.680027087Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_STARTED",
+      "taskId": "1048724",
+      "workflowTaskStartedEventAttributes": {
+        "scheduledEventId": "2",
+        "identity": "history-corpus-corpus-lifecycle-deprecated",
+        "requestId": "8b74d829-a1b1-4278-a50e-c900873f9e4e",
+        "historySizeBytes": "352",
+        "workerVersion": {
+          "buildId": "ocaml-temporal"
+        }
+      }
+    },
+    {
+      "eventId": "4",
+      "eventTime": "2026-10-11T07:41:25.686029379Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_COMPLETED",
+      "taskId": "1048728",
+      "workflowTaskCompletedEventAttributes": {
+        "scheduledEventId": "2",
+        "startedEventId": "3",
+        "identity": "history-corpus-corpus-lifecycle-deprecated",
+        "workerVersion": {
+          "buildId": "ocaml-temporal"
+        },
+        "sdkMetadata": {
+          "coreUsedFlags": [
+            2,
+            1,
+            3
+          ],
+          "sdkName": "temporal-ocaml",
+          "sdkVersion": "0.1.0-rc.1"
+        },
+        "meteringMetadata": {}
+      }
+    },
+    {
+      "eventId": "5",
+      "eventTime": "2026-10-11T07:41:25.686054879Z",
+      "eventType": "EVENT_TYPE_MARKER_RECORDED",
+      "taskId": "1048729",
+      "markerRecordedEventAttributes": {
+        "markerName": "core_patch",
+        "details": {
+          "patch-data": {
+            "payloads": [
+              {
+                "metadata": {
+                  "encoding": "anNvbi9wbGFpbg=="
+                },
+                "data": "eyJpZCI6ImNvcnB1cy5saWZlY3ljbGUubXVsdGkuYWN0aXZpdHkudjEiLCJkZXByZWNhdGVkIjp0cnVlfQ=="
+              }
+            ]
+          }
+        },
+        "workflowTaskCompletedEventId": "4"
+      }
+    },
+    {
+      "eventId": "6",
+      "eventTime": "2026-10-11T07:41:25.686832879Z",
+      "eventType": "EVENT_TYPE_UPSERT_WORKFLOW_SEARCH_ATTRIBUTES",
+      "taskId": "1048730",
+      "upsertWorkflowSearchAttributesEventAttributes": {
+        "workflowTaskCompletedEventId": "4",
+        "searchAttributes": {
+          "indexedFields": {
+            "TemporalChangeVersion": {
+              "metadata": {
+                "encoding": "anNvbi9wbGFpbg==",
+                "type": "S2V5d29yZExpc3Q="
+              },
+              "data": "WyJjb3JwdXMubGlmZWN5Y2xlLm11bHRpLmFjdGl2aXR5LnYxIl0="
+            }
+          }
+        }
+      }
+    },
+    {
+      "eventId": "7",
+      "eventTime": "2026-10-11T07:41:25.686858379Z",
+      "eventType": "EVENT_TYPE_ACTIVITY_TASK_SCHEDULED",
+      "taskId": "1048731",
+      "activityTaskScheduledEventAttributes": {
+        "activityId": "ocaml-activity-1",
+        "activityType": {
+          "name": "corpus.lifecycle.new"
+        },
+        "taskQueue": {
+          "name": "ocaml-temporal-history-corpus",
+          "kind": "TASK_QUEUE_KIND_NORMAL"
+        },
+        "header": {},
+        "input": {
+          "payloads": [
+            {
+              "metadata": {
+                "encoding": "anNvbi9wbGFpbg=="
+              },
+              "data": "ImRlcHJlY2F0ZWQi"
+            }
+          ]
+        },
+        "scheduleToCloseTimeout": "0s",
+        "scheduleToStartTimeout": "0s",
+        "startToCloseTimeout": "10s",
+        "heartbeatTimeout": "0s",
+        "workflowTaskCompletedEventId": "4",
+        "retryPolicy": {
+          "initialInterval": "1s",
+          "backoffCoefficient": 2,
+          "maximumInterval": "100s"
+        },
+        "useWorkflowBuildId": true
+      }
+    },
+    {
+      "eventId": "8",
+      "eventTime": "2026-10-11T07:41:25.689611879Z",
+      "eventType": "EVENT_TYPE_ACTIVITY_TASK_STARTED",
+      "taskId": "1048738",
+      "activityTaskStartedEventAttributes": {
+        "scheduledEventId": "7",
+        "identity": "history-corpus-corpus-lifecycle-deprecated",
+        "requestId": "d75d2c39-5fd4-499b-bb2e-86c1aa17be07",
+        "attempt": 1,
+        "workerVersion": {
+          "buildId": "ocaml-temporal"
+        }
+      }
+    },
+    {
+      "eventId": "9",
+      "eventTime": "2026-10-11T07:41:25.697624129Z",
+      "eventType": "EVENT_TYPE_ACTIVITY_TASK_COMPLETED",
+      "taskId": "1048739",
+      "activityTaskCompletedEventAttributes": {
+        "result": {
+          "payloads": [
+            {
+              "metadata": {
+                "encoding": "anNvbi9wbGFpbg=="
+              },
+              "data": "Ik5FVzpkZXByZWNhdGVkIg=="
+            }
+          ]
+        },
+        "scheduledEventId": "7",
+        "startedEventId": "8",
+        "identity": "history-corpus-corpus-lifecycle-deprecated"
+      }
+    },
+    {
+      "eventId": "10",
+      "eventTime": "2026-10-11T07:41:25.697634629Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_SCHEDULED",
+      "taskId": "1048740",
+      "workflowTaskScheduledEventAttributes": {
+        "taskQueue": {
+          "name": "history-corpus-corpus-lifecycle-deprecated-27c03bfdb4a34246be840b70d6e07980",
+          "kind": "TASK_QUEUE_KIND_STICKY",
+          "normalName": "ocaml-temporal-history-corpus"
+        },
+        "startToCloseTimeout": "10s",
+        "attempt": 1
+      }
+    },
+    {
+      "eventId": "11",
+      "eventTime": "2026-10-11T07:41:25.700451920Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_STARTED",
+      "taskId": "1048744",
+      "workflowTaskStartedEventAttributes": {
+        "scheduledEventId": "10",
+        "identity": "history-corpus-corpus-lifecycle-deprecated",
+        "requestId": "9f326494-eb67-44db-9468-3d5248101c1a",
+        "historySizeBytes": "1484",
+        "workerVersion": {
+          "buildId": "ocaml-temporal"
+        }
+      }
+    },
+    {
+      "eventId": "12",
+      "eventTime": "2026-10-11T07:41:25.705471754Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_COMPLETED",
+      "taskId": "1048748",
+      "workflowTaskCompletedEventAttributes": {
+        "scheduledEventId": "10",
+        "startedEventId": "11",
+        "identity": "history-corpus-corpus-lifecycle-deprecated",
+        "workerVersion": {
+          "buildId": "ocaml-temporal"
+        },
+        "sdkMetadata": {},
+        "meteringMetadata": {}
+      }
+    },
+    {
+      "eventId": "13",
+      "eventTime": "2026-10-11T07:41:25.705492712Z",
+      "eventType": "EVENT_TYPE_MARKER_RECORDED",
+      "taskId": "1048749",
+      "markerRecordedEventAttributes": {
+        "markerName": "core_patch",
+        "details": {
+          "patch-data": {
+            "payloads": [
+              {
+                "metadata": {
+                  "encoding": "anNvbi9wbGFpbg=="
+                },
+                "data": "eyJpZCI6ImNvcnB1cy5saWZlY3ljbGUubXVsdGkudGltZXIudjEiLCJkZXByZWNhdGVkIjp0cnVlfQ=="
+              }
+            ]
+          }
+        },
+        "workflowTaskCompletedEventId": "12"
+      }
+    },
+    {
+      "eventId": "14",
+      "eventTime": "2026-10-11T07:41:25.705921337Z",
+      "eventType": "EVENT_TYPE_UPSERT_WORKFLOW_SEARCH_ATTRIBUTES",
+      "taskId": "1048750",
+      "upsertWorkflowSearchAttributesEventAttributes": {
+        "workflowTaskCompletedEventId": "12",
+        "searchAttributes": {
+          "indexedFields": {
+            "TemporalChangeVersion": {
+              "metadata": {
+                "encoding": "anNvbi9wbGFpbg==",
+                "type": "S2V5d29yZExpc3Q="
+              },
+              "data": "WyJjb3JwdXMubGlmZWN5Y2xlLm11bHRpLmFjdGl2aXR5LnYxIiwiY29ycHVzLmxpZmVjeWNsZS5tdWx0aS50aW1lci52MSJd"
+            }
+          }
+        }
+      }
+    },
+    {
+      "eventId": "15",
+      "eventTime": "2026-10-11T07:41:25.705933920Z",
+      "eventType": "EVENT_TYPE_TIMER_STARTED",
+      "taskId": "1048751",
+      "timerStartedEventAttributes": {
+        "timerId": "2",
+        "startToFireTimeout": "0.100s",
+        "workflowTaskCompletedEventId": "12"
+      }
+    },
+    {
+      "eventId": "16",
+      "eventTime": "2026-10-11T07:41:26.705823087Z",
+      "eventType": "EVENT_TYPE_TIMER_FIRED",
+      "taskId": "1048755",
+      "timerFiredEventAttributes": {
+        "timerId": "2",
+        "startedEventId": "15"
+      }
+    },
+    {
+      "eventId": "17",
+      "eventTime": "2026-10-11T07:41:26.705840087Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_SCHEDULED",
+      "taskId": "1048756",
+      "workflowTaskScheduledEventAttributes": {
+        "taskQueue": {
+          "name": "history-corpus-corpus-lifecycle-deprecated-27c03bfdb4a34246be840b70d6e07980",
+          "kind": "TASK_QUEUE_KIND_STICKY",
+          "normalName": "ocaml-temporal-history-corpus"
+        },
+        "startToCloseTimeout": "10s",
+        "attempt": 1
+      }
+    },
+    {
+      "eventId": "18",
+      "eventTime": "2026-10-11T07:41:26.710161129Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_STARTED",
+      "taskId": "1048760",
+      "workflowTaskStartedEventAttributes": {
+        "scheduledEventId": "17",
+        "identity": "history-corpus-corpus-lifecycle-deprecated",
+        "requestId": "28d51283-20a2-46db-831b-c4ce0ec2417b",
+        "historySizeBytes": "2253",
+        "workerVersion": {
+          "buildId": "ocaml-temporal"
+        }
+      }
+    },
+    {
+      "eventId": "19",
+      "eventTime": "2026-10-11T07:41:26.719363379Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_COMPLETED",
+      "taskId": "1048764",
+      "workflowTaskCompletedEventAttributes": {
+        "scheduledEventId": "17",
+        "startedEventId": "18",
+        "identity": "history-corpus-corpus-lifecycle-deprecated",
+        "workerVersion": {
+          "buildId": "ocaml-temporal"
+        },
+        "sdkMetadata": {},
+        "meteringMetadata": {}
+      }
+    },
+    {
+      "eventId": "20",
+      "eventTime": "2026-10-11T07:41:26.719389462Z",
+      "eventType": "EVENT_TYPE_MARKER_RECORDED",
+      "taskId": "1048765",
+      "markerRecordedEventAttributes": {
+        "markerName": "core_patch",
+        "details": {
+          "patch-data": {
+            "payloads": [
+              {
+                "metadata": {
+                  "encoding": "anNvbi9wbGFpbg=="
+                },
+                "data": "eyJpZCI6ImNvcnB1cy5saWZlY3ljbGUubXVsdGkuY2hpbGQudjEiLCJkZXByZWNhdGVkIjp0cnVlfQ=="
+              }
+            ]
+          }
+        },
+        "workflowTaskCompletedEventId": "19"
+      }
+    },
+    {
+      "eventId": "21",
+      "eventTime": "2026-10-11T07:41:26.720260254Z",
+      "eventType": "EVENT_TYPE_UPSERT_WORKFLOW_SEARCH_ATTRIBUTES",
+      "taskId": "1048766",
+      "upsertWorkflowSearchAttributesEventAttributes": {
+        "workflowTaskCompletedEventId": "19",
+        "searchAttributes": {
+          "indexedFields": {
+            "TemporalChangeVersion": {
+              "metadata": {
+                "encoding": "anNvbi9wbGFpbg==",
+                "type": "S2V5d29yZExpc3Q="
+              },
+              "data": "WyJjb3JwdXMubGlmZWN5Y2xlLm11bHRpLmFjdGl2aXR5LnYxIiwiY29ycHVzLmxpZmVjeWNsZS5tdWx0aS5jaGlsZC52MSIsImNvcnB1cy5saWZlY3ljbGUubXVsdGkudGltZXIudjEiXQ=="
+            }
+          }
+        }
+      }
+    },
+    {
+      "eventId": "22",
+      "eventTime": "2026-10-11T07:41:26.720918879Z",
+      "eventType": "EVENT_TYPE_START_CHILD_WORKFLOW_EXECUTION_INITIATED",
+      "taskId": "1048767",
+      "startChildWorkflowExecutionInitiatedEventAttributes": {
+        "namespace": "temporal-sdk-test",
+        "namespaceId": "f9899138-8348-425b-b026-6e643e1aa6c0",
+        "workflowId": "history-corpus-lifecycle-child-deprecated",
+        "workflowType": {
+          "name": "corpus.lifecycle.child_new"
+        },
+        "taskQueue": {
+          "name": "ocaml-temporal-history-corpus",
+          "kind": "TASK_QUEUE_KIND_NORMAL"
+        },
+        "input": {
+          "payloads": [
+            {
+              "metadata": {
+                "encoding": "anNvbi9wbGFpbg=="
+              },
+              "data": "ImRlcHJlY2F0ZWQi"
+            }
+          ]
+        },
+        "workflowRunTimeout": "0s",
+        "workflowTaskTimeout": "10s",
+        "parentClosePolicy": "PARENT_CLOSE_POLICY_TERMINATE",
+        "workflowTaskCompletedEventId": "19",
+        "workflowIdReusePolicy": "WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE",
+        "header": {},
+        "inheritBuildId": true
+      }
+    },
+    {
+      "eventId": "23",
+      "eventTime": "2026-10-11T07:41:26.727584546Z",
+      "eventType": "EVENT_TYPE_CHILD_WORKFLOW_EXECUTION_STARTED",
+      "taskId": "1048771",
+      "childWorkflowExecutionStartedEventAttributes": {
+        "namespace": "temporal-sdk-test",
+        "namespaceId": "f9899138-8348-425b-b026-6e643e1aa6c0",
+        "initiatedEventId": "22",
+        "workflowExecution": {
+          "workflowId": "history-corpus-lifecycle-child-deprecated",
+          "runId": "01a129e8-d345-72e1-9c3b-30c0f93838d4"
+        },
+        "workflowType": {
+          "name": "corpus.lifecycle.child_new"
+        },
+        "header": {}
+      }
+    },
+    {
+      "eventId": "24",
+      "eventTime": "2026-10-11T07:41:26.727594671Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_SCHEDULED",
+      "taskId": "1048772",
+      "workflowTaskScheduledEventAttributes": {
+        "taskQueue": {
+          "name": "history-corpus-corpus-lifecycle-deprecated-27c03bfdb4a34246be840b70d6e07980",
+          "kind": "TASK_QUEUE_KIND_STICKY",
+          "normalName": "ocaml-temporal-history-corpus"
+        },
+        "startToCloseTimeout": "10s",
+        "attempt": 1
+      }
+    },
+    {
+      "eventId": "25",
+      "eventTime": "2026-10-11T07:41:26.730846504Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_STARTED",
+      "taskId": "1048777",
+      "workflowTaskStartedEventAttributes": {
+        "scheduledEventId": "24",
+        "identity": "history-corpus-corpus-lifecycle-deprecated",
+        "requestId": "88768e7b-60ff-4e36-906f-87d4da79307a",
+        "historySizeBytes": "3443",
+        "workerVersion": {
+          "buildId": "ocaml-temporal"
+        }
+      }
+    },
+    {
+      "eventId": "26",
+      "eventTime": "2026-10-11T07:41:26.739665588Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_COMPLETED",
+      "taskId": "1048781",
+      "workflowTaskCompletedEventAttributes": {
+        "scheduledEventId": "24",
+        "startedEventId": "25",
+        "identity": "history-corpus-corpus-lifecycle-deprecated",
+        "workerVersion": {
+          "buildId": "ocaml-temporal"
+        },
+        "sdkMetadata": {},
+        "meteringMetadata": {}
+      }
+    },
+    {
+      "eventId": "27",
+      "eventTime": "2026-10-11T07:41:26.745533421Z",
+      "eventType": "EVENT_TYPE_CHILD_WORKFLOW_EXECUTION_COMPLETED",
+      "taskId": "1048783",
+      "childWorkflowExecutionCompletedEventAttributes": {
+        "result": {
+          "payloads": [
+            {
+              "metadata": {
+                "encoding": "anNvbi9wbGFpbg=="
+              },
+              "data": "IkNISUxELU5FVzpkZXByZWNhdGVkIg=="
+            }
+          ]
+        },
+        "namespace": "temporal-sdk-test",
+        "namespaceId": "f9899138-8348-425b-b026-6e643e1aa6c0",
+        "workflowExecution": {
+          "workflowId": "history-corpus-lifecycle-child-deprecated",
+          "runId": "01a129e8-d345-72e1-9c3b-30c0f93838d4"
+        },
+        "workflowType": {
+          "name": "corpus.lifecycle.child_new"
+        },
+        "initiatedEventId": "22",
+        "startedEventId": "23"
+      }
+    },
+    {
+      "eventId": "28",
+      "eventTime": "2026-10-11T07:41:26.745540463Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_SCHEDULED",
+      "taskId": "1048784",
+      "workflowTaskScheduledEventAttributes": {
+        "taskQueue": {
+          "name": "history-corpus-corpus-lifecycle-deprecated-27c03bfdb4a34246be840b70d6e07980",
+          "kind": "TASK_QUEUE_KIND_STICKY",
+          "normalName": "ocaml-temporal-history-corpus"
+        },
+        "startToCloseTimeout": "10s",
+        "attempt": 1
+      }
+    },
+    {
+      "eventId": "29",
+      "eventTime": "2026-10-11T07:41:26.747241504Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_STARTED",
+      "taskId": "1048788",
+      "workflowTaskStartedEventAttributes": {
+        "scheduledEventId": "28",
+        "identity": "history-corpus-corpus-lifecycle-deprecated",
+        "requestId": "2b97efaf-e72d-4443-b3f6-67465e38d9b5",
+        "historySizeBytes": "4071",
+        "workerVersion": {
+          "buildId": "ocaml-temporal"
+        }
+      }
+    },
+    {
+      "eventId": "30",
+      "eventTime": "2026-10-11T07:41:26.759967296Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_COMPLETED",
+      "taskId": "1048792",
+      "workflowTaskCompletedEventAttributes": {
+        "scheduledEventId": "28",
+        "startedEventId": "29",
+        "identity": "history-corpus-corpus-lifecycle-deprecated",
+        "workerVersion": {
+          "buildId": "ocaml-temporal"
+        },
+        "sdkMetadata": {},
+        "meteringMetadata": {}
+      }
+    },
+    {
+      "eventId": "31",
+      "eventTime": "2026-10-11T07:41:26.759984046Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_EXECUTION_COMPLETED",
+      "taskId": "1048793",
+      "workflowExecutionCompletedEventAttributes": {
+        "result": {
+          "payloads": [
+            {
+              "metadata": {
+                "encoding": "anNvbi9wbGFpbg=="
+              },
+              "data": "Ik5FVzpkZXByZWNhdGVkfENISUxELU5FVzpkZXByZWNhdGVkIg=="
+            }
+          ]
+        },
+        "workflowTaskCompletedEventId": "30"
+      }
+    }
+  ]
+}
