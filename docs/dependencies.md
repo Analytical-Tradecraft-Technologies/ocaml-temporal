@@ -312,7 +312,7 @@ the `license` field of `cargo metadata` for the locked version.
 |---|---|---|---|---|---|
 | base64 | 0.23.0 | 0.22.1, 0.23.1 | normal | MIT OR Apache-2.0 | Payload bytes in the private JSON control protocol |
 | flate2 | 1.1.10 | 1.1.10 | dev | MIT OR Apache-2.0 | Decodes gzip-compressed gRPC requests in the test server double |
-| h2 | 0.4.19 | 0.4.19 | dev | MIT | Plaintext HTTP/2 gRPC test server double |
+| h2 | 0.4.19 | 0.4.20 | dev | MIT | Plaintext HTTP/2 gRPC test server double |
 | http | 1.5.0 | 1.5.0 | dev | MIT OR Apache-2.0 | HTTP types for the test server double |
 | prost | 0.14.4 | 0.14.4 | normal | Apache-2.0 | Protobuf encoding and decoding of Temporal API messages and replay histories |
 | serde | 1.0.228 | 1.0.229 | normal | MIT OR Apache-2.0 | Private control protocol data model |
