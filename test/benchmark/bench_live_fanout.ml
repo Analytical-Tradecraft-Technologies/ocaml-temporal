@@ -280,27 +280,60 @@ module Attribution = struct
              ])
 end
 
+(** Terminates every execution in [handles] and waits for its terminal
+    result, so a failed sample cannot leave executions holding the worker's
+    single activity slot while later samples run. A termination the server
+    did not acknowledge (including one for an already closed execution) is
+    not waited on, because that wait might never end; the sample still fails
+    with its original error. *)
+let retire handles =
+  List.iter
+    (fun handle ->
+      match Client.terminate ~reason:"benchmark sample failed" handle with
+      | Ok () -> ignore (Client.wait handle)
+      | Error _ -> ())
+    handles
+
+(** Requires one execution to complete with every activity result. *)
+let expect_fan_in handle =
+  match get "wait" (Client.wait handle) with
+  | Client.Completed { output; _ } when output = width -> ()
+  | Client.Completed { output; _ } ->
+      failwith (Printf.sprintf "fan-in returned %d results" output)
+  | _ -> failwith "fan-out execution did not complete"
+
 (** Starts every execution of one sample, then waits for each terminal
     result. Waiting in start order is sufficient: the executions progress on
     the server concurrently, and the sample ends when the last one is
-    observed. *)
+    observed. If a start or a check fails, every execution already admitted
+    and not yet observed is retired before the failure propagates, so the
+    next sample starts with an idle worker. *)
 let run_sample ~client ~task_queue ~next_id () =
-  let handles =
-    List.init concurrency (fun index ->
-        incr next_id;
-        get "start"
-          (Client.start client ~workflow ~task_queue
-             ~id:(Printf.sprintf "%s-%d-%d" task_queue !next_id index)
-             ~input:plan ()))
+  let rec start admitted index =
+    if index = concurrency then List.rev admitted
+    else begin
+      incr next_id;
+      match
+        Client.start client ~workflow ~task_queue
+          ~id:(Printf.sprintf "%s-%d-%d" task_queue !next_id index)
+          ~input:plan ()
+      with
+      | Ok handle -> start (handle :: admitted) (index + 1)
+      | Error error ->
+          retire admitted;
+          failwith ("start: " ^ Error.message error)
+    end
   in
-  List.iter
-    (fun handle ->
-      match get "wait" (Client.wait handle) with
-      | Client.Completed { output; _ } when output = width -> ()
-      | Client.Completed { output; _ } ->
-          failwith (Printf.sprintf "fan-in returned %d results" output)
-      | _ -> failwith "fan-out execution did not complete")
-    handles
+  let rec await = function
+    | [] -> ()
+    | handle :: rest -> (
+        match expect_fan_in handle with
+        | () -> await rest
+        | exception failure ->
+            retire rest;
+            raise failure)
+  in
+  await (start [] 0)
 
 (** Runs the attribution pass and derives the summary. Durations are
     reported per unit (one sample of [concurrency] executions). *)
@@ -384,14 +417,23 @@ let make_workload _config =
     Printf.sprintf "bench-live-fanout-%d-%d" (Unix.getpid ())
       (Random.State.bits (Random.State.make_self_init ()))
   in
+  (* The client is created first: it owns no Domain, so a worker creation
+     failure needs only the client shut down, and the worker's run Domain is
+     spawned once both handles exist. Nothing after the spawn can fail before
+     the harness receives [close]. *)
+  let client = get "client create" (Client.create ~target_url ~namespace ()) in
   let worker =
-    get "worker create"
-      (Worker.create ~target_url ~namespace ~task_queue
-         ~workflows:[ Worker.workflow workflow ]
-         ~activities:[ Worker.activity echo ] ())
+    match
+      Worker.create ~target_url ~namespace ~task_queue
+        ~workflows:[ Worker.workflow workflow ]
+        ~activities:[ Worker.activity echo ] ()
+    with
+    | Ok worker -> worker
+    | Error error ->
+        ignore (Client.shutdown client);
+        failwith ("worker create: " ^ Error.message error)
   in
   let running = Domain.spawn (fun () -> Worker.run worker) in
-  let client = get "client create" (Client.create ~target_url ~namespace ()) in
   let next_id = ref 0 in
   let sample () = run_sample ~client ~task_queue ~next_id () in
   let close () =
