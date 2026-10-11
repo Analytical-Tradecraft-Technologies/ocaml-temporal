@@ -51,9 +51,11 @@ if ! comparison=$(gh api "repos/$repo/compare/$pin...$release" \
   echo "could not compare $repo $pin with $release" >&2
   exit 2
 fi
-set -- $comparison
-status=${1:-}
-ahead_by=${2:-}
+# The compare API answers "<status> <ahead_by> <behind_by>"; split it with read
+# rather than unquoted word splitting so no field can glob-expand.
+read -r status ahead_by _behind_by <<COMPARISON
+$comparison
+COMPARISON
 
 short_pin=$(printf '%.12s' "$pin")
 short_release=$(printf '%.12s' "$release")

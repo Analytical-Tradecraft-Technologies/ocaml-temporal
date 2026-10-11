@@ -42,10 +42,10 @@ printf 'temporalio-sdk-core = { git = "https://example.invalid/sdk.git", rev = "
 # its report in $scratch/out for content checks.
 run() {
   set +e
-  PATH="$scratch/bin:$PATH" CORE_UPSTREAM_REPO=upstream/sdk STUB_RELEASE=$release \
-    STUB_COMPARE=$1 STUB_FAIL=${2:-never-matches} \
+  PATH="$scratch/bin:$PATH" CORE_UPSTREAM_REPO=upstream/sdk STUB_RELEASE="$release" \
+    STUB_COMPARE="$1" STUB_FAIL="${2:-never-matches}" \
     sh "$script" "$scratch/root" > "$scratch/out" 2> "$scratch/err"
-  echo $?
+  echo "$?"
   set -e
 }
 
