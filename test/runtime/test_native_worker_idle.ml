@@ -7,6 +7,15 @@
     readiness wait runs queues behind it, as it does in the native mailbox.
     Every test wait has a deadline so a lost wake fails promptly. *)
 
+(** Seconds on the native monotonic clock. The simulated server round trips
+    are sub-millisecond, and [Unix.gettimeofday] advances in about 15.6 ms
+    ticks on Windows, which turned each 0.5 ms round trip into a full tick
+    and inflated the yields the lanes requested; the bridge's monotonic clock
+    has sub-microsecond resolution on every supported platform. *)
+let now () =
+  Int64.to_float (Temporal_core_bridge.Native_bridge.monotonic_now_ns ())
+  /. 1e9
+
 module Loop = Temporal_runtime.Native_worker_loop
 module Idle = Temporal_runtime.Native_worker_idle
 
@@ -16,9 +25,9 @@ let check label condition = if not condition then failwith label
 (** Waits for a cross-Domain observation with a test-only deadline. Sleeps in
     short slices so the observed Domains keep their CPU. *)
 let await label predicate =
-  let deadline = Unix.gettimeofday () +. 5. in
+  let deadline = now () +. 5. in
   while not (predicate ()) do
-    if Unix.gettimeofday () >= deadline then
+    if now () >= deadline then
       failwith ("timed out waiting for " ^ label);
     Thread.delay 0.0001
   done
@@ -111,7 +120,7 @@ let test_early_join_poll_restarts_backoff () =
   check "backoff continues after the wait" (Idle.next_delay sibling = 0.008)
 
 (** A fake supervisor with one owner mutex and per-lane task visibility
-    times. A lane has a task when [Unix.gettimeofday] has reached its
+    times. A lane has a task when [now] has reached its
     [visible_at]; [infinity] means none. [on_take] runs inside the owner when
     a poll takes a task and returns the next visibility time of the other
     lane's task, or [None] to leave it unchanged.
@@ -193,7 +202,7 @@ let fake_poll fake ~workflow_lane =
         if workflow_lane then (fake.workflow_at, fake.activity_at)
         else (fake.activity_at, fake.workflow_at)
       in
-      if Unix.gettimeofday () >= Atomic.get mine then begin
+      if now () >= Atomic.get mine then begin
         Atomic.set fake.taken_after
           (Atomic.get fake.empty_polls.(i), Atomic.get fake.sleeps.(i));
         Atomic.set mine infinity;
@@ -223,12 +232,12 @@ let fake_wait fake ~workflow_lane =
   end;
   with_owner fake (fun () ->
       ignore (Atomic.fetch_and_add fake.native_waits 1);
-      let deadline = Unix.gettimeofday () +. Atomic.get fake.wait_timeout_s in
+      let deadline = now () +. Atomic.get fake.wait_timeout_s in
       let ready () =
-        let now = Unix.gettimeofday () in
+        let now = now () in
         now >= Atomic.get fake.workflow_at || now >= Atomic.get fake.activity_at
       in
-      while (not (ready ())) && Unix.gettimeofday () < deadline do
+      while (not (ready ())) && now () < deadline do
         Thread.delay 0.00005
       done;
       Ok (ready ()))
@@ -295,10 +304,10 @@ let publish_and_take fake ~workflow_lane =
   let i = lane_index ~workflow_lane in
   let cell = if workflow_lane then fake.workflow_at else fake.activity_at in
   let before = (Atomic.get fake.empty_polls.(i), Atomic.get fake.sleeps.(i)) in
-  let published = Unix.gettimeofday () in
+  let published = now () in
   Atomic.set cell published;
   await "the ready task to be taken" (fun () -> Atomic.get cell = infinity);
-  let latency = Unix.gettimeofday () -. published in
+  let latency = now () -. published in
   if Atomic.get fake.taken_after <> before then
     failwith "ready task was taken only after an extra poll or local yield";
   latency
@@ -381,25 +390,25 @@ let test_serial_chain_avoids_fixed_sleep () =
         Atomic.set closed true;
         None
       end
-      else Some (Unix.gettimeofday () +. rtt_s)
+      else Some (now () +. rtt_s)
     else begin
       ignore (Atomic.fetch_and_add activities 1);
-      Some (Unix.gettimeofday () +. rtt_s)
+      Some (now () +. rtt_s)
     end
   in
   let fake = make_fake ~closed ~on_take () in
-  let started = Unix.gettimeofday () in
+  let started = now () in
   Atomic.set fake.workflow_at started;
   let runner = Domain.spawn (fun () -> run_fake fake) in
   let observation =
     try
-      let deadline = Unix.gettimeofday () +. 60. in
+      let deadline = now () +. 60. in
       while not (Atomic.get fake.closed) do
-        if Unix.gettimeofday () >= deadline then
+        if now () >= deadline then
           failwith "timed out waiting for serial chain completion";
         Thread.delay 0.001
       done;
-      Ok (Unix.gettimeofday () -. started)
+      Ok (now () -. started)
     with exception_ -> Error exception_
   in
   let elapsed = finish fake runner observation in
@@ -447,12 +456,12 @@ let test_stop_while_idle_is_bounded () =
   let fake = make_fake () in
   let runner = Domain.spawn (fun () -> run_fake fake) in
   Thread.delay 0.2;
-  let stopped = Unix.gettimeofday () in
+  let stopped = now () in
   Atomic.set fake.closed true;
   (match Domain.join runner with
   | Ok () -> ()
   | Error () -> failwith "stopped idle fixture returned an error");
-  let elapsed = Unix.gettimeofday () -. stopped in
+  let elapsed = now () -. stopped in
   Printf.printf "idle stop returned in %.1f ms\n%!" (elapsed *. 1000.);
   if elapsed >= 1. then
     failwith (Printf.sprintf "idle stop took %.0f ms" (elapsed *. 1000.))

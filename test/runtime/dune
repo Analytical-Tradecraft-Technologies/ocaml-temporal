@@ -32,4 +32,4 @@
   test_execution_info
   test_thread_context_isolation
   test_race_matrix)
- (libraries temporal-sdk temporal_runtime unix))
+ (libraries temporal-sdk temporal_runtime temporal_core_bridge unix))

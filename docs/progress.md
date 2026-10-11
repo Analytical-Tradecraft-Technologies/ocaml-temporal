@@ -15,6 +15,19 @@ implementation when a later entry documents that work as complete. The
 records the current tested source, named assertions and successful CI job for
 the Temporal acceptance controllers.
 
+## 2026-10-12: Idle-pacing test uses the monotonic clock (#994 follow-up)
+
+`test/runtime/test_native_worker_idle.ml` simulated sub-millisecond server
+round trips with `Unix.gettimeofday`, which advances in coarse ticks on
+Windows. Each 0.5 ms round trip therefore lasted a whole tick there, the lanes
+backed off further while waiting, and the serial-chain check failed on the
+Windows x64 job ("serial step requested 6.42 ms of yields on average").
+The test now reads the bridge's monotonic clock
+(`Native_bridge.monotonic_now_ns`), so the simulated latency is what the test
+intends on every platform. On macOS three consecutive runs of
+`@test/runtime/runtest` reported 0.200 ms of requested yields per step, well
+below the 5 ms bound; production code is unchanged.
+
 ## 2026-10-12: Adaptive idle pacing between worker lane polls (#994)
 
 The live fan-out benchmark (#528) found that the fixed 10 ms local yield in
