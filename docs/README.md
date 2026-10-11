@@ -208,7 +208,10 @@ intentionally separate from the OCaml-version matrix and runs in containers.
 Make passes `DUNE_JOBS` to every Dune build, test, and `dune exec` it runs.
 It defaults to 2 locally so concurrent native links fit a default Docker VM, and
 to Dune's automatic count when `CI` is set; use `DUNE_JOBS=1` on a smaller VM
-or `DUNE_JOBS=auto` to restore Dune's default (#851).
+or `DUNE_JOBS=auto` to restore Dune's default (#851). Make exports a non-empty
+`DUNE_JOBS`, which Dune reads from its environment, and the fixture's `dev`
+Compose service passes it through, so nested Dune builds in test scripts and
+long-lived worker containers are bounded too.
 For the real server smoke, the Makefile owns Compose project selection,
 readiness checks, failure logs, and volume cleanup; do not run the fixture's
 Compose file from the repository root.

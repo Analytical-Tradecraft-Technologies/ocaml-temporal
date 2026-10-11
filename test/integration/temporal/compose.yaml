@@ -14,6 +14,11 @@ services:
       TEMPORAL_RUST_BRIDGE_DIR: ${TEMPORAL_RUST_BRIDGE_DIR:-}
       TEMPORAL_RUST_BRIDGE_KEY: ${TEMPORAL_RUST_BRIDGE_KEY:-}
       TEMPORAL_PREBUILT_SMOKE: ${TEMPORAL_PREBUILT_SMOKE:-0}
+      # Dune's job limit (#851), which the Makefile exports only when it is
+      # non-empty. With no value here Compose copies it from the caller's
+      # environment and leaves it unset otherwise, because Dune rejects an
+      # empty DUNE_JOBS.
+      DUNE_JOBS:
     volumes:
       - ../../..:/workspace
     init: true

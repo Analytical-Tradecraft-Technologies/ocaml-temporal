@@ -65,6 +65,18 @@ HOST_GID ?= $(shell id -g)
 # DUNE_BUILD_ARGS (enforced by test/smoke/test_build_jobs_contract.sh).
 DUNE_JOBS ?= $(if $(strip $(CI)),auto,2)
 DUNE_BUILD_ARGS := $(if $(strip $(DUNE_JOBS)),-j $(DUNE_JOBS),)
+# Dune also reads DUNE_JOBS from its environment. Exporting the resolved limit
+# bounds the Dune processes that Make does not start itself: the nested builds
+# in the install, prebuilt-consumer and vendored-build scripts, and the
+# `dune exec` of long-lived Compose workers. The dev service in the Compose
+# file passes the variable through to every container that extends it. Dune
+# rejects an empty value, so an explicitly empty DUNE_JOBS is removed from
+# recipe environments instead.
+ifneq ($(strip $(DUNE_JOBS)),)
+export DUNE_JOBS
+else
+unexport DUNE_JOBS
+endif
 # Rust integration tests each link the Temporal Core graph into a separate test
 # executable. Serializing those links and disabling unused incremental state
 # keeps the peak disk/memory footprint bounded on hosted runners without

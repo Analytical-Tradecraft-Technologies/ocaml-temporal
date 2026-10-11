@@ -122,11 +122,14 @@ downstream applications to link without rebuilding the SDK.
 
 Every Dune build, test, and `dune exec` that the Makefile runs is bounded by
 `DUNE_JOBS`, because each test executable links the large Rust static library
-and parallel links can exhaust a Docker VM's memory. Local runs default to
+and parallel links can exhaust a Docker VM's memory. Make also exports the
+limit, so nested Dune builds in the install and vendored-build checks and the
+long-lived Compose worker containers use the same bound. Local runs default to
 `DUNE_JOBS=2`, chosen for an 8 GiB VM; CI keeps Dune's automatic job count.
-Use `make verify DUNE_JOBS=1` on a smaller VM, or `DUNE_JOBS=auto` to restore
-Dune's default on a large one. An explicit `CARGO_BUILD_JOBS` also bounds the
-Rust bridge build, which otherwise uses Cargo's default parallelism.
+On a 4-6 GiB VM, use `DUNE_JOBS=1 CARGO_BUILD_JOBS=2`, for example
+`make verify DUNE_JOBS=1 CARGO_BUILD_JOBS=2`; on a large one, `DUNE_JOBS=auto`
+restores Dune's default. An explicit `CARGO_BUILD_JOBS` bounds the Rust bridge
+build, which otherwise uses Cargo's default parallelism.
 
 ### Install from a source checkout
 

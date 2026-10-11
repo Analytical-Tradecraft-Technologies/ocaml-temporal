@@ -84,6 +84,58 @@ expect_jobs 'explicit local limit' 1
 CI=true dry_run DUNE_JOBS=3
 expect_jobs 'explicit CI limit' 3
 
+# Dune processes that Make does not start itself (the nested builds in the
+# install, prebuilt-consumer and vendored-build scripts, and long-lived Compose
+# workers' `dune exec`) read DUNE_JOBS from their environment. A probe target
+# appended to the Makefile prints the value its recipe receives; Dune rejects
+# an empty value, so an explicitly empty limit must arrive unset.
+cat >"$temporary_root/probe.mk" <<'PROBE'
+.PHONY: print-dune-jobs-environment
+print-dune-jobs-environment:
+	@printf '%s\n' "$${DUNE_JOBS-unset}"
+PROBE
+
+# Runs the probe recipe with CI set to the third argument and any remaining
+# arguments as Make command-line variables, and fails unless the recipe's
+# DUNE_JOBS matches the expected value.
+expect_exported() {
+  label=$1
+  expected=$2
+  ci_value=$3
+  shift 3
+  actual=$(CI="$ci_value" make --no-print-directory -s -C "$source_root" \
+    -f Makefile -f "$temporary_root/probe.mk" "$@" \
+    print-dune-jobs-environment) || {
+    echo "$label: probe recipe failed" >&2
+    exit 1
+  }
+  if [ "$actual" != "$expected" ]; then
+    echo "$label: recipes receive DUNE_JOBS=$actual, expected $expected" >&2
+    exit 1
+  fi
+}
+expect_exported 'exported local default' 2 ''
+expect_exported 'exported CI default' auto true
+expect_exported 'exported command-line limit' 1 '' DUNE_JOBS=1
+expect_exported 'empty command-line limit' unset '' DUNE_JOBS=
+expect_exported 'empty CI limit' unset true DUNE_JOBS=
+# Subshells keep these environment values away from the later probes.
+(DUNE_JOBS='' && export DUNE_JOBS && expect_exported 'empty environment limit' unset '')
+(DUNE_JOBS=3 && export DUNE_JOBS && expect_exported 'environment limit' 3 '')
+
+# Compose copies the exported value into every service that extends dev, which
+# includes `compose run` containers and the long-lived workers. The key must
+# have no value: an interpolated default would hand Dune an empty string.
+compose_file=$source_root/test/integration/temporal/compose.yaml
+tr -d '\015' <"$compose_file" | awk '
+  /^  [[:alnum:]_-]+:/ { in_dev = ($1 == "dev:") }
+  in_dev && /^      DUNE_JOBS:[[:space:]]*$/ { found = 1 }
+  END { exit !found }
+' || {
+  echo "$compose_file: dev service does not pass DUNE_JOBS through" >&2
+  exit 1
+}
+
 # Cargo's test-only serial default must not slow the bridge build, while an
 # explicit CARGO_BUILD_JOBS is passed into every Compose container, so it
 # reaches the Cargo build that Dune's bridge rule, `make build`, executable
