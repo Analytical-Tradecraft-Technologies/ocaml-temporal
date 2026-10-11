@@ -14,7 +14,7 @@
 //! 2. Every worker thread concurrently attaches graphs to those shared
 //!    handles (the ABI permits concurrent attaches) and may also create a
 //!    graph with its own Core.
-//! 3. A barrier releases all threads together. The coordinator then frees or
+//! 3. A start gate releases all threads together. The coordinator then frees or
 //!    GC-disposes the shared handles at a seeded moment while the threads
 //!    start replay workers, feed histories, lease and complete activations,
 //!    finish input, finalize, dispose replay workers, and release their
@@ -22,8 +22,12 @@
 //!    sometimes with a lease still held.
 //!
 //! Every call must return a documented status and never `STATUS_PANIC`,
-//! `STATUS_INTERNAL`, or `STATUS_INVALID_ARGUMENT` on a live handle. A round
-//! that does not finish within its deadline is reported as a hang. After
+//! `STATUS_INTERNAL`, or `STATUS_INVALID_ARGUMENT` on a live handle. The
+//! round deadline starts before any thread is spawned and bounds setup, the
+//! start gate, and the run: a thread that hangs or panics during setup aborts
+//! the round promptly instead of stalling the others, and a round that does
+//! not finish in time is reported as a hang. A second test injects a setup
+//! hang and a setup panic to prove that path. After
 //! the last round the process-wide counters must converge: every runtime
 //! graph cleaned exactly once and every Core runtime (owned or shared)
 //! dropped exactly once, whichever holder released it last.
@@ -36,9 +40,10 @@ use std::{
     collections::BTreeMap,
     fmt::Write as _,
     fs,
+    panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
     ptr,
-    sync::{Arc, Barrier, Mutex, mpsc},
+    sync::{Arc, Condvar, Mutex, MutexGuard, mpsc},
     thread,
     time::{Duration, Instant},
 };
@@ -78,8 +83,20 @@ const DEFAULT_GRAPHS: usize = 3;
 const SHARED_PER_ROUND: usize = 2;
 /// Tokio worker threads of each shared runtime.
 const SHARED_WORKER_THREADS: u32 = 2;
-/// Longest a round may take before it is reported as a hang.
+/// Longest a round, from before its threads are spawned to the last report,
+/// may take before it is reported as a hang.
 const ROUND_DEADLINE: Duration = Duration::from_secs(180);
+/// Time an aborted round allows the other threads to release their graphs.
+const ABORT_GRACE: Duration = Duration::from_secs(30);
+
+/// Serializes the two tests in this binary: the cleanup counters are
+/// process-wide, so the fault-injection round must not overlap the stress.
+static SERIAL: Mutex<()> = Mutex::new(());
+
+/// Acquires [`SERIAL`] even after the other test panicked.
+fn serial() -> MutexGuard<'static, ()> {
+    SERIAL.lock().unwrap_or_else(|poison| poison.into_inner())
+}
 /// Longest the cleanup counters may take to converge after the last round.
 const CLEANUP_DEADLINE: Duration = Duration::from_secs(60);
 /// Pump iterations a full drain may use before it is reported as stuck.
@@ -224,12 +241,12 @@ impl Script {
 }
 
 /// Raw shared-runtime handle; the coordinator alone releases it, and worker
-/// threads only attach before the barrier.
+/// threads only attach before the start gate opens.
 #[derive(Clone, Copy)]
 struct SharedHandle(*const SharedRuntime);
 
 // SAFETY: concurrent attaches on one live shared handle are permitted by the
-// ABI, and the barrier orders every attach before the coordinator's release.
+// ABI, and the start gate orders every attach before the coordinator's release.
 unsafe impl Send for SharedHandle {}
 // SAFETY: as above; only attaches read through shared references.
 unsafe impl Sync for SharedHandle {}
@@ -488,22 +505,147 @@ struct ThreadReport {
     trace: Trace,
 }
 
-/// Attaches `count` graphs to the shared handles (or creates owned ones),
-/// waits at the barrier, then runs every graph's script with seeded
+/// Messages a worker thread sends to the coordinator. Every send ignores a
+/// closed channel, because the coordinator may already have given up.
+enum Event {
+    /// Setup finished; `owned` of the thread's graphs built their own Core.
+    Ready { owned: usize },
+    /// The thread finished, failed, or panicked. A thread that never became
+    /// ready sends only this.
+    Done(ThreadReport),
+}
+
+/// State of the start gate that replaces a blocking barrier.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GateState {
+    /// The coordinator is still collecting `Ready` events.
+    Waiting,
+    /// Every thread is ready and no attach can still be running.
+    Go,
+    /// Setup failed or timed out; threads stop creating graphs, release
+    /// what they hold, and report.
+    Abort,
+}
+
+/// Start gate shared by the coordinator and its worker threads. Unlike
+/// `std::sync::Barrier`, every wait is bounded by the round deadline and the
+/// coordinator can abort it, so a thread that hangs or panics during setup
+/// cannot stall the others.
+struct Gate {
+    state: Mutex<GateState>,
+    changed: Condvar,
+}
+
+impl Gate {
+    /// Creates a closed gate.
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(GateState::Waiting),
+            changed: Condvar::new(),
+        }
+    }
+
+    /// Opens (`Go`) or aborts the gate and wakes every waiter. An abort is
+    /// final; a later `Go` cannot reopen it.
+    fn set(&self, next: GateState) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if *state != GateState::Abort {
+            *state = next;
+        }
+        self.changed.notify_all();
+    }
+
+    /// Current state without waiting.
+    fn get(&self) -> GateState {
+        *self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    /// Waits until the gate leaves `Waiting` or `deadline` passes; a
+    /// timeout is reported as `Abort`.
+    fn wait(&self, deadline: Instant) -> GateState {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        while *state == GateState::Waiting {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return GateState::Abort;
+            }
+            state = self
+                .changed
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(|poison| poison.into_inner())
+                .0;
+        }
+        *state
+    }
+}
+
+/// Test-only fault injected into one worker's setup, so the deadline
+/// handling itself is tested. The ordinary stress never injects anything.
+#[derive(Clone, Copy, Debug)]
+enum SetupFault {
+    /// The thread sleeps for this long before creating any graph.
+    Hang(usize, Duration),
+    /// The thread panics before creating any graph.
+    Panic(usize),
+}
+
+/// Fixed inputs of one round.
+#[derive(Clone, Copy)]
+struct RoundPlan {
+    seed: u64,
+    round: usize,
+    threads: usize,
+    graphs: usize,
+    /// Whole-round budget, measured from before the threads are spawned.
+    deadline: Duration,
+    /// Extra time after an abort for the remaining threads to release their
+    /// graphs and report, so the shared handles can be released safely.
+    grace: Duration,
+    fault: Option<SetupFault>,
+    /// Whether a failure writes a report file; the fault-injection test
+    /// keeps its expected failures out of the CI artifact directory.
+    write_reports: bool,
+}
+
+/// Creates the thread's graphs (or stops early on an abort), reports
+/// readiness, waits at the gate, then runs every graph's script with seeded
 /// interleaving.
 fn worker(
     thread: usize,
     mut rng: Rng,
     shared: Vec<SharedHandle>,
-    graphs: usize,
-    barrier: Arc<Barrier>,
-    owned_cores: mpsc::Sender<usize>,
+    plan: RoundPlan,
+    gate: &Gate,
+    deadline: Instant,
+    events: &mpsc::Sender<Event>,
 ) -> ThreadReport {
+    match plan.fault {
+        Some(SetupFault::Hang(target, duration)) if target == thread => thread::sleep(duration),
+        Some(SetupFault::Panic(target)) if target == thread => {
+            panic!("injected setup panic in thread {thread}")
+        }
+        _ => {}
+    }
     let mut trace = Trace::default();
     let mut live: Vec<Graph> = Vec::new();
     let mut owned = 0;
     let mut setup_error = None;
-    for _ in 0..graphs {
+    for _ in 0..plan.graphs {
+        // An aborted round must not attach any more: the coordinator may
+        // release the shared handles as soon as every thread has reported.
+        if gate.get() == GateState::Abort {
+            setup_error = Some("setup aborted by the coordinator".to_owned());
+            break;
+        }
         let mut runtime: *mut Runtime = ptr::null_mut();
         let mut result = AbiResult::default();
         // One graph in four builds its own Core; the rest attach.
@@ -513,8 +655,9 @@ fn worker(
             unsafe { ocaml_temporal_core_v4_runtime_new(&mut runtime, &mut result) }
         } else {
             let handle = shared[rng.below(shared.len())];
-            // SAFETY: the handle is live until the barrier, and concurrent
-            // attaches on one handle are permitted.
+            // SAFETY: the coordinator releases a shared handle only after
+            // every thread is ready or has reported, so the handle is live;
+            // concurrent attaches on one handle are permitted.
             unsafe {
                 ocaml_temporal_core_v4_runtime_new_attached(handle.0, &mut runtime, &mut result)
             }
@@ -537,13 +680,23 @@ fn worker(
             fed: false,
         });
     }
-    owned_cores.send(owned).expect("coordinator is listening");
-    barrier.wait();
     if let Some(error) = setup_error {
         release_all(&mut live, &mut trace);
         return ThreadReport {
             thread,
             error: Some(error),
+            trace,
+        };
+    }
+    let _ = events.send(Event::Ready { owned });
+    // The coordinator always opens or aborts the gate by the deadline; the
+    // extra grace keeps this thread's own timeout from racing that decision,
+    // so it fires only if the coordinator itself is gone.
+    if gate.wait(deadline + plan.grace) != GateState::Go {
+        release_all(&mut live, &mut trace);
+        return ThreadReport {
+            thread,
+            error: Some("start gate aborted or timed out".to_owned()),
             trace,
         };
     }
@@ -599,14 +752,63 @@ fn write_report(seed: u64, round: usize, text: &str) -> PathBuf {
     path
 }
 
-/// Runs one round and returns the number of Core runtimes it created.
-fn run_round(
-    seed: u64,
-    round: usize,
-    threads: usize,
-    graphs: usize,
-    outcomes: &mut BTreeMap<String, usize>,
-) -> u64 {
+/// Adds one thread's outcome counts to the round totals and its failure,
+/// if any, to `failures`.
+fn absorb(report: ThreadReport, failures: &mut String, outcomes: &mut BTreeMap<String, usize>) {
+    for (outcome, count) in &report.trace.outcomes {
+        *outcomes.entry(outcome.clone()).or_default() += count;
+    }
+    describe(failures, &report);
+}
+
+/// Appends one thread's failure and trace to `failures`.
+fn describe(failures: &mut String, report: &ThreadReport) {
+    if let Some(error) = &report.error {
+        let _ = writeln!(failures, "thread {}: {error}", report.thread);
+        for line in &report.trace.lines {
+            let _ = writeln!(failures, "  {line}");
+        }
+    }
+}
+
+/// Releases the round's shared handles at the coordinator.
+fn release_shared(shared: &mut [*mut SharedRuntime], rng: &mut Rng) {
+    for handle in shared {
+        let dispose = rng.below(2) == 0;
+        // SAFETY: the coordinator owns the slot, and the caller guarantees no
+        // attach can still be running on it.
+        let status = unsafe {
+            if dispose {
+                ocaml_temporal_core_v4_shared_runtime_dispose(handle)
+            } else {
+                ocaml_temporal_core_v4_shared_runtime_free(handle)
+            }
+        };
+        assert_eq!(status, STATUS_OK, "shared release (dispose={dispose})");
+        assert!(handle.is_null(), "shared release clears the slot");
+    }
+}
+
+/// Runs one round. Returns the number of Core runtimes it created, or a
+/// report (also written to disk) when a thread failed, panicked, or missed
+/// the deadline.
+///
+/// The deadline starts before any thread is spawned and bounds setup, the
+/// start gate, and the run. If setup fails or times out, the gate is
+/// aborted and the coordinator waits at most `grace` longer for the other
+/// threads to release their graphs. It releases the shared handles only
+/// when every thread has reported, because a hung thread might still be
+/// inside `runtime_new_attached` on them; otherwise the handles are leaked
+/// and the report says so.
+fn run_round(plan: RoundPlan, outcomes: &mut BTreeMap<String, usize>) -> Result<u64, String> {
+    let RoundPlan {
+        seed,
+        round,
+        threads,
+        ..
+    } = plan;
+    let started = Instant::now();
+    let deadline = started + plan.deadline;
     let mut rng = Rng::derive(seed, u64::try_from(round).expect("round fits u64"));
     let mut shared: Vec<*mut SharedRuntime> = Vec::new();
     for _ in 0..SHARED_PER_ROUND {
@@ -625,79 +827,157 @@ fn run_round(
         shared.push(handle);
     }
     let handles: Vec<SharedHandle> = shared.iter().map(|handle| SharedHandle(*handle)).collect();
-    let barrier = Arc::new(Barrier::new(threads + 1));
-    let (report_tx, report_rx) = mpsc::channel();
-    let (owned_tx, owned_rx) = mpsc::channel();
+    let gate = Arc::new(Gate::new());
+    let (events_tx, events_rx) = mpsc::channel();
     for thread in 0..threads {
         let thread_rng = Rng::derive(rng.next_u64(), u64::try_from(thread).expect("fits"));
         let handles = handles.clone();
-        let barrier = Arc::clone(&barrier);
-        let report_tx = report_tx.clone();
-        let owned_tx = owned_tx.clone();
+        let gate = Arc::clone(&gate);
+        let events = events_tx.clone();
         thread::Builder::new()
             .name(format!("concurrent-stress-{round}-{thread}"))
             .spawn(move || {
-                let report = worker(thread, thread_rng, handles, graphs, barrier, owned_tx);
-                // The coordinator may already have given up on a hang.
-                let _ = report_tx.send(report);
+                // A panic anywhere in the worker becomes a prompt failure
+                // report instead of a silent missing thread.
+                let report = catch_unwind(AssertUnwindSafe(|| {
+                    worker(thread, thread_rng, handles, plan, &gate, deadline, &events)
+                }))
+                .unwrap_or_else(|panic| ThreadReport {
+                    thread,
+                    error: Some(format!("thread panicked: {}", panic_text(panic.as_ref()))),
+                    trace: Trace::default(),
+                });
+                let _ = events.send(Event::Done(report));
             })
             .expect("spawn stress thread");
     }
-    drop(report_tx);
-    drop(owned_tx);
-    let owned: usize = owned_rx.iter().take(threads).sum();
-    barrier.wait();
+    drop(events_tx);
 
+    // Setup: wait, bounded by the deadline, until every thread is ready or
+    // has reported. Any early report is a failure and aborts the round.
+    let mut ready = 0;
+    let mut owned = 0;
+    let mut reported = 0;
+    let mut failures = String::new();
+    while ready + reported < threads {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match events_rx.recv_timeout(remaining) {
+            Ok(Event::Ready { owned: count }) => {
+                ready += 1;
+                owned += count;
+            }
+            Ok(Event::Done(report)) => {
+                reported += 1;
+                if report.error.is_none() {
+                    let _ = writeln!(
+                        failures,
+                        "thread {} finished before the gate",
+                        report.thread
+                    );
+                }
+                absorb(report, &mut failures, outcomes);
+                break;
+            }
+            Err(_) => {
+                let _ = writeln!(
+                    failures,
+                    "setup did not finish within {:?}: {ready} of {threads} threads ready",
+                    plan.deadline
+                );
+                break;
+            }
+        }
+    }
+
+    if !failures.is_empty() {
+        // Abort: ready threads release their graphs; a thread still in setup
+        // stops before its next attach. Collect reports within the grace.
+        gate.set(GateState::Abort);
+        let grace = Instant::now() + plan.grace;
+        while reported < threads {
+            let remaining = grace.saturating_duration_since(Instant::now());
+            match events_rx.recv_timeout(remaining) {
+                Ok(Event::Ready { .. }) => {}
+                Ok(Event::Done(report)) => {
+                    reported += 1;
+                    absorb(report, &mut failures, outcomes);
+                }
+                Err(_) => break,
+            }
+        }
+        if reported == threads {
+            release_shared(&mut shared, &mut rng);
+        } else {
+            let _ = writeln!(
+                failures,
+                "{} thread(s) never reported; the shared runtimes are leaked",
+                threads - reported
+            );
+        }
+        return Err(fail(plan, started, &failures));
+    }
+
+    gate.set(GateState::Go);
     // Release the shared handles at a seeded moment while the graphs run.
-    // Either path must leave Core alive for every attached graph.
+    // Every attach finished before its thread became ready.
     thread::sleep(Duration::from_millis(
         u64::try_from(rng.below(20)).expect("fits"),
     ));
-    for handle in &mut shared {
-        let dispose = rng.below(2) == 0;
-        // SAFETY: the coordinator owns the slot; every attach finished
-        // before the barrier, so no attach can race this release.
-        let status = unsafe {
-            if dispose {
-                ocaml_temporal_core_v4_shared_runtime_dispose(handle)
-            } else {
-                ocaml_temporal_core_v4_shared_runtime_free(handle)
-            }
-        };
-        assert_eq!(status, STATUS_OK, "shared release (dispose={dispose})");
-        assert!(handle.is_null(), "shared release clears the slot");
-    }
+    release_shared(&mut shared, &mut rng);
 
-    let deadline = Instant::now() + ROUND_DEADLINE;
-    let mut failures = String::new();
-    for _ in 0..threads {
+    while reported < threads {
         let remaining = deadline.saturating_duration_since(Instant::now());
-        let Ok(report) = report_rx.recv_timeout(remaining) else {
-            let path = write_report(seed, round, "round exceeded its deadline\n");
-            panic!(
-                "concurrent stress seed {seed:#x} round {round} hung for {ROUND_DEADLINE:?}; report {}",
-                path.display()
-            );
-        };
-        for (outcome, count) in &report.trace.outcomes {
-            *outcomes.entry(outcome.clone()).or_default() += count;
-        }
-        if let Some(error) = report.error {
-            let _ = writeln!(failures, "thread {}: {error}", report.thread);
-            for line in &report.trace.lines {
-                let _ = writeln!(failures, "  {line}");
+        match events_rx.recv_timeout(remaining) {
+            Ok(Event::Ready { .. }) => {}
+            Ok(Event::Done(report)) => {
+                reported += 1;
+                absorb(report, &mut failures, outcomes);
+            }
+            Err(_) => {
+                let _ = writeln!(
+                    failures,
+                    "round exceeded its {:?} deadline with {} thread(s) still running",
+                    plan.deadline,
+                    threads - reported
+                );
+                return Err(fail(plan, started, &failures));
             }
         }
     }
     if !failures.is_empty() {
-        let text = format!(
-            "seed {seed:#x} round {round} threads {threads} graphs {graphs}\n\
-             rerun: make native-test-concurrent-stress CONCURRENT_STRESS_SEED={seed:#x}\n{failures}"
-        );
-        let path = write_report(seed, round, &text);
-        panic!("{text}\nreport {}", path.display());
+        return Err(fail(plan, started, &failures));
     }
-    u64::try_from(owned + SHARED_PER_ROUND).expect("fits")
+    Ok(u64::try_from(owned + SHARED_PER_ROUND).expect("fits"))
+}
+
+/// Formats and writes a round failure report, returning its text.
+fn fail(plan: RoundPlan, started: Instant, failures: &str) -> String {
+    let RoundPlan {
+        seed,
+        round,
+        threads,
+        graphs,
+        ..
+    } = plan;
+    let text = format!(
+        "seed {seed:#x} round {round} threads {threads} graphs {graphs} after {:?}\n\
+         rerun: make native-test-concurrent-stress CONCURRENT_STRESS_SEED={seed:#x}\n{failures}",
+        started.elapsed()
+    );
+    if !plan.write_reports {
+        return text;
+    }
+    let path = write_report(seed, round, &text);
+    format!("{text}report {}", path.display())
+}
+
+/// Extracts the message of a caught panic payload.
+fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|text| (*text).to_owned())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "non-string panic payload".to_owned())
 }
 
 /// Source locations of every panic observed on any thread during the run,
@@ -741,10 +1021,11 @@ fn eventually(mut done: impl FnMut() -> bool) -> bool {
 }
 
 /// The seeded concurrent rounds, followed by the process-wide convergence
-/// checks. This file holds one test so no other test in the process can
-/// move the counters.
+/// checks. The only other test in this binary holds [`SERIAL`] too, so
+/// nothing else moves the counters while they are measured.
 #[test]
 fn concurrent_lifecycle_rounds_converge() {
+    let _serial = serial();
     record_panics();
     let seed = base_seed();
     let rounds = setting("CONCURRENT_STRESS_ROUNDS", DEFAULT_ROUNDS, 1..=10_000);
@@ -756,7 +1037,20 @@ fn concurrent_lifecycle_rounds_converge() {
     let mut cores = 0;
     let started = Instant::now();
     for round in 0..rounds {
-        cores += run_round(seed, round, threads, graphs, &mut outcomes);
+        let plan = RoundPlan {
+            seed,
+            round,
+            threads,
+            graphs,
+            deadline: ROUND_DEADLINE,
+            grace: ABORT_GRACE,
+            fault: None,
+            write_reports: true,
+        };
+        match run_round(plan, &mut outcomes) {
+            Ok(created) => cores += created,
+            Err(report) => panic!("{report}"),
+        }
     }
 
     // Every graph was released, so every graph's cleanup and every Core
@@ -831,5 +1125,58 @@ fn concurrent_lifecycle_rounds_converge() {
                 "default run never observed {required}"
             );
         }
+    }
+}
+
+/// A worker that hangs or panics during setup is reported within the round
+/// deadline instead of stalling the coordinator and the other threads at
+/// the start gate. The faults are injected only here; the ordinary stress
+/// never sets [`RoundPlan::fault`]. Every graph the healthy threads created
+/// is released and both shared runtimes are freed, so the round leaks
+/// nothing.
+#[test]
+fn setup_faults_are_reported_within_the_deadline() {
+    let _serial = serial();
+    let deadline = Duration::from_secs(1);
+    let hang = Duration::from_secs(3);
+    for (fault, expected, bound) in [
+        (
+            SetupFault::Hang(0, hang),
+            "setup did not finish within",
+            deadline + hang + Duration::from_secs(10),
+        ),
+        (
+            SetupFault::Panic(1),
+            "injected setup panic",
+            deadline + Duration::from_secs(10),
+        ),
+    ] {
+        let (created_before, cleaned_before) = test_runtime_cleanup_counts();
+        let plan = RoundPlan {
+            seed: DEFAULT_SEED,
+            round: 0,
+            threads: 3,
+            graphs: 2,
+            deadline,
+            grace: Duration::from_secs(30),
+            fault: Some(fault),
+            write_reports: false,
+        };
+        let started = Instant::now();
+        let report = run_round(plan, &mut BTreeMap::new())
+            .expect_err("an injected setup fault must fail the round");
+        let elapsed = started.elapsed();
+        assert!(report.contains(expected), "{fault:?} report: {report}");
+        assert!(!report.contains("leaked"), "{fault:?} leaked: {report}");
+        assert!(
+            elapsed < bound,
+            "{fault:?} took {elapsed:?}, bound {bound:?}"
+        );
+        let (created, cleaned) = test_runtime_cleanup_counts();
+        assert_eq!(
+            created - created_before,
+            cleaned - cleaned_before,
+            "{fault:?}: every graph created before the abort was released"
+        );
     }
 }

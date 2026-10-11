@@ -21,13 +21,15 @@ large budgets.
 | Rust | `activity-task`, `activity-completion`, `activity-heartbeat` | `activity_protocol::decode_*` | `Ok`, and the value re-encodes and decodes | `Err` |
 | Rust | `async-complete`, `async-heartbeat` | asynchronous-activity ABI calls | `STATUS_INVALID_STATE` (no client) | `STATUS_PROTOCOL` |
 | Rust | `client-start`, `-cancel`, `-terminate`, `-reset`, `-signal`, `-query`, `-update`, `-poll-update`, `-visibility`, `-wait` | client ABI calls on a runtime without a client | `STATUS_INVALID_STATE` | `STATUS_PROTOCOL` |
+| Rust | `start-ticket-poll`, `start-ticket-wait` | `client_poll_start_workflow_json`, `client_wait_start_workflow_json` (`client_protocol::decode_start_ticket`) on a runtime without a client | `STATUS_INVALID_STATE` | `STATUS_PROTOCOL` |
 | Rust | `client-config` | `client_connect_json` | `STATUS_CONNECTION` from the refusing port `127.0.0.1:1` | `STATUS_CONFIGURATION` |
 | Rust | `worker-config` | `replay_worker_start_json` (a real replay worker, disposed after each acceptance) | `STATUS_OK` | `STATUS_CONFIGURATION`, `STATUS_WORKER` |
 | Rust | `replay-history` | `replay_worker_feed_history_json` after `finish_input` | `STATUS_INVALID_STATE` (feeder closed, after Core's `HistoryInfo` gate) | `STATUS_PROTOCOL` |
-| OCaml | `control-envelope`, `control-payload` | `Control_protocol.decode`, `decode_payload` | `Ok`, and the value re-encodes and decodes | `Error` |
+| OCaml | `control-envelope`, `control-payload`, `control-payload-object` | `Control_protocol.decode`, `decode_payload`, `decode_payload_object` (also used directly to validate replay histories) | `Ok`, and the value re-encodes and decodes | `Error` |
 | OCaml | `workflow-activation`, `workflow-completion` | `Workflow_protocol.decode_*` | as above | `Error` |
 | OCaml | `activity-task`, `activity-completion`, `activity-heartbeat` | `Activity_protocol.decode_*` | as above | `Error` |
-| OCaml | every client response and error body (start, start outcome, ticket, cancel, terminate, signal, reset, query, visibility, update, poll update, wait, and the five error decoders) | `Client_protocol.decode_*` | `Ok` (start outcomes also re-encode) | `Error` |
+| OCaml | every client response and error body: start, start outcome, ticket, cancel, terminate, signal, reset, query, visibility, update, poll update, and wait responses, and all eight error decoders (generic, start, wait, cancel, reset, signal, query, update) | `Client_protocol.decode_*` | `Ok` (start outcomes also re-encode) | `Error` |
+| OCaml | `client-call` | `Native_bridge.parse_client_call`, the `<owner>.<call>` handle Rust returns from a submitted call | `Some`, and both parts are plain decimal digits | `None` |
 
 The Rust `worker-config` target uses the replay worker because a live worker
 checks for a client before semantic validation; both share one decoder and
@@ -57,6 +59,18 @@ decoders.
 
 A target also fails if no generated input reaches the rejection path. With the
 default seed and budget, Rust targets must also reach the accepted path.
+
+## Findings
+
+`Native_bridge.parse_client_call` documented that both parts of a call
+handle are positive decimal integers, but it parsed each part with
+`int_of_string_opt`, which also accepts a sign, `_` separators, and `0x`,
+`0o`, `0b`, and `0u` prefixes. `+1.2`, `0x1.2`, and `1.0b10` were therefore
+accepted, and several spellings could alias one handle. Each part must now
+be nonempty ASCII digits before conversion. The spellings are kept as
+`client-call/regressions/` seeds, and `test/bridge/test_ocaml_bridge.ml`
+asserts them. Rust only ever issues plain decimal handles, so no released
+behaviour depended on the old parse.
 
 ## Corpus
 
@@ -126,7 +140,7 @@ make test-decoder-fuzz            # Docker development container
 make native-test-decoder-fuzz DECODER_FUZZ_CASES=20000 DECODER_FUZZ_OCAML_CASES=20000 DECODER_FUZZ_SEED=0x1234
 ```
 
-The default budget runs all 18 Rust targets in under a second and all 24
+The default budget runs all 20 Rust targets in under a second and all 29
 OCaml targets in a few seconds. On an Apple M-series laptop 20,000 cases per
 Rust target (360,000 inputs) took about 80 seconds. The largest per-call peak
 seen in the Rust harness was about 0.74 MiB; the largest OCaml allocation for

@@ -200,7 +200,7 @@ In each round:
 2. Every worker thread concurrently attaches its graphs to those handles
    (the ABI permits concurrent attaches). One graph in four builds its own
    Core instead.
-3. A barrier releases the threads together. At a seeded moment the
+3. A start gate releases the threads together. At a seeded moment the
    coordinator releases each shared handle, through `shared_runtime_free` or
    the GC-fallback `shared_runtime_dispose`, while the threads keep working.
 
@@ -215,7 +215,16 @@ The test checks:
 - every call returns a documented status, and never `STATUS_PANIC`,
   `STATUS_INTERNAL`, or `STATUS_INVALID_ARGUMENT` on a live handle;
 - a released slot is null;
-- a round finishes within 180 seconds, or it is reported as a hang;
+- a round finishes within 180 seconds, or it is reported as a hang. The
+  deadline starts before the threads are spawned and bounds setup, the start
+  gate, and the run; no wait is unbounded. A thread that panics anywhere
+  reports at once through `catch_unwind`. If setup fails or times out, the
+  gate is aborted, the other threads release their graphs and report within
+  a 30-second grace, and the shared runtimes are released only once every
+  thread has reported (a hung thread might still be attaching). A second
+  test, `setup_faults_are_reported_within_the_deadline`, injects a setup hang
+  and a setup panic and checks that each is reported promptly and leaks
+  nothing; the ordinary stress never injects a fault;
 - after the last round, within 60 seconds, every graph has been cleaned
   exactly once and every Core runtime, owned or shared, has been dropped
   exactly once, whichever holder released it last;

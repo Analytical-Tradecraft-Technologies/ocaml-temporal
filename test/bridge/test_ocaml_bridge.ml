@@ -187,7 +187,23 @@ let () =
     (fun text ->
       if Bridge.parse_client_call text <> None then
         failwith ("malformed call handle accepted: " ^ text))
-    [ ""; "7"; "0.1"; "1.0"; "-1.2"; "1.2.3"; "a.b" ];
+    [
+      "";
+      "7";
+      "0.1";
+      "1.0";
+      "-1.2";
+      "1.2.3";
+      "a.b";
+      (* Non-decimal spellings int_of_string_opt would accept (#506). *)
+      "+1.2";
+      "0x1.2";
+      "1.0b1";
+      "0o7.1";
+      "0u5.1";
+      "1_0.2";
+      "1. 2";
+    ];
   List.iter
     (fun text ->
       match Bridge.parse_client_call text with

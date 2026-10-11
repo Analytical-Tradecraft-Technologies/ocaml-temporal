@@ -58,6 +58,7 @@ use ocaml_temporal_core_bridge::{
     ocaml_temporal_core_v4_client_cancel_workflow_json,
     ocaml_temporal_core_v4_client_complete_async_activity_json,
     ocaml_temporal_core_v4_client_connect_json, ocaml_temporal_core_v4_client_list_visibility_json,
+    ocaml_temporal_core_v4_client_poll_start_workflow_json,
     ocaml_temporal_core_v4_client_poll_update_workflow_json,
     ocaml_temporal_core_v4_client_query_workflow_json,
     ocaml_temporal_core_v4_client_record_async_activity_heartbeat_json,
@@ -66,6 +67,7 @@ use ocaml_temporal_core_bridge::{
     ocaml_temporal_core_v4_client_start_workflow_json,
     ocaml_temporal_core_v4_client_terminate_workflow_json,
     ocaml_temporal_core_v4_client_update_workflow_json,
+    ocaml_temporal_core_v4_client_wait_start_workflow_json,
     ocaml_temporal_core_v4_client_wait_workflow_json, ocaml_temporal_core_v4_replay_worker_dispose,
     ocaml_temporal_core_v4_replay_worker_feed_history_json,
     ocaml_temporal_core_v4_replay_worker_finish_input,
@@ -213,6 +215,10 @@ enum Target {
     ClientVisibility,
     /// Client exact-run wait request through the ABI.
     ClientWait,
+    /// Asynchronous-start ticket read by `client_poll_start_workflow_json`.
+    StartTicketPoll,
+    /// Asynchronous-start ticket read by `client_wait_start_workflow_json`.
+    StartTicketWait,
     /// Client connection configuration through the ABI.
     ClientConfig,
     /// Worker configuration, decoded and validated by a real replay worker.
@@ -240,7 +246,7 @@ enum Invocation {
 
 impl Target {
     /// Every target in a stable order.
-    const ALL: [Target; 18] = [
+    const ALL: [Target; 20] = [
         Target::ActivityTask,
         Target::ActivityCompletion,
         Target::ActivityHeartbeat,
@@ -256,6 +262,8 @@ impl Target {
         Target::ClientPollUpdate,
         Target::ClientVisibility,
         Target::ClientWait,
+        Target::StartTicketPoll,
+        Target::StartTicketWait,
         Target::ClientConfig,
         Target::WorkerConfig,
         Target::ReplayHistory,
@@ -279,6 +287,8 @@ impl Target {
             Self::ClientPollUpdate => "client-poll-update",
             Self::ClientVisibility => "client-visibility",
             Self::ClientWait => "client-wait",
+            Self::StartTicketPoll => "start-ticket-poll",
+            Self::StartTicketWait => "start-ticket-wait",
             Self::ClientConfig => "client-config",
             Self::WorkerConfig => "worker-config",
             Self::ReplayHistory => "replay-history",
@@ -286,11 +296,14 @@ impl Target {
     }
 
     /// Corpus directory; the asynchronous activity targets share the pure
-    /// decoders' documents because the ABI decodes them with the same code.
+    /// decoders' documents because the ABI decodes them with the same code,
+    /// and both start-ticket readers share the ticket documents that the
+    /// OCaml harness decodes on the other side of the boundary.
     fn corpus(self) -> &'static str {
         match self {
             Self::AsyncComplete => "activity-completion",
             Self::AsyncHeartbeat => "activity-heartbeat",
+            Self::StartTicketPoll | Self::StartTicketWait => "ocaml-client/start-ticket",
             other => other.name(),
         }
     }
@@ -349,6 +362,10 @@ impl Target {
             }
             Self::ClientVisibility => client(ocaml_temporal_core_v4_client_list_visibility_json),
             Self::ClientWait => client(ocaml_temporal_core_v4_client_wait_workflow_json),
+            // Both ticket readers decode the ticket before the client check,
+            // so an unconnected runtime never waits on a pending start.
+            Self::StartTicketPoll => client(ocaml_temporal_core_v4_client_poll_start_workflow_json),
+            Self::StartTicketWait => client(ocaml_temporal_core_v4_client_wait_start_workflow_json),
             // A document that passes decoding and validation reaches Core's
             // connect against the refusing loopback port.
             Self::ClientConfig => Invocation::Abi {
@@ -1308,6 +1325,8 @@ fuzz_tests! {
     fuzz_client_poll_update => Target::ClientPollUpdate,
     fuzz_client_visibility => Target::ClientVisibility,
     fuzz_client_wait => Target::ClientWait,
+    fuzz_start_ticket_poll => Target::StartTicketPoll,
+    fuzz_start_ticket_wait => Target::StartTicketWait,
     fuzz_client_config => Target::ClientConfig,
     fuzz_worker_config => Target::WorkerConfig,
     fuzz_replay_history => Target::ReplayHistory,

@@ -2,9 +2,10 @@
     (issue #506).
 
     These decoders read every document the Rust bridge returns: control
-    envelopes and payloads, workflow activations and completions, activity
-    tasks, completions and heartbeats, and every client response and error
-    body. Each target owns one or more corpus directories under
+    envelopes, payloads and payload objects, workflow activations and
+    completions, activity tasks, completions and heartbeats, every client
+    response, every operation-specific client error decoder, and the
+    submitted-call handle. Each target owns one or more corpus directories under
     [fixtures/]. The harness mutates their documents with a seeded stream of
     structural operators and requires, for every input:
 
@@ -24,6 +25,7 @@ module Control = Temporal_protocol.Control_protocol
 module Workflow = Temporal_protocol.Workflow_protocol
 module Activity = Temporal_protocol.Activity_protocol
 module Client = Temporal_protocol.Client_protocol
+module Bridge = Temporal_core_bridge.Native_bridge
 
 (** Default number of generated cases per target in the ordinary test run. *)
 let default_cases = 96
@@ -438,6 +440,36 @@ let targets =
       strict = false };
     { (client "update-error" errors (fun input -> ok (Client.decode_update_error input))) with
       strict = false };
+    { (client "cancel-error" errors (fun input -> ok (Client.decode_cancel_error input))) with
+      strict = false };
+    { (client "reset-error" errors (fun input -> ok (Client.decode_reset_error input))) with
+      strict = false };
+    { (client "signal-error" errors (fun input -> ok (Client.decode_signal_error input))) with
+      strict = false };
+    {
+      name = "control-payload-object";
+      corpora = [ "protocol"; "workflow-protocol" ];
+      strict = false;
+      decode =
+        (fun input ->
+          accepted ~encode:Control.encode_payload_object ~decode:Control.decode_payload_object
+            (Control.decode_payload_object input));
+    };
+    (* The [<owner>.<call>] handle Rust returns from a submission. It is not
+       JSON, but it is untrusted bridge output parsed on the OCaml side. An
+       accepted handle must be two plain decimal parts, so a sign, separator
+       or radix prefix cannot alias another handle. *)
+    client "client-call" [ "client-call" ] (fun input ->
+        match Bridge.parse_client_call input with
+        | None -> false
+        | Some _ ->
+            let decimal part =
+              part <> "" && String.for_all (function '0' .. '9' -> true | _ -> false) part
+            in
+            (match String.split_on_char '.' input with
+            | [ owner; call ] when decimal owner && decimal call -> ()
+            | _ -> failwith "accepted a client call handle that is not two decimal parts");
+            true);
   ]
 
 (** Reads a whole file. *)

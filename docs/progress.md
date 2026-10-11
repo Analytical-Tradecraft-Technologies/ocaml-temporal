@@ -17,13 +17,15 @@ the Temporal acceptance controllers.
 
 ## 2026-10-12: Decoder fuzzing, concurrent lifecycle stress, and scheduled qualification (#506)
 
-`rust/core-bridge/tests/decoder_fuzz.rs` fuzzes the 18 Rust decoders that the
-structured parser fuzz did not cover: activity tasks, completions, and
-heartbeats; asynchronous activity calls; the ten client requests; client and
-worker configuration; and replay history documents, including their inner
-protobuf bytes. `test/bridge/test_ocaml_decoder_fuzz.ml` fuzzes 24 OCaml
-decoders: control envelopes and payloads, workflow activations and
-completions, activity documents, and every client response and error body.
+`rust/core-bridge/tests/decoder_fuzz.rs` fuzzes the 20 Rust decoder targets
+that the structured parser fuzz did not cover: activity tasks, completions,
+and heartbeats; asynchronous activity calls; the ten client requests; the
+asynchronous-start ticket read by poll and wait; client and worker
+configuration; and replay history documents, including their inner protobuf
+bytes. `test/bridge/test_ocaml_decoder_fuzz.ml` fuzzes 29 OCaml targets:
+control envelopes, payloads, and payload objects; workflow activations and
+completions; activity documents; every client response; all eight client
+error decoders; and the submitted-call handle parser.
 Both share the corpus under `test/bridge/fixtures/decoder-fuzz` and a set of
 15 structural operators. Every input must produce no panic or escaped
 exception, a typed rejection status with a bounded UTF-8 diagnostic, and an
@@ -50,7 +52,13 @@ producer CI now also retains `_build/decoder-fuzz` and
 Evidence on an Apple M-series laptop: 20,000 cases per Rust target with two
 seeds (720,000 inputs), 20,000 cases per OCaml target (480,000 inputs),
 1,200 Rust concurrent rounds of 16 threads with 4 graphs, and 300 OCaml rounds
-of 8 Domains found no bridge defect. The concurrent stress recorded an
+of 8 Domains found no Rust bridge defect. The OCaml fuzz found that
+`Native_bridge.parse_client_call` accepted signed, `_`-separated, and
+`0x`/`0o`/`0b`/`0u` spellings that its contract excludes, so several
+spellings aliased one handle; it now requires plain decimal digits, with
+regression seeds and assertions. The concurrent stress now bounds setup and
+the start gate by the round deadline, and a separate test injects a setup
+hang and panic to prove they are reported promptly. The concurrent stress recorded an
 upstream Temporal Core panic during runtime teardown (`poll_buffer.rs:428`,
 unwrapping a cancelled join handle). Tokio contains it, and it has no
 ABI-visible effect. The [lifecycle stress reference](reference/bridge-lifecycle-stress.md#findings)

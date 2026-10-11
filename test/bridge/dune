@@ -119,7 +119,7 @@
   (env_var DECODER_FUZZ_SEED)
   (env_var DECODER_FUZZ_OCAML_CASES)
   (env_var DECODER_FUZZ_TARGET))
- (libraries temporal_protocol))
+ (libraries temporal_protocol temporal_core_bridge))
 
 ; Seeded multi-Domain close/finalizer/attach races through the C stubs (#506).
 (test
