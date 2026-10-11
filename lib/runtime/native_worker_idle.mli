@@ -17,13 +17,22 @@
        without sleeping, and the poll itself is the readiness wait. To rule
        out a spin if a poll is ever served before the wait (or by a fast path
        that never enters the supervisor), a lane joins each native wait at
-       most once.}
+       most once.
+
+       The wait is marked in flight just before its request is admitted to
+       the supervisor mailbox, so the joining poll can win that race and
+       return empty while the wait is still in flight. A poll queued behind
+       the wait cannot return before the wait ends, so a lane that finds the
+       wait it joined still in flight knows its poll was early. It then
+       restarts its backoff at [first_delay_s] for that wait instead of
+       resuming a sleep of up to [max_delay_s]: its next poll, a fraction of
+       a millisecond later, queues behind the now admitted wait.}
     {- {b Adaptive backoff otherwise.} When no native wait is in flight (the
        sibling is busy running a task), the lane sleeps 0, then
        [first_delay_s], doubling up to [max_delay_s]. The sequence restarts at
        0 after a work event: a lane completed a task ({!note_work}), or a
-       native wait reported readiness ({!note_ready}). Work is therefore noticed within roughly the time
-       since the last event rather than a fixed 10 ms, while a worker that
+       native wait reported readiness ({!note_ready}). Work is therefore
+       noticed within roughly the time since the last event rather than a fixed 10 ms, while a worker that
        stays idle settles at [max_delay_s], the former fixed interval.}}
 
     Neither rule ever busy-spins: each zero-delay poll consumes one work event

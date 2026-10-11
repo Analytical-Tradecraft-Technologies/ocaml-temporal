@@ -23,7 +23,10 @@ busy or holds the native readiness wait, was about two thirds of a serial
 1,000-activity fan-out. The new private `Native_worker_idle` module paces that
 yield instead. While the sibling's `Wait_any` is in flight, the lane repolls
 at once, once per wait: the poll queues behind the wait in the supervisor
-mailbox and runs as soon as either lane has work. Otherwise it backs off 0,
+mailbox and runs as soon as either lane has work. If that poll was served
+just before the wait's mailbox admission, the lane sees the joined wait
+still in flight and restarts its backoff at 0.1 ms for that wait rather than
+resuming a capped sleep (PR review). Otherwise it backs off 0,
 0.1 ms, doubling to the former 10 ms cap, restarting after every completed
 task and after a readiness wake (for the sibling only, so the waiter cannot
 re-enter a wait that returns at once). Each zero yield consumes one bounded
@@ -34,12 +37,18 @@ workflow lane's retry fallback keeps a fixed 10 ms delay. No Rust, C or
 protocol change: the ABI stays at v4.
 
 New runtime tests drive the real lane scheduler against a fake one-owner
-supervisor: a task published on either lane of an idle worker was taken
-within 0.14 ms (bound 5 ms); a simulated serial activity chain with 0.5 ms
-round trips averaged 1.07 ms per step (12.5 ms with the fixed 10 ms yield;
-bound 4 ms); an idle worker made 20 polls and 10 native waits in one second;
-and a stop while idle returned in under 100 ms. Unit tests cover the backoff
-schedule, the once-per-wait join, sibling-only readiness resets and invalid
+supervisor, asserting poll order and requested yields rather than tight
+wall-clock bounds so loaded CI runners cannot fail them. A task published on
+either lane of an idle worker is taken by the poll the readiness wait
+releases, with no extra empty poll or yield (about 0.14 ms locally). A forced
+admission race, in which the sibling's joining poll is served before the
+wait, requeues it after at most a 0.2 ms yield (the unfixed rule resumed a
+10 ms sleep). A simulated serial activity chain with 0.5 ms round trips
+requests 0.2 ms of yields per step (21 ms with the fixed 10 ms yield; bound
+5 ms) and runs at about 1.07 ms per step. An idle worker made 20 polls and 10
+native waits in one second, and a stop while idle returned in under 100 ms.
+Unit tests cover the backoff schedule, the once-per-wait join, the
+early-join restart, sibling-only readiness resets and invalid
 configurations.
 
 Live fan-out on the Compose Temporal 1.32.0/PostgreSQL 18.6 stack (M4 Pro,

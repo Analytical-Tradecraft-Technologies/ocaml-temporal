@@ -368,7 +368,11 @@ and bridge, read the [documentation guide](../README.md) first.
   locally, then retries its nonblocking poll. The yield never enters the
   supervisor mailbox and is paced by `Native_worker_idle` (#994): it is zero
   once per in-flight sibling native wait, because the next poll then queues
-  behind that wait and returns when either lane has work; otherwise it is a
+  behind that wait and returns when either lane has work. The wait is marked
+  in flight just before mailbox admission, so a joining poll can be served
+  first; a lane that finds the joined wait still in flight after its poll
+  restarts its backoff at 0.1 ms for that wait instead of resuming a capped
+  sleep. Otherwise it is a
   backoff of 0, 0.1 ms, doubling up to 10 ms, which restarts after each
   completed task or readiness wake. A zero yield is always bounded by one such
   event, so an idle worker settles at the 10 ms cap and never busy-spins, and

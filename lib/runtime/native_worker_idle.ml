@@ -20,12 +20,15 @@ type t = {
 
     [seen_epoch] is the work epoch the current backoff sequence started from.
     [joined_generation] is the last native wait this lane joined with a
-    zero-delay poll. [delay_s] is the last delay returned, [0.] right after a
+    zero-delay poll. [early_generation] is the last joined wait during which
+    this lane found its joining poll returned early and restarted its
+    backoff. [delay_s] is the last delay returned, [0.] right after a
     reset. *)
 type lane = {
   shared : t;
   mutable seen_epoch : int;
   mutable joined_generation : int;
+  mutable early_generation : int;
   mutable delay_s : float;
 }
 
@@ -52,6 +55,7 @@ let lane shared =
     shared;
     seen_epoch = Atomic.get shared.work_epoch;
     joined_generation = Atomic.get shared.wait_generation;
+    early_generation = Atomic.get shared.wait_generation;
     delay_s = 0.;
   }
 
@@ -74,13 +78,27 @@ let native_wait lane f =
 let next_delay lane =
   let shared = lane.shared in
   let generation = Atomic.get shared.wait_generation in
-  if Atomic.get shared.waiting && generation <> lane.joined_generation then begin
+  let in_flight = Atomic.get shared.waiting in
+  if in_flight && generation <> lane.joined_generation then begin
     (* The sibling holds the supervisor in a native wait this lane has not
        joined: the next poll queues behind it and returns when either lane
        has work. Joining once per generation bounds the zero-delay polls if
        the poll does not, in fact, queue behind the wait. *)
     lane.joined_generation <- generation;
     0.
+  end
+  else if in_flight && generation <> lane.early_generation then begin
+    (* The joined wait is still in flight, yet the joining poll returned: a
+       poll queued behind the wait cannot return before it ends, so this one
+       was served before the wait's mailbox admission. Restart the backoff
+       short, once per wait, rather than sleep up to the cap while a task for
+       this lane may already wake the wait. A poll that never enters the
+       supervisor costs only the usual doubling sequence per wait. A queued
+       poll that returns just before the waiter clears [waiting] also lands
+       here; it only shortens one sleep. *)
+    lane.early_generation <- generation;
+    lane.delay_s <- shared.first_delay_s;
+    shared.first_delay_s
   end
   else
     let epoch = Atomic.get shared.work_epoch in

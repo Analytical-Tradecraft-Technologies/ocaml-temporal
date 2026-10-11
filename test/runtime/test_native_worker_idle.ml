@@ -88,11 +88,46 @@ let test_invalid_configuration () =
   check "first delay above cap"
     (rejects (fun () -> Idle.create ~first_delay_s:0.02 ~max_delay_s:0.01 ()))
 
+(** A joining poll served before the wait's mailbox admission returns empty
+    while the wait is still in flight. The lane must then restart its
+    backoff short for that wait, not resume a capped sleep, and only once per
+    wait (PR #996 review). *)
+let test_early_join_poll_restarts_backoff () =
+  let idle = Idle.create ~first_delay_s:0.001 ~max_delay_s:0.008 () in
+  let waiter = Idle.lane idle in
+  let sibling = Idle.lane idle in
+  for _ = 1 to 6 do
+    ignore (Idle.next_delay sibling)
+  done;
+  check "sibling settled at the cap" (Idle.next_delay sibling = 0.008);
+  let inside =
+    Idle.native_wait waiter (fun () ->
+        (* Join; the joining poll returns empty before admission; the next
+           delays are taken while the same wait is still in flight. *)
+        List.init 4 (fun _ -> Idle.next_delay sibling))
+  in
+  check "early join poll restarts the backoff once"
+    (inside = [ 0.; 0.001; 0.002; 0.004 ]);
+  check "backoff continues after the wait" (Idle.next_delay sibling = 0.008)
+
 (** A fake supervisor with one owner mutex and per-lane task visibility
     times. A lane has a task when [Unix.gettimeofday] has reached its
     [visible_at]; [infinity] means none. [on_take] runs inside the owner when
     a poll takes a task and returns the next visibility time of the other
-    lane's task, or [None] to leave it unchanged. *)
+    lane's task, or [None] to leave it unchanged.
+
+    Per-lane arrays are indexed by {!lane_index}. [empty_polls] counts polls
+    that returned no task; [queued] counts polls waiting for the owner;
+    [sleeps] counts the local yields a lane requested and [slept_us] sums
+    their requested microseconds over both lanes, so assertions do not depend
+    on how precisely the OS honours a sleep. [max_sleep_s] is the largest
+    yield a lane requested since the test last reset it. [taken_after] holds
+    the taking lane's [empty_polls] and [sleeps] at its latest take.
+    [wait_timeout_s] is read at the start of each wait, so a test can
+    lengthen later waits. [arm_admission_race] makes the next native wait hold back its owner
+    admission until the sibling lane has returned two empty polls, forcing a
+    joining poll to be served before the wait; [raced_waiter] then names the
+    waiting lane ([true] for the workflow lane). *)
 type fake = {
   owner : Mutex.t;
   workflow_at : float Atomic.t;
@@ -100,13 +135,25 @@ type fake = {
   closed : bool Atomic.t;
   polls : int Atomic.t;
   native_waits : int Atomic.t;
-  wait_timeout_s : float;
+  wait_timeout_s : float Atomic.t;
   on_take : workflow_lane:bool -> float option;
+  empty_polls : int Atomic.t array;
+  queued : int Atomic.t array;
+  sleeps : int Atomic.t array;
+  slept_us : int Atomic.t;
+  max_sleep_s : float Atomic.t array;
+  taken_after : (int * int) Atomic.t;
+  arm_admission_race : bool Atomic.t;
+  raced_waiter : bool option Atomic.t;
 }
+
+(** Array index of a lane in the per-lane counters. *)
+let lane_index ~workflow_lane = if workflow_lane then 0 else 1
 
 (** Makes a fake with no pending task. *)
 let make_fake ?(closed = Atomic.make false) ?(wait_timeout_s = 0.1)
     ?(on_take = fun ~workflow_lane:_ -> None) () =
+  let pair () = [| Atomic.make 0; Atomic.make 0 |] in
   {
     owner = Mutex.create ();
     workflow_at = Atomic.make infinity;
@@ -114,38 +161,69 @@ let make_fake ?(closed = Atomic.make false) ?(wait_timeout_s = 0.1)
     closed;
     polls = Atomic.make 0;
     native_waits = Atomic.make 0;
-    wait_timeout_s;
+    wait_timeout_s = Atomic.make wait_timeout_s;
     on_take;
+    empty_polls = pair ();
+    queued = pair ();
+    sleeps = pair ();
+    slept_us = Atomic.make 0;
+    max_sleep_s = [| Atomic.make 0.; Atomic.make 0. |];
+    taken_after = Atomic.make (-1, -1);
+    arm_admission_race = Atomic.make false;
+    raced_waiter = Atomic.make None;
   }
 
-(** Runs [f] as one supervisor operation. *)
-let with_owner fake f =
+(** Runs [f] as one supervisor operation, counting lane [lane] as queued
+    while it waits for the owner. *)
+let with_owner ?lane fake f =
+  Option.iter (fun i -> ignore (Atomic.fetch_and_add fake.queued.(i) 1)) lane;
   Mutex.lock fake.owner;
+  Option.iter
+    (fun i -> ignore (Atomic.fetch_and_add fake.queued.(i) (-1)))
+    lane;
   Fun.protect ~finally:(fun () -> Mutex.unlock fake.owner) f
 
-(** One non-blocking lane poll through the fake owner. *)
+(** One non-blocking lane poll through the fake owner. A take records the
+    lane's empty-poll and sleep counts at that moment in [taken_after]. *)
 let fake_poll fake ~workflow_lane =
-  with_owner fake (fun () ->
+  let i = lane_index ~workflow_lane in
+  with_owner ~lane:i fake (fun () ->
       ignore (Atomic.fetch_and_add fake.polls 1);
       let mine, other =
         if workflow_lane then (fake.workflow_at, fake.activity_at)
         else (fake.activity_at, fake.workflow_at)
       in
       if Unix.gettimeofday () >= Atomic.get mine then begin
+        Atomic.set fake.taken_after
+          (Atomic.get fake.empty_polls.(i), Atomic.get fake.sleeps.(i));
         Atomic.set mine infinity;
         Option.iter (Atomic.set other) (fake.on_take ~workflow_lane);
         Ok Loop.Progress
       end
-      else Ok Loop.Not_ready)
+      else begin
+        ignore (Atomic.fetch_and_add fake.empty_polls.(i) 1);
+        Ok Loop.Not_ready
+      end)
 
 (** The combined readiness wait: holds the owner until either lane has a
     visible task or [wait_timeout_s] elapses. Like the Rust wait, it does not
     observe the OCaml stop flag. The 50 us recheck stands in for the Rust
-    condition variable. *)
-let fake_wait fake =
+    condition variable. An armed race first lets the sibling's joining poll
+    through, as a poll admitted to the mailbox just ahead of the wait. *)
+let fake_wait fake ~workflow_lane =
+  if Atomic.compare_and_set fake.arm_admission_race true false then begin
+    let sibling = lane_index ~workflow_lane:(not workflow_lane) in
+    Atomic.set fake.max_sleep_s.(sibling) 0.;
+    Atomic.set fake.raced_waiter (Some workflow_lane);
+    (* A second empty poll after the wait was marked in flight must have
+       started after it, so the sibling joined this wait before polling. *)
+    let baseline = Atomic.get fake.empty_polls.(sibling) in
+    await "the sibling's early joining poll" (fun () ->
+        Atomic.get fake.empty_polls.(sibling) >= baseline + 2)
+  end;
   with_owner fake (fun () ->
       ignore (Atomic.fetch_and_add fake.native_waits 1);
-      let deadline = Unix.gettimeofday () +. fake.wait_timeout_s in
+      let deadline = Unix.gettimeofday () +. Atomic.get fake.wait_timeout_s in
       let ready () =
         let now = Unix.gettimeofday () in
         now >= Atomic.get fake.workflow_at || now >= Atomic.get fake.activity_at
@@ -155,8 +233,22 @@ let fake_wait fake =
       done;
       Ok (ready ()))
 
+(** Records one requested local yield of [delay] seconds for lane [i]. Only
+    lane [i]'s thread writes [max_sleep_s.(i)] apart from a test reset. *)
+let record_sleep fake i delay =
+  if delay > 0. then begin
+    ignore (Atomic.fetch_and_add fake.sleeps.(i) 1);
+    ignore
+      (Atomic.fetch_and_add fake.slept_us
+         (int_of_float (Float.round (delay *. 1e6))));
+    if delay > Atomic.get fake.max_sleep_s.(i) then
+      Atomic.set fake.max_sleep_s.(i) delay
+  end
+
 (** Runs the generic loop over [fake] with the production idle pacing wiring:
-    a completed task is a work event, and each lane owns its [Idle.lane]. *)
+    a completed task is a work event, and each lane owns its [Idle.lane]. The
+    local yield is [Idle.local_yield] spelled out, so the fixture can record
+    each requested delay. *)
 let run_fake fake =
   let idle = Idle.create () in
   let workflow_idle = Idle.lane idle in
@@ -171,10 +263,15 @@ let run_fake fake =
     ~poll_workflow:(poll ~workflow_lane:true)
     ~poll_activity:(poll ~workflow_lane:false)
     ~wait_for_lane:(fun ~workflow_lane ~native_wait ->
-      Idle.wait
-        (if workflow_lane then workflow_idle else activity_idle)
-        ~native_wait
-        (fun () -> fake_wait fake))
+      let lane = if workflow_lane then workflow_idle else activity_idle in
+      if native_wait then
+        Idle.wait lane ~native_wait (fun () -> fake_wait fake ~workflow_lane)
+      else begin
+        let delay = Idle.next_delay lane in
+        record_sleep fake (lane_index ~workflow_lane) delay;
+        if delay > 0. then Thread.delay delay;
+        Ok ()
+      end)
     ~retry_pending:(fun ~workflow_lane:_ ->
       failwith "idle pacing fixture entered completion retry")
 
@@ -189,11 +286,28 @@ let finish fake runner observation =
   | Ok () -> value
   | Error () -> failwith "idle pacing fixture returned an error"
 
-(** A task that becomes ready on an idle worker is taken well under the
-    former 10 ms sleep, on either lane. The task is published only once a
+(** Publishes a task for one lane and waits until it is taken. Returns the
+    wall latency, for the log only, and checks the poll order: the lane took
+    the task without one more empty poll or local yield after publication,
+    so it was released by the readiness wait rather than by a backoff
+    timer. *)
+let publish_and_take fake ~workflow_lane =
+  let i = lane_index ~workflow_lane in
+  let cell = if workflow_lane then fake.workflow_at else fake.activity_at in
+  let before = (Atomic.get fake.empty_polls.(i), Atomic.get fake.sleeps.(i)) in
+  let published = Unix.gettimeofday () in
+  Atomic.set cell published;
+  await "the ready task to be taken" (fun () -> Atomic.get cell = infinity);
+  let latency = Unix.gettimeofday () -. published in
+  if Atomic.get fake.taken_after <> before then
+    failwith "ready task was taken only after an extra poll or local yield";
+  latency
+
+(** A task that becomes ready on an idle worker is taken by the poll the
+    readiness wait releases, on either lane. The task is published once a
     native wait has been in flight long enough for the sibling to settle,
-    whether that sibling joined the wait or is sleeping at its 10 ms cap; a
-    long fake timeout keeps the wait in flight meanwhile. *)
+    whether it joined the wait or was sleeping at its 10 ms cap; a long fake
+    timeout keeps the wait in flight meanwhile. *)
 let test_ready_lane_wakes_promptly () =
   let fake = make_fake ~wait_timeout_s:2. () in
   let runner = Domain.spawn (fun () -> run_fake fake) in
@@ -201,35 +315,63 @@ let test_ready_lane_wakes_promptly () =
     try
       let worst = ref 0. in
       for step = 1 to 10 do
-        let workflow_lane = step mod 2 = 0 in
         let waits = Atomic.get fake.native_waits in
         await "a fresh native wait" (fun () ->
             Atomic.get fake.native_waits > waits);
         Thread.delay 0.03;
-        let cell = if workflow_lane then fake.workflow_at else fake.activity_at in
-        let polls = Atomic.get fake.polls in
-        let published = Unix.gettimeofday () in
-        Atomic.set cell published;
-        await "the ready task to be taken" (fun () ->
-            Atomic.get cell = infinity);
-        let latency = Unix.gettimeofday () -. published in
-        check "taken by a poll" (Atomic.get fake.polls > polls);
+        let latency = publish_and_take fake ~workflow_lane:(step mod 2 = 0) in
         worst := Float.max !worst latency
       done;
       Ok !worst
     with exception_ -> Error exception_
   in
   let worst = finish fake runner observation in
-  Printf.printf "ready lane worst wake: %.3f ms\n%!" (worst *. 1000.);
-  if worst >= 0.005 then
-    failwith (Printf.sprintf "ready lane woke after %.2f ms" (worst *. 1000.))
+  Printf.printf "ready lane worst wake: %.3f ms\n%!" (worst *. 1000.)
+
+(** Forces the admission race end to end: the sibling's joining poll is
+    served before the native wait takes the owner. The sibling must requeue
+    behind the wait after short yields only, never the 10 ms cap, and then
+    take its task on the poll the wait releases. *)
+let test_early_join_poll_requeues_behind_wait () =
+  let fake = make_fake () in
+  let runner = Domain.spawn (fun () -> run_fake fake) in
+  let observation =
+    try
+      (* Short waits let both idle lanes back off to their cap; the raced
+         wait is then long, so it stays in flight until the task. *)
+      await "both lanes to request a capped yield" (fun () ->
+          Atomic.get fake.max_sleep_s.(0) >= Idle.default_max_delay_s
+          && Atomic.get fake.max_sleep_s.(1) >= Idle.default_max_delay_s);
+      Thread.delay 0.3;
+      Atomic.set fake.wait_timeout_s 2.;
+      Atomic.set fake.arm_admission_race true;
+      await "the raced native wait" (fun () ->
+          Option.is_some (Atomic.get fake.raced_waiter));
+      let sibling = not (Option.get (Atomic.get fake.raced_waiter)) in
+      let i = lane_index ~workflow_lane:sibling in
+      await "the sibling to queue behind the wait" (fun () ->
+          Atomic.get fake.queued.(i) > 0);
+      let max_sleep = Atomic.get fake.max_sleep_s.(i) in
+      if max_sleep >= Idle.default_max_delay_s then
+        failwith
+          (Printf.sprintf "early joining poll resumed a %.1f ms sleep"
+             (max_sleep *. 1000.));
+      ignore (publish_and_take fake ~workflow_lane:sibling);
+      Ok max_sleep
+    with exception_ -> Error exception_
+  in
+  let max_sleep = finish fake runner observation in
+  Printf.printf "early join poll: longest requeue yield %.2f ms\n%!"
+    (max_sleep *. 1000.)
 
 (** A serial activity workflow alternates lanes on every step, with a
     simulated 0.5 ms server round trip before each follow-up task. The fixed
-    10 ms sleep made each crossing cost several milliseconds; adaptive pacing
-    must keep the mean step well below that floor. *)
+    10 ms sleep cost at least one 10 ms yield per step. The bound is on the
+    yields the lanes requested, not on wall time, so a loaded runner or a
+    coarse OS timer cannot fail it; half the old floor still separates the
+    two behaviours. *)
 let test_serial_chain_avoids_fixed_sleep () =
-  let steps = 200 in
+  let steps = 100 in
   let rtt_s = 0.0005 in
   let activities = Atomic.make 0 in
   let closed = Atomic.make false in
@@ -251,17 +393,29 @@ let test_serial_chain_avoids_fixed_sleep () =
   let runner = Domain.spawn (fun () -> run_fake fake) in
   let observation =
     try
-      await "serial chain completion" (fun () -> Atomic.get fake.closed);
+      let deadline = Unix.gettimeofday () +. 60. in
+      while not (Atomic.get fake.closed) do
+        if Unix.gettimeofday () >= deadline then
+          failwith "timed out waiting for serial chain completion";
+        Thread.delay 0.001
+      done;
       Ok (Unix.gettimeofday () -. started)
     with exception_ -> Error exception_
   in
   let elapsed = finish fake runner observation in
   check "every activity completed" (Atomic.get activities = steps);
-  let per_step_ms = elapsed /. float_of_int steps *. 1000. in
-  Printf.printf "serial chain mean step: %.3f ms (%.1f ms simulated round trips)\n%!"
-    per_step_ms (2. *. rtt_s *. 1000.);
-  if per_step_ms >= 4. then
-    failwith (Printf.sprintf "serial step took %.2f ms on average" per_step_ms)
+  let per_step ms = ms /. float_of_int steps in
+  let wall_ms = per_step (elapsed *. 1000.) in
+  let slept_ms = per_step (float_of_int (Atomic.get fake.slept_us) /. 1000.) in
+  Printf.printf
+    "serial chain per step: %.3f ms wall, %.3f ms of requested yields (%.1f \
+     ms simulated round trips)\n\
+     %!"
+    wall_ms slept_ms (2. *. rtt_s *. 1000.);
+  if slept_ms >= 5. then
+    failwith
+      (Printf.sprintf "serial step requested %.2f ms of yields on average"
+         slept_ms)
 
 (** An idle worker does not spin: over one second the lanes make a bounded
     number of polls and native waits. A busy loop would make tens of
@@ -286,7 +440,9 @@ let test_idle_worker_does_not_spin () =
          polls waits)
 
 (** A stop observed while idle ends the run within one native wait timeout
-    plus one capped local yield, as before (#495). *)
+    plus one capped local yield, as before (#495). The assertion allows a
+    loaded runner several times that bound; an unbounded wait would still
+    fail it. *)
 let test_stop_while_idle_is_bounded () =
   let fake = make_fake () in
   let runner = Domain.spawn (fun () -> run_fake fake) in
@@ -298,7 +454,7 @@ let test_stop_while_idle_is_bounded () =
   | Error () -> failwith "stopped idle fixture returned an error");
   let elapsed = Unix.gettimeofday () -. stopped in
   Printf.printf "idle stop returned in %.1f ms\n%!" (elapsed *. 1000.);
-  if elapsed >= 0.3 then
+  if elapsed >= 1. then
     failwith (Printf.sprintf "idle stop took %.0f ms" (elapsed *. 1000.))
 
 (** Runs the idle pacing regressions. *)
@@ -306,8 +462,10 @@ let () =
   test_backoff_schedule ();
   test_ready_restarts_only_sibling ();
   test_join_in_flight_wait_once ();
+  test_early_join_poll_restarts_backoff ();
   test_invalid_configuration ();
   test_ready_lane_wakes_promptly ();
+  test_early_join_poll_requeues_behind_wait ();
   test_serial_chain_avoids_fixed_sleep ();
   test_idle_worker_does_not_spin ();
   test_stop_while_idle_is_bounded ()

@@ -49,6 +49,12 @@ lane. The yield is paced by the private `Native_worker_idle` module (#994).
 While the sibling's native wait is in flight, the lane repolls at once, but
 only once per wait: that poll queues behind the wait in the supervisor mailbox
 and runs as soon as either lane has work, so the wait serves both lanes.
+The in-flight mark is published just before the wait's mailbox admission,
+so the joining poll can be served ahead of the wait and return empty. A
+queued poll cannot return while the wait it queued behind is in flight, so a
+lane that still sees its joined wait in flight knows its poll was early; it
+restarts its backoff at 0.1 ms, once per wait, and its next poll queues
+behind the admitted wait rather than after a sleep of up to 10 ms.
 Otherwise the lane backs off 0, 0.1 ms, 0.2 ms, doubling up to 10 ms, and the
 sequence restarts after any completed task or readiness wake. A fixed 10 ms
 yield used to add several milliseconds to every lane crossing of a serial
