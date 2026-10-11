@@ -419,6 +419,7 @@ fn rejects_invalid_patch_marker_documents() {
                     core_completion::Success {
                         commands: vec![core_commands::WorkflowCommand {
                             user_metadata: None,
+                            event_group_markers: Vec::new(),
                             variant: Some(
                                 core_commands::workflow_command::Variant::SetPatchMarker(
                                     core_commands::SetPatchMarker {
@@ -433,6 +434,8 @@ fn rejects_invalid_patch_marker_documents() {
                     },
                 ),
             ),
+            payload_download_metrics: None,
+            payload_upload_metrics: None,
         };
         assert_eq!(
             workflow_protocol::completion_from_core(&core_completion)
@@ -1424,6 +1427,7 @@ fn converts_signal_workflow_activation_losslessly() {
                 input: vec![payload.clone()],
                 identity: "séndér".to_owned(),
                 headers: [("trace".to_owned(), payload)].into(),
+                originating_event_id: 0,
             })),
         }],
         ..Default::default()
@@ -1476,6 +1480,7 @@ fn rejects_signal_identity_with_nul() {
                 input: Vec::new(),
                 identity: "sender\0".to_owned(),
                 headers: Default::default(),
+                originating_event_id: 0,
             })),
         }],
         ..Default::default()
@@ -2535,6 +2540,7 @@ fn converts_application_failure_options_in_activity_and_child_causes() {
                         status: Some(activity_result::activity_resolution::Status::Failed(
                             activity_result::Failure {
                                 failure: Some(failure),
+                                cause: 0,
                             },
                         )),
                     }),
@@ -2757,6 +2763,7 @@ fn converts_timeout_failure_info_losslessly() {
                         status: Some(activity_result::activity_resolution::Status::Failed(
                             activity_result::Failure {
                                 failure: Some(failure),
+                                cause: 0,
                             },
                         )),
                     }),
@@ -3208,6 +3215,7 @@ fn enforces_core_absence_and_eviction_invariants() {
 
     let absent_command = core_commands::WorkflowCommand {
         user_metadata: None,
+        event_group_markers: Vec::new(),
         variant: None,
     };
     let core = core_completion::WorkflowActivationCompletion {
@@ -3221,6 +3229,8 @@ fn enforces_core_absence_and_eviction_invariants() {
                 },
             ),
         ),
+        payload_download_metrics: None,
+        payload_upload_metrics: None,
     };
     assert_eq!(
         workflow_protocol::completion_from_core(&core)
@@ -3658,6 +3668,49 @@ fn rejects_omitted_required_nullable_fields() {
     );
 }
 
+/// External-storage metrics (Core 1.x) belong to the whole completion, so
+/// the strict reverse conversion rejects them on a failed task as well as on
+/// a successful one instead of dropping them on the failure path.
+#[test]
+fn external_storage_metrics_are_rejected_for_both_completion_statuses() {
+    let failed = workflow_protocol::completion_to_core(
+        &workflow_protocol::decode_completion(&fixture(&["valid", "task-failure.input.json"]))
+            .unwrap(),
+    )
+    .unwrap();
+    let successful = core_completion::WorkflowActivationCompletion {
+        run_id: "run-metrics".to_owned(),
+        status: Some(
+            core_completion::workflow_activation_completion::Status::Successful(
+                core_completion::Success::default(),
+            ),
+        ),
+        payload_download_metrics: None,
+        payload_upload_metrics: None,
+    };
+    for base in [failed, successful] {
+        assert!(workflow_protocol::completion_from_core(&base).is_ok());
+        for upload in [false, true] {
+            let mut core = base.clone();
+            let metrics = Some(core_common::ExternalStorageMetrics {
+                payload_count: 1,
+                ..Default::default()
+            });
+            if upload {
+                core.payload_upload_metrics = metrics;
+            } else {
+                core.payload_download_metrics = metrics;
+            }
+            assert_eq!(
+                workflow_protocol::completion_from_core(&core)
+                    .unwrap_err()
+                    .code,
+                workflow_protocol::CoreConversionErrorCode::Unsupported
+            );
+        }
+    }
+}
+
 /// The bilateral fixture represents Core's failed status, never a successful
 /// FailWorkflowExecution command. A poisoned activation cannot leak commands,
 /// and query/eviction leases retain their operation-specific acknowledgements.
@@ -3856,6 +3909,7 @@ fn activity_failure_activation_with_cause(
                         status: Some(activity_result::activity_resolution::Status::Failed(
                             activity_result::Failure {
                                 failure: Some(failure.clone()),
+                                cause: 0,
                             },
                         )),
                     }),

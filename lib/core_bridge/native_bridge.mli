@@ -444,7 +444,9 @@ val worker_complete_activity_json :
 (** Validates and submits progress for a currently leased remote activity. The
     task remains outstanding for its later terminal completion. The result is
     acknowledgement-only; pinned Temporal Core delivers cancellation, pause,
-    and reset flags asynchronously in a later Cancel task. *)
+    and reset flags asynchronously in a later Cancel task. A heartbeat whose
+    details exceed the namespace payload limit makes Core fail the activity
+    itself and also queue a Cancel task. *)
 val worker_record_activity_heartbeat_json :
   runtime -> bytes -> (unit, error) result
 

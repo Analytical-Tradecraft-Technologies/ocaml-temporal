@@ -540,7 +540,7 @@ payload-free.
 ## Pinned Temporal Core mapping
 
 The Cargo lockfile pins Temporal Core to commit
-`95e97686a079dcfe6c42e3254b2f3f5e3d97408f`. This design is tied to that
+`8fe478ee179ed754614d230f39586f3edb57da71`. This design is tied to that
 revision and must be rechecked when the pin changes.
 
 Rust creates its Tokio/Core runtime once for an SDK instance. It connects a
@@ -552,20 +552,20 @@ before any poll, as required by Core.
 
 The relevant pinned Core contracts are:
 
-* [`init_worker`](https://github.com/temporalio/sdk-core/blob/95e97686a079dcfe6c42e3254b2f3f5e3d97408f/crates/sdk-core/src/lib.rs)
+* [`init_worker`](https://github.com/temporalio/sdk-core/blob/8fe478ee179ed754614d230f39586f3edb57da71/crates/sdk-core/src/lib.rs)
   constructs a `Worker` from the Core runtime, worker configuration, and
   connection.
 * [`Worker::poll_workflow_activation` and
-  `Worker::complete_workflow_activation`](https://github.com/temporalio/sdk-core/blob/95e97686a079dcfe6c42e3254b2f3f5e3d97408f/crates/sdk-core/src/worker/mod.rs)
+  `Worker::complete_workflow_activation`](https://github.com/temporalio/sdk-core/blob/8fe478ee179ed754614d230f39586f3edb57da71/crates/sdk-core/src/worker/mod.rs)
   are the workflow poll/complete pair. Core requires a response for every
   activation and forbids concurrent workflow polls on one worker; a missing
   completion can permanently stall that run.
 * [`Worker::poll_activity_task` and
-  `Worker::complete_activity_task`](https://github.com/temporalio/sdk-core/blob/95e97686a079dcfe6c42e3254b2f3f5e3d97408f/crates/sdk-core/src/worker/mod.rs)
+  `Worker::complete_activity_task`](https://github.com/temporalio/sdk-core/blob/8fe478ee179ed754614d230f39586f3edb57da71/crates/sdk-core/src/worker/mod.rs)
   are the corresponding activity pair. Core forbids concurrent activity polls
   on one worker and allows activity completions concurrently.
 * [`Worker::initiate_shutdown`, `shutdown`, and
-  `finalize_shutdown`](https://github.com/temporalio/sdk-core/blob/95e97686a079dcfe6c42e3254b2f3f5e3d97408f/crates/sdk-core/src/worker/mod.rs)
+  `finalize_shutdown`](https://github.com/temporalio/sdk-core/blob/8fe478ee179ed754614d230f39586f3edb57da71/crates/sdk-core/src/worker/mod.rs)
   require the language SDK to stop admitting work, drain polls until they
   report shutdown, complete outstanding tasks, and then release the worker.
 * The client start path uses Rust's pinned Temporal client

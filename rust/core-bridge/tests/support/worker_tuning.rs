@@ -40,17 +40,25 @@ const DEFAULT_DOCUMENT: &str = concat!(
     "\"task_types\":{\"workflows\":true,\"activities\":true}}"
 );
 
-/// Per-buffer workflow poller behavior that pinned Core (95e9768) derives in
-/// its private `worker::wft_poller_behavior`: a `SimpleMaximum` total is
-/// split, giving the normal buffer `max(1, floor(total * ratio))` and the
-/// sticky buffer the rest (at least one), while an autoscaling behavior is
-/// handed unchanged to each buffer. Core does not export the function, so
-/// this mirror is pinned by the `nonsticky_to_sticky_poll_ratio` assertion
-/// below and must be re-checked on every Core upgrade. Returns the normal
-/// buffer's behavior and, for a caching worker, the sticky buffer's.
+/// Per-buffer workflow poller behavior that pinned Core (8fe478e, v1.1.0)
+/// derives in its private `worker::wft_poller_behavior`: a `SimpleMaximum`
+/// total is split, giving the normal buffer `max(1, floor(total * ratio))`
+/// and the sticky buffer the rest (at least one), while an autoscaling
+/// behavior is handed unchanged to each buffer. Core does not export the
+/// function, so this mirror is pinned by the `nonsticky_to_sticky_poll_ratio`
+/// assertion below and must be re-checked on every Core upgrade. Returns the
+/// normal buffer's behavior and, for a caching worker, the sticky buffer's.
+///
+/// Core 1.x made the configured behavior optional and resolves `None` at
+/// worker start (autoscaling when the namespace advertises auto-enrolment).
+/// The bridge always supplies an explicit behavior, so `None` here is a
+/// regression and fails the test.
 fn per_buffer_pollers(config: &WorkerConfig) -> (PollerBehavior, Option<PollerBehavior>) {
     let sticky = config.max_cached_workflows > 0;
-    match config.workflow_task_poller_behavior {
+    let behavior = config
+        .workflow_task_poller_behavior
+        .expect("the bridge always configures an explicit workflow poller behavior");
+    match behavior {
         PollerBehavior::SimpleMaximum(total) => {
             let ratio = f64::from(config.nonsticky_to_sticky_poll_ratio);
             let mut normal = 0_usize;
@@ -113,11 +121,11 @@ fn tuned_document_maps_every_option_onto_core() {
     assert_eq!(config.max_outstanding_workflow_tasks, Some(4));
     assert_eq!(
         config.workflow_task_poller_behavior,
-        PollerBehavior::Autoscaling {
+        Some(PollerBehavior::Autoscaling {
             minimum: 2,
             maximum: 6,
             initial: 3,
-        }
+        })
     );
     assert_eq!(
         config.graceful_shutdown_period,
@@ -141,7 +149,7 @@ fn tuned_document_maps_every_option_onto_core() {
     assert_eq!(config.max_outstanding_local_activities, Some(1));
     assert_eq!(
         config.activity_task_poller_behavior,
-        PollerBehavior::SimpleMaximum(1)
+        Some(PollerBehavior::SimpleMaximum(1))
     );
     // Autoscaling bounds are per buffer: the sticky and normal queues each
     // scale between 2 and 6 polls, so up to 12 polls can be open in total.
@@ -224,7 +232,7 @@ fn default_document_keeps_core_defaults() {
     assert_eq!(config.max_outstanding_workflow_tasks, Some(1_000));
     assert_eq!(
         config.workflow_task_poller_behavior,
-        PollerBehavior::SimpleMaximum(2)
+        Some(PollerBehavior::SimpleMaximum(2))
     );
     assert_eq!(
         config.graceful_shutdown_period,

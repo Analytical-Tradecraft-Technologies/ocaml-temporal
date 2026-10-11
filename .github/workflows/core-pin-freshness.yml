@@ -1,0 +1,66 @@
+name: Temporal Core pin freshness
+
+# Dependabot cannot bump the `rev =` git pin of Temporal Core, so this weekly
+# check compares it with the latest stable temporalio/sdk-core release
+# (issue #824). When an upgrade is due it opens one tracking issue, or comments
+# on the open one once per new release, and the run fails so the gap stays
+# visible. It never edits the pin; the upgrade itself needs the evidence in
+# docs/dependencies.md ("Temporal Core pin upgrades").
+
+on:
+  schedule:
+    # Mondays 20:00 UTC (Tuesday morning in Sydney).
+    - cron: '0 20 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: core-pin-freshness
+  cancel-in-progress: false
+
+jobs:
+  core-pin:
+    name: Compare Core pin with latest sdk-core release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+      - name: Compare pin with the latest release
+        id: compare
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+          sh scripts/check-core-pin-freshness.sh . > "$RUNNER_TEMP/core-pin.md"
+          status=$?
+          set -e
+          cat "$RUNNER_TEMP/core-pin.md" >> "$GITHUB_STEP_SUMMARY"
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          # Status 2 means the pin or GitHub metadata was unreadable; fail
+          # here rather than report a stale or current pin.
+          test "$status" -le 1
+      - name: Open or update the upgrade tracking issue
+        if: steps.compare.outputs.status == '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TITLE: Temporal Core pin is behind the latest sdk-core release
+        run: |
+          report="$RUNNER_TEMP/core-pin.md"
+          release=$(sed -n 's/^- Latest .* release: `\([^`]*\)`.*/\1/p' "$report")
+          number=$(gh issue list --state open --search "\"$TITLE\" in:title" \
+            --json number,title --jq "map(select(.title == env.TITLE)) | .[0].number // empty")
+          if [ -z "$number" ]; then
+            gh issue create --title "$TITLE" --body-file "$report"
+          elif ! gh issue view "$number" --comments --json body,comments \
+            --jq '[.body] + [.comments[].body] | join("\n")' | grep -Fq "\`$release\`"; then
+            gh issue comment "$number" --body-file "$report"
+          fi
+      - name: Fail while an upgrade is due
+        if: steps.compare.outputs.status == '1'
+        run: exit 1
