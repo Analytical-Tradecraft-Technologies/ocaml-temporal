@@ -41,7 +41,9 @@ type activity_detach = {
     the token rotates between lanes, so a lane-specific wait would sleep
     through the sibling's task for the whole bound on every other step of a
     sequential workflow (#806). Otherwise it must perform a short bounded local
-    yield without entering the supervisor mailbox.
+    yield without entering the supervisor mailbox. That yield may be zero only
+    when a bounded event justifies an immediate repoll, as
+    {!Native_worker_idle} does, so the loop never busy-spins (#994).
     [retry_pending] must apply a real bounded backoff even if unrelated work is
     ready, so an uncertain completion cannot spin or rerun its callback. *)
 val run :
