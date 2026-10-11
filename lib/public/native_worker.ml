@@ -17,6 +17,7 @@ module Worker_policy = Temporal_sdk_kernel.Native_worker_policy
 module Owner = Temporal_sdk_kernel.Native_worker_owner
 module Observer = Temporal_sdk_kernel.Native_worker_observer
 module Watchdog = Temporal_sdk_kernel.Native_worker_watchdog
+module Idle = Temporal_sdk_kernel.Native_worker_idle
 module Bounded_shutdown = Temporal_sdk_kernel.Native_worker_shutdown
 
 (** Result-bind notation keeps expected startup and lifecycle failures typed. *)
@@ -447,10 +448,31 @@ let poll_activity worker =
       Ok Retry_pending
   | Error error -> Error (public_activity_error "activity task poll" error)
 
+(** Per-run idle pacing (#994). [idle] is shared by both lanes; each
+    [Idle.lane] is used only by the lane it names: [workflow_idle] on the
+    calling thread of [run], [activity_idle] on the activity Domain. A fresh
+    value is created for every [run], so no state leaks across runs or into a
+    detached activity Domain's next run. *)
+type lane_pacing = {
+  idle : Idle.t;
+  workflow_idle : Idle.lane;
+  activity_idle : Idle.lane;
+}
+
+(** Makes the pacing state for one [run]. *)
+let make_lane_pacing () =
+  let idle = Idle.create () in
+  { idle; workflow_idle = Idle.lane idle; activity_idle = Idle.lane idle }
+
 (** Uses native event readiness only for the one idle lane holding the wait
-    token. When its sibling is busy or already waiting, a 10 ms local yield
-    avoids occupying the sole supervisor owner. The next poll checks the Rust
-    queue; when both lanes become idle, they take turns holding the token.
+    token. When its sibling is busy or already waiting, the lane yields
+    locally through [Idle.local_yield] instead of occupying the sole
+    supervisor owner (#994). That yield is zero while the sibling's native
+    wait is in flight, because this lane's next poll then queues behind the
+    wait and runs as soon as either lane has work; otherwise it is an
+    adaptive backoff from 0 up to 10 ms that restarts on every completed task
+    or readiness wake. A fixed 10 ms sleep here used to dominate the latency
+    of serial activity workflows.
 
     The native wait itself observes both lanes ([Wait_any]), whichever lane
     holds the token. A lane-specific wait held the sole supervisor owner for
@@ -459,26 +481,34 @@ let poll_activity worker =
     lane's poll queued in the mailbox during the wait runs as soon as it ends.
     The wait does not consume the task, so the owning lane still takes it; this
     also covers an activity-only worker, whose idle workflow lane never wakes
-    it. [workflow_lane] therefore matters only for the local yield. *)
-let wait_for_lane worker ~workflow_lane:_ ~native_wait =
-  if not native_wait then begin
-    Thread.delay 0.01;
-    Ok ()
-  end
-  else
-    match Native.perform worker.supervisor Native.Wait_any with
-    | Ok () -> Ok ()
-    | Error error when is_not_ready error -> Ok ()
-    | Error error -> Error (public_native_error "worker readiness wait" error)
+    it. A wait that ends for readiness restarts the sibling's backoff; one
+    that times out does not, so an idle worker settles at the 10 ms cap. *)
+let wait_for_lane worker pacing ~workflow_lane ~native_wait =
+  let lane =
+    if workflow_lane then pacing.workflow_idle else pacing.activity_idle
+  in
+  Idle.wait lane ~native_wait (fun () ->
+      match Native.perform worker.supervisor Native.Wait_any with
+      | Ok () -> Ok true
+      | Error error when is_not_ready error -> Ok false
+      | Error error -> Error (public_native_error "worker readiness wait" error))
+
+(** Seconds the workflow lane waits before retrying a retained completion. *)
+let workflow_retry_delay_s = 0.01
 
 (** Applies the bounded delay used after a retained activity completion. The
     native supervisor owns the timer operation and its C stub releases the OCaml
     runtime lock while sleeping, so this callback cannot block a workflow
     scheduler or let a ready-but-unrelated activity lane spin. A workflow retry
-    is not currently produced by the workflow adapter; its bounded local yield
-    remains a fallback if a future adapter adds one without a dedicated timer. *)
+    is not currently produced by the workflow adapter; a fixed local delay
+    remains a fallback if a future adapter adds one without a dedicated timer.
+    It deliberately bypasses the adaptive idle backoff, which could otherwise
+    retry immediately after unrelated work. *)
 let retry_pending worker ~workflow_lane =
-  if workflow_lane then wait_for_lane worker ~workflow_lane ~native_wait:false
+  if workflow_lane then begin
+    Thread.delay workflow_retry_delay_s;
+    Ok ()
+  end
   else
     match
       Native.perform worker.supervisor
@@ -586,13 +616,20 @@ let retry_discard worker =
   Bounded_shutdown.Deferred_discard.retry worker.discard_pending
     ~try_discard:(fun () -> try_discard_adapters worker)
 
+(** Records a completed task as a work event for the idle pacing, so an idle
+    sibling repolls promptly for the follow-up task Core will deliver. *)
+let note_progress pacing result =
+  (match result with Ok Progress -> Idle.note_work pacing.idle | _ -> ());
+  result
+
 (** Runs both lanes through the generic loop and converts an escaped lane
     exception into a defect result. *)
 let run_lanes worker =
+  let pacing = make_lane_pacing () in
   try
     Worker_loop.run ~detach:(Some (activity_detach worker))
       ~closed:(fun () -> stop_observed worker)
-      ~poll_workflow:(fun () -> poll_workflow worker)
+      ~poll_workflow:(fun () -> note_progress pacing (poll_workflow worker))
       ~poll_activity:(fun () ->
         Owner.enter_activity worker.owner;
         (* The poll holds the activity adapter lock while it runs a callback.
@@ -601,9 +638,9 @@ let run_lanes worker =
            run, here on the lane's own Domain (#495). *)
         Fun.protect
           ~finally:(fun () -> retry_discard worker)
-          (fun () -> poll_activity worker))
+          (fun () -> note_progress pacing (poll_activity worker)))
       ~wait_for_lane:(fun ~workflow_lane ~native_wait ->
-        wait_for_lane worker ~workflow_lane ~native_wait)
+        wait_for_lane worker pacing ~workflow_lane ~native_wait)
       ~retry_pending:(fun ~workflow_lane -> retry_pending worker ~workflow_lane)
   with _ ->
     Error (Base_error.defect ~message:"native worker execution lane failed")

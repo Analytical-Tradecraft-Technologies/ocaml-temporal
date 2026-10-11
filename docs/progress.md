@@ -70,6 +70,51 @@ tracks it for re-evaluation after the Core upgrade. A sanitizer-instrumented
 Rust build and live-worker concurrency remain open under #506. See
 [decoder fuzzing](reference/bridge-decoder-fuzz.md).
 
+## 2026-10-12: Adaptive idle pacing between worker lane polls (#994)
+
+The live fan-out benchmark (#528) found that the fixed 10 ms local yield in
+`Native_worker.wait_for_lane`, taken by an idle lane while its sibling is
+busy or holds the native readiness wait, was about two thirds of a serial
+1,000-activity fan-out. The new private `Native_worker_idle` module paces that
+yield instead. While the sibling's `Wait_any` is in flight, the lane repolls
+at once, once per wait: the poll queues behind the wait in the supervisor
+mailbox and runs as soon as either lane has work. If that poll was served
+just before the wait's mailbox admission, the lane sees the joined wait
+still in flight and restarts its backoff at 0.1 ms for that wait rather than
+resuming a capped sleep (PR review). Otherwise it backs off 0,
+0.1 ms, doubling to the former 10 ms cap, restarting after every completed
+task and after a readiness wake (for the sibling only, so the waiter cannot
+re-enter a wait that returns at once). Each zero yield consumes one bounded
+event, so an idle worker settles at the 10 ms cap and does not spin; the
+100 ms native wait, the bounded shutdown deadlines (#495), the activity
+completion retry backoff and the activation watchdog are unchanged. The
+workflow lane's retry fallback keeps a fixed 10 ms delay. No Rust, C or
+protocol change: the ABI stays at v4.
+
+New runtime tests drive the real lane scheduler against a fake one-owner
+supervisor, asserting poll order and requested yields rather than tight
+wall-clock bounds so loaded CI runners cannot fail them. A task published on
+either lane of an idle worker is taken by the poll the readiness wait
+releases, with no extra empty poll or yield (about 0.14 ms locally). A forced
+admission race, in which the sibling's joining poll is served before the
+wait, requeues it after at most a 0.2 ms yield (the unfixed rule resumed a
+10 ms sleep). A simulated serial activity chain with 0.5 ms round trips
+requests 0.2 ms of yields per step (21 ms with the fixed 10 ms yield; bound
+5 ms) and runs at about 1.07 ms per step. An idle worker made 20 polls and 10
+native waits in one second, and a stop while idle returned in under 100 ms.
+Unit tests cover the backoff schedule, the once-per-wait join, the
+early-join restart, sibling-only readiness resets and invalid
+configurations.
+
+Live fan-out on the Compose Temporal 1.32.0/PostgreSQL 18.6 stack (M4 Pro,
+Docker Desktop, OCaml 5.2.1 development container, #993's benchmark applied
+locally, width 1,000, payload 256 B, one warmup): one execution, five
+samples, p50 10.89 s before and 5.94 s after (90 to 162 activities/s); eight
+executions, three samples, p50 107.9 s before and 79.1 s after (75 to 92
+activities/s), with no errors. In the one-execution attribution pass, time
+outside any native call or codec pass fell from about 5.5 s to about 0.3 s;
+what remains is Core completion calls and genuine readiness waits for the
+server.
 ## 2026-10-12: One encode per activity completion (#995)
 
 Each activity completion was encoded twice: once in

@@ -60,6 +60,10 @@ module Native_worker_observer = Temporal_runtime.Native_worker_observer
     yield. *)
 module Native_worker_watchdog = Temporal_runtime.Native_worker_watchdog
 
+(** Idle pacing between native lane polls: joins an in-flight readiness wait
+    or backs off adaptively (#994). *)
+module Native_worker_idle = Temporal_runtime.Native_worker_idle
+
 (** Bounded worker shutdown orchestration over injected lane, drain, and
     native-release operations (#495). *)
 module Native_worker_shutdown = Temporal_runtime.Native_worker_shutdown
