@@ -1097,8 +1097,20 @@ docs:
 # The OPAM licence audit first confirms that docs/dependencies.md still lists
 # exactly the locked and pinned inputs, so the reviewed inventory cannot drift
 # from what is built (#783). The inventory check is host-only POSIX shell.
+# It then audits the CI-only official Python SDK closure (#517).
 license-check: check-dependency-inventory
 	$(COMPOSE_RUN) sh scripts/check-licenses.sh
+	$(MAKE) python-license-check
+
+# Installs test/integration/sdk_interop/python/requirements.lock with its
+# hashes in the digest-pinned image of the sdk-interop-python Compose service
+# and audits each installed distribution's own license metadata; the policy
+# contract on fake distributions runs first. Python never enters the OCaml
+# development image, and this target starts no Temporal service.
+.PHONY: python-license-check
+python-license-check:
+	$(TEMPORAL_COMPOSE) run --rm --no-deps -T sdk-interop-python \
+		sh /workspace/scripts/check-python-licenses.sh
 
 .PHONY: check-dependency-inventory test-dependency-inventory-contract
 check-dependency-inventory:

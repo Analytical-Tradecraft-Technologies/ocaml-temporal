@@ -25,7 +25,14 @@ environment from a hash-locked closure of five packages
 (`test/integration/sdk_interop/python/requirements.lock`, all MIT, BSD,
 Apache-2.0 or PSF-2.0). `docs/dependencies.md` gains a CI-only
 interoperability tooling table, and `scripts/check-dependency-inventory.sh`
-and its contract now compare that table with the lock.
+and its contract now compare that table with the lock. `make license-check`
+now also runs `make python-license-check`, which installs the lock with its
+hashes in the pinned Python image and audits each installed distribution's
+own `importlib.metadata` license fields and license files against the shared
+SPDX allowlist, with two exact reviewed overrides (protobuf's free-text
+license and typing-extensions' PSF-2.0) and an exact installed-equals-lock
+check; `test/smoke/test_python_license_policy.sh` proves the rules on fake
+distributions.
 
 The OCaml regression process hosts the workflow worker and publishes its
 queues; the Python driver hosts the activity the OCaml workflow calls, starts

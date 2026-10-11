@@ -9,6 +9,9 @@ standalone GitHub Actions license job streams locked metadata emitted by
 official Python container. `make cargo-metadata` only emits the locked Cargo
 metadata; it does not run the scanner. Cargo license scanning deliberately
 does not run in the compiler/architecture matrix or as a Makefile target.
+`make license-check` also audits the CI-only official Python SDK closure of
+the interoperability regression in the pinned Python image; see
+[CI-only interoperability tooling](#ci-only-interoperability-tooling).
 The Makefile's `quality` target is a separate contributor/CI gate for RustSec,
 unused-dependency, and spelling checks.
 
@@ -183,11 +186,36 @@ pinned by version and SHA-256 digest, nothing outside the lock is resolved,
 and no package build code runs. None of these packages is an SDK dependency:
 they are absent from `temporal-sdk.opam` and its lock, are never installed in
 the OCaml development image, and are not linked into or redistributed with
-any SDK artifact. `make license-check` therefore does not audit them; a lock
-change must update this table, which `make check-dependency-inventory`
-enforces, and each new or changed license must be reviewed from the package
-metadata. The Python Software Foundation license of `typing-extensions` is a
-permissive, non-copyleft license, the same family as the CPython image itself.
+any SDK artifact.
+
+`make license-check` audits the closure itself through
+`make python-license-check`, so the standalone license job covers it. In the
+same pinned Python image, `scripts/check-python-licenses.sh` installs the lock
+with its hashes into a throwaway virtual environment created without pip, and
+`scripts/check-python-licenses.py` reads each installed distribution's own
+metadata with `importlib.metadata`: the PEP 639 `License-Expression`, every
+`License ::` classifier, the free-text `License` field, and each declared
+`License-File`, which must be present. Expressions are evaluated with the SPDX
+parser and permissive allowlist shared with the Cargo scanner
+(`scripts/check-cargo-licenses.py`). A missing, unknown, malformed, copyleft
+or ambiguous license fails, as does a declared license file that is absent, a
+copyleft classifier, or a classifier that contradicts the expression. The
+installed set must equal the lock exactly, so an unlocked or differently
+versioned distribution also fails. `test/smoke/test_python_license_policy.sh`
+runs first and proves these rules on the small fake distributions under
+`test/fixtures/python-licenses`, without the network.
+
+The only overrides are the reviewed entries below, which are keyed by exact
+package and version and also pin the observed metadata value, so an upgrade
+or a metadata change fails until it is reviewed again:
+
+| Package | Version | Observed metadata | Concluded license | Reason |
+|---|---|---|---|---|
+| protobuf | 7.36.2 | `License: 3-Clause BSD License` (free text, no expression or classifier) | BSD-3-Clause | The upstream `protocolbuffers/protobuf` license is BSD-3-Clause |
+| typing-extensions | 4.16.0 | `License-Expression: PSF-2.0` | PSF-2.0 | The Python Software Foundation license is permissive and non-copyleft, the same family as the CPython image itself, but outside the shared allowlist; this package is CI-only and never redistributed |
+
+A lock change must also update the table below, which
+`make check-dependency-inventory` enforces.
 
 | Package | Exact version | License | Role |
 |---|---:|---|---|
@@ -281,7 +309,7 @@ Python image is linked into or redistributed with the SDK.
 | Image | Manifest index digest | Used by | Native platforms | License |
 |---|---|---|---|---|
 | `rust:1.99-bookworm` | `sha256:59037199c44290f2befcdd58dcc540164763fc296950255aaefeef096a1866b0` | `Dockerfile.dev` Rust toolchain stage and `Dockerfile.rust-ci` | Linux amd64 and arm64/v8 | Rust is Apache-2.0 OR MIT; image packaging (`rust-lang/docker-rust`) is Apache-2.0 OR MIT |
-| `python:3.14-slim-bookworm` | `sha256:4ff4b92a68355dbdb52584ab3391dff8d371a61d4e063468bfd0130e3189c6d9` | Cargo license audit, release-preflight Cargo SBOM generation and audit, and the official-SDK interoperability driver (CI-only) | Linux amd64, arm64/v8, and additional official architectures | CPython's PSF license stack (SPDX `Python-2.0`); image packaging (`docker-library/python`) is MIT |
+| `python:3.14-slim-bookworm` | `sha256:4ff4b92a68355dbdb52584ab3391dff8d371a61d4e063468bfd0130e3189c6d9` | Cargo license audit, release-preflight Cargo SBOM generation and audit, the official-SDK interoperability driver, and its Python license audit (CI-only) | Linux amd64, arm64/v8, and additional official architectures | CPython's PSF license stack (SPDX `Python-2.0`); image packaging (`docker-library/python`) is MIT |
 
 `ocamlformat` is deliberately absent. Version 0.28.1 is MIT licensed, but its
 build closure includes ordinary GPL packages (`menhir` and `fix`), which this
