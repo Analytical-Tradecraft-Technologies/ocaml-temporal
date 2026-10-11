@@ -18,6 +18,21 @@
 # an opt-in Make target rather than part of the default runtest alias.
 set -eu
 
+# Runs `opam exec -- dune SUBCOMMAND ARGS...` and adds an explicit `-j` when
+# DUNE_JOBS is non-empty. Make exports the limit (#851), but Dune reads the
+# DUNE_JOBS environment variable only from 3.22, and the SDK supports 3.18, so
+# the flag keeps this nested build bounded on every supported release.
+# test/smoke/test_build_jobs_contract.sh runs this function with a stub Dune.
+opam_dune() {
+  dune_subcommand=$1
+  shift
+  if [ -n "${DUNE_JOBS:-}" ]; then
+    opam exec -- dune "$dune_subcommand" -j "$DUNE_JOBS" "$@"
+  else
+    opam exec -- dune "$dune_subcommand" "$@"
+  fi
+}
+
 sdk_root=$(cd "$1" && pwd)
 scratch=$(mktemp -d "${TMPDIR:-/tmp}/ocaml-temporal-vendored.XXXXXX")
 # Remove the scratch workspace, including its Dune build and any fallback
@@ -83,8 +98,8 @@ let () =
 EOF
 
 cd "$scratch"
-opam exec -- dune build --root . ./app/main.exe
-opam exec -- dune exec --root . ./app/main.exe
+opam_dune build --root . ./app/main.exe
+opam_dune exec --root . ./app/main.exe
 
 # Without an explicit CARGO_TARGET_DIR the fallback must stay inside the
 # vendored SDK's build directory, never the consumer's build root.

@@ -14,4 +14,10 @@ if [ "${TEMPORAL_PREBUILT_SMOKE:-0}" = 1 ]; then
   test -x "$binary" || { echo "missing prebuilt smoke executable: $binary" >&2; exit 1; }
   exec "$binary" "$@"
 fi
+# Make exports DUNE_JOBS and Compose passes it to worker containers (#851).
+# Dune reads that variable itself only from 3.22, while the SDK supports 3.18,
+# so a non-empty limit is also passed as an explicit `-j`.
+if [ -n "${DUNE_JOBS:-}" ]; then
+  exec opam exec -- dune exec -j "$DUNE_JOBS" "$build_dir" "$@"
+fi
 exec opam exec -- dune exec "$build_dir" "$@"
