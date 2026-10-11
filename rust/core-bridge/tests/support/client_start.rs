@@ -447,3 +447,38 @@ fn invalid_execution_policies_never_reach_the_transport() {
         assert!(runtime.pending_starts.is_empty());
     }
 }
+
+/// A configured start limit of two (#796) replaces the default of 64 on both
+/// the ticket path and the submitted-call path: a third distinct request ID
+/// is refused with the retryable capacity status naming the configured limit.
+#[test]
+fn configured_start_limit_is_enforced() {
+    let (mut runtime, _probe) = connected_runtime(Reply::Hung);
+    runtime.client_limits =
+        crate::client_calls::ClientLimits::from_config(None, Some(2), None).expect("valid limits");
+    for index in 0..2 {
+        runtime
+            .begin_start_workflow_json(&start_request(index))
+            .expect("start admitted below the configured limit");
+    }
+    let excess = runtime
+        .begin_start_workflow_json(&start_request(2))
+        .expect_err("ticket start beyond the configured limit");
+    assert_eq!(excess.status, STATUS_RESOURCE_EXHAUSTED);
+    assert!(excess.message.contains("limit 2"), "{}", excess.message);
+
+    for index in 10..12 {
+        runtime
+            .submit_client_call(1, &start_request(index))
+            .expect("submitted start admitted below the configured limit");
+    }
+    let excess = runtime
+        .submit_client_call(1, &start_request(12))
+        .expect_err("submitted start beyond the configured limit");
+    assert_eq!(excess.status, STATUS_RESOURCE_EXHAUSTED);
+    assert!(excess.message.contains("limit 2"), "{}", excess.message);
+
+    assert!(runtime.disconnect_client().is_ok());
+    assert!(runtime.pending_starts.is_empty());
+    assert_eq!(runtime.close(true), STATUS_OK);
+}
