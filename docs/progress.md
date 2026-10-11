@@ -15,6 +15,30 @@ implementation when a later entry documents that work as complete. The
 records the current tested source, named assertions and successful CI job for
 the Temporal acceptance controllers.
 
+## 2026-10-12: One encode per activity completion (#995)
+
+Each activity completion was encoded twice: once in
+`Native_activity_execution` to validate it, and again in the supervisor's
+`Complete_activity` / `Complete_async_activity` handler to send it. The
+adapter now runs the strict encoder once through the new private
+`Temporal_protocol.Encoded_activity_completion`, the activity counterpart of
+`Encoded_workflow_completion` (#846). Its abstract value is the only form a
+completion can take to reach the supervisor, so an invalid completion is still
+rejected before the bridge, and the supervisor copies its bytes into C
+unchanged. A retained worker lease keeps only those immutable bytes in place of
+a token-copied typed completion, so a retry through `poll`, `drain` or
+`try_drain` resubmits the identical string. The async completion path encodes
+once per submission. The protocol adapter's `encode_activity_completion` is
+gone. The ABI and JSON documents are unchanged.
+
+The fake supervisors in the runtime tests now decode the submitted bytes
+strictly and check that they are the canonical encoding of the decoded value.
+`test_completion_is_encoded_once` rejects one submission, raises a transient
+exception on the next, and drains the third. It requires all three to be the
+physically identical string and to equal the canonical encoding of the
+accepted completion. The asynchronous heartbeat path still encodes a heartbeat
+once to validate it and again in the supervisor. It is outside this change.
+
 ## 2026-10-11: Configurable client admission limits (#796)
 
 The native client's three admission limits were fixed constants in the Rust
@@ -4063,27 +4087,3 @@ runner output and report state that a pass is forward-compatibility evidence
 only, not rollback evidence (#508). The
 whole corpus replays in about a second. Every current capture comes from Core
 `95e97686`, so the first Core bump will be the first cross-revision replay.
-
-## 2026-10-12: One encode per activity completion (#995)
-
-Each activity completion was encoded twice: once in
-`Native_activity_execution` to validate it, and again in the supervisor's
-`Complete_activity` / `Complete_async_activity` handler to send it. The
-adapter now runs the strict encoder once through the new private
-`Temporal_protocol.Encoded_activity_completion`, the activity counterpart of
-`Encoded_workflow_completion` (#846). Its abstract value is the only form a
-completion can take to reach the supervisor, so an invalid completion is still
-rejected before the bridge, and the supervisor copies its bytes into C
-unchanged. A retained worker lease keeps only those immutable bytes in place of
-a token-copied typed completion, so a retry through `poll`, `drain` or
-`try_drain` resubmits the identical string. The async completion path encodes
-once per submission. The protocol adapter's `encode_activity_completion` is
-gone. The ABI and JSON documents are unchanged.
-
-The fake supervisors in the runtime tests now decode the submitted bytes
-strictly and check that they are the canonical encoding of the decoded value.
-`test_completion_is_encoded_once` rejects one submission, raises a transient
-exception on the next, and drains the third. It requires all three to be the
-physically identical string and to equal the canonical encoding of the
-accepted completion. The asynchronous heartbeat path still encodes a heartbeat
-once to validate it and again in the supervisor. It is outside this change.
