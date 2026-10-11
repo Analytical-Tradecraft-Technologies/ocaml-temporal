@@ -46,6 +46,37 @@ sender-side rejection, Rust's acceptance of a limited document, and typed
 defects from `Client.create`; the capacity classification test covers the
 configured-limit messages. The concurrent client live regression now also
 refuses a third wait on a client created with `~max_pending_waits:2`.
+## 2026-10-11: Patch lifecycle replay matrix (#531)
+
+The history corpus now records the patch lifecycle beyond the single
+`corpus.patch` workflow. Four frozen generations of each `corpus.lifecycle.*`
+workflow type (legacy, patched, deprecated, removed) differ only in one gate
+function. `corpus.lifecycle.multi` has three independent patches around an
+activity, a timer and a child workflow; `corpus.lifecycle.loop` consults one
+patch in each of three iterations; `corpus.lifecycle.handlers` puts patches in
+a signal handler and an update handler that each run an activity; and
+`corpus.lifecycle.handover` was started by a legacy worker and finished by a
+fresh patched worker that reached the patch point for the first time.
+
+The capture `live-2026-10-11` (Server 1.32.0, Core `95e97686`, OCaml 5.4.1,
+clean tree at the recorded commit) adds 13 histories. They are replayed
+against every other lifecycle generation as 39 derived cases, bringing the
+corpus to 73 cases and 25 negative controls. Every prediction held: upgrades
+replay in lifecycle order, premature deprecation and removal without
+deprecation are nondeterministic, the deprecated and removed stages can roll
+back one stage, and nothing written after the legacy stage replays on legacy
+code. A negative control can now declare `expected_message`, a fragment of
+Core's failure reason, and the runner fails it for any other mismatch. The
+coverage gate requires the new patch features, and the mismatch test adds a
+wrong-reason scenario. `HISTORY_CORPUS_GENERATIONS` lets a capture record only
+new definition sets.
+
+No SDK defect was found. Version routing remains deferred by the v1 support
+policy, so no routing claim is made. Concurrent old and new workers on one
+task queue are not exercised.
+
+Evidence: `dune test test/history_corpus` passes all 73 cases and the three
+runner negative-path scenarios.
 
 ## 2026-10-10: Concurrent calls on one client (#807)
 

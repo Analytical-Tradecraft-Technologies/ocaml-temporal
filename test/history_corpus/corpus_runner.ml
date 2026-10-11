@@ -166,9 +166,22 @@ let failure_outcome = function
   | Temporal.Replay.Unsupported_history _ -> Unsupported_history
   | Temporal.Replay.Replay_error _ -> Replay_error
 
+(** Returns whether [text] contains [fragment] as a contiguous substring.
+    Used to check a negative control's declared failure reason; a plain scan
+    is enough for these bounded diagnostic strings. *)
+let contains ~fragment text =
+  let length = String.length fragment in
+  let rec scan index =
+    index + length <= String.length text
+    && (String.sub text index length = fragment || scan (index + 1))
+  in
+  scan 0
+
 (** Replays one entry from [root], the corpus directory, and compares the
     outcome with the manifest. A nondeterminism verdict must also name the
-    entry's run ID, so a negative control cannot pass on the wrong run. *)
+    entry's run ID, so a negative control cannot pass on the wrong run, and
+    its failure text must contain the entry's [expected_message] when the
+    manifest declares one, so it cannot pass for an unrelated mismatch. *)
 let run_entry ~root ~captures (entry : Corpus_manifest.entry) =
   let capture =
     List.find_opt
@@ -215,8 +228,19 @@ let run_entry ~root ~captures (entry : Corpus_manifest.entry) =
           let actual = failure_outcome failure in
           let message = Temporal.Replay.failure_message failure in
           (* A matching negative control keeps Core's mismatch text for the
-             report but is still a pass. *)
-          if actual = expected then
+             report but is still a pass, provided the text carries the
+             manifest's expected failure reason when one is declared. *)
+          let reason_matches =
+            match entry.expected_message with
+            | None -> true
+            | Some fragment -> contains ~fragment message
+          in
+          if actual = expected && not reason_matches then
+            finish actual
+              (Some
+                 (Printf.sprintf "expected failure text containing %S, got %s"
+                    (Option.get entry.expected_message) message))
+          else if actual = expected then
             { entry; capture; actual; passed = true; message = Some message }
           else
             finish actual

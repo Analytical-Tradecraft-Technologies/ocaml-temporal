@@ -140,3 +140,13 @@ migration automation, or a live routing
 acceptance test. Those require server-side compatibility-set orchestration and
 are tracked separately in the [feature coverage](feature-coverage.md) and
 [implementation roadmap](../implementation-roadmap.md).
+
+Issue [#531](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/531)
+added patch lifecycle replay coverage but deliberately no routing case: the
+[v1 support policy](v1-support-policy.md) defers deployment and build-ID
+routing, so neither `Legacy_build_id` nor `Deployment_based` is claimed to
+send an execution to a particular worker. A routing claim needs live
+evidence that the expected worker received the execution, for one routing
+mode selected with the maintainers; the
+[patching reference](workflow-patching.md#lifecycle-replay-matrix) records
+what replay alone establishes about mixed-version deploys.

@@ -47,6 +47,10 @@ type entry = {
   negative_control_of : string option;
       (** For a [Nondeterminism] entry, the [Replays_ok] entry whose history
           it reuses. *)
+  expected_message : string option;
+      (** For a [Nondeterminism] entry, an optional non-empty fragment that
+          the replay failure text must contain, so a negative control fails
+          for its documented reason rather than for any mismatch. *)
 }
 
 (** The provenance fields of one capture that replay reports compare with the
@@ -230,7 +234,7 @@ let check_entry errors index json =
         [
           "id"; "purpose"; "features"; "workflow_type"; "workflow_id"; "run_id";
           "capture"; "generation"; "history"; "replay_definitions"; "expected";
-          "negative_control_of"; "notes";
+          "negative_control_of"; "expected_message"; "notes";
         ]
         members;
       let id = string_member errors location members "id" in
@@ -258,12 +262,21 @@ let check_entry errors index json =
           error errors location "a nondeterminism entry needs negative_control_of"
       | Replays_ok, Some _ ->
           error errors location "only a negative control has negative_control_of");
+      (* The failure-reason fragment narrows a negative control only. *)
+      (match (expected, List.assoc_opt "expected_message" members) with
+      | Nondeterminism, Some (`String "") ->
+          error errors location "expected_message must not be empty"
+      | Replays_ok, Some _ ->
+          error errors location "only a negative control has expected_message"
+      | _, None | Nondeterminism, Some _ ->
+          (* A non-string value is reported by the type check below. *)
+          ());
       List.iter
         (fun name ->
           match List.assoc_opt name members with
           | None | Some (`String _) -> ()
           | Some _ -> error errors location (name ^ " must be a string"))
-        [ "generation"; "notes"; "negative_control_of" ];
+        [ "generation"; "notes"; "negative_control_of"; "expected_message" ];
       Some
         {
           id;
@@ -279,6 +292,10 @@ let check_entry errors index json =
           expected;
           negative_control_of =
             (match List.assoc_opt "negative_control_of" members with
+            | Some (`String value) -> Some value
+            | _ -> None);
+          expected_message =
+            (match List.assoc_opt "expected_message" members with
             | Some (`String value) -> Some value
             | _ -> None);
         }
