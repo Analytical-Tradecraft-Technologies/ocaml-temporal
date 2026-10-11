@@ -62,17 +62,17 @@ jobs:
       - name: Check out the exact tested commit
         uses: actions/checkout@v7
       - name: Download all four tested bridge bundles
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           pattern: rust-bridge-*
           path: _build/release-bundles
       - name: Download the audited Cargo SBOM
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: release-cargo-sbom
           path: _build/release-assets
       - name: Download all sixteen tested OCaml libraries
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           pattern: ocaml-sdk-*
           path: _build/release-ocaml-bundles

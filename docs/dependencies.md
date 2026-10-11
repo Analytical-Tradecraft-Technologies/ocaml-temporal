@@ -540,7 +540,7 @@ version comment recorded beside a commit pin.
 | `actions/cache/save` | `caa296126883cff596d87d8935842f9db880ef25` | v5 | MIT | Saving verified Rust bridge bundles |
 | `actions/upload-artifact` | `043fb46d1a93c77aae656e7c1c64a875d1fc6a0a` | v7 | MIT | Passing bridges, reports, and release inputs between jobs |
 | `actions/upload-artifact` | `cf430e030ddbb5b0abf93d22962f4752f3646cd9` | v7 | MIT | Passing bridges, reports, and release inputs between jobs |
-| `actions/download-artifact` | `3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c` | v8 | MIT | Consuming those artifacts |
+| `actions/download-artifact` | `9000827ccba6bdab643e8b6fd33ac0654aef8333` | v8 | MIT | Consuming those artifacts |
 | `msys2/setup-msys2` | `ec48f7c5447b3140e2b088413ae3a55687bccb6e` | v2 | MIT | MinGW build tools for the Windows Rust producer |
 | `ocaml/setup-ocaml` | `93303b622b2522e4411e295f9e77411a24912ac7` | v3.9.0 | MIT | Native macOS and Windows OCaml compilers |
 | `taiki-e/install-action` | `f7e5d7c961414b23f5b25b2da9294395d08513ad` | v2.87.26 | Apache-2.0 OR MIT | Installing the pinned CI-only quality tools |

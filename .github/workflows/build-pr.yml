@@ -173,7 +173,7 @@ jobs:
           OCAML_RESULT: ${{ needs.verify.result }}
         run: test "$OCAML_RESULT" = success
       - name: Download compiled smoke executables
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: temporal-smoke-linux-amd64-ocaml-5.5.1
           path: _build/smoke-artifact
@@ -272,7 +272,7 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v7
       - name: Download the verified platform bridge
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: rust-bridge-linux-${{ matrix.runner == 'ubuntu-24.04-arm' && 'arm64' || 'amd64' }}
           path: _build/rust-bridge
@@ -395,7 +395,7 @@ jobs:
         shell: bash
         run: sh scripts/opam-locked-deps.sh install --assume-depexts
       - name: Download the verified platform bridge
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: rust-bridge-macos-arm64
           path: _build/rust-bridge
@@ -476,7 +476,7 @@ jobs:
         shell: bash
         run: sh scripts/opam-locked-deps.sh install --assume-depexts
       - name: Download the verified platform bridge
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: rust-bridge-windows-amd64
           path: _build/rust-bridge
