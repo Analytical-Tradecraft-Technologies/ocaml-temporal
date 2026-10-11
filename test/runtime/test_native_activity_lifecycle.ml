@@ -7,6 +7,7 @@
     retry and a failed drain before the eventual acknowledgement. *)
 
 module Protocol = Temporal_protocol.Activity_protocol
+module Encoded = Temporal_protocol.Encoded_activity_completion
 module Adapter = Temporal_runtime.Native_activity_execution
 
 (** A deterministic source error used by the fake supervisor. *)
@@ -61,7 +62,7 @@ module Fake_supervisor = struct
 
   (** Rejects the configured number of attempts before acknowledging the exact
       binary token. A rejection leaves the lease in place for adapter retry. *)
-  let complete_activity supervisor (completion : Protocol.completion) =
+  let complete_activity supervisor encoded =
     if !(supervisor.completion_rejections) > 0 then begin
       decr supervisor.completion_rejections;
       Error
@@ -72,8 +73,14 @@ module Fake_supervisor = struct
         }
     end
     else
+      (* Decode the adapter's single-encode bytes, as the Rust bridge does. *)
+      let completion =
+        match Protocol.decode_completion (Encoded.to_string encoded) with
+        | Ok completion -> completion
+        | Error _ -> failwith "adapter submitted an invalid completion"
+      in
       let found, remaining =
-        remove_token completion.task_token !(supervisor.leased)
+        remove_token completion.Protocol.task_token !(supervisor.leased)
       in
       if not found then
         Error
@@ -97,7 +104,7 @@ module Fake_supervisor = struct
   (** This lifecycle fake does not model deferred client completion; explicit
       rejection prevents an async test from accidentally bypassing its lease
       assertions. *)
-  let complete_async_activity _supervisor (_completion : Protocol.completion) =
+  let complete_async_activity _supervisor (_encoded : Encoded.t) =
     Error
       {
         code = "unsupported";

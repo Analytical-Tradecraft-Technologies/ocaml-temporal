@@ -8,6 +8,7 @@
     Server. *)
 
 module Protocol = Temporal_protocol.Activity_protocol
+module Encoded = Temporal_protocol.Encoded_activity_completion
 module Raw_adapter = Temporal_runtime.Native_activity_execution
 
 (** Copies a public payload into the base payload representation expected by the
@@ -112,6 +113,10 @@ type fake_supervisor = {
   completions : Protocol.completion list ref;
   (* Validated submissions, including attempts whose acknowledgement fails. *)
   completion_attempts : Protocol.completion list ref;
+  (* The exact canonical documents handed to [complete_activity], newest
+     first, retained without copying so a test can prove that a retry
+     resubmits the physically identical single-encode string (issue #995). *)
+  submitted_documents : string list ref;
   (* Heartbeats accepted while their corresponding token remains leased. *)
   heartbeats : Protocol.heartbeat list ref;
   (* One-shot transport rejection used to verify completion retry without a
@@ -146,6 +151,7 @@ let fake_supervisor () =
     leased = ref [];
     completions = ref [];
     completion_attempts = ref [];
+    submitted_documents = ref [];
     heartbeats = ref [];
     reject_next_completion = ref false;
     raise_next_completion = ref false;
@@ -155,16 +161,18 @@ let fake_supervisor () =
     heartbeat_hook = ref ignore;
   }
 
-(** Copies a validated completion by traversing the same strict JSON semantic
-    codec used at the Rust boundary. The fake therefore never retains a mutable
-    token or payload buffer owned by the adapter. *)
-let copy_completion completion =
-  match Protocol.encode_completion completion with
+(** Strictly decodes the canonical bytes the adapter submitted, as the Rust
+    bridge does, and checks that they are exactly the canonical encoding of
+    the decoded value. The fake therefore owns fresh token and payload storage
+    and never encodes a submission itself. *)
+let copy_completion encoded =
+  let json = Encoded.to_string encoded in
+  match Protocol.decode_completion json with
   | Error _ -> failwith "adapter submitted an invalid completion to fake source"
-  | Ok json -> (
-      match Protocol.decode_completion json with
-      | Ok value -> value
-      | Error _ -> failwith "fake source could not reparse its own completion")
+  | Ok value ->
+      if Protocol.encode_completion value <> Ok json then
+        failwith "adapter submitted non-canonical completion bytes";
+      value
 
 (** Copies a heartbeat through the strict protocol codec so the fake source
     cannot accidentally retain mutable buffers owned by an activity context. *)
@@ -219,9 +227,12 @@ module Fake_supervisor = struct
   (** Accepts a completion only for a currently leased exact token. An injected
       rejection leaves the native lease untouched so the adapter must retry the
       same completion without invoking the OCaml implementation again. *)
-  let complete_activity supervisor (completion : Protocol.completion) =
+  let complete_activity supervisor encoded =
+    supervisor.submitted_documents :=
+      Encoded.to_string encoded :: !(supervisor.submitted_documents);
+    let completion = copy_completion encoded in
     supervisor.completion_attempts :=
-      copy_completion completion :: !(supervisor.completion_attempts);
+      completion :: !(supervisor.completion_attempts);
     if !(supervisor.raise_next_completion) then begin
       supervisor.raise_next_completion := false;
       raise Transient_completion_failure
@@ -259,7 +270,7 @@ module Fake_supervisor = struct
       else begin
         supervisor.leased := remaining;
         supervisor.completions :=
-          copy_completion completion :: !(supervisor.completions);
+          completion :: !(supervisor.completions);
         Ok ()
       end
 
@@ -287,7 +298,7 @@ module Fake_supervisor = struct
 
   (** The legacy activity fake does not model a namespace-bound client; making
       this explicit keeps tests honest when the adapter contract grows. *)
-  let complete_async_activity _supervisor (_completion : Protocol.completion) =
+  let complete_async_activity _supervisor (_encoded : Encoded.t) =
     Error
       {
         code = "unsupported";
@@ -925,6 +936,46 @@ let test_completion_retry_does_not_redo_activity () =
     failwith "pending completion retry submitted more than one completion";
   if !(supervisor.leased) <> [] then
     failwith "retried completion left lease active"
+
+(** Each completion is encoded exactly once (issue #995). The adapter's single
+    encoder pass yields the immutable document that every submission sends:
+    a typed rejection retried by [poll] and a transient exception retried by
+    [drain] both resubmit the physically identical string, so neither a retry
+    nor the supervisor re-encodes the completion. The document is also
+    byte-for-byte the canonical encoding of the accepted completion, so the
+    JSON protocol is unchanged. *)
+let test_completion_is_encoded_once () =
+  let supervisor = fake_supervisor () in
+  let activity =
+    Temporal.Activity.define ~name:"native_activity_single_encode"
+      ~input:Temporal.Codec.unit ~output:Temporal.Codec.string (fun () ->
+        Ok "encoded once")
+  in
+  let token = Bytes.of_string "\000single-encode\255" in
+  enqueue supervisor
+    (start_task ~token ~activity_type:"native_activity_single_encode"
+       ~input:[ encode_input Temporal.Codec.unit () ]);
+  supervisor.reject_next_completion := true;
+  let worker = worker supervisor [ Adapter.register activity ] in
+  (match Worker.poll worker with
+  | Error { code = "completion_failed"; retryable = true; _ } -> ()
+  | _ -> failwith "single-encode: first submission was not rejected");
+  supervisor.raise_next_completion := true;
+  (match Worker.poll worker with
+  | Error { code = "completion_failed"; retryable = true; _ } -> ()
+  | _ -> failwith "single-encode: second submission did not raise");
+  (match Worker.drain worker with
+  | Ok () -> ()
+  | Error _ -> failwith "single-encode: drain did not submit the retained lease");
+  match !(supervisor.submitted_documents), !(supervisor.completions) with
+  | [ third; second; first ], [ accepted ] ->
+      if not (first == second && second == third) then
+        failwith "single-encode: a retry submitted a re-encoded document";
+      if Protocol.encode_completion accepted <> Ok first then
+        failwith "single-encode: submitted bytes are not the canonical encoding";
+      if not (Bytes.equal accepted.Protocol.task_token token) then
+        failwith "single-encode: submitted token changed"
+  | _ -> failwith "single-encode: unexpected number of submissions"
 
 (** A completion exception follows the same ownership rule as a typed
     rejection when the supervisor explicitly marks that exception transient.
@@ -1889,6 +1940,7 @@ let () =
   test_cancellation ();
   test_completion_retry_does_not_redo_activity ();
   test_transient_completion_exception_does_not_redo_activity ();
+  test_completion_is_encoded_once ();
   test_non_retryable_completion_is_never_resubmitted ();
   test_contextual_heartbeat_lifecycle ();
   test_context_payloads_are_copied ();

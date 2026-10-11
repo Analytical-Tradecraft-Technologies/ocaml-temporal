@@ -8,6 +8,7 @@
     because its completion transport failed. *)
 
 module Protocol = Temporal_protocol.Activity_protocol
+module Encoded_completion = Temporal_protocol.Encoded_activity_completion
 module Definition = Temporal_base.Definition
 module Codec = Temporal_base.Codec
 module Base_error = Temporal_base.Error
@@ -29,12 +30,15 @@ module type SUPERVISOR = sig
   type error
 
   val try_poll_activity : t -> (Protocol.task option, error) result
-  val complete_activity : t -> Protocol.completion -> (unit, error) result
+  (* Both completion calls receive the canonical bytes from the adapter's
+     single encoder pass (issue #995); implementations submit them without
+     encoding the completion again. *)
+  val complete_activity : t -> Encoded_completion.t -> (unit, error) result
   (* Submits a completion for an activity that has already returned
      [WillCompleteAsync]. This path uses Core's namespace-bound client and
      never consults the worker task-token ledger. *)
   val complete_async_activity :
-    t -> Protocol.completion -> (unit, error) result
+    t -> Encoded_completion.t -> (unit, error) result
   val record_activity_heartbeat : t -> Protocol.heartbeat -> (unit, error) result
   (* Records heartbeat details through the namespace-bound async handle. *)
   val record_async_activity_heartbeat :
@@ -144,13 +148,16 @@ type accepted_result =
 type lease = {
   token : bytes;
   activity_type : string option;
-  completion : Protocol.completion;
+  encoded : Encoded_completion.t;
   accepted_result : accepted_result;
   mutable retry_refusal : error_view option;
 }
 (** One completion that has not yet been proven accepted by native Core. The
-    [token] is always an owned copy and [completion] contains another owned copy
-    of that same token.
+    [token] is always an owned copy. [encoded] is the immutable canonical JSON
+    from the completion's single encoder pass, which also embeds that same
+    token; every submission and retry sends exactly these bytes, so no retry
+    re-encodes the completion or observes a later buffer mutation
+    (issue #995).
 
     [retry_refusal] records the first failure that was not explicitly
     classified as retryable. Once it is [Some], the completion is never
@@ -666,19 +673,19 @@ type completion_attempt =
   | Rejected_by_supervisor of error_view
   | Raised_by_supervisor of exn
 
-(** Validates the typed completion using the same strict JSON semantic encoder
-    that the Rust-facing supervisor uses. No JSON string is retained; the
-    round-trip is a validation gate only. *)
-let validate_completion completion =
-  match
-    (* Timed only while the bridge source is at [Debug] (#528). This pass is
-       separate from the supervisor's encode, so attribution reports both. *)
-    Observability.debug_timed ~src:Observability.Source.bridge
-      ~operation:"activity_completion_validate" (fun () ->
-        Protocol.encode_completion completion)
-  with
-  | Ok _ -> Ok ()
-  | Error error -> Error (protocol_error ~path:"$.completion" error)
+(** Validates and serializes the typed completion in its one strict semantic
+    encoder pass. The returned value is the only form a completion can take on
+    its way to the supervisor, which copies its bytes into the C call without
+    encoding them again (issue #995); an encoder rejection therefore keeps the
+    completion away from the native bridge. The pass is timed as
+    [activity_completion_encode] only while the bridge source is at [Debug]
+    (#528). *)
+let encode_completion completion =
+  Result.map_error
+    (fun error -> protocol_error ~path:"$.completion" error)
+    (Observability.debug_timed ~src:Observability.Source.bridge
+       ~operation:"activity_completion_encode" (fun () ->
+         Encoded_completion.encode completion))
 
 (** Converts a supervisor completion exception to a stable diagnostic without
     revealing the opaque token or native exception object. *)
@@ -970,9 +977,11 @@ module Make (Supervisor : SUPERVISOR) = struct
       ()
 
   (** Owned, fully validated requests ready to cross the supervisor boundary.
-      Preparing these values never changes either lease ledger. *)
+      A completion is carried as its single encoder pass's canonical bytes,
+      which the supervisor submits unchanged. Preparing these values never
+      changes either lease ledger. *)
   type async_request =
-    | Async_completion of Protocol.completion
+    | Async_completion of Encoded_completion.t
     | Async_heartbeat of Protocol.heartbeat
 
   (** Copies and validates an entire late operation before any native call.
@@ -990,32 +999,35 @@ module Make (Supervisor : SUPERVISOR) = struct
       in
       loop [] payloads
     in
+    (* Build the typed request first; a completion is then encoded exactly
+       once below and only its bytes enter [async_request]. *)
     let* request =
       match operation with
       | Async_activity.Complete payload ->
           let* payload = protocol_payload "$.async_completion.result" payload in
-          Ok (Async_completion Protocol.{ task_token; result = Completed payload })
+          Ok (`Completion Protocol.{ task_token; result = Completed payload })
       | Async_activity.Fail failure ->
           let diagnostic = application_error ~path:"$.async_failure" failure in
           let* failure = failure_of_application_error diagnostic failure in
-          Ok (Async_completion Protocol.{ task_token; result = Failed failure })
+          Ok (`Completion Protocol.{ task_token; result = Failed failure })
       | Async_activity.Cancel payloads ->
           let* details = details "$.async_cancellation.details" payloads in
           let failure = cancellation_failure ~details Protocol.Cancellation_requested in
-          Ok (Async_completion Protocol.{ task_token; result = Cancelled failure })
+          Ok (`Completion Protocol.{ task_token; result = Cancelled failure })
       | Async_activity.Heartbeat payloads ->
           let* details = details "$.async_heartbeat.details" payloads in
-          Ok (Async_heartbeat Protocol.{ task_token; details })
+          Ok (`Heartbeat Protocol.{ task_token; details })
     in
-    let* () =
-      match request with
-      | Async_completion completion -> validate_completion completion
-      | Async_heartbeat heartbeat ->
-          (match Protocol.encode_heartbeat heartbeat with
-          | Ok _ -> Ok ()
-          | Error error -> Error (protocol_error ~path:"$.async_heartbeat" error))
-    in
-    Ok request
+    match request with
+    | `Completion completion ->
+        (* The completion's only encoder pass; its bytes are what the
+           supervisor submits. *)
+        let* encoded = encode_completion completion in
+        Ok (Async_completion encoded)
+    | `Heartbeat heartbeat ->
+        (match Protocol.encode_heartbeat heartbeat with
+        | Ok _ -> Ok (Async_heartbeat heartbeat)
+        | Error error -> Error (protocol_error ~path:"$.async_heartbeat" error))
 
   (** Maps an adapter-local failure that never received a native answer (a
       missing lease or a supervisor exception) to a lifecycle decision. Such
@@ -1089,8 +1101,8 @@ module Make (Supervisor : SUPERVISOR) = struct
                       try
                         let submitted =
                           match request with
-                          | Async_completion completion ->
-                              Supervisor.complete_async_activity adapter.supervisor completion
+                          | Async_completion encoded ->
+                              Supervisor.complete_async_activity adapter.supervisor encoded
                           | Async_heartbeat heartbeat ->
                               Supervisor.record_async_activity_heartbeat adapter.supervisor heartbeat
                         in
@@ -1111,12 +1123,13 @@ module Make (Supervisor : SUPERVISOR) = struct
                         | Async_activity.Retryable_submission _) -> ());
                     result))
 
-  (** Submits an already validated, owned completion and preserves lease
+  (** Submits an already encoded, immutable completion and preserves lease
       uncertainty when a typed native error or an exception is returned. Local
-      validation happens before admission to the pending-completion map. *)
-  let attempt_completion supervisor completion =
+      validation (the single encoder pass) happens before admission to the
+      pending-completion map. *)
+  let attempt_completion supervisor encoded =
     try
-      match Supervisor.complete_activity supervisor completion with
+      match Supervisor.complete_activity supervisor encoded with
       | Ok () -> Accepted
       | Error source_error ->
           let source =
@@ -1195,7 +1208,7 @@ module Make (Supervisor : SUPERVISOR) = struct
       if not error.retryable then lease.retry_refusal <- Some error;
       Error error
     in
-    match attempt_completion adapter.supervisor lease.completion with
+    match attempt_completion adapter.supervisor lease.encoded with
     | Rejected_by_supervisor error -> refuse_unless_retryable error
     | Raised_by_supervisor exception_ ->
         let retryable = completion_exception_is_retryable exception_ in
@@ -1254,18 +1267,20 @@ module Make (Supervisor : SUPERVISOR) = struct
 
   (** Validates and records one completion without submitting it. Invalid
       application data becomes a bounded failure before anything is retained
-      for transport retry. [enqueue_and_finish] submits the recorded lease at
-      once; [drain] records several and then submits them in token order. *)
+      for transport retry. The completion is encoded exactly once here; the
+      lease retains only those immutable bytes, which every submission and
+      retry sends unchanged (issue #995). [enqueue_and_finish] submits the
+      recorded lease at once; [drain] records several and then submits them in
+      token order. *)
   let admit_completion adapter ~token ~activity_type ~completion
       ~accepted_result =
     let (completion : Protocol.completion) = completion in
     let token = Bytes.copy token in
-    let completion =
-      Protocol.{ completion with task_token = Bytes.copy completion.task_token }
-    in
-    let* completion, accepted_result =
-      match validate_completion completion with
-      | Ok () -> Ok (completion, accepted_result)
+    (* Encoding snapshots the token and payload bytes, so no defensive copy of
+       the typed completion is needed before it is retained. *)
+    let* encoded, accepted_result =
+      match encode_completion completion with
+      | Ok encoded -> Ok (encoded, accepted_result)
       | Error error ->
           (* No native submission has occurred. Do not retain an invalid value
              that every subsequent poll would reject, and do not admit an async
@@ -1278,15 +1293,16 @@ module Make (Supervisor : SUPERVISOR) = struct
               result = Failed (failure_of_error error) }
           in
           (* A malformed supervisor token cannot be repaired by dropping
-             application details. Validate the fallback too, before admission. *)
-          let* () = validate_completion fallback in
-          Ok (fallback, Rejected_result error)
+             application details. Encode (and so validate) the fallback too,
+             before admission. *)
+          let* encoded = encode_completion fallback in
+          Ok (encoded, Rejected_result error)
     in
     let lease =
       {
         token;
         activity_type;
-        completion;
+        encoded;
         accepted_result;
         retry_refusal = None;
       }

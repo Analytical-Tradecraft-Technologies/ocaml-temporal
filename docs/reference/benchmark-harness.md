@@ -448,10 +448,10 @@ Findings:
   39 MB above the pre-load baseline after compaction, consistent with native
   allocator capacity rather than retained OCaml data; the suite cannot
   separate Core's own retention from allocator behavior.
-- **Activity completions are encoded twice**: once by the activity adapter's
-  validation pass (`activity_completion_validate`) and again by the
-  supervisor (`activity_completion_encode`), about 8 µs each with these
-  payloads. The cost is small here but grows with payload size.
+- **Activity completions were encoded twice** when these numbers were taken:
+  once by the activity adapter's validation pass and again by the supervisor,
+  about 8 µs each with these payloads. #995 since made it one encode in the
+  adapter, timed as `activity_completion_encode`.
 
 [#507]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/507
 [#526]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/526

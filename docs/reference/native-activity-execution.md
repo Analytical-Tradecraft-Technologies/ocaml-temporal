@@ -11,13 +11,13 @@ try_poll_activity :
   supervisor -> (Activity_protocol.task option, native_error) result
 
 complete_activity :
-  supervisor -> Activity_protocol.completion -> (unit, native_error) result
+  supervisor -> Encoded_activity_completion.t -> (unit, native_error) result
 
 record_activity_heartbeat :
   supervisor -> Activity_protocol.heartbeat -> (unit, native_error) result
 
 complete_async_activity :
-  supervisor -> Activity_protocol.completion -> (unit, native_error) result
+  supervisor -> Encoded_activity_completion.t -> (unit, native_error) result
 
 record_async_activity_heartbeat :
   supervisor -> Activity_protocol.heartbeat -> (unit, native_error) result
@@ -35,6 +35,15 @@ The adapter is deliberately independent of the concrete Rust supervisor.  A
 deterministic fake supervisor can therefore test every lease and completion
 path without a Temporal Server, while the production supervisor remains the
 only owner of Rust handles and network state.
+
+Both completion operations take an abstract
+`Temporal_protocol.Encoded_activity_completion.t`, not a typed completion. The
+adapter runs the strict activity-protocol encoder exactly once per completion,
+and that pass is both the validation gate and the source of the bytes the
+supervisor copies into the C call (issue #995). Only
+`Encoded_activity_completion.encode` can build the value, so an invalid
+completion cannot reach the bridge, and the supervisor never encodes it again.
+The JSON document is unchanged.
 
 ## Asynchronous completion
 
@@ -118,7 +127,10 @@ operation while a retryable request remains in flight or unresolved. Terminal
 state is retired after native acceptance or a terminal native rejection. The
 adapter validates each complete request through the strict activity-protocol
 encoder before calling the supervisor, including metadata uniqueness and size
-limits. For a new request, local codec or payload validation failures preserve
+limits. For a terminal completion that encoder pass produces the
+`Encoded_activity_completion.t` the supervisor submits, so the request is
+encoded once per submission. A retried async request is a new submission and
+is prepared, and so encoded, again. For a new request, local codec or payload validation failures preserve
 the handle and its asynchronous lease, and release the invalid operation key.
 The caller may then submit corrected data or choose a different operation;
 shutdown still reports the outstanding lease until a terminal operation completes.
@@ -191,12 +203,13 @@ adapter mutex:
    Temporal failure without text conversion; metadata still follows the
    runtime's strict UTF-8 key/value rules rather than becoming an unvalidated
    side channel.
-5. Validate the entire completion through the strict activity-protocol encoder
-   before admitting it to the pending-completion map. Invalid application
+5. Encode the entire completion once through the strict activity-protocol
+   encoder before admitting it to the pending-completion map. The lease keeps
+   only the resulting immutable bytes. Invalid application
    metadata (including duplicate or oversized keys) becomes a bounded,
    non-retryable application failure with no details, retaining the exact task
    token. Validate that replacement before admitting it too.
-6. Submit the completion to the supervisor and remove the token only after the
+6. Submit those bytes to the supervisor and remove the token only after the
    supervisor returns `Ok ()`.
 
 The adapter mutex covers this whole transaction, including the user
@@ -505,10 +518,13 @@ the adapter retires its token only after confirmed acceptance. The
 duplicate keys, oversized keys, and malformed UTF-8 through the public worker,
 requiring a normal activity to complete after each rejected failure.
 
-The token is copied on receipt, copied again into the completion, and never
-converted to a string.  This preserves arbitrary binary tokens, prevents
-caller-owned mutable buffers from being retained, and keeps tokens out of
-diagnostics and logs.  The map is protected by one mutex around poll,
+The token is copied on receipt and never converted to a diagnostic string.
+The retained completion is the immutable canonical JSON from its single
+encoder pass, which embeds the token. Every retry resubmits that same string
+without re-encoding it, and a later mutation of a caller-owned token or payload
+buffer cannot change what is sent. This preserves arbitrary binary tokens,
+prevents caller-owned mutable buffers from being retained, and keeps tokens
+out of diagnostics and logs.  The map is protected by one mutex around poll,
 dispatch, and completion so two OCaml Domains cannot execute or retire the
 same lease concurrently.  The mutex is an OCaml state guard; it does not hold
 the OCaml runtime lock while Rust waits.  The concrete supervisor is
