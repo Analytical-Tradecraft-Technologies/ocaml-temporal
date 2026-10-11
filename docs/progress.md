@@ -31,11 +31,23 @@ unset when the caller has none. The defaults are unchanged: 2 locally and
 `auto` when `CI` is set. The README quickstart now gives
 `DUNE_JOBS=1 CARGO_BUILD_JOBS=2` for a 4-6 GiB VM.
 
+Dune reads `DUNE_JOBS` from its environment only from 3.22.0, and the SDK
+supports Dune 3.18, so the export alone does not bound older releases. The
+install, prebuilt-consumer and vendored-build scripts therefore start Dune
+through an `opam_dune` helper, and `scripts/run-temporal-executable.sh` uses
+the same branch. When `DUNE_JOBS` is non-empty, both add an explicit
+`-j "$DUNE_JOBS"`.
+
 `test/smoke/test_build_jobs_contract.sh` now runs a probe recipe to check that
 recipes receive the local default, the CI default, and command-line and
 environment overrides, and that an empty limit arrives unset. It also checks
 that the `dev` service passes the variable through without an interpolated
 default. Removing either the export or the unexport makes the contract fail.
+For the scripts, the contract puts stub `opam` and `dune` commands on `PATH`.
+It checks that every Dune start in the three test scripts goes through
+`opam_dune`, and runs each helper and the worker launcher with and without
+`DUNE_JOBS`. With a value, the recorded Dune arguments must include `-j`;
+without one, they must not.
 `docker compose config` showed the value reaching an extending worker
 service, and `dune build --help` in the development image confirmed that
 Dune 3.24.2 reads `DUNE_JOBS`.

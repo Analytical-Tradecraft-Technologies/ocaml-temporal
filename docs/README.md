@@ -209,9 +209,10 @@ Make passes `DUNE_JOBS` to every Dune build, test, and `dune exec` it runs.
 It defaults to 2 locally so concurrent native links fit a default Docker VM, and
 to Dune's automatic count when `CI` is set; use `DUNE_JOBS=1` on a smaller VM
 or `DUNE_JOBS=auto` to restore Dune's default (#851). Make exports a non-empty
-`DUNE_JOBS`, which Dune reads from its environment, and the fixture's `dev`
-Compose service passes it through, so nested Dune builds in test scripts and
-long-lived worker containers are bounded too.
+`DUNE_JOBS`, and the fixture's `dev` Compose service passes it through. Dune
+reads that variable itself only from 3.22, so the test scripts and the worker
+launcher that start Dune also pass it as an explicit `-j`. This bounds nested
+builds and long-lived worker containers on Dune 3.18 and later.
 For the real server smoke, the Makefile owns Compose project selection,
 readiness checks, failure logs, and volume cleanup; do not run the fixture's
 Compose file from the repository root.
