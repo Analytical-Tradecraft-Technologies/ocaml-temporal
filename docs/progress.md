@@ -38,6 +38,42 @@ exception on the next, and drains the third. It requires all three to be the
 physically identical string and to equal the canonical encoding of the
 accepted completion. The asynchronous heartbeat path still encodes a heartbeat
 once to validate it and again in the supervisor. It is outside this change.
+## 2026-10-12: Official-SDK interoperability regression (#517)
+
+A new live regression, `test/integration/sdk_interop`, drives an OCaml
+workflow from the official Temporal Python SDK (`temporalio` 1.33.0, MIT).
+The SDK runs only in the digest-pinned `python:3.14-slim-bookworm` image as
+the `sdk-interop-python` Compose service, installed into a throwaway virtual
+environment from a hash-locked closure of five packages
+(`test/integration/sdk_interop/python/requirements.lock`, all MIT, BSD,
+Apache-2.0 or PSF-2.0). `docs/dependencies.md` gains a CI-only
+interoperability tooling table, and `scripts/check-dependency-inventory.sh`
+and its contract now compare that table with the lock. `make license-check`
+now also runs `make python-license-check`, which installs the lock with its
+hashes in the pinned Python image and audits each installed distribution's
+own `importlib.metadata` license fields and license files against the shared
+SPDX allowlist, with two exact reviewed overrides (protobuf's free-text
+license and typing-extensions' PSF-2.0) and an exact installed-equals-lock
+check; `test/smoke/test_python_license_policy.sh` proves the rules on fake
+distributions.
+
+The OCaml regression process hosts the workflow worker and publishes its
+queues; the Python driver hosts the activity the OCaml workflow calls, starts
+the workflow with structured `json/plain` input, queries it, sends an
+accepted update and three rejected ones (validator, `binary/plain` input,
+wrong shape), signals a document with 2^53+1, a fraction, astral-plane text
+and `null`, and checks the exact echoed result, the history payload
+encodings, and the `temporal-ocaml` SDK name and version recorded in
+`WorkflowTaskCompleted`. An activity `ApplicationError` returns through the
+OCaml workflow as a `PricingFailed` failure with the original detail, and a
+JSON string workflow input fails the workflow task while the run stays open.
+The OCaml client then re-reads the same three exact runs. The suite is in
+`LIVE_REGRESSION_EXECUTABLES`, and `run-live-regressions.sh` dispatches it to
+both containers. It passed locally against the Compose Temporal Server 1.32.0
+and PostgreSQL stack with OCaml 5.2:
+`make test-temporal-live-regressions LIVE_REGRESSION_EXECUTABLES=test/integration/sdk_interop/regression.exe`.
+Child workflows across SDKs, official-SDK workflows calling OCaml activities,
+other official SDKs and custom codecs remain unqualified.
 ## 2026-10-11: Dune job limit reaches nested and long-lived Dune processes (#851)
 
 The earlier #851 change passed `-j $(DUNE_JOBS)` to every Dune command in the
