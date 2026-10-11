@@ -425,6 +425,15 @@ turns the watchdog off for debugging. The watchdog's timing never reaches a
 workflow command, so it cannot cause replay divergence: a failed workflow task
 is simply retried from history.
 
+`test/integration/non_yielding_workflow` is the live qualification against
+Temporal Server: a 500 ms deadline detects a spinning workflow, the health
+report, log record, and `WorkflowTaskFailed` event name the run without its
+input, `shutdown_with_report` returns within its bound with one abandoned
+activation, other workflows and a legitimately heavy activation complete on a
+worker with a 3 s deadline, and the failed run completes there from history
+with exactly one failed task recorded. Releasing the stuck code then drops its
+late completion and lets `run` return.
+
 The semantic translator accepts child-start commands with the workflow identity,
 input, and optional retry policy represented by the protocol. Core child options
 not yet exposed by the OCaml runtime remain explicit defaults, but the two child
