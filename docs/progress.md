@@ -15,18 +15,38 @@ implementation when a later entry documents that work as complete. The
 records the current tested source, named assertions and successful CI job for
 the Temporal acceptance controllers.
 
-## 2026-10-12: Idle-pacing test uses the monotonic clock (#994 follow-up)
+## 2026-10-12: Idle-pacing tests measure decisions, not sleep granularity (#994 follow-up)
 
-`test/runtime/test_native_worker_idle.ml` simulated sub-millisecond server
-round trips with `Unix.gettimeofday`, which advances in coarse ticks on
-Windows. Each 0.5 ms round trip therefore lasted a whole tick there, the lanes
-backed off further while waiting, and the serial-chain check failed on the
-Windows x64 job ("serial step requested 6.42 ms of yields on average").
-The test now reads the bridge's monotonic clock
-(`Native_bridge.monotonic_now_ns`), so the simulated latency is what the test
-intends on every platform. On macOS three consecutive runs of
-`@test/runtime/runtest` reported 0.200 ms of requested yields per step, well
-below the 5 ms bound; production code is unchanged.
+`test/runtime/test_native_worker_idle.ml` failed on the Windows x64 job of
+unrelated PRs ("serial step requested 6.42 ms of yields on average", "timed
+out waiting for both lanes to request a capped yield"). Switching the test to
+the bridge's monotonic clock did not fix it. The cause is OCaml's Windows
+`Thread.delay`, which passes whole milliseconds to `Sleep`: a sub-millisecond
+backoff step returns at once and a longer one lasts until a 15.625 ms tick.
+The lanes therefore take more backoff steps per round trip, so the total of
+requested delays per step rose to about 6.5 ms. The pacing decisions were
+unchanged, and no capped yield was requested during the chain. Idle lanes also
+seldom reach the 10 ms cap there, because each new native wait restarts them.
+
+The test's sleeps now go through one function that can simulate the Windows
+sleep (`IDLE_TEST_SLEEP_MODEL=windows`). That reproduced both failures on
+macOS: 6.2 to 6.9 ms of requested yields per step. The assertions now
+measure the algorithm's decisions:
+- the serial chain allows at most one capped yield per two steps. Adaptive
+  pacing requests none on either sleep model; the fixed 10 ms yield
+  requests 213 in 100 steps;
+- the admission-race test no longer waits for capped yields. It confirms the
+  sibling is queued while the raced wait holds the owner, which removes a
+  transient-queue race, and only the raced wait has the long timeout. The
+  pure unit test still checks the capped-lane restart deterministically.
+
+`test/runtime/dune` also reruns the test under the Windows model, so this
+interleaving is covered on every platform. The monotonic-clock change is
+kept. Production code is unchanged.
+
+With the Windows model, a simulated serial step takes about 21 ms with
+adaptive pacing and 23 ms with the fixed yield. On Windows the #994 gain is
+therefore limited by timer granularity.
 
 ## 2026-10-12: Adaptive idle pacing between worker lane polls (#994)
 

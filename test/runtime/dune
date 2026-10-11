@@ -33,3 +33,16 @@
   test_thread_context_isolation
   test_race_matrix)
  (libraries temporal-sdk temporal_runtime temporal_core_bridge unix))
+
+; Reruns the idle-pacing regressions with the Windows sleep model (sub-ms
+; Thread.delay returns at once, longer sleeps last whole 15.625 ms ticks), so
+; the interleaving behind the Windows x64 CI failures is exercised on every
+; platform.
+
+(rule
+ (alias runtest)
+ (action
+  (setenv
+   IDLE_TEST_SLEEP_MODEL
+   windows
+   (run %{exe:test_native_worker_idle.exe}))))
