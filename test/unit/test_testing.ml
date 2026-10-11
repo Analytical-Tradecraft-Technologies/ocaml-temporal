@@ -500,13 +500,22 @@ let rec countdown_workflow =
        (fun remaining ->
          if remaining = 0 then
            let* info = T.Workflow.info () in
+           let initiator =
+             match T.Workflow.Info.continuation_initiator info with
+             | Some `Continue_as_new -> "continue-as-new"
+             | Some (`Retry | `Cron_schedule) | None -> "other"
+           in
            Ok
-             (Printf.sprintf "%s/%s" (T.Workflow.Info.run_id info)
+             (Printf.sprintf "%s/%s<-%s:%s" (T.Workflow.Info.run_id info)
                 (Option.value ~default:""
-                   (T.Workflow.Info.first_execution_run_id info)))
+                   (T.Workflow.Info.first_execution_run_id info))
+                (Option.value ~default:""
+                   (T.Workflow.Info.continued_from_run_id info))
+                initiator)
          else T.Workflow.continue_as_new (Lazy.force countdown_workflow) (remaining - 1)))
 
-(** Continue-as-new starts successor runs and the handle follows them. *)
+(** Continue-as-new starts successor runs and the handle follows them; each
+    successor reports its predecessor and the continue-as-new initiator. *)
 let test_continue_as_new () =
   let countdown = Lazy.force countdown_workflow in
   with_environment ~workflows:[ T.Testing.workflow countdown ] ~activities:[]
@@ -514,9 +523,10 @@ let test_continue_as_new () =
       let handle = ok "start" (T.Testing.start environment countdown 3) in
       (* The runs contain no timers, so [start] already ran every successor;
          the handle follows the chain to its fourth and final run, which
-         still reports the chain's first run. *)
+         still reports the chain's first run and names its predecessor. *)
       expect "handle follows the latest run" "test-run-4" (T.Testing.run_id handle);
-      expect "final run and first run" "test-run-4/test-run-1"
+      expect "final run, first run, and predecessor"
+        "test-run-4/test-run-1<-test-run-3:continue-as-new"
         (ok "result" (T.Testing.result handle)))
 
 (** Combines virtual time, workflow identity, and the replay-safe random

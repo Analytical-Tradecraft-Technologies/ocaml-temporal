@@ -277,6 +277,83 @@ module Info = struct
   (** Returns the workflow retry attempt. *)
   let attempt info = info.run.attempt
 
+  (** Continuation reason; see the interface. *)
+  type continuation_initiator = [ `Continue_as_new | `Retry | `Cron_schedule ]
+
+  (** Returns the predecessor run recorded by Core, if any. *)
+  let continued_from_run_id info = Option.map fst info.run.continued_from
+
+  (** Maps Core's initiator to the public variant. The unspecified zero value
+      names no reason, so it is reported as [None] rather than guessed. *)
+  let continuation_initiator info : continuation_initiator option =
+    Option.bind info.run.continued_from (fun (_, initiator) ->
+        match initiator with
+        | Temporal_sdk_kernel.Workflow_protocol.Continue_as_new_workflow ->
+            Some `Continue_as_new
+        | Temporal_sdk_kernel.Workflow_protocol.Continue_as_new_retry ->
+            Some `Retry
+        | Temporal_sdk_kernel.Workflow_protocol.Continue_as_new_cron_schedule ->
+            Some `Cron_schedule
+        | Temporal_sdk_kernel.Workflow_protocol.Continue_as_new_unspecified ->
+            None)
+
+  (** The largest value [Duration.of_ms] accepts: the protobuf duration
+      maximum truncated to whole milliseconds. *)
+  let maximum_duration_ms = 315_576_000_000_999L
+
+  (** Converts a protocol duration to public milliseconds, rounding a
+      sub-millisecond remainder up so a nonzero server value never reads as
+      zero. The protocol decoder already bounded both components; the
+      clamps only keep this accessor total, because metadata access must not
+      raise. *)
+  let duration (value : Temporal_sdk_kernel.Workflow_protocol.duration) =
+    let seconds = Int64.max 0L value.seconds in
+    let nanoseconds = max 0 (min 999_999_999 value.nanoseconds) in
+    let fraction_ms = Int64.of_int ((nanoseconds + 999_999) / 1_000_000) in
+    let milliseconds =
+      if Int64.compare seconds (Int64.div maximum_duration_ms 1_000L) > 0 then
+        maximum_duration_ms
+      else Int64.add (Int64.mul seconds 1_000L) fraction_ms
+    in
+    Duration.of_ms (Int64.min milliseconds maximum_duration_ms)
+
+  (** Returns the recorded execution timeout. *)
+  let execution_timeout info = Option.map duration info.run.execution_timeout
+
+  (** Returns the recorded run timeout. *)
+  let run_timeout info = Option.map duration info.run.run_timeout
+
+  (** Returns the recorded workflow task timeout. *)
+  let task_timeout info = Option.map duration info.run.task_timeout
+
+  (** Rebuilds the public policy from the bridge-validated record. Both the
+      Rust and OCaml protocol layers enforce the same constraints as
+      [Activity.Retry_policy.make], and rounding both intervals up preserves
+      their order, so a construction failure is a violated internal
+      invariant rather than a routine error. A new value is built on every
+      call; the public policy is immutable. *)
+  let retry_policy info =
+    Option.map
+      (fun (policy : Temporal_sdk_kernel.Workflow_protocol.retry_policy) ->
+        let coefficient =
+          Int64.float_of_bits
+            (Int64.of_string ("0u" ^ policy.backoff_coefficient_bits))
+        in
+        match
+          Activity.Retry_policy.make
+            ~initial_interval:(duration policy.initial_interval)
+            ~backoff_coefficient:coefficient
+            ~maximum_interval:(duration policy.maximum_interval)
+            ~maximum_attempts:policy.maximum_attempts
+            ~non_retryable_error_types:policy.non_retryable_error_types ()
+        with
+        | Ok policy -> policy
+        | Error error ->
+            invalid_arg
+              ("workflow retry policy escaped protocol validation: "
+              ^ Error.message error))
+      info.run.retry_policy
+
   (** Projects the private protocol record into the public parent type. *)
   let parent info =
     Option.map

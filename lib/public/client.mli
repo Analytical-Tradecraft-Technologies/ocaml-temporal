@@ -240,7 +240,9 @@ val create :
     [run_timeout]): Temporal would silently lower a larger value instead of
     honouring it. Violations are typed defects returned before anything is
     sent. An expired workflow timeout ends the run, which {!wait} reports as
-    [Timed_out].
+    [Timed_out]. Workflow code reads the recorded timeouts through
+    {!Workflow.Info.execution_timeout}, {!Workflow.Info.run_timeout}, and
+    {!Workflow.Info.task_timeout}.
 
     [retry_policy] asks Temporal to retry a failed or timed-out run as a new
     run of the same workflow ID. Omitted, a workflow is not retried. The
@@ -249,7 +251,10 @@ val create :
     [Failed] with the error that caused the retry, or [Timed_out], with the
     retry run as its successor; it never reports a retry as
     [Continued_as_new]. A current-run handle from {!get_handle} follows the
-    retry chain to its last run.
+    retry chain to its last run. A retry run reads the effective policy
+    through {!Workflow.Info.retry_policy}, its attempt through
+    {!Workflow.Info.attempt}, and the run it retried through
+    {!Workflow.Info.continued_from_run_id} with initiator [`Retry].
 
     [rpc_timeout] bounds this start call only (default 10 seconds; see
     {{!section-rpc_deadlines} RPC deadlines}). If it expires while the start
@@ -270,7 +275,7 @@ val create :
     metadata values may contain arbitrary bytes. Values are encoded before the
     native bridge is called. Search attributes must be registered in the
     namespace with matching server types. Workers
-    can read the recorded values through [Workflow.start_metadata].
+    can read the recorded values through {!Workflow.val-start_metadata}.
 
     This client does not expose cron schedules or delayed starts. OCaml
     workers reject cron and nonzero root start delay; do not start those
