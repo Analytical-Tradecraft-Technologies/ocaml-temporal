@@ -122,6 +122,17 @@ The adaptations keep the previous behaviour:
   attach by default (`disable_environment_info`).
 - Workflow and activity pollers stay explicit; Core 1.x would otherwise
   auto-enrol an unset poller behavior in autoscaling.
+- Client connection is bounded. `Connection::connect` performs the
+  transport connect and then an unretried `GetSystemInfo` that only Core's
+  30 s per-call default bounds. A refused or closed connection still fails in
+  milliseconds. However, an endpoint that accepts the connection without
+  answering held `Client.create` for the full 30 s, which made the
+  transport-interruption refuse scenario intermittent in CI. The bridge now
+  bounds the whole handshake with `CLIENT_CONNECT_TIMEOUT` (10 s). It also
+  sets Core 1.x's new transport `connect_timeout` to the same value, which is
+  unset by default. Expiry is reported as the usual `STATUS_CONNECTION` with
+  `cause=timeout`, so OCaml still sees a typed `Bridge` error. Workers reuse
+  this one runtime connection and have no separate connect path.
 
 Core 1.x enforces namespace payload limits in the worker by default: an
 oversized activity result or heartbeat becomes a `PayloadsTooLarge` activity

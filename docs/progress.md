@@ -33,7 +33,10 @@ Asynchronous activity completion and heartbeat now send their
 Core's handle now applies the client data converter and accepts only a
 high-level failure. New Core protobuf fields keep their previous meaning,
 worker heartbeats keep omitting host environment details, and the two new
-child-start failure causes reach OCaml as `unspecified`. The
+child-start failure causes reach OCaml as `unspecified`. Client connection is
+now bounded at 10 s, because an endpoint that accepted and then stayed silent
+held `Client.create` for Core's 30 s `GetSystemInfo` deadline and failed the
+transport-interruption refuse scenario intermittently in CI. The
 [Core bridge reference](reference/core-bridge.md#temporal-core-revision)
 lists each adaptation and the Core behaviour changes kept as upstream
 intends, notably worker-side payload-limit enforcement.

@@ -1075,9 +1075,25 @@ impl Runtime {
             config.identity,
             core.telemetry().get_temporal_metric_meter(),
         );
+        // Core performs the TCP/TLS connect and then an unretried
+        // `GetSystemInfo`, which is bounded only by Core's 30 s per-call
+        // default. An endpoint that accepts a connection but never answers
+        // (for example a proxy whose accept loop has not yet closed it) would
+        // otherwise hold `Client.create` for that full interval (#824). The
+        // whole handshake is therefore bounded by `CLIENT_CONNECT_TIMEOUT`
+        // and reported as the same typed connection failure.
         let connection = core
             .tokio_handle()
-            .block_on(Connection::connect(options))
+            .block_on(async {
+                tokio::time::timeout(CLIENT_CONNECT_TIMEOUT, Connection::connect(options)).await
+            })
+            .map_err(|_elapsed| Failure {
+                status: STATUS_CONNECTION,
+                message: diagnostics::connection_failure_message(
+                    diagnostics::ConnectionCause::Timeout,
+                    CLIENT_CONNECT_TIMEOUT_DETAIL,
+                ),
+            })?
             .map_err(|error| {
                 // Core's error text can contain server-provided gRPC status
                 // messages or configured header values. Only a closed cause
@@ -6108,6 +6124,16 @@ const SDK_NAME: &str = "temporal-ocaml";
 /// preflight gate rejects a release whose metadata disagrees with it.
 const SDK_VERSION: &str = "0.1.0-rc.1";
 
+/// Upper bound on establishing a client connection: transport connect, TLS,
+/// and Core's initial `GetSystemInfo` together. Healthy local and WAN
+/// handshakes finish well inside it; it only cuts short an endpoint that
+/// accepts and then stays silent, which Core would wait on for 30 s.
+const CLIENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Fixed, server-independent detail reported when [`CLIENT_CONNECT_TIMEOUT`]
+/// expires.
+const CLIENT_CONNECT_TIMEOUT_DETAIL: &str = "connection handshake did not complete within 10 s";
+
 /// Builds Core connection options with this SDK's identity rather than Core's
 /// `temporal-rust` default, so server metrics, histories, and the Web UI
 /// attribute calls to the OCaml SDK and its own version.
@@ -6121,6 +6147,10 @@ fn connection_options(
         .client_name(SDK_NAME.to_owned())
         .client_version(SDK_VERSION.to_owned())
         .maybe_metrics_meter(meter)
+        // Core 1.x exposes a transport connect timeout (unset by default).
+        // Setting it lets a black-holed address fail with Core's own
+        // transport error inside the overall handshake bound.
+        .connect_timeout(CLIENT_CONNECT_TIMEOUT)
         .build()
 }
 
