@@ -301,12 +301,12 @@ and bridge, read the [documentation guide](../README.md) first.
   invariants. A replay feeder has one bounded slot, and a completion or
   rejection is accepted only for the exact activation lease that was polled.
 - The private supervisor validates native poll bytes before returning typed
-  workflow or activity values to another Domain. It canonically encodes and
-  semantically validates typed activity completions before entering C. A workflow
-  completion arrives already encoded: the worker adapter runs the canonical
-  encoder once and passes its bytes as an abstract
-  `Encoded_workflow_completion.t`, which only that encoder can produce, so the
-  supervisor copies them into C without a second encode.
+  workflow or activity values to another Domain. Workflow and activity
+  completions arrive already encoded: the worker and activity adapters run the
+  canonical encoder once and pass its bytes as an abstract
+  `Encoded_workflow_completion.t` or `Encoded_activity_completion.t`, which only
+  that encoder can produce, so the supervisor copies them into C without a
+  second encode.
 - An activity `Start` (remote or local) creates one Core completion debt. A `Cancel` poll
   is an update to that same token: it is handed to the OCaml activity adapter
   while the token remains tracked, but it never acquires a second completion
