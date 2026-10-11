@@ -83,6 +83,7 @@
         "replay_definitions": {"$ref": "#/$defs/nonempty", "description": "Name of a definition set in test/history_corpus/corpus_definitions.ml."},
         "expected": {"enum": ["replays_ok", "nondeterminism"]},
         "negative_control_of": {"$ref": "#/$defs/identifier", "description": "Required exactly for nondeterminism entries: the replays_ok entry whose history is reused."},
+        "expected_message": {"$ref": "#/$defs/nonempty", "description": "Optional, nondeterminism entries only: a fragment the public replay failure text must contain, so the negative control fails for its documented reason."},
         "notes": {"$ref": "#/$defs/nonempty"}
       }
     }

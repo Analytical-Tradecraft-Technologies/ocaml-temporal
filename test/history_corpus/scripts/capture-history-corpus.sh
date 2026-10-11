@@ -24,6 +24,9 @@
 #   HISTORY_CORPUS_COMMAND      capture command recorded as provenance
 #   HISTORY_CORPUS_CORE_PROTOS  pinned Core protos directory; by default it is
 #                               located with `cargo metadata` on the host
+#   HISTORY_CORPUS_GENERATIONS  space-separated worker generations to run, in
+#                               order (default: every generation below). Use
+#                               it to capture only new definition sets.
 #   TEMPORAL_NAMESPACE          namespace (default temporal-sdk-test)
 set -eu
 
@@ -44,8 +47,13 @@ mkdir -p "$capture_dir"
 
 # Generation order is fixed: the two older patch generations run before the
 # current corpus-v1 worker, so each patch history is produced by exactly one
-# source generation and the workflow IDs never collide with an open run.
-for generation in corpus-v1-patch-legacy corpus-v1-patch-deprecated corpus-v1; do
+# source generation and the workflow IDs never collide with an open run. The
+# patch lifecycle generations follow their stage order; the legacy one leaves
+# a parked handover run that the patched one must find and finish.
+default_generations="corpus-v1-patch-legacy corpus-v1-patch-deprecated corpus-v1 \
+corpus-lifecycle-legacy corpus-lifecycle-patched corpus-lifecycle-deprecated \
+corpus-lifecycle-removed"
+for generation in ${HISTORY_CORPUS_GENERATIONS:-$default_generations}; do
   echo "history corpus capture: generation=$generation" >&2
   # The prefix is shell text (it may carry quoted paths and leading
   # environment assignments, as Make's Compose commands do), so it is

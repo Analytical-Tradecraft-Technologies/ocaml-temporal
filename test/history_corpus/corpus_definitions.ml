@@ -73,6 +73,21 @@ let patch_new_activity =
     ~input:Temporal.Codec.unit ~output:Temporal.Codec.string (fun () ->
       Ok "PATCH:NEW")
 
+(** The legacy-branch activity of every [corpus.lifecycle.*] workflow. The
+    input is echoed so each scheduled call is distinguishable in history. *)
+let lifecycle_legacy_activity =
+  Temporal.Activity.define ~name:"corpus.lifecycle.legacy"
+    ~input:Temporal.Codec.string ~output:Temporal.Codec.string (fun input ->
+      Ok ("LEGACY:" ^ input))
+
+(** The new-branch activity of every [corpus.lifecycle.*] workflow. A
+    different activity type is what makes a legacy/new branch mismatch
+    visible to Core as nondeterminism. *)
+let lifecycle_new_activity =
+  Temporal.Activity.define ~name:"corpus.lifecycle.new"
+    ~input:Temporal.Codec.string ~output:Temporal.Codec.string (fun input ->
+      Ok ("NEW:" ^ input))
+
 (** Every corpus activity, so any capture generation can serve them. *)
 let activities =
   Temporal.Worker.
@@ -81,6 +96,8 @@ let activities =
       activity flaky_activity;
       activity patch_legacy_activity;
       activity patch_new_activity;
+      activity lifecycle_legacy_activity;
+      activity lifecycle_new_activity;
     ]
 
 (** {1 Workflows} *)
@@ -286,6 +303,262 @@ let stable_workflows =
     plain continue_as_new_workflow;
   ]
 
+(** {1 Patch lifecycle generations (issue #531)}
+
+    Four source generations of the same [corpus.lifecycle.*] workflow types,
+    one per patch lifecycle stage. Each generation differs from the others
+    only at its patch gates (see {!lifecycle_gate}), so the replay matrix
+    between generations isolates the patch API's compatibility boundaries. *)
+
+(** A patch lifecycle stage: which source generation is running. *)
+type lifecycle_stage =
+  | Lifecycle_legacy  (** Before the change: no patch call, legacy branch. *)
+  | Lifecycle_patched  (** [Temporal.Workflow.patched] chooses the branch. *)
+  | Lifecycle_deprecated
+      (** [Temporal.Workflow.deprecate_patch], then the new branch. *)
+  | Lifecycle_removed  (** Patch call deleted; the new branch only. *)
+
+(** Recorded lifecycle workflow type names; see the interface. *)
+let lifecycle_multi_workflow_type = "corpus.lifecycle.multi"
+let lifecycle_loop_workflow_type = "corpus.lifecycle.loop"
+let lifecycle_handlers_workflow_type = "corpus.lifecycle.handlers"
+let lifecycle_handover_workflow_type = "corpus.lifecycle.handover"
+
+(** Patch IDs of the lifecycle workflows. Each is a durable history key and
+    names exactly one behavioral change, so it must never be reused. *)
+let lifecycle_multi_activity_patch = "corpus.lifecycle.multi.activity.v1"
+let lifecycle_multi_timer_patch = "corpus.lifecycle.multi.timer.v1"
+let lifecycle_multi_child_patch = "corpus.lifecycle.multi.child.v1"
+let lifecycle_loop_patch = "corpus.lifecycle.loop.v1"
+let lifecycle_signal_patch = "corpus.lifecycle.signal.v1"
+let lifecycle_update_patch = "corpus.lifecycle.update.v1"
+let lifecycle_handover_patch = "corpus.lifecycle.handover.v1"
+
+(** The single place where lifecycle generations differ: returns whether the
+    new branch runs at one patch point. [Lifecycle_patched] asks
+    [Temporal.Workflow.patched]; [Lifecycle_deprecated] records the
+    lifecycle-only deprecation marker and takes the new branch
+    unconditionally, which is the documented replacement for a [patched]
+    call; [Lifecycle_removed] makes no patch call. The result is
+    deterministic for a given history because the API calls are. *)
+let lifecycle_gate stage ~id =
+  match stage with
+  | Lifecycle_legacy -> false
+  | Lifecycle_patched -> Temporal.Workflow.patched ~id
+  | Lifecycle_deprecated ->
+      Temporal.Workflow.deprecate_patch ~id;
+      true
+  | Lifecycle_removed -> true
+
+(** Runs the lifecycle activity for one branch with the corpus timeout. *)
+let run_lifecycle_activity ~use_new input =
+  Temporal.Activity.execute
+    ~start_to_close_timeout:(Temporal.Duration.of_ms 10_000L)
+    (if use_new then lifecycle_new_activity else lifecycle_legacy_activity)
+    input
+
+(** Legacy-branch child of [corpus.lifecycle.multi]; issues no commands. *)
+let lifecycle_child_legacy =
+  Temporal.Workflow.define ~name:"corpus.lifecycle.child_legacy"
+    ~input:Temporal.Codec.string ~output:Temporal.Codec.string (fun input ->
+      Ok ("CHILD-LEGACY:" ^ input))
+
+(** New-branch child of [corpus.lifecycle.multi]. A different child workflow
+    type is what Core compares on replay. *)
+let lifecycle_child_new =
+  Temporal.Workflow.define ~name:"corpus.lifecycle.child_new"
+    ~input:Temporal.Codec.string ~output:Temporal.Codec.string (fun input ->
+      Ok ("CHILD-NEW:" ^ input))
+
+(** [corpus.lifecycle.multi]: three independent patches in one workflow, each
+    around a different command kind. The activity patch swaps the activity
+    type, the timer patch adds a durable timer, and the child patch swaps the
+    child workflow type. The child ID is derived from the input only, so the
+    start-child command is identical on every replay. *)
+let lifecycle_multi_workflow stage =
+  Temporal.Workflow.define ~name:lifecycle_multi_workflow_type
+    ~input:Temporal.Codec.string ~output:Temporal.Codec.string (fun label ->
+      let open Temporal.Result_syntax in
+      let* first =
+        run_lifecycle_activity
+          ~use_new:(lifecycle_gate stage ~id:lifecycle_multi_activity_patch)
+          label
+      in
+      let* () =
+        if lifecycle_gate stage ~id:lifecycle_multi_timer_patch then
+          Temporal.Workflow.sleep corpus_timer
+        else Ok ()
+      in
+      let child =
+        if lifecycle_gate stage ~id:lifecycle_multi_child_patch then
+          lifecycle_child_new
+        else lifecycle_child_legacy
+      in
+      let* second =
+        Temporal.Child_workflow.execute
+          ~id:("history-corpus-lifecycle-child-" ^ label)
+          child label
+      in
+      Ok (first ^ "|" ^ second))
+
+(** Number of iterations of [corpus.lifecycle.loop]. *)
+let lifecycle_loop_iterations = 3
+
+(** [corpus.lifecycle.loop]: consults the same patch ID once per iteration,
+    after the previous iteration's activity resolved. Replay therefore depends
+    on the first answer being retained for the run: a marker-free history must
+    keep [false] for every iteration, and a marked history [true]. *)
+let lifecycle_loop_workflow stage =
+  Temporal.Workflow.define ~name:lifecycle_loop_workflow_type
+    ~input:Temporal.Codec.string ~output:Temporal.Codec.string (fun label ->
+      let open Temporal.Result_syntax in
+      let rec loop iteration results =
+        if iteration > lifecycle_loop_iterations then
+          Ok (String.concat "," (List.rev results))
+        else
+          let* result =
+            run_lifecycle_activity
+              ~use_new:(lifecycle_gate stage ~id:lifecycle_loop_patch)
+              (Printf.sprintf "%s-%d" label iteration)
+          in
+          loop (iteration + 1) (result :: results)
+      in
+      loop 1 [])
+
+(** Signal whose handler holds the signal-handler patch. *)
+let lifecycle_signal =
+  Temporal.Signal.define ~name:"corpus.lifecycle.handlers.signal"
+    ~input:Temporal.Codec.string
+
+(** Update whose handler holds the update-handler patch. *)
+let lifecycle_update =
+  Temporal.Update.define ~name:"corpus.lifecycle.handlers.update"
+    ~input:Temporal.Codec.string ~output:Temporal.Codec.string
+
+(** Per-run activity result recorded by the lifecycle signal handler. *)
+let lifecycle_signal_result = Temporal.Workflow_context.Local.create ()
+
+(** Per-run activity result recorded by the lifecycle update handler. *)
+let lifecycle_update_result = Temporal.Workflow_context.Local.create ()
+
+(** Signal handler: the patch decision and its activity live in the handler,
+    which suspends on the activity on the workflow's own scheduler. *)
+let lifecycle_signal_handler stage =
+  Temporal.Signal.Handler.make lifecycle_signal (fun value ->
+      let open Temporal.Result_syntax in
+      let* result =
+        run_lifecycle_activity
+          ~use_new:(lifecycle_gate stage ~id:lifecycle_signal_patch)
+          value
+      in
+      Temporal.Workflow_context.Local.set lifecycle_signal_result result)
+
+(** Update handler: like the signal handler, under its own patch ID, and
+    returns the activity result to the caller. *)
+let lifecycle_update_handler stage =
+  Temporal.Update.Handler.make lifecycle_update (fun value ->
+      let open Temporal.Result_syntax in
+      let* result =
+        run_lifecycle_activity
+          ~use_new:(lifecycle_gate stage ~id:lifecycle_update_patch)
+          value
+      in
+      let* () =
+        Temporal.Workflow_context.Local.set lifecycle_update_result result
+      in
+      Ok result)
+
+(** [corpus.lifecycle.handlers]: parks until both handlers have recorded
+    their activity results, then joins them. The root makes no patch call. *)
+let lifecycle_handlers_workflow =
+  Temporal.Workflow.define ~name:lifecycle_handlers_workflow_type
+    ~input:Temporal.Codec.string ~output:Temporal.Codec.string (fun label ->
+      let open Temporal.Result_syntax in
+      let* () =
+        Temporal.Condition.wait_until_result (fun () ->
+            let* signal = read_local lifecycle_signal_result in
+            let* update = read_local lifecycle_update_result in
+            Ok (Option.is_some signal && Option.is_some update))
+      in
+      let* signal = read_local lifecycle_signal_result in
+      let* update = read_local lifecycle_update_result in
+      match (signal, update) with
+      | Some signal, Some update -> Ok (String.concat ":" [ label; signal; update ])
+      | _ ->
+          Error
+            (Temporal.Error.defect
+               ~message:"lifecycle handlers resumed without both results"))
+
+(** Signal releasing a parked [corpus.lifecycle.handover] run. *)
+let lifecycle_handover_release =
+  Temporal.Signal.define ~name:"corpus.lifecycle.handover.release"
+    ~input:Temporal.Codec.unit
+
+(** Query used by the capture driver to learn that the handover run's first
+    workflow task completed before its worker is replaced. *)
+let lifecycle_handover_status =
+  Temporal.Query.define ~name:"corpus.lifecycle.handover.status"
+    ~output:Temporal.Codec.string
+
+(** Per-run flag set by the handover release signal. *)
+let lifecycle_handover_released = Temporal.Workflow_context.Local.create ()
+
+(** Records the release; deterministic and I/O-free. *)
+let lifecycle_handover_release_handler =
+  Temporal.Signal.Handler.make lifecycle_handover_release (fun () ->
+      Temporal.Workflow_context.Local.set lifecycle_handover_released ())
+
+(** Reports whether the handover run is still parked. Read-only. *)
+let lifecycle_handover_status_handler =
+  Temporal.Query.Handler.make lifecycle_handover_status (fun () ->
+      match read_local lifecycle_handover_released with
+      | Error error -> Error error
+      | Ok None -> Ok "parked"
+      | Ok (Some ()) -> Ok "released")
+
+(** [corpus.lifecycle.handover]: parks before its patch point until released
+    by a signal. The capture starts it on the legacy generation and releases
+    it on the patched generation, so the history models a rolling deploy in
+    which a run created by an old worker reaches the patch point for the first
+    time on a new worker: [patched] then returns [true] mid-run and records
+    its marker after a marker-free prefix. *)
+let lifecycle_handover_workflow stage =
+  Temporal.Workflow.define ~name:lifecycle_handover_workflow_type
+    ~input:Temporal.Codec.string ~output:Temporal.Codec.string (fun label ->
+      let open Temporal.Result_syntax in
+      let* () =
+        Temporal.Condition.wait_until_result (fun () ->
+            let* released = read_local lifecycle_handover_released in
+            Ok (Option.is_some released))
+      in
+      run_lifecycle_activity
+        ~use_new:(lifecycle_gate stage ~id:lifecycle_handover_patch)
+        label)
+
+(** Every lifecycle registration of one stage. Both child types are
+    registered in every stage so a live worker can serve either branch. *)
+let lifecycle_workflows stage =
+  [
+    plain (lifecycle_multi_workflow stage);
+    plain (lifecycle_loop_workflow stage);
+    Workflow
+      {
+        definition = lifecycle_handlers_workflow;
+        signals = [ lifecycle_signal_handler stage ];
+        queries = [];
+        updates = [ lifecycle_update_handler stage ];
+      };
+    Workflow
+      {
+        definition = lifecycle_handover_workflow stage;
+        signals = [ lifecycle_handover_release_handler ];
+        queries = [ lifecycle_handover_status_handler ];
+        updates = [];
+      };
+    plain lifecycle_child_legacy;
+    plain lifecycle_child_new;
+  ]
+
 (** {1 Reused fixture definitions} *)
 
 (** The corrected generation of [test/integration/temporal/task_failure]. The
@@ -352,6 +625,10 @@ let definition_sets =
     ("negative-timer-removed", [ plain timer_removed_workflow ]);
     ("task-failure-corrected", task_failure_corrected);
     ("initial-signals", initial_signals);
+    ("corpus-lifecycle-legacy", lifecycle_workflows Lifecycle_legacy);
+    ("corpus-lifecycle-patched", lifecycle_workflows Lifecycle_patched);
+    ("corpus-lifecycle-deprecated", lifecycle_workflows Lifecycle_deprecated);
+    ("corpus-lifecycle-removed", lifecycle_workflows Lifecycle_removed);
   ]
 
 (** Set names in declaration order. *)
