@@ -264,7 +264,7 @@ linked into the SDK or redistributed in its OCaml package. Dependabot's
 
 | Image | Manifest digest | Native platforms | Primary software license | Review |
 |---|---|---|---|---|
-| `postgres:18.6-bookworm` | `sha256:3725f4e2499eef5134592b3b4ab79a543ed7f8e533b05b5b637af926630f6650` | Linux amd64, arm64/v8, and additional official architectures | PostgreSQL License; Docker image packaging is MIT | [PostgreSQL license](https://www.postgresql.org/about/licence/), [official image source](https://github.com/docker-library/postgres) |
+| `postgres:18.6-bookworm` | `sha256:afc7e2d441324c0388fa80c3d24f733b4194a4eb7f47dd8ee2b08eb1a24a647c` | Linux amd64, arm64/v8, and additional official architectures | PostgreSQL License; Docker image packaging is MIT | [PostgreSQL license](https://www.postgresql.org/about/licence/), [official image source](https://github.com/docker-library/postgres) |
 | `temporalio/server:1.32.0` | `sha256:c3e752127759616bb1615e0f9ba0e21635aeb5fdeb922de4f371c350955f46ae` | Linux amd64 and arm64 | MIT | [Temporal source and license](https://github.com/temporalio/temporal), [official Compose sample](https://github.com/temporalio/samples-server/tree/main/compose) |
 | `temporalio/admin-tools:1.32.0` | `sha256:a9f84fb9a374b2374fe2e67c8efc0468ff3f1c66c8a0b14597ec86e349e62bca` | Linux amd64 and arm64 | MIT | Schema and CLI tooling from the official Temporal release/sample |
 
