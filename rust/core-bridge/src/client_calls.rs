@@ -354,8 +354,8 @@ pub(crate) const MAX_CONFIGURABLE_IN_FLIGHT_CALLS: u32 = 65_536;
 /// or any submitted call; admission beyond a limit returns
 /// `STATUS_RESOURCE_EXHAUSTED` before any task or RPC exists. The values are
 /// fixed for the lifetime of one connection: [`ClientLimits::from_config`]
-/// validates the optional fields of the client connect document, and a
-/// runtime without a connection keeps the defaults. All three are counts and
+/// validates the optional fields of the client connect document, disconnect
+/// resets them, and a runtime without a connection reports the defaults. All three are counts and
 /// every value is at least one. The in-flight ceiling applies on top of the
 /// start and wait limits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

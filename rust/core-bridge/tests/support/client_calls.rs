@@ -419,6 +419,26 @@ fn configured_wait_limit_is_enforced() {
     assert_eq!(runtime.close(true), STATUS_OK);
 }
 
+/// Disconnecting resets the connection's limits to the defaults (#796), so a
+/// runtime without a connection never keeps an earlier client's limits.
+#[test]
+fn disconnect_resets_client_limits() {
+    let (mut runtime, _probe) = connected_runtime();
+    runtime.client_limits =
+        crate::client_calls::ClientLimits::from_config(Some(2), Some(3), Some(5))
+            .expect("valid limits");
+    assert_ne!(
+        runtime.client_limits,
+        crate::client_calls::ClientLimits::default()
+    );
+    assert!(runtime.disconnect_client().is_ok());
+    assert_eq!(
+        runtime.client_limits,
+        crate::client_calls::ClientLimits::default()
+    );
+    assert_eq!(runtime.close(true), STATUS_OK);
+}
+
 /// A configured in-flight ceiling of three (#796) refuses a fourth call of
 /// any kind, here a signal behind three pending queries.
 #[test]

@@ -693,8 +693,9 @@ pub struct Runtime {
     /// Tasks of submitted client calls that may still be running, keyed by
     /// call identifier. Finished tasks are pruned on each submission.
     pending_calls: HashMap<u64, PendingCall>,
-    /// Admission limits of the current connection (#796). Replaced only by a
-    /// successful connect; a runtime without one keeps the defaults.
+    /// Admission limits of the current connection (#796). Set by a successful
+    /// connect and reset to the defaults by disconnect, so a runtime without
+    /// a connection always reports the defaults.
     client_limits: crate::client_calls::ClientLimits,
     cleanup: std::sync::mpsc::Sender<RuntimeCleanup>,
 }
@@ -2677,6 +2678,10 @@ impl Runtime {
         let remaining = self.abort_pending_calls(true);
         debug_assert!(remaining.is_empty());
         self.client.take();
+        // Limits belong to the connection they were configured with (#796):
+        // a runtime without a connection reports the defaults again, and a
+        // later connect installs its own.
+        self.client_limits = crate::client_calls::ClientLimits::default();
         Ok(Vec::new())
     }
 
