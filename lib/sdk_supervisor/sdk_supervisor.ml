@@ -481,13 +481,6 @@ module Protocol_adapter = struct
     poll_result ~decode:decode_activity_task ~reject ~rejected_is_progress:true
       result
 
-  (** Canonically serializes and reparses one activity completion before it
-      can be submitted across the C boundary. *)
-  let encode_activity_completion completion =
-    match Activity.encode_completion completion with
-    | Ok output -> Ok (Bytes.of_string output)
-    | Error error -> activity_error "activity completion encoding" error
-
   (** Canonically serializes one activity heartbeat before it reaches the
       native bridge. *)
   let encode_activity_heartbeat heartbeat =
@@ -1052,9 +1045,9 @@ module Native_backend = struct
     | Wait_any : unit operation
     | Wait_activity_completion_retry_backoff : unit operation
     | Complete_activity :
-        Temporal_protocol.Activity_protocol.completion -> unit operation
+        Temporal_protocol.Encoded_activity_completion.t -> unit operation
     | Complete_async_activity :
-        Temporal_protocol.Activity_protocol.completion -> unit operation
+        Temporal_protocol.Encoded_activity_completion.t -> unit operation
     | Record_activity_heartbeat :
         Temporal_protocol.Activity_protocol.heartbeat -> unit operation
     | Record_async_activity_heartbeat :
@@ -1344,14 +1337,17 @@ module Native_backend = struct
     | Wait_any -> Bridge.worker_wait_any runtime
     | Wait_activity_completion_retry_backoff ->
         Bridge.worker_wait_activity_completion_retry_backoff runtime
-    | Complete_activity completion ->
-        Result.bind
-          (Protocol_adapter.encode_activity_completion completion)
-          (Bridge.worker_complete_activity_json runtime)
-    | Complete_async_activity completion ->
-        Result.bind
-          (Protocol_adapter.encode_activity_completion completion)
-          (Bridge.client_complete_async_activity_json runtime)
+    | Complete_activity encoded ->
+        (* [encoded] already passed the canonical encoder exactly once in the
+           activity adapter (issue #995); only the C call's owned copy is made
+           here. *)
+        Bridge.worker_complete_activity_json runtime
+          (Temporal_protocol.Encoded_activity_completion.to_bytes encoded)
+    | Complete_async_activity encoded ->
+        (* The async client path accepts the same completion document and
+           likewise submits the adapter's single-encode bytes unchanged. *)
+        Bridge.client_complete_async_activity_json runtime
+          (Temporal_protocol.Encoded_activity_completion.to_bytes encoded)
     | Record_activity_heartbeat heartbeat ->
         Result.bind
           (Protocol_adapter.encode_activity_heartbeat heartbeat)
@@ -1504,9 +1500,9 @@ module Native = struct
     | Wait_any : unit operation
     | Wait_activity_completion_retry_backoff : unit operation
     | Complete_activity :
-        Temporal_protocol.Activity_protocol.completion -> unit operation
+        Temporal_protocol.Encoded_activity_completion.t -> unit operation
     | Complete_async_activity :
-        Temporal_protocol.Activity_protocol.completion -> unit operation
+        Temporal_protocol.Encoded_activity_completion.t -> unit operation
     | Record_activity_heartbeat :
         Temporal_protocol.Activity_protocol.heartbeat -> unit operation
     | Record_async_activity_heartbeat :
