@@ -569,7 +569,7 @@ test-temporal-diagnostics-contract:
 # CI executes (#795). Every entry must also be in scripts/ci-smoke-executables.txt,
 # and test/smoke/test_live_regressions_contract.sh fails when a regression
 # executable under test/integration is neither here nor otherwise run by CI.
-LIVE_REGRESSION_EXECUTABLES := test/integration/activity_cancellation/regression.exe test/integration/bounded_shutdown/regression.exe test/integration/client_policies/regression.exe test/integration/client_request_ids/regression.exe test/integration/completed_queries/regression.exe test/integration/concurrent_client/regression.exe test/integration/interaction_recovery/regression.exe test/integration/local_activity_cancellation/regression.exe test/integration/split_worker_task_types/regression.exe test/integration/transport_interruption/regression.exe test/integration/update_outcomes/regression.exe test/integration/worker_resource_options/regression.exe test/integration/workflow_start_info/regression.exe
+LIVE_REGRESSION_EXECUTABLES := test/integration/activity_cancellation/regression.exe test/integration/bounded_shutdown/regression.exe test/integration/client_policies/regression.exe test/integration/client_request_ids/regression.exe test/integration/completed_queries/regression.exe test/integration/concurrent_client/regression.exe test/integration/interaction_recovery/regression.exe test/integration/local_activity_cancellation/regression.exe test/integration/non_yielding_workflow/regression.exe test/integration/split_worker_task_types/regression.exe test/integration/transport_interruption/regression.exe test/integration/update_outcomes/regression.exe test/integration/worker_resource_options/regression.exe test/integration/workflow_start_info/regression.exe
 # Seconds for each regression process; the suites normally finish in seconds.
 LIVE_REGRESSION_TIMEOUT_SECONDS ?= 180
 
@@ -962,6 +962,13 @@ test-update-outcomes-live:
 .PHONY: test-interaction-recovery-live
 test-interaction-recovery-live:
 	$(RUN) dune exec $(DUNE_BUILD_ARGS) test/integration/interaction_recovery/regression.exe -- check $(TEMPORAL_CLIENT_TEST_URL) $(TEMPORAL_TEST_CLI)
+
+# Requires a disposable server with the `temporal-sdk-test` namespace, or the
+# namespace named by TEMPORAL_NAMESPACE, and an explicit official Temporal CLI
+# path (#493).
+.PHONY: test-non-yielding-workflow-live
+test-non-yielding-workflow-live:
+	$(RUN) dune exec $(DUNE_BUILD_ARGS) test/integration/non_yielding_workflow/regression.exe -- check $(TEMPORAL_CLIENT_TEST_URL) $(TEMPORAL_TEST_CLI)
 
 test-runtime:
 	$(RUN) dune runtest $(DUNE_BUILD_ARGS) test/runtime test/integration/temporal/observer
