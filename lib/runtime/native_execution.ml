@@ -1386,6 +1386,33 @@ let activate_translated execution (translated : translated_activation) =
                    Option.bind context
                      (fun (context : Protocol.initialize_context) ->
                        context.start_time);
+                 execution_timeout =
+                   Option.bind context
+                     (fun (context : Protocol.initialize_context) ->
+                       context.workflow_execution_timeout);
+                 run_timeout =
+                   Option.bind context
+                     (fun (context : Protocol.initialize_context) ->
+                       context.workflow_run_timeout);
+                 task_timeout =
+                   Option.bind context
+                     (fun (context : Protocol.initialize_context) ->
+                       context.workflow_task_timeout);
+                 retry_policy =
+                   Option.bind context
+                     (fun (context : Protocol.initialize_context) ->
+                       context.retry_policy);
+                 (* Only provenance is retained: the predecessor's failure and
+                    completion payloads are not part of the public run info,
+                    so their mutable payload bytes are never shared here. *)
+                 continued_from =
+                   Option.bind context
+                     (fun (context : Protocol.initialize_context) ->
+                       Option.map
+                         (fun (continuation : Protocol.continuation) ->
+                           ( continuation.continued_from_execution_run_id,
+                             continuation.initiator ))
+                         context.continuation);
                });
         Ok ()
   in

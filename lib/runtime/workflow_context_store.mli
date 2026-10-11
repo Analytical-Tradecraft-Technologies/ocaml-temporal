@@ -7,10 +7,16 @@ type start_metadata = {
   execution_expiration_time : Temporal_protocol.Workflow_protocol.timestamp option;
 }
 
-(** Run-stable identity copied from Core's initialization job and the
-    activation that carried it. [first_execution_run_id] is empty when Core
-    omitted the initialization context. [parent] is [None] for a top-level
-    workflow. [start_time] is the server's run start time when reported. *)
+(** Run-stable identity and start policy copied from Core's initialization
+    job and the activation that carried it. [first_execution_run_id] is empty
+    when Core omitted the initialization context. [parent] is [None] for a
+    top-level workflow. [start_time] is the server's run start time when
+    reported. The three timeouts and [retry_policy] are the exact values the
+    server recorded on this run's start event ([None] when absent); they are
+    metadata only and the runtime never schedules them. [continued_from]
+    pairs the predecessor run ID with Core's reason for creating this run and
+    is [None] for the first run of a chain. All fields are immutable values
+    from history, so live execution and replay observe the same record. *)
 type run_info = {
   workflow_id : string;
   run_id : string;
@@ -19,6 +25,13 @@ type run_info = {
   first_execution_run_id : string;
   parent : Temporal_protocol.Workflow_protocol.namespaced_workflow_execution option;
   start_time : Temporal_protocol.Workflow_protocol.timestamp option;
+  execution_timeout : Temporal_protocol.Workflow_protocol.duration option;
+  run_timeout : Temporal_protocol.Workflow_protocol.duration option;
+  task_timeout : Temporal_protocol.Workflow_protocol.duration option;
+  retry_policy : Temporal_protocol.Workflow_protocol.retry_policy option;
+  continued_from :
+    (string * Temporal_protocol.Workflow_protocol.continue_as_new_initiator)
+    option;
 }
 
 (** History facts reported with one activation. [history_size_bytes] is
