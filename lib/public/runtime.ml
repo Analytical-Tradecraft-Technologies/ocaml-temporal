@@ -7,11 +7,25 @@ module Shared = Temporal_sdk_kernel.Shared_runtime
 
 type t = Shared.t
 
-let create ?io_threads () =
+(** Thin typed facade over [Temporal_base.Metrics_config], which owns the
+    validation rules and the bridge document. *)
+module Metrics = struct
+  type t = Temporal_base.Metrics_config.t
+
+  let prometheus ?global_tags ?counters_total_suffix ?unit_suffix
+      ?durations_as_seconds ~bind_address () =
+    Temporal_base.Metrics_config.prometheus ?global_tags ?counters_total_suffix
+      ?unit_suffix ?durations_as_seconds ~bind_address ()
+    |> Result.map_error (fun message ->
+           Error.defect ~message:("Runtime.Metrics.prometheus: " ^ message))
+end
+
+let create ?io_threads ?metrics () =
   match Backend.validate_io_threads io_threads with
   | Error _ as error -> error
   | Ok () -> (
-      match Shared.create ?worker_threads:io_threads () with
+      let telemetry = Option.map Temporal_base.Metrics_config.to_json metrics in
+      match Shared.create ?worker_threads:io_threads ?telemetry () with
       | Ok runtime -> Ok runtime
       | Error { Temporal_sdk_kernel.Bridge.message; _ } ->
           Error
@@ -20,6 +34,7 @@ let create ?io_threads () =
                ()))
 
 let attached = Shared.attached
+let metrics_address = Shared.metrics_address
 
 let shutdown runtime =
   match Shared.shutdown runtime with

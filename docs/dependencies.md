@@ -282,14 +282,19 @@ before publication.
 
 ## Locked Cargo closure
 
-`rust/Cargo.lock` locks 306 packages: the project bridge and 305 dependencies
+`rust/Cargo.lock` locks 307 packages: the project bridge and 306 dependencies
 rooted at Temporal Core commit `8fe478ee179ed754614d230f39586f3edb57da71`
 (upstream release tags `v1.1.0` and `core-v0.10.0`).
 Some crates are locked at more than one version because different packages in
 the graph require incompatible releases. The client, common, and SDK-Core
 dependencies disable their default features: `temporalio-client` enables
 `core-based-sdk` and `tls-ring`, `temporalio-sdk-core` enables `tls-ring`, and
-`temporalio-common` uses no additional features. `temporalio-protos` uses its
+`temporalio-common` enables only `prometheus`. That feature backs the opt-in
+Prometheus metrics endpoint of a shared `Temporal.Runtime` (#500). It adds one
+package, `prometheus` 0.14.0 (Apache-2.0, default features off), and activates
+Core's existing `hyper`, `hyper-util`, and `http-body-util` dependencies for
+the scrape server; all three were already locked through Core's gRPC
+transport. Core's `otel` feature (OTLP export) stays disabled. `temporalio-protos` uses its
 default feature set. The project bridge is Apache-2.0 and
 emits `staticlib` and `cdylib` artifacts for the native boundary plus an
 internal `rlib` for Rust integration tests.

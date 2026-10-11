@@ -475,6 +475,17 @@ val runtime_close : runtime -> (unit, error) result
 val shared_runtime_create :
   ?worker_threads:int -> unit -> (shared_runtime, error) result
 
+(** Like {!shared_runtime_create}, additionally passing [telemetry], a strict
+    JSON telemetry document (#500), to Rust. On success returns the handle
+    and the socket address the metrics endpoint is bound to, or [""] when
+    the document configures no exporter. An invalid document or an unusable
+    address is a [Configuration] error, and nothing is left running. *)
+val shared_runtime_create_with_telemetry :
+  ?worker_threads:int ->
+  telemetry:string ->
+  unit ->
+  (shared_runtime * string, error) result
+
 (** Creates one graph (used and closed exactly like a {!runtime_create}
     graph) that runs on [shared]'s Core instead of building its own. A closed
     [shared] returns [Invalid_argument]. Callers must not close [shared]

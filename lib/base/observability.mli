@@ -33,6 +33,12 @@ module Tag : sig
   (** Temporal workflow run ID, truncated to a bounded tag length. *)
   val run_id : string Logs.Tag.def
 
+  (** Whether the activation being reported was replaying history (#500).
+      Replayed work re-runs code whose effects were already recorded, so a
+      reporter can use this to avoid counting a replayed completion as new
+      business progress. *)
+  val replaying : bool Logs.Tag.def
+
   (** Non-negative number of jobs supplied in one activation. *)
   val job_count : int Logs.Tag.def
 
@@ -56,6 +62,7 @@ val tags :
   ?workflow_type:string ->
   ?workflow_id:string ->
   ?run_id:string ->
+  ?replaying:bool ->
   ?job_count:int ->
   ?command_count:int ->
   ?bridge_status:string ->

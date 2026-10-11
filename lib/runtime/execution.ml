@@ -228,6 +228,13 @@ let start ?(task_queue = "default") ?(namespace = "default")
 let workflow_type execution =
   Temporal_base.Definition.name execution.definition
 
+(** Whether the current activation is replaying history (#500). Lifecycle
+    records carry it so a reporter can tell a replayed completion, whose
+    effects Temporal already recorded, from new progress. A plain field
+    read, so it is valid after the context is shut down. *)
+let replaying execution =
+  Workflow_context_store.activation_is_replaying execution.context
+
 (** Installs independently owned start metadata before the initial fiber runs. *)
 let set_start_metadata execution metadata =
   Workflow_context_store.set_start_metadata execution.context metadata
@@ -282,7 +289,8 @@ let emit_terminal execution command =
     | Activation.Complete_workflow _ ->
         let tags =
           Observability.tags ~operation:"workflow_completed"
-            ~workflow_type:(workflow_type execution) ()
+            ~workflow_type:(workflow_type execution)
+            ~replaying:(replaying execution) ()
         in
         report ~src:Observability.Source.workflow Logs.Info ~tags
           "workflow completed"
@@ -331,6 +339,7 @@ let fail execution error =
     let tags =
       Observability.tags ~operation:"workflow_failed"
         ~workflow_type:(workflow_type execution)
+        ~replaying:(replaying execution)
         ~error_kind:(Temporal_base.Error.kind error) ()
     in
     report ~src:Observability.Source.workflow Logs.Error ~tags
@@ -386,7 +395,8 @@ let unhandled_signal_error signal_name =
 let enqueue_workflow execution =
   let tags =
     Observability.tags ~operation:"workflow_started"
-      ~workflow_type:(workflow_type execution) ()
+      ~workflow_type:(workflow_type execution)
+      ~replaying:(replaying execution) ()
   in
   report ~src:Observability.Source.workflow Logs.Info ~tags
     "workflow started";
@@ -681,7 +691,8 @@ let process_job execution = function
       if not execution.terminal then (
         let tags =
           Observability.tags ~operation:"workflow_cancelled"
-            ~workflow_type:(workflow_type execution) ()
+            ~workflow_type:(workflow_type execution)
+            ~replaying:(replaying execution) ()
         in
         report ~src:Observability.Source.workflow Logs.Info ~tags
           "workflow cancellation requested");

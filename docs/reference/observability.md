@@ -1,7 +1,8 @@
-# OCaml SDK Logging
+# OCaml SDK Logging and Metrics
 
 The OCaml SDK uses the [`logs`](https://ocaml.org/p/logs/latest) library for
-application-configurable logging. The SDK creates sources and submits events,
+application-configurable logging, and can export Temporal Core's worker and
+client metrics to Prometheus ([worker metrics](#worker-metrics)). The SDK creates sources and submits events,
 but never installs a reporter or changes reporting levels. An application owns
 those process-wide choices.
 
@@ -62,8 +63,9 @@ Reporters receive typed structural tags independently from message prose:
 | `temporal.operation` | string | Stable operation identifier |
 | `temporal.duration_ms` | float | Finite non-negative elapsed milliseconds |
 | `temporal.workflow_type` | string | Registered workflow type |
-| `temporal.workflow_id` | string | Workflow ID; attached only to diagnostics that must name one execution |
-| `temporal.run_id` | string | Workflow run ID; attached only to diagnostics that must name one execution |
+| `temporal.workflow_id` | string | Workflow ID; attached to diagnostics that name one execution (watchdog, workflow lease outcomes) |
+| `temporal.run_id` | string | Workflow run ID; attached to diagnostics that name one execution (watchdog, workflow lease outcomes) |
+| `temporal.replaying` | bool | Whether the reported activation was replaying history |
 | `temporal.job_count` | int | Jobs supplied in one activation |
 | `temporal.command_count` | int | Commands emitted by one activation |
 | `temporal.bridge_status` | string | Stable lowercase bridge status |
@@ -129,6 +131,14 @@ accepted by Temporal:
 | `activation_ignored` | `Warning` | A later activation arrived for an execution already removed from the cache. The SDK intentionally ignores it and returns no commands; repeated occurrences indicate a stale or out-of-order delivery that needs investigation. |
 | `activate` | `Debug` | One activation batch finished local processing. `temporal.job_count`, `temporal.command_count`, `temporal.workflow_type`, and `temporal.duration_ms` describe that batch, including a zero-command ignored batch. |
 
+`workflow_started`, `workflow_completed`, `workflow_failed`, and
+`workflow_cancelled` also carry `temporal.replaying` (#500). Core re-runs
+workflow code when it rebuilds an evicted run from history, so the same
+`workflow_completed` can be emitted again for a run whose completion
+Temporal already recorded. Count business outcomes only from records with
+`temporal.replaying=false`, or better, from the server-side workflow result;
+these records are local evidence that a command was buffered.
+
 Interaction events distinguish admission from handler completion. A matching
 signal emits `workflow_signal_received` when it is queued on the owning
 scheduler and `workflow_signal_handled` only after the handler returns `Ok ()`.
@@ -166,9 +176,9 @@ adapter from a public `Worker.run` or `Worker.shutdown` result:
 
 | Operation | Level | Meaning |
 |---|---|---|
-| `workflow_activation_completed` | `Debug` | The native supervisor accepted a retained workflow completion and the adapter retired that completion. A task failure or Core eviction removes the execution from the adapter registry; a terminal workflow completion remains available for queries until eviction. This is not a server-side workflow-result acknowledgement. |
+| `workflow_activation_completed` | `Debug` | The native supervisor accepted a retained workflow completion and the adapter retired that completion. A task failure or Core eviction removes the execution from the adapter registry; a terminal workflow completion remains available for queries until eviction. This is not a server-side workflow-result acknowledgement. Carries `temporal.workflow_id`, `temporal.run_id`, and `temporal.replaying` for correlation with the workflow history (#500). |
 | `workflow_completion_diagnostic_failed` | `Warning` | A diagnostic callback raised after the supervisor accepted a workflow completion. The adapter contains the observer exception, so the completion stays accepted. |
-| `workflow_activation_rejected` | `Warning` | The adapter submitted an SDK-generated failure completion for a malformed or otherwise rejected activation, and the native supervisor accepted that rejection. `temporal.error_kind` identifies the stable reason; a transport failure that leaves the completion pending does not emit this event. |
+| `workflow_activation_rejected` | `Warning` | The adapter submitted an SDK-generated failure completion for a malformed or otherwise rejected activation, and the native supervisor accepted that rejection. `temporal.error_kind` identifies the stable reason; a transport failure that leaves the completion pending does not emit this event. Carries `temporal.run_id`, and `temporal.workflow_id` while the run is cached (#500). |
 | `workflow_activation_deadline_exceeded` | `Error` | Workflow source. The activation watchdog found an activation running workflow code for at least the configured deadline and released its lease with the adapter's failure completion (#493). Carries `temporal.workflow_type`, `temporal.workflow_id`, `temporal.run_id`, `temporal.duration_ms` (a lower bound), and a `temporal.error_kind` naming what was acknowledged: `workflow_task_failed` (an ordinary activation's workflow task was failed), `workflow_queries_failed` (a query-only activation's queries were answered with failures; the task was not failed), `eviction_acknowledged` (an eviction-only activation received its empty acknowledgement), or `completion_unacknowledged` (the replacement completion could not be delivered). Emitted once per worker lifetime; the worker is unhealthy and should be restarted. |
 | `workflow_activation_late_completion_dropped` | `Warning` | The code of an activation the watchdog already failed finally returned; its completion was dropped without a native call and its run removed. |
 | `workflow_task_rejected` | `Warning` | The public worker observed an adapter rejection whose failure completion already retired the workflow lease. The worker loop treats that as progress and continues polling; a rejection that did not retire its lease is returned as a worker error instead. |
@@ -181,6 +191,13 @@ adapter from a public `Worker.run` or `Worker.shutdown` result:
 | `activity_lane_detached` | `Warning` | After a stop, an activity callback was still running when the grace period ended, so `Worker.run` returned without joining its activity Domain (#495). The callback keeps running and its result will be discarded. |
 | `worker_shutdown_abandoned_work` | `Warning` | Bounded shutdown stopped waiting for a lane at the end of the grace period (#495). `temporal.error_kind` is `activity_callback`, `workflow_activation`, or `native_call` (a lane blocked in a native call). The abandoned task is failed so Temporal retries it; the process should be restarted. |
 | `worker_shutdown_teardown_detached` | `Warning` | The teardown timeout elapsed before native teardown finished (#495). Shutdown returned; the teardown continues on its own SDK thread. |
+
+Submission and acceptance are separate: the SDK emits
+`workflow_activation_completed` only after Core accepted the completion,
+never when it was merely encoded or submitted. A completion whose submission
+failed retryably stays retained and emits nothing until a later submission is
+accepted; `workflow_completed` (workflow source) is emitted earlier, when the
+command is buffered, and therefore never by itself proves acceptance.
 
 The workflow and activity task-rejection events are lease outcomes, not
 application-level retries. A `Warning` for an acknowledged rejection means the
@@ -226,7 +243,10 @@ optional reporter package on the application's behalf.
 ## Privacy and failure isolation
 
 Events contain operation names, counts, type names, stable error categories,
-and latency. They do not contain payload bytes, workflow inputs or outputs,
+latency, the replay flag, and, on the execution-scoped records named above,
+the workflow and run IDs. Applications that treat workflow IDs as sensitive
+should filter `temporal.workflow_id` in their reporter. Events do not contain
+payload bytes, workflow inputs or outputs,
 credentials, Rust diagnostic strings, or arbitrary remote failure detail.
 User-controlled string tags are capped at 256 bytes. Truncation preserves valid
 UTF-8 character boundaries before adding the visible `...` suffix, and current
@@ -319,6 +339,126 @@ temporarily masked. A reporter that calls a workflow API re-entrantly therefore
 receives the normal outside-workflow behavior and cannot append deterministic
 commands to the activation being reported.
 
+## Worker metrics
+
+Temporal Core instruments every worker and client it runs. The SDK exports
+those instruments, with Core's names and labels, through a Prometheus scrape
+endpoint on a shared `Temporal.Runtime` (#500):
+
+```ocaml
+let ( let* ) = Result.bind
+
+let start ~target_url ~namespace ~task_queue ~workflows ~activities =
+  let* metrics =
+    Temporal.Runtime.Metrics.prometheus ~bind_address:"0.0.0.0:9464"
+      ~global_tags:[ ("deployment", "orders-blue") ] ()
+  in
+  let* runtime = Temporal.Runtime.create ~metrics () in
+  let* worker =
+    Temporal.Worker.create ~runtime ~target_url ~namespace ~task_queue
+      ~workflows ~activities ()
+  in
+  (* Worker.run, then Worker.shutdown before Runtime.shutdown. *)
+  Ok (worker, runtime)
+```
+
+Every client and worker created with `~runtime` reports to the same endpoint,
+`http://<bind_address>/metrics`. Clients and workers that own their runtime
+(no `~runtime`) export nothing. `Runtime.metrics_address` returns the bound
+address, resolving a requested port `0`. The endpoint is bound before
+`Runtime.create` returns: an address already in use is a `Bridge` error that
+names the address and leaves nothing running. It stops when
+`Runtime.shutdown` has destroyed the runtime.
+
+This is the same mechanism and naming the official SDKs use (their runtime
+telemetry options feed Core's Prometheus exporter), so existing Temporal SDK
+dashboards and alerts apply unchanged. OTLP/OpenTelemetry push export,
+custom metric prefixes, and application-defined metrics are not offered yet;
+`Runtime.Metrics` is where they would be added.
+
+### Metric set
+
+Names carry the `temporal_` prefix. Durations are histograms in
+milliseconds unless `durations_as_seconds` is set; `unit_suffix` appends the
+unit and `counters_total_suffix` appends `_total` to counters, as in the
+official SDKs.
+
+| Area | Metric (type) | Use |
+|---|---|---|
+| Client RPCs | `temporal_request`, `temporal_request_failure` (counters); `temporal_request_latency` (histogram) | Server call volume, errors, and latency by `operation` and `status_code`. |
+| Polling | `temporal_long_request`, `temporal_long_request_failure` (counters); `temporal_long_request_latency` (histogram); `temporal_num_pollers` (gauge) | Long-poll volume and poll or connection failures (`temporal_long_request_failure`); pollers by `poller_type`. |
+| Poll outcomes | `temporal_workflow_task_queue_poll_succeed`, `temporal_workflow_task_queue_poll_empty`, `temporal_activity_task_received`, `temporal_activity_poll_no_task` (counters) | Task throughput and idle polls. |
+| Saturation | `temporal_worker_task_slots_available`, `temporal_worker_task_slots_used` (gauges, by `worker_type`); `temporal_workflow_task_schedule_to_start_latency`, `temporal_activity_schedule_to_start_latency` (histograms) | A worker with no free slots and growing schedule-to-start latency is saturated. |
+| Workflow tasks | `temporal_workflow_task_execution_latency`, `temporal_workflow_task_replay_latency` (histograms); `temporal_workflow_task_execution_failed` (counter, by `failure_reason`) | Task latency, replay cost, and task failures, including nondeterminism. |
+| Workflow outcomes | `temporal_workflow_completed`, `temporal_workflow_failed`, `temporal_workflow_canceled`, `temporal_workflow_continue_as_new` (counters); `temporal_workflow_endtoend_latency` (histogram) | Terminal outcomes reported by the worker that completed them. |
+| Activities | `temporal_activity_execution_latency`, `temporal_activity_succeed_endtoend_latency` (histograms); `temporal_activity_execution_failed` (counter); `temporal_local_activity_*` equivalents | Activity latency and failures. |
+| Sticky cache | `temporal_sticky_cache_size` (gauge); `temporal_sticky_cache_hit`, `temporal_sticky_cache_miss`, `temporal_sticky_cache_total_forced_eviction` (counters) | Cache pressure; forced evictions cause replays. |
+| Lifecycle | `temporal_worker_start` (counter) | Worker starts. |
+
+Core creates a family on its first observation, so an idle worker exports a
+subset. The live regression requires the 19 families that a worker which ran
+one workflow and one activity must export.
+
+### Labels and cardinality
+
+Series carry only bounded labels: `service_name` (constant
+`temporal-core-sdk`), `namespace`, `task_queue`, `workflow_type`,
+`activity_type`, `poller_type`, `worker_type`, `eager`, `failure_reason`,
+`operation`, `status_code`, the histogram `le`, and the application's global
+tags. Cardinality is therefore the product of task queues, registered
+workflow and activity types, and small closed enumerations. Workflow IDs, run
+IDs, activity IDs, payloads, failure messages, and credentials are never
+labels; use the correlated log records above to diagnose one execution.
+Global tags are bounded (at most 16, 64-byte names, 256-byte values) and may
+not reuse a Core label name. The live regression fails on any other label and
+checks that the execution's IDs never appear in the scrape.
+
+### Failure isolation and resource use
+
+The scrape server is Core's own Prometheus exporter, running as one task on
+the runtime's background I/O threads. It never runs OCaml code and is not on
+the workflow or activity path: instruments are updated in memory, so a slow,
+failing, or absent scraper cannot block, fail, or reorder workflow and
+activity execution or change durable behavior. Memory is bounded by the
+label cardinality above. Each scrape connection is served by a short-lived
+task; Core imposes no connection limit, so bind the endpoint to a loopback or
+private interface (or put a scraping agent in front of it) rather than a
+public one. The endpoint has no authentication or TLS.
+
+### Monitoring and alerting example
+
+```yaml
+groups:
+  - name: temporal-worker
+    rules:
+      - alert: TemporalWorkerPollFailures
+        expr: sum by (task_queue) (rate(temporal_long_request_failure[5m])) > 0
+        for: 5m
+      - alert: TemporalWorkerSaturated
+        expr: >
+          min by (task_queue) (temporal_worker_task_slots_available{worker_type="WorkflowWorker"}) == 0
+          and on (task_queue)
+          histogram_quantile(0.95, sum by (task_queue, le)
+            (rate(temporal_workflow_task_schedule_to_start_latency_bucket[5m]))) > 1000
+        for: 10m
+      - alert: TemporalWorkflowTaskFailures
+        expr: sum by (task_queue, failure_reason) (rate(temporal_workflow_task_execution_failed[5m])) > 0
+```
+
+A poll failure shows as `temporal_long_request_failure` (and Core's stderr
+warnings); a saturated executor as zero available slots with rising
+schedule-to-start latency; a stuck activation additionally as the
+`workflow_activation_deadline_exceeded` record and `Worker.health`.
+Shutdown outcomes, including a teardown timeout, are reported by
+`Worker.shutdown_with_report` and the `worker_shutdown*` lifecycle records
+rather than by a metric, because the endpoint stops with the runtime.
+
+### Tracing
+
+Distributed tracing (OpenTelemetry spans across client, workflow, and
+activity) is deferred. Core's internal spans reach operators only as the
+stderr log records described above.
+
 ## Verification
 
 `test/observability/test_logging.ml` installs an in-memory reporter and checks
@@ -343,3 +483,21 @@ queue, that drops are counted and reported in one summary line, and that
 runtime close completes while the writer is blocked.
 `test/unit/test_client_worker.ml` checks that the cause reaches the public
 `Client.create` error.
+
+Metrics (#500): `test/unit/test_metrics_config.ml` covers option validation
+(bind addresses, tag names, values, count, uniqueness, and that no rejected
+value is echoed) and the exact bridge document.
+`rust/core-bridge/tests/metrics_exporter.rs` proves through the C ABI that a
+configured exporter answers scrapes on its resolved ephemeral port, that
+attached graphs receive Core's meter, that invalid documents and a busy port
+publish nothing, and that the socket is closed once the last Core reference
+is released. `test/bridge/test_runtime_metrics.ml` repeats the lifecycle
+through the public `Runtime` API. The live regression
+`test/integration/worker_metrics/regression.exe` (part of
+`make test-temporal-live-regressions`) runs a workflow and an activity on a
+worker attached to an exporting runtime, scrapes the endpoint, requires the
+documented families, rejects any unexpected label or execution identifier
+in the scrape, checks the global tag, and checks that every
+`workflow_activation_completed` record for the run carries its workflow ID,
+run ID, and `temporal.replaying=false`. `test/observability/test_logging.ml`
+checks the `temporal.replaying` tag on replayed and fresh executions.

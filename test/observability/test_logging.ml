@@ -217,7 +217,8 @@ let test_source_and_tag_names () =
   assert
     (Logs.Tag.name Observability.Tag.bridge_status = "temporal.bridge_status");
   assert
-    (Logs.Tag.name Observability.Tag.error_kind = "temporal.error_kind")
+    (Logs.Tag.name Observability.Tag.error_kind = "temporal.error_kind");
+  assert (Logs.Tag.name Observability.Tag.replaying = "temporal.replaying")
 
 (** Bridge calls report status and non-negative millisecond latency without
     changing their typed result behavior. *)
@@ -343,6 +344,33 @@ let test_workflow_events_and_privacy () =
       assert
         (Logs.Tag.find Observability.Tag.error_kind failure.tags = Some "bridge"))
 
+(** Workflow lifecycle records say whether the activation was replaying
+    (#500), so a reporter can tell a replayed start or failure from new
+    progress. The flag follows the activation, not the execution. *)
+let test_lifecycle_events_mark_replay () =
+  with_capture (fun () ->
+      let replayed = Execution.start failing_workflow () in
+      Execution.set_activation_is_replaying replayed true;
+      ignore (Execution.activate replayed [ Activation.Start_workflow ]);
+      let started =
+        require_event ~source:"temporal.sdk.workflow" ~level:Logs.Info
+          ~operation:"workflow_started"
+      in
+      assert (Logs.Tag.find Observability.Tag.replaying started.tags = Some true);
+      let failed =
+        require_event ~source:"temporal.sdk.workflow" ~level:Logs.Error
+          ~operation:"workflow_failed"
+      in
+      assert (Logs.Tag.find Observability.Tag.replaying failed.tags = Some true);
+      events := [];
+      let fresh = Execution.start failing_workflow () in
+      ignore (Execution.activate fresh [ Activation.Start_workflow ]);
+      let failed =
+        require_event ~source:"temporal.sdk.workflow" ~level:Logs.Error
+          ~operation:"workflow_failed"
+      in
+      assert (Logs.Tag.find Observability.Tag.replaying failed.tags = Some false))
+
 (** Reporter exceptions are swallowed at the common wrapper, including both a
     direct bridge call and workflow activation. *)
 let test_reporter_exceptions_are_contained () =
@@ -387,5 +415,6 @@ let () =
   test_bridge_events ();
   test_bridge_payload_privacy ();
   test_workflow_events_and_privacy ();
+  test_lifecycle_events_mark_replay ();
   test_reporter_exceptions_are_contained ();
   test_reporters_cannot_reenter_workflow_context ()

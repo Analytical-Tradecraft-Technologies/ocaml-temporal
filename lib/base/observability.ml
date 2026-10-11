@@ -59,6 +59,10 @@ module Tag = struct
     Logs.Tag.def ~doc:"Temporal workflow run ID" "temporal.run_id"
       Format.pp_print_string
 
+  let replaying =
+    Logs.Tag.def ~doc:"Whether the activation was replaying history"
+      "temporal.replaying" Format.pp_print_bool
+
   let job_count =
     Logs.Tag.def ~doc:"Jobs in one workflow activation" "temporal.job_count"
       Format.pp_print_int
@@ -92,13 +96,14 @@ let non_negative_count value = Int.max 0 value
 
 (** Constructs a bounded tag set in a fixed, reviewable order. *)
 let tags ~operation ?duration_ms ?workflow_type ?workflow_id ?run_id
-    ?job_count ?command_count ?bridge_status ?error_kind () =
+    ?replaying ?job_count ?command_count ?bridge_status ?error_kind () =
   Logs.Tag.empty
   |> Logs.Tag.add Tag.operation (bounded operation)
   |> add_optional Tag.duration_ms non_negative_finite duration_ms
   |> add_optional Tag.workflow_type bounded workflow_type
   |> add_optional Tag.workflow_id bounded workflow_id
   |> add_optional Tag.run_id bounded run_id
+  |> add_optional Tag.replaying Fun.id replaying
   |> add_optional Tag.job_count non_negative_count job_count
   |> add_optional Tag.command_count non_negative_count command_count
   |> add_optional Tag.bridge_status bounded bridge_status
