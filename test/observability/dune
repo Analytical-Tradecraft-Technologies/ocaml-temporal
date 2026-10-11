@@ -10,3 +10,7 @@
 (test
  (name test_tag_normalization)
  (libraries logs temporal_base))
+
+(test
+ (name test_debug_timed)
+ (libraries logs temporal_base))

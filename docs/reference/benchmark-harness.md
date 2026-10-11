@@ -8,7 +8,9 @@ the C/Rust bridge, worker polling, a Temporal Server, or network latency. The
 activation suites for [#526] add distinct warm-cache and cold-replay
 boundaries. The [memory and allocation suites](#memory-and-allocation-suites)
 for [#527] and the [fan-out suite](#fan-out-and-json-bridge-overhead) for
-[#528] extend the same report with memory sections. None of these suites alone
+[#528] extend the same report with memory sections. The
+[live fan-out suite](#live-fan-out-and-bridge-attribution) is the one suite
+that does run against a Temporal Server. None of these suites alone
 qualifies the sustained-load gate in [#507].
 
 From a checkout with Docker Compose and Python 3 available, run the original
@@ -239,7 +241,8 @@ typed completion and subtracts it from the poll time; the duplicate is never
 submitted. The attribution is limited to OCaml. The Rust half of the JSON
 bridge (serde encoding of activations and decoding of completions), the C
 copies, Core and scheduling between Domains are not measured, so the shares
-below are a lower bound on total bridge cost.
+below are a lower bound on total bridge cost. The
+[live suite](#live-fan-out-and-bridge-attribution) measures those parts.
 
 ## Indicative results and bottlenecks
 
@@ -297,6 +300,158 @@ Observations from these runs:
   grows to 33%, and the end-to-end cost is about 0.5 ms per activity.
   Optimizing the codec, or a binary protocol, is out of scope here; the
   numbers locate the cost for a later decision.
+
+## Live fan-out and bridge attribution
+
+The suites above exclude Temporal Core, the native bridge and the server. The
+live suite for [#528] runs the same fan-out shape end to end against the
+Compose Temporal stack, and attributes its time to the JSON bridge, native
+calls and the rest:
+
+```sh
+# Starts (or reuses) the Compose stack, then one report per level. The stack
+# keeps running for reruns: `make temporal-clean` removes it.
+make bench-fanout-live BENCH_LIVE_FANOUT_LEVELS='1 8' BENCH_FANOUT_WIDTH=1000 \
+  BENCH_FANOUT_PAYLOAD_BYTES=256 BENCH_LIVE_FANOUT_SAMPLES=5 \
+  BENCH_LIVE_FANOUT_REPETITIONS=2 BENCH_HOST_LABEL='machine/CPU/RAM description'
+# The Rust half of the JSON bridge, on documents of the same shape.
+make bench-json-bridge-rust BENCH_FANOUT_WIDTH=1000 BENCH_FANOUT_BATCH=10 \
+  BENCH_FANOUT_PAYLOAD_BYTES=256
+```
+
+**Live activity fan-out** (`live-activity-fanout`, `bench_live_fanout.ml`).
+One process creates a client and one worker (on its own Domain) on a fresh
+task queue. One sample starts `BENCH_FANOUT_CONCURRENCY` executions through
+`Client.start` and waits for each. Every execution starts
+`BENCH_FANOUT_WIDTH` remote activities with `Activity.start`, fans them back
+in with `Future.all` and returns their count, which the sample checks. Each
+activity echoes a JSON string of `BENCH_FANOUT_PAYLOAD_BYTES` encoded bytes.
+Sample latency therefore includes the client, Temporal Server, PostgreSQL,
+Core, the Rust bridge, the C stubs, the supervisor, the OCaml adapter,
+workflow code and activity execution. Reports go to
+`_build/benchmarks/live-activity-fanout-c<level>.json` and record the server
+image (with digest) as `server_version`. `BENCH_LIVE_TARGET_URL` (default
+`http://temporal:7233`, inside the Compose network) and
+`BENCH_LIVE_NAMESPACE` (default `temporal-sdk-test`) select the server. Width
+is bounded to 5,000 and arguments plus results to 32 MiB per execution, well
+inside Temporal's default history limits; concurrency is bounded to 64, the
+client's start capacity. Memory snapshots are those of the shared harness;
+RSS and the Linux `VmHWM` peak cover the whole benchmark process (client,
+worker, Core and Rust), not the server or database.
+
+The untimed `live_bridge_attribution` pass reruns
+`BENCH_LIVE_ATTRIBUTION_SAMPLES` samples with the SDK's bridge and workflow
+log sources at `Debug` and aggregates three kinds of records (see
+[observability](observability.md#protocol-codec-timing)):
+
+- every bridge call's native duration, split into calls that returned work
+  (`ok`), empty polls (`not_ready`) and errors. A poll that returned work
+  covers taking the item from Core's lane, Rust's conversion from protobuf,
+  serde encoding with its validation reparse, and the C copy; a completion
+  call covers the C copy, serde decoding, Core and, because the bridge waits
+  for Core's result, Core's RPC to the server;
+- the OCaml codec passes timed by `Observability.debug_timed`;
+- each workflow activation's local processing (`activate`).
+
+Durations are per sample. Lanes overlap (the workflow lane, the activity
+Domain and the supervisor run concurrently), so the categories are compared
+with the pass's wall time rather than summed to it, and the rest of the wall
+time is not attributed by a record. The pass is slower than the timed phases
+because every record costs a clock read and a reporter call; its wall time is
+reported next to the measured latency.
+
+The Rust benchmark (`rust/core-bridge/benches/json_bridge.rs`, Cargo's
+optimized bench profile) times `encode_activation` of one activation of
+`BENCH_FANOUT_BATCH` activity results, `decode_completion` plus Core
+conversion of the completion that schedules `BENCH_FANOUT_WIDTH` activities,
+and `decode_completion` of one activity completion, and estimates their sum
+per fan-out. It builds its documents from the semantic JSON protocol, so
+Core's protobuf-to-semantic conversion and the activity-task encoding are not
+in that estimate; the live ready-poll durations bound them instead.
+
+### Indicative live results
+
+Single local runs, not baselines or thresholds. Host: Apple M4 Pro (14
+cores, 48 GB), macOS 27, Docker Desktop VM with 14 CPUs and 9.7 GiB
+(`Linux 7.0.14-linuxkit aarch64`). The benchmark ran in the development
+container (OCaml 5.4.1, the digest-pinned `ocaml-5.4` stage of `Dockerfile.dev`,
+Dune `release` profile, Core `95e97686`) against
+`temporalio/server:1.32.0` with PostgreSQL 18.6 in the same VM, on this
+change's branch from `master` after #990. Width 1,000, payload 256 B, two
+repetitions of one warmup and five measured samples, one attribution sample
+per repetition. Server, database and benchmark share the VM's CPUs, so
+absolute times are specific to this machine and Docker configuration.
+
+| Executions per sample | p50 per sample (rep 1 / rep 2) | Activities/s | Peak RSS (`VmHWM`) | Errors |
+| --- | --- | --- | --- | --- |
+| 1 | 9.16 s / 8.97 s | 109 | 80 MB / 99 MB | 0 |
+| 8 | 98.3 s / 90.0 s | 80 / 87 | 140 MB / 152 MB | 0 |
+
+Attribution pass, first repetition, per sample (one execution: 272
+workflow activations, 1,000 activity tasks; eight executions: 6,113
+activations, 8,000 tasks):
+
+| Category | 1 execution | Share of wall | 8 executions | Share of wall |
+| --- | --- | --- | --- | --- |
+| Instrumented wall time | 9.10 s | | 95.2 s | |
+| OCaml JSON codec (all five passes) | 77 ms | 0.8% | 777 ms | 0.8% |
+| Native polls that returned work | 108 ms | 1.2% | 1.49 s | 1.6% |
+| Native completion calls (Core and server RPC) | 2.03 s | 22% | 28.9 s | 30% |
+| Native readiness waits (`worker_wait_any`) | 0.86 s | 9% | 15.4 s | 16% |
+| Workflow activation processing | 5.5 ms | 0.06% | 82 ms | 0.09% |
+| Not inside any native call or codec pass | about 6.0 s | 66% | about 48.6 s | 51% |
+
+The OCaml codec splits as follows for one execution: activity-task decoding
+34 µs per task (33.6 ms), activation decoding 40 µs per activation
+(10.9 ms), workflow completion encoding 16.6 ms (most of it the one
+1,000-command completion), and the two activity completion encodes 8.5 ms and
+7.3 ms. Each activity completion takes 1.5 ms (2.1 ms with eight executions)
+inside its native call, and each workflow completion 1.8 ms (2.0 ms).
+
+The Rust benchmark, run natively on the same Mac (not in the container), for
+width 1,000 and batches of 10:
+
+| Payload | Activation encode (10 results) | Fan-out completion decode + conversion | Activity completion decode | Estimated Rust codec per fan-out |
+| --- | --- | --- | --- | --- |
+| 256 B | 116 µs | 4.49 ms + 0.25 ms | 2.6 µs | 18.9 ms |
+| 16 KiB | 884 µs | 30.5 ms + 0.54 ms | 29 µs | 148 ms |
+
+Findings:
+
+- **JSON is not the live bottleneck.** With 256-byte payloads, OCaml codec
+  work is about 77 ms and the Rust codec estimate about 19 ms per
+  1,000-activity fan-out: together about 1% of a 9-second fan-out. The
+  server-free suite's 65% JSON share describes the adapter alone; once Core
+  and the server are in the path it is small. Larger payloads raise it (the
+  Rust estimate grows eightfold at 16 KiB) but this run did not measure them
+  live.
+- **Throughput is bounded by one activity at a time.** The worker has one
+  remote activity slot by design (see `Worker.Options`), so 1,000 activities
+  are 1,000 sequential poll, execute and complete cycles: about 9 ms each with
+  one execution and 11 to 12 ms each with eight. Eight executions add
+  activation and workflow-completion traffic (6,113 instead of 272
+  activations per 8,000 activities) that competes for the same supervisor,
+  so per-activity cost rises rather than amortizing.
+- **The largest share is outside native calls.** About 6 s of the 9.1 s
+  passes in no native call or codec pass. An unmerged experiment that
+  reduced the 10 ms local yield in `Native_worker.wait_for_lane` (used when
+  the sibling lane holds the native wait token) to 1 ms cut the one-execution
+  p50 from 9.16 s to 3.97 s (three samples, otherwise identical), so that
+  yield is the dominant cost of this workload. Changing it is a scheduling
+  decision for a separate issue, not part of this measurement.
+- **Native completions are the next cost**: 1.5 to 2.5 ms per activity
+  completion, which includes Core's response RPC to the server. Ready polls,
+  conversion and serde encoding cost about 80 to 130 µs per item.
+- **Memory**: peak RSS stays at 80 to 100 MB for one execution and 140 to
+  150 MB for eight. Retained OCaml live bytes after close were about 20 KB in
+  both repetitions at both levels, with no rising trend. RSS remained 19 to
+  39 MB above the pre-load baseline after compaction, consistent with native
+  allocator capacity rather than retained OCaml data; the suite cannot
+  separate Core's own retention from allocator behavior.
+- **Activity completions are encoded twice**: once by the activity adapter's
+  validation pass (`activity_completion_validate`) and again by the
+  supervisor (`activity_completion_encode`), about 8 µs each with these
+  payloads. The cost is small here but grows with payload size.
 
 [#507]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/507
 [#526]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/526

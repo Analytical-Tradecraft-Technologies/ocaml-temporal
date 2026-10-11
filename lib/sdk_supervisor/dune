@@ -3,6 +3,7 @@
  (package temporal-sdk)
  (wrapped false)
  (libraries
+  temporal_base
   temporal_mailbox_processor
   temporal_core_bridge
   temporal_protocol

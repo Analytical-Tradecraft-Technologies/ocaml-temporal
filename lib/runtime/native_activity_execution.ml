@@ -670,7 +670,13 @@ type completion_attempt =
     that the Rust-facing supervisor uses. No JSON string is retained; the
     round-trip is a validation gate only. *)
 let validate_completion completion =
-  match Protocol.encode_completion completion with
+  match
+    (* Timed only while the bridge source is at [Debug] (#528). This pass is
+       separate from the supervisor's encode, so attribution reports both. *)
+    Observability.debug_timed ~src:Observability.Source.bridge
+      ~operation:"activity_completion_validate" (fun () ->
+        Protocol.encode_completion completion)
+  with
   | Ok _ -> Ok ()
   | Error error -> Error (protocol_error ~path:"$.completion" error)
 
