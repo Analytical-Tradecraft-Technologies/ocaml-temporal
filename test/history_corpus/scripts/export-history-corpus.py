@@ -78,6 +78,38 @@ CASES = {
     ),
 }
 
+# Patch lifecycle cases (issue #531). Each stage of the lifecycle captures the
+# same three workflow types; the stage decides the marker tag.
+LIFECYCLE_STAGES = {
+    "legacy": ("patch-marker-free", "legacy generation (no patch call)"),
+    "patched": ("patch-active", "patched generation (Workflow.patched)"),
+    "deprecated": ("patch-deprecated", "deprecated generation (Workflow.deprecate_patch)"),
+    "removed": ("patch-removed", "removed generation (patch call deleted, new branch)"),
+}
+LIFECYCLE_KINDS = {
+    "multi": (
+        ["patch-multiple"],
+        "Three patches around an activity, a timer and a child workflow",
+    ),
+    "loop": (["patch-loop"], "One patch consulted in each of three loop iterations"),
+    "handlers": (
+        ["patch-signal-handler", "patch-update-handler", "signal", "update"],
+        "Patches inside a signal handler and an update handler, each running an activity",
+    ),
+}
+for _kind, (_features, _what) in LIFECYCLE_KINDS.items():
+    for _stage, (_marker, _generation) in LIFECYCLE_STAGES.items():
+        CASES[f"lifecycle-{_kind}-{_stage}"] = (
+            ["patch", _marker] + _features,
+            f"{_what}; recorded by the {_generation}.",
+        )
+CASES["lifecycle-handover"] = (
+    ["patch", "patch-active", "patch-mid-run-upgrade", "signal"],
+    "Rolling-deploy handover: started and parked by the legacy generation, "
+    "then released on a fresh patched-generation worker, which reaches the "
+    "patch point for the first time and records the marker mid-run.",
+)
+
 IDENTITY_PATTERN = re.compile(r"^history-corpus-[a-z0-9-]+$")
 
 

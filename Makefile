@@ -992,14 +992,18 @@ test-history-corpus-upgrade:
 # the corpus directory to append them; installation never replaces an entry.
 # The export step needs host python3 with the protobuf package, protoc, and
 # cargo (or HISTORY_CORPUS_CORE_PROTOS naming the pinned Core protos).
+# HISTORY_CORPUS_GENERATIONS optionally limits the capture to the named worker
+# generations (space-separated, in order); empty runs every generation.
 HISTORY_CORPUS_CAPTURE_ID ?=
 HISTORY_CORPUS_INSTALL ?=
+HISTORY_CORPUS_GENERATIONS ?=
 history-corpus-capture: test-temporal-config
 	@test -n "$(HISTORY_CORPUS_CAPTURE_ID)" || { echo "set HISTORY_CORPUS_CAPTURE_ID, e.g. live-YYYY-MM-DD" >&2; exit 2; }
 	$(MAKE) temporal-start
 	$(RUN) dune build $(DUNE_BUILD_ARGS) test/history_corpus/capture/history_corpus_capture.exe
 	HISTORY_CORPUS_CAPTURE_ID="$(HISTORY_CORPUS_CAPTURE_ID)" \
 	HISTORY_CORPUS_INSTALL="$(HISTORY_CORPUS_INSTALL)" \
+	HISTORY_CORPUS_GENERATIONS="$(HISTORY_CORPUS_GENERATIONS)" \
 	HISTORY_CORPUS_RUN='OCAML_IMAGE=$(OCAML_IMAGE) $(COMPOSE) --progress quiet run --rm --user $(HOST_UID):$(HOST_GID) $(SERVICE) env TEMPORAL_ADDRESS=http://temporal:7233 TEMPORAL_NAMESPACE=temporal-sdk-test _build/default/test/history_corpus/capture/history_corpus_capture.exe' \
 	HISTORY_CORPUS_TEMPORAL_CLI='$(TEMPORAL_COMPOSE) run --rm --no-deps -T temporal-admin-tools temporal' \
 	sh test/history_corpus/scripts/capture-history-corpus.sh

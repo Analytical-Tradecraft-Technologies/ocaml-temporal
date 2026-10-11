@@ -183,13 +183,121 @@ let patch client ~case =
   ignore (expect_completed case handle : string);
   record ~case ~workflow_type handle
 
+(** Workflow ID of the handover run. The legacy generation starts it and the
+    patched generation, a separate process, finds it again by this ID. *)
+let handover_workflow_id = "history-corpus-lifecycle-handover"
+
+(** Client reference for every [corpus.lifecycle.*] workflow type, which all
+    take and return a string. *)
+let lifecycle_remote workflow_type =
+  remote workflow_type Temporal.Codec.string Temporal.Codec.string
+
+(** Captures the three matrix workflows of one lifecycle stage. [stage] is
+    the short stage name used in case IDs and as the workflow input, so each
+    stage's runs (and the multi workflow's child IDs) are distinct. *)
+let lifecycle_matrix client ~stage =
+  let run ~kind ~workflow_type =
+    let case = Printf.sprintf "lifecycle-%s-%s" kind stage in
+    let handle =
+      start client ~workflow:(lifecycle_remote workflow_type)
+        ~id:("history-corpus-" ^ case) ~input:stage
+    in
+    (handle, case)
+  in
+  let simple ~kind ~workflow_type =
+    let handle, case = run ~kind ~workflow_type in
+    ignore (expect_completed case handle : string);
+    record ~case ~workflow_type handle
+  in
+  let multi =
+    simple ~kind:"multi" ~workflow_type:Defs.lifecycle_multi_workflow_type
+  in
+  let loop = simple ~kind:"loop" ~workflow_type:Defs.lifecycle_loop_workflow_type in
+  let handlers =
+    let workflow_type = Defs.lifecycle_handlers_workflow_type in
+    let handle, case = run ~kind:"handlers" ~workflow_type in
+    require "lifecycle signal"
+      (Temporal.Client.signal handle ~signal:Defs.lifecycle_signal
+         ~input:("signal-" ^ stage));
+    let update =
+      require "lifecycle start update"
+        (Temporal.Client.start_update
+           ~update_id:("history-corpus-lifecycle-update-" ^ stage)
+           handle ~update:Defs.lifecycle_update ~input:("update-" ^ stage) ())
+    in
+    ignore (require "lifecycle wait update" (Temporal.Client.wait_update update)
+            : string);
+    ignore (expect_completed case handle : string);
+    record ~case ~workflow_type handle
+  in
+  [ multi; loop; handlers ]
+
+(** Polls the handover status query until it returns [expected], proving the
+    run's first workflow task completed. Transient query failures before that
+    task are retried within a bounded deadline. *)
+let wait_for_handover_status handle expected =
+  let deadline = Unix.gettimeofday () +. 30. in
+  let rec loop () =
+    match Temporal.Client.query handle ~query:Defs.lifecycle_handover_status with
+    | Ok value when value = expected -> ()
+    | _ when Unix.gettimeofday () < deadline ->
+        Unix.sleepf 0.2;
+        loop ()
+    | Ok value -> failwith ("handover query returned " ^ value)
+    | Error error -> require "handover query" (Error error)
+  in
+  loop ()
+
+(** Legacy half of the handover: starts the run and leaves it parked before
+    its patch point once the legacy worker has completed its first task. The
+    run stays open when this process exits; nothing is recorded yet. *)
+let start_handover client =
+  let handle =
+    start client
+      ~workflow:(lifecycle_remote Defs.lifecycle_handover_workflow_type)
+      ~id:handover_workflow_id ~input:"handover"
+  in
+  wait_for_handover_status handle "parked"
+
+(** Patched half of the handover: a fresh worker process replays the legacy
+    prefix, is released by a signal, and reaches the patch point for the
+    first time. The run ID is left to the export script, which reads the
+    only run of this workflow ID. *)
+let finish_handover client =
+  let workflow_type = Defs.lifecycle_handover_workflow_type in
+  let handle =
+    require "handover handle"
+      (Temporal.Client.get_handle client
+         ~workflow:(lifecycle_remote workflow_type)
+         ~id:handover_workflow_id ())
+  in
+  require "handover release"
+    (Temporal.Client.signal handle ~signal:Defs.lifecycle_handover_release
+       ~input:());
+  let result = expect_completed "lifecycle-handover" handle in
+  if result <> "NEW:handover" then
+    failwith ("handover did not take the new branch: " ^ result);
+  record ~case:"lifecycle-handover" ~workflow_type handle
+
 (** Selects the scenarios a generation captures. Each patch generation owns
-    one [corpus.patch] history; [corpus-v1] also captures the active marker. *)
+    one [corpus.patch] history; [corpus-v1] also captures the active marker.
+    The lifecycle generations each capture their matrix workflows; the
+    legacy generation must run before the patched one because it leaves the
+    handover run open for the patched generation to finish. *)
 let scenarios generation client =
   match generation with
   | "corpus-v1" -> corpus_v1 client @ [ patch client ~case:"patch-active" ]
   | "corpus-v1-patch-legacy" -> [ patch client ~case:"patch-marker-free" ]
   | "corpus-v1-patch-deprecated" -> [ patch client ~case:"patch-deprecated" ]
+  | "corpus-lifecycle-legacy" ->
+      let records = lifecycle_matrix client ~stage:"legacy" in
+      start_handover client;
+      records
+  | "corpus-lifecycle-patched" ->
+      let handover = finish_handover client in
+      lifecycle_matrix client ~stage:"patched" @ [ handover ]
+  | "corpus-lifecycle-deprecated" -> lifecycle_matrix client ~stage:"deprecated"
+  | "corpus-lifecycle-removed" -> lifecycle_matrix client ~stage:"removed"
   | other -> failwith ("generation has no capture scenarios: " ^ other)
 
 (** Converts a definition-set entry to a live worker registration. *)
