@@ -343,8 +343,9 @@ before publication.
 
 ## Locked Cargo closure
 
-`rust/Cargo.lock` locks 322 packages: the project bridge and 321 dependencies
-rooted at Temporal Core commit `95e97686a079dcfe6c42e3254b2f3f5e3d97408f`.
+`rust/Cargo.lock` locks 306 packages: the project bridge and 305 dependencies
+rooted at Temporal Core commit `8fe478ee179ed754614d230f39586f3edb57da71`
+(upstream release tags `v1.1.0` and `core-v0.10.0`).
 Some crates are locked at more than one version because different packages in
 the graph require incompatible releases. The client, common, and SDK-Core
 dependencies disable their default features: `temporalio-client` enables
@@ -379,10 +380,10 @@ the `license` field of `cargo metadata` for the locked version.
 | serde | 1.0.228 | 1.0.229 | normal | MIT OR Apache-2.0 | Private control protocol data model |
 | serde_json | 1.0.150 | 1.0.151 | normal | MIT OR Apache-2.0 | Private JSON control protocol |
 | prost-wkt-types | 0.7.1 | 0.7.2 | normal | Apache-2.0 AND BSD-3-Clause | Exact protobuf timestamps and durations in the semantic adapter |
-| temporalio-client | Core revision | 0.5.0 | normal | MIT (reviewed `LICENSE.txt`) | Temporal Core client |
-| temporalio-common | Core revision | 0.5.0 | normal | MIT (reviewed `LICENSE.txt`) | Temporal Core shared types |
-| temporalio-sdk-core | Core revision | 0.5.0 | normal | MIT (reviewed `LICENSE.txt`) | Temporal Core worker state machines |
-| temporalio-protos | Core revision | 0.5.0 | normal | MIT (reviewed `LICENSE.txt`) | Temporal API protobuf types |
+| temporalio-client | Core revision | 1.1.0 | normal | MIT (reviewed `LICENSE.txt`) | Temporal Core client |
+| temporalio-common | Core revision | 1.1.0 | normal | MIT (reviewed `LICENSE.txt`) | Temporal Core shared types |
+| temporalio-sdk-core | Core revision | 0.10.0 | normal | MIT (reviewed `LICENSE.txt`) | Temporal Core worker state machines |
+| temporalio-protos | Core revision | 0.10.0 | normal | MIT (reviewed `LICENSE.txt`) | Temporal API protobuf types |
 | tokio | 1.52.3 | 1.53.2 | normal, dev | MIT | Core's existing executor, channels, and task handles for the guarded poll lanes; tests also enable `net` |
 | uuid | 1.23.4 | 1.27.0 | normal | Apache-2.0 OR MIT | Random v4 tickets for pending workflow-start operations |
 
@@ -397,7 +398,11 @@ and a maximum of ten open Cargo version-update PRs. Its explicit
 `allow: dependency-type: all` policy includes direct and transitive Cargo
 dependencies; without that rule, routine version updates cover only direct
 dependencies (security updates can still cover vulnerable lockfile entries).
-Temporal Core packages remain grouped. Cargo resolution continues to enforce
+Temporal Core packages remain grouped, but Dependabot does not move a
+`rev =` pin of a Git dependency, so that group has never proposed a Core
+upgrade; the scheduled freshness check under
+[Temporal Core pin upgrades](#temporal-core-pin-upgrades) does that job. Cargo
+resolution continues to enforce
 upstream version requirements; this policy does not override those constraints.
 Docker, Docker Compose, Rust toolchains, and GitHub Actions have separate daily
 entries. Versions embedded in arbitrary scripts, Makefiles, and action inputs
@@ -412,6 +417,21 @@ See the [Dependabot allow reference](https://docs.github.com/en/code-security/re
 for the direct/indirect update behavior.
 
 ### Temporal Core pin upgrades
+
+Core is pinned to the commit of an upstream stable release tag rather than an
+untagged commit on its default branch. The `Temporal Core pin freshness`
+workflow (`.github/workflows/core-pin-freshness.yml`) runs every Monday at
+20:00 UTC and on demand: `scripts/check-core-pin-freshness.sh` compares the pin
+with the commit of the latest stable `temporalio/sdk-core` release through the
+GitHub compare API. When that release is not contained in the pin, the
+workflow opens the tracking issue "Temporal Core pin is behind the latest
+sdk-core release" (or comments on the open one once per new release) and
+fails, so the gap stays visible until the pin moves. It never edits the pin.
+The expected cadence is to upgrade within one upstream release, and always
+before an SDK release; a release that is deliberately skipped is recorded on
+the tracking issue together with the upstream fixes left out.
+`test/smoke/test_core_pin_freshness.sh` covers the script's exit-status
+contract offline.
 
 A change to the Temporal Core revision, whether a hand-edited pin bump or a
 grouped Dependabot `temporal-core` PR, and any other Dependabot Cargo PR must
@@ -435,6 +455,11 @@ carry this evidence before merge:
    rollback evidence.
 4. Compatibility evidence: the Temporal/PostgreSQL live job passes against the
    new pin.
+
+The most recent upgrade moved the pin from `95e97686` (crate 0.5.0) to
+`8fe478ee` (`v1.1.0`/`core-v0.10.0`) for issue #824; its adaptations and
+evidence are recorded in [progress](progress.md) and the
+[Core bridge reference](reference/core-bridge.md#temporal-core-revision).
 
 The Cargo scanner parses SPDX `AND`, `OR`, `WITH`, and parentheses rather than
 matching substrings. For an `OR`, it prints the exact approved branch selected;

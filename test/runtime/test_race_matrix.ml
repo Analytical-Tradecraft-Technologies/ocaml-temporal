@@ -22,7 +22,7 @@
 
     Rows only use job orders that the pinned Core can deliver. Core's
     activation contract (workflow_activation.proto at the pinned revision
-    95e97686, "Job ordering guarantees and semantics") orders jobs as:
+    8fe478ee, "Job ordering guarantees and semantics") orders jobs as:
     initialization, patches, random-seed updates, signals and updates, all
     other jobs in history order (timer, activity, and child resolutions, and
     workflow cancellation), local-activity resolutions, then queries and

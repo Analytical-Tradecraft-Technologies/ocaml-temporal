@@ -18,7 +18,7 @@ pub mod workflow_protocol;
 pub use abi::*;
 
 /// Immutable Temporal Core revision linked by this bridge.
-pub const TEMPORAL_CORE_REVISION: &str = "95e97686a079dcfe6c42e3254b2f3f5e3d97408f";
+pub const TEMPORAL_CORE_REVISION: &str = "8fe478ee179ed754614d230f39586f3edb57da71";
 
 /// Identifies the Core crate pinned in the locked Cargo build graph.
 pub fn temporal_core_revision() -> &'static str {

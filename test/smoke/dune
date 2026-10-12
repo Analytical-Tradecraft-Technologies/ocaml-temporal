@@ -30,6 +30,12 @@
 
 (rule
  (alias runtest)
+ (deps ../../scripts/check-core-pin-freshness.sh test_core_pin_freshness.sh)
+ (action
+  (run sh %{dep:test_core_pin_freshness.sh} %{workspace_root})))
+
+(rule
+ (alias runtest)
  (deps ../../scripts/render-rust-link-flags.sh test_rust_link_flags.sh)
  (action
   (run sh %{dep:test_rust_link_flags.sh} %{workspace_root})))

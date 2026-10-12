@@ -52,6 +52,92 @@ admin-tools CLI; `sh scripts/check-format.sh`; `uvx typos@1.48.0`;
 `scripts/check-dependency-inventory.sh`; and
 `sh test/smoke/test_live_regressions_contract.sh .`.
 
+## 2026-10-12: Idle-pacing tests measure decisions, not sleep granularity (#994 follow-up)
+
+`test/runtime/test_native_worker_idle.ml` failed on the Windows x64 job of
+unrelated PRs ("serial step requested 6.42 ms of yields on average", "timed
+out waiting for both lanes to request a capped yield"). Switching the test to
+the bridge's monotonic clock did not fix it. The cause is OCaml's Windows
+`Thread.delay`, which passes whole milliseconds to `Sleep`: a sub-millisecond
+backoff step returns at once and a longer one lasts until a 15.625 ms tick.
+The lanes therefore take more backoff steps per round trip, so the total of
+requested delays per step rose to about 6.5 ms. The pacing decisions were
+unchanged, and no capped yield was requested during the chain. Idle lanes also
+seldom reach the 10 ms cap there, because each new native wait restarts them.
+
+The test's sleeps now go through one function that can simulate the Windows
+sleep (`IDLE_TEST_SLEEP_MODEL=windows`). That reproduced both failures on
+macOS: 6.2 to 6.9 ms of requested yields per step. The assertions now
+measure the algorithm's decisions:
+- the serial chain allows at most one capped yield per two steps. Adaptive
+  pacing requests none on either sleep model; the fixed 10 ms yield
+  requests 213 in 100 steps;
+- the admission-race test no longer waits for capped yields. It confirms the
+  sibling is queued while the raced wait holds the owner, which removes a
+  transient-queue race, and only the raced wait has the long timeout. The
+  pure unit test still checks the capped-lane restart deterministically.
+
+`test/runtime/dune` also reruns the test under the Windows model, so this
+interleaving is covered on every platform. The monotonic-clock change is
+kept. Production code is unchanged.
+
+With the Windows model, a simulated serial step takes about 21 ms with
+adaptive pacing and 23 ms with the fixed yield. On Windows the #994 gain is
+therefore limited by timer granularity.
+
+## 2026-10-11: Temporal Core upgraded to v1.1.0, with a freshness check (#824)
+
+The Core pin moves from `95e97686` (crate 0.5.0, 154 commits behind) to
+`8fe478ee179ed754614d230f39586f3edb57da71`, the commit of upstream tags
+`v1.1.0` and `core-v0.10.0`. The newest stable release was chosen over
+`v1.0.0` because it also carries the sticky/normal poller balancing,
+first-attempt-only workflow-task failure reporting and local-activity replay
+grouping fixes. The lock shrinks from 322 to 306 packages: `backoff`,
+`aws-lc-rs`/`aws-lc-sys`, `quinn` and the old `rand` 0.8 line leave the graph,
+and `backon`, `ryu`, `serde_urlencoded`, `tracing-serde` and `wasm-streams`
+join it, all permissively licensed. The Core licence file is byte-identical.
+
+The C ABI, status values and every JSON document are unchanged (version 4).
+Asynchronous activity completion and heartbeat now send their
+`RespondActivityTask*`/`RecordActivityTaskHeartbeat` RPCs directly, because
+Core's handle now applies the client data converter and accepts only a
+high-level failure. New Core protobuf fields keep their previous meaning,
+worker heartbeats keep omitting host environment details, and the two new
+child-start failure causes reach OCaml as `unspecified`. Client connection is
+now bounded at 10 s, because an endpoint that accepted and then stayed silent
+held `Client.create` for Core's 30 s `GetSystemInfo` deadline and failed the
+transport-interruption refuse scenario intermittently in CI. The
+[Core bridge reference](reference/core-bridge.md#temporal-core-revision)
+lists each adaptation and the Core behaviour changes kept as upstream
+intends, notably worker-side payload-limit enforcement.
+
+Code comments that describe Core behaviour were rechecked against the new
+source: the fixed-poller split and `nonsticky_to_sticky_poll_ratio`, the
+`PollRateLimiter` reciprocal, replay worker shutdown ordering, the one-slot
+activity configuration, the nondeterminism text parsed by `Temporal.Replay`,
+activation job ordering, and retry/throttle timing. Only the cache slot clamp
+(#555) changed: Core's balancer now honours the cap itself, so the clamp is
+kept for parity rather than as a workaround.
+
+Nothing prompted the upgrade because Dependabot never moves a `rev =` pin.
+The weekly `Temporal Core pin freshness` workflow now compares the pin with
+the latest stable sdk-core release, opens or updates one tracking issue and
+fails while an upgrade is due; `test/smoke/test_core_pin_freshness.sh` covers
+its exit contract offline. [Dependencies](dependencies.md#temporal-core-pin-upgrades)
+records the cadence.
+
+Evidence (macOS ARM64, OCaml 5.4.1, Rust 1.97.1; CI uses the pinned
+1.99.0): `cargo test --locked` (410 tests), clippy with `-D warnings` and `cargo fmt --check`; the bridge,
+runtime, supervisor, unit, API witness, history corpus and smoke Dune suites;
+`@doc`; the Cargo licence scan and its policy fixtures; the dependency
+inventory; formatting and `typos`. `make test-history-corpus-upgrade` replayed
+all 21 corpus cases, recorded at Core `95e97686`, with expected outcomes and
+no history or expectation edits: the first cross-revision replay. Against
+Temporal Server 1.32.0 and PostgreSQL 18.6, the activity-cancellation,
+bounded-shutdown, client-request-ID, completed-query, concurrent-client,
+split-task-type and worker-resource live regressions and the two-binary smoke
+(including asynchronous activity completion) passed with native executables.
+The CLI-dependent live regressions and Linux lanes run in CI.
 ## 2026-10-12: Adaptive idle pacing between worker lane polls (#994)
 
 The live fan-out benchmark (#528) found that the fixed 10 ms local yield in
