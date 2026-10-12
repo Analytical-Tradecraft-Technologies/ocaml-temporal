@@ -15,6 +15,13 @@ implementation when a later entry documents that work as complete. The
 records the current tested source, named assertions and successful CI job for
 the Temporal acceptance controllers.
 
+## 2026-10-12: Benchmark record for adaptive idle pacing (#994)
+
+`docs/reference/benchmark-harness.md` now records the live fan-out results
+before and after #994's adaptive idle pacing (PR #996): one-execution p50
+10.89 s to 5.94 s, eight-execution p50 107.9 s to 79.1 s, with the Windows
+timer-granularity limitation tracked in #1008. Documentation only.
+
 ## 2026-10-11: Live fan-out benchmark and JSON bridge attribution (#528)
 
 `make bench-fanout-live` runs a high fan-out workload against the Compose
