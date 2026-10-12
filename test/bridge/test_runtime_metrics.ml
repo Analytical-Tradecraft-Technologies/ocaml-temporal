@@ -23,13 +23,55 @@ let socket_of address =
       in
       Unix.ADDR_INET (Unix.inet_addr_of_string host, port)
 
-(** Sends one HTTP/1.1 GET and returns the full response. *)
+(** Upper bound, in seconds, on one scrape. Generous because Windows CI
+    runners can stall a loopback round trip for several seconds (#1058). *)
+let scrape_timeout_seconds = 30.
+
+(** The [Content-Length] of a response whose header block is [headers], if
+    present. Header names are case-insensitive. *)
+let content_length headers =
+  String.split_on_char '\n' headers
+  |> List.find_map (fun line ->
+         match String.index_opt line ':' with
+         | None -> None
+         | Some colon ->
+             let name = String.lowercase_ascii (String.sub line 0 colon) in
+             if name <> "content-length" then None
+             else
+               String.sub line (colon + 1) (String.length line - colon - 1)
+               |> String.trim |> int_of_string_opt)
+
+(** Whether [response] holds a complete header block and, when it declares
+    a [Content-Length], that whole body. Without a length the response ends
+    only at EOF. *)
+let complete response =
+  let text = Buffer.contents response in
+  let marker = "\r\n\r\n" in
+  let rec find_marker index =
+    if index + 4 > String.length text then None
+    else if String.sub text index 4 = marker then Some index
+    else find_marker (index + 1)
+  in
+  match find_marker 0 with
+  | None -> false
+  | Some header_end -> (
+      match content_length (String.sub text 0 header_end) with
+      | None -> false
+      | Some length -> String.length text - (header_end + 4) >= length)
+
+(** Sends one HTTP/1.1 GET and returns the full response.
+
+    The response is complete once its headers and [Content-Length] body have
+    arrived; the helper does not wait for the server to close the
+    connection, whose timing is not part of the endpoint's contract and
+    varies on Windows (#1058). A timeout fails with the number of bytes
+    received, which tells a slow close apart from a missing response. *)
 let http_get address path =
   let socket = Unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
   Fun.protect
     ~finally:(fun () -> Unix.close socket)
     (fun () ->
-      Unix.setsockopt_float socket Unix.SO_RCVTIMEO 5.;
+      Unix.setsockopt_float socket Unix.SO_RCVTIMEO scrape_timeout_seconds;
       Unix.connect socket (socket_of address);
       let request =
         Printf.sprintf
@@ -40,11 +82,18 @@ let http_get address path =
       let buffer = Buffer.create 4096 in
       let chunk = Bytes.create 4096 in
       let rec read () =
-        match Unix.read socket chunk 0 (Bytes.length chunk) with
-        | 0 -> ()
-        | count ->
-            Buffer.add_subbytes buffer chunk 0 count;
-            read ()
+        if not (complete buffer) then
+          match Unix.read socket chunk 0 (Bytes.length chunk) with
+          | 0 -> ()
+          | count ->
+              Buffer.add_subbytes buffer chunk 0 count;
+              read ()
+          | exception Unix.Unix_error ((Unix.ETIMEDOUT | Unix.EAGAIN), _, _) ->
+              failwith
+                (Printf.sprintf
+                   "scrape of %s%s timed out after %.0f s with %d byte(s) \
+                    received"
+                   address path scrape_timeout_seconds (Buffer.length buffer))
       in
       read ();
       Buffer.contents buffer)

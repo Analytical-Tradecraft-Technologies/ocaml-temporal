@@ -46,6 +46,18 @@ warnings`, `cargo fmt --check`, `dune build @install` and
 `dune build @test/bridge/runtest` on OCaml 5.4.1 (macOS). The in-process
 transport-fault proxy still ignores SIGPIPE for its own sockets; a Linux
 fault proxy in a separate process remains future work.
+## 2026-10-13: Metrics scrape test no longer waits for connection close (#1058)
+
+`test/bridge/test_runtime_metrics.ml` timed out intermittently on Windows
+while reading a scrape until EOF with a 5 s receive timeout. Its `http_get`
+helper now treats a response as complete once the headers and the declared
+`Content-Length` body have arrived, falling back to EOF only without a
+length, so the test no longer depends on when the exporter closes the
+connection. The bound is 30 s, and a timeout now reports how many bytes
+arrived, which separates a slow close from a missing response. The helper
+was checked standalone against complete, partial and length-less responses
+on OCaml 5.4.1 (macOS); the Windows CI job is the regression gate.
+
 ## 2026-10-13: Compile-checked API landing page (#1013)
 
 The quick start on the rendered API landing page (`lib/public/index.mld`)
