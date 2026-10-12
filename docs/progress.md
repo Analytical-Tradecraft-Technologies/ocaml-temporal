@@ -69,6 +69,12 @@ ABI-visible effect. The [lifecycle stress reference](reference/bridge-lifecycle-
 tracks it for re-evaluation after the Core upgrade. A sanitizer-instrumented
 Rust build and live-worker concurrency remain open under #506. See
 [decoder fuzzing](reference/bridge-decoder-fuzz.md).
+## 2026-10-12: Benchmark record for adaptive idle pacing (#994)
+
+`docs/reference/benchmark-harness.md` now records the live fan-out results
+before and after #994's adaptive idle pacing (PR #996): one-execution p50
+10.89 s to 5.94 s, eight-execution p50 107.9 s to 79.1 s, with the Windows
+timer-granularity limitation tracked in #1008. Documentation only.
 
 ## 2026-10-11: Live fan-out benchmark and JSON bridge attribution (#528)
 
