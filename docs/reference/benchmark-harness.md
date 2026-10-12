@@ -437,8 +437,8 @@ Findings:
   reduced the 10 ms local yield in `Native_worker.wait_for_lane` (used when
   the sibling lane holds the native wait token) to 1 ms cut the one-execution
   p50 from 9.16 s to 3.97 s (three samples, otherwise identical), so that
-  yield is the dominant cost of this workload. Changing it is a scheduling
-  decision for a separate issue, not part of this measurement.
+  yield is the dominant cost of this workload. [#994] then replaced the fixed
+  yield with adaptive idle pacing (see "Adaptive idle pacing" below).
 - **Native completions are the next cost**: 1.5 to 2.5 ms per activity
   completion, which includes Core's response RPC to the server. Ready polls,
   conversion and serde encoding cost about 80 to 130 µs per item.
@@ -453,8 +453,35 @@ Findings:
   about 8 µs each with these payloads. #995 since made it one encode in the
   adapter, timed as `activity_completion_encode`.
 
+### Adaptive idle pacing (#994)
+
+[#994] replaced the fixed 10 ms local yield with adaptive pacing: a lane
+repolls at once while its sibling's native wait is in flight, and otherwise
+backs off from 0 through 0.1 ms, doubling up to the old 10 ms cap, resetting
+whenever a task completes. The same workload (width 1,000, 256 B payloads,
+Compose Temporal 1.32.0, OCaml 5.2.1 container) measured before and after
+the change, as recorded for PR #996:
+
+| Executions per sample | Samples | p50 before | p50 after | Activities/s | Errors |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 5 | 10.89 s | 5.94 s | 90 to 162 | 0 |
+| 8 | 3 | 107.9 s | 79.1 s | 75 to 92 | 0 |
+
+In the one-execution attribution pass the time outside any native call or
+codec pass fell from about 5.5 s to about 0.3 s; what remains is Core
+completion calls and real server waits. Empty polls rose from about 2.4k to
+6.4k per sample at about 1.7 µs each. The eight-execution samples are noisy
+(67, 79 and 115 s). These are single-machine numbers.
+
+On Windows the gain is small: `Thread.delay` rounds sub-millisecond requests
+to an immediate return and longer ones to the 15.6 ms timer tick, so a
+simulated serial step takes about 21 ms with adaptive pacing against about
+23 ms with the fixed yield. [#1008] tracks closing that gap.
+
 [#507]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/507
 [#526]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/526
 [#527]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/527
 [#528]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/528
 [#846]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/846
+[#994]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/994
+[#1008]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/1008

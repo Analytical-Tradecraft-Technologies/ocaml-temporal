@@ -51,6 +51,12 @@ three times against a local Compose Temporal/PostgreSQL stack with the pinned
 admin-tools CLI; `sh scripts/check-format.sh`; `uvx typos@1.48.0`;
 `scripts/check-dependency-inventory.sh`; and
 `sh test/smoke/test_live_regressions_contract.sh .`.
+## 2026-10-12: Benchmark record for adaptive idle pacing (#994)
+
+`docs/reference/benchmark-harness.md` now records the live fan-out results
+before and after #994's adaptive idle pacing (PR #996): one-execution p50
+10.89 s to 5.94 s, eight-execution p50 107.9 s to 79.1 s, with the Windows
+timer-granularity limitation tracked in #1008. Documentation only.
 
 ## 2026-10-11: Live fan-out benchmark and JSON bridge attribution (#528)
 
