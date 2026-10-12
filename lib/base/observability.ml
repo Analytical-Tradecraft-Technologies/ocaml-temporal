@@ -122,3 +122,16 @@ let measure_ms action =
 let report ~src level ~tags message =
   try Logs.msg ~src level (fun log -> log ~tags "%s" message)
   with _reporter_or_formatter_defect -> ()
+
+(** Times [action] only when [src] currently accepts [Debug] records. The
+    level is read before the action, so a level change during the action
+    cannot produce a record without a start time. *)
+let debug_timed ~src ~operation action =
+  match Logs.Src.level src with
+  | Some Logs.Debug ->
+      let value, duration_ms = measure_ms action in
+      report ~src Logs.Debug
+        ~tags:(tags ~operation ~duration_ms ())
+        "codec operation completed";
+      value
+  | _ -> action ()

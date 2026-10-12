@@ -89,6 +89,17 @@ val command_to_protocol :
     two-stage start/terminal resolutions are translated without fabricating
     Core fields. *)
 
+val encode_completion :
+  Temporal_protocol.Workflow_protocol.completion ->
+  ( Temporal_protocol.Encoded_workflow_completion.t,
+    Temporal_protocol.Workflow_protocol.error )
+  result
+(** Runs the canonical completion encoder exactly once, as
+    [Encoded_workflow_completion.encode]. While the bridge log source is at
+    [Debug], the pass is also reported as a [workflow_completion_encode]
+    record with its duration, for codec attribution (#528); otherwise no
+    clock is read. Every adapter encoder pass goes through this function. *)
+
 val completion_of_commands :
   run_id:string ->
   Activation.command list ->

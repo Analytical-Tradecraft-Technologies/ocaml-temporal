@@ -26,7 +26,8 @@ Current events use these levels:
 - `Debug` records bridge operation completions, expected not-ready states,
   workflow execution and activation processing, and worker/adapter
   poll/completion detail. `temporal.duration_ms` is currently attached to
-  bridge-operation completion and local workflow activation records.
+  bridge-operation completion, protocol codec timing and local workflow
+  activation records.
 - `Info` records runtime initialization/closure, workflow lifecycle
   transitions, and worker run/shutdown transitions.
 - `Warning` records recoverable abnormal conditions, such as work delivered to
@@ -80,7 +81,7 @@ also has a higher-level lifecycle record:
 
 | Source | Current operation identifiers |
 |---|---|
-| `temporal.sdk.bridge` | `check_abi_version`, `echo`, `conformance_wait_ms`, `runtime_create`, `runtime_close`, `client_connect`, `client_disconnect`, `client_start_workflow_json`, `client_begin_start_workflow_json`, `client_poll_start_workflow_json`, `client_wait_start_workflow_json`, `client_wait_workflow_json`, `client_submit_json`, `client_await_call`, `client_release_call`, `client_cancel_workflow_json`, `client_reset_workflow_json`, `client_terminate_workflow_json`, `client_list_visibility_json`, `client_signal_workflow_json`, `client_query_workflow_json`, `client_update_workflow_json`, `client_poll_update_workflow_json`, `client_complete_async_activity_json`, `client_record_async_activity_heartbeat_json`, `worker_start`, `worker_try_poll_workflow`, `worker_wait_workflow`, `worker_complete_workflow_json`, `worker_reject_workflow_json`, `worker_try_poll_activity`, `worker_wait_activity`, `worker_wait_any`, `worker_wait_activity_completion_retry_backoff`, `worker_complete_activity_json`, `worker_reject_activity_json`, `worker_record_activity_heartbeat_json`, `worker_shutdown`, `replay_worker_start`, `replay_worker_feed_history`, `replay_worker_try_poll_workflow`, `replay_worker_wait_workflow`, `replay_worker_complete_workflow`, `replay_worker_reject_workflow`, `replay_worker_finish_input`, `replay_worker_finalize`, `replay_worker_dispose` |
+| `temporal.sdk.bridge` | `check_abi_version`, `echo`, `conformance_wait_ms`, `runtime_create`, `runtime_close`, `client_connect`, `client_disconnect`, `client_start_workflow_json`, `client_begin_start_workflow_json`, `client_poll_start_workflow_json`, `client_wait_start_workflow_json`, `client_wait_workflow_json`, `client_submit_json`, `client_await_call`, `client_release_call`, `client_cancel_workflow_json`, `client_reset_workflow_json`, `client_terminate_workflow_json`, `client_list_visibility_json`, `client_signal_workflow_json`, `client_query_workflow_json`, `client_update_workflow_json`, `client_poll_update_workflow_json`, `client_complete_async_activity_json`, `client_record_async_activity_heartbeat_json`, `worker_start`, `worker_try_poll_workflow`, `worker_wait_workflow`, `worker_complete_workflow_json`, `worker_reject_workflow_json`, `worker_try_poll_activity`, `worker_wait_activity`, `worker_wait_any`, `worker_wait_activity_completion_retry_backoff`, `worker_complete_activity_json`, `worker_reject_activity_json`, `worker_record_activity_heartbeat_json`, `worker_shutdown`, `replay_worker_start`, `replay_worker_feed_history`, `replay_worker_try_poll_workflow`, `replay_worker_wait_workflow`, `replay_worker_complete_workflow`, `replay_worker_reject_workflow`, `replay_worker_finish_input`, `replay_worker_finalize`, `replay_worker_dispose`; codec timing (Debug only): `workflow_activation_decode`, `workflow_completion_encode`, `activity_task_decode`, `activity_completion_encode` |
 | `temporal.sdk.lifecycle` | `runtime_create`, `runtime_close`, `workflow_task_rejected`, `activity_task_rejected`, `activity_completion_retry`, `worker_run_started`, `worker_run_finished`, `worker_terminal_cleanup`, `worker_terminal_cleanup_failed`, `worker_shutdown`, `worker_shutdown_failed`, `activity_lane_detached`, `worker_shutdown_abandoned_work`, `worker_shutdown_teardown_detached`, `workflow_activation_completed`, `workflow_completion_diagnostic_failed`, `workflow_activation_rejected`, `workflow_poll_not_ready`, `activity_task_completed`, `activity_async_handoff_accepted`, `activity_poll_not_ready` |
 | `temporal.sdk.workflow` | `execution_created`, `workflow_started`, `workflow_completed`, `workflow_failed`, `workflow_task_failed`, `workflow_query_unhandled`, `workflow_query_completed`, `workflow_query_failed`, `workflow_update_unhandled`, `workflow_signal_unhandled`, `workflow_signal_received`, `workflow_signal_handled`, `workflow_cancelled`, `execution_evicted`, `activation_ignored`, `activate` |
 
@@ -91,6 +92,30 @@ uses the status-specific level policy above: normal `Not_ready` progress is
 need intervention are `Error`. Applications that need a broad worker view
 should filter `temporal.sdk.lifecycle`; applications diagnosing deterministic
 workflow execution should filter `temporal.sdk.workflow`.
+
+### Protocol codec timing
+
+The OCaml half of the private JSON bridge can be timed inside a running
+worker. While `temporal.sdk.bridge` is at `Debug`, each protocol codec pass
+emits one `Debug` record, `codec operation completed`, carrying
+`temporal.operation` and `temporal.duration_ms`:
+
+| Operation | Pass |
+|---|---|
+| `workflow_activation_decode` | Copy of the native activation bytes and strict decoding, in the supervisor |
+| `workflow_completion_encode` | The single canonical encoder pass over a workflow completion, in the worker adapter |
+| `activity_task_decode` | Copy of the native activity-task bytes and strict decoding, in the supervisor |
+| `activity_completion_encode` | The single canonical encoder pass over an activity completion, in the activity adapter; the supervisor submits those bytes without encoding again (#995) |
+
+Below `Debug` these passes run without reading the clock or building tags
+(`Observability.debug_timed`), so the instrumentation has no measurable cost
+in a production configuration. The records exist for benchmark attribution
+([#528]); see the live fan-out suite in
+[benchmark-harness.md](benchmark-harness.md#live-fan-out-and-bridge-attribution).
+An activity completion is currently encoded twice, once by each of the last
+two operations.
+
+[#528]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/528
 
 ### Activity lease events
 
@@ -208,7 +233,7 @@ submission. Neither event means that the callback was invoked twice.
 Latency is measured around the local OCaml operation with the portable Unix
 wall clock, expressed as fractional milliseconds, and clamped to zero if the
 clock moves backwards. The SDK currently attaches this tag to bridge-operation
-completion and local workflow activation records; worker and adapter lifecycle
+completion, protocol codec timing and local workflow activation records; worker and adapter lifecycle
 records do not currently carry latency tags. It is diagnostic metadata only:
 workflow code never uses it to choose commands or results. Future modules
 should reuse the source and tag definitions in `Temporal_base.Observability`

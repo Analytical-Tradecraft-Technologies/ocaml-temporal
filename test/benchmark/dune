@@ -141,6 +141,13 @@
              (run %{test} --warmup 1 --samples 2 --repetitions 1 --seed 1)
              (run %{exe:check_report.exe} activity-fanout 2 2))))))))))))))
 
+; Live fan-out (#528) needs a Temporal Server, so `dune test` only builds it;
+; `make bench-fanout-live` runs it against the Compose stack.
+(executable
+ (name bench_live_fanout)
+ (modules bench_live_fanout)
+ (libraries benchmark_harness logs temporal-sdk temporal_base threads unix))
+
 ; Harness invariants: released workloads are excluded from recovery
 ; snapshots, and the fan-out fixture byte bound rejects oversized runs.
 (test

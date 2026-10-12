@@ -32,3 +32,9 @@ flate2.workspace = true
 h2.workspace = true
 http.workspace = true
 tokio = { workspace = true, features = ["net"] }
+
+# Opt-in Rust half of the #528 JSON bridge attribution; `make
+# bench-json-bridge-rust` runs it. `cargo test` does not build benches.
+[[bench]]
+name = "json_bridge"
+harness = false
