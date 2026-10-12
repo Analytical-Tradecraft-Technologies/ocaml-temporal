@@ -1115,6 +1115,7 @@ dependencies = [
  "flate2",
  "h2",
  "http",
+ "libc",
  "prost",
  "prost-wkt-types",
  "serde",

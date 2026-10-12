@@ -15,6 +15,38 @@ implementation when a later entry documents that work as complete. The
 records the current tested source, named assertions and successful CI job for
 the Temporal acceptance controllers.
 
+## 2026-10-12: SIGPIPE containment (#1041)
+
+A peer-closed connection can no longer kill a Linux worker or client with
+SIGPIPE. Vectored socket writes (`writev`, used by h2, hyper and
+tokio-rustls) raise the signal, and an OCaml host keeps its default,
+terminating action because Rust's startup code that ignores it never runs in
+a static library. The bridge does not change the process-wide disposition;
+it blocks SIGPIPE in the signal mask of every thread it owns (Core's Tokio
+workers and blocking pool through Core's thread-start hook, the cleanup
+threads and the Core log writer) and, for the duration of each ABI call, on
+the application's calling thread, consuming any SIGPIPE raised by the call
+and restoring the caller's exact mask afterwards. The write then fails with
+`EPIPE` through the normal error path. The bridge now declares `libc` (MIT OR
+Apache-2.0, already locked) as a direct dependency, used only on Unix. The design is
+recorded under SIGPIPE containment in the
+[Core bridge reference](reference/core-bridge.md).
+
+`rust/core-bridge/tests/sigpipe_containment.rs` restores the default
+disposition and checks that Core's Tokio threads block the signal, that ABI
+calls restore both unblocked and caller-blocked masks, and that a SIGPIPE
+raised during a guarded call is consumed; on Linux it also drives `writev`
+into reset connections on a blocked thread and inside a guarded call, and
+resets 64 metrics scrapes mid-request before a final scrape succeeds.
+`test/bridge/test_runtime_metrics.ml` repeats the aborted-scrape check from an
+OCaml host with the default disposition. Verified with `cargo test --test
+sigpipe_containment` (the Linux-only cases were also compiled and run on macOS
+by temporarily widening their `cfg`), `cargo clippy --all-targets -D
+warnings`, `cargo fmt --check`, `dune build @install` and
+`dune build @test/bridge/runtest` on OCaml 5.4.1 (macOS). The in-process
+transport-fault proxy still ignores SIGPIPE for its own sockets; a Linux
+fault proxy in a separate process remains future work.
+
 ## 2026-10-12: Activity log correlation (#500)
 
 Activity lease records now name the attempt they describe. The native activity
