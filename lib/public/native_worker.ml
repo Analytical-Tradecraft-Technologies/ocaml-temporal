@@ -430,15 +430,16 @@ let poll_workflow worker =
     | Error error -> Error (public_adapter_error "workflow task poll" error)
 
 (** Maps one activity adapter poll using the same lease-retirement rule as the
-    workflow path. An acknowledged activity failure is ordinary progress. *)
+    workflow path. An acknowledged activity failure is ordinary progress. Unlike
+    the workflow path, a retired rejection is not logged here: the activity
+    adapter already emitted exactly one record for it, correlated with the
+    activity identity and classified as an application failure or an SDK
+    rejection (issue #1024). *)
 let poll_activity worker =
   match Activity.poll worker.activities with
   | Ok Activity_adapter.Not_ready -> Ok Not_ready
   | Ok (Activity_adapter.Completed _) -> Ok Progress
-  | Ok (Activity_adapter.Rejected { error; lease_retired = true; _ }) ->
-      report Logs.Warning ~operation:"activity_task_rejected"
-        ~error_kind:error.code ();
-      Ok Progress
+  | Ok (Activity_adapter.Rejected { lease_retired = true; _ }) -> Ok Progress
   | Ok (Activity_adapter.Rejected { error; lease_retired = false; _ }) ->
       Error (public_activity_error "activity task completion" error)
   | Error { retryable = true; code; _ } ->
