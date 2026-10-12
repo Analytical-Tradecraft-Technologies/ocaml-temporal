@@ -7,6 +7,11 @@ type payload = Payload.t = { metadata : (string * string) list; data : bytes }
 type 'a t = {
   encode_payload : 'a -> (payload, Error.t) result;
   decode_payload : payload -> ('a, Error.t) result;
+  no_argument : bool;
+      (** [true] only for {!unit}. An input encoded with such a codec is sent
+          to Temporal as zero argument payloads, the representation other SDKs
+          use for a call with no parameters; every other codec sends exactly
+          one payload, even when that payload is [binary/null] (#1012). *)
 }
 
 (** Finds the optional encoding marker while enforcing the object semantics of
@@ -85,7 +90,7 @@ let make ~encoding ~encode ~decode =
                   encoding actual))
     | Ok None -> Error (Error.codec ~message:"payload has no encoding metadata")
   in
-  { encode_payload; decode_payload }
+  { encode_payload; decode_payload; no_argument = false }
 
 (** Serializes a value while preserving the codec's ownership boundary. *)
 let encode codec value = codec.encode_payload value
@@ -131,12 +136,20 @@ let bytes =
     ~decode:(fun value -> Ok (Bytes.copy value))
 
 (** Represents [()] as an empty [binary/null] payload and rejects unexpected
-    bytes when decoding. *)
+    bytes when decoding. It is the only codec marked [no_argument], so a unit
+    input is sent as a call with no arguments. *)
 let unit =
-  make ~encoding:"binary/null" ~encode:(fun () -> Ok Bytes.empty)
-    ~decode:(fun data ->
-      if Bytes.length data = 0 then Ok ()
-      else Error (Error.codec ~message:"unit payload must be empty"))
+  {
+    (make ~encoding:"binary/null" ~encode:(fun () -> Ok Bytes.empty)
+       ~decode:(fun data ->
+         if Bytes.length data = 0 then Ok ()
+         else Error (Error.codec ~message:"unit payload must be empty")))
+    with
+    no_argument = true;
+  }
+
+(** Exposes the [no_argument] marker to the SDK's argument-list adapters. *)
+let is_unit codec = codec.no_argument
 
 (** Serializes a payload into a self-describing byte buffer used by the option
     wrapper. Framing is a [u32] metadata count, then each entry as a [u32]
@@ -255,6 +268,9 @@ let option codec =
             | Error error -> Error error
             | Ok inner -> Result.map Option.some (decode codec inner))
         | Ok _ -> Result.map Option.some (decode codec payload));
+    (* [None] is a real argument (a foreign [Optional] parameter receives
+       [null]), so an option input is never collapsed to zero payloads. *)
+    no_argument = false;
   }
 
 (** Name used by every built-in JSON codec. It is the standard Temporal

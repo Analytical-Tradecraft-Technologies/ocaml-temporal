@@ -763,7 +763,7 @@ let start_handle_internal ?scope ?activity_id ?task_queue ?schedule_to_close_tim
       with
       | Error error -> failed_handle error
       | Ok () -> (
-          match Codec_private.encode_base definition.input input with
+          match Codec_private.encode_arguments definition.input input with
           | Error error -> failed_handle (Error_private.of_base error)
           | Ok input -> (
               match check_scope scope with

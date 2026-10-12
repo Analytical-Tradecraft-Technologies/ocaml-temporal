@@ -757,6 +757,15 @@ let cancel_activity environment run seq =
                 | job -> job)
               run.jobs)
 
+(** Converts a command's workflow argument list into the single payload an
+    OCaml workflow decodes, as a native worker does: zero arguments (a
+    [Codec.unit] input) become the canonical unit payload and one argument is
+    used as is. OCaml workflows take exactly one input, so more is a defect. *)
+let workflow_input_of_arguments = function
+  | [] -> Ok (Payload.unit_null ())
+  | [ payload ] -> Ok payload
+  | _ -> Error (defect "workflow definitions accept exactly one input value")
+
 (** Starts a child chain for a [Start_child_workflow] command and queues the
     start acknowledgement. A running workflow ID, an unregistered type, or an
     input the child cannot decode fails the start instead. *)
@@ -780,8 +789,9 @@ let start_child environment run ~seq ~id ~name ~input ~parent_close_policy =
   then start_failed "workflow_already_exists"
   else
     match
-      new_chain environment ~workflow_id:id ~workflow_type:name ~input
-        ~parent:(Some (run, seq)) ~parent_close_policy
+      Result.bind (workflow_input_of_arguments input) (fun input ->
+          new_chain environment ~workflow_id:id ~workflow_type:name ~input
+            ~parent:(Some (run, seq)) ~parent_close_policy)
     with
     | Error error -> start_failed (Error.message error)
     | Ok chain ->
@@ -922,7 +932,10 @@ let rec apply_command environment run command =
       finish environment run (Error (cancelled "workflow cancelled"))
   | Continue_as_new { workflow_type; input } -> (
       close_run environment run;
-      match create_run environment run.chain ~workflow_type ~input with
+      match
+        Result.bind (workflow_input_of_arguments input) (fun input ->
+            create_run environment run.chain ~workflow_type ~input)
+      with
       | Ok _ -> ()
       | Error error -> close_chain environment run.chain (Error error))
 

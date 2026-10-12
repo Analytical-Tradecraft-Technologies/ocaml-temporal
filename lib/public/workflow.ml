@@ -141,18 +141,19 @@ let signal_external_workflow ~workflow_id ~run_id ~(signal : 'input Signal.t)
       | Error error ->
           failed_external_operation context error
       | Ok () -> (
-          match Codec_private.encode_base (Signal.input signal) input with
+          match Codec_private.encode_arguments (Signal.input signal) input with
           | Error error ->
               failed_external_operation context (Error_private.of_base error)
-          | Ok payload ->
-              (* A unit signal is sent as zero payloads, as other SDKs do;
+          | Ok arguments ->
+              (* A [Codec.unit] signal is sent as zero payloads, as other SDKs
+                 do, and any other input as one (#1012);
                  [Signal.Handler.dispatch_payloads] decodes [[]] as unit. Core
                  does not compare signal arguments during replay. *)
               let future =
                 Temporal_sdk_kernel.Workflow_context_store.signal_external_workflow
                   context ~workflow_id ~run_id
                   ~signal_name:(Signal.name signal)
-                  ~input:(Temporal_base.Payload.input_arguments payload) ()
+                  ~input:arguments ()
               in
               Future_private.of_internal future))
 
@@ -531,10 +532,10 @@ let continue_as_new definition next_input =
   | None ->
       invalid_arg "Temporal.Workflow.continue_as_new used outside a workflow execution"
   | Some context -> (
-      match Codec_private.encode_base (input definition) next_input with
-      | Ok payload ->
+      match Codec_private.encode_arguments (input definition) next_input with
+      | Ok arguments ->
           Temporal_sdk_kernel.Workflow_context_store.continue_as_new context
-            ~workflow_type:(name definition) ~input:payload
+            ~workflow_type:(name definition) ~input:arguments
       | Error error ->
           Temporal_sdk_kernel.Workflow_context_store.terminate context
             (Temporal_sdk_kernel.Activation.Fail_workflow error))

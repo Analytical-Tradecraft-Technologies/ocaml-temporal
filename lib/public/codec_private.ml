@@ -27,6 +27,22 @@ let encode_base (codec : 'a Codec.t) value =
   | Ok payload -> Ok (Payload_private.to_base payload)
   | Error error -> Error (Error_private.to_base error)
 
+(** Encodes one input value as the argument payload list sent to Temporal.
+    The rule is decided by the codec, not by the payload's shape (#1012):
+    {!Codec.unit} is sent as zero payloads, as other SDKs send a call with no
+    parameters, while every other codec sends exactly one payload. In
+    particular [Codec.option]'s [None] stays one [binary/null] argument, so a
+    foreign handler with one optional parameter receives [null] rather than
+    no argument. The unit value is still encoded first so the codec contract
+    (and its error) is unchanged. OCaml receivers decode [[]] as the unit
+    payload and accept a single [binary/null] payload too, so older OCaml
+    senders remain compatible. *)
+let encode_arguments (codec : 'a Codec.t) value =
+  match encode_base codec value with
+  | Error _ as error -> error
+  | Ok _ when Codec.is_unit codec -> Ok []
+  | Ok payload -> Ok [ payload ]
+
 (* Decodes a private payload through public callbacks, copying bytes before
    invoking code owned by the application. *)
 (** Decodes a base payload through the public codec while preserving the typed

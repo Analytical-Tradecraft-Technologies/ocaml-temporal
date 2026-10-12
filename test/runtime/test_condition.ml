@@ -287,7 +287,7 @@ let test_condition_skips_continue_as_new_terminal () =
     ~terminate:(fun context ->
       let continue : unit -> unit =
         Workflow_context_store.continue_as_new context
-          ~workflow_type:"condition-successor" ~input:successor_input
+          ~workflow_type:"condition-successor" ~input:[ successor_input ]
       in
       continue ())
     ~expect_command:(function
