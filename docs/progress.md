@@ -49,6 +49,26 @@ is not included, because this environment cannot run the Docker Compose
 stack. Verified with `dune build @install` and the `test/runtime`,
 `test/unit`, `test/bridge`, `test/sdk_supervisor`, and `test/api_witness`
 test aliases on OCaml 5.4.1 (macOS).
+## 2026-10-13: One log record per failed activity attempt (#1024)
+
+An activity attempt that fails or is rejected now produces exactly one log
+record. Previously every ordinary application `Error` was logged twice as an
+`activity_task_rejected` warning: once by the activity adapter and again,
+without correlation, by the public worker loop. The worker loop no longer logs
+retired activity rejections; the adapter's correlated record is the only one.
+The adapter also distinguishes the two causes: an `Error` returned by the
+implementation, which Temporal routinely retries, is logged at `Info` as the
+new `activity_task_failed` operation, while `activity_task_rejected` stays at
+`Warning` for SDK-side refusals (unregistered type, codec or protocol errors,
+or a raised callback). Both still return `Rejected` to the caller and submit
+the same failure completion. `docs/reference/observability.md` documents the
+new operation and drops the stale claim that an activity completion is encoded
+twice (fixed by #995).
+
+`test/runtime/test_native_activity_execution.ml` asserts that an application
+failure yields exactly one correlated `activity_task_failed` record at `Info`
+and no warning. Verified with `dune build @install` and the
+`test/runtime` test alias on OCaml 5.4.1 (macOS).
 
 ## 2026-10-12: One encode per activity heartbeat (#1001)
 
