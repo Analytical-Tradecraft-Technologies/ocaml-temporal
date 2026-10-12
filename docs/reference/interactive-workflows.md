@@ -35,6 +35,10 @@ proves typed update admission and completion. The `interaction_recovery`
 live regression (#530) covers queries and an accepted, suspended update after
 sticky-cache eviction and after worker replacement; see
 [Recovery after eviction and restart](#recovery-after-eviction-and-restart).
+The `update_run_close` live regression (#520) pins the typed result every
+update caller receives when the run completes, is cancelled, or is terminated
+before the update finishes; see
+[Update callers when the run closes](#update-callers-when-the-run-closes).
 Query deadlines and broader interaction coverage remain future work.
 
 `Temporal.Client.query` is a separate control-plane operation: it asks an
@@ -479,11 +483,53 @@ cancellation jobs.
 | Signal and `Cancel_workflow` in one activation | `Cancel_workflow_execution` only; handler not invoked | n/a (known gap [#962]) |
 
 An abandoned update is accepted, and its completion is never sent. When the run
-closes, the Temporal Server fails the caller's pending update request. That
-server step and the caller-visible results of the [#962] orderings are not
-yet verified against a live server. A replay with `run_validator = false`
-reproduces each accepted row exactly even when the validator would now reject,
-because a replayed update follows its recorded acceptance.
+closes, the Temporal Server fails the caller's pending update request; see
+[Update callers when the run closes](#update-callers-when-the-run-closes). A
+replay with `run_validator = false` reproduces each accepted row exactly even
+when the validator would now reject, because a replayed update follows its
+recorded acceptance.
+
+### Update callers when the run closes
+
+`test/integration/update_run_close` (#520, run by
+`make test-temporal-live-regressions`) closes real runs against Temporal
+Server 1.32 while an update is unfinished, and pins what every caller
+receives. No caller hangs: each result arrives within 10 seconds of the close
+(in practice well under one second), and the suite fails with a named error
+otherwise.
+
+| Update state when the run closes | How the run closes | Caller result |
+| --- | --- | --- |
+| Accepted, handler suspended | Body completes (`Completed`) | `Error`: category `` `Update ``, non-retryable, `error_type = Some "AcceptedUpdateCompletedWorkflow"`, no RPC status |
+| Accepted, handler suspended | Cancellation (`Cancelled`) | Same as above |
+| Accepted, handler suspended | Termination (`Terminated`) | Same as above |
+| Admitted, not yet accepted | Termination | `Error`: category `` `Bridge ``, non-retryable, RPC status `` `Not_found `` |
+
+The accepted-update failure is the update's own outcome, set by the server
+with the message "Workflow Update failed because the Workflow completed before
+the Update completed." The same result is returned to a `wait_update` that was
+already polling when the run closed, to a later `wait_update` on the same
+handle, and to a `start_update` that re-attaches with the same update ID after
+the close. History records the acceptance and no completion. The suite closes
+the run only after the SDK's `temporal.sdk.bridge` debug records show the
+first caller's poll submitted to the native transport and still unanswered
+after a full one-second await slice, with no other client call in between.
+That proves `wait_update` is blocked on an outstanding poll RPC when the close
+is sent. It does not prove the server had registered the poll, because
+Temporal does not expose pending update polls.
+
+For an admitted update the server aborts the in-flight request ("workflow
+update was aborted by closing workflow", gRPC `aborted`). Temporal Core's
+client retries `aborted` as transient, so the retried request finds the run
+closed and the caller receives `` `Not_found ``, as does any later
+`start_update` with that update ID. The update was never accepted, history
+has no update event, and no retry can make it run. The suite makes the
+admitted state observable without timing: the run's only worker is stopped
+after its first task, so the pending workflow task `describe` then reports
+can only be the speculative task the server schedules for the update. The
+same caller result is expected for the unanswered [#962] ordering (an update
+in the activation that cancels the workflow), but that ordering is not
+produced live.
 
 [#514]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/514
 [#962]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/962

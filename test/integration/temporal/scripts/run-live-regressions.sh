@@ -139,7 +139,8 @@ for executable in "$@"; do
     test/integration/local_activity_cancellation/regression.exe|\
     test/integration/non_yielding_workflow/regression.exe|\
     test/integration/transport_interruption/regression.exe|\
-    test/integration/update_outcomes/regression.exe)
+    test/integration/update_outcomes/regression.exe|\
+    test/integration/update_run_close/regression.exe)
       cli_argument=$container_cli ;;
     test/integration/sdk_interop/regression.exe)
       cli_argument='' ;;

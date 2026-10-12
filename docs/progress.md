@@ -15,6 +15,42 @@ implementation when a later entry documents that work as complete. The
 records the current tested source, named assertions and successful CI job for
 the Temporal acceptance controllers.
 
+## 2026-10-12: Update callers when the run closes (#520)
+
+A new live regression, `test/integration/update_run_close`, completes the
+caller half of #520 that the offline race matrix (#963) could not observe:
+an update caller must not hang when the run closes before the update
+finishes. Against Temporal Server 1.32 it closes runs with an accepted,
+suspended update by body completion, cancellation and termination. In each
+case a `wait_update` already in flight, a later `wait_update` on the same
+handle, and a `start_update` re-attaching by update ID all return the
+server's non-retryable `Update` failure of type
+`AcceptedUpdateCompletedWorkflow`. History shows the acceptance and no
+completion. The run is closed only after the SDK's `temporal.sdk.bridge`
+debug records show the in-flight caller's poll submitted and still
+unanswered after a full one-second await slice, so that caller is provably
+blocked on an outstanding poll RPC, although the server's receipt of the
+poll is not observable. A fourth case terminates a run while an update is admitted but
+not accepted. The driver makes admission observable, without timing, by
+stopping the only worker first and waiting for the speculative workflow task
+in `describe`. That caller, and a later one with the same update ID, receive
+the non-retryable `Not_found` RPC error: Temporal aborts the request, Core
+retries `aborted`, and the retry finds the run closed. Every caller returned
+within 10 seconds (well under one second in practice). The SDK neither hung
+nor misclassified a result, so no runtime change was needed. The orderings of
+#962 remain open and are not produced live.
+
+The suite is in `LIVE_REGRESSION_EXECUTABLES`, the CI smoke artifact list and
+the `run-live-regressions.sh` dispatch, and has its own
+`make test-update-run-close-live` target. `docs/reference/interactive-workflows.md`
+records the outcome table.
+
+Evidence: `opam exec --switch=ocaml-5.4.1 -- dune build --root . @install`
+and `@doc`; `dune test` for `test/runtime` and `test/unit`; the suite run
+three times against a local Compose Temporal/PostgreSQL stack with the pinned
+admin-tools CLI; `sh scripts/check-format.sh`; `uvx typos@1.48.0`;
+`scripts/check-dependency-inventory.sh`; and
+`sh test/smoke/test_live_regressions_contract.sh .`.
 ## 2026-10-12: Benchmark record for adaptive idle pacing (#994)
 
 `docs/reference/benchmark-harness.md` now records the live fan-out results
