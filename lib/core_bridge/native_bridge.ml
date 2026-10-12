@@ -200,6 +200,10 @@ external runtime_close_raw : runtime -> int = "ocaml_temporal_runtime_close"
 external shared_runtime_create_raw : int -> shared_runtime * response
   = "ocaml_temporal_shared_runtime_create"
 
+external shared_runtime_create_with_telemetry_raw :
+  int -> string -> shared_runtime * response
+  = "ocaml_temporal_shared_runtime_create_with_telemetry"
+
 external runtime_attach_raw : shared_runtime -> runtime * response
   = "ocaml_temporal_runtime_attach"
 
@@ -1328,6 +1332,33 @@ let shared_runtime_create ?worker_threads () =
               in
               match decode response with
               | Ok _ -> Ok shared
+              | Error error ->
+                  ignore (shared_runtime_close shared);
+                  Error error)))
+  |> report_shared_lifecycle ~operation:"shared_runtime_create"
+       ~ok_message:"shared runtime initialized"
+       ~error_message:"shared runtime initialization failed"
+
+(** As [shared_runtime_create], but passes the strict telemetry document
+    [telemetry] to Rust (#500) and returns the bound metrics address, which
+    is empty when the document configures no exporter. Rust validates the
+    document and binds the endpoint before publishing the handle, so a
+    failure leaves nothing running; the empty owner is still closed. *)
+let shared_runtime_create_with_telemetry ?worker_threads ~telemetry () =
+  bridge_call "shared_runtime_create" (fun () ->
+      match validate_runtime_worker_threads worker_threads with
+      | Error _ as error -> error
+      | Ok () -> (
+          match check_abi_version abi_version with
+          | Error _ as error -> error
+          | Ok () -> (
+              let shared, response =
+                shared_runtime_create_with_telemetry_raw
+                  (Option.value worker_threads ~default:0)
+                  telemetry
+              in
+              match decode response with
+              | Ok address -> Ok (shared, Bytes.to_string address)
               | Error error ->
                   ignore (shared_runtime_close shared);
                   Error error)))

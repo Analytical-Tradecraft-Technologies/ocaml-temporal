@@ -206,6 +206,12 @@ type pending_result =
   | Pending_rejected of {
       error : error_view;
       remove_run : bool;
+      (* Correlation for the [workflow_activation_rejected] record (#500),
+         captured when the rejection is built: an initial activation can be
+         rejected before its run is ever cached, and a cached run may be
+         dropped before the rejection is accepted. *)
+      workflow_id : string option;
+      replaying : bool;
     }
 
 (** The completion is owned by this adapter until the supervisor accepts it.
@@ -462,10 +468,15 @@ let is_terminal completion =
     completion.Protocol.commands
 
 (** Reports one bounded lifecycle message without allowing a reporter defect to
-    affect worker progress. *)
-let report level ~operation ?error_kind () =
+    affect worker progress. Lease outcomes pass the run's correlation
+    identifiers (#500) so an operator can join a log record to the workflow
+    history; they are bounded tag values, never metric labels. *)
+let report level ~operation ?error_kind ?workflow_id ?run_id ?replaying () =
   try
-    let tags = Observability.tags ~operation ?error_kind () in
+    let tags =
+      Observability.tags ~operation ?error_kind ?workflow_id ?run_id ?replaying
+        ()
+    in
     Observability.report ~src:Observability.Source.lifecycle level ~tags
       "native workflow worker adapter event"
   with _ -> ()
@@ -733,6 +744,14 @@ module Make (Supervisor : SUPERVISOR) = struct
         (try callback info with _ ->
           report Logs.Warning ~operation:"workflow_completion_diagnostic_failed" ())
 
+  (** The workflow ID of a cached run, for log correlation (#500). Only the
+      initializing activation carries the ID itself, so later activations
+      read it from the run registry. Must be called before [drop_run]. *)
+  let cached_workflow_id adapter run_id =
+    match Run_map.find_opt run_id adapter.runs with
+    | Some (Run { workflow_id; _ }) -> Some workflow_id
+    | None -> None
+
   (** Applies bookkeeping only after the supervisor acknowledges a retained
       completion. The retained completion bytes are released here, while a
       successfully completed run keeps its final query state until Core
@@ -742,9 +761,16 @@ module Make (Supervisor : SUPERVISOR) = struct
     match pending.result with
     | Pending_completed
         { command_count; terminal; evicted; activation_info } ->
+        let workflow_id =
+          match activation_info.workflow_id with
+          | Some _ as workflow_id -> workflow_id
+          | None -> cached_workflow_id adapter pending.run_id
+        in
         if evicted then drop_run adapter pending.run_id;
         notify_completion adapter activation_info;
-        report Logs.Debug ~operation:"workflow_activation_completed" ();
+        report Logs.Debug ~operation:"workflow_activation_completed"
+          ?workflow_id ~run_id:activation_info.run_id
+          ~replaying:activation_info.is_replaying ();
         Ok
           (Completed
              {
@@ -752,10 +778,11 @@ module Make (Supervisor : SUPERVISOR) = struct
                command_count;
                terminal;
              })
-    | Pending_rejected { error; remove_run } ->
+    | Pending_rejected { error; remove_run; workflow_id; replaying } ->
         if remove_run then drop_run adapter pending.run_id;
         report Logs.Warning ~operation:"workflow_activation_rejected"
-          ~error_kind:error.code ();
+          ~error_kind:error.code ?workflow_id ~run_id:pending.run_id ~replaying
+          ();
         Ok
           (Rejected
              {
@@ -933,11 +960,32 @@ module Make (Supervisor : SUPERVISOR) = struct
       match Run_map.find_opt activation.run_id adapter.runs with
       | Some (Run { execution; _ }) -> (try Execution.shutdown execution with _ -> ())
       | None -> ());
+    (* The initializing job names the workflow even when the run never
+       reached the registry (unknown type, undecodable input); later
+       activations read it from the registry before any removal. *)
+    let workflow_id =
+      match
+        List.find_map
+          (function
+            | Protocol.Initialize_workflow { workflow_id; _ } -> Some workflow_id
+            | _ -> None)
+          activation.jobs
+      with
+      | Some _ as workflow_id -> workflow_id
+      | None -> cached_workflow_id adapter activation.run_id
+    in
     let pending =
       {
         run_id = activation.run_id;
         submission = encode_submission completion;
-        result = Pending_rejected { error; remove_run };
+        result =
+          Pending_rejected
+            {
+              error;
+              remove_run;
+              workflow_id;
+              replaying = activation.is_replaying;
+            };
         retry_refusal = None;
       }
     in

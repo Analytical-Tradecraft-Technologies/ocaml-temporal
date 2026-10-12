@@ -4,9 +4,12 @@ module Bridge = Temporal_core_bridge.Native_bridge
     close in [shutdown] so that every [Ok] return, including a concurrent
     second caller's, happens after Core has been destroyed. Holding it there
     cannot deadlock: no lease is outstanding, so no [release] waits on it,
-    and the C close never calls back into OCaml. [native] is immutable. *)
+    and the C close never calls back into OCaml. [native] and
+    [metrics_address] are immutable; the latter is the bound address of the
+    opt-in metrics endpoint (#500), recorded once at creation. *)
 type t = {
   native : Bridge.shared_runtime;
+  metrics_address : string option;
   mutex : Mutex.t;
   mutable attached : int;
   mutable closed : bool;
@@ -25,10 +28,24 @@ let with_lock mutex f =
   Mutex.lock mutex;
   Fun.protect ~finally:(fun () -> Mutex.unlock mutex) f
 
-let create ?worker_threads () =
-  Result.map
-    (fun native -> { native; mutex = Mutex.create (); attached = 0; closed = false })
-    (Bridge.shared_runtime_create ?worker_threads ())
+(** Builds the owner record around a freshly created native handle. *)
+let make native metrics_address =
+  { native; metrics_address; mutex = Mutex.create (); attached = 0; closed = false }
+
+let create ?worker_threads ?telemetry () =
+  match telemetry with
+  | None ->
+      Result.map
+        (fun native -> make native None)
+        (Bridge.shared_runtime_create ?worker_threads ())
+  | Some telemetry ->
+      Result.map
+        (fun (native, address) ->
+          make native (if address = "" then None else Some address))
+        (Bridge.shared_runtime_create_with_telemetry ?worker_threads ~telemetry
+           ())
+
+let metrics_address runtime = runtime.metrics_address
 
 let acquire runtime =
   with_lock runtime.mutex (fun () ->

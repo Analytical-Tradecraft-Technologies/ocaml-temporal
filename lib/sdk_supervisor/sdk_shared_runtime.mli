@@ -39,11 +39,20 @@ type shutdown_error =
           handle was detached before Rust was called. *)
 
 (** Creates the Core runtime with an optional Tokio worker bound, validated
-    as in {!Temporal_core_bridge.Native_bridge.runtime_create}. *)
+    as in {!Temporal_core_bridge.Native_bridge.runtime_create}. [telemetry]
+    is a strict JSON telemetry document (#500) passed unchanged to
+    {!Temporal_core_bridge.Native_bridge.shared_runtime_create_with_telemetry};
+    callers validate it first so Rust's checks are only a backstop. *)
 val create :
   ?worker_threads:int ->
+  ?telemetry:string ->
   unit ->
   (t, Temporal_core_bridge.Native_bridge.error) result
+
+(** The socket address the runtime's metrics endpoint is bound to, or
+    [None] when no exporter was configured. Constant for the value's
+    lifetime; the endpoint itself stops when Core is destroyed. *)
+val metrics_address : t -> string option
 
 (** Reserves one attachment, or returns [None] once the runtime is shut down.
     The caller must eventually pass the lease to {!release}. *)

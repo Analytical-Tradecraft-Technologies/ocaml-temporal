@@ -950,9 +950,26 @@ let _runtime_abi_version : unit -> (int32, T.Error.t) result =
 
 (* A shared runtime is an explicit resource: created, counted, and shut down
    by the application, with typed results on every path (#832). *)
-let _runtime_create : ?io_threads:int -> unit -> (T.Runtime.t, T.Error.t) result =
+let _runtime_create :
+    ?io_threads:int ->
+    ?metrics:T.Runtime.Metrics.t ->
+    unit ->
+    (T.Runtime.t, T.Error.t) result =
   T.Runtime.create
 let _runtime_attached : T.Runtime.t -> int = T.Runtime.attached
+
+(* Opt-in Prometheus export of Core's worker and client metrics (#500). *)
+let _runtime_metrics_prometheus :
+    ?global_tags:(string * string) list ->
+    ?counters_total_suffix:bool ->
+    ?unit_suffix:bool ->
+    ?durations_as_seconds:bool ->
+    bind_address:string ->
+    unit ->
+    (T.Runtime.Metrics.t, T.Error.t) result =
+  T.Runtime.Metrics.prometheus
+let _runtime_metrics_address : T.Runtime.t -> string option =
+  T.Runtime.metrics_address
 let _runtime_shutdown : T.Runtime.t -> (unit, T.Error.t) result =
   T.Runtime.shutdown
 

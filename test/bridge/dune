@@ -111,6 +111,11 @@
  (name test_client_limits)
  (libraries temporal-sdk temporal_core_bridge))
 
+; Opt-in Prometheus export on a public Runtime, without a server (#500).
+(test
+ (name test_runtime_metrics)
+ (libraries temporal-sdk unix))
+
 ; Seeded mutation fuzzing of every OCaml protocol decoder and multi-Domain
 ; close/finalizer/attach races through the C stubs (#506).
 ;

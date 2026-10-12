@@ -44,3 +44,8 @@
 (test
  (name test_testing)
  (libraries temporal-sdk unix))
+
+; Metrics-export option validation and bridge document encoding (#500).
+(test
+ (name test_metrics_config)
+ (libraries temporal_base))
