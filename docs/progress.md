@@ -15,6 +15,41 @@ implementation when a later entry documents that work as complete. The
 records the current tested source, named assertions and successful CI job for
 the Temporal acceptance controllers.
 
+## 2026-10-13: Option None inputs are sent as one argument (#1012)
+
+The zero-argument convention from #819 is now decided by the input codec,
+not by the encoded payload's bytes. Previously any input payload equal to
+`{encoding=binary/null; data=""}` was sent as zero payloads, so
+`Codec.option`'s `None` (byte-for-byte identical to `Codec.unit`) reached a
+foreign handler with an optional parameter as no argument at all. Python then
+raised a missing-argument `TypeError`, and the activity or workflow task
+retried forever. Only `Codec.unit` is now sent as zero payloads. Every other
+codec, including an option's `None`, sends exactly one payload, which matches
+the Go, Java, and Python SDKs' single `binary/null` payload for a nil
+argument.
+
+The public codec carries a private `no_argument` marker that only
+`Codec.unit` sets, exposed as `Codec.is_unit`.
+`Codec_private.encode_arguments` applies the rule at every outbound site:
+client start, signal, and update; activity, local-activity, and child-workflow
+scheduling; continue-as-new; and external signals. The private runtime
+commands and backend requests now carry the argument list, so no inner layer
+inspects payload shapes. `Temporal_base.Payload.input_arguments` and
+`is_unit_null` were removed. Decoding is unchanged and backward compatible:
+OCaml receivers still map zero payloads to the unit payload, so an option
+input from an older OCaml sender still decodes as `None`. Core does not
+compare arguments on replay, so existing histories replay.
+
+`test/runtime/test_input_arguments.ml` drives the public API for unit,
+`None`, and `Some` across activities, local activities, child workflows,
+continue-as-new, and external signals, and checks `Codec.is_unit`.
+`test_native_execution` and `test_activation` cover exact forwarding of a
+`binary/null` argument. A live cross-SDK fixture with a Python or Go handler
+is not included, because this environment cannot run the Docker Compose
+stack. Verified with `dune build @install` and the `test/runtime`,
+`test/unit`, `test/bridge`, `test/sdk_supervisor`, and `test/api_witness`
+test aliases on OCaml 5.4.1 (macOS).
+
 ## 2026-10-12: Activity log correlation (#500)
 
 Activity lease records now name the attempt they describe. The native activity

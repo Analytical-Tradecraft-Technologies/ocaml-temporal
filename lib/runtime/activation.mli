@@ -154,7 +154,9 @@ type command =
       seq : int64;
       id : string;
       name : string;
-      input : Temporal_base.Codec.payload;
+      input : Temporal_base.Codec.payload list;
+          (** Exact argument payloads sent to Core: empty for a [Codec.unit]
+              input, otherwise one payload. *)
       retry_policy : retry_policy option;
       cancellation_type : child_workflow_cancellation_type;
     }
@@ -209,5 +211,9 @@ type command =
   (** Replaces the current run with a new run of the same workflow type. The
       command is terminal for the current execution; [input] is the one
       encoded argument passed to the successor run. *)
-  | Continue_as_new of { workflow_type : string; input : Temporal_base.Codec.payload }
+  | Continue_as_new of {
+      workflow_type : string;
+      input : Temporal_base.Codec.payload list;
+          (** Exact argument payloads, as for [Start_child_workflow]. *)
+    }
   | Cancel_workflow_execution
