@@ -708,16 +708,15 @@ let test_invalid_failure_completion_retry () =
   if !calls <> 1 || !(supervisor.leased) <> [] || Queue.length supervisor.queue <> 1 then
     failwith "replacement retry reran the activity, retained its lease, or polled later work"
 
-(** Wire-valid context values which the runtime cannot represent must fail only
-    their own task. Exercise both callback styles (a sub-millisecond heartbeat
-    timeout is unrepresentable only for synchronous ones), immediate
-    acknowledgement, and transport retry through poll and drain before running
-    unrelated work. *)
+(** Wire-valid context values which the runtime cannot represent (binary
+    heartbeat metadata) must fail only their own task. Exercise both callback
+    styles, immediate acknowledgement, and transport retry through poll and
+    drain before running unrelated work. A sub-millisecond heartbeat timeout
+    is representable since #1032 (it rounds up); see
+    [test_task_timeouts_zero_is_unset]. *)
 let test_unrepresentable_context_retires_lease () =
   List.iter
     (fun async ->
-      List.iter
-        (fun binary_metadata ->
           List.iter
             (fun retry ->
               let supervisor = fake_supervisor () in
@@ -745,13 +744,9 @@ let test_unrepresentable_context_retires_lease () =
                     Ok ())
               in
               let heartbeat_details, heartbeat_timeout, path =
-                if binary_metadata then
-                  ([ Protocol.{ metadata = [ ("opaque", Bytes.of_string "\255") ];
-                       data = Bytes.of_string "private-heartbeat" } ],
-                   None, "$.variant.heartbeat_details[0].metadata.opaque")
-                else
-                  ([], Some Protocol.{ seconds = 1L; nanoseconds = 1 },
-                   "$.variant.heartbeat_timeout.nanoseconds")
+                ([ Protocol.{ metadata = [ ("opaque", Bytes.of_string "\255") ];
+                     data = Bytes.of_string "private-heartbeat" } ],
+                 None, "$.variant.heartbeat_details[0].metadata.opaque")
               in
               let token = Bytes.of_string "\000bad-context\255" in
               let task =
@@ -834,12 +829,93 @@ let test_unrepresentable_context_retires_lease () =
               | Ok () when !(supervisor.leased) = [] && Atomic.get good_calls = 1 -> ()
               | _ -> failwith "context rejection left unaccounted completion debt")
             [ false; true ])
-        (* A sub-millisecond heartbeat timeout only fails synchronous
-           definitions, whose context exposes the exact interval.
-           Asynchronous callbacks accept it and report it rounded up through
-           [Async_context.info]; test_native_async_activity covers that. *)
-        (if async then [ true ] else [ true; false ]))
     [ false; true ]
+
+(** Temporal reports an unset timeout as a zero duration: Core fills a local
+    activity's absent schedule-to-close with zero and the server reports an
+    unset heartbeat timeout as zero. Both [Info] and
+    [Context.heartbeat_timeout] must read those as [None], matching
+    [Temporal.Testing], while a positive timeout stays [Some]. A
+    sub-millisecond heartbeat interval from another SDK rounds up instead of
+    rejecting a synchronous task (#1032). *)
+let test_task_timeouts_zero_is_unset () =
+  let zero = Some Protocol.{ seconds = 0L; nanoseconds = 0 } in
+  let ms value = Option.map Temporal.Duration.to_ms value in
+  let run ~is_local ~schedule_to_close ~start_to_close ~heartbeat =
+    let supervisor = fake_supervisor () in
+    let observed = ref None in
+    let activity =
+      Temporal.Activity.define_with_context ~name:"timeouts"
+        ~input:Temporal.Codec.unit ~output:Temporal.Codec.unit
+        (fun context () ->
+          let module Info = Temporal.Activity.Info in
+          match Temporal.Activity.Context.info context with
+          | Error error -> Error error
+          | Ok info ->
+              observed :=
+                Some
+                  ( ms (Info.schedule_to_close_timeout info),
+                    ms (Info.start_to_close_timeout info),
+                    ms (Info.heartbeat_timeout info),
+                    ms (Temporal.Activity.Context.heartbeat_timeout context) );
+              Ok ())
+    in
+    let task =
+      match
+        start_task ~token:(Bytes.of_string "timeouts-token")
+          ~activity_type:"timeouts"
+          ~input:[ encode_input Temporal.Codec.unit () ]
+      with
+      | { Protocol.variant = Protocol.Start start; _ } as task ->
+          {
+            task with
+            variant =
+              Protocol.Start
+                {
+                  start with
+                  is_local;
+                  schedule_to_close_timeout = schedule_to_close;
+                  start_to_close_timeout = start_to_close;
+                  heartbeat_timeout = heartbeat;
+                };
+          }
+      | _ -> failwith "start fixture was not a start task"
+    in
+    (* Round-trip through the strict wire codec so the fixture is a task the
+       bridge could really deliver. *)
+    let task =
+      match Result.bind (Protocol.encode_task task) Protocol.decode_task with
+      | Ok task -> task
+      | Error _ -> failwith "timeout fixture is not wire-valid"
+    in
+    enqueue supervisor task;
+    let worker = worker supervisor [ Adapter.register activity ] in
+    expect_completed Adapter.Succeeded (Worker.poll worker);
+    match !observed with
+    | Some timeouts -> timeouts
+    | None -> failwith "timeout activity did not run"
+  in
+  (* A local activity scheduled without schedule-to-close. *)
+  if
+    run ~is_local:true ~schedule_to_close:zero
+      ~start_to_close:(Some Protocol.{ seconds = 5L; nanoseconds = 0 })
+      ~heartbeat:None
+    <> (None, Some 5_000L, None, None)
+  then failwith "local activity reported an unset schedule-to-close as zero";
+  (* A remote activity with the server's zero heartbeat timeout and a zero
+     schedule-to-close inherited from a workflow without a run timeout. *)
+  if
+    run ~is_local:false ~schedule_to_close:zero
+      ~start_to_close:(Some Protocol.{ seconds = 60L; nanoseconds = 0 })
+      ~heartbeat:zero
+    <> (None, Some 60_000L, None, None)
+  then failwith "remote activity reported unset timeouts as zero";
+  (* A sub-millisecond heartbeat interval rounds up in both views. *)
+  if
+    run ~is_local:false ~schedule_to_close:None ~start_to_close:None
+      ~heartbeat:(Some Protocol.{ seconds = 1L; nanoseconds = 1 })
+    <> (None, None, Some 1_001L, Some 1_001L)
+  then failwith "sub-millisecond heartbeat timeout was not rounded up"
 
 (** An unknown activity type is acknowledged with a typed non-retryable failure,
     preventing a leased task from being silently abandoned. *)
@@ -2213,6 +2289,7 @@ let () =
   test_invalid_failure_details_allow_next_activity ();
   test_invalid_failure_completion_retry ();
   test_unrepresentable_context_retires_lease ();
+  test_task_timeouts_zero_is_unset ();
   test_unknown_activity_retires_lease ();
   test_cancellation ();
   test_completion_retry_does_not_redo_activity ();
