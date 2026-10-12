@@ -206,6 +206,12 @@ type pending_result =
   | Pending_rejected of {
       error : error_view;
       remove_run : bool;
+      (* Correlation for the [workflow_activation_rejected] record (#500),
+         captured when the rejection is built: an initial activation can be
+         rejected before its run is ever cached, and a cached run may be
+         dropped before the rejection is accepted. *)
+      workflow_id : string option;
+      replaying : bool;
     }
 
 (** The completion is owned by this adapter until the supervisor accepts it.
@@ -772,11 +778,11 @@ module Make (Supervisor : SUPERVISOR) = struct
                command_count;
                terminal;
              })
-    | Pending_rejected { error; remove_run } ->
-        let workflow_id = cached_workflow_id adapter pending.run_id in
+    | Pending_rejected { error; remove_run; workflow_id; replaying } ->
         if remove_run then drop_run adapter pending.run_id;
         report Logs.Warning ~operation:"workflow_activation_rejected"
-          ~error_kind:error.code ?workflow_id ~run_id:pending.run_id ();
+          ~error_kind:error.code ?workflow_id ~run_id:pending.run_id ~replaying
+          ();
         Ok
           (Rejected
              {
@@ -954,11 +960,32 @@ module Make (Supervisor : SUPERVISOR) = struct
       match Run_map.find_opt activation.run_id adapter.runs with
       | Some (Run { execution; _ }) -> (try Execution.shutdown execution with _ -> ())
       | None -> ());
+    (* The initializing job names the workflow even when the run never
+       reached the registry (unknown type, undecodable input); later
+       activations read it from the registry before any removal. *)
+    let workflow_id =
+      match
+        List.find_map
+          (function
+            | Protocol.Initialize_workflow { workflow_id; _ } -> Some workflow_id
+            | _ -> None)
+          activation.jobs
+      with
+      | Some _ as workflow_id -> workflow_id
+      | None -> cached_workflow_id adapter activation.run_id
+    in
     let pending =
       {
         run_id = activation.run_id;
         submission = encode_submission completion;
-        result = Pending_rejected { error; remove_run };
+        result =
+          Pending_rejected
+            {
+              error;
+              remove_run;
+              workflow_id;
+              replaying = activation.is_replaying;
+            };
         retry_refusal = None;
       }
     in
