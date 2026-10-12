@@ -1972,6 +1972,190 @@ let test_late_sweep_delivery_is_classified () =
   | _ -> failwith "a late-delivered cancellation was submitted as a failure"
 
 (** Runs every adapter assertion with a stable test-process failure. *)
+module Observability = Temporal_base.Observability
+
+(** One SDK log record observed by [with_captured_logs]: its operation tag and
+    the full tag set for correlation assertions. *)
+type captured_record = { operation : string option; tags : Logs.Tag.set }
+
+(** Runs [f] with a reporter that records every lifecycle-source record at
+    [Debug], then restores the previous reporter and source level even when
+    [f] raises. Returns the records in emission order. The adapter is driven
+    synchronously on this Domain, so a plain list reference is sufficient. *)
+let with_captured_logs f =
+  let records = ref [] in
+  let source = Observability.Source.lifecycle in
+  let previous_reporter = Logs.reporter () in
+  let previous_level = Logs.Src.level source in
+  let report src _level ~over continuation messagef =
+    if Logs.Src.equal src source then
+      messagef (fun ?header:_ ?(tags = Logs.Tag.empty) format ->
+          Format.ikfprintf
+            (fun _ ->
+              records :=
+                {
+                  operation = Logs.Tag.find Observability.Tag.operation tags;
+                  tags;
+                }
+                :: !records;
+              over ();
+              continuation ())
+            Format.str_formatter format)
+    else (
+      over ();
+      continuation ())
+  in
+  Logs.set_reporter { Logs.report };
+  Logs.Src.set_level source (Some Logs.Debug);
+  Fun.protect
+    ~finally:(fun () ->
+      Logs.set_reporter previous_reporter;
+      Logs.Src.set_level source previous_level)
+    f;
+  List.rev !records
+
+(** Returns the only captured record for [operation], failing otherwise. *)
+let single_record records operation =
+  match
+    List.filter
+      (fun record -> record.operation = Some operation)
+      records
+  with
+  | [ record ] -> record.tags
+  | found ->
+      failwith
+        (Printf.sprintf "expected one %s record, found %d" operation
+           (List.length found))
+
+(** Requires the tag set to name the attempt built by [start_task_fields]:
+    workflow-1/run-1 of test_workflow, activity-1 of [activity_type], attempt
+    1 (#500). *)
+let expect_attempt_identity ~activity_type tags =
+  let check definition expected label =
+    if Logs.Tag.find definition tags <> Some expected then
+      failwith ("activity record lacked its correlated " ^ label)
+  in
+  check Observability.Tag.workflow_id "workflow-1" "workflow ID";
+  check Observability.Tag.run_id "run-1" "run ID";
+  check Observability.Tag.workflow_type "test_workflow" "workflow type";
+  check Observability.Tag.activity_id "activity-1" "activity ID";
+  check Observability.Tag.activity_type activity_type "activity type";
+  check Observability.Tag.attempt 1 "attempt"
+
+(** The started and completed lease records of one attempt carry its full
+    identity, and the started record precedes any log the callback writes, so
+    application logs can be joined to the attempt between the two (#500). *)
+let test_lease_records_carry_activity_identity () =
+  let supervisor = fake_supervisor () in
+  let activity =
+    Temporal.Activity.define ~name:"correlated" ~input:Temporal.Codec.unit
+      ~output:Temporal.Codec.unit (fun () ->
+        (* Emitted through the lifecycle source only so the capture can
+           prove ordering; real callbacks log to their own sources. *)
+        Observability.report ~src:Observability.Source.lifecycle Logs.Debug
+          ~tags:(Observability.tags ~operation:"test_callback_ran" ())
+          "callback ran";
+        Ok ())
+  in
+  let token = Bytes.of_string "correlated-token" in
+  enqueue supervisor
+    (start_task ~token ~activity_type:"correlated"
+       ~input:[ encode_input Temporal.Codec.unit () ]);
+  let worker = worker supervisor [ Adapter.register activity ] in
+  let records =
+    with_captured_logs (fun () ->
+        expect_completed Adapter.Succeeded (Worker.poll worker))
+  in
+  expect_attempt_identity ~activity_type:"correlated"
+    (single_record records "activity_task_started");
+  expect_attempt_identity ~activity_type:"correlated"
+    (single_record records "activity_task_completed");
+  let operations = List.filter_map (fun record -> record.operation) records in
+  let index name =
+    let rec loop position = function
+      | [] -> failwith ("missing record " ^ name)
+      | current :: _ when String.equal current name -> position
+      | _ :: rest -> loop (position + 1) rest
+    in
+    loop 0 operations
+  in
+  if
+    not
+      (index "activity_task_started" < index "test_callback_ran"
+      && index "test_callback_ran" < index "activity_task_completed")
+  then failwith "activity lease records did not bracket the callback";
+  (* The opaque token is a correlation credential, never a log value. *)
+  List.iter
+    (fun record ->
+      let rendered = Format.asprintf "%a" Logs.Tag.pp_set record.tags in
+      let contains needle =
+        let needle_length = String.length needle in
+        let rec scan offset =
+          offset + needle_length <= String.length rendered
+          && (String.sub rendered offset needle_length = needle
+             || scan (offset + 1))
+        in
+        scan 0
+      in
+      if contains "correlated-token" then
+        failwith "an activity record exposed the task token")
+    records
+
+(** A task-level rejection (here an unregistered type) is correlated with the
+    attempt it retired, alongside its stable error kind. *)
+let test_rejection_record_carries_activity_identity () =
+  let supervisor = fake_supervisor () in
+  enqueue supervisor
+    (start_task ~token:(Bytes.of_string "missing") ~activity_type:"missing"
+       ~input:[]);
+  let worker = worker supervisor [] in
+  let records =
+    with_captured_logs (fun () ->
+        match Worker.poll worker with
+        | Ok (Adapter.Rejected { lease_retired = true; _ }) -> ()
+        | _ -> failwith "unknown activity was not rejected")
+  in
+  let tags = single_record records "activity_task_rejected" in
+  expect_attempt_identity ~activity_type:"missing" tags;
+  if
+    Logs.Tag.find Observability.Tag.error_kind tags
+    <> Some "unknown_activity_type"
+  then failwith "rejection record lost its error kind"
+
+(** A cancellation delivered to a running attempt through a heartbeat sweep
+    names that attempt, and a bare cancellation whose start this adapter never
+    saw carries no fabricated identity. *)
+let test_cancellation_records_correlation () =
+  let supervisor = fake_supervisor () in
+  let token = Bytes.of_string "cancel-running" in
+  let calls = ref 0 in
+  let results = ref [] in
+  let activity =
+    heartbeating_activity ~name:"cancel_correlated" ~beats:1 ~calls ~results
+      ~finish:(fun _ -> Ok "done")
+  in
+  enqueue supervisor
+    (start_task ~token ~activity_type:"cancel_correlated"
+       ~input:[ encode_input Temporal.Codec.unit () ]);
+  enqueue supervisor
+    (cancel_task_with ~reason:Protocol.Cancellation_requested token);
+  let worker = worker supervisor [ Adapter.register activity ] in
+  let delivered =
+    with_captured_logs (fun () -> ignore (Worker.poll worker))
+  in
+  expect_attempt_identity ~activity_type:"cancel_correlated"
+    (single_record delivered "activity_cancellation_delivered");
+  enqueue supervisor (cancel_task (Bytes.of_string "bare-cancel"));
+  let bare =
+    with_captured_logs (fun () ->
+        expect_completed Adapter.Cancelled (Worker.poll worker))
+  in
+  let tags = single_record bare "activity_task_completed" in
+  if
+    Logs.Tag.find Observability.Tag.activity_id tags <> None
+    || Logs.Tag.find Observability.Tag.workflow_id tags <> None
+  then failwith "a bare cancellation record fabricated an activity identity"
+
 let () =
   test_successful_dispatch ();
   test_typed_failure ();
@@ -2001,4 +2185,7 @@ let () =
   test_worker_shutdown_signal ();
   test_drain_retires_deferred_starts ();
   test_sweep_poll_error_is_deferred ();
-  test_late_sweep_delivery_is_classified ()
+  test_late_sweep_delivery_is_classified ();
+  test_lease_records_carry_activity_identity ();
+  test_rejection_record_carries_activity_identity ();
+  test_cancellation_records_correlation ()

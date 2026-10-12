@@ -40,6 +40,32 @@ category's default. New tests cover a single canonical async heartbeat document 
 a later caller-buffer mutation cannot change, encoder-rejected synchronous and
 asynchronous heartbeats that never reach the supervisor, and the supervisor's
 heartbeat bytes and missing-worker rejection.
+## 2026-10-12: Activity log correlation (#500)
+
+Activity lease records now name the attempt they describe. The native activity
+adapter copies each start task's workflow ID, run ID, workflow type, activity
+ID, activity type, and attempt into the lease. Its `activity_task_completed`,
+`activity_task_rejected`, `activity_async_handoff_accepted`, and
+`activity_cancellation_delivered` records carry those values as
+`temporal.workflow_id`, `temporal.run_id`, `temporal.workflow_type`,
+`temporal.activity_id`, `temporal.activity_type`, and `temporal.attempt`. A
+new `Debug` record, `activity_task_started`, is emitted before dispatch, so
+application logs from the callback fall between two correlated SDK records.
+`Temporal_base.Observability` gains the three activity tags with the shared
+bounding rules (strings capped at 256 bytes; a negative attempt becomes zero).
+The task token is never logged, and the identifiers stay out of metric labels.
+A bare cancellation whose start the worker never saw carries no identity.
+
+`test/runtime/test_native_activity_execution.ml` covers the started,
+completed, rejected, and cancellation-delivered records, their ordering
+around the callback, the absence of the token, and the bare-cancellation
+case. `test/observability/test_tag_normalization.ml` covers the new tags.
+Verified with `dune build`, and `dune test` for `test/runtime`,
+`test/observability`, and `test/unit`, on OCaml 5.4.1 (macOS).
+
+Still open for #500: OCaml-only executor and admission metrics, the sample
+deployment that induces poll failure, saturation, and a shutdown timeout,
+bounded exporter connections, and OTLP export.
 
 ## 2026-10-12: Decoder fuzzing, concurrent lifecycle stress, and scheduled qualification (#506)
 
