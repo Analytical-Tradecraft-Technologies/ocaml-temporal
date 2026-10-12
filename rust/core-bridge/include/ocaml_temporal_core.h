@@ -116,6 +116,21 @@ ocaml_temporal_core_status ocaml_temporal_core_v4_shared_runtime_new(
     ocaml_temporal_core_result *output);
 
 /*
+ * shared_runtime_new plus an opt-in telemetry document (#500). `input` is a
+ * strict UTF-8 JSON object of at most 16 KiB; `{}` configures no exporter and
+ * `{"prometheus":{"bind_address":"127.0.0.1:9464",...}}` serves Core's
+ * metrics for scraping until Core is destroyed. Invalid input or an unusable
+ * address returns OCAML_TEMPORAL_CORE_STATUS_CONFIGURATION and leaves
+ * `*shared` NULL. On success the result value is the bound socket address as
+ * UTF-8 text (empty without an exporter).
+ */
+ocaml_temporal_core_status
+ocaml_temporal_core_v4_shared_runtime_new_with_telemetry_json(
+    uint32_t worker_threads, const uint8_t *input, size_t input_len,
+    ocaml_temporal_core_shared_runtime **shared,
+    ocaml_temporal_core_result *output);
+
+/*
  * Create a runtime graph that runs on `shared`'s Core instead of its own.
  * The graph is used and released exactly like one from runtime_new. It holds
  * its own reference to the shared Core, so Core outlives the graph even if

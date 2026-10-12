@@ -1310,6 +1310,138 @@ let test_query_validation_failure_preserves_run () =
     (activation ~run_id [ Protocol.Fire_timer { seq = timer_seq } ]);
   expect_completed ~terminal:true (Result.get_ok (Worker.poll worker))
 
+(** Tags of every [workflow_activation_rejected] record reported while
+    [action] runs, newest first. Logs state is restored afterwards. *)
+let capture_rejection_records action =
+  let records = ref [] in
+  let reporter =
+    let report _source _level ~over continuation messagef =
+      messagef (fun ?header:_ ?(tags = Logs.Tag.empty) format ->
+          Format.ikfprintf
+            (fun _ ->
+              (match
+                 Logs.Tag.find Temporal_base.Observability.Tag.operation tags
+               with
+              | Some "workflow_activation_rejected" -> records := tags :: !records
+              | _ -> ());
+              over ();
+              continuation ())
+            Format.str_formatter format)
+    in
+    { Logs.report }
+  in
+  let previous_reporter = Logs.reporter () in
+  let previous_level = Logs.level () in
+  Logs.set_reporter reporter;
+  Logs.set_level (Some Logs.Debug);
+  Fun.protect
+    ~finally:(fun () ->
+      Logs.set_reporter previous_reporter;
+      Logs.set_level previous_level)
+    action;
+  !records
+
+(** Asserts that the newest rejection record names [workflow_id], [run_id],
+    and [replaying]. *)
+let expect_rejection_correlation ~label ~workflow_id ~run_id ~replaying records =
+  let module Tag = Temporal_base.Observability.Tag in
+  match records with
+  | tags :: _ ->
+      if Logs.Tag.find Tag.workflow_id tags <> Some workflow_id then
+        failwith (label ^ ": rejection record lacks the workflow ID");
+      if Logs.Tag.find Tag.run_id tags <> Some run_id then
+        failwith (label ^ ": rejection record lacks the run ID");
+      if Logs.Tag.find Tag.replaying tags <> Some replaying then
+        failwith (label ^ ": rejection record lacks the replay flag")
+  | [] -> failwith (label ^ ": no workflow_activation_rejected record")
+
+(** Rejected activations keep their correlation (#500): an initial
+    activation rejected before its run is cached (unknown type, undecodable
+    input) still names the workflow from its initialization job, and a
+    rejection on a cached run reads the workflow ID from the registry. Each
+    record carries the activation's replay flag. *)
+let test_rejected_activation_log_correlation () =
+  let supervisor = fake_supervisor () in
+  let invalid_query =
+    Raw_adapter.make_query_handler ~name:"invalid-payload"
+      ~dispatch:(fun _query ->
+        Ok { Temporal_base.Payload.metadata = [ ("", "invalid") ]; data = Bytes.empty })
+  in
+  let string_input =
+    Temporal.Workflow.define ~name:"native_worker_rejection_string_input"
+      ~input:Temporal.Codec.string ~output:Temporal.Codec.unit (fun _ ->
+        Temporal.Workflow.sleep (Temporal.Duration.of_ms 25L))
+  in
+  let worker =
+    worker supervisor
+      [ Adapter.register string_input;
+        Adapter.register ~query_handlers:[ invalid_query ]
+          (Temporal.Workflow.define ~name:"native_worker_rejection_cached"
+             ~input:Temporal.Codec.unit ~output:Temporal.Codec.unit (fun () ->
+               Temporal.Workflow.sleep (Temporal.Duration.of_ms 25L))) ]
+  in
+  let expect_rejected ~label =
+    match Worker.poll worker with
+    | Ok (Adapter.Rejected { lease_retired = true; _ }) -> ()
+    | Ok _ -> failwith (label ^ ": activation was not rejected")
+    | Error error -> failwith (label ^ ": poll failed: " ^ error.message)
+  in
+  (* Unknown workflow type, first execution. *)
+  let run_id = "run-reject-unknown-type" in
+  let records =
+    capture_rejection_records (fun () ->
+        enqueue supervisor
+          { (activation ~run_id
+               [ initialize ~run_id ~workflow_type:"native_worker_not_registered" ])
+            with is_replaying = false };
+        expect_rejected ~label:"unknown type")
+  in
+  expect_rejection_correlation ~label:"unknown type"
+    ~workflow_id:("workflow-" ^ run_id) ~run_id ~replaying:false records;
+  (* Undecodable input during replay. *)
+  let run_id = "run-reject-invalid-input" in
+  let records =
+    capture_rejection_records (fun () ->
+        enqueue supervisor
+          (activation ~run_id
+             [ Protocol.Initialize_workflow
+                 {
+                   workflow_id = "workflow-" ^ run_id;
+                   workflow_type = "native_worker_rejection_string_input";
+                   arguments = [ encoded_protocol Temporal.Codec.int 7 ];
+                   randomness_seed = "1";
+                   attempt = 1;
+                   context = None;
+                 } ]);
+        expect_rejected ~label:"invalid input")
+  in
+  expect_rejection_correlation ~label:"invalid input"
+    ~workflow_id:("workflow-" ^ run_id) ~run_id ~replaying:true records;
+  (* Cached run: a query-only activation (no initialization job) whose
+     handler result fails validation. *)
+  let run_id = "run-reject-cached" in
+  enqueue supervisor
+    (activation ~run_id
+       [ initialize ~run_id ~workflow_type:"native_worker_rejection_cached" ]);
+  expect_completed ~terminal:false (Result.get_ok (Worker.poll worker));
+  let records =
+    capture_rejection_records (fun () ->
+        enqueue supervisor
+          { (activation ~run_id
+               [ Protocol.Query_workflow
+                   {
+                     query_id = "query-reject-cached";
+                     query_type = "invalid-payload";
+                     arguments = [];
+                     headers = [];
+                   } ])
+            with is_replaying = false };
+        expect_rejected ~label:"cached run")
+  in
+  expect_rejection_correlation ~label:"cached run"
+    ~workflow_id:("workflow-" ^ run_id) ~run_id ~replaying:false records
+
+
 (** Overlong unhandled query names are bounded before protocol encoding. The
     query type is individually valid at the bridge limit, but the constructed
     diagnostic would exceed that limit without truncation. *)
@@ -3166,6 +3298,7 @@ let () =
   test_update_terminal_and_eviction_cleanup ();
   test_query_adapter_failure_uses_query_results ();
   test_query_validation_failure_preserves_run ();
+  test_rejected_activation_log_correlation ();
   test_unhandled_query_failure_message_is_bounded ();
   test_unhandled_signal_fails_closed ();
   test_eviction ();

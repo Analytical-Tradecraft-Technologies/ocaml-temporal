@@ -708,6 +708,35 @@ one seam: Core moves out of the per-instance graph into a reference-counted
 - `ocaml_temporal_core_v4_shared_runtime_free` releases the handle's
   reference and waits; `..._shared_runtime_dispose` is the non-waiting GC
   fallback. Both clear the slot first and are idempotent on a null slot.
+- `ocaml_temporal_core_v4_shared_runtime_new_with_telemetry_json(worker_threads,
+  input, input_len, &shared, out)` (#500) is `shared_runtime_new` plus a
+  strict telemetry document of at most 16 KiB; the plain constructor now
+  delegates to it with `{}`. The only member today is optional
+  `prometheus`: `{"bind_address": "<ip>:<port>", "global_tags":
+  [{"name": ..., "value": ...}], "counters_total_suffix": bool,
+  "unit_suffix": bool, "durations_as_seconds": bool}` (the tag list and the
+  three switches default to empty and `false`; unknown members are
+  rejected). `src/telemetry.rs` validates it with the same rules as
+  `Temporal_base.Metrics_config` (IP socket address only, at most 16 tags,
+  names `[A-Za-z_][A-Za-z0-9_]*` up to 64 bytes without `__` prefix or a
+  label Core already uses, values 1..256 bytes without control characters,
+  unique names) before Core is built, so a rejected document allocates
+  nothing. It then builds Core, starts Core's own
+  `start_prometheus_metric_exporter` inside Core's Tokio context, and
+  attaches the returned meter with `attach_late_init_metrics` before the
+  handle is published, so every graph attached later hands the meter to its
+  client (`ConnectionOptions::metrics_meter`) and worker. A bind failure is
+  `CONFIGURATION` naming the configured address and the `io::ErrorKind`
+  only; the just-built Core is dropped on the calling thread. The success
+  value is the bound address as UTF-8 (port `0` resolved), or empty without
+  an exporter. The returned `MetricsExporter` guard is the first field of
+  `SharedCore`: dropping the last Core reference aborts the scrape task and
+  then drops Core's Tokio runtime, which joins its workers and so closes
+  the listening socket before the release returns
+  (`rust/core-bridge/tests/metrics_exporter.rs`). The scrape server runs
+  entirely on Tokio threads and never calls OCaml. Enabling it requires
+  `temporalio-common`'s `prometheus` feature, which adds only the
+  Apache-2.0 `prometheus` crate (see [dependencies](../dependencies.md)).
 
 Ownership rules. Each graph still has exactly one owner (its supervisor's
 owner Domain) and one release path; supervisors never share mutable native

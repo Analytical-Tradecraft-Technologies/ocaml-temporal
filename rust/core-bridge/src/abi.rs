@@ -4,7 +4,7 @@ use crate::worker_bridge::{
     WORKER_FINALIZE_TIMEOUT, WORKER_SHUTDOWN_DRAIN_TIMEOUT, WorkerBridgeError,
     public_poll_lane_error_message, public_worker_error_message,
 };
-use crate::{activity_protocol, client_protocol, diagnostics, workflow_protocol};
+use crate::{activity_protocol, client_protocol, diagnostics, telemetry, workflow_protocol};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::future::Future;
@@ -571,9 +571,14 @@ impl Drop for CoreDropMarker {
 /// panics.
 ///
 /// Field order is load-bearing: Rust drops fields in declaration order, so
-/// Core is dropped before the log writer (which then flushes Core's shutdown
-/// records within `CORE_LOG_CLOSE_TIMEOUT`), and the drop marker last.
+/// the metrics exporter's scrape server is aborted first, then Core is
+/// dropped (its Tokio shutdown closes the scrape socket) before the log
+/// writer (which then flushes Core's shutdown records within
+/// `CORE_LOG_CLOSE_TIMEOUT`), and the drop marker last.
 pub(crate) struct SharedCore {
+    /// Opt-in Prometheus scrape server running on Core's Tokio pool (#500);
+    /// see [`telemetry::MetricsExporter`].
+    metrics: Option<telemetry::MetricsExporter>,
     core: CoreRuntime,
     /// Writer thread draining Core's log queue to stderr, absent when Core
     /// logging is `off`; see [`diagnostics::CoreLogWriter`]. The writer owns
@@ -759,6 +764,7 @@ impl Runtime {
     /// [`create_runtime`] would.
     fn with_owned_core(core: CoreRuntime) -> std::result::Result<Self, Failure> {
         Self::new(Arc::new(SharedCore {
+            metrics: None,
             core,
             core_log: std::sync::Mutex::new(None),
             _dropped: CoreDropMarker,
@@ -3891,15 +3897,27 @@ fn create_runtime(
     worker_threads: usize,
     spawn_log: impl FnOnce() -> std::io::Result<diagnostics::CoreLogWriter>,
 ) -> std::result::Result<Runtime, Failure> {
-    let core = create_shared_core(log_level, worker_threads, spawn_log)?;
+    let core = create_shared_core(
+        log_level,
+        worker_threads,
+        &telemetry::TelemetryConfig::default(),
+        spawn_log,
+    )?;
     Runtime::new(Arc::new(core))
 }
 
 /// Builds one Core runtime and its optional log writer without any instance
 /// graph; see [`create_runtime`] for the logging and failure contract.
+///
+/// `telemetry_config` selects an optional metrics exporter (#500). It is started
+/// after Core exists (it needs Core's Tokio pool) and before the runtime is
+/// returned, so every client and worker later created on it receives the
+/// meter. A failed exporter start drops the just-built Core here, and with
+/// it the log writer, so no thread or socket outlives the failure.
 fn create_shared_core(
     log_level: Option<diagnostics::CoreLogLevel>,
     worker_threads: usize,
+    telemetry_config: &telemetry::TelemetryConfig,
     spawn_log: impl FnOnce() -> std::io::Result<diagnostics::CoreLogWriter>,
 ) -> std::result::Result<SharedCore, Failure> {
     let core_log = match log_level {
@@ -3937,7 +3955,7 @@ fn create_shared_core(
     // hook are preserved; only the worker count differs from the default.
     let mut tokio_builder = TokioRuntimeBuilder::default();
     tokio_builder.inner.worker_threads(worker_threads);
-    let core = CoreRuntime::new(options, tokio_builder).map_err(|_error| {
+    let mut core = CoreRuntime::new(options, tokio_builder).map_err(|_error| {
         Failure {
             status: STATUS_INTERNAL,
             // Runtime construction errors can contain Core or Tokio
@@ -3946,7 +3964,9 @@ fn create_shared_core(
             message: "could not create Temporal Core runtime".to_owned(),
         }
     })?;
+    let metrics = telemetry::start_metrics(&mut core, telemetry_config)?;
     Ok(SharedCore {
+        metrics,
         core,
         core_log: std::sync::Mutex::new(core_log.map(|(_, writer)| writer)),
         _dropped: CoreDropMarker,
@@ -4093,6 +4113,54 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_shared_runtime_new(
     shared: *mut *mut SharedRuntime,
     output: *mut Result,
 ) -> Status {
+    const NO_TELEMETRY: &[u8] = b"{}";
+    // SAFETY: `NO_TELEMETRY` is a readable static span; the remaining
+    // pointer contracts are forwarded unchanged.
+    unsafe {
+        ocaml_temporal_core_v4_shared_runtime_new_with_telemetry_json(
+            worker_threads,
+            NO_TELEMETRY.as_ptr(),
+            NO_TELEMETRY.len(),
+            shared,
+            output,
+        )
+    }
+}
+
+/// Upper bound on a runtime telemetry document. The largest valid document
+/// (sixteen maximal global tags) is well below this.
+const MAX_TELEMETRY_CONFIG_BYTES: usize = 16 * 1024;
+
+/// Create a shareable Core runtime with opt-in telemetry export (#500).
+///
+/// This is [`ocaml_temporal_core_v4_shared_runtime_new`] plus a strict JSON
+/// telemetry document (see `docs/reference/core-bridge.md`). `{}` configures
+/// no exporter. With a `prometheus` member, Core's built-in worker and client
+/// metrics are served at `http://<bind_address>/metrics` from a scrape server
+/// on the runtime's own Tokio pool; the server stops when Core is destroyed,
+/// that is, when the last of the shared handle and its attached graphs is
+/// released.
+///
+/// The document is validated, and the endpoint bound, before the handle is
+/// published: an invalid document or an unusable address fails with
+/// `STATUS_CONFIGURATION` and leaves `*shared` null with nothing running. On
+/// success the result value is the UTF-8 socket address the endpoint
+/// actually listens on (an ephemeral port `0` is resolved), or empty when no
+/// exporter was configured.
+///
+/// # Safety
+///
+/// `input` must be readable for `input_len` bytes for this call (it may be
+/// null only when `input_len` is zero). `shared` and `output` follow
+/// [`ocaml_temporal_core_v4_shared_runtime_new`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ocaml_temporal_core_v4_shared_runtime_new_with_telemetry_json(
+    worker_threads: u32,
+    input: *const u8,
+    input_len: usize,
+    shared: *mut *mut SharedRuntime,
+    output: *mut Result,
+) -> Status {
     // Canonicalize the slot first, as in `runtime_new_with_worker_threads`,
     // so every failing return leaves a known null value.
     if !shared.is_null() {
@@ -4102,8 +4170,8 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_shared_runtime_new(
     if output.is_null() {
         return STATUS_INVALID_ARGUMENT;
     }
-    // SAFETY: The result pointer was checked above; the slot is checked in
-    // the closure before it is written.
+    // SAFETY: The result pointer was checked above; the slot and the input
+    // span are checked in the closure before use.
     unsafe {
         invoke(output, || {
             if shared.is_null() {
@@ -4112,6 +4180,29 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_shared_runtime_new(
                     message: "shared runtime output pointer is null".to_owned(),
                 });
             }
+            if input_len > MAX_TELEMETRY_CONFIG_BYTES {
+                return Err(Failure {
+                    status: STATUS_CONFIGURATION,
+                    message: format!(
+                        "runtime telemetry configuration exceeds {MAX_TELEMETRY_CONFIG_BYTES} bytes"
+                    ),
+                });
+            }
+            if input_len != 0 && input.is_null() {
+                return Err(Failure {
+                    status: STATUS_INVALID_ARGUMENT,
+                    message: "telemetry input is null but input_len is nonzero".to_owned(),
+                });
+            }
+            let bytes = if input_len == 0 {
+                &[]
+            } else {
+                // SAFETY: The caller promises the readable span documented
+                // above; the nonempty null case was rejected.
+                std::slice::from_raw_parts(input, input_len)
+            };
+            // Validate everything that allocates nothing before building Core.
+            let telemetry = telemetry::parse_telemetry_config(bytes)?;
             let worker_threads = runtime_worker_threads(worker_threads)?;
             let log_level = diagnostics::core_log_level_from_env().map_err(|message| Failure {
                 status: STATUS_CONFIGURATION,
@@ -4120,13 +4211,19 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_shared_runtime_new(
             let core = create_shared_core(
                 log_level,
                 worker_threads,
+                &telemetry,
                 diagnostics::CoreLogWriter::spawn_stderr,
             )?;
+            let address = core
+                .metrics
+                .as_ref()
+                .map(|exporter| exporter.bound_address().to_string())
+                .unwrap_or_default();
             let owned = Box::into_raw(Box::new(SharedRuntime::new(core)?));
             // SAFETY: The slot was validated above and is exclusively owned
             // by this call until it returns.
             ptr::write(shared, owned);
-            Ok(Vec::new())
+            Ok(address.into_bytes())
         })
     }
 }
@@ -5642,6 +5739,21 @@ pub unsafe fn test_runtimes_share_core(
     // SAFETY: The caller promises null or live, unshared handles.
     let (left, right) = unsafe { (left.as_ref()?, right.as_ref()?) };
     Some(Arc::ptr_eq(left.core.as_ref()?, right.core.as_ref()?))
+}
+
+/// Reports whether a live instance graph's Core carries a metrics meter, so
+/// a client or worker created on it would record Core's built-in metrics
+/// (#500). `None` for a null or released handle. Not part of the C ABI.
+///
+/// # Safety
+///
+/// `runtime` must be null or a live handle not used concurrently.
+#[doc(hidden)]
+pub unsafe fn test_runtime_has_metrics_meter(runtime: *const Runtime) -> Option<bool> {
+    // SAFETY: The caller promises a null or live, unshared handle.
+    let runtime = unsafe { runtime.as_ref()? };
+    let core = runtime.core.as_ref()?;
+    Some(core.telemetry().get_temporal_metric_meter().is_some())
 }
 
 /// Returns the number of live references to a shared handle's Core (the

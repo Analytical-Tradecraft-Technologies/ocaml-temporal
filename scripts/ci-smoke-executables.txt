@@ -32,6 +32,7 @@ test/integration/test_core_lifecycle.exe
 test/integration/transport_interruption/regression.exe
 test/integration/update_outcomes/regression.exe
 test/integration/update_run_close/regression.exe
+test/integration/worker_metrics/regression.exe
 test/integration/worker_poll_isolation/regression.exe
 test/integration/worker_resource_options/regression.exe
 test/integration/workflow_start_info/regression.exe

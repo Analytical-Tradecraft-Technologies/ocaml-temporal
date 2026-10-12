@@ -1,0 +1,5 @@
+; Live #500 regression; see regression.ml. Run by
+; make test-temporal-live-regressions against a disposable server.
+(executable
+ (name regression)
+ (libraries logs temporal-sdk temporal_base unix))

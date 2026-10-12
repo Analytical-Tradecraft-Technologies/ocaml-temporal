@@ -659,6 +659,52 @@ CAMLprim value ocaml_temporal_shared_runtime_create(value worker_threads) {
   CAMLreturn(pair);
 }
 
+/* Create a shared Core runtime with an opt-in telemetry document (#500).
+ * The thread-count mapping matches [ocaml_temporal_shared_runtime_create].
+ * The JSON bytes are copied to a C allocation before the OCaml runtime lock
+ * is released (the string may move during a GC) and freed after Rust
+ * returns; Rust only borrows the copy for the duration of the call. On
+ * success the response value is the bound metrics address, if any. */
+CAMLprim value ocaml_temporal_shared_runtime_create_with_telemetry(
+    value worker_threads, value telemetry) {
+  CAMLparam2(worker_threads, telemetry);
+  CAMLlocal3(shared, response, pair);
+  ocaml_temporal_core_shared_runtime *native_shared = NULL;
+  ocaml_temporal_core_result native_result = {0};
+  intnat requested = Long_val(worker_threads);
+  uint32_t bounded_request =
+      requested < 0 || (uintnat)requested > UINT32_MAX ? UINT32_MAX
+                                                       : (uint32_t)requested;
+  size_t input_length = caml_string_length(telemetry);
+  uint8_t *input_copy = NULL;
+
+  shared = alloc_shared_runtime();
+  response = alloc_response();
+  if (input_length > 0) {
+    input_copy = malloc(input_length);
+    if (input_copy == NULL) {
+      caml_raise_out_of_memory();
+    }
+    memcpy(input_copy, String_val(telemetry), input_length);
+  }
+
+  caml_enter_blocking_section();
+  (void)ocaml_temporal_core_v4_shared_runtime_new_with_telemetry_json(
+      bounded_request, input_copy, input_length, &native_shared,
+      &native_result);
+  caml_leave_blocking_section();
+  free(input_copy);
+
+  atomic_store_explicit(&Shared_runtime_val(shared)->shared, native_shared,
+                        memory_order_release);
+  Response_val(response)->result = native_result;
+
+  pair = caml_alloc_tuple(2);
+  Store_field(pair, 0, shared);
+  Store_field(pair, 1, response);
+  CAMLreturn(pair);
+}
+
 /* Create one runtime graph attached to a shared Core runtime. The shared
  * pointer is borrowed through its gate for the whole native call, so a
  * concurrent close waits rather than freeing it; a closed owner passes NULL

@@ -41,6 +41,47 @@ a later caller-buffer mutation cannot change, encoder-rejected synchronous and
 asynchronous heartbeats that never reach the supervisor, and the supervisor's
 heartbeat bytes and missing-worker rejection.
 
+## 2026-10-12: Prometheus worker metrics and workflow log correlation (#500)
+
+`Temporal.Runtime.create ?metrics` now exports Temporal Core's built-in
+worker and client metrics. `Runtime.Metrics.prometheus ~bind_address ()`
+validates an IP socket address and up to 16 bounded global tags (names that
+collide with Core's labels are refused), and the endpoint is bound before
+`create` returns; `Runtime.metrics_address` reports the bound address. Every
+client and worker attached to the runtime reports there, under the
+`temporal_`-prefixed names and bounded labels the official SDKs use, so
+their dashboards apply unchanged. The design follows the official SDKs:
+Core's own Prometheus exporter receives the meter at runtime construction, so
+no Rust thread ever calls OCaml and no OCaml code runs on the scrape path.
+
+The ABI stays at version 4. One additive export,
+`shared_runtime_new_with_telemetry_json`, takes a strict telemetry document;
+`shared_runtime_new` delegates to it with `{}`. The exporter guard is the
+first field of `SharedCore`, so the scrape socket closes when the last Core
+reference is released. Enabling `temporalio-common`'s `prometheus` feature
+adds one locked package, `prometheus` 0.14.0 (Apache-2.0); the lock grows to
+307 packages.
+
+Log correlation: `workflow_activation_completed` and
+`workflow_activation_rejected` now carry the workflow and run IDs, and a new
+`temporal.replaying` tag marks those records and the workflow-source
+`workflow_started`, `workflow_completed`, `workflow_failed` and
+`workflow_cancelled` records, so replayed work is not mistaken for new
+business progress. The [observability reference](reference/observability.md#worker-metrics)
+documents the metric set, cardinality, failure isolation, an alerting
+example, and the decision to defer tracing.
+
+Evidence: `cargo test --locked` (including the new `metrics_exporter.rs`),
+the new `test/unit/test_metrics_config.ml` and
+`test/bridge/test_runtime_metrics.ml`, the extended
+`test/observability/test_logging.ml`, and the new live regression
+`test/integration/worker_metrics/regression.exe`, which passed against a
+local Compose server: it scraped 20 metric families, found no label outside
+the bounded set and neither execution ID in the scrape, and saw every
+`workflow_activation_completed` record for the run carry its IDs. Still
+open under #500: activity-scoped log correlation (activity ID, attempt),
+OCaml-only executor/admission metrics, OTLP export, and the sample
+deployment that induces poll failure, saturation and a shutdown timeout.
 ## 2026-10-12: Update callers when the run closes (#520)
 
 A new live regression, `test/integration/update_run_close`, completes the

@@ -203,6 +203,15 @@ for those rules.
   instances must be shut down before their runtime. A shut-down runtime
   rejects new attachments with a typed defect. Without `?runtime`, behavior
   is unchanged.
+- `Runtime.create ?metrics` exports Temporal Core's built-in worker and
+  client metrics (#500). `Runtime.Metrics.prometheus ~bind_address ()`
+  validates a Prometheus scrape endpoint (IP socket address, optional
+  bounded global tags, and Core's counter, unit, and duration naming
+  switches); the endpoint is bound before `create` returns, a busy address
+  is a typed `Bridge` error, and `Runtime.metrics_address` reports the bound
+  address. Every client and worker attached to the runtime reports there.
+  Metric names and labels match the official SDKs; see
+  [observability](observability.md#worker-metrics).
 - `Temporal.Worker` registers workflows, activities, and the signal, query, and
   update handlers attached to each workflow registration. It owns one
   supervisor graph, runs the poll loops, and performs idempotent shutdown.
