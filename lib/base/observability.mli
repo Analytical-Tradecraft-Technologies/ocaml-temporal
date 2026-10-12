@@ -68,6 +68,17 @@ val tags :
     commands or other deterministic decisions. *)
 val measure_ms : (unit -> 'value) -> 'value * float
 
+(** [debug_timed ~src ~operation action] returns [action ()]. Only while
+    [src] reports at [Debug] does it read the clock around [action] and emit
+    one [Debug] record carrying [operation] and [duration_ms]. Otherwise it
+    calls [action] directly, so disabled instrumentation costs one source
+    level check (and the caller's closure), with no clock read or record.
+    Benchmarks use it to attribute protocol codec time inside a live worker
+    (#528). If [action] raises, the exception propagates and no record is
+    emitted. Like {!measure_ms}, the duration is diagnostic only. *)
+val debug_timed :
+  src:Logs.src -> operation:string -> (unit -> 'value) -> 'value
+
 (** [report ~src level ~tags message] submits one bounded constant SDK message.
     Any exception raised by the application-selected reporter or formatter is
     contained so observability cannot alter SDK result or exception semantics.
