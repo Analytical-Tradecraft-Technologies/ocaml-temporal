@@ -9,6 +9,7 @@
 
 module Protocol = Temporal_protocol.Activity_protocol
 module Encoded = Temporal_protocol.Encoded_activity_completion
+module Encoded_heartbeat = Temporal_protocol.Encoded_activity_heartbeat
 module Raw_adapter = Temporal_runtime.Native_activity_execution
 
 (** Copies a public payload into the base payload representation expected by the
@@ -174,15 +175,18 @@ let copy_completion encoded =
         failwith "adapter submitted non-canonical completion bytes";
       value
 
-(** Copies a heartbeat through the strict protocol codec so the fake source
-    cannot accidentally retain mutable buffers owned by an activity context. *)
-let copy_heartbeat heartbeat =
-  match Protocol.encode_heartbeat heartbeat with
+(** Strictly decodes the adapter's single-encode heartbeat bytes, as the
+    Rust bridge does, and checks that they are canonical. Decoding gives the
+    fake fresh storage, so it cannot retain mutable buffers owned by an
+    activity context, and it never encodes a submission itself (#1001). *)
+let copy_heartbeat encoded =
+  let json = Encoded_heartbeat.to_string encoded in
+  match Protocol.decode_heartbeat json with
   | Error _ -> failwith "adapter submitted an invalid heartbeat to fake source"
-  | Ok json -> (
-      match Protocol.decode_heartbeat json with
-      | Ok value -> value
-      | Error _ -> failwith "fake source could not reparse its own heartbeat")
+  | Ok value ->
+      if Protocol.encode_heartbeat value <> Ok json then
+        failwith "adapter submitted non-canonical heartbeat bytes";
+      value
 
 (** Removes one exact opaque token from a list and reports whether it was found.
     [Bytes.equal] is intentional: tokens are binary correlation data, not text.
@@ -277,15 +281,15 @@ module Fake_supervisor = struct
   (** Accepts progress only while the activity token is leased. The focused
       dispatch tests do not retain heartbeat bodies; the lease check still
       verifies that the adapter never sends a heartbeat after completion. *)
-  let record_activity_heartbeat supervisor (heartbeat : Protocol.heartbeat) =
+  let record_activity_heartbeat supervisor encoded =
     !(supervisor.heartbeat_hook) ();
+    let heartbeat = copy_heartbeat encoded in
     if
       List.exists
         (fun token -> Bytes.equal token heartbeat.Protocol.task_token)
         !(supervisor.leased)
     then begin
-      supervisor.heartbeats :=
-        copy_heartbeat heartbeat :: !(supervisor.heartbeats);
+      supervisor.heartbeats := heartbeat :: !(supervisor.heartbeats);
       Ok ()
     end
     else
@@ -307,7 +311,7 @@ module Fake_supervisor = struct
       }
 
   let record_async_activity_heartbeat _supervisor
-      (_heartbeat : Protocol.heartbeat) =
+      (_encoded : Encoded_heartbeat.t) =
     Error
       {
         code = "unsupported";
@@ -1249,6 +1253,45 @@ let test_contextual_heartbeat_lifecycle () =
         | Ok () -> failwith "heartbeat succeeded after activity completion")
   end
 
+(** A synchronous heartbeat is encoded once by the adapter, which also
+    validates it (#1001): details the strict encoder rejects (here duplicate
+    metadata keys, which payload conversion alone cannot detect) fail as a
+    typed codec error without any supervisor call, and a valid heartbeat
+    from the same attempt still reaches the supervisor exactly once. *)
+let test_heartbeat_encoder_rejection_stays_local () =
+  let supervisor = fake_supervisor () in
+  let supervisor_calls = ref 0 in
+  supervisor.heartbeat_hook := (fun () -> incr supervisor_calls);
+  let activity =
+    Temporal.Activity.define_with_context ~name:"native_heartbeat_rejected"
+      ~input:Temporal.Codec.unit ~output:Temporal.Codec.string
+      (fun context () ->
+        let duplicate : Temporal.Payload.t =
+          { metadata = [ ("opaque", "one"); ("opaque", "two") ];
+            data = Bytes.of_string "invalid" }
+        in
+        (match Temporal.Activity.Context.heartbeat_payloads context [ duplicate ] with
+        | Error error when (Temporal.Error.view error).category = `Codec -> ()
+        | Error _ -> failwith "encoder-rejected heartbeat was not a codec error"
+        | Ok () -> failwith "encoder-rejected heartbeat was accepted");
+        if !supervisor_calls <> 0 then
+          failwith "encoder-rejected heartbeat reached the supervisor";
+        Result.map
+          (fun () -> "done")
+          (Temporal.Activity.Context.heartbeat context Temporal.Codec.string
+             "valid"))
+  in
+  let token = Bytes.of_string "heartbeat-rejected-token" in
+  enqueue supervisor
+    (start_task ~token ~activity_type:"native_heartbeat_rejected"
+       ~input:[ encode_input Temporal.Codec.unit () ]);
+  let worker = worker supervisor [ Adapter.register activity ] in
+  expect_completed Adapter.Succeeded (Worker.poll worker);
+  supervisor.heartbeat_hook := ignore;
+  match !supervisor_calls, !(supervisor.heartbeats) with
+  | 1, [ heartbeat ] when Bytes.equal heartbeat.Protocol.task_token token -> ()
+  | _ -> failwith "valid heartbeat was not submitted exactly once"
+
 (** The public context view must never expose mutable payload storage owned by
     the adapter. This test mutates the source details, a getter result, the
     heartbeat argument, and the callback's retained view in turn; every later
@@ -2007,9 +2050,13 @@ let test_late_sweep_delivery_is_classified () =
 (** Runs every adapter assertion with a stable test-process failure. *)
 module Observability = Temporal_base.Observability
 
-(** One SDK log record observed by [with_captured_logs]: its operation tag and
-    the full tag set for correlation assertions. *)
-type captured_record = { operation : string option; tags : Logs.Tag.set }
+(** One SDK log record observed by [with_captured_logs]: its level, its
+    operation tag, and the full tag set for correlation assertions. *)
+type captured_record = {
+  level : Logs.level;
+  operation : string option;
+  tags : Logs.Tag.set;
+}
 
 (** Runs [f] with a reporter that records every lifecycle-source record at
     [Debug], then restores the previous reporter and source level even when
@@ -2020,13 +2067,14 @@ let with_captured_logs f =
   let source = Observability.Source.lifecycle in
   let previous_reporter = Logs.reporter () in
   let previous_level = Logs.Src.level source in
-  let report src _level ~over continuation messagef =
+  let report src level ~over continuation messagef =
     if Logs.Src.equal src source then
       messagef (fun ?header:_ ?(tags = Logs.Tag.empty) format ->
           Format.ikfprintf
             (fun _ ->
               records :=
                 {
+                  level;
                   operation = Logs.Tag.find Observability.Tag.operation tags;
                   tags;
                 }
@@ -2155,6 +2203,50 @@ let test_rejection_record_carries_activity_identity () =
     <> Some "unknown_activity_type"
   then failwith "rejection record lost its error kind"
 
+(** An ordinary application [Error] is expected Temporal behaviour, not an SDK
+    rejection: the attempt yields exactly one correlated [activity_task_failed]
+    record at [Info] and no [activity_task_rejected] warning (#1024). *)
+let test_application_failure_logs_one_record () =
+  let supervisor = fake_supervisor () in
+  let activity =
+    Temporal.Activity.define ~name:"failing" ~input:Temporal.Codec.unit
+      ~output:Temporal.Codec.unit (fun () ->
+        Error
+          (Temporal.Error.make ~category:`Activity ~message:"business failure"
+             ()))
+  in
+  enqueue supervisor
+    (start_task ~token:(Bytes.of_string "failing-token")
+       ~activity_type:"failing"
+       ~input:[ encode_input Temporal.Codec.unit () ]);
+  let worker = worker supervisor [ Adapter.register activity ] in
+  let records =
+    with_captured_logs (fun () ->
+        match Worker.poll worker with
+        | Ok (Adapter.Rejected { lease_retired = true; _ }) -> ()
+        | _ -> failwith "application failure was not retired")
+  in
+  let failed =
+    List.filter
+      (fun record -> record.operation = Some "activity_task_failed")
+      records
+  in
+  (match failed with
+  | [ { level = Logs.Info; _ } ] -> ()
+  | [ _ ] -> failwith "application failure was not logged at Info"
+  | _ -> failwith "expected exactly one activity_task_failed record");
+  let tags = single_record records "activity_task_failed" in
+  expect_attempt_identity ~activity_type:"failing" tags;
+  if Logs.Tag.find Observability.Tag.error_kind tags <> Some "activity" then
+    failwith "failure record lost its error kind";
+  if
+    List.exists
+      (fun record ->
+        record.operation = Some "activity_task_rejected"
+        || record.level = Logs.Warning)
+      records
+  then failwith "an application failure was logged as an SDK rejection"
+
 (** A cancellation delivered to a running attempt through a heartbeat sweep
     names that attempt, and a bare cancellation whose start this adapter never
     saw carries no fabricated identity. *)
@@ -2191,6 +2283,7 @@ let test_cancellation_records_correlation () =
 
 let () =
   test_successful_dispatch ();
+  test_application_failure_logs_one_record ();
   test_typed_failure ();
   test_typed_failure_error_type ();
   test_invalid_failure_details_allow_next_activity ();
@@ -2204,6 +2297,7 @@ let () =
   test_completion_is_encoded_once ();
   test_non_retryable_completion_is_never_resubmitted ();
   test_contextual_heartbeat_lifecycle ();
+  test_heartbeat_encoder_rejection_stays_local ();
   test_context_payloads_are_copied ();
   test_context_callback_exception_and_invalidation ();
   test_extra_input_is_rejected ();
