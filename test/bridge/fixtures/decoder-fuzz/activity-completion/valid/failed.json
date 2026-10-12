@@ -1,0 +1,1 @@
+{"task_token":"AAEC/v8=","result":{"kind":"failed","failure":{"cause":null,"encoded_attributes":null,"info":{"details":[],"kind":"application","non_retryable":true,"type":"defect"},"message":"boom","source":"ocaml","stack_trace":""}}}

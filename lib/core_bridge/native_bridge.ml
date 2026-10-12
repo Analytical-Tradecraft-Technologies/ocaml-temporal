@@ -989,10 +989,16 @@ let client_call_selector = function
 let max_client_await_ms = 60_000
 
 (** Parses the [<owner>.<call>] handle Rust returns; both parts must be
-    positive decimal integers. *)
+    positive decimal integers. [int_of_string_opt] alone also accepts a sign,
+    [_] separators, and [0x]/[0o]/[0b]/[0u] prefixes, which would let several
+    spellings alias one handle, so each part must first be nonempty ASCII
+    decimal digits (#506 decoder fuzz). *)
 let parse_client_call text =
+  let decimal part =
+    part <> "" && String.for_all (function '0' .. '9' -> true | _ -> false) part
+  in
   match String.split_on_char '.' text with
-  | [ owner; call ] -> (
+  | [ owner; call ] when decimal owner && decimal call -> (
       match (int_of_string_opt owner, int_of_string_opt call) with
       | Some owner, Some call when owner > 0 && call > 0 -> Some { owner; call }
       | _ -> None)

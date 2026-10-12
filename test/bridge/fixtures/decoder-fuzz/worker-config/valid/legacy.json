@@ -1,0 +1,1 @@
+{"namespace":"decoder-fuzz","task_queue":"decoder-fuzz","build_id":"build-7","versioning":{"kind":"legacy_build_id","build_id":"build-7"},"max_cached_workflows":1,"max_outstanding_workflow_tasks":2,"max_concurrent_workflow_task_polls":2,"graceful_shutdown_timeout_ms":1000}
