@@ -1196,7 +1196,10 @@ let worker_complete_activity_json runtime input =
     it, because terminal completion remains a separate operation. The result is
     deliberately an acknowledgement only: pinned Temporal Core reports
     cancellation, pause, and reset flags asynchronously in a later Cancel task
-    rather than fabricating synchronous status here. *)
+    rather than fabricating synchronous status here. Since Core v1.0, a
+    heartbeat whose details exceed the namespace payload limit makes Core fail
+    the activity itself and queue that Cancel task; the later OCaml completion
+    is then accepted and discarded by Core. *)
 let worker_record_activity_heartbeat_json runtime input =
   bridge_call "worker_record_activity_heartbeat_json" (fun () ->
       Result.map (fun _ -> ())

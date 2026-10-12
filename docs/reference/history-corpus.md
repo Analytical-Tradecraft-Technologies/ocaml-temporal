@@ -297,8 +297,9 @@ SDK/Core upgrade gate. The corpus does not yet add malformed-history negative
 controls beyond the bridge's and `Temporal.Replay`'s own validation tests, or
 qualify every supported feature for #503. The lifecycle matrix covers
 replay compatibility only; concurrent mixed-version workers and version
-routing are outside the corpus. Every current capture was produced
-at Core `95e97686`; the first Core pin bump is the first true cross-revision
-replay, and its report is the evidence to retain. Cancellation,
+routing are outside the corpus. Every current capture was produced at Core
+`95e97686`. The first Core pin bump, to `8fe478ee` (v1.1.0, #824), was the
+first true cross-revision replay: every case kept its expected outcome, and
+its report is the evidence retained on that pull request. Cancellation,
 timeouts, local activities, external signals and search-attribute histories
 are not yet represented.
