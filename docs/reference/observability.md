@@ -64,9 +64,12 @@ Reporters receive typed structural tags independently from message prose:
 | `temporal.operation` | string | Stable operation identifier |
 | `temporal.duration_ms` | float | Finite non-negative elapsed milliseconds |
 | `temporal.workflow_type` | string | Registered workflow type |
-| `temporal.workflow_id` | string | Workflow ID; attached to diagnostics that name one execution (watchdog, workflow lease outcomes) |
-| `temporal.run_id` | string | Workflow run ID; attached to diagnostics that name one execution (watchdog, workflow lease outcomes) |
+| `temporal.workflow_id` | string | Workflow ID; attached to diagnostics that name one execution (watchdog, workflow and activity lease outcomes) |
+| `temporal.run_id` | string | Workflow run ID; attached to diagnostics that name one execution (watchdog, workflow and activity lease outcomes) |
 | `temporal.replaying` | bool | Whether the reported activation was replaying history |
+| `temporal.activity_id` | string | Activity ID; attached to activity lease records that name one attempt |
+| `temporal.activity_type` | string | Registered activity type of that attempt |
+| `temporal.attempt` | int | Activity attempt number reported by Core (one-based), distinguishing retries of one activity ID |
 | `temporal.job_count` | int | Jobs supplied in one activation |
 | `temporal.command_count` | int | Commands emitted by one activation |
 | `temporal.bridge_status` | string | Stable lowercase bridge status |
@@ -82,7 +85,7 @@ also has a higher-level lifecycle record:
 | Source | Current operation identifiers |
 |---|---|
 | `temporal.sdk.bridge` | `check_abi_version`, `echo`, `conformance_wait_ms`, `runtime_create`, `runtime_close`, `client_connect`, `client_disconnect`, `client_start_workflow_json`, `client_begin_start_workflow_json`, `client_poll_start_workflow_json`, `client_wait_start_workflow_json`, `client_wait_workflow_json`, `client_submit_json`, `client_await_call`, `client_release_call`, `client_cancel_workflow_json`, `client_reset_workflow_json`, `client_terminate_workflow_json`, `client_list_visibility_json`, `client_signal_workflow_json`, `client_query_workflow_json`, `client_update_workflow_json`, `client_poll_update_workflow_json`, `client_complete_async_activity_json`, `client_record_async_activity_heartbeat_json`, `worker_start`, `worker_try_poll_workflow`, `worker_wait_workflow`, `worker_complete_workflow_json`, `worker_reject_workflow_json`, `worker_try_poll_activity`, `worker_wait_activity`, `worker_wait_any`, `worker_wait_activity_completion_retry_backoff`, `worker_complete_activity_json`, `worker_reject_activity_json`, `worker_record_activity_heartbeat_json`, `worker_shutdown`, `replay_worker_start`, `replay_worker_feed_history`, `replay_worker_try_poll_workflow`, `replay_worker_wait_workflow`, `replay_worker_complete_workflow`, `replay_worker_reject_workflow`, `replay_worker_finish_input`, `replay_worker_finalize`, `replay_worker_dispose`; codec timing (Debug only): `workflow_activation_decode`, `workflow_completion_encode`, `activity_task_decode`, `activity_completion_encode` |
-| `temporal.sdk.lifecycle` | `runtime_create`, `runtime_close`, `workflow_task_rejected`, `activity_task_rejected`, `activity_completion_retry`, `worker_run_started`, `worker_run_finished`, `worker_terminal_cleanup`, `worker_terminal_cleanup_failed`, `worker_shutdown`, `worker_shutdown_failed`, `activity_lane_detached`, `worker_shutdown_abandoned_work`, `worker_shutdown_teardown_detached`, `workflow_activation_completed`, `workflow_completion_diagnostic_failed`, `workflow_activation_rejected`, `workflow_poll_not_ready`, `activity_task_completed`, `activity_async_handoff_accepted`, `activity_poll_not_ready` |
+| `temporal.sdk.lifecycle` | `runtime_create`, `runtime_close`, `workflow_task_rejected`, `activity_task_rejected`, `activity_completion_retry`, `worker_run_started`, `worker_run_finished`, `worker_terminal_cleanup`, `worker_terminal_cleanup_failed`, `worker_shutdown`, `worker_shutdown_failed`, `activity_lane_detached`, `worker_shutdown_abandoned_work`, `worker_shutdown_teardown_detached`, `workflow_activation_completed`, `workflow_completion_diagnostic_failed`, `workflow_activation_rejected`, `workflow_poll_not_ready`, `activity_task_started`, `activity_cancellation_delivered`, `activity_task_completed`, `activity_async_handoff_accepted`, `activity_poll_not_ready` |
 | `temporal.sdk.workflow` | `execution_created`, `workflow_started`, `workflow_completed`, `workflow_failed`, `workflow_task_failed`, `workflow_query_unhandled`, `workflow_query_completed`, `workflow_query_failed`, `workflow_update_unhandled`, `workflow_signal_unhandled`, `workflow_signal_received`, `workflow_signal_handled`, `workflow_cancelled`, `execution_evicted`, `activation_ignored`, `activate` |
 
 The bridge source emits a completion record for every bridge call and a
@@ -125,10 +128,31 @@ matters when diagnosing retries:
 
 | Operation | Level | Meaning |
 |---|---|---|
+| `activity_task_started` | `Debug` | The adapter is about to dispatch a start task to its registered callback (or to reject it, for example an unregistered type). Emitted before any application code runs. |
+| `activity_cancellation_delivered` | `Debug` | A Core cancellation for the running attempt was delivered to its context during a heartbeat. |
 | `activity_task_completed` | `Debug` | The native worker accepted a terminal completion for the leased task. The adapter retires that lease; it does not call the activity again. |
 | `activity_task_rejected` | `Warning` | The adapter submitted a typed task-level rejection and the lease was retired. This is acknowledged task progress, so the worker loop continues; inspect `temporal.error_kind` for the stable rejection category. |
 | `activity_completion_retry` | `Warning` | Submission of a terminal completion returned the explicitly retryable bridge status. The exact completion remains retained for a later drain, and the activity callback is not rerun. This event is a transient lease condition, not evidence that the activity ran twice. |
 | `activity_async_handoff_accepted` | `Debug` | Core accepted `Will_complete_async`, moving the task from the worker lease to the namespace-bound asynchronous lease. This is not a terminal activity result; a later `Async_handle.complete`, `fail`, or `cancel` call must retire that lease. |
+
+#### Activity correlation
+
+The adapter's `activity_task_started`, `activity_cancellation_delivered`,
+`activity_task_completed`, `activity_task_rejected`, and
+`activity_async_handoff_accepted` records carry the attempt's identity (#500):
+`temporal.workflow_id`, `temporal.run_id`, `temporal.workflow_type`,
+`temporal.activity_id`, `temporal.activity_type`, and `temporal.attempt`.
+The started record precedes the callback and the terminal record follows it,
+so application logs written by the callback fall between two SDK records for
+the same attempt. To tag those application logs directly, read the same
+fields from `Temporal.Activity.Context.info`. The task token is never logged.
+
+Two records do not carry this identity. A bare cancellation whose start this
+worker never received completes with no workflow or activity ID, because
+none is known. The worker loop's own `activity_task_rejected` and
+`activity_completion_retry` records carry only `temporal.error_kind`; use the
+adapter's correlated record for the attempt. Activity records are not
+replay-tagged: activities do not replay.
 
 The `activity_async_handoff_accepted` record therefore proves only that the
 worker-side handoff was accepted. It does not prove that a later asynchronous
@@ -269,8 +293,9 @@ optional reporter package on the application's behalf.
 
 Events contain operation names, counts, type names, stable error categories,
 latency, the replay flag, and, on the execution-scoped records named above,
-the workflow and run IDs. Applications that treat workflow IDs as sensitive
-should filter `temporal.workflow_id` in their reporter. Events do not contain
+the workflow and run IDs and, for activity lease records, the activity ID and
+attempt. Applications that treat workflow or activity IDs as sensitive should
+filter `temporal.workflow_id` and `temporal.activity_id` in their reporter. Events do not contain
 payload bytes, workflow inputs or outputs,
 credentials, Rust diagnostic strings, or arbitrary remote failure detail.
 User-controlled string tags are capped at 256 bytes. Truncation preserves valid
@@ -526,3 +551,8 @@ in the scrape, checks the global tag, and checks that every
 `workflow_activation_completed` record for the run carries its workflow ID,
 run ID, and `temporal.replaying=false`. `test/observability/test_logging.ml`
 checks the `temporal.replaying` tag on replayed and fresh executions.
+`test/runtime/test_native_activity_execution.ml` checks that activity lease
+records carry the attempt identity, bracket the callback's own logs, never
+contain the task token, and carry no identity for a bare cancellation;
+`test/observability/test_tag_normalization.ml` checks bounding of the
+activity tags.

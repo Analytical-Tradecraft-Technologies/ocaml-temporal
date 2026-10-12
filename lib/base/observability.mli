@@ -39,6 +39,20 @@ module Tag : sig
       business progress. *)
   val replaying : bool Logs.Tag.def
 
+  (** Temporal activity ID, truncated to a bounded tag length. Attached only
+      to activity lease records that name one attempt (#500); like the
+      workflow and run IDs it is an execution identifier, never a metric
+      label. *)
+  val activity_id : string Logs.Tag.def
+
+  (** Registered Temporal activity type, truncated to a bounded tag length. *)
+  val activity_type : string Logs.Tag.def
+
+  (** Non-negative activity attempt number as reported by Core (one-based for
+      real tasks). It distinguishes records for successive retries of the same
+      activity ID. *)
+  val attempt : int Logs.Tag.def
+
   (** Non-negative number of jobs supplied in one activation. *)
   val job_count : int Logs.Tag.def
 
@@ -54,8 +68,8 @@ end
 
 (** [tags ~operation ()] constructs metadata shared by current SDK boundaries.
     String values are bounded before they reach an application reporter without
-    splitting valid UTF-8 characters. Negative counts and negative, NaN, or
-    infinite durations become zero. *)
+    splitting valid UTF-8 characters. Negative counts and attempts, and
+    negative, NaN, or infinite durations, become zero. *)
 val tags :
   operation:string ->
   ?duration_ms:float ->
@@ -63,6 +77,9 @@ val tags :
   ?workflow_id:string ->
   ?run_id:string ->
   ?replaying:bool ->
+  ?activity_id:string ->
+  ?activity_type:string ->
+  ?attempt:int ->
   ?job_count:int ->
   ?command_count:int ->
   ?bridge_status:string ->

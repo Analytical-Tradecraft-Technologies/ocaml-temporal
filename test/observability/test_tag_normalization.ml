@@ -46,7 +46,25 @@ let test_bounded_tag_preserves_utf8_character_boundaries () =
   assert
     (require Observability.Tag.workflow_type tags = ascii_prefix ^ "...")
 
+(** Activity correlation tags (#500) follow the shared normalization: a
+    negative attempt becomes zero and an oversized activity ID is bounded. *)
+let test_activity_correlation_tags_are_normalized () =
+  let tags =
+    Observability.tags ~operation:"activity_correlation"
+      ~activity_id:(String.make 300 'x') ~activity_type:"charge" ~attempt:(-4)
+      ()
+  in
+  assert (require Observability.Tag.attempt tags = 0);
+  assert (require Observability.Tag.activity_type tags = "charge");
+  assert
+    (require Observability.Tag.activity_id tags = String.make 253 'x' ^ "...");
+  let tags =
+    Observability.tags ~operation:"activity_correlation" ~attempt:3 ()
+  in
+  assert (require Observability.Tag.attempt tags = 3)
+
 let () =
+  test_activity_correlation_tags_are_normalized ();
   test_invalid_numeric_metadata_becomes_zero ();
   test_valid_numeric_metadata_is_unchanged ();
   test_bounded_tag_preserves_utf8_character_boundaries ()

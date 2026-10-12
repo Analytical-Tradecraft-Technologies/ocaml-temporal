@@ -133,6 +133,21 @@ module Name_map = Map.Make (String)
 (** Name lookup is separate from token lookup because Temporal schedules by an
     activity type while Core correlates completion by an opaque token. *)
 
+(** Identity of one activity attempt, copied from its start task so the
+    adapter's lease records can be correlated with the workflow history and
+    with application logs emitted inside the callback (#500). These are
+    execution identifiers: they go only into log tags, never into metric
+    labels, completion bytes, or error messages. The task token is
+    deliberately absent because it is an opaque, credential-like value. *)
+type correlation = {
+  workflow_id : string;
+  run_id : string;
+  workflow_type : string;
+  activity_id : string;
+  activity_type : string;
+  attempt : int;
+}
+
 (** What the caller should observe after a lease is acknowledged. A rejected
     task carries the original adapter diagnostic so the caller can identify a
     bad registration or payload without inspecting the completion bytes. *)
@@ -147,7 +162,7 @@ type accepted_result =
 
 type lease = {
   token : bytes;
-  activity_type : string option;
+  correlation : correlation option;
   encoded : Encoded_completion.t;
   accepted_result : accepted_result;
   mutable retry_refusal : error_view option;
@@ -158,6 +173,11 @@ type lease = {
     token; every submission and retry sends exactly these bytes, so no retry
     re-encodes the completion or observes a later buffer mutation
     (issue #995).
+
+    [correlation] is the start task's identity when the adapter saw one; it is
+    [None] only for a bare cancellation whose start this adapter never
+    received. It is used for log correlation and the outcome's activity type,
+    never for completion encoding.
 
     [retry_refusal] records the first failure that was not explicitly
     classified as retryable. Once it is [Some], the completion is never
@@ -608,6 +628,25 @@ let task_info (start : Protocol.activity_start) : Activity_context.info =
     task_heartbeat_timeout = Option.map info_duration start.heartbeat_timeout;
   }
 
+(** Projects the log-correlation identity of a start task. The strict decoder
+    has bounded every string; [Observability.tags] bounds them again for the
+    reporter. Core's attempt is a uint32, which fits a native [int] on the
+    supported 64-bit targets. *)
+let correlation_of_start (start : Protocol.activity_start) =
+  {
+    workflow_id = start.workflow_execution.workflow_id;
+    run_id = start.workflow_execution.run_id;
+    workflow_type = start.workflow_type;
+    activity_id = start.activity_id;
+    activity_type = start.activity_type;
+    attempt = Int64.to_int start.attempt;
+  }
+
+(** The activity type exposed on a public outcome, when the lease knows it. *)
+let lease_activity_type (lease : lease) =
+  Option.map (fun (correlation : correlation) -> correlation.activity_type)
+    lease.correlation
+
 (** Finds an executable definition by the Temporal activity type. *)
 let find_definition definitions activity_type =
   match Name_map.find_opt activity_type definitions with
@@ -658,10 +697,24 @@ let build_definitions activities =
     (Ok Name_map.empty) activities
 
 (** Reports lifecycle events without allowing an observability backend defect to
-    affect lease ownership or activity execution. *)
-let report level ~operation ?error_kind () =
+    affect lease ownership or activity execution. With [correlation], the
+    record carries the attempt's workflow ID, run ID, workflow type, activity
+    ID, activity type, and attempt (#500), so a reporter can join SDK lease
+    records with application logs for the same attempt. *)
+let report level ~operation ?error_kind ?(correlation : correlation option) ()
+    =
   try
-    let tags = Observability.tags ~operation ?error_kind () in
+    let tags =
+      match correlation with
+      | None -> Observability.tags ~operation ?error_kind ()
+      | Some correlation ->
+          Observability.tags ~operation ?error_kind
+            ~workflow_id:correlation.workflow_id ~run_id:correlation.run_id
+            ~workflow_type:correlation.workflow_type
+            ~activity_id:correlation.activity_id
+            ~activity_type:correlation.activity_type
+            ~attempt:correlation.attempt ()
+    in
     Observability.report ~src:Observability.Source.lifecycle level ~tags
       "native activity worker adapter event"
   with _ -> ()
@@ -699,9 +752,12 @@ let completion_exception_error ?(retryable = false) exception_ =
     routed to that attempt's context instead of becoming a second completion:
     Core's cancellation is an update to the original start token, and the
     start's one completion remains owned by [process_start]. [observed] keeps
-    the exact Core task so the completion can report its reason and details. *)
+    the exact Core task so the completion can report its reason and details.
+    [running_correlation] lets the cancellation-delivery record name the
+    attempt it reached. *)
 type running_attempt = {
   running_token : bytes;
+  running_correlation : correlation;
   signal : Activity_context.cancellation_signal;
   mutable observed : Protocol.activity_cancel option;
 }
@@ -837,7 +893,8 @@ module Make (Supervisor : SUPERVISOR) = struct
             ignore
               (Activity_context.signal_cancellation running.signal
                  (context_cancellation cancel));
-            report Logs.Debug ~operation:"activity_cancellation_delivered" ())
+            report Logs.Debug ~operation:"activity_cancellation_delivered"
+              ~correlation:running.running_correlation ())
     | _ -> Queue.push (Deferred_task task) adapter.deferred
 
   (** Delivers pending Core activity tasks while a callback is running.
@@ -1218,22 +1275,23 @@ module Make (Supervisor : SUPERVISOR) = struct
         begin match lease.accepted_result with
         | Completed_result { kind; cancellation_details } ->
             adapter.leases <- Token_map.remove lease.token adapter.leases;
-            report Logs.Debug ~operation:"activity_task_completed" ();
+            report Logs.Debug ~operation:"activity_task_completed"
+              ?correlation:lease.correlation ();
             Ok
               (Completed
                  {
-                   activity_type = lease.activity_type;
+                   activity_type = lease_activity_type lease;
                    kind;
                    cancellation_details;
                  })
         | Rejected_result error ->
             adapter.leases <- Token_map.remove lease.token adapter.leases;
             report Logs.Warning ~operation:"activity_task_rejected"
-              ~error_kind:error.code ();
+              ~error_kind:error.code ?correlation:lease.correlation ();
             Ok
               (Rejected
                  {
-                   activity_type = lease.activity_type;
+                   activity_type = lease_activity_type lease;
                    error;
                    lease_retired = true;
                  })
@@ -1246,11 +1304,12 @@ module Make (Supervisor : SUPERVISOR) = struct
                 refuse_unless_retryable { error with retryable = false }
             | Ok () ->
                 adapter.leases <- Token_map.remove lease.token adapter.leases;
-                report Logs.Debug ~operation:"activity_async_handoff_accepted" ();
+                report Logs.Debug ~operation:"activity_async_handoff_accepted"
+                  ?correlation:lease.correlation ();
                 Ok
                   (Completed
                      {
-                       activity_type = lease.activity_type;
+                       activity_type = lease_activity_type lease;
                        kind = Deferred;
                        cancellation_details = None;
                      }))
@@ -1272,7 +1331,7 @@ module Make (Supervisor : SUPERVISOR) = struct
       retry sends unchanged (issue #995). [enqueue_and_finish] submits the
       recorded lease at once; [drain] records several and then submits them in
       token order. *)
-  let admit_completion adapter ~token ~activity_type ~completion
+  let admit_completion adapter ~token ~correlation ~completion
       ~accepted_result =
     let (completion : Protocol.completion) = completion in
     let token = Bytes.copy token in
@@ -1301,7 +1360,7 @@ module Make (Supervisor : SUPERVISOR) = struct
     let lease =
       {
         token;
-        activity_type;
+        correlation;
         encoded;
         accepted_result;
         retry_refusal = None;
@@ -1322,35 +1381,35 @@ module Make (Supervisor : SUPERVISOR) = struct
       native call so uncertain submissions retain their exact completion; only
       a [Retryable] source classification may authorize resubmission, while
       generic transport failures remain fail-closed. *)
-  let enqueue_and_finish adapter ~token ~activity_type ~completion
+  let enqueue_and_finish adapter ~token ~correlation ~completion
       ~accepted_result =
     let* lease =
-      admit_completion adapter ~token ~activity_type ~completion
+      admit_completion adapter ~token ~correlation ~completion
         ~accepted_result
     in
     finish_lease adapter lease
 
   (** Turns an adapter diagnostic into a non-retryable failure completion while
       preserving the original task token. *)
-  let reject_task_with_failure adapter ~token ~activity_type ~failure error =
+  let reject_task_with_failure adapter ~token ~correlation ~failure error =
     let completion =
       Protocol.{ task_token = Bytes.copy token; result = Failed failure }
     in
-    enqueue_and_finish adapter ~token ~activity_type ~completion
+    enqueue_and_finish adapter ~token ~correlation ~completion
       ~accepted_result:(Rejected_result error)
 
   (** Builds the standard adapter failure for registry, codec, and protocol
       errors, all of which are non-retryable because retrying cannot repair the
       worker configuration or malformed task. *)
-  let reject_task adapter ~token ~activity_type error =
-    reject_task_with_failure adapter ~token ~activity_type
+  let reject_task adapter ~token ~correlation error =
+    reject_task_with_failure adapter ~token ~correlation
       ~failure:(failure_of_error error) error
 
   (** Retires a task whose application callback raised. Without [backtrace]
       it must be called directly from the exception handler so the captured
       backtrace is the callback's; a caller that does other work first passes
       the backtrace it captured in the handler. *)
-  let reject_callback_exception ?backtrace adapter ~token ~activity_type
+  let reject_callback_exception ?backtrace adapter ~token ~correlation
       exception_ =
     let backtrace =
       match backtrace with
@@ -1363,7 +1422,7 @@ module Make (Supervisor : SUPERVISOR) = struct
     let diagnostic =
       exception_error ~path:"$.implementation" exception_
     in
-    reject_task_with_failure adapter ~token ~activity_type
+    reject_task_with_failure adapter ~token ~correlation
       ~failure:(callback_exception_failure diagnostic backtrace) diagnostic
 
   (** Reports whether an activity error claims to acknowledge cancellation. *)
@@ -1383,7 +1442,7 @@ module Make (Supervisor : SUPERVISOR) = struct
       [`Cancelled] error for a delivered Core cancellation. The error's detail
       payloads become the canceled failure's details; Core's reason and flags
       stay private outcome metadata, as for an unstarted cancellation. *)
-  let complete_acknowledged_cancellation adapter ~token ~activity_type
+  let complete_acknowledged_cancellation adapter ~token ~correlation
       (cancel : Protocol.activity_cancel) error =
     let rec details_loop reversed = function
       | [] -> Ok (List.rev reversed)
@@ -1394,7 +1453,7 @@ module Make (Supervisor : SUPERVISOR) = struct
           details_loop (payload :: reversed) rest
     in
     match details_loop [] (Base_error.view error).details with
-    | Error error -> reject_task adapter ~token ~activity_type error
+    | Error error -> reject_task adapter ~token ~correlation error
     | Ok details ->
         let completion =
           Protocol.
@@ -1403,7 +1462,7 @@ module Make (Supervisor : SUPERVISOR) = struct
               result = Cancelled (cancellation_failure ~details cancel.reason);
             }
         in
-        enqueue_and_finish adapter ~token ~activity_type ~completion
+        enqueue_and_finish adapter ~token ~correlation ~completion
           ~accepted_result:
             (Completed_result
                { kind = Cancelled; cancellation_details = cancel.details })
@@ -1416,16 +1475,16 @@ module Make (Supervisor : SUPERVISOR) = struct
       an ordinary failure before a completion is queued. *)
   let process_async_start adapter token definition
       (start : Protocol.activity_start) =
-    let activity_type = Some start.activity_type in
+    let correlation = Some (correlation_of_start start) in
     let process () =
       (* [decode_payloads], not [decode_start]: the exact heartbeat interval
          is only needed by synchronous contexts. *)
       match decode_payloads definition start with
-      | Error error -> reject_task adapter ~token ~activity_type error
+      | Error error -> reject_task adapter ~token ~correlation error
       | Ok (input, _details) ->
           (match Definition.implementation definition with
           | None ->
-              reject_task adapter ~token ~activity_type
+              reject_task adapter ~token ~correlation
                 (make_error ~path:"$.variant.activity_type" "not_executable"
                    "registered asynchronous activity has no local implementation")
           | Some implementation ->
@@ -1456,18 +1515,18 @@ module Make (Supervisor : SUPERVISOR) = struct
               (try
                  match implementation context input with
                  | exception exception_ ->
-                     reject_callback_exception adapter ~token ~activity_type
+                     reject_callback_exception adapter ~token ~correlation
                        exception_
                  | Async_activity.Completed output ->
                      (match encode_output output with
                      | Error error ->
-                         reject_task adapter ~token ~activity_type
+                         reject_task adapter ~token ~correlation
                            (application_error
                               ~path:"$.implementation.output" error)
                      | Ok payload ->
                          (match protocol_payload "$.completion.result" payload with
                          | Error error ->
-                             reject_task adapter ~token ~activity_type error
+                             reject_task adapter ~token ~correlation error
                          | Ok payload ->
                              let completion =
                                Protocol.
@@ -1476,7 +1535,7 @@ module Make (Supervisor : SUPERVISOR) = struct
                                    result = Completed payload;
                                  }
                              in
-                             enqueue_and_finish adapter ~token ~activity_type
+                             enqueue_and_finish adapter ~token ~correlation
                                ~completion
                                ~accepted_result:
                                (Completed_result
@@ -1493,9 +1552,9 @@ module Make (Supervisor : SUPERVISOR) = struct
                         failure_of_application_error diagnostic
                           implementation_error
                       with
-                     | Error error -> reject_task adapter ~token ~activity_type error
+                     | Error error -> reject_task adapter ~token ~correlation error
                      | Ok failure ->
-                         reject_task_with_failure adapter ~token ~activity_type
+                         reject_task_with_failure adapter ~token ~correlation
                            ~failure diagnostic)
                  | Async_activity.Will_complete_async handle ->
                      if start.is_local then begin
@@ -1505,7 +1564,7 @@ module Make (Supervisor : SUPERVISOR) = struct
                           The failure lease remains retryable if native
                           submission is genuinely uncertain. *)
                        ignore (Async_activity.close context_handle);
-                       reject_task adapter ~token ~activity_type
+                       reject_task adapter ~token ~correlation
                          (make_error ~path:"$.implementation.async_handle"
                             "local_async_unsupported"
                             "local activities cannot be completed asynchronously")
@@ -1516,7 +1575,7 @@ module Make (Supervisor : SUPERVISOR) = struct
                             handle
                         with
                        | Error error ->
-                           reject_task adapter ~token ~activity_type
+                           reject_task adapter ~token ~correlation
                              (application_error ~path:"$.implementation.async_handle"
                                 error)
                        | Ok () ->
@@ -1527,40 +1586,51 @@ module Make (Supervisor : SUPERVISOR) = struct
                                  result = Will_complete_async;
                                }
                            in
-                           enqueue_and_finish adapter ~token ~activity_type
+                           enqueue_and_finish adapter ~token ~correlation
                              ~completion ~accepted_result:(Async_handoff handle))
                with exception_ ->
-                 reject_task adapter ~token ~activity_type
+                 reject_task adapter ~token ~correlation
                    (exception_error ~path:"$.implementation" exception_)))
     in
     try process ()
     with exception_ ->
-      reject_task adapter ~token ~activity_type
+      reject_task adapter ~token ~correlation
         (exception_error ~path:"$.implementation" exception_)
 
-  (** Executes one start-task implementation under a final exception guard. *)
+  (** Executes one start-task implementation under a final exception guard.
+      The [activity_task_started] record is emitted before dispatch, so every
+      application log written by the callback falls between it and the
+      attempt's terminal lease record, both tagged with the same identity. *)
   let process_start adapter token (start : Protocol.activity_start) =
-    let activity_type = Some start.activity_type in
+    let identity = correlation_of_start start in
+    let correlation = Some identity in
+    report Logs.Debug ~operation:"activity_task_started" ~correlation:identity
+      ();
     (* Keep all local dispatch and codec failures on the completion path. The
        outer guard catches defects so even an exception retires this lease. *)
     let process () =
       match find_definition adapter.definitions start.activity_type with
-      | Error error -> reject_task adapter ~token ~activity_type error
+      | Error error -> reject_task adapter ~token ~correlation error
       | Ok (Registered_async_definition definition) ->
           process_async_start adapter token definition start
       | Ok (Registered_definition definition) ->
           (match Definition.implementation definition with
           | None ->
-              reject_task adapter ~token ~activity_type
+              reject_task adapter ~token ~correlation
                 (make_error ~path:"$.variant.activity_type" "not_executable"
                    "registered activity has no local implementation")
           | Some implementation ->
               (match decode_start definition start with
-              | Error error -> reject_task adapter ~token ~activity_type error
+              | Error error -> reject_task adapter ~token ~correlation error
               | Ok (input, details, heartbeat_timeout) ->
                   let signal = Activity_context.cancellation_signal () in
                   let running =
-                    { running_token = Bytes.copy token; signal; observed = None }
+                    {
+                      running_token = Bytes.copy token;
+                      running_correlation = identity;
+                      signal;
+                      observed = None;
+                    }
                   in
                   with_delivery adapter (fun () ->
                       adapter.running <- Some running);
@@ -1594,14 +1664,14 @@ module Make (Supervisor : SUPERVISOR) = struct
                   (match returned with
                       | Error (exception_, backtrace) ->
                           reject_callback_exception ~backtrace adapter ~token
-                            ~activity_type exception_
+                            ~correlation exception_
                       | Ok (Error implementation_error)
                         when is_cancelled_error implementation_error
                              && Option.is_some delivered ->
                           (* The callback acknowledged a cancellation that
                              Core actually requested: report it as one. *)
                           complete_acknowledged_cancellation adapter ~token
-                            ~activity_type (Option.get delivered)
+                            ~correlation (Option.get delivered)
                             implementation_error
                       | Ok (Error implementation_error) ->
                           let diagnostic =
@@ -1614,17 +1684,17 @@ module Make (Supervisor : SUPERVISOR) = struct
                                 implementation_error
                             with
                             | Error error ->
-                                reject_task adapter ~token ~activity_type error
+                                reject_task adapter ~token ~correlation error
                             | Ok failure ->
                                 reject_task_with_failure adapter ~token
-                                  ~activity_type ~failure diagnostic
+                                  ~correlation ~failure diagnostic
                           end
                       | Ok (Ok output) ->
                           (match
                              Codec.encode (Definition.output definition) output
                            with
                           | Error error ->
-                              reject_task adapter ~token ~activity_type
+                              reject_task adapter ~token ~correlation
                                 (application_error
                                    ~path:"$.implementation.output" error)
                           | Ok payload ->
@@ -1632,7 +1702,7 @@ module Make (Supervisor : SUPERVISOR) = struct
                                  protocol_payload "$.completion.result" payload
                                with
                               | Error error ->
-                                  reject_task adapter ~token ~activity_type error
+                                  reject_task adapter ~token ~correlation error
                               | Ok payload ->
                                   let completion =
                                     Protocol.
@@ -1642,7 +1712,7 @@ module Make (Supervisor : SUPERVISOR) = struct
                                       }
                                   in
                                   enqueue_and_finish adapter ~token
-                                    ~activity_type ~completion
+                                    ~correlation ~completion
                                     ~accepted_result:
                                     (Completed_result
                                        {
@@ -1652,7 +1722,7 @@ module Make (Supervisor : SUPERVISOR) = struct
     in
     try process ()
     with exception_ ->
-      reject_task adapter ~token ~activity_type
+      reject_task adapter ~token ~correlation
         (exception_error ~path:"$.implementation" exception_)
 
   (** Builds the canceled completion and accepted result for a cancellation
@@ -1670,11 +1740,11 @@ module Make (Supervisor : SUPERVISOR) = struct
 
   (** Submits the cancelled completion for a task whose callback never ran:
       a bare cancellation, or a deferred start whose cancellation was also
-      deferred. [activity_type] is known only in the second case. *)
-  let process_cancel ?activity_type adapter token
+      deferred. [correlation] is known only in the second case. *)
+  let process_cancel ?correlation adapter token
       (cancel : Protocol.activity_cancel) =
     let completion, accepted_result = cancelled_completion token cancel in
-    enqueue_and_finish adapter ~token ~activity_type ~completion
+    enqueue_and_finish adapter ~token ~correlation ~completion
       ~accepted_result
 
   (** Removes every deferred cancellation for [token] and returns the first.
@@ -1712,8 +1782,8 @@ module Make (Supervisor : SUPERVISOR) = struct
       | Protocol.Start start -> (
           match take_deferred_cancel adapter token with
           | Some cancel ->
-              process_cancel ~activity_type:start.activity_type adapter token
-                cancel
+              process_cancel ~correlation:(correlation_of_start start) adapter
+                token cancel
           | None -> process_start adapter token start)
       | Cancel cancel -> process_cancel adapter token cancel
 
@@ -1758,7 +1828,7 @@ module Make (Supervisor : SUPERVISOR) = struct
                       { kind = Failed; cancellation_details = None } )
             in
             admit_completion adapter ~token
-              ~activity_type:(Some start.activity_type) ~completion
+              ~correlation:(Some (correlation_of_start start)) ~completion
               ~accepted_result
             |> Result.map ignore
         | Ok (), (Deferred_task { variant = Cancel _; _ } | Deferred_poll_error _)
