@@ -956,6 +956,46 @@ let test_async_heartbeat_single_encode () =
   | Ok () -> ()
   | Error _ -> failwith "completed async heartbeat handle still blocked drain"
 
+(** The retry cache is keyed on the handle's request identity, not on
+    structural equality of the operation (#1001). A [Fail] without an explicit
+    [error_type] and one with [error_type = "activity"] are structurally
+    different but send the same failure type for category [Activity], so the
+    handle admits the second as the exact retry of the first; it must resend
+    the first submission's string physically rather than re-encode it. *)
+let test_async_retry_reuses_bytes_for_equal_request_key () =
+  let token = Bytes.of_string "async-retry-key-token" in
+  let supervisor, worker, handle, calls =
+    heartbeat_status_fixture ~name:"async_retry_request_key" ~token
+  in
+  supervisor.reject_next_async_completion := true;
+  let implicit =
+    Temporal.Error.make ~category:`Activity ~message:"external work failed" ()
+  in
+  (match Temporal.Activity.Async_handle.fail handle implicit with
+  | Error error when not (Temporal.Error.view error).non_retryable -> ()
+  | Error _ -> failwith "uncertain async failure was reported as non-retryable"
+  | Ok () -> failwith "rejected async failure was reported as accepted");
+  let explicit =
+    Temporal.Error.make ~error_type:"activity" ~category:`Activity
+      ~message:"external work failed" ()
+  in
+  (match Temporal.Activity.Async_handle.fail handle explicit with
+  | Ok () -> ()
+  | Error error ->
+      failwith ("equal-key async failure retry was refused: "
+        ^ Temporal.Error.message error));
+  if !calls <> 1 then failwith "async failure retry reran the callback";
+  (match !(supervisor.async_completion_documents), !(supervisor.async_completions) with
+  | [ retry; first ], [ accepted ] ->
+      if not (retry == first) then
+        failwith "equal-key async retry submitted a re-encoded document";
+      if Protocol.encode_completion accepted <> Ok first then
+        failwith "async failure bytes are not the canonical encoding"
+  | _ -> failwith "equal-key async retry recorded unexpected submissions");
+  match Worker.drain worker with
+  | Ok () when !(supervisor.async_leased) = [] -> ()
+  | _ -> failwith "accepted async failure retry left completion debt"
+
 (** A native [Connection] heartbeat result is uncertain, not terminal: the
     client did not consume the worker completion lease, and the server activity
     can still be live. The handle and lease survive, and because a heartbeat is
@@ -1931,6 +1971,7 @@ let () =
   test_async_invalid_encoding_preserves_handle ();
   test_async_completion_retry ();
   test_async_heartbeat_single_encode ();
+  test_async_retry_reuses_bytes_for_equal_request_key ();
   test_async_terminal_rejection_closes_lease ();
   test_async_connection_heartbeat_keeps_handle ();
   test_async_rejected_completion_keeps_live_handle ();

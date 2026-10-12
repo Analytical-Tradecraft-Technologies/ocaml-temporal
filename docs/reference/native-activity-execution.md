@@ -54,12 +54,15 @@ and never reaches the bridge. The supervisor copies the bytes into the C call
 unchanged.
 
 An asynchronous terminal request whose native outcome was uncertain
-(`Retryable_submission`) keeps its operation and its encoded bytes on the
-adapter's async lease. The handle allows only that identical operation until
-it is resolved, and the adapter resends the physically identical string
-instead of preparing and encoding the completion again. Any other completion
-outcome clears the retained bytes, and an operation that does not structurally
-match them is prepared afresh.
+(`Retryable_submission`) keeps its request key (`Async_activity.operation_key`)
+and its encoded bytes on the adapter's async lease. The handle admits only a
+request with that same key until it is resolved. Equal keys mean the same wire
+request even when the operations differ structurally (for example a `Fail`
+whose explicit `error_type` equals its category's default), so the adapter
+resends the physically identical string for every admitted retry instead of
+preparing and encoding the completion again. Any other completion outcome
+clears the retained bytes, and a request with a different key is prepared
+afresh and never sent them.
 
 ## Asynchronous completion
 

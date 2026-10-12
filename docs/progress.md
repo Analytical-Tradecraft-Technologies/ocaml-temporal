@@ -26,14 +26,17 @@ before any supervisor call, and `Record_activity_heartbeat` /
 `Record_async_activity_heartbeat` carry that value so the supervisor copies
 its bytes into C unchanged. `Protocol_adapter.encode_activity_heartbeat` is
 gone. An async completion whose submission had an uncertain outcome keeps its
-encoded bytes on its lease, and the exact retry the handle allows resends that
-same string instead of re-preparing and re-encoding it. The ABI, Rust code and
+encoded bytes on its lease, keyed on the handle's own request key
+(`Async_activity.operation_key`, now exported), so every retry the handle
+allows resends that same string instead of re-preparing and re-encoding it. The ABI, Rust code and
 JSON documents are unchanged.
 
 The runtime fakes decode submitted heartbeats strictly and check they are
 canonical, and never encode a submission. `test_async_completion_retry` now
 requires the retried async completion to be physically the string submitted
-first (`==`). New tests cover a single canonical async heartbeat document that
+first (`==`), and `test_async_retry_reuses_bytes_for_equal_request_key` does
+the same for a `Fail` retried with an explicit `error_type` equal to its
+category's default. New tests cover a single canonical async heartbeat document that
 a later caller-buffer mutation cannot change, encoder-rejected synchronous and
 asynchronous heartbeats that never reach the supervisor, and the supervisor's
 heartbeat bytes and missing-worker rejection.

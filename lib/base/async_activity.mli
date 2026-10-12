@@ -125,3 +125,12 @@ val heartbeat : 'output handle -> Payload.t list -> submit_result
     operation is in flight returns an outstanding-operation error instead of
     silently invalidating that request. *)
 val close : 'output handle -> submit_result
+
+(** The canonical request identity the handle uses to permit a retry after an
+    uncertain submission: two operations with equal keys produce the same wire
+    request, even when they differ structurally (for example a [Fail] whose
+    explicit [error_type] equals its category's default). The native adapter
+    keys its retained encoded bytes on this value so every retry the handle
+    admits resends exactly those bytes. It is an equality key, not a digest or
+    an authentication mechanism, and contains payload bytes. *)
+val operation_key : operation -> string

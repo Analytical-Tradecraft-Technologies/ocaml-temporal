@@ -177,24 +177,23 @@ type lease = {
     task leases because later operations use the namespace-bound Temporal
     client and must never be sent through the worker completion ledger.
 
-    [uncertain_completion] holds a terminal operation whose last submission
-    had an unknown native outcome ([Retryable_submission]), together with the
-    bytes of its single encoder pass. The handle only lets that same operation
-    through until it is resolved, and a structurally equal retry resends
-    these physically identical bytes instead of preparing and encoding the
-    completion again (issue #1001). Any other completion outcome clears it.
-    The retained operation is the adapter's own reference (the base handle
-    copied its payloads), and a mismatch merely falls back to a fresh
-    encode. *)
+    [uncertain_completion] holds the request key
+    ([Async_activity.operation_key]) of a terminal operation whose last
+    submission had an unknown native outcome ([Retryable_submission]),
+    together with the bytes of its single encoder pass. The handle admits
+    only a request with that same key until it is resolved, and equal keys
+    mean the same wire request even when the operations differ structurally,
+    so every admitted retry resends these physically identical bytes instead
+    of preparing and encoding the completion again (issue #1001). Any other
+    completion outcome clears it, and a request with a different key is
+    prepared afresh, so it is never sent the retained bytes. *)
 type async_lease =
   | Async_lease :
       {
         token : bytes;
         handle : 'output Temporal_base.Async_activity.handle;
         mutable in_flight : bool;
-        mutable uncertain_completion :
-          (Temporal_base.Async_activity.operation * Encoded_completion.t)
-          option;
+        mutable uncertain_completion : (string * Encoded_completion.t) option;
       }
       -> async_lease
 
@@ -1115,11 +1114,18 @@ module Make (Supervisor : SUPERVISOR) = struct
               (base_operation_error "async activity handle" (make_error
                 ~path:"$.async_handle" "busy" "asynchronous activity operation is already in flight")))
         | Some (Async_lease lease) ->
+            (* The handle's own request identity; computed only while an
+               uncertain completion is retained. *)
+            let key =
+              lazy (Async_activity.operation_key operation)
+            in
             let prepared =
               match lease.uncertain_completion with
-              | Some (retained, encoded) when retained = operation ->
-                  (* An exact retry of an uncertain terminal submission:
-                     resend the bytes already validated and encoded for it. *)
+              | Some (retained_key, encoded)
+                when String.equal retained_key (Lazy.force key) ->
+                  (* A retry of an uncertain terminal submission that the
+                     handle admitted as the same request: resend the bytes
+                     already validated and encoded for it. *)
                   Ok (Async_completion encoded)
               | Some _ | None -> (
                   try prepare_async_request ~token operation with exception_ ->
@@ -1170,7 +1176,8 @@ module Make (Supervisor : SUPERVISOR) = struct
                     (match (request, result) with
                     | Async_completion encoded,
                       Error (Async_activity.Retryable_submission _) ->
-                        lease.uncertain_completion <- Some (operation, encoded)
+                        lease.uncertain_completion <-
+                          Some (Lazy.force key, encoded)
                     | Async_completion _, _ -> lease.uncertain_completion <- None
                     | Async_heartbeat _, _ -> ());
                     result))
