@@ -56,6 +56,13 @@ the bounded set and neither execution ID in the scrape, and saw every
 open under #500: activity-scoped log correlation (activity ID, attempt),
 OCaml-only executor/admission metrics, OTLP export, and the sample
 deployment that induces poll failure, saturation and a shutdown timeout.
+## 2026-10-12: Benchmark record for adaptive idle pacing (#994)
+
+`docs/reference/benchmark-harness.md` now records the live fan-out results
+before and after #994's adaptive idle pacing (PR #996): one-execution p50
+10.89 s to 5.94 s, eight-execution p50 107.9 s to 79.1 s, with the Windows
+timer-granularity limitation tracked in #1008. Documentation only.
+
 ## 2026-10-11: Live fan-out benchmark and JSON bridge attribution (#528)
 
 `make bench-fanout-live` runs a high fan-out workload against the Compose
