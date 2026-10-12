@@ -34,24 +34,89 @@ let reserved_tag_names =
 (** Result-bind notation keeps validation a flat sequence of checks. *)
 let ( let* ) = Result.bind
 
-(** Whether [port] is a plain decimal TCP port. Signs, spaces, and leading
-    [+] are rejected so OCaml and Rust agree on the accepted spelling. *)
+(** Whether [text] is a non-empty run of ASCII decimal digits. *)
+let all_digits text =
+  text <> "" && String.for_all (fun character -> character >= '0' && character <= '9') text
+
+(** Whether [text] is a canonical decimal number of at most [max_digits]
+    digits: no sign, no spaces, and no leading zero except ["0"] itself, so
+    no spelling is ambiguous between decimal and octal. *)
+let canonical_decimal ~max_digits text =
+  all_digits text
+  && String.length text <= max_digits
+  && (text = "0" || text.[0] <> '0')
+
+(** Whether [port] is a canonical decimal TCP port, 0 (ephemeral) to 65535. *)
 let valid_port port =
-  port <> ""
-  && String.length port <= 5
-  && String.for_all (fun character -> character >= '0' && character <= '9') port
-  && int_of_string port <= 65_535
+  canonical_decimal ~max_digits:5 port && int_of_string port <= 65_535
 
-(** Whether [host] parses as a numeric address of the expected family.
-    [Unix.inet_addr_of_string] never resolves names, so a host name fails
-    here rather than being looked up. *)
-let numeric_address ~ipv6 host =
-  match Unix.inet_addr_of_string host with
-  | address -> Unix.is_inet6_addr address = ipv6
-  | exception Failure _ -> false
+(** Whether [host] is a dotted-quad IPv4 address: exactly four canonical
+    decimal octets 0..255. This parser is deliberately platform-independent;
+    system parsers such as [Unix.inet_addr_of_string] on Windows accept
+    shorthand ([1], [127.1]), octal, and hexadecimal forms. *)
+let valid_ipv4 host =
+  match String.split_on_char '.' host with
+  | [ _; _; _; _ ] as octets ->
+      List.for_all
+        (fun octet ->
+          canonical_decimal ~max_digits:3 octet && int_of_string octet <= 255)
+        octets
+  | _ -> false
 
-(** Validates [a.b.c.d:port] or [[ipv6]:port]. Rust's [SocketAddr] parser
-    is the authority; this check only rejects obvious mistakes early. *)
+(** Whether [group] is one IPv6 group of 1 to 4 hexadecimal digits. *)
+let valid_hex_group group =
+  let length = String.length group in
+  length >= 1 && length <= 4
+  && String.for_all
+       (function '0' .. '9' | 'a' .. 'f' | 'A' .. 'F' -> true | _ -> false)
+       group
+
+(** Number of 16-bit groups in a colon-separated IPv6 fragment, or [None] if
+    it is malformed. [allow_ipv4_tail] permits a final dotted quad, which
+    counts as two groups. An empty fragment has zero groups. *)
+let ipv6_groups ~allow_ipv4_tail fragment =
+  if fragment = "" then Some 0
+  else
+    let parts = String.split_on_char ':' fragment in
+    let count = List.length parts in
+    let rec check index = function
+      | [] -> Some 0
+      | [ last ] when index = count - 1 && allow_ipv4_tail && valid_ipv4 last ->
+          Some 2
+      | part :: rest ->
+          if valid_hex_group part then
+            Option.map (fun groups -> groups + 1) (check (index + 1) rest)
+          else None
+    in
+    check 0 parts
+
+(** Whether [host] is an RFC 4291 textual IPv6 address: eight groups, or
+    fewer with exactly one [::], optionally ending in a dotted quad. Zone
+    identifiers ([%scope]) are rejected. *)
+let valid_ipv6 host =
+  let find_double_colon () =
+    let rec search index =
+      if index + 1 >= String.length host then None
+      else if host.[index] = ':' && host.[index + 1] = ':' then Some index
+      else search (index + 1)
+    in
+    search 0
+  in
+  match find_double_colon () with
+  | None -> ipv6_groups ~allow_ipv4_tail:true host = Some 8
+  | Some index -> (
+      let head = String.sub host 0 index in
+      let tail = String.sub host (index + 2) (String.length host - index - 2) in
+      (* A second [::], or a stray colon next to it, leaves an empty group
+         that [valid_hex_group] rejects. *)
+      match
+        (ipv6_groups ~allow_ipv4_tail:false head, ipv6_groups ~allow_ipv4_tail:true tail)
+      with
+      | Some head_groups, Some tail_groups -> head_groups + tail_groups <= 7
+      | _ -> false)
+
+(** Validates [a.b.c.d:port] or [[ipv6]:port] with the strict grammar above,
+    identically on every platform; Rust applies the same grammar. *)
 let validate_bind_address address =
   let invalid =
     Error
@@ -70,8 +135,8 @@ let validate_bind_address address =
         let host_ok =
           let length = String.length host in
           if length >= 2 && host.[0] = '[' && host.[length - 1] = ']' then
-            numeric_address ~ipv6:true (String.sub host 1 (length - 2))
-          else (not (String.contains host ':')) && numeric_address ~ipv6:false host
+            valid_ipv6 (String.sub host 1 (length - 2))
+          else valid_ipv4 host
         in
         if host_ok && valid_port port then Ok () else invalid
 

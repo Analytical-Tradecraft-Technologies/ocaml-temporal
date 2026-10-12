@@ -154,6 +154,31 @@ fn valid_tag_name(name: &str) -> bool {
         && !RESERVED_METRICS_TAG_NAMES.contains(&name)
 }
 
+/// Parses a bind address with the grammar `Temporal_base.Metrics_config`
+/// documents, identically on every platform: a dotted-quad IPv4 address of
+/// four canonical decimal octets, or a bracketed IPv6 address without a zone
+/// identifier, then a canonical decimal port 0..=65535 (no leading zeros).
+///
+/// Rust's `Ipv4Addr` parser already rejects shorthand (`1`, `127.1`), octal
+/// (`0177.0.0.1`), and hexadecimal forms. The explicit checks pin the
+/// remaining spellings the OCaml validator also rejects (zone identifiers,
+/// zero-padded ports), so both sides accept exactly the same text.
+fn parse_bind_address(text: &str) -> Option<SocketAddr> {
+    let (host, port) = text.rsplit_once(':')?;
+    let canonical_port = !port.is_empty()
+        && port.len() <= 5
+        && port.bytes().all(|byte| byte.is_ascii_digit())
+        && (port == "0" || !port.starts_with('0'));
+    if !canonical_port || host.contains('%') {
+        return None;
+    }
+    let address = SocketAddr::from_str(text).ok()?;
+    // A bracketed host must be IPv6 and a bare one IPv4. The standard parser
+    // already enforces this; the check keeps the contract explicit.
+    let bracketed = host.starts_with('[') && host.ends_with(']');
+    (bracketed == address.is_ipv6()).then_some(address)
+}
+
 /// Decodes and validates one telemetry document.
 ///
 /// Parser diagnostics are reduced to one constant message for the same reason
@@ -171,7 +196,7 @@ pub(crate) fn parse_telemetry_config(bytes: &[u8]) -> Result<TelemetryConfig, Fa
 /// Applies the documented bounds to one Prometheus configuration.
 fn validate_prometheus(config: &PrometheusConfig) -> Result<(), Failure> {
     if config.bind_address.len() > MAX_METRICS_BIND_ADDRESS_BYTES
-        || SocketAddr::from_str(&config.bind_address).is_err()
+        || parse_bind_address(&config.bind_address).is_none()
     {
         return Err(invalid(
             "metrics bind_address must be an IP socket address such as 127.0.0.1:9464".to_owned(),
@@ -222,9 +247,8 @@ pub(crate) fn start_metrics(
     let Some(prometheus) = &config.prometheus else {
         return Ok(None);
     };
-    let socket_addr = SocketAddr::from_str(&prometheus.bind_address).map_err(|_error| {
-        invalid("metrics bind_address must be an IP socket address".to_owned())
-    })?;
+    let socket_addr = parse_bind_address(&prometheus.bind_address)
+        .ok_or_else(|| invalid("metrics bind_address must be an IP socket address".to_owned()))?;
     let global_tags: HashMap<String, String> = prometheus
         .global_tags
         .iter()

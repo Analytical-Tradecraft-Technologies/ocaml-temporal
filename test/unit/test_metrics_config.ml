@@ -34,10 +34,37 @@ let rejected ?global_tags ?(secret = "never-echoed") bind_address =
 let test_bind_addresses () =
   List.iter
     (fun address -> ignore (accepted address))
-    [ "127.0.0.1:9464"; "0.0.0.0:0"; "[::1]:9464"; "[::]:65535" ];
+    [
+      "127.0.0.1:9464";
+      "0.0.0.0:0";
+      "255.255.255.255:1";
+      "[::1]:9464";
+      "[::]:65535";
+      "[fe80::1:2]:80";
+      "[2001:db8:0:0:0:0:0:1]:443";
+      "[::ffff:192.0.2.1]:9464";
+    ];
+  (* Shorthand, octal, and hexadecimal IPv4 spellings that some platform
+     resolvers (notably Windows) accept must be rejected everywhere. *)
   List.iter rejected
     [
       "";
+      "1:9464";
+      "127.1:9464";
+      "127.0.1:9464";
+      "0x7f.0.0.1:9464";
+      "0177.0.0.1:9464";
+      "127.0.0.01:9464";
+      "256.0.0.1:9464";
+      "127.0.0.1.1:9464";
+      ":9464";
+      "[]:9464";
+      "127.0.0.1:09464";
+      "[fe80::1%1]:80";
+      "[1:2:3:4:5:6:7:8:9]:80";
+      "[1::2::3]:80";
+      "[1:2:3:4:5:6:7::8]:80";
+      "[12345::1]:80";
       "localhost:9464";
       "127.0.0.1";
       "127.0.0.1:";

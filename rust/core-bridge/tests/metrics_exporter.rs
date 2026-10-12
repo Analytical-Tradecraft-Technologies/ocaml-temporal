@@ -192,6 +192,18 @@ fn invalid_documents_are_rejected_before_anything_is_published() {
         r#"{"prometheus":{}}"#.to_owned(),
         r#"{"prometheus":{"bind_address":"localhost:9464"}}"#.to_owned(),
         r#"{"prometheus":{"bind_address":"127.0.0.1"}}"#.to_owned(),
+        // Shorthand, octal, hexadecimal, and zero-padded spellings that some
+        // platform resolvers accept are rejected on every platform, matching
+        // the OCaml validator.
+        r#"{"prometheus":{"bind_address":"1:9464"}}"#.to_owned(),
+        r#"{"prometheus":{"bind_address":"127.1:9464"}}"#.to_owned(),
+        r#"{"prometheus":{"bind_address":"0x7f.0.0.1:9464"}}"#.to_owned(),
+        r#"{"prometheus":{"bind_address":"0177.0.0.1:9464"}}"#.to_owned(),
+        r#"{"prometheus":{"bind_address":":9464"}}"#.to_owned(),
+        r#"{"prometheus":{"bind_address":"127.0.0.1:"}}"#.to_owned(),
+        r#"{"prometheus":{"bind_address":"127.0.0.1:09464"}}"#.to_owned(),
+        r#"{"prometheus":{"bind_address":"[fe80::1%1]:80"}}"#.to_owned(),
+        r#"{"prometheus":{"bind_address":"[127.0.0.1]:80"}}"#.to_owned(),
         r#"{"prometheus":{"bind_address":"127.0.0.1:0","extra":true}}"#.to_owned(),
         r#"{"prometheus":{"bind_address":"127.0.0.1:0","global_tags":[{"name":"task_queue","value":"x"}]}}"#.to_owned(),
         r#"{"prometheus":{"bind_address":"127.0.0.1:0","global_tags":[{"name":"__x","value":"x"}]}}"#.to_owned(),

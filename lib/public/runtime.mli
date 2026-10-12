@@ -53,7 +53,9 @@ module Metrics : sig
 
       [bind_address] is an IP socket address such as ["0.0.0.0:9464"],
       ["127.0.0.1:9464"], or ["[::1]:9464"]; host names are rejected so the
-      listening interface is explicit. Port [0] picks a free port, which
+      listening interface is explicit. IPv4 must be four plain decimal
+      octets (shorthand such as ["127.1"], octal, and hexadecimal forms are
+      rejected on every platform) and the port has no leading zeros. Port [0] picks a free port, which
       {!val-metrics_address} then reports. [global_tags] adds constant labels
       (for example [("deployment", "blue")]) to every series: at most 16,
       each name matching [[A-Za-z_][A-Za-z0-9_]*] (at most 64 bytes, no

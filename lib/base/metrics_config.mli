@@ -28,9 +28,13 @@ val reserved_tag_names : string list
 
 (** [prometheus ~bind_address ()] validates a Prometheus scrape endpoint.
 
-    [bind_address] is an IP socket address: [a.b.c.d:port] or
-    [[ipv6]:port]; host names are rejected so the listening interface is
-    explicit. Port [0] selects an ephemeral port. Each global tag name must
+    [bind_address] is an IP socket address: [a.b.c.d:port] with exactly
+    four canonical decimal octets (no shorthand such as [127.1], and no
+    octal, hexadecimal, or zero-padded octets), or [[ipv6]:port] without a
+    zone identifier; host names are rejected so the listening interface is
+    explicit. The port is canonical decimal (no leading zeros) from [0] to
+    [65535]; port [0] selects an ephemeral port. The grammar is the same on
+    every platform and matches the Rust bridge. Each global tag name must
     match [[A-Za-z_][A-Za-z0-9_]*], be at most {!max_tag_name_bytes} bytes,
     not start with [__], not be in {!reserved_tag_names}, and be unique;
     each value must be 1 to {!max_tag_value_bytes} bytes with no control
