@@ -182,11 +182,6 @@ module Native : sig
         [None], so one undecodable task cannot end [Worker.run]. A failed
         rejection keeps the [Protocol] error. *)
 
-    val encode_activity_heartbeat :
-      Temporal_protocol.Activity_protocol.heartbeat ->
-      (bytes, Temporal_core_bridge.Native_bridge.error) result
-    (** Canonically serializes and reparses one activity heartbeat. *)
-
     val expired_rpc_deadline_error : Temporal_core_bridge.Native_bridge.error
     (** The [Connection] failure with the closed [rpc] [deadline_exceeded]
         document that Rust returns when an RPC budget expires. The supervisor
@@ -592,13 +587,18 @@ module Native : sig
             the namespace-bound client path, with the same single-encode
             contract as [Complete_activity]. *)
     | Record_activity_heartbeat :
-        Temporal_protocol.Activity_protocol.heartbeat -> unit operation
+        Temporal_protocol.Encoded_activity_heartbeat.t -> unit operation
         (** Records progress for a leased activity without retiring it. The
             operation is acknowledgement-only; cancellation, pause, and reset
-            flags arrive later as an activity Cancel task from Core. *)
+            flags arrive later as an activity Cancel task from Core. The
+            heartbeat arrives as the canonical bytes of its single encoder
+            pass ([Encoded_activity_heartbeat.encode]), so it is already
+            validated; the supervisor copies it into the C call without
+            encoding it again (issue #1001). *)
     | Record_async_activity_heartbeat :
-        Temporal_protocol.Activity_protocol.heartbeat -> unit operation
-        (** Records progress for an admitted asynchronous activity. *)
+        Temporal_protocol.Encoded_activity_heartbeat.t -> unit operation
+        (** Records progress for an admitted asynchronous activity, with the
+            same single-encode contract as [Record_activity_heartbeat]. *)
     | Shutdown_worker : unit operation
     | Disconnect_client : unit operation
     | Client_submit : 'value client_rpc -> 'value client_call operation

@@ -9,6 +9,7 @@
 
 module Protocol = Temporal_protocol.Activity_protocol
 module Encoded_completion = Temporal_protocol.Encoded_activity_completion
+module Encoded_heartbeat = Temporal_protocol.Encoded_activity_heartbeat
 module Definition = Temporal_base.Definition
 module Codec = Temporal_base.Codec
 module Base_error = Temporal_base.Error
@@ -39,10 +40,13 @@ module type SUPERVISOR = sig
      never consults the worker task-token ledger. *)
   val complete_async_activity :
     t -> Encoded_completion.t -> (unit, error) result
-  val record_activity_heartbeat : t -> Protocol.heartbeat -> (unit, error) result
+  (* Both heartbeat calls likewise receive the canonical bytes from the
+     adapter's single encoder pass (issue #1001) and never encode again. *)
+  val record_activity_heartbeat :
+    t -> Encoded_heartbeat.t -> (unit, error) result
   (* Records heartbeat details through the namespace-bound async handle. *)
   val record_async_activity_heartbeat :
-    t -> Protocol.heartbeat -> (unit, error) result
+    t -> Encoded_heartbeat.t -> (unit, error) result
   val error_code : error -> string
   val error_message : error -> string
   val error_is_retryable : error -> bool
@@ -200,13 +204,25 @@ type lease = {
 (** An async lease is the capability retained after Core accepts
     [WillCompleteAsync]. It is deliberately kept in a separate map from worker
     task leases because later operations use the namespace-bound Temporal
-    client and must never be sent through the worker completion ledger. *)
+    client and must never be sent through the worker completion ledger.
+
+    [uncertain_completion] holds the request key
+    ([Async_activity.operation_key]) of a terminal operation whose last
+    submission had an unknown native outcome ([Retryable_submission]),
+    together with the bytes of its single encoder pass. The handle admits
+    only a request with that same key until it is resolved, and equal keys
+    mean the same wire request even when the operations differ structurally,
+    so every admitted retry resends these physically identical bytes instead
+    of preparing and encoding the completion again (issue #1001). Any other
+    completion outcome clears it, and a request with a different key is
+    prepared afresh, so it is never sent the retained bytes. *)
 type async_lease =
   | Async_lease :
       {
         token : bytes;
         handle : 'output Temporal_base.Async_activity.handle;
         mutable in_flight : bool;
+        mutable uncertain_completion : (string * Encoded_completion.t) option;
       }
       -> async_lease
 
@@ -749,6 +765,15 @@ let encode_completion completion =
        ~operation:"activity_completion_encode" (fun () ->
          Encoded_completion.encode completion))
 
+(** Validates and serializes one heartbeat in its single strict encoder pass,
+    for both the synchronous context and an asynchronous handle. The
+    supervisor submits the returned bytes unchanged (issue #1001), so an
+    encoder rejection keeps the heartbeat away from the native bridge. *)
+let encode_heartbeat ~path heartbeat =
+  Result.map_error
+    (fun error -> protocol_error ~path error)
+    (Encoded_heartbeat.encode heartbeat)
+
 (** Converts a supervisor completion exception to a stable diagnostic without
     revealing the opaque token or native exception object. *)
 let completion_exception_error ?(retryable = false) exception_ =
@@ -973,11 +998,22 @@ module Make (Supervisor : SUPERVISOR) = struct
       in
       match convert 0 [] payloads with
       | Error _ as error -> error
-      | Ok details ->
+      | Ok details -> (
           let heartbeat = Protocol.{ task_token = Bytes.copy token; details } in
+          (* The heartbeat's only encoder pass; a rejection is a codec error
+             in user-supplied details and never reaches the supervisor. *)
+          match encode_heartbeat ~path:"$.heartbeat" heartbeat with
+          | Error error ->
+              Error
+                (Base_error.make ~category:`Codec
+                   ~message:(
+                     Printf.sprintf "activity heartbeat rejected at %s: %s"
+                       error.path error.message)
+                   ())
+          | Ok encoded -> (
           try
             match
-              Supervisor.record_activity_heartbeat adapter.supervisor heartbeat
+              Supervisor.record_activity_heartbeat adapter.supervisor encoded
             with
             | Ok () -> Ok ()
             | Error source_error ->
@@ -1000,7 +1036,7 @@ module Make (Supervisor : SUPERVISOR) = struct
                  ~message:(
                    Printf.sprintf "activity heartbeat failed (%s): %s"
                      source.code source.message)
-                 ())
+                 ())))
     in
     (* Record first, then deliver: Core can only learn of a server-side
        cancellation from a heartbeat response, and the sweep runs even when
@@ -1043,12 +1079,12 @@ module Make (Supervisor : SUPERVISOR) = struct
       ()
 
   (** Owned, fully validated requests ready to cross the supervisor boundary.
-      A completion is carried as its single encoder pass's canonical bytes,
-      which the supervisor submits unchanged. Preparing these values never
-      changes either lease ledger. *)
+      Each is carried as its single encoder pass's canonical bytes, which the
+      supervisor submits unchanged (issues #995 and #1001). Preparing these
+      values never changes either lease ledger. *)
   type async_request =
     | Async_completion of Encoded_completion.t
-    | Async_heartbeat of Protocol.heartbeat
+    | Async_heartbeat of Encoded_heartbeat.t
 
   (** Copies and validates an entire late operation before any native call.
       Payload conversion alone cannot detect duplicate metadata or wire limits;
@@ -1065,8 +1101,8 @@ module Make (Supervisor : SUPERVISOR) = struct
       in
       loop [] payloads
     in
-    (* Build the typed request first; a completion is then encoded exactly
-       once below and only its bytes enter [async_request]. *)
+    (* Build the typed request first; it is then encoded exactly once below
+       and only its bytes enter [async_request]. *)
     let* request =
       match operation with
       | Async_activity.Complete payload ->
@@ -1091,9 +1127,9 @@ module Make (Supervisor : SUPERVISOR) = struct
         let* encoded = encode_completion completion in
         Ok (Async_completion encoded)
     | `Heartbeat heartbeat ->
-        (match Protocol.encode_heartbeat heartbeat with
-        | Ok _ -> Ok (Async_heartbeat heartbeat)
-        | Error error -> Error (protocol_error ~path:"$.async_heartbeat" error))
+        (* Likewise the heartbeat's only encoder pass. *)
+        let* encoded = encode_heartbeat ~path:"$.async_heartbeat" heartbeat in
+        Ok (Async_heartbeat encoded)
 
   (** Maps an adapter-local failure that never received a native answer (a
       missing lease or a supervisor exception) to a lifecycle decision. Such
@@ -1144,9 +1180,22 @@ module Make (Supervisor : SUPERVISOR) = struct
               (base_operation_error "async activity handle" (make_error
                 ~path:"$.async_handle" "busy" "asynchronous activity operation is already in flight")))
         | Some (Async_lease lease) ->
+            (* The handle's own request identity; computed only while an
+               uncertain completion is retained. *)
+            let key =
+              lazy (Async_activity.operation_key operation)
+            in
             let prepared =
-              try prepare_async_request ~token operation with exception_ ->
-                Error (exception_error ~path:"$.async_payload" exception_)
+              match lease.uncertain_completion with
+              | Some (retained_key, encoded)
+                when String.equal retained_key (Lazy.force key) ->
+                  (* A retry of an uncertain terminal submission that the
+                     handle admitted as the same request: resend the bytes
+                     already validated and encoded for it. *)
+                  Ok (Async_completion encoded)
+              | Some _ | None -> (
+                  try prepare_async_request ~token operation with exception_ ->
+                    Error (exception_error ~path:"$.async_payload" exception_))
             in
             match prepared with
             | Error error ->
@@ -1187,6 +1236,16 @@ module Make (Supervisor : SUPERVISOR) = struct
                     | Ok () | Error (Async_activity.Not_submitted _
                         | Async_activity.Rejected_submission _
                         | Async_activity.Retryable_submission _) -> ());
+                    (* Only a terminal request with an unknown native outcome
+                       keeps its bytes for the exact retry the handle allows;
+                       a heartbeat never touches the retained completion. *)
+                    (match (request, result) with
+                    | Async_completion encoded,
+                      Error (Async_activity.Retryable_submission _) ->
+                        lease.uncertain_completion <-
+                          Some (Lazy.force key, encoded)
+                    | Async_completion _, _ -> lease.uncertain_completion <- None
+                    | Async_heartbeat _, _ -> ());
                     result))
 
   (** Submits an already encoded, immutable completion and preserves lease
@@ -1244,7 +1303,13 @@ module Make (Supervisor : SUPERVISOR) = struct
           else (
             adapter.async_leases <-
               Token_map.add token
-                (Async_lease { token = Bytes.copy token; handle; in_flight = false })
+                (Async_lease
+                   {
+                     token = Bytes.copy token;
+                     handle;
+                     in_flight = false;
+                     uncertain_completion = None;
+                   })
                 adapter.async_leases;
             Ok ()))
     in
