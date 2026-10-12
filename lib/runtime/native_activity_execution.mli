@@ -1,14 +1,16 @@
 (** Private typed execution of one native Temporal activity-task lease.
 
     The native supervisor supplies already decoded semantic tasks and accepts
-    completions only as canonical pre-encoded bytes
-    ({!Temporal_protocol.Encoded_activity_completion.t}). This adapter owns the
+    completions and heartbeats only as canonical pre-encoded bytes
+    ({!Temporal_protocol.Encoded_activity_completion.t} and
+    {!Temporal_protocol.Encoded_activity_heartbeat.t}). This adapter owns the
     OCaml activity registry, decodes one activity input with the definition's
     codec, invokes the local implementation, encodes its completion exactly
     once (which also validates it before it can reach the bridge, #995), and
     keeps those bytes until the supervisor confirms the exact opaque task
-    token. A supervisor must submit the bytes it is given and never encode a
-    completion itself. It is intentionally hidden from the
+    token. Every heartbeat is likewise encoded exactly once (#1001). A
+    supervisor must submit the bytes it is given and never encode a
+    completion or heartbeat itself. It is intentionally hidden from the
     public worker API: [Temporal.Worker] supplies the supervisor operations and
     owns lifecycle while this module remains responsible only for typed
     dispatch and lease-safe completion. *)
@@ -44,17 +46,22 @@ module type SUPERVISOR = sig
     t -> Temporal_protocol.Encoded_activity_completion.t -> (unit, error) result
   (** Submits a completion for a task already handed off with
       [WillCompleteAsync] through the namespace-bound client path. It carries
-      the same single-encode bytes as [complete_activity]. *)
+      the same single-encode bytes as [complete_activity]. An exact retry of
+      a submission whose outcome was uncertain passes the physically same
+      value rather than a fresh encoding (#1001). *)
 
   val record_activity_heartbeat :
-    t -> Temporal_protocol.Activity_protocol.heartbeat -> (unit, error) result
+    t -> Temporal_protocol.Encoded_activity_heartbeat.t -> (unit, error) result
   (** Records progress for the currently leased task without retiring its
-      lease. The supervisor must serialize this call with completion and
-      shutdown operations. *)
+      lease. The heartbeat is the canonical bytes of its single encoder pass,
+      performed by the adapter before this call (#1001); implementations
+      submit them without encoding again. The supervisor must serialize this
+      call with completion and shutdown operations. *)
 
   val record_async_activity_heartbeat :
-    t -> Temporal_protocol.Activity_protocol.heartbeat -> (unit, error) result
-  (** Records heartbeat details for an admitted asynchronous activity. *)
+    t -> Temporal_protocol.Encoded_activity_heartbeat.t -> (unit, error) result
+  (** Records heartbeat details for an admitted asynchronous activity, with
+      the same single-encode contract as [record_activity_heartbeat]. *)
 
   val error_code : error -> string
   (** Stable classification for a native failure. *)
