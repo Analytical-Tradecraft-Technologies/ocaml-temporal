@@ -21,6 +21,9 @@ temporalio-common.workspace = true
 temporalio-sdk-core.workspace = true
 temporalio-protos.workspace = true
 tokio.workspace = true
+# Warning and error records from the metrics endpoint's accept loop (#1030),
+# delivered through Core's log pipeline like Core's own records.
+tracing.workspace = true
 uuid.workspace = true
 
 # Test-only doubles. These crates are already locked transitively through
@@ -31,6 +34,8 @@ uuid.workspace = true
 flate2.workspace = true
 h2.workspace = true
 http.workspace = true
+# Lowers the descriptor limit so a test can make accept() fail (#1030).
+libc.workspace = true
 tokio = { workspace = true, features = ["net"] }
 
 # Opt-in Rust half of the #528 JSON bridge attribution; `make
