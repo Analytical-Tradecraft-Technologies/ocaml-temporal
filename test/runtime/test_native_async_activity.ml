@@ -10,6 +10,7 @@
 
 module Protocol = Temporal_protocol.Activity_protocol
 module Encoded = Temporal_protocol.Encoded_activity_completion
+module Encoded_heartbeat = Temporal_protocol.Encoded_activity_heartbeat
 module Raw_adapter = Temporal_runtime.Native_activity_execution
 module Base_async = Temporal_base.Async_activity
 module Bridge = Temporal_core_bridge.Native_bridge
@@ -86,15 +87,18 @@ let copy_completion encoded =
         failwith "async fake received non-canonical completion bytes";
       value
 
-(** Copies a protocol heartbeat through the strict codec to test ownership of
-    late detail payloads as well as their semantic shape. *)
-let copy_heartbeat heartbeat =
-  match Protocol.encode_heartbeat heartbeat with
+(** Strictly decodes the adapter's single-encode heartbeat bytes, as the
+    Rust bridge does, and checks that they are canonical. Decoding gives the
+    fake its own storage for late detail payloads, and the fake never encodes
+    a submission itself (#1001). *)
+let copy_heartbeat encoded =
+  let json = Encoded_heartbeat.to_string encoded in
+  match Protocol.decode_heartbeat json with
   | Error _ -> failwith "async fake received an invalid heartbeat"
-  | Ok json -> (
-      match Protocol.decode_heartbeat json with
-      | Ok value -> value
-      | Error _ -> failwith "async fake could not reparse its heartbeat")
+  | Ok value ->
+      if Protocol.encode_heartbeat value <> Ok json then
+        failwith "async fake received non-canonical heartbeat bytes";
+      value
 
 type source_error = {
   code : string;
@@ -115,6 +119,8 @@ type fake_supervisor = {
   async_heartbeats : Protocol.heartbeat list ref;
   async_completion_calls : int ref;
   async_heartbeat_calls : int ref;
+  async_completion_documents : string list ref;
+  async_heartbeat_documents : string list ref;
   reject_next_worker_completion : bool ref;
   reject_next_async_completion : bool ref;
   reject_next_async_completion_terminal : bool ref;
@@ -126,6 +132,9 @@ type fake_supervisor = {
 }
 (** Fake native state. [leased] and [async_leased] intentionally model
     different Temporal APIs and are never allowed to substitute for one another.
+    [async_completion_documents] and [async_heartbeat_documents] keep, newest
+    first, the exact strings each namespace-bound call received, so a test can
+    check physical identity of a retried submission (#1001).
 *)
 
 let fake_supervisor () =
@@ -140,6 +149,8 @@ let fake_supervisor () =
     async_heartbeats = ref [];
     async_completion_calls = ref 0;
     async_heartbeat_calls = ref 0;
+    async_completion_documents = ref [];
+    async_heartbeat_documents = ref [];
     reject_next_worker_completion = ref false;
     reject_next_async_completion = ref false;
     reject_next_async_completion_terminal = ref false;
@@ -236,6 +247,8 @@ module Fake_supervisor = struct
   let complete_async_activity supervisor encoded =
     let completion = copy_completion encoded in
     incr supervisor.async_completion_calls;
+    supervisor.async_completion_documents :=
+      Encoded.to_string encoded :: !(supervisor.async_completion_documents);
     if !(supervisor.reject_next_async_completion_terminal) then begin
       supervisor.reject_next_async_completion_terminal := false;
       (* A terminal [NotFound] response means the native task token is no
@@ -277,16 +290,21 @@ module Fake_supervisor = struct
 
   (** Records ordinary activity heartbeats only while the worker lease remains
       active. Async callbacks use [record_async_activity_heartbeat] instead. *)
-  let record_activity_heartbeat supervisor (heartbeat : Protocol.heartbeat) =
+  let record_activity_heartbeat supervisor encoded =
+    let heartbeat = copy_heartbeat encoded in
     if has_token heartbeat.Protocol.task_token !(supervisor.leased) then begin
-      supervisor.heartbeats := copy_heartbeat heartbeat :: !(supervisor.heartbeats);
+      supervisor.heartbeats := heartbeat :: !(supervisor.heartbeats);
       Ok ()
     end
     else Error (source_error "stale_lease" "worker lease is not active")
 
   (** Records heartbeat details against the namespace-bound async lease. *)
-  let record_async_activity_heartbeat supervisor (heartbeat : Protocol.heartbeat) =
+  let record_async_activity_heartbeat supervisor encoded =
+    let heartbeat = copy_heartbeat encoded in
     incr supervisor.async_heartbeat_calls;
+    supervisor.async_heartbeat_documents :=
+      Encoded_heartbeat.to_string encoded
+      :: !(supervisor.async_heartbeat_documents);
     if !(supervisor.reject_next_async_heartbeat_terminal) then begin
       supervisor.reject_next_async_heartbeat_terminal := false;
       let _, remaining =
@@ -316,8 +334,7 @@ module Fake_supervisor = struct
            "async heartbeat transport unavailable")
     end
     else if has_token heartbeat.Protocol.task_token !(supervisor.async_leased) then begin
-      supervisor.async_heartbeats :=
-        copy_heartbeat heartbeat :: !(supervisor.async_heartbeats);
+      supervisor.async_heartbeats := heartbeat :: !(supervisor.async_heartbeats);
       Ok ()
     end
     else Error (source_error "stale_async_lease" "async lease is not active")
@@ -815,7 +832,16 @@ let test_async_completion_retry () =
   if List.length !(supervisor.async_completions) <> 1 then
     failwith "async completion retry submitted more than one accepted result";
   if !(supervisor.async_completion_calls) <> 2 then
-    failwith "async completion did not submit exactly one identical retry"
+    failwith "async completion did not submit exactly one identical retry";
+  (* The retry reuses the bytes validated and encoded for the first
+     submission rather than preparing the completion again (#1001). *)
+  match !(supervisor.async_completion_documents), !(supervisor.async_completions) with
+  | [ retry; first ], [ accepted ] ->
+      if not (retry == first) then
+        failwith "async completion retry submitted a re-encoded document";
+      if Protocol.encode_completion accepted <> Ok first then
+        failwith "async completion bytes are not the canonical encoding"
+  | _ -> failwith "async completion retry recorded unexpected submissions"
 
 (** A terminal native rejection closes both sides of the retained capability.
     The adapter must drop its lease so worker drain cannot wait forever, while
@@ -882,6 +908,53 @@ let heartbeat_status_fixture ~name ~token =
   let worker = worker supervisor [ Adapter.register_async activity ] in
   expect_deferred (Worker.poll worker);
   (supervisor, worker, Option.get !retained, calls)
+
+(** An async heartbeat crosses the supervisor as the bytes of its single
+    encoder pass (#1001). The fake decodes them strictly, as Rust does, and
+    each accepted heartbeat yields exactly one document: the canonical
+    encoding of what was recorded. The document is an immutable snapshot, so
+    mutating the caller's detail buffer afterwards cannot change it, and a
+    heartbeat the encoder rejects never reaches the supervisor. *)
+let test_async_heartbeat_single_encode () =
+  let token = Bytes.of_string "\000async-heartbeat-encode\255" in
+  let supervisor, worker, handle, _ =
+    heartbeat_status_fixture ~name:"async_heartbeat_single_encode" ~token
+  in
+  let detail : Temporal.Payload.t =
+    { metadata = [ ("encoding", "binary/plain") ];
+      data = Bytes.of_string "progress" }
+  in
+  (match Temporal.Activity.Async_handle.heartbeat handle [ detail ] with
+  | Ok () -> ()
+  | Error error ->
+      failwith ("async heartbeat failed: " ^ Temporal.Error.message error));
+  Bytes.fill detail.data 0 (Bytes.length detail.data) 'x';
+  (match !(supervisor.async_heartbeat_documents), !(supervisor.async_heartbeats) with
+  | [ document ], [ recorded ] ->
+      if Protocol.encode_heartbeat recorded <> Ok document then
+        failwith "async heartbeat bytes are not the canonical encoding";
+      if not (Bytes.equal recorded.Protocol.task_token token) then
+        failwith "async heartbeat changed the opaque token";
+      (match Protocol.decode_heartbeat document with
+      | Ok { Protocol.details = [ payload ]; _ }
+        when Bytes.equal payload.Protocol.data (Bytes.of_string "progress") -> ()
+      | _ -> failwith "async heartbeat document observed a later buffer mutation")
+  | _ -> failwith "async heartbeat was not submitted exactly once");
+  let duplicate : Temporal.Payload.t =
+    { metadata = [ ("opaque", "one"); ("opaque", "two") ];
+      data = Bytes.of_string "invalid" }
+  in
+  (match Temporal.Activity.Async_handle.heartbeat handle [ duplicate ] with
+  | Error _ -> ()
+  | Ok () -> failwith "encoder-rejected async heartbeat was accepted");
+  if !(supervisor.async_heartbeat_calls) <> 1 then
+    failwith "encoder-rejected async heartbeat reached the supervisor";
+  (match Temporal.Activity.Async_handle.complete handle "done" with
+  | Ok () -> ()
+  | Error error -> failwith (Temporal.Error.message error));
+  match Worker.drain worker with
+  | Ok () -> ()
+  | Error _ -> failwith "completed async heartbeat handle still blocked drain"
 
 (** A native [Connection] heartbeat result is uncertain, not terminal: the
     client did not consume the worker completion lease, and the server activity
@@ -1857,6 +1930,7 @@ let () =
   test_async_codec_error_preserves_handle ();
   test_async_invalid_encoding_preserves_handle ();
   test_async_completion_retry ();
+  test_async_heartbeat_single_encode ();
   test_async_terminal_rejection_closes_lease ();
   test_async_connection_heartbeat_keeps_handle ();
   test_async_rejected_completion_keeps_live_handle ();

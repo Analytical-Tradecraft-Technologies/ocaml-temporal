@@ -599,7 +599,7 @@ operations. It exposes a typed GADT rather than raw JSON bytes:
 | `Try_poll_activity` | `Activity_protocol.task option`; `None` means the activity lane was empty at that instant |
 | `Wait_activity` | bounded native readiness wait; it does not consume an activity task and releases the OCaml runtime lock |
 | `Wait_any` | bounded native readiness wait that any queued workflow activation or activity task ends; it consumes nothing and releases the OCaml runtime lock |
-| `Record_activity_heartbeat heartbeat` | canonical strict heartbeat JSON is validated and recorded for the outstanding activity lease without retiring it; the acknowledgement carries no cancellation flags, which arrive later on the activity poll lane |
+| `Record_activity_heartbeat encoded` | an `Encoded_activity_heartbeat.t` holding the canonical JSON from the activity adapter's single encoder pass, which validated the token and details; the supervisor copies those bytes into the native call without encoding them again (#1001), and Rust records them for the outstanding activity lease without retiring it. The acknowledgement carries no cancellation flags, which arrive later on the activity poll lane. `Record_async_activity_heartbeat` takes the same value |
 | `Complete_activity encoded` | an `Encoded_activity_completion.t` holding the canonical JSON from the activity adapter's single encoder pass, which validated the opaque token and result; the supervisor copies those bytes into the native completion call without encoding them again, and Rust strictly decodes them. `Complete_async_activity` takes the same value |
 
 All eight operations enter the same bounded mailbox as client and worker
