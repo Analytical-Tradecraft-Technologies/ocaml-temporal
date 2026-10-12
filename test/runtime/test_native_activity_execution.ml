@@ -1931,9 +1931,13 @@ let test_late_sweep_delivery_is_classified () =
 (** Runs every adapter assertion with a stable test-process failure. *)
 module Observability = Temporal_base.Observability
 
-(** One SDK log record observed by [with_captured_logs]: its operation tag and
-    the full tag set for correlation assertions. *)
-type captured_record = { operation : string option; tags : Logs.Tag.set }
+(** One SDK log record observed by [with_captured_logs]: its level, its
+    operation tag, and the full tag set for correlation assertions. *)
+type captured_record = {
+  level : Logs.level;
+  operation : string option;
+  tags : Logs.Tag.set;
+}
 
 (** Runs [f] with a reporter that records every lifecycle-source record at
     [Debug], then restores the previous reporter and source level even when
@@ -1944,13 +1948,14 @@ let with_captured_logs f =
   let source = Observability.Source.lifecycle in
   let previous_reporter = Logs.reporter () in
   let previous_level = Logs.Src.level source in
-  let report src _level ~over continuation messagef =
+  let report src level ~over continuation messagef =
     if Logs.Src.equal src source then
       messagef (fun ?header:_ ?(tags = Logs.Tag.empty) format ->
           Format.ikfprintf
             (fun _ ->
               records :=
                 {
+                  level;
                   operation = Logs.Tag.find Observability.Tag.operation tags;
                   tags;
                 }
@@ -2079,6 +2084,50 @@ let test_rejection_record_carries_activity_identity () =
     <> Some "unknown_activity_type"
   then failwith "rejection record lost its error kind"
 
+(** An ordinary application [Error] is expected Temporal behaviour, not an SDK
+    rejection: the attempt yields exactly one correlated [activity_task_failed]
+    record at [Info] and no [activity_task_rejected] warning (#1024). *)
+let test_application_failure_logs_one_record () =
+  let supervisor = fake_supervisor () in
+  let activity =
+    Temporal.Activity.define ~name:"failing" ~input:Temporal.Codec.unit
+      ~output:Temporal.Codec.unit (fun () ->
+        Error
+          (Temporal.Error.make ~category:`Activity ~message:"business failure"
+             ()))
+  in
+  enqueue supervisor
+    (start_task ~token:(Bytes.of_string "failing-token")
+       ~activity_type:"failing"
+       ~input:[ encode_input Temporal.Codec.unit () ]);
+  let worker = worker supervisor [ Adapter.register activity ] in
+  let records =
+    with_captured_logs (fun () ->
+        match Worker.poll worker with
+        | Ok (Adapter.Rejected { lease_retired = true; _ }) -> ()
+        | _ -> failwith "application failure was not retired")
+  in
+  let failed =
+    List.filter
+      (fun record -> record.operation = Some "activity_task_failed")
+      records
+  in
+  (match failed with
+  | [ { level = Logs.Info; _ } ] -> ()
+  | [ _ ] -> failwith "application failure was not logged at Info"
+  | _ -> failwith "expected exactly one activity_task_failed record");
+  let tags = single_record records "activity_task_failed" in
+  expect_attempt_identity ~activity_type:"failing" tags;
+  if Logs.Tag.find Observability.Tag.error_kind tags <> Some "activity" then
+    failwith "failure record lost its error kind";
+  if
+    List.exists
+      (fun record ->
+        record.operation = Some "activity_task_rejected"
+        || record.level = Logs.Warning)
+      records
+  then failwith "an application failure was logged as an SDK rejection"
+
 (** A cancellation delivered to a running attempt through a heartbeat sweep
     names that attempt, and a bare cancellation whose start this adapter never
     saw carries no fabricated identity. *)
@@ -2115,6 +2164,7 @@ let test_cancellation_records_correlation () =
 
 let () =
   test_successful_dispatch ();
+  test_application_failure_logs_one_record ();
   test_typed_failure ();
   test_typed_failure_error_type ();
   test_invalid_failure_details_allow_next_activity ();

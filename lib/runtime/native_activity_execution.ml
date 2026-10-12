@@ -148,6 +148,15 @@ type correlation = {
   attempt : int;
 }
 
+(** Why a lease carries a failure completion. [Application_failure] is an
+    ordinary [Error] returned by the activity implementation, which Temporal
+    routinely retries; [Sdk_rejection] is an adapter-side refusal (unknown
+    activity type, codec or protocol error, raised callback) that indicates a
+    worker or caller defect. The distinction only selects the log operation and
+    level (issue #1024); both are acknowledged with the same failure completion
+    and reported to the caller as [Rejected]. *)
+type rejection_origin = Application_failure | Sdk_rejection
+
 (** What the caller should observe after a lease is acknowledged. A rejected
     task carries the original adapter diagnostic so the caller can identify a
     bad registration or payload without inspecting the completion bytes. *)
@@ -156,7 +165,7 @@ type accepted_result =
       kind : completion_kind;
       cancellation_details : cancellation_details option;
     }
-  | Rejected_result of error_view
+  | Rejected_result of { error : error_view; origin : rejection_origin }
   | Async_handoff :
       'output Temporal_base.Async_activity.handle -> accepted_result
 
@@ -1284,10 +1293,20 @@ module Make (Supervisor : SUPERVISOR) = struct
                    kind;
                    cancellation_details;
                  })
-        | Rejected_result error ->
+        | Rejected_result { error; origin } ->
             adapter.leases <- Token_map.remove lease.token adapter.leases;
-            report Logs.Warning ~operation:"activity_task_rejected"
-              ~error_kind:error.code ?correlation:lease.correlation ();
+            (* This is the only record for an acknowledged failure: the worker
+               loop deliberately does not log [Rejected] again (issue #1024).
+               An application [Error] is expected, retried Temporal behaviour,
+               so it is reported at [Info] under its own operation; [Warning]
+               is reserved for SDK-side rejections an operator must fix. *)
+            (match origin with
+            | Application_failure ->
+                report Logs.Info ~operation:"activity_task_failed"
+                  ~error_kind:error.code ?correlation:lease.correlation ()
+            | Sdk_rejection ->
+                report Logs.Warning ~operation:"activity_task_rejected"
+                  ~error_kind:error.code ?correlation:lease.correlation ());
             Ok
               (Rejected
                  {
@@ -1355,7 +1374,7 @@ module Make (Supervisor : SUPERVISOR) = struct
              application details. Encode (and so validate) the fallback too,
              before admission. *)
           let* encoded = encode_completion fallback in
-          Ok (encoded, Rejected_result error)
+          Ok (encoded, Rejected_result { error; origin = Sdk_rejection })
     in
     let lease =
       {
@@ -1389,14 +1408,16 @@ module Make (Supervisor : SUPERVISOR) = struct
     in
     finish_lease adapter lease
 
-  (** Turns an adapter diagnostic into a non-retryable failure completion while
-      preserving the original task token. *)
-  let reject_task_with_failure adapter ~token ~correlation ~failure error =
+  (** Acknowledges the task with [failure] while preserving the original task
+      token. [origin] defaults to [Sdk_rejection]; application [Error] results
+      pass [Application_failure] so they are logged as ordinary failures. *)
+  let reject_task_with_failure ?(origin = Sdk_rejection) adapter ~token
+      ~correlation ~failure error =
     let completion =
       Protocol.{ task_token = Bytes.copy token; result = Failed failure }
     in
     enqueue_and_finish adapter ~token ~correlation ~completion
-      ~accepted_result:(Rejected_result error)
+      ~accepted_result:(Rejected_result { error; origin })
 
   (** Builds the standard adapter failure for registry, codec, and protocol
       errors, all of which are non-retryable because retrying cannot repair the
@@ -1554,8 +1575,8 @@ module Make (Supervisor : SUPERVISOR) = struct
                       with
                      | Error error -> reject_task adapter ~token ~correlation error
                      | Ok failure ->
-                         reject_task_with_failure adapter ~token ~correlation
-                           ~failure diagnostic)
+                         reject_task_with_failure ~origin:Application_failure
+                           adapter ~token ~correlation ~failure diagnostic)
                  | Async_activity.Will_complete_async handle ->
                      if start.is_local then begin
                        (* The callback may retain the dormant handle. Close its
@@ -1686,7 +1707,8 @@ module Make (Supervisor : SUPERVISOR) = struct
                             | Error error ->
                                 reject_task adapter ~token ~correlation error
                             | Ok failure ->
-                                reject_task_with_failure adapter ~token
+                                reject_task_with_failure
+                                  ~origin:Application_failure adapter ~token
                                   ~correlation ~failure diagnostic
                           end
                       | Ok (Ok output) ->
