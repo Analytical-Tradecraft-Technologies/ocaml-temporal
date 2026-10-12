@@ -69,7 +69,7 @@ let make_workflow ?policy name =
            | Some context ->
                let future, _cancel =
                  Context.schedule_activity context ~name:"retryable_activity"
-                   ~input:(encode_input input) ?retry_policy:policy
+                   ~input:[ encode_input input ] ?retry_policy:policy
                    ~decode:(Temporal_base.Codec.decode Temporal_base.Codec.string)
                    ()
                in

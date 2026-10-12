@@ -151,7 +151,7 @@ let test_teardown kind ending ~queued ~finished =
     | Fail -> [ Activation.Fail_workflow (base_error (application_error ())) ]
     | Cancel -> [ Activation.Cancel_workflow_execution ]
     | Continue ->
-        [ Activation.Continue_as_new { workflow_type = "successor"; input = unit_payload } ]
+        [ Activation.Continue_as_new { workflow_type = "successor"; input = [] } ]
     | Evict | Shutdown -> []
   in
   expect "teardown preserves terminal command" expected commands;

@@ -1727,27 +1727,40 @@ let test_command_order_and_validation () =
        (Activation.Cancel_timer { seq = 4_294_967_296L }))
 
   ;
-  let continue_input = runtime_unit_payload () in
   let continue_completion =
     unwrap "continue-as-new command conversion"
       (Native_execution.completion_of_commands ~run_id:"run-native-translation"
-         [
-           Activation.Continue_as_new
-             { workflow_type = "native"; input = continue_input };
-         ])
+         [ Activation.Continue_as_new { workflow_type = "native"; input = [] } ])
   in
-  (* A unit continue-as-new input is sent as zero payloads (#819), matching
+  (* A unit continue-as-new input arrives as zero arguments (#819), matching
      other SDKs; the next run's start decodes [[]] back to unit. *)
   (match continue_completion.commands with
   | [ Protocol.Continue_as_new { workflow_type = "native"; input = [] } ] ->
       ()
   | _ -> failwith "continue-as-new command was not translated as terminal");
+  (* A non-unit argument whose bytes are [binary/null], such as an option's
+     [None], is forwarded as one payload rather than collapsed (#1012). *)
+  (match
+     (unwrap "continue-as-new command with a null argument"
+        (Native_execution.completion_of_commands
+           ~run_id:"run-native-translation"
+           [
+             Activation.Continue_as_new
+               { workflow_type = "native"; input = [ runtime_unit_payload () ] };
+           ]))
+       .commands
+   with
+  | [ Protocol.Continue_as_new { workflow_type = "native"; input = [ null ] } ]
+    when null.Protocol.metadata = [ ("encoding", Bytes.of_string "binary/null") ]
+         && Bytes.length null.data = 0 ->
+      ()
+  | _ -> failwith "continue-as-new collapsed a null argument");
   let continue_completion =
     unwrap "continue-as-new command with input"
       (Native_execution.completion_of_commands ~run_id:"run-native-translation"
          [
            Activation.Continue_as_new
-             { workflow_type = "native"; input = runtime_payload "next" };
+             { workflow_type = "native"; input = [ runtime_payload "next" ] };
          ])
   in
   match continue_completion.commands with
@@ -1906,7 +1919,7 @@ let test_activity_command_translation_and_validation () =
               seq = 2L;
               id = "child/1";
               name = "child";
-              input;
+              input = [];
               retry_policy = None;
               cancellation_type = Activation.Child_abandon;
             }))
@@ -1932,7 +1945,7 @@ let test_activity_command_translation_and_validation () =
               seq = 3L;
               id = "child/2";
               name = "child";
-              input = runtime_payload "argument";
+              input = [ runtime_payload "argument" ];
               retry_policy = None;
               cancellation_type = Activation.Child_abandon;
             }))

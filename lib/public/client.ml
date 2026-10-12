@@ -59,7 +59,7 @@ type ('input, 'output) update_handle = {
   workflow_id : string;
   run_id : string;
   update_id : string;
-  input : Payload.t;
+  input : Payload.t list;
   (* A completed admission outcome can be decoded without looking up a server
      record that may no longer exist. Immutable across caller Domains. *)
   outcome : Backend.update_outcome option;
@@ -342,6 +342,15 @@ let validate_start_policies ~execution_timeout ~run_timeout ~task_timeout
       start_rpc_deadline;
     }
 
+(** Encodes one typed workflow, signal, or update input as the argument list
+    sent to Temporal, in the public payload and error vocabulary: zero payloads
+    for [Codec.unit] and one payload for any other codec, so an option's [None]
+    reaches a foreign handler as one [null] argument (#1012). *)
+let encode_arguments codec value =
+  match Codec_private.encode_arguments codec value with
+  | Ok arguments -> Ok (List.map Payload_private.of_base arguments)
+  | Error error -> Error (Error_private.of_base error)
+
 (** Starts a workflow after encoding its typed input and checking the backend's
     response still refers to the request. The response check prevents an
     adapter bug from creating a handle for a different execution. *)
@@ -368,7 +377,7 @@ let start client ?request_id ?(memo = []) ?(search_attributes = [])
         with
         | Error error -> Error error
         | Ok policies -> (
-            match Codec.encode (Workflow.input workflow) input with
+            match encode_arguments (Workflow.input workflow) input with
         | Error error -> Error error
         | Ok encoded_input ->
             let request : Backend.start_request =
@@ -748,7 +757,7 @@ let signal ?request_id ?rpc_timeout
     with
     | Error error -> Error error
     | Ok rpc_deadline -> (
-        match Codec.encode (Signal.input signal) input with
+        match encode_arguments (Signal.input signal) input with
         | Error error -> Error error
         | Ok encoded_input ->
             let request_id =
@@ -946,7 +955,7 @@ let start_update ?update_id ?rpc_timeout
     with
     | Error error -> Error error
     | Ok rpc_deadline -> (
-        match Codec.encode (Update.input update) input with
+        match encode_arguments (Update.input update) input with
         | Error error -> Error error
         | Ok encoded_input ->
             let request : Backend.update_request =

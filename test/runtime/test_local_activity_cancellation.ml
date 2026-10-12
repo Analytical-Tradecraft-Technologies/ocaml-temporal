@@ -29,7 +29,7 @@ let with_activity ~is_replaying policy action =
   Fun.protect ~finally:(fun () -> Context.shutdown context) (fun () ->
       let future, cancel =
         Context.schedule_local_activity context ~name:"retrying-local"
-          ~input:{ Temporal_base.Payload.metadata = []; data = Bytes.empty }
+          ~input:[ { Temporal_base.Payload.metadata = []; data = Bytes.empty } ]
           ~cancellation_type:policy ~decode:(fun payload -> Ok payload) ()
       in
       ignore (Context.take_commands context);
