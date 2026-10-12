@@ -284,7 +284,7 @@ let current_context () =
 (** Schedules one remote activity with a string argument of [payload_bytes]
     encoded bytes, returning its result future. *)
 let schedule_activity context ~payload_bytes =
-  let input = string_payload payload_bytes in
+  let input = [ string_payload payload_bytes ] in
   fst
     (Context.schedule_activity context ~name:"benchmark_activity" ~input
        ~decode:(Codec.decode Codec.string) ())

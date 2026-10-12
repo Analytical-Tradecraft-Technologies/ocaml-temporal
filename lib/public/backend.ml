@@ -31,7 +31,9 @@ type start_request = {
   workflow_name : string;
   workflow_id : string;
   task_queue : string;
-  input : Payload.t;
+  input : Payload.t list;
+      (** Encoded argument payloads exactly as sent to Temporal: empty for a
+          [Codec.unit] input, otherwise one payload (#1012). *)
   memo : (string * Payload.t) list;
   search_attributes : (string * Payload.t) list;
   (* What to do when [workflow_id] already has an open run; see
@@ -124,7 +126,9 @@ type signal_request = {
   run_id : string;
   signal_name : string;
   request_id : string;
-  input : Payload.t;
+  input : Payload.t list;
+      (** Encoded argument payloads exactly as sent to Temporal: empty for a
+          [Codec.unit] input, otherwise one payload (#1012). *)
   rpc_deadline : Client_protocol.rpc_deadline option;
       (** Caller deadline of this RPC, validated by the public client and
           fixed on the monotonic clock when the call began; the native
@@ -187,7 +191,9 @@ type update_request = {
   run_id : string;
   update_id : string;
   update_name : string;
-  input : Payload.t;
+  input : Payload.t list;
+      (** Encoded argument payloads exactly as sent to Temporal: empty for a
+          [Codec.unit] input, otherwise one payload (#1012). *)
   rpc_deadline : Client_protocol.rpc_deadline option;
       (** Caller deadline of this RPC, validated by the public client and
           fixed on the monotonic clock when the call began; the native
@@ -294,7 +300,7 @@ type mock_terminal =
     ID for different signal data is rejected. *)
 type mock_signal = {
   signal_name : string;
-  input : Payload.t;
+  input : Payload.t list;
 }
 
 (** A mock execution is retained so repeated exact waits return the same
@@ -420,7 +426,7 @@ let copy_start_request (request : start_request) : start_request =
   in
   {
     request with
-    input = copy_payload request.input;
+    input = List.map copy_payload request.input;
     memo = copy_fields request.memo;
     search_attributes = copy_fields request.search_attributes;
   }
@@ -444,7 +450,7 @@ let equal_start_request (left : start_request) (right : start_request) =
   && String.equal left.workflow_name right.workflow_name
   && String.equal left.workflow_id right.workflow_id
   && String.equal left.task_queue right.task_queue
-  && equal_payload left.input right.input
+  && List.equal equal_payload left.input right.input
   && List.equal equal_field left.memo right.memo
   && List.equal equal_field left.search_attributes right.search_attributes
 
@@ -758,18 +764,14 @@ let protocol_payload (payload : Payload.t) : Client_protocol.payload =
     data = Bytes.copy payload.data;
   }
 
-(** Converts a client operation's one encoded input into Temporal's repeated
-    input payloads by the shared rule [Temporal_base.Payload.input_arguments]:
-    the canonical [Codec.unit] payload is sent as zero payloads, as the CLI and
-    other SDKs do for a no-argument call, so a zero-parameter foreign handler
-    is not given a surplus [null] argument. The base record built here only
-    shares the caller's fields for inspection; [protocol_payload] copies. *)
-let protocol_input (payload : Payload.t) =
-  if
-    Temporal_base.Payload.is_unit_null
-      { Temporal_base.Payload.metadata = payload.metadata; data = payload.data }
-  then []
-  else [ protocol_payload payload ]
+(** Converts a client operation's argument list into Temporal's repeated
+    input payloads. The public client already applied the codec-decided rule
+    ([Codec_private.encode_arguments]): a [Codec.unit] input is zero payloads,
+    as the CLI and other SDKs send a no-argument call, and any other input,
+    including an option's [None], is one payload (#1012). [protocol_payload]
+    copies each payload. *)
+let protocol_input (arguments : Payload.t list) =
+  List.map protocol_payload arguments
 
 (** Copies one protocol payload into the public representation. OCaml strings
     are byte strings, so converting metadata with [Bytes.to_string] is
@@ -834,6 +836,15 @@ let terminal_details_error ~category ~message details =
     unit-output workflows decode instead of becoming a spurious codec error. *)
 let unit_null_payload : Payload.t =
   { Payload.metadata = [ ("encoding", "binary/null") ]; data = Bytes.empty }
+
+(** Recovers the single payload a mock execution echoes as its result from a
+    start's argument list, as an OCaml worker would decode it: zero arguments
+    are the [Codec.unit] input. The public client never sends more than one,
+    so any extra payload is ignored rather than invented as an error path. *)
+let mock_workflow_input (arguments : Payload.t list) =
+  match arguments with
+  | [] -> copy_payload unit_null_payload
+  | payload :: _ -> copy_payload payload
 
 (** Converts one native wait response into the backend terminal-result algebra.
     A single payload is the normal case; zero payloads are the unit completion
@@ -1222,7 +1233,7 @@ let mock_start_new_run service (request : start_request) =
       run_id;
       workflow_type = request.workflow_name;
       task_queue = request.task_queue;
-      input = copy_payload request.input;
+      input = mock_workflow_input request.input;
       terminal = Mock_pending;
       signal_requests = Hashtbl.create 8;
     }
@@ -1768,7 +1779,10 @@ let mock_client_signal (client : mock_client) (request : signal_request) =
             Error (mock_not_found "workflow run id does not match the started run")
         | Some ({ terminal = Mock_pending; _ } as execution) -> (
             let delivery =
-              { signal_name = request.signal_name; input = copy_payload request.input }
+              {
+                signal_name = request.signal_name;
+                input = List.map copy_payload request.input;
+              }
             in
             match Hashtbl.find_opt execution.signal_requests request.request_id with
             | None ->
@@ -1776,8 +1790,11 @@ let mock_client_signal (client : mock_client) (request : signal_request) =
                 Ok ()
             | Some previous
               when String.equal previous.signal_name delivery.signal_name
-                   && previous.input.metadata = delivery.input.metadata
-                   && Bytes.equal previous.input.data delivery.input.data ->
+                   && List.equal
+                        (fun (left : Payload.t) (right : Payload.t) ->
+                          left.metadata = right.metadata
+                          && Bytes.equal left.data right.data)
+                        previous.input delivery.input ->
                 Ok ()
             | Some _ ->
                 Error

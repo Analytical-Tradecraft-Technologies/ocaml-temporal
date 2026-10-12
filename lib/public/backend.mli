@@ -30,7 +30,9 @@ type start_request = {
   workflow_name : string;
   workflow_id : string;
   task_queue : string;
-  input : Payload.t;
+  input : Payload.t list;
+      (** Encoded argument payloads exactly as sent to Temporal: empty for a
+          [Codec.unit] input, otherwise one payload (#1012). *)
   memo : (string * Payload.t) list;
   search_attributes : (string * Payload.t) list;
   (* What to do when [workflow_id] already has an open run; see
@@ -129,7 +131,9 @@ type signal_request = {
   run_id : string;
   signal_name : string;
   request_id : string;
-  input : Payload.t;
+  input : Payload.t list;
+      (** Encoded argument payloads exactly as sent to Temporal: empty for a
+          [Codec.unit] input, otherwise one payload (#1012). *)
   rpc_deadline : Temporal_sdk_kernel.Client_protocol.rpc_deadline option;
       (** Caller deadline of this RPC, validated by the public client and
           fixed on the monotonic clock when the call began; the native
@@ -193,7 +197,9 @@ type update_request = {
   run_id : string;
   update_id : string;
   update_name : string;
-  input : Payload.t;
+  input : Payload.t list;
+      (** Encoded argument payloads exactly as sent to Temporal: empty for a
+          [Codec.unit] input, otherwise one payload (#1012). *)
   rpc_deadline : Temporal_sdk_kernel.Client_protocol.rpc_deadline option;
       (** Caller deadline of this RPC, validated by the public client and
           fixed on the monotonic clock when the call began; the native

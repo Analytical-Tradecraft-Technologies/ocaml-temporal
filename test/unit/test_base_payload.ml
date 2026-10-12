@@ -1,31 +1,20 @@
-(** Tests the shared zero-argument payload rule in [Temporal_base.Payload]
-    (#819). Every outbound input site relies on [input_arguments], so these
-    cases pin exactly which payloads are treated as the canonical unit value. *)
+(** Tests the canonical unit payload in [Temporal_base.Payload]. Inbound
+    decoders use it to reconstruct a single input from an empty argument list
+    (#819); the outbound argument-count rule is codec-decided and covered by
+    [test/runtime/test_input_arguments.ml] (#1012). *)
 
 module Payload = Temporal_base.Payload
 
-(** Builds a payload with owned bytes for one test case. *)
-let payload metadata data = { Payload.metadata; data = Bytes.of_string data }
-
-(** The canonical unit payload, and only it, maps to zero arguments; anything
-    carrying data or extra metadata is preserved as one argument so no
-    information is dropped on the wire. *)
-let test_input_arguments () =
-  let unit_null = Payload.unit_null () in
-  assert (Payload.is_unit_null unit_null);
-  assert (Payload.input_arguments unit_null = []);
+(** The canonical unit payload is exactly what [Codec.unit] encodes, so a
+    decoder that substitutes it for zero arguments sees the same value an
+    OCaml sender would have encoded. *)
+let test_unit_null_matches_codec_unit () =
   let codec_unit =
     match Temporal_base.Codec.encode Temporal_base.Codec.unit () with
     | Ok value -> value
     | Error _ -> failwith "Codec.unit failed to encode"
   in
-  assert (Payload.input_arguments codec_unit = []);
-  let keep value = assert (Payload.input_arguments value = [ value ]) in
-  keep (payload [ ("encoding", "json/plain") ] "\"\"");
-  keep (payload [ ("encoding", "binary/null") ] "x");
-  keep (payload [ ("encoding", "binary/null"); ("extra", "1") ] "");
-  keep (payload [ ("encoding", "binary/plain") ] "");
-  keep (payload [] "")
+  assert (Payload.unit_null () = codec_unit)
 
 (** Each call returns a fresh record so a caller mutating one result cannot
     affect another. *)
@@ -36,5 +25,5 @@ let test_unit_null_is_fresh () =
   assert (first = second)
 
 let () =
-  test_input_arguments ();
+  test_unit_null_matches_codec_unit ();
   test_unit_null_is_fresh ()

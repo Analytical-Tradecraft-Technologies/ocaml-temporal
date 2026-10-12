@@ -35,6 +35,71 @@ schedule-to-close timeouts, and a sub-millisecond heartbeat interval through
 both views. Verified with `dune build @install` and the `test/runtime` test
 alias on OCaml 5.4.1 (macOS).
 
+## 2026-10-13: Metrics scrape test no longer waits for connection close (#1058)
+
+`test/bridge/test_runtime_metrics.ml` timed out intermittently on Windows
+while reading a scrape until EOF with a 5 s receive timeout. Its `http_get`
+helper now treats a response as complete once the headers and the declared
+`Content-Length` body have arrived, falling back to EOF only without a
+length, so the test no longer depends on when the exporter closes the
+connection. The bound is 30 s, and a timeout now reports how many bytes
+arrived, which separates a slow close from a missing response. The helper
+was checked standalone against complete, partial and length-less responses
+on OCaml 5.4.1 (macOS); the Windows CI job is the regression gate.
+
+## 2026-10-13: Compile-checked API landing page (#1013)
+
+The quick start on the rendered API landing page (`lib/public/index.mld`)
+compiles again. Its client example now matches `Client.Completed` as the
+inline record `Completed { output = message; _ }` introduced by #837/#957. The
+shutdown comment no longer claims the client has no finalizer: it now says a
+GC finalizer is only a last-resort safeguard. The page's module index gains
+`Temporal.Runtime`, `Temporal.Replay` and `Temporal.Testing`, which the root
+module exports.
+
+odoc does not type-check code blocks, so `test/doc_snippets/` now guards the
+page in every `dune runtest`. A standard-library-only extractor writes the
+page's `{[ ... ]}` blocks, with line directives pointing back at the page,
+into a library that is compiled against the in-tree `temporal-sdk` without
+linking the Rust bridge. The same program fails if the `{!modules: ...}` index
+differs from the `module X = ...` aliases in `lib/public/temporal.ml`. Run
+against the unfixed page, the check reported the original error at
+`index.mld` line 91. Verified on OCaml 5.4.1 (macOS) with `dune build @install`
+and `dune build @test/doc_snippets/runtest @test/api_witness/runtest`.
+## 2026-10-13: Option None inputs are sent as one argument (#1012)
+
+The zero-argument convention from #819 is now decided by the input codec,
+not by the encoded payload's bytes. Previously any input payload equal to
+`{encoding=binary/null; data=""}` was sent as zero payloads, so
+`Codec.option`'s `None` (byte-for-byte identical to `Codec.unit`) reached a
+foreign handler with an optional parameter as no argument at all. Python then
+raised a missing-argument `TypeError`, and the activity or workflow task
+retried forever. Only `Codec.unit` is now sent as zero payloads. Every other
+codec, including an option's `None`, sends exactly one payload, which matches
+the Go, Java, and Python SDKs' single `binary/null` payload for a nil
+argument.
+
+The public codec carries a private `no_argument` marker that only
+`Codec.unit` sets, exposed as `Codec.is_unit`.
+`Codec_private.encode_arguments` applies the rule at every outbound site:
+client start, signal, and update; activity, local-activity, and child-workflow
+scheduling; continue-as-new; and external signals. The private runtime
+commands and backend requests now carry the argument list, so no inner layer
+inspects payload shapes. `Temporal_base.Payload.input_arguments` and
+`is_unit_null` were removed. Decoding is unchanged and backward compatible:
+OCaml receivers still map zero payloads to the unit payload, so an option
+input from an older OCaml sender still decodes as `None`. Core does not
+compare arguments on replay, so existing histories replay.
+
+`test/runtime/test_input_arguments.ml` drives the public API for unit,
+`None`, and `Some` across activities, local activities, child workflows,
+continue-as-new, and external signals, and checks `Codec.is_unit`.
+`test_native_execution` and `test_activation` cover exact forwarding of a
+`binary/null` argument. A live cross-SDK fixture with a Python or Go handler
+is not included, because this environment cannot run the Docker Compose
+stack. Verified with `dune build @install` and the `test/runtime`,
+`test/unit`, `test/bridge`, `test/sdk_supervisor`, and `test/api_witness`
+test aliases on OCaml 5.4.1 (macOS).
 ## 2026-10-13: One log record per failed activity attempt (#1024)
 
 An activity attempt that fails or is rejected now produces exactly one log

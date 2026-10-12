@@ -50,8 +50,20 @@ val string : string t
     buffers so later changes by a caller cannot alter a stored payload. *)
 val bytes : bytes t
 
-(** Encodes [()] as an empty [binary/null] payload. *)
+(** Encodes [()] as an empty [binary/null] payload.
+
+    When [unit] is the input codec of a workflow, activity, child workflow,
+    signal, update, or continue-as-new call, the SDK sends the call with no
+    argument payloads, as other Temporal SDKs, the CLI, and the Web UI do for
+    a handler without parameters. Every other input codec sends exactly one
+    payload. OCaml receivers decode zero arguments as [()]. *)
 val unit : unit t
+
+(** [is_unit codec] is [true] only for {!unit} itself, the one codec whose
+    inputs are sent as zero argument payloads. A different codec that happens
+    to write [binary/null], such as {!option} for [None], is [false]: its value
+    is sent as one argument. *)
+val is_unit : 'a t -> bool
 
 (** {1 JSON codecs}
 
@@ -130,5 +142,10 @@ val json_conv :
     other-language SDKs already understand. If you instead want an option to
     collapse onto a foreign nullable — deliberately letting [Some ()] read as
     absent for a non-OCaml consumer — do not use this combinator; define that
-    exact wire representation yourself with {!make}. *)
+    exact wire representation yourself with {!make}.
+
+    As a workflow, activity, signal, or update input, [None] is sent as one
+    [binary/null] argument, as the Go, Java, and Python SDKs send a nil value,
+    so a foreign handler with one optional parameter receives it. Only {!unit}
+    inputs are sent with no argument payloads. *)
 val option : 'a t -> 'a option t

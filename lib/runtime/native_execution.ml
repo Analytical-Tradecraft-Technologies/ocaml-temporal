@@ -288,13 +288,13 @@ let null_runtime_payload : Temporal_base.Codec.payload =
     data = Bytes.empty;
   }
 
-(** Converts the single encoded input of a child-workflow or continue-as-new
-    command into Core's repeated input payloads using the shared
-    [Temporal_base.Payload.input_arguments] rule: a canonical unit input is sent
-    as zero payloads, matching other SDKs, and OCaml workflow starts decode
-    [[]] back to that unit payload. Core compares only the workflow type when
-    replaying these commands, so histories recorded with one [binary/null]
-    input still replay. *)
+(** Converts the argument list of a child-workflow or continue-as-new command
+    into Core's repeated input payloads, validating each one. The public layer
+    has already applied the codec-decided rule: a [Codec.unit] input is zero
+    payloads, matching other SDKs, and any other input (an option's [None]
+    included) is one payload (#1012). OCaml workflow starts decode [[]] back
+    to the unit payload. Core compares only the workflow type when replaying
+    these commands, so histories recorded under either rule still replay. *)
 let protocol_input path input =
   let rec loop reversed = function
     | [] -> Ok (List.rev reversed)
@@ -302,7 +302,7 @@ let protocol_input path input =
         let* payload = protocol_payload path payload in
         loop (payload :: reversed) rest
   in
-  loop [] (Temporal_base.Payload.input_arguments input)
+  loop [] input
 
 (** Recognizes the same canonical null marker after conversion to protocol
     payload bytes. *)

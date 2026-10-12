@@ -55,7 +55,7 @@ let workflow = Workflow.define ~name:"local-backoff-cancellation"
     let context = Option.get (Context.current ()) in
     let future, cancel_operation = Context.schedule_local_activity context
       ~name:"fail-for-local-backoff"
-      ~input:(get_base (Temporal_base.Codec.encode Temporal_base.Codec.string name))
+      ~input:[ get_base (Temporal_base.Codec.encode Temporal_base.Codec.string name) ]
       ~start_to_close_timeout:30_000L ~retry_policy ~cancellation_type:(policy name)
       ~decode:(Temporal_base.Codec.decode Temporal_base.Codec.unit) () in
     get (Workflow_context.Local.set cancellation cancel_operation);

@@ -323,7 +323,11 @@ built-in codecs are:
 value that was encoded. For every option type that another-language SDK can
 represent — `string option`, `int option`, and so on — this is also the fully
 interoperable representation (`None` is the standard `binary/null` nil; `Some v`
-is the inner codec's own encoding). The private `binary/x-ocaml-optional`
+is the inner codec's own encoding). As an input, `None` is sent as one
+`binary/null` argument, as the other SDKs send a nil value, so a Python
+activity declared `def lookup(customer_id: Optional[str])` receives `None`.
+Only `Codec.unit` inputs are sent with no argument payloads, matching a
+handler that takes no parameters. The private `binary/x-ocaml-optional`
 envelope appears only for `unit option` and nested `option`, types that have no
 counterpart in most other SDKs; a non-OCaml worker or client that received one
 would report an unknown-encoding error rather than silently reading it as `None`.

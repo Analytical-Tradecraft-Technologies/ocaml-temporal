@@ -221,7 +221,7 @@ let test_child_workflow_cancellation () =
           seq = 1L;
           id = "cancel-me";
           name = "greeting_child";
-          input = payload "Ada";
+          input = [ payload "Ada" ];
           retry_policy = None;
           cancellation_type = Activation.Child_wait_cancellation_requested;
         };
@@ -313,7 +313,7 @@ let test_default_child_workflow_cancellation_policy () =
           seq = 1L;
           id = "default-cancel-me";
           name = "greeting_child";
-          input = payload "Ada";
+          input = [ payload "Ada" ];
           retry_policy = None;
           cancellation_type = Activation.Child_try_cancel;
         };
@@ -700,7 +700,7 @@ let test_child_workflow_completion () =
           seq = 1L;
           id = "greeting/Ada";
           name = "greeting_child";
-          input = payload "Ada";
+          input = [ payload "Ada" ];
           retry_policy = None;
           cancellation_type = Activation.Child_try_cancel;
         };
@@ -727,7 +727,7 @@ let test_child_workflow_retry_policy () =
           seq = 1L;
           id = "retrying-child";
           name = "greeting_child";
-          input = payload "Ada";
+          input = [ payload "Ada" ];
           retry_policy =
             Some
               {
@@ -766,7 +766,7 @@ let test_child_workflow_concurrency_and_decoding () =
           seq = 1L;
           id = "child-1";
           name = "greeting_child";
-          input = payload "Ada";
+          input = [ payload "Ada" ];
           retry_policy = None;
           cancellation_type = Activation.Child_try_cancel;
         };
@@ -928,7 +928,7 @@ let test_child_workflow_id_boundary () =
           seq = 1L;
           id = "after-invalid";
           name = "greeting_child";
-          input = payload "Ada";
+          input = [ payload "Ada" ];
           retry_policy = None;
           cancellation_type = Activation.Child_try_cancel;
         };
@@ -1038,7 +1038,7 @@ let test_child_cancelled_before_start_acknowledgment () =
         seq = 1L;
         id = "default-cancel-me";
         name = "greeting_child";
-        input = payload "Ada";
+        input = [ payload "Ada" ];
         retry_policy = None;
         cancellation_type = Activation.Child_try_cancel;
       }
@@ -1086,7 +1086,7 @@ let test_child_start_conflicting_result_keeps_future_pending () =
   let context = Workflow_context_store.create scheduler in
   let future, _cancel =
     Workflow_context_store.start_child_workflow context ~id:"child-id"
-      ~name:"child-workflow" ~input:(payload "Ada")
+      ~name:"child-workflow" ~input:[ payload "Ada" ]
       ~decode:(fun value -> Ok value) ()
   in
   (match
@@ -1133,7 +1133,7 @@ let test_activity_cancel_after_natural_completion_is_noop () =
   let context = Workflow_context_store.create scheduler in
   let future, cancel =
     Workflow_context_store.schedule_activity context ~name:"greeting"
-      ~input:(payload "Ada") ~decode:(fun value -> Ok value) ()
+      ~input:[ payload "Ada" ] ~decode:(fun value -> Ok value) ()
   in
   expect "natural-completion activity schedule command"
     [ Activation.Schedule_activity
@@ -1176,27 +1176,31 @@ let test_activity_cancel_after_natural_completion_is_noop () =
     (Workflow_context_store.take_commands context);
   Workflow_context_store.shutdown context
 
-(** A unit activity input is scheduled with zero arguments (#819), matching
-    other SDKs so a zero-parameter foreign activity is not given a surplus
-    [null]; both remote and local activities use the shared rule. *)
-let test_unit_activity_input_has_no_arguments () =
+(** The context store forwards an activity's argument list exactly. The
+    public layer decides it from the input codec: a [Codec.unit] input is zero
+    arguments (#819) and anything else is one payload, so a [binary/null]
+    argument such as an option's [None] must not be collapsed here (#1012).
+    Both remote and local activities follow the same rule;
+    [test_input_arguments] covers the codec decision itself. *)
+let test_activity_arguments_are_forwarded_exactly () =
   let scheduler = Scheduler.create () in
   let context = Workflow_context_store.create scheduler in
-  let unit_input = Temporal_base.Payload.unit_null () in
+  let null_argument = Temporal_base.Payload.unit_null () in
   let _remote, _cancel =
-    Workflow_context_store.schedule_activity context ~name:"ping"
-      ~input:unit_input ~decode:(fun value -> Ok value) ()
+    Workflow_context_store.schedule_activity context ~name:"ping" ~input:[]
+      ~decode:(fun value -> Ok value) ()
   in
   let _local, _cancel_local =
     Workflow_context_store.schedule_local_activity context ~name:"local-ping"
-      ~input:unit_input ~decode:(fun value -> Ok value) ()
+      ~input:[ null_argument ] ~decode:(fun value -> Ok value) ()
   in
   (match Workflow_context_store.take_commands context with
   | [ Activation.Schedule_activity { activity_type = "ping"; arguments = []; _ };
       Activation.Schedule_local_activity
-        { activity_type = "local-ping"; arguments = []; _ } ] ->
+        { activity_type = "local-ping"; arguments = [ forwarded ]; _ } ]
+    when forwarded = Temporal_base.Payload.unit_null () ->
       ()
-  | _ -> failwith "unit activity input was not sent as zero arguments");
+  | _ -> failwith "activity arguments were not forwarded exactly");
   Workflow_context_store.shutdown context
 
 (** A Core backoff keeps the original local-activity future pending, creates a
@@ -1207,7 +1211,7 @@ let test_local_activity_backoff_reschedules_without_resolving () =
   let context = Workflow_context_store.create scheduler in
   let future, _cancel =
     Workflow_context_store.schedule_local_activity context ~name:"local-greeting"
-      ~input:(payload "Ada") ~decode:(fun value -> Ok value) ()
+      ~input:[ payload "Ada" ] ~decode:(fun value -> Ok value) ()
   in
   expect "initial local activity command"
     [ Activation.Schedule_local_activity
@@ -1281,7 +1285,7 @@ let test_activity_cancel_after_failure_is_noop () =
   let context = Workflow_context_store.create scheduler in
   let future, cancel =
     Workflow_context_store.schedule_activity context ~name:"greeting"
-      ~input:(payload "Ada") ~decode:(fun value -> Ok value) ()
+      ~input:[ payload "Ada" ] ~decode:(fun value -> Ok value) ()
   in
   ignore (Workflow_context_store.take_commands context);
   let failure =
@@ -1320,7 +1324,7 @@ let test_activity_cancel_owner_check () =
   let context = Workflow_context_store.create scheduler in
   let _future, cancel =
     Workflow_context_store.schedule_activity context ~name:"greeting"
-      ~input:(payload "Ada") ~decode:(fun value -> Ok value) ()
+      ~input:[ payload "Ada" ] ~decode:(fun value -> Ok value) ()
   in
   ignore (Workflow_context_store.take_commands context);
   (match cancel () with
@@ -1347,7 +1351,7 @@ let test_child_cancel_after_natural_completion_is_noop () =
   let context = Workflow_context_store.create scheduler in
   let future, cancel =
     Workflow_context_store.start_child_workflow context ~id:"late-cancel-child"
-      ~name:"child-workflow" ~input:(payload "Ada")
+      ~name:"child-workflow" ~input:[ payload "Ada" ]
       ~decode:(fun value -> Ok value) ()
   in
   expect "natural-completion start command"
@@ -1357,7 +1361,7 @@ let test_child_cancel_after_natural_completion_is_noop () =
           seq = 1L;
           id = "late-cancel-child";
           name = "child-workflow";
-          input = payload "Ada";
+          input = [ payload "Ada" ];
           retry_policy = None;
           cancellation_type = Activation.Child_try_cancel;
         };
@@ -1403,7 +1407,7 @@ let test_child_cancel_after_start_failure_is_noop () =
   let context = Workflow_context_store.create scheduler in
   let future, cancel =
     Workflow_context_store.start_child_workflow context ~id:"failed-child"
-      ~name:"child-workflow" ~input:(payload "Ada")
+      ~name:"child-workflow" ~input:[ payload "Ada" ]
       ~decode:(fun value -> Ok value) ()
   in
   ignore (Workflow_context_store.take_commands context);
@@ -1450,7 +1454,7 @@ let test_child_resolution_rejections_preserve_lifecycle_state () =
   let context = Workflow_context_store.create scheduler in
   let future, _cancel =
     Workflow_context_store.start_child_workflow context ~id:"ordered-child"
-      ~name:"child-workflow" ~input:(payload "Ada")
+      ~name:"child-workflow" ~input:[ payload "Ada" ]
       ~decode:(fun value -> Ok value) ()
   in
   (match
@@ -1551,14 +1555,10 @@ let test_continue_as_new_terminal () =
         Temporal.Workflow.sleep (Temporal.Duration.of_ms 1L))
   in
   let execution = Execution.start source () in
-  let expected_input =
-    match Temporal.Codec.encode Temporal.Codec.unit () with
-    | Ok value -> base_payload value
-    | Error error -> failwith (Temporal.Error.message error)
-  in
+  (* A [Codec.unit] successor input is sent as zero arguments (#819). *)
   expect "continue-as-new command"
     [ Activation.Continue_as_new
-        { workflow_type = "continuation_target"; input = expected_input } ]
+        { workflow_type = "continuation_target"; input = [] } ]
     (Execution.activate execution [ Activation.Start_workflow ]);
   expect "continue-as-new activation is terminal" []
     (Execution.activate execution [ Activation.Start_workflow ]);
@@ -1591,14 +1591,8 @@ let test_codec_callback_preserves_terminal_control () =
         Ok ())
   in
   let expected =
-    let successor_input =
-      match Temporal.Codec.encode Temporal.Codec.unit () with
-      | Ok payload -> base_payload payload
-      | Error error -> failwith (Temporal.Error.message error)
-    in
     [ Activation.Continue_as_new
-        { workflow_type = "codec_continuation_target";
-          input = successor_input } ]
+        { workflow_type = "codec_continuation_target"; input = [] } ]
   in
   expect "activity codec callback terminal command" expected
     (Execution.activate (Execution.start source ()) [ Activation.Start_workflow ]);
@@ -2313,7 +2307,7 @@ let () =
   test_child_cancelled_before_start_acknowledgment ();
   test_child_start_conflicting_result_keeps_future_pending ();
   test_activity_cancel_after_natural_completion_is_noop ();
-  test_unit_activity_input_has_no_arguments ();
+  test_activity_arguments_are_forwarded_exactly ();
   test_local_activity_backoff_reschedules_without_resolving ();
   test_activity_cancel_after_failure_is_noop ();
   test_activity_cancel_owner_check ();
