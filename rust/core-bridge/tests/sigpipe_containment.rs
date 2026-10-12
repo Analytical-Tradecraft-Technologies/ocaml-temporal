@@ -112,7 +112,9 @@ fn abi_calls_restore_the_callers_signal_mask() {
 
 /// A SIGPIPE directed at the calling thread during a guarded call is
 /// consumed, not delivered when the guard restores the mask; with the default
-/// disposition, delivery would end this process.
+/// disposition, delivery would end this process. The guard only acts on
+/// Linux; elsewhere bridge writes cannot raise SIGPIPE.
+#[cfg(target_os = "linux")]
 #[test]
 fn guard_consumes_sigpipe_raised_during_the_call() {
     default_sigpipe_disposition();

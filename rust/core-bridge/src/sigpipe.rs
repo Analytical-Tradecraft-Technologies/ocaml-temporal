@@ -22,9 +22,9 @@
 //!   Core's runtime (through Core's `lang_on_thread_start` hook), the runtime
 //!   cleanup threads, and the Core log writer. A signal left pending on such a
 //!   thread is never delivered and is harmless.
-//! - A thread the application owns (the OCaml supervisor Domain) enters the
-//!   bridge through the shared ABI wrapper, which holds a [`CallerGuard`] for
-//!   the duration of the call. `block_on` can drive connection setup, such as
+//! - On Linux, a thread the application owns (the OCaml supervisor Domain)
+//!   enters the bridge through the shared ABI wrapper, which holds a
+//!   [`CallerGuard`] for the duration of the call. `block_on` can drive connection setup, such as
 //!   a TLS handshake, on that thread. The guard blocks SIGPIPE, consumes one
 //!   that became pending during the call, and restores the caller's exact
 //!   mask, so the application observes no change. Threads that Core spawns
@@ -111,33 +111,20 @@ fn sigpipe_set() -> libc::sigset_t {
 
 /// Removes one pending SIGPIPE without delivering it.
 ///
-/// Linux uses a zero-timeout `sigtimedwait` so the call cannot block even if
-/// another thread accepted the signal after [`pending`] reported it. Other
-/// Unix platforms lack `sigtimedwait`; there `sigwait` returns immediately
-/// because the signal was just observed pending and is blocked here. (On
-/// macOS, the other supported Unix, bridge sockets never raise SIGPIPE.)
-#[cfg(unix)]
+/// A zero-timeout `sigtimedwait` cannot block even if another thread accepted
+/// a process-directed signal after [`pending`] reported it. Only Linux needs
+/// (and has) this; see [`CallerGuard`] for why other platforms never drain.
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn consume_pending() {
     let set = sigpipe_set();
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    {
-        let timeout = libc::timespec {
-            tv_sec: 0,
-            tv_nsec: 0,
-        };
-        // SAFETY: `set` and `timeout` are initialized; a null info pointer
-        // is permitted.
-        unsafe {
-            libc::sigtimedwait(&set, std::ptr::null_mut(), &timeout);
-        }
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    {
-        let mut signal: libc::c_int = 0;
-        // SAFETY: `set` is initialized and `signal` is writable.
-        unsafe {
-            libc::sigwait(&set, &mut signal);
-        }
+    let timeout = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `set` and `timeout` are initialized; a null info pointer is
+    // permitted.
+    unsafe {
+        libc::sigtimedwait(&set, std::ptr::null_mut(), &timeout);
     }
 }
 
@@ -149,14 +136,20 @@ fn consume_pending() {
 /// is left entirely alone, including any signal it has pending. The guard
 /// must be dropped on the thread that created it, because a saved mask is
 /// meaningless on another thread; the guard is `!Send` to enforce that.
+///
+/// The guard only changes the mask on Linux. Elsewhere it does nothing:
+/// macOS bridge sockets set `SO_NOSIGPIPE` so no write raises the signal,
+/// and without a non-blocking `sigtimedwait` a drain could block forever if
+/// another thread accepted a process-directed SIGPIPE between the pending
+/// check and the wait. Windows has no SIGPIPE.
 #[must_use = "SIGPIPE is unblocked again when the guard is dropped"]
 pub struct CallerGuard {
     /// The caller's mask to restore, or `None` when nothing was changed.
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     previous: Option<libc::sigset_t>,
     /// Whether SIGPIPE was already pending on entry; such a signal belongs
     /// to someone else and is not consumed.
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     was_pending: bool,
     /// Keeps the guard `!Send` so it is always dropped on its own thread.
     _thread_bound: std::marker::PhantomData<*const ()>,
@@ -164,7 +157,7 @@ pub struct CallerGuard {
 
 impl CallerGuard {
     /// Blocks SIGPIPE on the calling thread until the guard is dropped.
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     pub fn enter() -> Self {
         let set = sigpipe_set();
         let mut previous = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
@@ -186,8 +179,9 @@ impl CallerGuard {
         }
     }
 
-    /// No SIGPIPE exists on this platform; the guard does nothing.
-    #[cfg(not(unix))]
+    /// Bridge writes cannot raise SIGPIPE on this platform; the guard does
+    /// nothing.
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     pub fn enter() -> Self {
         Self {
             _thread_bound: std::marker::PhantomData,
@@ -200,7 +194,7 @@ impl Drop for CallerGuard {
     /// mask. Consuming first matters: unblocking with the signal pending
     /// would deliver it immediately with the default (terminating) action.
     fn drop(&mut self) {
-        #[cfg(unix)]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         if let Some(previous) = self.previous.take() {
             if !self.was_pending && pending() {
                 consume_pending();

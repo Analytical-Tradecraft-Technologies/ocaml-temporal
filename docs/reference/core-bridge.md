@@ -666,12 +666,16 @@ blocks it in thread signal masks instead (`rust/core-bridge/src/sigpipe.rs`):
 - every Tokio worker and blocking-pool thread of Core's runtime blocks it at
   start, through Core's `lang_on_thread_start` hook, as do the runtime
   cleanup threads and the Core log writer;
-- the common ABI wrapper (`invoke`) blocks it for the duration of each call
-  on the application's thread, where `block_on` can drive connection setup
+- on Linux, the common ABI wrapper (`invoke`) blocks it for the duration of
+  each call on the application's thread, where `block_on` can drive connection setup
   such as a TLS handshake. On return it consumes a SIGPIPE that became
   pending during the call and restores the caller's exact mask. A caller that
   had already blocked SIGPIPE is left untouched. Threads Core spawns during a
-  guarded call inherit the blocked mask.
+  guarded call inherit the blocked mask. The drain is a zero-timeout
+  `sigtimedwait`, so it cannot block if another thread accepted a
+  process-directed SIGPIPE first. Other platforms skip the guard: macOS
+  bridge sockets never raise SIGPIPE, and without `sigtimedwait` a drain
+  could block indefinitely.
 
 The write then fails with `EPIPE` and follows the ordinary error path.
 Setting `SIG_IGN` instead (as the Rust, Python and Node runtimes do) was
