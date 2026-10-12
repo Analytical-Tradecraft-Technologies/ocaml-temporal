@@ -1,0 +1,41 @@
+; Compile-checks the API documentation landing page (#1013).
+;
+; odoc never type-checks `{[ ... ]}` blocks, so the quick start in
+; lib/public/index.mld could stop compiling without failing `make docs`.
+; These rules extract its code blocks into one module and compile it against
+; the in-tree `temporal-sdk`, and check that the page's module index lists
+; every public module. Both run in every `dune runtest`, which every CI lane
+; runs, without Docker or a Temporal Server.
+
+; Uses only the standard library, so it builds independently of the SDK.
+
+(executable
+ (name doc_snippets)
+ (modules doc_snippets))
+
+(rule
+ (with-stdout-to
+  index_snippets.ml
+  (run %{exe:doc_snippets.exe} extract %{dep:../../lib/public/index.mld})))
+
+; A library (rather than an executable) type-checks the snippets without
+; linking the Rust bridge, and their top-level definitions are never run.
+
+(library
+ (name temporal_index_snippets)
+ (modules index_snippets)
+ (libraries temporal-sdk))
+
+; Depending on the compiled interface makes `runtest` fail when a snippet no
+; longer compiles; the action then checks the module index.
+
+(rule
+ (alias runtest)
+ (package temporal-sdk)
+ (deps %{cmi:index_snippets})
+ (action
+  (run
+   %{exe:doc_snippets.exe}
+   check-modules
+   %{dep:../../lib/public/index.mld}
+   %{dep:../../lib/public/temporal.ml})))

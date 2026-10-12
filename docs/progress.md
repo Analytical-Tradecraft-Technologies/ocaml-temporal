@@ -27,6 +27,25 @@ arrived, which separates a slow close from a missing response. The helper
 was checked standalone against complete, partial and length-less responses
 on OCaml 5.4.1 (macOS); the Windows CI job is the regression gate.
 
+## 2026-10-13: Compile-checked API landing page (#1013)
+
+The quick start on the rendered API landing page (`lib/public/index.mld`)
+compiles again. Its client example now matches `Client.Completed` as the
+inline record `Completed { output = message; _ }` introduced by #837/#957. The
+shutdown comment no longer claims the client has no finalizer: it now says a
+GC finalizer is only a last-resort safeguard. The page's module index gains
+`Temporal.Runtime`, `Temporal.Replay` and `Temporal.Testing`, which the root
+module exports.
+
+odoc does not type-check code blocks, so `test/doc_snippets/` now guards the
+page in every `dune runtest`. A standard-library-only extractor writes the
+page's `{[ ... ]}` blocks, with line directives pointing back at the page,
+into a library that is compiled against the in-tree `temporal-sdk` without
+linking the Rust bridge. The same program fails if the `{!modules: ...}` index
+differs from the `module X = ...` aliases in `lib/public/temporal.ml`. Run
+against the unfixed page, the check reported the original error at
+`index.mld` line 91. Verified on OCaml 5.4.1 (macOS) with `dune build @install`
+and `dune build @test/doc_snippets/runtest @test/api_witness/runtest`.
 ## 2026-10-13: Option None inputs are sent as one argument (#1012)
 
 The zero-argument convention from #819 is now decided by the input codec,
