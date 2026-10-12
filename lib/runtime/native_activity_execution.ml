@@ -421,46 +421,6 @@ let protocol_payload path (payload : Temporal_base.Codec.payload) =
   let* metadata = metadata_loop [] payload.metadata in
   Ok Protocol.{ metadata; data = Bytes.copy payload.data }
 
-(** Converts a Core duration into the runtime's millisecond-only value without
-    silently rounding. Core can represent sub-millisecond durations, but the
-    public OCaml duration intentionally cannot; rejecting those values keeps a
-    heartbeat timeout exact instead of changing its meaning at the boundary. *)
-let runtime_duration path (duration : Protocol.duration) =
-  if Int64.compare duration.seconds 0L < 0 then
-    Error
-      (make_error ~path:(path ^ ".seconds") "invalid_message"
-         "duration must not be negative")
-  else if duration.nanoseconds < 0 || duration.nanoseconds >= 1_000_000_000 then
-    Error
-      (make_error ~path:(path ^ ".nanoseconds") "invalid_message"
-         "nanoseconds are outside protobuf range")
-  else if duration.nanoseconds mod 1_000_000 <> 0 then
-    Error
-      (make_error ~path:(path ^ ".nanoseconds") "unsupported"
-         "sub-millisecond durations are not representable by the runtime")
-  else
-    (* Compute the largest representable whole-millisecond value before
-       multiplying seconds, avoiding an overflowing intermediate Int64. *)
-    let milliseconds_per_second = 1_000L in
-    let milliseconds = Int64.of_int (duration.nanoseconds / 1_000_000) in
-    let maximum_seconds = Int64.div Int64.max_int milliseconds_per_second in
-    let maximum_remainder =
-      Int64.rem Int64.max_int milliseconds_per_second
-    in
-    if Int64.compare duration.seconds maximum_seconds > 0
-       || (Int64.equal duration.seconds maximum_seconds
-          && Int64.compare milliseconds maximum_remainder > 0)
-    then
-      Error
-        (make_error ~path "unsupported"
-           "duration exceeds the runtime millisecond range")
-    else
-      Ok
-        (Temporal_base.Duration.of_ms
-           (Int64.add
-              (Int64.mul duration.seconds milliseconds_per_second)
-              milliseconds))
-
 (** Converts a list of protocol payloads while preserving order and copying
     every body. The indexed path makes malformed metadata diagnosable without
     exposing the payload bytes themselves. *)
@@ -551,32 +511,15 @@ let decode_payloads definition (start : Protocol.activity_start) =
   in
   Ok (input, details)
 
-(** Converts all synchronous callback inputs before dispatch, including the
-    exact heartbeat interval behind [Temporal.Activity.Context.heartbeat_timeout].
-    Asynchronous definitions use [decode_payloads] instead: they have no
-    synchronous heartbeat context, so a sub-millisecond timeout that
-    [runtime_duration] cannot represent exactly must not reject their task;
-    [task_info] exposes it rounded up through [Async_context.info]. Error
-    routing is the same as for [decode_payloads]. *)
-let decode_start definition (start : Protocol.activity_start) =
-  let* input, details = decode_payloads definition start in
-  let* heartbeat_timeout =
-    match start.heartbeat_timeout with
-    | None -> Ok None
-    | Some timeout ->
-        Result.map (fun timeout -> Some timeout)
-          (runtime_duration "$.variant.heartbeat_timeout" timeout)
-  in
-  Ok (input, details, heartbeat_timeout)
-
 (** Converts a task timeout to whole milliseconds for
-    [Temporal.Activity.Info], rounding a sub-millisecond remainder up.
+    [Temporal.Activity.Info] and [Context.heartbeat_timeout], rounding a
+    sub-millisecond remainder up.
 
-    Unlike [runtime_duration], which rejects sub-millisecond heartbeat
-    intervals because heartbeat throttling depends on the exact value, this
-    conversion is total: metadata exposure must never add a task-rejection
-    path. Rounding up keeps a positive timeout positive (zero would read as
-    "already expired"). The result is clamped to 315,576,000,000,999 ms, the
+    The conversion is total: exposing metadata must never add a
+    task-rejection path, so a sub-millisecond heartbeat interval scheduled by
+    another SDK is accepted rather than failing the task (#1032). Rounding up
+    keeps a positive timeout positive (zero would read as "already
+    expired"). The result is clamped to 315,576,000,000,999 ms, the
     largest whole-millisecond protobuf duration and the maximum accepted by
     [Temporal.Duration.of_ms]: rounding up the valid protobuf maximum
     (315,576,000,000 s plus 999,999,999 ns) would otherwise exceed it by one
@@ -597,10 +540,35 @@ let info_duration (duration : Protocol.duration) =
   in
   Temporal_base.Duration.of_ms (Int64.min milliseconds maximum_ms)
 
+(** Projects an optional Core timeout into the public representation. Temporal
+    uses a zero duration to mean "not set": Core fills an absent local
+    schedule-to-close with zero, the server reports an unset heartbeat timeout
+    as zero, and an unset remote schedule-to-close inherits a zero workflow run
+    timeout. Exposing those as [Some 0ms] would make deadline arithmetic
+    conclude the attempt already expired and heartbeat pacing at half the
+    interval spin, so zero becomes [None] as in the Go and Python SDKs and in
+    [Temporal.Testing] (#1032). Any positive value goes through
+    [info_duration]. *)
+let configured_timeout = function
+  | None -> None
+  | Some { Protocol.seconds = 0L; nanoseconds = 0 } -> None
+  | Some duration -> Some (info_duration duration)
+
+(** Converts all synchronous callback inputs before dispatch, including the
+    heartbeat interval behind [Temporal.Activity.Context.heartbeat_timeout],
+    which uses the same total [configured_timeout] projection as
+    [Activity.Info]: an unset (zero) interval is [None] and a sub-millisecond
+    one rounds up, so only the payloads can reject the task. Asynchronous
+    definitions use [decode_payloads] instead because they have no synchronous
+    heartbeat context. Error routing is the same as for [decode_payloads]. *)
+let decode_start definition (start : Protocol.activity_start) =
+  let* input, details = decode_payloads definition start in
+  Ok (input, details, configured_timeout start.heartbeat_timeout)
+
 (** Copies the identity and scheduling facts of a start task into the
     immutable record exposed through [Temporal.Activity.Context.info]. The
     strict protocol decoder has already bounded every string and validated
-    timestamp fractions, and [info_duration] is total, so this projection
+    timestamp fractions, and [configured_timeout] is total, so this projection
     cannot fail. Core's attempt is a uint32, which always fits a native OCaml
     [int] on supported 64-bit targets. *)
 let task_info (start : Protocol.activity_start) : Activity_context.info =
@@ -623,9 +591,9 @@ let task_info (start : Protocol.activity_start) : Activity_context.info =
       timestamp start.current_attempt_scheduled_time;
     started_time = timestamp start.started_time;
     schedule_to_close_timeout =
-      Option.map info_duration start.schedule_to_close_timeout;
-    start_to_close_timeout = Option.map info_duration start.start_to_close_timeout;
-    task_heartbeat_timeout = Option.map info_duration start.heartbeat_timeout;
+      configured_timeout start.schedule_to_close_timeout;
+    start_to_close_timeout = configured_timeout start.start_to_close_timeout;
+    task_heartbeat_timeout = configured_timeout start.heartbeat_timeout;
   }
 
 (** Projects the log-correlation identity of a start task. The strict decoder
@@ -1477,8 +1445,8 @@ module Make (Supervisor : SUPERVISOR) = struct
       (start : Protocol.activity_start) =
     let correlation = Some (correlation_of_start start) in
     let process () =
-      (* [decode_payloads], not [decode_start]: the exact heartbeat interval
-         is only needed by synchronous contexts. *)
+      (* [decode_payloads], not [decode_start]: the heartbeat interval is
+         only needed by synchronous contexts. *)
       match decode_payloads definition start with
       | Error error -> reject_task adapter ~token ~correlation error
       | Ok (input, _details) ->
