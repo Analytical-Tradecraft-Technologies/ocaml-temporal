@@ -909,7 +909,7 @@ module Make (Supervisor : SUPERVISOR) = struct
       non-retryable supervisor rejection produced when the supervisor ran the
       encoder; [finish_pending] fails it closed without a native call. *)
   let encode_submission completion =
-    match Encoded_completion.encode completion with
+    match Native_execution.encode_completion completion with
     | Ok encoded -> Ok { Native_execution.completion; encoded }
     | Error error ->
         let view = Protocol.error_view error in

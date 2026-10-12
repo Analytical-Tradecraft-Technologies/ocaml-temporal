@@ -12,6 +12,14 @@ module Protocol = Temporal_protocol.Workflow_protocol
 module Failure_diagnostic = Temporal_protocol.Failure_diagnostic
 module Encoded_completion = Temporal_protocol.Encoded_workflow_completion
 
+(** See the interface. The wrapper is the single place the adapter invokes
+    the completion encoder, so live codec attribution counts every pass. *)
+let encode_completion completion =
+  Temporal_base.Observability.debug_timed
+    ~src:Temporal_base.Observability.Source.bridge
+    ~operation:"workflow_completion_encode" (fun () ->
+      Encoded_completion.encode completion)
+
 (** Result-bind notation keeps every boundary conversion on the typed error
     path; no protocol or runtime input is handled with an exception. *)
 let ( let* ) = Result.bind
@@ -1265,7 +1273,7 @@ let encoded_completion_of_commands ~run_id commands =
   in
   let* commands = loop [] commands in
   let completion = Protocol.{ run_id; task_failure = None; commands } in
-  match Encoded_completion.encode completion with
+  match encode_completion completion with
   | Ok encoded -> Ok { completion; encoded }
   | Error error -> Error (protocol_error error)
 
@@ -1473,7 +1481,7 @@ let activate_translated execution (translated : translated_activation) =
           run_id = translated.run_id; commands = []; task_failure = Some failure
         } in
         let* encoded =
-          Encoded_completion.encode completion |> Result.map_error protocol_error
+          encode_completion completion |> Result.map_error protocol_error
         in
         Ok { completion; encoded }
   in

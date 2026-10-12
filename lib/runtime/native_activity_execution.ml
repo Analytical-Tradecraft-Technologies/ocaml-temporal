@@ -677,11 +677,15 @@ type completion_attempt =
     encoder pass. The returned value is the only form a completion can take on
     its way to the supervisor, which copies its bytes into the C call without
     encoding them again (issue #995); an encoder rejection therefore keeps the
-    completion away from the native bridge. *)
+    completion away from the native bridge. The pass is timed as
+    [activity_completion_encode] only while the bridge source is at [Debug]
+    (#528). *)
 let encode_completion completion =
   Result.map_error
     (fun error -> protocol_error ~path:"$.completion" error)
-    (Encoded_completion.encode completion)
+    (Observability.debug_timed ~src:Observability.Source.bridge
+       ~operation:"activity_completion_encode" (fun () ->
+         Encoded_completion.encode completion))
 
 (** Converts a supervisor completion exception to a stable diagnostic without
     revealing the opaque token or native exception object. *)

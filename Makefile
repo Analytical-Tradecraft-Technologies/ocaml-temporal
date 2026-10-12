@@ -196,9 +196,21 @@ BENCH_FANOUT_BATCH ?= 10
 BENCH_FANOUT_PAYLOAD_BYTES ?= 256
 BENCH_FANOUT_WARMUP ?= 2
 BENCH_FANOUT_SAMPLES ?= 20
+# #528 live fan-out against the Compose Temporal stack. The benchmark runs in
+# the development container on the stack's network; TEMPORAL_COMPOSE_PROJECT
+# selects the stack, which this target starts but leaves running for reruns
+# (stop it with `make temporal-clean`).
+BENCH_LIVE_FANOUT_LEVELS ?= 1 8
+BENCH_LIVE_FANOUT_WARMUP ?= 1
+BENCH_LIVE_FANOUT_SAMPLES ?= 5
+BENCH_LIVE_FANOUT_REPETITIONS ?= 1
+BENCH_LIVE_TARGET_URL ?= http://temporal:7233
+BENCH_LIVE_NAMESPACE ?= temporal-sdk-test
+BENCH_LIVE_ATTRIBUTION_SAMPLES ?= 1
+BENCH_SERVER_VERSION ?= none
 
 .PHONY: test-temporal-live-ci test-temporal-diagnostics-contract
-.PHONY: bench bench-activation bench-activation-warm bench-activation-cold bench-payload-codec bench-memory bench-history bench-cache bench-cache-steady bench-cache-churn bench-fanout
+.PHONY: bench bench-activation bench-activation-warm bench-activation-cold bench-payload-codec bench-memory bench-history bench-cache bench-cache-steady bench-cache-churn bench-fanout bench-fanout-live bench-json-bridge-rust
 .NOTPARALLEL: bench-activation bench-memory bench-cache
 .PHONY: version-check build build-examples docs cargo-metadata test test-unit test-runtime test-rust test-bridge test-install test-api release-preflight release-tag-check test-quality-contract test-temporal-config test-temporal-worker-readiness-contract test-temporal-worker-stop-contract test-temporal-worker-crash-recovery-contract test-temporal-worker-cache-eviction-contract test-core-lifecycle-integration temporal-start temporal-start-worker temporal-run-driver temporal-inspect-smoke temporal-stop-worker test-temporal-two-binary test-temporal-integration test-temporal-worker-restart test-temporal-worker-restart-contract test-temporal-worker-restart-live test-temporal-worker-crash-recovery test-temporal-worker-cache-eviction test-temporal-worker-cache-eviction-live test-temporal-workflow-patching test-temporal-workflow-patching-contract test-temporal-workflow-patching-live test-temporal-parent-child-restart test-temporal-parent-child-restart-contract test-temporal-parent-child-restart-live test-temporal-parent-child-failure-replay test-temporal-parent-child-failure-replay-contract test-temporal-parent-child-failure-replay-live temporal-health temporal-status temporal-logs temporal-stop temporal-clean lint lint-rust fmt quality quality-tool-version-check quality-rust quality-spelling license-check audit clean verify check native-version-check native-build native-test native-test-rust native-test-install native-lint native-lint-rust native-verify
 version-check:
@@ -264,6 +276,10 @@ bench:
 		BENCH_FANOUT_CONCURRENCY="$(BENCH_FANOUT_CONCURRENCY)" \
 		BENCH_FANOUT_BATCH="$(BENCH_FANOUT_BATCH)" \
 		BENCH_FANOUT_PAYLOAD_BYTES="$(BENCH_FANOUT_PAYLOAD_BYTES)" \
+		BENCH_LIVE_TARGET_URL="$(BENCH_LIVE_TARGET_URL)" \
+		BENCH_LIVE_NAMESPACE="$(BENCH_LIVE_NAMESPACE)" \
+		BENCH_LIVE_ATTRIBUTION_SAMPLES="$(BENCH_LIVE_ATTRIBUTION_SAMPLES)" \
+		BENCH_SERVER_VERSION="$(BENCH_SERVER_VERSION)" \
 		opam exec -- dune exec $(DUNE_BUILD_ARGS) --profile release test/benchmark/$(BENCH_EXECUTABLE).exe -- \
 		--warmup "$(BENCH_WARMUP)" --samples "$(BENCH_SAMPLES)" \
 		--repetitions "$(BENCH_REPETITIONS)" --seed "$(BENCH_SEED)" \
@@ -328,6 +344,33 @@ bench-fanout:
 			BENCH_FANOUT_CONCURRENCY="$$level" \
 			BENCH_WARMUP="$(BENCH_FANOUT_WARMUP)" BENCH_SAMPLES="$(BENCH_FANOUT_SAMPLES)"; \
 	done
+
+# #528 live fan-out: starts the Compose stack, then runs one report per
+# concurrency level against it. The server image is read from the Compose file
+# so the report names the exact server the run used.
+bench-fanout-live:
+	$(MAKE) temporal-start
+	@set -eu; \
+	server=$$(awk '$$1 == "image:" && index($$2, "temporalio/server:") == 1 { print $$2; exit }' "$(TEMPORAL_COMPOSE_FILE)"); \
+	test -n "$$server"; \
+	for level in $(BENCH_LIVE_FANOUT_LEVELS); do \
+		$(MAKE) bench BENCH_EXECUTABLE=bench_live_fanout \
+			BENCH_REPORT="$(BENCH_REPORT_DIR)/live-activity-fanout-c$$level.json" \
+			BENCH_FANOUT_CONCURRENCY="$$level" \
+			BENCH_SERVER_VERSION="$$server" \
+			BENCH_WARMUP="$(BENCH_LIVE_FANOUT_WARMUP)" \
+			BENCH_SAMPLES="$(BENCH_LIVE_FANOUT_SAMPLES)" \
+			BENCH_REPETITIONS="$(BENCH_LIVE_FANOUT_REPETITIONS)"; \
+	done
+
+# #528 Rust half of the JSON bridge: serde encode/decode and Core conversion
+# of fan-out-shaped documents, in Cargo's optimized bench profile. Prints one
+# JSON report; it needs no server.
+bench-json-bridge-rust:
+	$(COMPOSE_RUN) env BENCH_FANOUT_WIDTH="$(BENCH_FANOUT_WIDTH)" \
+		BENCH_FANOUT_BATCH="$(BENCH_FANOUT_BATCH)" \
+		BENCH_FANOUT_PAYLOAD_BYTES="$(BENCH_FANOUT_PAYLOAD_BYTES)" \
+		cargo bench --manifest-path $(CARGO_MANIFEST) --locked --bench json_bridge
 
 test:
 	$(MAKE) test-temporal-config

@@ -344,6 +344,15 @@ module Protocol_adapter = struct
   module Client = Temporal_protocol.Client_protocol
   module Workflow = Temporal_protocol.Workflow_protocol
   module Activity = Temporal_protocol.Activity_protocol
+  module Observability = Temporal_base.Observability
+
+  (** Times one protocol codec pass as a [Debug] bridge record when that
+      source is enabled (#528); otherwise it only runs [action]. The
+      measured span includes the copy between native bytes and the OCaml
+      string, matching what the supervisor does for every task. *)
+  let codec_timed operation action =
+    Observability.debug_timed ~src:Observability.Source.bridge ~operation
+      action
 
   (** Converts a workflow protocol failure to the bridge error vocabulary used
       by the native supervisor. Protocol diagnostics contain only stable code,
@@ -395,7 +404,10 @@ module Protocol_adapter = struct
 
   (** Strictly validates one workflow activation copied from Rust. *)
   let decode_workflow_activation input =
-    match Workflow.decode_activation (Bytes.to_string input) with
+    match
+      codec_timed "workflow_activation_decode" (fun () ->
+          Workflow.decode_activation (Bytes.to_string input))
+    with
     | Ok activation -> Ok activation
     | Error error -> workflow_error "workflow activation decoding" error
 
@@ -469,7 +481,10 @@ module Protocol_adapter = struct
 
   (** Strictly validates one remote activity task copied from Rust. *)
   let decode_activity_task input =
-    match Activity.decode_task (Bytes.to_string input) with
+    match
+      codec_timed "activity_task_decode" (fun () ->
+          Activity.decode_task (Bytes.to_string input))
+    with
     | Ok task -> Ok task
     | Error error -> activity_error "activity task decoding" error
 
