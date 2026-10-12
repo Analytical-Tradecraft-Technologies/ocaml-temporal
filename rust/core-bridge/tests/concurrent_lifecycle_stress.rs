@@ -43,7 +43,11 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
     ptr,
-    sync::{Arc, Condvar, Mutex, MutexGuard, mpsc},
+    sync::{
+        Arc, Condvar, Mutex, MutexGuard,
+        atomic::{AtomicU64, Ordering},
+        mpsc,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -508,8 +512,8 @@ struct ThreadReport {
 /// Messages a worker thread sends to the coordinator. Every send ignores a
 /// closed channel, because the coordinator may already have given up.
 enum Event {
-    /// Setup finished; `owned` of the thread's graphs built their own Core.
-    Ready { owned: usize },
+    /// Setup finished and the thread is waiting at the start gate.
+    Ready,
     /// The thread finished, failed, or panicked. A thread that never became
     /// ready sends only this.
     Done(ThreadReport),
@@ -588,6 +592,14 @@ impl Gate {
     }
 }
 
+/// State shared by the coordinator and the worker threads of one round.
+struct RoundSync {
+    /// Start gate released (or aborted) by the coordinator.
+    gate: Gate,
+    /// Graphs of this round that built their own Core runtime.
+    owned_cores: AtomicU64,
+}
+
 /// Test-only fault injected into one worker's setup, so the deadline
 /// handling itself is tested. The ordinary stress never injects anything.
 #[derive(Clone, Copy, Debug)]
@@ -624,7 +636,7 @@ fn worker(
     mut rng: Rng,
     shared: Vec<SharedHandle>,
     plan: RoundPlan,
-    gate: &Gate,
+    sync: &RoundSync,
     deadline: Instant,
     events: &mpsc::Sender<Event>,
 ) -> ThreadReport {
@@ -637,12 +649,11 @@ fn worker(
     }
     let mut trace = Trace::default();
     let mut live: Vec<Graph> = Vec::new();
-    let mut owned = 0;
     let mut setup_error = None;
     for _ in 0..plan.graphs {
         // An aborted round must not attach any more: the coordinator may
         // release the shared handles as soon as every thread has reported.
-        if gate.get() == GateState::Abort {
+        if sync.gate.get() == GateState::Abort {
             setup_error = Some("setup aborted by the coordinator".to_owned());
             break;
         }
@@ -650,9 +661,14 @@ fn worker(
         let mut result = AbiResult::default();
         // One graph in four builds its own Core; the rest attach.
         let status = if rng.below(4) == 0 {
-            owned += 1;
             // SAFETY: both outputs are writable and owned by this thread.
-            unsafe { ocaml_temporal_core_v4_runtime_new(&mut runtime, &mut result) }
+            let status = unsafe { ocaml_temporal_core_v4_runtime_new(&mut runtime, &mut result) };
+            // Count every Core this round builds, including graphs a failed
+            // setup releases again, so the drop accounting stays exact.
+            if status == STATUS_OK && !runtime.is_null() {
+                sync.owned_cores.fetch_add(1, Ordering::SeqCst);
+            }
+            status
         } else {
             let handle = shared[rng.below(shared.len())];
             // SAFETY: the coordinator releases a shared handle only after
@@ -688,11 +704,11 @@ fn worker(
             trace,
         };
     }
-    let _ = events.send(Event::Ready { owned });
+    let _ = events.send(Event::Ready);
     // The coordinator always opens or aborts the gate by the deadline; the
     // extra grace keeps this thread's own timeout from racing that decision,
     // so it fires only if the coordinator itself is gone.
-    if gate.wait(deadline + plan.grace) != GateState::Go {
+    if sync.gate.wait(deadline + plan.grace) != GateState::Go {
         release_all(&mut live, &mut trace);
         return ThreadReport {
             thread,
@@ -789,9 +805,20 @@ fn release_shared(shared: &mut [*mut SharedRuntime], rng: &mut Rng) {
     }
 }
 
-/// Runs one round. Returns the number of Core runtimes it created, or a
-/// report (also written to disk) when a thread failed, panicked, or missed
-/// the deadline.
+/// What one round produced.
+struct RoundResult {
+    /// Core runtimes the round created: its shared runtimes plus every graph
+    /// that built its own Core, whether or not the round failed. Each of
+    /// them is dropped exactly once after release (possibly later, on a
+    /// cleanup thread, for the GC-fallback dispose paths), unless the report
+    /// says the shared runtimes were leaked.
+    cores_created: u64,
+    /// `Err` holds the failure report (also written to disk when enabled)
+    /// when a thread failed, panicked, or missed the deadline.
+    outcome: Result<(), String>,
+}
+
+/// Runs one round.
 ///
 /// The deadline starts before any thread is spawned and bounds setup, the
 /// start gate, and the run. If setup fails or times out, the gate is
@@ -800,7 +827,7 @@ fn release_shared(shared: &mut [*mut SharedRuntime], rng: &mut Rng) {
 /// when every thread has reported, because a hung thread might still be
 /// inside `runtime_new_attached` on them; otherwise the handles are leaked
 /// and the report says so.
-fn run_round(plan: RoundPlan, outcomes: &mut BTreeMap<String, usize>) -> Result<u64, String> {
+fn run_round(plan: RoundPlan, outcomes: &mut BTreeMap<String, usize>) -> RoundResult {
     let RoundPlan {
         seed,
         round,
@@ -827,12 +854,15 @@ fn run_round(plan: RoundPlan, outcomes: &mut BTreeMap<String, usize>) -> Result<
         shared.push(handle);
     }
     let handles: Vec<SharedHandle> = shared.iter().map(|handle| SharedHandle(*handle)).collect();
-    let gate = Arc::new(Gate::new());
+    let sync = Arc::new(RoundSync {
+        gate: Gate::new(),
+        owned_cores: AtomicU64::new(0),
+    });
     let (events_tx, events_rx) = mpsc::channel();
     for thread in 0..threads {
         let thread_rng = Rng::derive(rng.next_u64(), u64::try_from(thread).expect("fits"));
         let handles = handles.clone();
-        let gate = Arc::clone(&gate);
+        let sync = Arc::clone(&sync);
         let events = events_tx.clone();
         thread::Builder::new()
             .name(format!("concurrent-stress-{round}-{thread}"))
@@ -840,7 +870,7 @@ fn run_round(plan: RoundPlan, outcomes: &mut BTreeMap<String, usize>) -> Result<
                 // A panic anywhere in the worker becomes a prompt failure
                 // report instead of a silent missing thread.
                 let report = catch_unwind(AssertUnwindSafe(|| {
-                    worker(thread, thread_rng, handles, plan, &gate, deadline, &events)
+                    worker(thread, thread_rng, handles, plan, &sync, deadline, &events)
                 }))
                 .unwrap_or_else(|panic| ThreadReport {
                     thread,
@@ -856,15 +886,20 @@ fn run_round(plan: RoundPlan, outcomes: &mut BTreeMap<String, usize>) -> Result<
     // Setup: wait, bounded by the deadline, until every thread is ready or
     // has reported. Any early report is a failure and aborts the round.
     let mut ready = 0;
-    let mut owned = 0;
     let mut reported = 0;
+    // Shared runtimes count as created now; owned Cores are read from the
+    // counter once no thread can create more.
+    let shared_cores = u64::try_from(SHARED_PER_ROUND).expect("fits");
+    let result = |owned_cores: &AtomicU64, outcome| RoundResult {
+        cores_created: shared_cores + owned_cores.load(Ordering::SeqCst),
+        outcome,
+    };
     let mut failures = String::new();
     while ready + reported < threads {
         let remaining = deadline.saturating_duration_since(Instant::now());
         match events_rx.recv_timeout(remaining) {
-            Ok(Event::Ready { owned: count }) => {
+            Ok(Event::Ready) => {
                 ready += 1;
-                owned += count;
             }
             Ok(Event::Done(report)) => {
                 reported += 1;
@@ -892,12 +927,12 @@ fn run_round(plan: RoundPlan, outcomes: &mut BTreeMap<String, usize>) -> Result<
     if !failures.is_empty() {
         // Abort: ready threads release their graphs; a thread still in setup
         // stops before its next attach. Collect reports within the grace.
-        gate.set(GateState::Abort);
+        sync.gate.set(GateState::Abort);
         let grace = Instant::now() + plan.grace;
         while reported < threads {
             let remaining = grace.saturating_duration_since(Instant::now());
             match events_rx.recv_timeout(remaining) {
-                Ok(Event::Ready { .. }) => {}
+                Ok(Event::Ready) => {}
                 Ok(Event::Done(report)) => {
                     reported += 1;
                     absorb(report, &mut failures, outcomes);
@@ -914,10 +949,10 @@ fn run_round(plan: RoundPlan, outcomes: &mut BTreeMap<String, usize>) -> Result<
                 threads - reported
             );
         }
-        return Err(fail(plan, started, &failures));
+        return result(&sync.owned_cores, Err(fail(plan, started, &failures)));
     }
 
-    gate.set(GateState::Go);
+    sync.gate.set(GateState::Go);
     // Release the shared handles at a seeded moment while the graphs run.
     // Every attach finished before its thread became ready.
     thread::sleep(Duration::from_millis(
@@ -928,7 +963,7 @@ fn run_round(plan: RoundPlan, outcomes: &mut BTreeMap<String, usize>) -> Result<
     while reported < threads {
         let remaining = deadline.saturating_duration_since(Instant::now());
         match events_rx.recv_timeout(remaining) {
-            Ok(Event::Ready { .. }) => {}
+            Ok(Event::Ready) => {}
             Ok(Event::Done(report)) => {
                 reported += 1;
                 absorb(report, &mut failures, outcomes);
@@ -940,14 +975,14 @@ fn run_round(plan: RoundPlan, outcomes: &mut BTreeMap<String, usize>) -> Result<
                     plan.deadline,
                     threads - reported
                 );
-                return Err(fail(plan, started, &failures));
+                return result(&sync.owned_cores, Err(fail(plan, started, &failures)));
             }
         }
     }
     if !failures.is_empty() {
-        return Err(fail(plan, started, &failures));
+        return result(&sync.owned_cores, Err(fail(plan, started, &failures)));
     }
-    Ok(u64::try_from(owned + SHARED_PER_ROUND).expect("fits"))
+    result(&sync.owned_cores, Ok(()))
 }
 
 /// Formats and writes a round failure report, returning its text.
@@ -1047,9 +1082,10 @@ fn concurrent_lifecycle_rounds_converge() {
             fault: None,
             write_reports: true,
         };
-        match run_round(plan, &mut outcomes) {
-            Ok(created) => cores += created,
-            Err(report) => panic!("{report}"),
+        let round = run_round(plan, &mut outcomes);
+        cores += round.cores_created;
+        if let Err(report) = round.outcome {
+            panic!("{report}");
         }
     }
 
@@ -1072,20 +1108,7 @@ fn concurrent_lifecycle_rounds_converge() {
         graph_count,
         "every graph was created through runtime_new or runtime_new_attached"
     );
-    let cores_converged =
-        eventually(|| test_core_runtime_counts().1 - cores_dropped_before == cores);
-    assert!(
-        cores_converged,
-        "Core drops did not converge: expected {cores}, observed {}",
-        test_core_runtime_counts().1 - cores_dropped_before
-    );
-    // Drops past the expected count would mean a double destruction.
-    thread::sleep(Duration::from_millis(100));
-    assert_eq!(
-        test_core_runtime_counts().1 - cores_dropped_before,
-        cores,
-        "a Core runtime was dropped more than once"
-    );
+    expect_core_drops(cores_dropped_before, cores, "concurrent rounds");
 
     // A panic in bridge code is a defect even on a Tokio thread where the
     // ABI's catch_unwind cannot see it. Panics inside Temporal Core during
@@ -1152,6 +1175,7 @@ fn setup_faults_are_reported_within_the_deadline() {
         ),
     ] {
         let (created_before, cleaned_before) = test_runtime_cleanup_counts();
+        let (_, drops_before) = test_core_runtime_counts();
         let plan = RoundPlan {
             seed: DEFAULT_SEED,
             round: 0,
@@ -1163,20 +1187,46 @@ fn setup_faults_are_reported_within_the_deadline() {
             write_reports: false,
         };
         let started = Instant::now();
-        let report = run_round(plan, &mut BTreeMap::new())
-            .expect_err("an injected setup fault must fail the round");
+        let round = run_round(plan, &mut BTreeMap::new());
         let elapsed = started.elapsed();
+        let report = round
+            .outcome
+            .expect_err("an injected setup fault must fail the round");
         assert!(report.contains(expected), "{fault:?} report: {report}");
         assert!(!report.contains("leaked"), "{fault:?} leaked: {report}");
         assert!(
             elapsed < bound,
             "{fault:?} took {elapsed:?}, bound {bound:?}"
         );
-        let (created, cleaned) = test_runtime_cleanup_counts();
-        assert_eq!(
-            created - created_before,
-            cleaned - cleaned_before,
+        assert!(
+            eventually(|| {
+                let (created, cleaned) = test_runtime_cleanup_counts();
+                created - created_before == cleaned - cleaned_before
+            }),
             "{fault:?}: every graph created before the abort was released"
         );
+        // A shared runtime released through the GC-fallback dispose drops its
+        // Core later, on a cleanup thread. Wait for exactly this round's drops
+        // before releasing SERIAL, so a late drop can never land inside the
+        // other test's measurement (#1003 macOS CI saw one such drop).
+        expect_core_drops(drops_before, round.cores_created, &format!("{fault:?}"));
     }
+}
+
+/// Waits until exactly `expected` Core runtimes have been dropped since
+/// `before`, then confirms after a short pause that no further drop follows,
+/// which would mean a double destruction.
+fn expect_core_drops(before: u64, expected: u64, label: &str) {
+    let converged = eventually(|| test_core_runtime_counts().1 - before == expected);
+    assert!(
+        converged,
+        "{label}: Core drops did not converge: expected {expected}, observed {}",
+        test_core_runtime_counts().1 - before
+    );
+    thread::sleep(Duration::from_millis(100));
+    assert_eq!(
+        test_core_runtime_counts().1 - before,
+        expected,
+        "{label}: a Core runtime was dropped more than once"
+    );
 }

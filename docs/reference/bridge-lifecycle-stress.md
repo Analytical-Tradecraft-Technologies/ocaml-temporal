@@ -224,7 +224,14 @@ The test checks:
   thread has reported (a hung thread might still be attaching). A second
   test, `setup_faults_are_reported_within_the_deadline`, injects a setup hang
   and a setup panic and checks that each is reported promptly and leaks
-  nothing; the ordinary stress never injects a fault;
+  nothing; the ordinary stress never injects a fault. The two tests share a
+  mutex, and each one waits until exactly its own Core runtimes have been
+  dropped before releasing it. Each round counts the Cores it creates,
+  including those of graphs that a failed setup releases again. A shared
+  runtime released through the GC-fallback `shared_runtime_dispose` drops its
+  Core later, on a cleanup thread. Before this wait, such a late drop from the
+  fault-injection test could land inside the other test's measurement, which
+  macOS CI on PR #1003 reported as one drop too many;
 - after the last round, within 60 seconds, every graph has been cleaned
   exactly once and every Core runtime, owned or shared, has been dropped
   exactly once, whichever holder released it last;
