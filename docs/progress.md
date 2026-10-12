@@ -15,6 +15,60 @@ implementation when a later entry documents that work as complete. The
 records the current tested source, named assertions and successful CI job for
 the Temporal acceptance controllers.
 
+## 2026-10-12: Decoder fuzzing, concurrent lifecycle stress, and scheduled qualification (#506)
+
+`rust/core-bridge/tests/decoder_fuzz.rs` fuzzes the 20 Rust decoder targets
+that the structured parser fuzz did not cover: activity tasks, completions,
+and heartbeats; asynchronous activity calls; the ten client requests; the
+asynchronous-start ticket read by poll and wait; client and worker
+configuration; and replay history documents, including their inner protobuf
+bytes. `test/bridge/test_ocaml_decoder_fuzz.ml` fuzzes 29 OCaml targets:
+control envelopes, payloads, and payload objects; workflow activations and
+completions; activity documents; every client response; all eight client
+error decoders; and the submitted-call handle parser.
+Both share the corpus under `test/bridge/fixtures/decoder-fuzz` and a set of
+15 structural operators. Every input must produce no panic or escaped
+exception, a typed rejection status with a bounded UTF-8 diagnostic, and an
+allocation below a per-target bound measured by a counting allocator (Rust)
+or `Gc.allocated_bytes` (OCaml). Accepted values must round-trip.
+
+`rust/core-bridge/tests/concurrent_lifecycle_stress.rs` runs replay graphs on
+several threads at once, attached to shared runtimes that the coordinator
+releases mid-round. It requires every graph to be cleaned once, every Core
+runtime to be dropped once, and no panic in bridge code on any thread.
+`test/bridge/test_ocaml_concurrent_lifecycle_stress.ml` closes runtimes from
+another Domain while their owners are inside native calls, closes a shared
+runtime during concurrent attaches, and finalizes dropped runtimes while
+other Domains collect and compact.
+
+All four run in every PR with small budgets. The Rust tests are part of
+`cargo test`. The two OCaml tests run under the `@test/bridge/bridge-stress`
+alias, which `make test` and `make native-test` build after `dune runtest`.
+Running the multi-Domain stress inside `dune runtest` starved timing-bound
+runtime tests on the Windows x64 runner.
+`make test-decoder-fuzz`, `make test-concurrent-stress`, and their `native-`
+forms raise the budget. `make stress-qualification` runs every fuzzer and
+stress with long budgets, and the new `.github/workflows/stress.yml` runs it
+weekly and on dispatch, keeping reproductions as 30-day artifacts. Rust
+producer CI now also retains `_build/decoder-fuzz` and
+`_build/concurrent-stress` on failure.
+
+Evidence on an Apple M-series laptop: 20,000 cases per Rust target with two
+seeds (720,000 inputs), 20,000 cases per OCaml target (480,000 inputs),
+1,200 Rust concurrent rounds of 16 threads with 4 graphs, and 300 OCaml rounds
+of 8 Domains found no Rust bridge defect. The OCaml fuzz found that
+`Native_bridge.parse_client_call` accepted signed, `_`-separated, and
+`0x`/`0o`/`0b`/`0u` spellings that its contract excludes, so several
+spellings aliased one handle; it now requires plain decimal digits, with
+regression seeds and assertions. The concurrent stress now bounds setup and
+the start gate by the round deadline, and a separate test injects a setup
+hang and panic to prove they are reported promptly. The concurrent stress recorded an
+upstream Temporal Core panic during runtime teardown (`poll_buffer.rs:428`,
+unwrapping a cancelled join handle). Tokio contains it, and it has no
+ABI-visible effect. The [lifecycle stress reference](reference/bridge-lifecycle-stress.md#findings)
+tracks it for re-evaluation after the Core upgrade. A sanitizer-instrumented
+Rust build and live-worker concurrency remain open under #506. See
+[decoder fuzzing](reference/bridge-decoder-fuzz.md).
 ## 2026-10-12: Prometheus worker metrics and workflow log correlation (#500)
 
 `Temporal.Runtime.create ?metrics` now exports Temporal Core's built-in
@@ -327,6 +381,7 @@ live-regressions contract, the dependency inventory, `check-format.sh`, and
 `typos`. There are no library, Rust, C, or ABI changes; ABI version 4 is
 unchanged. Remaining limit, unchanged and documented: workflow tasks Core had
 already received for a stuck worker wait for their workflow-task timeout.
+
 ## 2026-10-12: Official-SDK interoperability regression (#517)
 
 A new live regression, `test/integration/sdk_interop`, drives an OCaml
