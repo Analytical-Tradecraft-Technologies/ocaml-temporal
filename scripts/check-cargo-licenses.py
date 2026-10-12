@@ -28,7 +28,7 @@ ALLOWED_LICENSES = {
     "Zlib",
 }
 ALLOWED_WITH_EXCEPTIONS = {"Apache-2.0 WITH LLVM-exception"}
-CORE_REVISION = "95e97686a079dcfe6c42e3254b2f3f5e3d97408f"
+CORE_REVISION = "8fe478ee179ed754614d230f39586f3edb57da71"
 CORE_SOURCE_PREFIX = (
     "git+https://github.com/temporalio/sdk-core.git?rev="
     f"{CORE_REVISION}#"
