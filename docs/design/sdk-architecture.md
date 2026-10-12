@@ -458,7 +458,7 @@ The project goal is complete only when current evidence demonstrates all of the 
 
 ## 17. Primary References
 
-- [Temporal Core SDK architecture](https://github.com/temporalio/sdk-core/blob/95e97686a079dcfe6c42e3254b2f3f5e3d97408f/ARCHITECTURE.md)
+- [Temporal Core SDK architecture](https://github.com/temporalio/sdk-core/blob/8fe478ee179ed754614d230f39586f3edb57da71/ARCHITECTURE.md)
 - [Temporal Core SDK repository](https://github.com/temporalio/sdk-core)
 - [OCaml 5 Effect module](https://ocaml.org/manual/5.4/api/Effect.html)
 - [OCaml C interoperability and embedding](https://ocaml.org/manual/5.5/intfc.html)

@@ -359,6 +359,7 @@ fn query_retries_a_transient_failure() {
         CoreQueryResponse {
             query_result: Some(Payloads::default()),
             query_rejected: None,
+            link: None,
         }
         .encode_to_vec(),
     );

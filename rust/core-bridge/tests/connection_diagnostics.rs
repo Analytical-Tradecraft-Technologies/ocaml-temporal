@@ -102,6 +102,74 @@ fn unresolvable_host_reports_dns_cause() {
     assert!(message.contains("(cause=dns)"), "{message}");
 }
 
+/// A listener that accepts each TCP connection and closes it after `delay`,
+/// like the transport-interruption fault proxy in `Refuse` mode (#824), whose
+/// accept thread may close a socket only after the client has sent its
+/// request. The thread stops when the test process exits; the port is
+/// ephemeral and loopback-only.
+fn accept_and_close_listener(delay: std::time::Duration) -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let port = listener.local_addr().expect("local address").port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            std::thread::sleep(delay);
+            drop(stream);
+        }
+    });
+    port
+}
+
+/// A closed port and an endpoint that drops every connection both fail
+/// `client_connect` promptly with the typed connection status, rather than
+/// waiting out Core's gRPC retries (#824).
+#[test]
+fn refused_and_dropped_connections_fail_fast() {
+    let mut targets = vec!["http://127.0.0.1:1".to_owned()];
+    for millis in [0, 20, 100, 500] {
+        let port = accept_and_close_listener(std::time::Duration::from_millis(millis));
+        targets.push(format!("http://127.0.0.1:{port}"));
+    }
+    for target in &targets {
+        let target = target.as_str();
+        let started = std::time::Instant::now();
+        let (status, message) = connect_failure(target);
+        let elapsed = started.elapsed();
+        assert_eq!(status, STATUS_CONNECTION, "{target}: {message}");
+        assert_bounded_connection_message(&message);
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "{target} took {elapsed:?}: {message}"
+        );
+    }
+}
+
+/// An endpoint that accepts the connection and then never answers is cut off
+/// by the bridge's 10 s handshake bound with a typed timeout, instead of
+/// waiting out Core's 30 s `GetSystemInfo` deadline (#824).
+#[test]
+fn silent_endpoint_times_out_within_the_connect_bound() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let port = listener.local_addr().expect("local address").port();
+    std::thread::spawn(move || {
+        // Accepted sockets are kept open and unread for the process lifetime.
+        let mut held = Vec::new();
+        for stream in listener.incoming() {
+            held.push(stream);
+        }
+    });
+    let started = std::time::Instant::now();
+    let (status, message) = connect_failure(&format!("http://127.0.0.1:{port}"));
+    let elapsed = started.elapsed();
+    assert_eq!(status, STATUS_CONNECTION, "{message}");
+    assert_bounded_connection_message(&message);
+    assert!(message.contains("(cause=timeout)"), "{message}");
+    assert!(
+        elapsed >= std::time::Duration::from_secs(9)
+            && elapsed < std::time::Duration::from_secs(15),
+        "took {elapsed:?}: {message}"
+    );
+}
+
 /// Structured I/O error kinds classify without relying on platform wording,
 /// and an unrecognized error falls back to no cause.
 #[test]

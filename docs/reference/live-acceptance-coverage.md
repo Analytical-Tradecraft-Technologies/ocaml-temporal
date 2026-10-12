@@ -23,7 +23,7 @@ first introduction of smaller slices and must not be called the current suite.
 | Live server job | Linux `ubuntu-24.04`, OCaml 5.5, independent OCaml worker/client processes, plaintext Temporal Server 1.32.0 and PostgreSQL 18.6 in Compose | One server/compiler/platform/topology combination; no TLS/authentication, Temporal Cloud, upgrade, or production qualification |
 | Linux build/test matrix | OCaml 5.2, 5.3, 5.4, and 5.5 on amd64 and arm64 | Build, lint, focused tests, and source contracts; these are not additional live-server lanes |
 | Native build/test matrix | OCaml 5.5 on Windows x64 and macOS ARM64 | Native package/bridge/runtime validation, without the Compose server suite |
-| Pins | [Compose images][compose] include immutable image digests; [Cargo manifest][cargo] pins Temporal Core to `95e97686a079dcfe6c42e3254b2f3f5e3d97408f`; the [workflow][workflow] identifies the executed lanes | A successful snapshot does not qualify later image, Core, toolchain, or source changes |
+| Pins | [Compose images][compose] include immutable image digests; [Cargo manifest][cargo] pins Temporal Core to `8fe478ee179ed754614d230f39586f3edb57da71`; the [workflow][workflow] identifies the executed lanes | A successful snapshot does not qualify later image, Core, toolchain, or source changes |
 
 The workflow and Makefile must be read at the tested commit. In particular,
 the audited Rust toolchain file selects 1.98 while the native workflow/Makefile

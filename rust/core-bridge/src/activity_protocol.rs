@@ -606,6 +606,10 @@ pub fn completion_to_core(
         }
         ActivityCompletionResult::Failed { failure } => Status::Failed(activity_result::Failure {
             failure: Some(workflow_protocol::failure_to_core(failure)?),
+            // Core 1.x uses the cause only as a bounded metric label for
+            // worker-detected size or storage failures. An application
+            // failure reported by OCaml has no such cause.
+            cause: activity_result::ActivityTaskFailedCause::Unspecified.into(),
         }),
         ActivityCompletionResult::Cancelled { failure } => {
             Status::Cancelled(activity_result::Cancellation {
