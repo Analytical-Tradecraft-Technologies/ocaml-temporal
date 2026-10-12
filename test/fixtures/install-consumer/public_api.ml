@@ -374,6 +374,7 @@ let _codec_option : 'a T.Codec.t -> 'a option T.Codec.t = T.Codec.option
 let _codec_string : string T.Codec.t = T.Codec.string
 let _codec_bytes : bytes T.Codec.t = T.Codec.bytes
 let _codec_unit : unit T.Codec.t = T.Codec.unit
+let _codec_is_unit : 'a T.Codec.t -> bool = T.Codec.is_unit
 let _codec_int : int T.Codec.t = T.Codec.int
 let _codec_int64 : int64 T.Codec.t = T.Codec.int64
 let _codec_bool : bool T.Codec.t = T.Codec.bool

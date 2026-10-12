@@ -35,7 +35,7 @@ let definition =
            let context = Option.get (Context.current ()) in
            let future, _cancel =
              Context.schedule_local_activity context ~name:"flaky"
-               ~input:empty_payload ~decode:(fun payload -> Ok payload) ()
+               ~input:[ empty_payload ] ~decode:(fun payload -> Ok payload) ()
            in
            Result.map (fun _ -> "done") (Future.await future)))
 

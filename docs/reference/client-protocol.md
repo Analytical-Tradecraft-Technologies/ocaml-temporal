@@ -73,15 +73,24 @@ metadata and bytes use the shared workflow payload codec, so binary values are
 never treated as UTF-8 text.
 
 Start, signal, and update requests carry one encoded typed value, with one
-exception (#819): when that value is exactly the canonical `Codec.unit`
-payload (`encoding` = `binary/null`, no data), `input` is the empty list. The
-Temporal CLI, Web UI, and other SDKs send zero payloads for a no-argument call,
-and an SDK that binds payloads positionally (Python, for example) would reject a
-surplus `null` argument. OCaml workers decode an empty list back to that unit
-payload, so OCaml-to-OCaml calls are unchanged. The same
-`Temporal_base.Payload.input_arguments` rule is applied to workflow commands
-that carry input: activities, local activities, child workflows,
-continue-as-new, and external signals.
+exception (#819): when the definition's input codec is `Codec.unit`, `input`
+is the empty list. The Temporal CLI, Web UI, and other SDKs send zero payloads
+for a no-argument call, and an SDK that binds payloads positionally (Python,
+for example) would reject a surplus `null` argument. OCaml workers decode an
+empty list back to the canonical unit payload, so OCaml-to-OCaml calls are
+unchanged.
+
+The rule is decided by the codec, not by the payload's bytes (#1012).
+`Codec.option`'s `None` encodes to the same `binary/null` payload as `()`, but
+it is a real argument: Go, Java, and Python send one `binary/null` payload
+for a nil argument (TypeScript for `undefined`), so a foreign handler with one
+optional parameter must receive it. Every codec other than `Codec.unit`
+therefore sends exactly one payload. OCaml receivers decode either zero
+payloads or one `binary/null` payload as `None`, so OCaml senders built before
+this change remain compatible. The same codec-decided rule
+(`Codec_private.encode_arguments`) is applied to workflow commands that carry
+input: activities, local activities, child workflows, continue-as-new, and
+external signals.
 
 Rust validates every identifier, rejects NUL bytes, rejects duplicate or
 unknown members, validates payloads, and then calls Core's raw
