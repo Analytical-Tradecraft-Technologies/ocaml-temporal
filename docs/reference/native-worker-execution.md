@@ -42,10 +42,25 @@ lane-specific `Wait_workflow` and `Wait_activity` operations remain for
 bridge tests and replay. A
 nonpreferred lane may claim the free wait after one local deferral if staggered
 polls keep the preferred lane from observing both lanes idle. If its sibling is
-busy or owns the native wait, a lane yields locally for 10 ms and then retries
-its nonblocking `try_poll_*` operation. This prevents an idle lane
+busy or owns the native wait, a lane yields locally and then retries its
+nonblocking `try_poll_*` operation. This prevents an idle lane
 from repeatedly occupying the sole supervisor owner during work on the other
-lane. The busy check is a snapshot taken after the lane's own poll: a sibling
+lane. The yield is paced by the private `Native_worker_idle` module (#994).
+While the sibling's native wait is in flight, the lane repolls at once, but
+only once per wait: that poll queues behind the wait in the supervisor mailbox
+and runs as soon as either lane has work, so the wait serves both lanes.
+The in-flight mark is published just before the wait's mailbox admission,
+so the joining poll can be served ahead of the wait and return empty. A
+queued poll cannot return while the wait it queued behind is in flight, so a
+lane that still sees its joined wait in flight knows its poll was early; it
+restarts its backoff at 0.1 ms, once per wait, and its next poll queues
+behind the admitted wait rather than after a sleep of up to 10 ms.
+Otherwise the lane backs off 0, 0.1 ms, 0.2 ms, doubling up to 10 ms, and the
+sequence restarts after any completed task or readiness wake. A fixed 10 ms
+yield used to add several milliseconds to every lane crossing of a serial
+activity workflow; in the live fan-out benchmark it was about two thirds of
+the latency. An idle worker still settles at one poll per 10 ms per lane at
+most, so it does not spin. The busy check is a snapshot taken after the lane's own poll: a sibling
 that becomes busy between that decision and the native wait simply queues its
 poll behind the wait, which `Wait_any` ends as soon as that task is ready.
 Rust poll-lane failures are also reported by `try_poll_*` when no task is
@@ -64,7 +79,8 @@ reports a retryable transport outcome, the loop uses a separate
 OCaml runtime lock while the timer runs. It is intentionally not an activity
 readiness wait: unrelated queued work must not make the retained completion
 spin. The workflow adapter does not currently produce a retry-pending result;
-its branch remains on ordinary readiness as a safe extension point.
+its branch uses a fixed 10 ms local delay, deliberately outside the adaptive
+idle pacing, as a safe extension point.
 
 The supervisor remains the sole owner of the Rust runtime, client, worker, and
 native task ledger. Rust leases a Core task before handing it to a poll lane,
@@ -261,7 +277,7 @@ run: the calling Domain polls and executes workflow activations, and one
 dedicated Domain polls and executes activity tasks. Both Domains send native
 operations through the same owner-Domain supervisor mailbox. Each lane waits
 in turn on the bounded combined readiness operation when both are idle, and
-uses a short local yield while its sibling is busy. A slow activity callback
+uses a short adaptive local yield while its sibling is busy (#994). A slow activity callback
 therefore cannot hold up an unrelated workflow activation; the activity lane
 has capacity one and cannot poll another activity while its callback or exact
 completion retry is pending. A task-level workflow/activity failure is
@@ -408,6 +424,15 @@ through `Worker.Options.make ~workflow_activation_deadline`; `` `Disabled ``
 turns the watchdog off for debugging. The watchdog's timing never reaches a
 workflow command, so it cannot cause replay divergence: a failed workflow task
 is simply retried from history.
+
+`test/integration/non_yielding_workflow` is the live qualification against
+Temporal Server: a 500 ms deadline detects a spinning workflow, the health
+report, log record, and `WorkflowTaskFailed` event name the run without its
+input, `shutdown_with_report` returns within its bound with one abandoned
+activation, other workflows and a legitimately heavy activation complete on a
+worker with a 3 s deadline, and the failed run completes there from history
+with exactly one failed task recorded. Releasing the stuck code then drops its
+late completion and lets `run` return.
 
 The semantic translator accepts child-start commands with the workflow identity,
 input, and optional retry policy represented by the protocol. Core child options

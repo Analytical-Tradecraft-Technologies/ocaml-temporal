@@ -20,6 +20,7 @@ module Native_worker_policy = Temporal_runtime.Native_worker_policy
 module Native_worker_owner = Temporal_runtime.Native_worker_owner
 module Native_worker_observer = Temporal_runtime.Native_worker_observer
 module Native_worker_watchdog = Temporal_runtime.Native_worker_watchdog
+module Native_worker_idle = Temporal_runtime.Native_worker_idle
 module Native_worker_shutdown = Temporal_runtime.Native_worker_shutdown
 module Future = Temporal_future_kernel
 module Execution = Temporal_runtime.Execution

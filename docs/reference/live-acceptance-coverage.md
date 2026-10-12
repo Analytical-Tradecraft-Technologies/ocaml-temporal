@@ -56,7 +56,7 @@ boundaries are defined by their own references, and the
 | --- | --- | --- |
 | `test-temporal-start-metadata-live` | Five exact active runs carry memo, search-attribute, combined, continued and official-CLI start metadata; workflow snapshots match before and after worker replacement | [start metadata](workflow-start-metadata.md) |
 | `test-temporal-task-failure-live` | Body, encoder and missing-registration defects leave exact runs with durable workflow-task failures; a corrected worker replays and completes them, and typed business failures keep their retryability flags | [workflow failures](workflow-failures.md) |
-| `test-temporal-live-regressions` | Each fixed-bug regression executable in `LIVE_REGRESSION_EXECUTABLES` runs once, bounded, against a fresh stack: cooperative activity cancellation and the worker-shutdown signal (#494), bounded shutdown of a worker whose activity never heartbeats, with the attempt retried on a second worker (#495), client request IDs (#545), update admission outcomes (#546), completed-workflow queries (#548), local activity retry cancellation (#567), split workflow/activity workers (#805) and query and suspended-update recovery after sticky-cache eviction and worker replacement (#530). The run fails if any suite fails; a Docker-free contract requires every `test/integration/*/regression.exe` to be in the smoke artifact and run by CI (#795) | Each suite's `README.md` or module comment under `test/integration/` |
+| `test-temporal-live-regressions` | Each fixed-bug regression executable in `LIVE_REGRESSION_EXECUTABLES` runs once, bounded, against a fresh stack: cooperative activity cancellation and the worker-shutdown signal (#494), bounded shutdown of a worker whose activity never heartbeats, with the attempt retried on a second worker (#495), detection, task failure and bounded shutdown of a worker whose workflow code stops yielding, with the run recovered on a corrected worker (#493), client request IDs (#545), update admission outcomes (#546), completed-workflow queries (#548), local activity retry cancellation (#567), split workflow/activity workers (#805), query and suspended-update recovery after sticky-cache eviction and worker replacement (#530), and official-SDK interoperability (#517), where the pinned official Python SDK client and activity worker drive an OCaml workflow and both clients decode the same exact runs. The run fails if any suite fails; a Docker-free contract requires every `test/integration/*/regression.exe` to be in the smoke artifact and run by CI (#795) | Each suite's `README.md` or module comment under `test/integration/` |
 
 The [child-failure acceptance reference](child-failure-replay-acceptance.md)
 records the original PR #361 evidence. Its status is live-tested, not pending a
@@ -108,6 +108,10 @@ regression (#495) is the live evidence that shutdown returns within its bound
 while a callback ignores it. That bound applies to `Worker.shutdown`, not to
 the abandoned callback, which keeps running; the stop-marker checks and
 focused lifecycle tests do not prove Kubernetes termination behavior.
+The `non_yielding_workflow` regression (#493) is the matching evidence for
+workflow code: the watchdog fails the stuck task within the deadline plus one
+tick, shutdown reports the abandoned activation within its bound, and
+Temporal's retry completes the same run on a corrected worker.
 
 Reset, bounded visibility listing, worker deployment routing, search-attribute
 upserts and priority metadata have implemented/focused-tested surfaces but no

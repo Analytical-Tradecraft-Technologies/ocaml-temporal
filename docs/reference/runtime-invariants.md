@@ -301,12 +301,12 @@ and bridge, read the [documentation guide](../README.md) first.
   invariants. A replay feeder has one bounded slot, and a completion or
   rejection is accepted only for the exact activation lease that was polled.
 - The private supervisor validates native poll bytes before returning typed
-  workflow or activity values to another Domain. It canonically encodes and
-  semantically validates typed activity completions before entering C. A workflow
-  completion arrives already encoded: the worker adapter runs the canonical
-  encoder once and passes its bytes as an abstract
-  `Encoded_workflow_completion.t`, which only that encoder can produce, so the
-  supervisor copies them into C without a second encode.
+  workflow or activity values to another Domain. Workflow and activity
+  completions arrive already encoded: the worker and activity adapters run the
+  canonical encoder once and pass its bytes as an abstract
+  `Encoded_workflow_completion.t` or `Encoded_activity_completion.t`, which only
+  that encoder can produce, so the supervisor copies them into C without a
+  second encode.
 - An activity `Start` (remote or local) creates one Core completion debt. A `Cancel` poll
   is an update to that same token: it is handed to the OCaml activity adapter
   while the token remains tracked, but it never acquires a second completion
@@ -365,8 +365,20 @@ and bridge, read the [documentation guide](../README.md) first.
   polls. The live worker's native wait is `Wait_any`, so work on either lane
   ends it and the token holder can never sleep through the sibling's task
   (#806). While its sibling is busy or already owns the wait, a lane yields
-  locally for 10 ms, then retries its nonblocking poll. The poll reports a
-  fatal Rust lane error even with no queued task.
+  locally, then retries its nonblocking poll. The yield never enters the
+  supervisor mailbox and is paced by `Native_worker_idle` (#994): it is zero
+  once per in-flight sibling native wait, because the next poll then queues
+  behind that wait and returns when either lane has work. The wait is marked
+  in flight just before mailbox admission, so a joining poll can be served
+  first; a lane that finds the joined wait still in flight after its poll
+  restarts its backoff at 0.1 ms for that wait instead of resuming a capped
+  sleep. Otherwise it is a
+  backoff of 0, 0.1 ms, doubling up to 10 ms, which restarts after each
+  completed task or readiness wake. A zero yield is always bounded by one such
+  event, so an idle worker settles at the 10 ms cap and never busy-spins, and
+  a stopping lane still observes its stop flag within one native wait plus one
+  capped yield. The poll reports a fatal Rust lane error even with no queued
+  task.
 - The workflow execution Domain and capacity-one activity execution Domain
   share the same serialized supervisor mailbox. The activity adapter retains
   exclusive ownership of an attempt and its completion retry. Worker shutdown

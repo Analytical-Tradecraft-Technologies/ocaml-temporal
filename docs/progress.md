@@ -110,6 +110,199 @@ bounded-shutdown, client-request-ID, completed-query, concurrent-client,
 split-task-type and worker-resource live regressions and the two-binary smoke
 (including asynchronous activity completion) passed with native executables.
 The CLI-dependent live regressions and Linux lanes run in CI.
+## 2026-10-12: Adaptive idle pacing between worker lane polls (#994)
+
+The live fan-out benchmark (#528) found that the fixed 10 ms local yield in
+`Native_worker.wait_for_lane`, taken by an idle lane while its sibling is
+busy or holds the native readiness wait, was about two thirds of a serial
+1,000-activity fan-out. The new private `Native_worker_idle` module paces that
+yield instead. While the sibling's `Wait_any` is in flight, the lane repolls
+at once, once per wait: the poll queues behind the wait in the supervisor
+mailbox and runs as soon as either lane has work. If that poll was served
+just before the wait's mailbox admission, the lane sees the joined wait
+still in flight and restarts its backoff at 0.1 ms for that wait rather than
+resuming a capped sleep (PR review). Otherwise it backs off 0,
+0.1 ms, doubling to the former 10 ms cap, restarting after every completed
+task and after a readiness wake (for the sibling only, so the waiter cannot
+re-enter a wait that returns at once). Each zero yield consumes one bounded
+event, so an idle worker settles at the 10 ms cap and does not spin; the
+100 ms native wait, the bounded shutdown deadlines (#495), the activity
+completion retry backoff and the activation watchdog are unchanged. The
+workflow lane's retry fallback keeps a fixed 10 ms delay. No Rust, C or
+protocol change: the ABI stays at v4.
+
+New runtime tests drive the real lane scheduler against a fake one-owner
+supervisor, asserting poll order and requested yields rather than tight
+wall-clock bounds so loaded CI runners cannot fail them. A task published on
+either lane of an idle worker is taken by the poll the readiness wait
+releases, with no extra empty poll or yield (about 0.14 ms locally). A forced
+admission race, in which the sibling's joining poll is served before the
+wait, requeues it after at most a 0.2 ms yield (the unfixed rule resumed a
+10 ms sleep). A simulated serial activity chain with 0.5 ms round trips
+requests 0.2 ms of yields per step (21 ms with the fixed 10 ms yield; bound
+5 ms) and runs at about 1.07 ms per step. An idle worker made 20 polls and 10
+native waits in one second, and a stop while idle returned in under 100 ms.
+Unit tests cover the backoff schedule, the once-per-wait join, the
+early-join restart, sibling-only readiness resets and invalid
+configurations.
+
+Live fan-out on the Compose Temporal 1.32.0/PostgreSQL 18.6 stack (M4 Pro,
+Docker Desktop, OCaml 5.2.1 development container, #993's benchmark applied
+locally, width 1,000, payload 256 B, one warmup): one execution, five
+samples, p50 10.89 s before and 5.94 s after (90 to 162 activities/s); eight
+executions, three samples, p50 107.9 s before and 79.1 s after (75 to 92
+activities/s), with no errors. In the one-execution attribution pass, time
+outside any native call or codec pass fell from about 5.5 s to about 0.3 s;
+what remains is Core completion calls and genuine readiness waits for the
+server.
+## 2026-10-12: One encode per activity completion (#995)
+
+Each activity completion was encoded twice: once in
+`Native_activity_execution` to validate it, and again in the supervisor's
+`Complete_activity` / `Complete_async_activity` handler to send it. The
+adapter now runs the strict encoder once through the new private
+`Temporal_protocol.Encoded_activity_completion`, the activity counterpart of
+`Encoded_workflow_completion` (#846). Its abstract value is the only form a
+completion can take to reach the supervisor, so an invalid completion is still
+rejected before the bridge, and the supervisor copies its bytes into C
+unchanged. A retained worker lease keeps only those immutable bytes in place of
+a token-copied typed completion, so a retry through `poll`, `drain` or
+`try_drain` resubmits the identical string. The async completion path encodes
+once per submission. The protocol adapter's `encode_activity_completion` is
+gone. The ABI and JSON documents are unchanged.
+
+The fake supervisors in the runtime tests now decode the submitted bytes
+strictly and check that they are the canonical encoding of the decoded value.
+`test_completion_is_encoded_once` rejects one submission, raises a transient
+exception on the next, and drains the third. It requires all three to be the
+physically identical string and to equal the canonical encoding of the
+accepted completion. The asynchronous heartbeat path still encodes a heartbeat
+once to validate it and again in the supervisor. It is outside this change.
+## 2026-10-12: Live qualification of non-yielding workflow recovery (#493)
+
+PR #951 added the activation watchdog (detect, report, and fail the workflow
+task) and PR #974 (#495) bounded shutdown with a stuck activation; both were
+covered by focused tests only. The new `test/integration/non_yielding_workflow`
+live regression closes the remaining acceptance criteria against Temporal
+Server. Worker A (500 ms deadline) completes a control workflow, then runs a
+workflow that spins without yielding. The fixture checks that:
+
+- detection happens within the deadline plus one second of the code starting
+  (about 0.64 s in five local runs), and `Worker.health` names the workflow
+  type, workflow ID, run ID, a non-replaying activation, an elapsed time of at
+  least the deadline, and `` `Task_failed ``;
+- exactly one `workflow_activation_deadline_exceeded` record carries the same
+  identifiers, and neither it nor the server's `WorkflowTaskFailed` event
+  (identity `non-yielding-a`, message naming the activation deadline)
+  contains the run's secret input;
+- `shutdown_with_report` on A while the code still spins returns within the
+  grace period plus the teardown timeout (about 1.3 s with a 1 s grace
+  period) and reports one abandoned workflow activation, and A's `run` has not
+  returned;
+- worker B, the corrected build with a 3 s deadline, completes a second
+  control workflow and a legitimately heavy 1 s activation while staying
+  healthy, and Temporal's retry completes the original run with the
+  corrected code. That run's history holds exactly one failed workflow task,
+  task completions only from B, one completion, and no event the abandoned
+  code could have produced;
+- releasing the spinning code drops A's late completion exactly once and lets
+  A's `run` return.
+
+The suite is in `LIVE_REGRESSION_EXECUTABLES`, the CI smoke artifact list,
+and the `run-live-regressions.sh` dispatch (it reads history through the
+pinned CLI), and has a `make test-non-yielding-workflow-live` target. The
+workflows guide now lists the blocking operations to avoid, how to size the
+deadline for heavy activations and replay, the three diagnostic views, and how
+a failed run recovers once corrected code serves its queue; its stale claim
+that `shutdown` cannot finish while code is stuck now describes the bounded
+report. The support policy, live coverage, and native worker references link
+the regression.
+
+Verification: the regression passed five of five runs on macOS (OCaml 5.4.1)
+against the Compose Temporal/PostgreSQL stack, together with
+`dune build @install`, `@doc`, the runtime, unit and smoke tests, the
+live-regressions contract, the dependency inventory, `check-format.sh`, and
+`typos`. There are no library, Rust, C, or ABI changes; ABI version 4 is
+unchanged. Remaining limit, unchanged and documented: workflow tasks Core had
+already received for a stuck worker wait for their workflow-task timeout.
+## 2026-10-12: Official-SDK interoperability regression (#517)
+
+A new live regression, `test/integration/sdk_interop`, drives an OCaml
+workflow from the official Temporal Python SDK (`temporalio` 1.33.0, MIT).
+The SDK runs only in the digest-pinned `python:3.14-slim-bookworm` image as
+the `sdk-interop-python` Compose service, installed into a throwaway virtual
+environment from a hash-locked closure of five packages
+(`test/integration/sdk_interop/python/requirements.lock`, all MIT, BSD,
+Apache-2.0 or PSF-2.0). `docs/dependencies.md` gains a CI-only
+interoperability tooling table, and `scripts/check-dependency-inventory.sh`
+and its contract now compare that table with the lock. `make license-check`
+now also runs `make python-license-check`, which installs the lock with its
+hashes in the pinned Python image and audits each installed distribution's
+own `importlib.metadata` license fields and license files against the shared
+SPDX allowlist, with two exact reviewed overrides (protobuf's free-text
+license and typing-extensions' PSF-2.0) and an exact installed-equals-lock
+check; `test/smoke/test_python_license_policy.sh` proves the rules on fake
+distributions.
+
+The OCaml regression process hosts the workflow worker and publishes its
+queues; the Python driver hosts the activity the OCaml workflow calls, starts
+the workflow with structured `json/plain` input, queries it, sends an
+accepted update and three rejected ones (validator, `binary/plain` input,
+wrong shape), signals a document with 2^53+1, a fraction, astral-plane text
+and `null`, and checks the exact echoed result, the history payload
+encodings, and the `temporal-ocaml` SDK name and version recorded in
+`WorkflowTaskCompleted`. An activity `ApplicationError` returns through the
+OCaml workflow as a `PricingFailed` failure with the original detail, and a
+JSON string workflow input fails the workflow task while the run stays open.
+The OCaml client then re-reads the same three exact runs. The suite is in
+`LIVE_REGRESSION_EXECUTABLES`, and `run-live-regressions.sh` dispatches it to
+both containers. It passed locally against the Compose Temporal Server 1.32.0
+and PostgreSQL stack with OCaml 5.2:
+`make test-temporal-live-regressions LIVE_REGRESSION_EXECUTABLES=test/integration/sdk_interop/regression.exe`.
+Child workflows across SDKs, official-SDK workflows calling OCaml activities,
+other official SDKs and custom codecs remain unqualified.
+## 2026-10-11: Dune job limit reaches nested and long-lived Dune processes (#851)
+
+The earlier #851 change passed `-j $(DUNE_JOBS)` to every Dune command in the
+Makefile, but Dune processes started by scripts still used Dune's per-CPU
+default. These are the `dune build @install` and installed-consumer builds in
+`test/bridge/test_install.sh`, the prebuilt-consumer and vendored-build
+checks, and the `dune exec` that starts each long-lived Compose worker. Dune
+3.24 reads `DUNE_JOBS` from its environment, so the Makefile now exports the
+resolved limit when it is non-empty. It unexports the variable when it is
+empty, because Dune rejects an empty value. The fixture's `dev` Compose
+service lists `DUNE_JOBS` without a value, so Compose copies it into every
+`compose run` container and every service that extends `dev`, and leaves it
+unset when the caller has none. The defaults are unchanged: 2 locally and
+`auto` when `CI` is set. The README quickstart now gives
+`DUNE_JOBS=1 CARGO_BUILD_JOBS=2` for a 4-6 GiB VM.
+
+Dune reads `DUNE_JOBS` from its environment only from 3.22.0, and the SDK
+supports Dune 3.18, so the export alone does not bound older releases. The
+install, prebuilt-consumer and vendored-build scripts therefore start Dune
+through an `opam_dune` helper, and `scripts/run-temporal-executable.sh` uses
+the same branch. When `DUNE_JOBS` is non-empty, both add an explicit
+`-j "$DUNE_JOBS"`.
+
+`test/smoke/test_build_jobs_contract.sh` now runs a probe recipe to check that
+recipes receive the local default, the CI default, and command-line and
+environment overrides, and that an empty limit arrives unset. It also checks
+that the `dev` service passes the variable through without an interpolated
+default. Removing either the export or the unexport makes the contract fail.
+For the scripts, the contract puts stub `opam` and `dune` commands on `PATH`.
+It checks that every Dune start in the three test scripts goes through
+`opam_dune`, and runs each helper and the worker launcher with and without
+`DUNE_JOBS`. With a value, the recorded Dune arguments must include `-j`;
+without one, they must not.
+`docker compose config` showed the value reaching an extending worker
+service, and `dune build --help` in the development image confirmed that
+Dune 3.24.2 reads `DUNE_JOBS`.
+
+An attempted local containerized `make build` with the default `-j 2`
+reached a peak of 4.3 GiB in the dev container on a 9.7 GiB Docker Desktop VM.
+The host disk then filled and the build stopped, so the full build and verify
+were not completed locally.
+
 ## 2026-10-11: Configurable client admission limits (#796)
 
 The native client's three admission limits were fixed constants in the Rust

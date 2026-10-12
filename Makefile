@@ -65,6 +65,19 @@ HOST_GID ?= $(shell id -g)
 # DUNE_BUILD_ARGS (enforced by test/smoke/test_build_jobs_contract.sh).
 DUNE_JOBS ?= $(if $(strip $(CI)),auto,2)
 DUNE_BUILD_ARGS := $(if $(strip $(DUNE_JOBS)),-j $(DUNE_JOBS),)
+# Exporting the resolved limit bounds the Dune processes that Make does not
+# start itself: the nested builds in the install, prebuilt-consumer and
+# vendored-build scripts, and the `dune exec` of long-lived Compose workers.
+# The dev service in the Compose file passes the variable through to every
+# container that extends it. Dune 3.22 and later read DUNE_JOBS directly; for
+# the older supported releases, those scripts also pass it as an explicit `-j`.
+# Dune rejects an empty value, so an explicitly empty DUNE_JOBS is removed from
+# recipe environments instead.
+ifneq ($(strip $(DUNE_JOBS)),)
+export DUNE_JOBS
+else
+unexport DUNE_JOBS
+endif
 # Rust integration tests each link the Temporal Core graph into a separate test
 # executable. Serializing those links and disabling unused incremental state
 # keeps the peak disk/memory footprint bounded on hosted runners without
@@ -569,7 +582,7 @@ test-temporal-diagnostics-contract:
 # CI executes (#795). Every entry must also be in scripts/ci-smoke-executables.txt,
 # and test/smoke/test_live_regressions_contract.sh fails when a regression
 # executable under test/integration is neither here nor otherwise run by CI.
-LIVE_REGRESSION_EXECUTABLES := test/integration/activity_cancellation/regression.exe test/integration/bounded_shutdown/regression.exe test/integration/client_policies/regression.exe test/integration/client_request_ids/regression.exe test/integration/completed_queries/regression.exe test/integration/concurrent_client/regression.exe test/integration/interaction_recovery/regression.exe test/integration/local_activity_cancellation/regression.exe test/integration/split_worker_task_types/regression.exe test/integration/transport_interruption/regression.exe test/integration/update_outcomes/regression.exe test/integration/worker_resource_options/regression.exe test/integration/workflow_start_info/regression.exe test/integration/worker_metrics/regression.exe
+LIVE_REGRESSION_EXECUTABLES := test/integration/activity_cancellation/regression.exe test/integration/bounded_shutdown/regression.exe test/integration/client_policies/regression.exe test/integration/client_request_ids/regression.exe test/integration/completed_queries/regression.exe test/integration/concurrent_client/regression.exe test/integration/interaction_recovery/regression.exe test/integration/local_activity_cancellation/regression.exe test/integration/non_yielding_workflow/regression.exe test/integration/sdk_interop/regression.exe test/integration/split_worker_task_types/regression.exe test/integration/transport_interruption/regression.exe test/integration/update_outcomes/regression.exe test/integration/worker_metrics/regression.exe test/integration/worker_resource_options/regression.exe test/integration/workflow_start_info/regression.exe
 # Seconds for each regression process; the suites normally finish in seconds.
 LIVE_REGRESSION_TIMEOUT_SECONDS ?= 180
 
@@ -963,6 +976,13 @@ test-update-outcomes-live:
 test-interaction-recovery-live:
 	$(RUN) dune exec $(DUNE_BUILD_ARGS) test/integration/interaction_recovery/regression.exe -- check $(TEMPORAL_CLIENT_TEST_URL) $(TEMPORAL_TEST_CLI)
 
+# Requires a disposable server with the `temporal-sdk-test` namespace, or the
+# namespace named by TEMPORAL_NAMESPACE, and an explicit official Temporal CLI
+# path (#493).
+.PHONY: test-non-yielding-workflow-live
+test-non-yielding-workflow-live:
+	$(RUN) dune exec $(DUNE_BUILD_ARGS) test/integration/non_yielding_workflow/regression.exe -- check $(TEMPORAL_CLIENT_TEST_URL) $(TEMPORAL_TEST_CLI)
+
 test-runtime:
 	$(RUN) dune runtest $(DUNE_BUILD_ARGS) test/runtime test/integration/temporal/observer
 
@@ -1097,8 +1117,20 @@ docs:
 # The OPAM licence audit first confirms that docs/dependencies.md still lists
 # exactly the locked and pinned inputs, so the reviewed inventory cannot drift
 # from what is built (#783). The inventory check is host-only POSIX shell.
+# It then audits the CI-only official Python SDK closure (#517).
 license-check: check-dependency-inventory
 	$(COMPOSE_RUN) sh scripts/check-licenses.sh
+	$(MAKE) python-license-check
+
+# Installs test/integration/sdk_interop/python/requirements.lock with its
+# hashes in the digest-pinned image of the sdk-interop-python Compose service
+# and audits each installed distribution's own license metadata; the policy
+# contract on fake distributions runs first. Python never enters the OCaml
+# development image, and this target starts no Temporal service.
+.PHONY: python-license-check
+python-license-check:
+	$(TEMPORAL_COMPOSE) run --rm --no-deps -T sdk-interop-python \
+		sh /workspace/scripts/check-python-licenses.sh
 
 .PHONY: check-dependency-inventory test-dependency-inventory-contract
 check-dependency-inventory:

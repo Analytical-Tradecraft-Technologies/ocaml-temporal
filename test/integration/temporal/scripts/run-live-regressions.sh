@@ -86,6 +86,42 @@ mv "$evidence/temporal.partial" "$evidence/temporal"
 chmod 0755 "$evidence/temporal"
 in_dev 60 "$container_cli" --version
 
+# The official-SDK interoperability suite (#517) has a second process in a
+# different image. The OCaml executable hosts the workflow worker and publishes
+# its task queues in ready.json under the shared evidence directory; the
+# pinned `sdk-interop-python` service then runs the official Python SDK driver,
+# which writes python-report.json. This function records the driver's exit
+# status in driver-exit (through a rename, so it is never read half-written),
+# after which the OCaml process checks the reported exact runs through its own
+# client. Both statuses must be zero. The driver's container is bounded by the
+# ordinary per-suite limit; the OCaml process gets one more minute because it
+# outlives the driver to verify its report.
+run_sdk_interop() {
+  interop_evidence="$evidence/sdk_interop"
+  mkdir -p "$interop_evidence"
+  in_dev "$((limit + 60))" "/workspace/_build/default/$1" check "$address" \
+    /workspace/_build/live-regressions/sdk_interop </dev/null &
+  ocaml_pid=$!
+  # Interpolated by compose.yaml into the driver's environment and timeout.
+  OCAML_SDK_VERSION=$ocaml_sdk_version
+  SDK_INTEROP_TIMEOUT_SECONDS=$limit
+  export OCAML_SDK_VERSION SDK_INTEROP_TIMEOUT_SECONDS
+  driver_status=0
+  compose run --rm --no-deps -T sdk-interop-python </dev/null || driver_status=$?
+  printf '%s\n' "$driver_status" >"$interop_evidence/driver-exit.partial"
+  mv "$interop_evidence/driver-exit.partial" "$interop_evidence/driver-exit"
+  ocaml_status=0
+  wait "$ocaml_pid" || ocaml_status=$?
+  printf 'official SDK driver status %s, OCaml check status %s\n' \
+    "$driver_status" "$ocaml_status"
+  [ "$driver_status" -eq 0 ] || return "$driver_status"
+  return "$ocaml_status"
+}
+
+# The OCaml SDK identity recorded in workflow-task history is the package
+# version in SemVer spelling, as rust/core-bridge/src/abi.rs reports it.
+ocaml_sdk_version=$(tr '~' '-' <"$root/.release-version" | tr -d '[:space:]')
+
 failed=''
 for executable in "$@"; do
   case "$executable" in
@@ -102,9 +138,12 @@ for executable in "$@"; do
     test/integration/client_policies/regression.exe|\
     test/integration/interaction_recovery/regression.exe|\
     test/integration/local_activity_cancellation/regression.exe|\
+    test/integration/non_yielding_workflow/regression.exe|\
     test/integration/transport_interruption/regression.exe|\
     test/integration/update_outcomes/regression.exe)
       cli_argument=$container_cli ;;
+    test/integration/sdk_interop/regression.exe)
+      cli_argument='' ;;
     *)
       echo "no live regression invocation is defined for $executable" >&2
       exit 2 ;;
@@ -114,10 +153,14 @@ for executable in "$@"; do
   log="$evidence/$suite.log"
   printf 'live regression %s: begin\n' "$suite"
   status=0
-  # cli_argument is either empty or one path without whitespace.
-  # shellcheck disable=SC2086
-  in_dev "$limit" "/workspace/_build/default/$executable" check "$address" $cli_argument \
-    >"$log" 2>&1 || status=$?
+  if [ "$suite" = sdk_interop ]; then
+    run_sdk_interop "$executable" >"$log" 2>&1 || status=$?
+  else
+    # cli_argument is either empty or one path without whitespace.
+    # shellcheck disable=SC2086
+    in_dev "$limit" "/workspace/_build/default/$executable" check "$address" $cli_argument \
+      >"$log" 2>&1 || status=$?
+  fi
   cat "$log"
   case "$status" in
     0) outcome=ok ;;
