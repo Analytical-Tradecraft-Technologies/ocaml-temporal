@@ -5,6 +5,7 @@ module Workflow = Temporal_protocol.Workflow_protocol
 module Activity = Temporal_protocol.Activity_protocol
 module Encoded_completion = Temporal_protocol.Encoded_workflow_completion
 module Encoded_activity = Temporal_protocol.Encoded_activity_completion
+module Encoded_heartbeat = Temporal_protocol.Encoded_activity_heartbeat
 
 (** Requires two structural values to be equal and identifies the violated
     native-worker contract if they differ. *)
@@ -181,7 +182,23 @@ let test_protocol_serialization () =
        {|{"result":{"kind":"will_complete_async"},"task_token":"AAEC"}|})
     (match Encoded_activity.encode activity_completion with
     | Ok encoded -> Encoded_activity.to_bytes encoded
-    | Error _ -> failwith "valid activity completion was not encoded")
+    | Error _ -> failwith "valid activity completion was not encoded");
+  let heartbeat : Activity.heartbeat =
+    { task_token = Bytes.of_string "\000\001\002"; details = [] }
+  in
+  (* Heartbeats follow the same single-encode contract (issue #1001): the
+     supervisor copies the adapter's encoder output into the C call, so the
+     wire document is unchanged and each copy is caller-owned. *)
+  match Encoded_heartbeat.encode heartbeat with
+  | Error _ -> failwith "valid activity heartbeat was not encoded"
+  | Ok encoded ->
+      let expected = {|{"details":[],"task_token":"AAEC"}|} in
+      if Encoded_heartbeat.to_string encoded <> expected then
+        failwith "activity heartbeat JSON did not match";
+      let copy = Encoded_heartbeat.to_bytes encoded in
+      Bytes.fill copy 0 (Bytes.length copy) 'x';
+      if Encoded_heartbeat.to_string encoded <> expected then
+        failwith "mutating a native copy changed the encoded heartbeat"
 
 (** Invalid incoming and outgoing semantic documents are converted to the
     stable bridge [Protocol] status without including source payload bytes in
@@ -567,6 +584,29 @@ let test_native_lifecycle_guards () =
    with
   | Error (Supervisor.Backend { Bridge.status = Invalid_state; _ }) -> ()
   | _ -> failwith "activity completion without worker was accepted");
+  (* Likewise for heartbeats (issue #1001): an empty token is rejected by the
+     encoder, so no value exists for either heartbeat operation to send. *)
+  (match
+     Encoded_heartbeat.encode
+       ({ task_token = Bytes.empty; details = [] } : Activity.heartbeat)
+   with
+  | Error _ -> ()
+  | Ok _ -> failwith "invalid activity heartbeat was encoded for the native worker");
+  let heartbeat =
+    match
+      Encoded_heartbeat.encode
+        ({ task_token = Bytes.of_string "token"; details = [] }
+          : Activity.heartbeat)
+    with
+    | Ok encoded -> encoded
+    | Error _ -> failwith "valid activity heartbeat was not encoded"
+  in
+  (match
+     Supervisor.perform supervisor
+       (Supervisor.Record_activity_heartbeat heartbeat)
+   with
+  | Error (Supervisor.Backend { Bridge.status = Invalid_state; _ }) -> ()
+  | _ -> failwith "activity heartbeat without worker was accepted");
   expect "native shutdown" (Ok ()) (Supervisor.shutdown supervisor);
   expect "poll after shutdown" (Error Supervisor.Closed)
     (Supervisor.perform supervisor Supervisor.Try_poll_workflow)

@@ -180,13 +180,15 @@ module Activity_source = struct
     Native.perform supervisor (Native.Complete_async_activity encoded)
 
   (** Records progress for the currently leased activity through the same
-      supervisor mailbox as polling and completion. *)
-  let record_activity_heartbeat supervisor heartbeat =
-    Native.perform supervisor (Native.Record_activity_heartbeat heartbeat)
+      supervisor mailbox as polling and completion. The heartbeat arrives
+      already encoded once by the adapter. *)
+  let record_activity_heartbeat supervisor encoded =
+    Native.perform supervisor (Native.Record_activity_heartbeat encoded)
 
-  (** Records progress for an admitted asynchronous activity. *)
-  let record_async_activity_heartbeat supervisor heartbeat =
-    Native.perform supervisor (Native.Record_async_activity_heartbeat heartbeat)
+  (** Records progress for an admitted asynchronous activity, likewise as the
+      adapter's single-encode heartbeat bytes. *)
+  let record_async_activity_heartbeat supervisor encoded =
+    Native.perform supervisor (Native.Record_async_activity_heartbeat encoded)
 
   (** Returns the stable classification used in adapter diagnostics. *)
   let error_code error = fst (native_error_view error)
