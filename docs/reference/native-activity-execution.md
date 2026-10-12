@@ -14,13 +14,13 @@ complete_activity :
   supervisor -> Encoded_activity_completion.t -> (unit, native_error) result
 
 record_activity_heartbeat :
-  supervisor -> Activity_protocol.heartbeat -> (unit, native_error) result
+  supervisor -> Encoded_activity_heartbeat.t -> (unit, native_error) result
 
 complete_async_activity :
   supervisor -> Encoded_activity_completion.t -> (unit, native_error) result
 
 record_async_activity_heartbeat :
-  supervisor -> Activity_protocol.heartbeat -> (unit, native_error) result
+  supervisor -> Encoded_activity_heartbeat.t -> (unit, native_error) result
 ```
 
 For a `Start` task, the native bridge has already leased the opaque task token
@@ -44,6 +44,25 @@ supervisor copies into the C call (issue #995). Only
 `Encoded_activity_completion.encode` can build the value, so an invalid
 completion cannot reach the bridge, and the supervisor never encodes it again.
 The JSON document is unchanged.
+
+Both heartbeat operations follow the same rule with the abstract
+`Temporal_protocol.Encoded_activity_heartbeat.t` (issue #1001). The adapter
+encodes each synchronous or asynchronous heartbeat exactly once, before any
+supervisor call; a heartbeat the strict encoder rejects returns a typed error
+(`Codec` for a synchronous context, a non-submitted error for an async handle)
+and never reaches the bridge. The supervisor copies the bytes into the C call
+unchanged.
+
+An asynchronous terminal request whose native outcome was uncertain
+(`Retryable_submission`) keeps its request key (`Async_activity.operation_key`)
+and its encoded bytes on the adapter's async lease. The handle admits only a
+request with that same key until it is resolved. Equal keys mean the same wire
+request even when the operations differ structurally (for example a `Fail`
+whose explicit `error_type` equals its category's default), so the adapter
+resends the physically identical string for every admitted retry instead of
+preparing and encoding the completion again. Any other completion outcome
+clears the retained bytes, and a request with a different key is prepared
+afresh and never sent them.
 
 ## Asynchronous completion
 
@@ -245,9 +264,9 @@ value is fixed for the whole attempt: heartbeats sent by the current attempt
 are recorded for the next attempt and never replace what `details` returns,
 matching the other Temporal SDKs. `heartbeat_timeout` returns the server's
 configured interval when one was supplied. `Context.heartbeat` and
-`Context.heartbeat_payloads` copy their payloads, validate them through the
-same strict activity JSON codec as completions, and send them through the
-supervisor mailbox. The mailbox serializes heartbeats with polling,
+`Context.heartbeat_payloads` copy their payloads, validate and encode them
+once through the same strict activity JSON codec as completions, and send
+those bytes through the supervisor mailbox. The mailbox serializes heartbeats with polling,
 completion, and shutdown; an arbitrary Rust thread never calls an OCaml
 callback.
 

@@ -9,6 +9,7 @@
 
 module Protocol = Temporal_protocol.Activity_protocol
 module Encoded = Temporal_protocol.Encoded_activity_completion
+module Encoded_heartbeat = Temporal_protocol.Encoded_activity_heartbeat
 module Raw_adapter = Temporal_runtime.Native_activity_execution
 
 (** Copies a public payload into the base payload representation expected by the
@@ -174,15 +175,18 @@ let copy_completion encoded =
         failwith "adapter submitted non-canonical completion bytes";
       value
 
-(** Copies a heartbeat through the strict protocol codec so the fake source
-    cannot accidentally retain mutable buffers owned by an activity context. *)
-let copy_heartbeat heartbeat =
-  match Protocol.encode_heartbeat heartbeat with
+(** Strictly decodes the adapter's single-encode heartbeat bytes, as the
+    Rust bridge does, and checks that they are canonical. Decoding gives the
+    fake fresh storage, so it cannot retain mutable buffers owned by an
+    activity context, and it never encodes a submission itself (#1001). *)
+let copy_heartbeat encoded =
+  let json = Encoded_heartbeat.to_string encoded in
+  match Protocol.decode_heartbeat json with
   | Error _ -> failwith "adapter submitted an invalid heartbeat to fake source"
-  | Ok json -> (
-      match Protocol.decode_heartbeat json with
-      | Ok value -> value
-      | Error _ -> failwith "fake source could not reparse its own heartbeat")
+  | Ok value ->
+      if Protocol.encode_heartbeat value <> Ok json then
+        failwith "adapter submitted non-canonical heartbeat bytes";
+      value
 
 (** Removes one exact opaque token from a list and reports whether it was found.
     [Bytes.equal] is intentional: tokens are binary correlation data, not text.
@@ -277,15 +281,15 @@ module Fake_supervisor = struct
   (** Accepts progress only while the activity token is leased. The focused
       dispatch tests do not retain heartbeat bodies; the lease check still
       verifies that the adapter never sends a heartbeat after completion. *)
-  let record_activity_heartbeat supervisor (heartbeat : Protocol.heartbeat) =
+  let record_activity_heartbeat supervisor encoded =
     !(supervisor.heartbeat_hook) ();
+    let heartbeat = copy_heartbeat encoded in
     if
       List.exists
         (fun token -> Bytes.equal token heartbeat.Protocol.task_token)
         !(supervisor.leased)
     then begin
-      supervisor.heartbeats :=
-        copy_heartbeat heartbeat :: !(supervisor.heartbeats);
+      supervisor.heartbeats := heartbeat :: !(supervisor.heartbeats);
       Ok ()
     end
     else
@@ -307,7 +311,7 @@ module Fake_supervisor = struct
       }
 
   let record_async_activity_heartbeat _supervisor
-      (_heartbeat : Protocol.heartbeat) =
+      (_encoded : Encoded_heartbeat.t) =
     Error
       {
         code = "unsupported";
@@ -1172,6 +1176,45 @@ let test_contextual_heartbeat_lifecycle () =
         | Error _ -> ()
         | Ok () -> failwith "heartbeat succeeded after activity completion")
   end
+
+(** A synchronous heartbeat is encoded once by the adapter, which also
+    validates it (#1001): details the strict encoder rejects (here duplicate
+    metadata keys, which payload conversion alone cannot detect) fail as a
+    typed codec error without any supervisor call, and a valid heartbeat
+    from the same attempt still reaches the supervisor exactly once. *)
+let test_heartbeat_encoder_rejection_stays_local () =
+  let supervisor = fake_supervisor () in
+  let supervisor_calls = ref 0 in
+  supervisor.heartbeat_hook := (fun () -> incr supervisor_calls);
+  let activity =
+    Temporal.Activity.define_with_context ~name:"native_heartbeat_rejected"
+      ~input:Temporal.Codec.unit ~output:Temporal.Codec.string
+      (fun context () ->
+        let duplicate : Temporal.Payload.t =
+          { metadata = [ ("opaque", "one"); ("opaque", "two") ];
+            data = Bytes.of_string "invalid" }
+        in
+        (match Temporal.Activity.Context.heartbeat_payloads context [ duplicate ] with
+        | Error error when (Temporal.Error.view error).category = `Codec -> ()
+        | Error _ -> failwith "encoder-rejected heartbeat was not a codec error"
+        | Ok () -> failwith "encoder-rejected heartbeat was accepted");
+        if !supervisor_calls <> 0 then
+          failwith "encoder-rejected heartbeat reached the supervisor";
+        Result.map
+          (fun () -> "done")
+          (Temporal.Activity.Context.heartbeat context Temporal.Codec.string
+             "valid"))
+  in
+  let token = Bytes.of_string "heartbeat-rejected-token" in
+  enqueue supervisor
+    (start_task ~token ~activity_type:"native_heartbeat_rejected"
+       ~input:[ encode_input Temporal.Codec.unit () ]);
+  let worker = worker supervisor [ Adapter.register activity ] in
+  expect_completed Adapter.Succeeded (Worker.poll worker);
+  supervisor.heartbeat_hook := ignore;
+  match !supervisor_calls, !(supervisor.heartbeats) with
+  | 1, [ heartbeat ] when Bytes.equal heartbeat.Protocol.task_token token -> ()
+  | _ -> failwith "valid heartbeat was not submitted exactly once"
 
 (** The public context view must never expose mutable payload storage owned by
     the adapter. This test mutates the source details, a getter result, the
@@ -2127,6 +2170,7 @@ let () =
   test_completion_is_encoded_once ();
   test_non_retryable_completion_is_never_resubmitted ();
   test_contextual_heartbeat_lifecycle ();
+  test_heartbeat_encoder_rejection_stays_local ();
   test_context_payloads_are_copied ();
   test_context_callback_exception_and_invalidation ();
   test_extra_input_is_rejected ();
