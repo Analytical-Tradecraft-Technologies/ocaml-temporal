@@ -52,6 +52,33 @@ admin-tools CLI; `sh scripts/check-format.sh`; `uvx typos@1.48.0`;
 `scripts/check-dependency-inventory.sh`; and
 `sh test/smoke/test_live_regressions_contract.sh .`.
 
+## 2026-10-11: Live fan-out benchmark and JSON bridge attribution (#528)
+
+`make bench-fanout-live` runs a high fan-out workload against the Compose
+Temporal stack: each execution starts N remote activities and fans them back
+in with `Future.all`, with one or more executions per sample. The report has
+the shared harness's latency, throughput, errors, OCaml memory and process RSS
+with the Linux peak. An untimed attribution pass enables `Debug` on the
+bridge and workflow log sources and aggregates each native bridge call's
+duration, each workflow activation's processing time and new opt-in codec
+records. `Observability.debug_timed` times the five OCaml protocol codec
+passes only while the bridge source is at `Debug` and otherwise only checks
+the level. `make bench-json-bridge-rust` times the Rust serde passes on
+documents of the same shape.
+
+At width 1,000 with 256-byte payloads on an M4 Pro Docker Desktop VM, a
+one-execution fan-out took about 9 s and eight executions about 90 to 98 s,
+with no errors and flat retained OCaml memory. JSON (OCaml about 77 ms, Rust
+about 19 ms per fan-out) is about 1% of the live latency. The single remote
+activity slot serializes activities, native completion calls (Core and the
+server RPC) take about a quarter of the time, and an unmerged experiment
+showed the 10 ms local lane yield in `Native_worker.wait_for_lane` to be the
+dominant remaining cost. Activity completions are encoded twice (validation
+and supervisor). The results and their limits are in
+[benchmark-harness.md](reference/benchmark-harness.md#live-fan-out-and-bridge-attribution).
+Verification: `dune build @install`, the benchmark and observability tests,
+`@doc`, both live levels and the Rust benchmark, the format, spelling and
+dependency-inventory checks.
 ## 2026-10-12: Idle-pacing tests measure decisions, not sleep granularity (#994 follow-up)
 
 `test/runtime/test_native_worker_idle.ml` failed on the Windows x64 job of
