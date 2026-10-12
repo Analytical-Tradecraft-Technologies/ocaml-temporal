@@ -267,11 +267,13 @@ val detached_error :
     Temporal requires at least one activity timeout. The cancellation operation
     emits at most one activity-cancellation command for its sequence and
     remains a valid no-op after a terminal result or activity-start failure.
-    Calls made without this context current are typed lifecycle defects. *)
+    Calls made without this context current are typed lifecycle defects.
+    [input] is the exact argument list sent to Core; the public layer decides
+    it from the input codec ([Codec_private.encode_arguments]). *)
 val schedule_activity :
   t ->
   name:string ->
-  input:Temporal_base.Codec.payload ->
+  input:Temporal_base.Codec.payload list ->
   ?activity_id:string ->
   ?task_queue:string ->
   ?schedule_to_close_timeout:int64 ->
@@ -299,7 +301,7 @@ val schedule_activity :
 val schedule_local_activity :
   t ->
   name:string ->
-  input:Temporal_base.Codec.payload ->
+  input:Temporal_base.Codec.payload list ->
   ?activity_id:string ->
   ?schedule_to_close_timeout:int64 ->
   ?schedule_to_start_timeout:int64 ->
@@ -320,12 +322,14 @@ val schedule_local_activity :
     valid only while this context is current; it emits at most one cancellation
     command and leaves Core to resolve the future. A repeated valid call is a
     no-op, including after Core has delivered a terminal result or start
-    failure; a call after context shutdown remains a typed lifecycle defect. *)
+    failure; a call after context shutdown remains a typed lifecycle defect.
+    [input] is the exact argument list sent to Core, as for
+    [schedule_activity]. *)
 val start_child_workflow :
   t ->
   id:string ->
   name:string ->
-  input:Temporal_base.Codec.payload ->
+  input:Temporal_base.Codec.payload list ->
   ?retry_policy:Activation.retry_policy ->
   ?task_queue:string ->
   ?parent_close_policy:Activation.child_workflow_parent_close_policy ->
@@ -430,9 +434,10 @@ val emit : t -> Activation.command -> unit
 val terminate : t -> Activation.command -> 'value
 
 (** Buffers a continue-as-new command and stops the current workflow fiber.
-    The successor input is encoded before it reaches this private operation. *)
+    The successor input is encoded into its argument list before it reaches
+    this private operation. *)
 val continue_as_new :
-  t -> workflow_type:string -> input:Temporal_base.Codec.payload -> 'value
+  t -> workflow_type:string -> input:Temporal_base.Codec.payload list -> 'value
 
 (** True when the pending command buffer already holds a terminal workflow
     command such as complete, fail, cancel, or continue-as-new. *)

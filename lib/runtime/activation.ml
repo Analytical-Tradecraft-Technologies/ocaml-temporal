@@ -160,7 +160,9 @@ type command =
       seq : int64;
       id : string;
       name : string;
-      input : Temporal_base.Codec.payload;
+      input : Temporal_base.Codec.payload list;
+          (** Exact argument payloads sent to Core: empty for a [Codec.unit]
+              input, otherwise one payload. *)
       retry_policy : retry_policy option;
       cancellation_type : child_workflow_cancellation_type;
     }
@@ -217,5 +219,9 @@ type command =
   | Fail_workflow of Temporal_base.Error.t
   (** Ends this run and asks Temporal to start the same workflow type with a
       fresh history and the supplied encoded input. *)
-  | Continue_as_new of { workflow_type : string; input : Temporal_base.Codec.payload }
+  | Continue_as_new of {
+      workflow_type : string;
+      input : Temporal_base.Codec.payload list;
+          (** Exact argument payloads, as for [Start_child_workflow]. *)
+    }
   | Cancel_workflow_execution

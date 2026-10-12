@@ -170,11 +170,11 @@ let execute ?id ?timeout environment definition input =
   Result.bind (start ?id environment definition input) (result ?timeout)
 
 (** Encodes one typed value as the argument list the runtime delivers, using
-    the same unit-as-no-arguments convention as Temporal commands. *)
+    the same codec-decided rule as Temporal commands: zero payloads for
+    [Codec.unit], one payload otherwise (#1012). *)
 let arguments codec value =
-  Codec.encode codec value
-  |> Result.map (fun payload ->
-         Temporal_base.Payload.input_arguments (Payload_private.to_base payload))
+  Codec_private.encode_arguments codec value
+  |> Result.map_error Error_private.of_base
 
 let signal handle signal value =
   Result.bind (arguments (Signal.input signal) value) (fun input ->

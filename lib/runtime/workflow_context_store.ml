@@ -783,18 +783,19 @@ let schedule_activity context ~name ~input ?activity_id ?task_queue
     | None, None -> Some 60_000L
     | _, value -> value
   in
-  (* [Payload.input_arguments] sends a unit input as zero arguments so a
-     zero-parameter activity in another SDK is not given a surplus [null].
-     OCaml activity workers decode [[]] back to the canonical unit payload.
-     Core does not compare arguments when replaying ScheduleActivityTask or
-     local-activity markers, so older histories with one [binary/null]
-     argument still replay. *)
+  (* [input] is already the argument list: the public layer sends a
+     [Codec.unit] input as zero arguments so a zero-parameter activity in
+     another SDK is not given a surplus [null], and every other input,
+     including an option's [None], as one payload (#1012). OCaml activity
+     workers decode [[]] back to the canonical unit payload. Core does not
+     compare arguments when replaying ScheduleActivityTask or local-activity
+     markers, so histories recorded under either rule still replay. *)
   if local then begin
     let local_state =
       {
         activity_id;
         activity_type = name;
-        arguments = Temporal_base.Payload.input_arguments input;
+        arguments = input;
         schedule_to_close_timeout;
         schedule_to_start_timeout;
         start_to_close_timeout;
@@ -816,7 +817,7 @@ let schedule_activity context ~name ~input ?activity_id ?task_queue
            activity_type = name;
            attempt = 1L;
            original_schedule_time = None;
-           arguments = Temporal_base.Payload.input_arguments input;
+           arguments = input;
            schedule_to_close_timeout;
            schedule_to_start_timeout;
            start_to_close_timeout;
@@ -833,7 +834,7 @@ let schedule_activity context ~name ~input ?activity_id ?task_queue
            activity_id;
            activity_type = name;
            task_queue;
-           arguments = Temporal_base.Payload.input_arguments input;
+           arguments = input;
            schedule_to_close_timeout;
            schedule_to_start_timeout;
            start_to_close_timeout;
