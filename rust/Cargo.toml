@@ -18,7 +18,7 @@ serde = "1.0.228"
 serde_json = "1.0.150"
 prost-wkt-types = "0.7.1"
 temporalio-client = { git = "https://github.com/temporalio/sdk-core.git", rev = "8fe478ee179ed754614d230f39586f3edb57da71", default-features = false, features = ["core-based-sdk", "tls-ring"] }
-temporalio-common = { git = "https://github.com/temporalio/sdk-core.git", rev = "8fe478ee179ed754614d230f39586f3edb57da71", default-features = false }
+temporalio-common = { git = "https://github.com/temporalio/sdk-core.git", rev = "8fe478ee179ed754614d230f39586f3edb57da71", default-features = false, features = ["prometheus"] }
 temporalio-sdk-core = { git = "https://github.com/temporalio/sdk-core.git", rev = "8fe478ee179ed754614d230f39586f3edb57da71", default-features = false, features = ["tls-ring"] }
 temporalio-protos = { git = "https://github.com/temporalio/sdk-core.git", rev = "8fe478ee179ed754614d230f39586f3edb57da71" }
 tokio = { version = "1.52.3", features = ["rt", "sync", "time"] }
