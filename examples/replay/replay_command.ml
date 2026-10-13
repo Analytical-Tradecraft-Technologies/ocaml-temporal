@@ -161,8 +161,9 @@ let parse arguments =
     ~options_done:false [] arguments
 
 (** Reads [channel] to end of input, stopping with [`Too_large] as soon as
-    more than {!Temporal.Replay.History.max_bytes} bytes have arrived, so an
-    oversized input is never held in memory beyond one extra chunk. Only
+    more than {!Temporal.Replay.History.max_bytes} bytes have arrived. The
+    size check runs before each chunk is appended, so the buffer never grows
+    past the limit (an append beyond its capacity would double it). Only
     sequential reads are used: [In_channel.length] would need a seekable
     file and fails with [Illegal seek] on a pipe, a process substitution, or
     [/dev/stdin]. *)
@@ -171,13 +172,12 @@ let read_bounded channel =
   let chunk = Bytes.create 65_536 in
   let buffer = Buffer.create 65_536 in
   let rec loop () =
-    if Buffer.length buffer > limit then Error `Too_large
-    else
-      match In_channel.input channel chunk 0 (Bytes.length chunk) with
-      | 0 -> Ok (Buffer.contents buffer)
-      | count ->
-          Buffer.add_subbytes buffer chunk 0 count;
-          loop ()
+    match In_channel.input channel chunk 0 (Bytes.length chunk) with
+    | 0 -> Ok (Buffer.contents buffer)
+    | count when count > limit - Buffer.length buffer -> Error `Too_large
+    | count ->
+        Buffer.add_subbytes buffer chunk 0 count;
+        loop ()
   in
   loop ()
 
