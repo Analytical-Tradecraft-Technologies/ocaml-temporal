@@ -58,6 +58,48 @@ accessors. Verified with `dune build @install`, the `test/bridge`,
 `test/runtime` and `test/unit` aliases on OCaml 5.4.1 (macOS), and the
 focused `cargo test`, `cargo fmt --check` and `cargo clippy -D warnings`
 runs.
+## 2026-10-13: Activity retryability for unrunnable tasks, pause/reset completion, and async lease expiry (#1031, #1022, #1043)
+
+An activity task for a type the worker does not register, or with an input
+it cannot decode, was failed non-retryably, so during a rolling deploy or on
+a queue shared by workers with different registrations the first attempt
+failed the activity permanently (#1031). For a remote activity the adapter
+now reports a retryable application failure: type `NotFoundError` with a
+message listing the registered types for an unknown type (matching the Go,
+Python, TypeScript and .NET SDKs), and the existing type for an undecodable
+input. A local activity, which always runs on the scheduling worker, still
+fails non-retryably, as does an unrepresentable heartbeat context.
+
+A synchronous activity that acknowledged an operator pause or reset was
+completed as cancelled, which the server rejects without a cancellation
+request, leaving the attempt open until it timed out (#1022). When Core's
+primary cancellation reason is `Paused` or `Reset` (Core reports those only
+when no cancellation was requested), the attempt, a start interrupted before
+admission, or a bare cancel task is now failed with a retryable
+`ActivityPause` or `ActivityReset` application failure, as in the Python
+SDK.
+
+An async lease that application code never finished stayed admitted for the
+worker's life, so every later shutdown waited the full grace period and
+reported a lost completion (#1043). Each admitted lease now records its
+attempt deadline (admission plus the shorter close timeout) and its heartbeat
+deadline (heartbeat timeout after admission or the last async heartbeat),
+which are never earlier than the server's; five seconds after either passes
+the lease is closed without a native call and logged as
+`activity_async_lease_expired`. Expiry is checked on admission, on every
+drain, and by the shutdown probe, so a stale lease no longer holds shutdown.
+The workflow guide's async example now retries the retryable "not active
+yet" error on a system thread instead of a one-shot `Domain`, and the guide
+and `Activity.Async_handle` document that every handle must be finished.
+
+`test/runtime/test_native_activity_execution.ml` covers unknown types and
+undecodable inputs for both localities and pause/reset for a running
+attempt, a bare task and a start interrupted before admission;
+`test/runtime/test_native_async_activity.ml` covers lease expiry by each
+close timeout, the slack, heartbeat renewal, the no-timeout case, and expiry
+on admission with an injected clock. Verified with `dune build @install` and
+the `test/runtime` test alias on OCaml 5.4.1 (macOS). A live two-worker or
+`temporal activity pause` test is not included.
 ## 2026-10-13: Binary payload metadata is carried losslessly (#1048)
 
 Temporal payload metadata values are bytes, and the protocol layers already
