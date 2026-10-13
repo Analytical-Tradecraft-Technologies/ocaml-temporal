@@ -282,11 +282,10 @@ module Info = struct
   type continuation_initiator = [ `Continue_as_new | `Retry | `Cron_schedule ]
 
   (** Returns the predecessor run recorded by Core, if any. A Temporal
-      Schedule action carries the previous action's result or failure with an
-      empty run ID (#1015); it has no predecessor run, so it reads as [None]. *)
+      Schedule action's empty run ID (#1015) is already stored as [None] by
+      the runtime, so a [Some] here always names a real predecessor. *)
   let continued_from_run_id info =
-    Option.bind info.run.continued_from (fun (run_id, _) ->
-        if String.equal run_id "" then None else Some run_id)
+    Option.map fst info.run.continued_from
 
   (** Maps Core's initiator to the public variant. The unspecified zero value
       names no reason, so it is reported as [None] rather than guessed. *)

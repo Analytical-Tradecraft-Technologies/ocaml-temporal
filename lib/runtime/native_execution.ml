@@ -1412,15 +1412,23 @@ let activate_translated execution (translated : translated_activation) =
                        context.retry_policy);
                  (* Only provenance is retained: the predecessor's failure and
                     completion payloads are not part of the public run info,
-                    so their mutable payload bytes are never shared here. *)
+                    so their mutable payload bytes are never shared here. A
+                    Temporal Schedule action carries the previous action's
+                    result or failure with an empty run ID (#1015); it has no
+                    predecessor run, so it is stored as [None] to keep the
+                    store's "[None] for a first run" invariant. *)
                  continued_from =
                    Option.bind context
                      (fun (context : Protocol.initialize_context) ->
-                       Option.map
+                       Option.bind context.continuation
                          (fun (continuation : Protocol.continuation) ->
-                           ( continuation.continued_from_execution_run_id,
-                             continuation.initiator ))
-                         context.continuation);
+                           if String.equal
+                                continuation.continued_from_execution_run_id ""
+                           then None
+                           else
+                             Some
+                               ( continuation.continued_from_execution_run_id,
+                                 continuation.initiator )));
                });
         Ok ()
   in

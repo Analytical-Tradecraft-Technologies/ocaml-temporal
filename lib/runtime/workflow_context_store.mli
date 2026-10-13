@@ -15,7 +15,9 @@ type start_metadata = {
     server recorded on this run's start event ([None] when absent); they are
     metadata only and the runtime never schedules them. [continued_from]
     pairs the predecessor run ID with Core's reason for creating this run and
-    is [None] for the first run of a chain. All fields are immutable values
+    is [None] for the first run of a chain, including a Temporal Schedule
+    action whose continuation carries an empty run ID (#1015); a [Some]
+    always names a real predecessor run. All fields are immutable values
     from history, so live execution and replay observe the same record. *)
 type run_info = {
   workflow_id : string;
