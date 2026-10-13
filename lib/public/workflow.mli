@@ -196,7 +196,8 @@ module Info : sig
   type continuation_initiator = [ `Continue_as_new | `Retry | `Cron_schedule ]
 
   (** Returns the run ID this run was continued or retried from, or [None]
-      for the first run of a chain. *)
+      for the first run of a chain, including a run started by a Temporal
+      Schedule. *)
   val continued_from_run_id : t -> string option
 
   (** Returns why Temporal started this run from {!continued_from_run_id},
@@ -224,7 +225,11 @@ module Info : sig
       or [None] when the run is not retried. Temporal fills omitted policy
       fields with its defaults before recording the start event, so the
       result is the effective policy rather than the literal request.
-      Intervals are rounded up to whole milliseconds. *)
+      Intervals are rounded up to whole milliseconds. Temporal does not
+      validate a policy whose maximum attempts is 1, so another SDK can
+      record one that {!Activity.Retry_policy.make} would reject (for
+      example a backoff coefficient below 1.0); such a policy is also
+      reported as [None]. *)
   val retry_policy : t -> Activity.Retry_policy.t option
 
   (** Returns the parent workflow, or [None] for a top-level workflow. *)
