@@ -219,9 +219,12 @@ adapter mutex:
    then invoke the implementation and convert its typed `result` into either an
    encoded payload or a structured application failure. Application failure
    retryability and each detail body supplied in `Error.t` are copied into the
-   Temporal failure without text conversion; metadata still follows the
-   runtime's strict UTF-8 key/value rules rather than becoming an unvalidated
-   side channel.
+   Temporal failure without text conversion; metadata keys follow the
+   bridge protocol's key rule (non-empty, valid UTF-8, at most 65536 bytes;
+   NUL allowed, so keys written by other SDKs round-trip), while metadata
+   values are
+   arbitrary bytes carried losslessly (#1048). Inbound task input and
+   heartbeat details are never rejected for their metadata.
 5. Encode the entire completion once through the strict activity-protocol
    encoder before admitting it to the pending-completion map. The lease keeps
    only the resulting immutable bytes. Invalid application
@@ -537,7 +540,8 @@ payload therefore cannot permanently block later activities or make
 replacement failure remains unchanged across uncertain transport outcomes;
 the adapter retires its token only after confirmed acceptance. The
 `smoke.activity_invalid_failure_details` live acceptance scenario exercises
-duplicate keys, oversized keys, and malformed UTF-8 through the public worker,
+duplicate keys, oversized keys, and a key that is not UTF-8 through the
+public worker,
 requiring a normal activity to complete after each rejected failure.
 
 The token is copied on receipt and never converted to a diagnostic string.

@@ -519,6 +519,37 @@ let test_successful_dispatch () =
   | _ -> failwith "empty activity queue did not report Not_ready"
   end
 
+(** Payload metadata values are arbitrary bytes (#1048). A task whose input
+    carries a binary metadata value, as a Go or Java codec may write beside
+    the encoding, used to be failed non-retryably before the activity ran even
+    though the codec ignores that entry. It must now run and succeed. *)
+let test_binary_metadata_input () =
+  let supervisor = fake_supervisor () in
+  let received = ref None in
+  let activity =
+    Temporal.Activity.define ~name:"native_activity_binary_metadata"
+      ~input:Temporal.Codec.bytes ~output:Temporal.Codec.bytes (fun input ->
+        received := Some (Bytes.to_string input);
+        Ok input)
+  in
+  let input : Protocol.payload =
+    {
+      Protocol.metadata =
+        [
+          ("encoding", Bytes.of_string "binary/plain");
+          ("nonce", Bytes.of_string "\xff\x00");
+        ];
+      data = Bytes.of_string "body";
+    }
+  in
+  enqueue supervisor
+    (start_task ~token:(Bytes.of_string "binary-metadata-token")
+       ~activity_type:"native_activity_binary_metadata" ~input:[ input ]);
+  let worker = worker supervisor [ Adapter.register activity ] in
+  expect_completed Adapter.Succeeded (Worker.poll worker);
+  if !received <> Some "body" then
+    failwith "activity with binary input metadata did not run"
+
 (** A typed [Error.t] from an activity becomes a structured application failure,
     preserves retryability and application detail payloads, and is acknowledged
     without raising an exception. The binary detail body verifies that failure
@@ -621,9 +652,9 @@ let test_invalid_failure_details_allow_next_activity () =
     [ ("duplicate", [ ("encoding", "binary/plain"); ("encoding", "binary/plain") ]);
       ("oversized", [ (String.make 65_537 'k', "value") ]);
       ("empty", [ ("", "value") ]);
-      ("nul", [ ("bad\000key", "value") ]);
-      ("invalid-key", [ ("\255", "value") ]);
-      ("invalid-value", [ ("encoding", "\255") ]) ]
+      (* A binary metadata value and a NUL in a key are valid Temporal data
+         (#1048), so only keys outside the protocol's key rule remain. *)
+      ("invalid-key", [ ("\255", "value") ]) ]
   in
   List.iter
     (fun (label, metadata) ->
@@ -708,8 +739,8 @@ let test_invalid_failure_completion_retry () =
   if !calls <> 1 || !(supervisor.leased) <> [] || Queue.length supervisor.queue <> 1 then
     failwith "replacement retry reran the activity, retained its lease, or polled later work"
 
-(** Wire-valid context values which the runtime cannot represent (binary
-    heartbeat metadata) must fail only their own task. Exercise both callback
+(** Wire-valid task values which the runtime cannot represent (here a second
+    input value) must fail only their own task. Exercise both callback
     styles, immediate acknowledgement, and transport retry through poll and
     drain before running unrelated work. A sub-millisecond heartbeat timeout
     is representable since #1032 (it rounds up); see
@@ -743,15 +774,16 @@ let test_unrepresentable_context_retires_lease () =
                     ignore (Atomic.fetch_and_add good_calls 1);
                     Ok ())
               in
-              let heartbeat_details, heartbeat_timeout, path =
-                ([ Protocol.{ metadata = [ ("opaque", Bytes.of_string "\255") ];
-                     data = Bytes.of_string "private-heartbeat" } ],
-                 None, "$.variant.heartbeat_details[0].metadata.opaque")
-              in
+              (* Binary heartbeat metadata is representable since #1048, so
+                 the remaining unrepresentable shape is a second input value,
+                 which the single-input definition cannot accept. *)
+              let unit_input = encode_input Temporal.Codec.unit () in
+              let path = "$.variant.input" in
               let token = Bytes.of_string "\000bad-context\255" in
               let task =
-                start_task_with_heartbeat ~heartbeat_details ~heartbeat_timeout
-                  ~token ~activity_type:"bad-context" ~input:[]
+                start_task_with_heartbeat ~heartbeat_details:[]
+                  ~heartbeat_timeout:None ~token ~activity_type:"bad-context"
+                  ~input:[ unit_input; unit_input ]
               in
               (* These are valid native tasks, not malformed wire envelopes. *)
               let task =
@@ -2282,6 +2314,7 @@ let test_cancellation_records_correlation () =
   then failwith "a bare cancellation record fabricated an activity identity"
 
 let () =
+  test_binary_metadata_input ();
   test_successful_dispatch ();
   test_application_failure_logs_one_record ();
   test_typed_failure ();
