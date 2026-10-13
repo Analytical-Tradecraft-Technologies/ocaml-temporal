@@ -7,6 +7,8 @@
   ../../.github/workflows/build.yml
   ../../dune-project
   ../../Dockerfile.dev
+  ../../.github/dependabot.yml
+  (source_tree ../../docker)
   ../../scripts/ci-matrix.py
   ../../temporal-sdk.opam
   ../../temporal-sdk.opam.locked
@@ -26,6 +28,8 @@
   ../../.github/workflows/build.yml
   ../../dune-project
   ../../Dockerfile.dev
+  ../../.github/dependabot.yml
+  (source_tree ../../docker)
   ../../scripts/ci-matrix.py
   ../../temporal-sdk.opam
   ../../temporal-sdk.opam.locked
