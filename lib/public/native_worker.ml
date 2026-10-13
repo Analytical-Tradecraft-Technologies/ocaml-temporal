@@ -945,14 +945,22 @@ let shutdown worker =
     the narrow native retry path and keeps adapter maps retained until that path
     returns. If a system thread cannot be created during process teardown, the
     native custom-block finalizer remains the last-resort reclaim mechanism
-    rather than discarding a still-owned lease. *)
+    rather than discarding a still-owned lease.
+
+    A worker and its supervisor usually become unreachable in the same
+    collection, and [Gc.finalise] then runs both finalizers in no guaranteed
+    order; resurrecting [worker] here does not cancel one already scheduled
+    for the supervisor. [create] therefore delegates the supervisor's
+    abandoned cleanup to this function (#1044), which makes it the only path
+    that closes the native graph of an abandoned worker. *)
 let cleanup_abandoned worker =
   if Atomic.get worker.terminal_cleanup_pending then
     schedule_terminal_cleanup worker
   else if not (Atomic.get worker.closed) then
-    (* Keep [worker] (and therefore [supervisor]) reachable for the lifetime of
-       the cleanup thread so the supervisor's own finalizer cannot tear the
-       native graph down before drain completes. The thread owns this root. *)
+    (* The thread captures [worker] (and therefore [supervisor]) so both stay
+       alive until the drain-then-shutdown path has returned. Because the
+       supervisor's own finalizer was disabled in [create], nothing else can
+       close the graph while that drain delivers retained completions. *)
     match
       Thread.create
         (fun instance ->
@@ -968,7 +976,10 @@ let cleanup_abandoned worker =
         (* Cannot spawn a helper. Do not block the finalizer Domain on the
            mailbox owner. Mark closed and request a terminal retry path without
            awaiting drain; residual native reclaim still goes through the
-           runtime custom-block finalizer. *)
+           runtime custom-block finalizer. Closing admission is what the
+           supervisor's own (now delegated) finalizer would have done here,
+           and never blocks. *)
+        (try Native.initiate_shutdown worker.supervisor with _ -> ());
         Atomic.set worker.closed true;
         Atomic.set worker.terminal_cleanup_pending true;
         schedule_terminal_cleanup worker
@@ -1100,6 +1111,7 @@ let create ?max_cached_workflows
          resort for abandoned workers: it schedules the same drain-then-native
          teardown so GC of a live [t] cannot leave Core leases without an
          OCaml completion document. *)
+      Native.delegate_abandoned_cleanup worker.supervisor;
       Gc.finalise cleanup_abandoned worker;
       Ok worker
   | Error error -> cleanup error

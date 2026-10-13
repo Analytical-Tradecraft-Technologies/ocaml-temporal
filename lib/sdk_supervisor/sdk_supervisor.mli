@@ -79,6 +79,14 @@ module Make (Backend : Backend) : sig
       this same path on a dedicated system thread; the garbage-collector
       finalizer itself never waits on mailbox locks or native teardown. *)
   val shutdown : t -> (unit, error) result
+
+  (** [delegate_abandoned_cleanup instance] makes the caller solely responsible
+      for shutting [instance] down if it is abandoned: the supervisor's own
+      garbage-collector finalizer becomes a no-op. An owner whose abandoned
+      cleanup must drain its own state before the graph closes uses it,
+      because OCaml runs the finalizers of an owner and its supervisor that
+      become unreachable together in no guaranteed order. *)
+  val delegate_abandoned_cleanup : t -> unit
 end
 
 (** Caller-side completion of submitted client calls (#807).
@@ -687,4 +695,8 @@ module Native : sig
 
   (** Deterministically closes worker, client, runtime, then owner Domain. *)
   val shutdown : t -> (unit, error) result
+
+  (** Makes the caller's own finalizer the only abandoned-instance cleanup
+      path; see {!Make.delegate_abandoned_cleanup}. *)
+  val delegate_abandoned_cleanup : t -> unit
 end

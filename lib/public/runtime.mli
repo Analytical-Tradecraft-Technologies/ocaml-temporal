@@ -11,8 +11,12 @@
     - the application creates the runtime with {!create} and releases it
       with {!shutdown};
     - every client and worker created with [~runtime] is attached to it until
-      its own [shutdown] has returned (a creation that fails is never
-      attached);
+      its native teardown has completed (a creation that fails is never
+      attached). For a client that is when {!Client.shutdown} returns. A
+      worker whose {!Worker.shutdown} or {!Worker.shutdown_with_report}
+      returned while its native teardown was still running in the background
+      ([`Detached] in {!Worker.Shutdown_report.teardown}) stays attached until
+      that teardown finishes;
     - {!shutdown} returns a typed defect, and releases nothing, while any
       client or worker is still attached, so shut those down first;
     - after a successful {!shutdown}, creating a client or worker on the
@@ -109,7 +113,9 @@ val attached : t -> int
 (** Stops the runtime's background threads and waits until they have
     exited. While any client or worker is still attached, returns a
     [`Defect] error naming how many, and changes nothing; shut them down
-    and call [shutdown] again. Repeating a successful call returns [Ok ()].
+    and call [shutdown] again. This includes a worker whose shutdown
+    returned with a [`Detached] native teardown: poll {!attached} or retry
+    until that teardown has finished. Repeating a successful call returns [Ok ()].
     A native release failure is a [`Bridge] error, and the runtime is
     nevertheless closed. *)
 val shutdown : t -> (unit, Error.t) result
