@@ -223,8 +223,79 @@ let test_application_failure_type () =
   assert (type_of (wrap 128 (application "Bounded" None)) = Some "Bounded");
   assert (type_of (wrap 129 (application "TooDeep" None)) = None)
 
+(** Inbound application failure types written by other SDKs may contain
+    control characters, invalid UTF-8 or more than the outbound limit (#1011).
+    The extracted type must be deterministic, must leave valid text unchanged,
+    and must always be accepted by [Error.make], which raises on the raw
+    values. *)
+let test_inbound_failure_type_is_sanitized () =
+  let application type_name =
+    layer ~message:"app" ~source:"python"
+      ~info:(Protocol.Application
+               { type_name; non_retryable = false; details = [];
+                 category = Protocol.Application_category_unspecified;
+                 next_retry_delay = None })
+      ~cause:None
+  in
+  let activity cause =
+    layer ~message:"activity" ~source:"core"
+      ~info:(Protocol.Activity
+               { scheduled_event_id = 1L; started_event_id = 2L;
+                 identity = "w"; activity_type = "act"; activity_id = "a";
+                 retry_state = Protocol.Non_retryable_failure })
+      ~cause:(Some cause)
+  in
+  let accepted raw =
+    match Diagnostic.application_failure_type (activity (application raw)) with
+    | None -> assert false
+    | Some sanitized ->
+        let error =
+          Temporal_base.Error.make ~error_type:sanitized ~category:`Activity
+            ~message:"inbound" ()
+        in
+        assert (Temporal_base.Error.error_type error = Some sanitized);
+        assert (Diagnostic.sanitize_inbound_error_type raw = sanitized);
+        sanitized
+  in
+  let raises raw =
+    match
+      Temporal_base.Error.make ~error_type:raw ~category:`Activity
+        ~message:"raw" ()
+    with
+    | _ -> false
+    | exception Invalid_argument _ -> true
+  in
+  assert (raises "Invalid\tInput");
+  assert (accepted "Invalid\tInput" = "Invalid\\u0009Input");
+  assert (accepted "a\nb\x7f" = "a\\u000Ab\\u007F");
+  assert (accepted "nul\000x" = "nul\\u0000x");
+  assert (accepted "bad\xffutf8" = "bad\xef\xbf\xbdutf8");
+  assert (accepted "Valid \xe6\x97\xa5 \"quoted\"" = "Valid \xe6\x97\xa5 \"quoted\"");
+  let limit = Diagnostic.max_inbound_error_type_encoded_length in
+  let exact = String.make limit 'x' in
+  assert (accepted exact = exact);
+  (* The Rust bridge truncates an over-long type with a marker that starts
+     with a newline; both the length and the marker must be repaired. *)
+  let over_long = String.make (limit + 10) 'y' ^ "\n...[truncated]" in
+  assert (raises over_long);
+  let sanitized = accepted over_long in
+  assert (String.length sanitized = limit);
+  assert (String.ends_with ~suffix:"..." sanitized);
+  (* A cut never splits a multi-byte character or an escape sequence, and a
+     quote counts two encoded characters. *)
+  let multibyte = String.concat "" (List.init limit (fun _ -> "\xe6\x97\xa5")) in
+  let sanitized = accepted multibyte in
+  assert (String.is_valid_utf_8 sanitized);
+  let quoted = String.make limit '"' in
+  let sanitized = accepted quoted in
+  assert (String.length sanitized = ((limit - 3) / 2) + 3);
+  let controls = String.make limit '\t' in
+  let sanitized = accepted controls in
+  assert (String.length sanitized = ((limit - 3) / 7 * 6) + 3)
+
 (** Runs the pure diagnostic regression cases. *)
 let () =
+  test_inbound_failure_type_is_sanitized ();
   test_application_failure_type ();
   test_nested_timeout_is_visible ();
   test_depth_is_bounded ();
