@@ -97,7 +97,10 @@ facade without unsafe casts:
 - `Future.t` equals `Temporal_sdk_kernel.Future.t`, an alias of the generic
   `temporal_future_kernel` future;
 - `Runtime.t` equals `Temporal_sdk_kernel.Shared_runtime.t`, the shared
-  Core runtime owned by the SDK supervisor;
+  Core runtime handle owned by the application: `Runtime.create` makes it,
+  the application releases it with `Runtime.shutdown` after every attached
+  client and worker has shut down, and each attached supervisor holds only
+  a lease on it;
 - `Activity.context` equals `Temporal_base.Activity_context.t`;
 - `Activity.async_handle` and `Activity.async_context` equal
   `Temporal_base.Async_activity.handle` and `.context`;
