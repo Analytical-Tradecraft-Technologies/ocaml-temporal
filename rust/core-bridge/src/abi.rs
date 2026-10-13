@@ -5779,6 +5779,46 @@ pub unsafe fn test_runtime_has_metrics_meter(runtime: *const Runtime) -> Option<
     Some(core.telemetry().get_temporal_metric_meter().is_some())
 }
 
+/// Stops Core's own Prometheus scrape server on a shared handle while the
+/// bridge's public accept loop keeps running, reproducing the state an accept
+/// error on Core's private listener leaves behind (#1030). Returns whether
+/// the handle had an exporter. Not part of the C ABI.
+///
+/// # Safety
+///
+/// `shared` must be null or a live handle that is not released concurrently.
+#[doc(hidden)]
+pub unsafe fn test_shared_runtime_stop_core_metrics_server(shared: *const SharedRuntime) -> bool {
+    // SAFETY: The caller promises a null or live handle.
+    let Some(shared) = (unsafe { shared.as_ref() }) else {
+        return false;
+    };
+    match shared.core.as_ref().and_then(|core| core.metrics.as_ref()) {
+        Some(exporter) => {
+            exporter.stop_core_server();
+            true
+        }
+        None => false,
+    }
+}
+
+/// Reports whether Core's own Prometheus scrape server on a shared handle has
+/// stopped (#1030); `None` for a null or released handle or one without an
+/// exporter. Not part of the C ABI.
+///
+/// # Safety
+///
+/// `shared` must be null or a live handle that is not released concurrently.
+#[doc(hidden)]
+pub unsafe fn test_shared_runtime_core_metrics_server_stopped(
+    shared: *const SharedRuntime,
+) -> Option<bool> {
+    // SAFETY: The caller promises a null or live handle.
+    let shared = unsafe { shared.as_ref() }?;
+    let exporter = shared.core.as_ref()?.metrics.as_ref()?;
+    Some(exporter.core_server_stopped())
+}
+
 /// Returns the number of live references to a shared handle's Core (the
 /// handle's own plus one per attached graph), or `None` for a null or
 /// released handle. Not part of the C ABI.
