@@ -1177,6 +1177,45 @@ let test_client_validation_errors () =
        ~input:"ignored");
   unwrap (Temporal.Client.shutdown client)
 
+(** Malformed UTF-8 in free-text client inputs is a non-retryable defect on
+    the mock backend, matching the native backend instead of succeeding
+    (#1014). Natively, the owner Domain's JSON encoder used to reject such text
+    as a retryable [Bridge] error; the public boundary now rejects it first, so
+    both transports agree and retry loops cannot spin on a caller mistake. An
+    empty reason or query is still accepted. *)
+let test_client_free_text_utf8_validation () =
+  let invalid = "\xff" in
+  let client =
+    unwrap
+      (Temporal.Client.create ~target_url:"mock://client"
+         ~namespace:"unit-test" ())
+  in
+  let handle =
+    unwrap
+      (Temporal.Client.start client ~workflow:echo_workflow
+         ~task_queue:"unit-test" ~id:"utf8-reason-validation" ~input:"ignored"
+         ())
+  in
+  let expect_utf8_defect label result =
+    expect_error_message_contains "defect" (label ^ " must be valid UTF-8")
+      result;
+    match result with
+    | Error error when (Temporal.Error.view error).non_retryable -> ()
+    | _ -> failwith (label ^ " UTF-8 defect must be non-retryable")
+  in
+  expect_utf8_defect "cancellation reason"
+    (Temporal.Client.cancel ~reason:invalid handle);
+  expect_utf8_defect "termination reason"
+    (Temporal.Client.terminate ~reason:invalid handle);
+  expect_utf8_defect "reset reason"
+    (Temporal.Client.reset ~reason:invalid ~workflow_task_finish_event_id:4L
+       handle);
+  expect_utf8_defect "visibility query"
+    (Temporal.Client.list_visibility client ~query:invalid ());
+  ignore (unwrap (Temporal.Client.list_visibility client ~query:"" ()));
+  unwrap (Temporal.Client.terminate ~reason:"" handle);
+  unwrap (Temporal.Client.shutdown client)
+
 (** Identifier limits are enforced before transport selection. This keeps the
     deterministic mock honest about the native JSON bridge's 65,536-byte
     bound, so an oversized workflow ID or cancellation request cannot pass
@@ -1753,6 +1792,7 @@ let () =
   test_default_signal_request_ids_are_process_wide ();
   test_client_validation_errors ();
   test_client_identifier_size_validation ();
+  test_client_free_text_utf8_validation ();
   test_client_identifier_utf_8_validation ();
   test_client_start_payload_metadata_validation ();
   test_native_client_configuration_boundary ();
