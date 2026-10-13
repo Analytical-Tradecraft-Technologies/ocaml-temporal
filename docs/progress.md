@@ -58,6 +58,19 @@ accessors. Verified with `dune build @install`, the `test/bridge`,
 `test/runtime` and `test/unit` aliases on OCaml 5.4.1 (macOS), and the
 focused `cargo test`, `cargo fmt --check` and `cargo clippy -D warnings`
 runs.
+## 2026-10-13: Continue-as-new encoder errors fail only the task (#1034)
+
+`Codec.make` deliberately keeps the identity of an error that a custom encoder
+returns, and the runtime turns a `Fail_workflow` into a workflow-task failure
+only for `Bridge`, `Codec` and `Defect` errors. A continue-as-new successor
+encoder that returned, for example, a `Workflow` error therefore emitted a real
+`FailWorkflowExecution`. The run closed as failed, or started a retry run,
+which contradicted the documented contract. `Workflow.continue_as_new` now
+rewraps any other category as a `Codec` error. The new error names the
+original category and message and keeps its details and failure type, so the
+task fails with no commands and the run stays open, just as with the workflow
+result encoder. A new runtime test drives a failing encoder with every
+category and checks that only the task fails.
 ## 2026-10-13: Empty search-attribute upserts emit no command (#1033)
 
 `Workflow.upsert_search_attributes []` used to buffer an
