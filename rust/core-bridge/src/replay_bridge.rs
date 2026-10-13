@@ -23,7 +23,10 @@ use temporalio_common::protos::{
     coresdk::{
         workflow_activation::WorkflowActivation, workflow_completion::WorkflowActivationCompletion,
     },
-    temporal::api::history::v1::History,
+    temporal::api::{
+        enums::v1::EventType,
+        history::v1::{History, history_event},
+    },
 };
 use temporalio_sdk_core::replay::{
     HistoryFeeder, HistoryForReplay, HistoryInfo, ReplayWorkerInput,
@@ -52,6 +55,20 @@ pub(crate) enum ReplayInputError {
     InvalidProtobuf,
     /// Core's history invariant checks rejected the event sequence.
     InvalidHistory,
+    /// The start event records a workflow ID that differs from the one the
+    /// caller supplied. Replaying under another ID would make
+    /// `Workflow.info` and every ID-derived command differ from the
+    /// recorded execution, producing a false verdict (issue #1046).
+    WorkflowIdMismatch,
+    /// The start event has no task queue. Core's replay poll unwraps it and
+    /// would panic inside a Tokio task, stalling the replay (issue #1047).
+    MissingTaskQueue,
+    /// Event IDs do not run 1, 2, 3, ... without gaps. Core would raise
+    /// "History is out of order" while applying a workflow task.
+    NonContiguousEventIds,
+    /// A `WorkflowTaskStarted` event has no `event_time`. Core would raise a
+    /// fatal machines error while applying that workflow task.
+    MissingWorkflowTaskTimestamp,
 }
 
 impl fmt::Display for ReplayInputError {
@@ -63,6 +80,14 @@ impl fmt::Display for ReplayInputError {
             Self::InvalidEncoding => "replay history payload is not canonical base64",
             Self::InvalidProtobuf => "replay history is not a valid Temporal protobuf",
             Self::InvalidHistory => "replay history failed Core invariant validation",
+            Self::WorkflowIdMismatch => {
+                "replay history records a different workflow ID than the one supplied"
+            }
+            Self::MissingTaskQueue => "replay history start event has no task queue",
+            Self::NonContiguousEventIds => "replay history event IDs are not contiguous from 1",
+            Self::MissingWorkflowTaskTimestamp => {
+                "replay history has a WorkflowTaskStarted event without an event time"
+            }
         };
         formatter.write_str(message)
     }
@@ -70,12 +95,44 @@ impl fmt::Display for ReplayInputError {
 
 impl std::error::Error for ReplayInputError {}
 
+impl ReplayInputError {
+    /// Returns the constant diagnostic that crosses the C ABI for this
+    /// category. Every string is static and input-free, so a hostile history
+    /// or workflow ID can never be echoed through the bridge's error channel.
+    /// The categories a caller can act on get their own sentence; malformed
+    /// documents and Core's own invariant failures share one.
+    pub(crate) fn abi_message(self) -> &'static str {
+        match self {
+            Self::WorkflowIdMismatch => {
+                "Temporal replay history records a different workflow ID than the one supplied"
+            }
+            Self::MissingTaskQueue => "Temporal replay history start event has no task queue",
+            Self::NonContiguousEventIds => {
+                "Temporal replay history event IDs are not contiguous from 1"
+            }
+            Self::MissingWorkflowTaskTimestamp => {
+                "Temporal replay history has a WorkflowTaskStarted event without an event time"
+            }
+            Self::InvalidDocument
+            | Self::InvalidWorkflowId
+            | Self::InvalidEncoding
+            | Self::InvalidProtobuf
+            | Self::InvalidHistory => "Temporal replay history failed strict validation",
+        }
+    }
+}
+
 /// Strict wire representation of one replay history document.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ReplayHistoryDocument {
-    /// Workflow identity is absent from Temporal's History protobuf and must
-    /// be attached by the caller before Core can construct a replay task.
+    /// The execution's workflow ID. Core's replay worker takes it from the
+    /// caller rather than from the history. Since Temporal Server 1.21 the
+    /// start event also records it
+    /// (`WorkflowExecutionStartedEventAttributes.workflow_id`); when that
+    /// field is non-empty the two must match, see
+    /// [`validate_replay_preconditions`]. Older histories leave it empty, so
+    /// the caller's value is then the only source.
     workflow_id: String,
     /// The history's protobuf bytes wrapped in the bridge's binary-safe form.
     history: ReplayPayload,
@@ -126,6 +183,61 @@ fn decode_wire(input: &str) -> Result<ReplayHistoryDocument, ReplayInputError> {
     serde_json::from_str(input).map_err(|_| ReplayInputError::InvalidDocument)
 }
 
+/// Checks the history properties that Core's `HistoryInfo` gate does not
+/// check but that Core relies on later, after the history has left the
+/// bridge's control. Runs after `HistoryInfo::new_from_history` has accepted
+/// `history`, which guarantees a non-empty event list whose first event
+/// carries `WorkflowExecutionStartedEventAttributes`.
+///
+/// Each check turns a failure that Core would otherwise report late, or not
+/// at all, into an invalid-history verdict at admission:
+///
+/// - A start event without a task queue makes Core's replay mock poll
+///   (`HistoryInfo::as_poll_wft_response` at the pinned revision) unwrap
+///   `None` inside a Tokio task. The panic stalls the replay until the
+///   OCaml idle bound reports an unknown verdict (issue #1047). The history
+///   is rejected rather than normalized: a server never records a start
+///   without a task queue, so such input is not a faithful export.
+/// - A recorded workflow ID that differs from the supplied one would replay
+///   the run under the wrong identity (issue #1046). An empty recorded ID,
+///   as in histories from servers before 1.21, is accepted.
+/// - Missing or reordered event IDs, and a `WorkflowTaskStarted` event
+///   without a timestamp, are fatal machine errors in Core. Inside a run's
+///   first workflow task Core auto-fails such a task with eviction reason
+///   `Unspecified` instead of reporting it through a language completion
+///   (issue #1045). The OCaml replay runner classifies that eviction as an
+///   invalid history too, but rejecting the known cases here gives a precise
+///   message and keeps Core's autonomous failure path out of the common
+///   scrubbed-history case. Core numbers events from 1 (its
+///   `last_processed_event` starts at 0), so the expected sequence is 1..n.
+fn validate_replay_preconditions(
+    history: &History,
+    workflow_id: &str,
+) -> Result<(), ReplayInputError> {
+    let Some(history_event::Attributes::WorkflowExecutionStartedEventAttributes(started)) = history
+        .events
+        .first()
+        .and_then(|event| event.attributes.as_ref())
+    else {
+        return Err(ReplayInputError::InvalidHistory);
+    };
+    if !started.workflow_id.is_empty() && started.workflow_id != workflow_id {
+        return Err(ReplayInputError::WorkflowIdMismatch);
+    }
+    if started.task_queue.is_none() {
+        return Err(ReplayInputError::MissingTaskQueue);
+    }
+    for (expected, event) in (1_i64..).zip(history.events.iter()) {
+        if event.event_id != expected {
+            return Err(ReplayInputError::NonContiguousEventIds);
+        }
+        if event.event_type == EventType::WorkflowTaskStarted as i32 && event.event_time.is_none() {
+            return Err(ReplayInputError::MissingWorkflowTaskTimestamp);
+        }
+    }
+    Ok(())
+}
+
 /// Converts one validated JSON replay document into Core's replay input.
 ///
 /// `HistoryInfo::new_from_history` is the same invariant gate used by Core's
@@ -133,6 +245,7 @@ fn decode_wire(input: &str) -> Result<ReplayHistoryDocument, ReplayInputError> {
 /// workflow-task boundaries are valid before the history enters the
 /// `HistoryFeeder`; this prevents Core's later history stream assertion from
 /// becoming a panic caused by untrusted bridge input.
+/// [`validate_replay_preconditions`] then adds the checks Core's gate lacks.
 pub(crate) fn decode_history_document(input: &str) -> Result<HistoryForReplay, ReplayInputError> {
     let document = decode_wire(input)?;
     validate_workflow_id(&document.workflow_id)?;
@@ -147,6 +260,7 @@ pub(crate) fn decode_history_document(input: &str) -> Result<HistoryForReplay, R
     if info.orig_run_id().is_empty() {
         return Err(ReplayInputError::InvalidHistory);
     }
+    validate_replay_preconditions(&history, &document.workflow_id)?;
     Ok(HistoryForReplay::new(info, document.workflow_id))
 }
 
