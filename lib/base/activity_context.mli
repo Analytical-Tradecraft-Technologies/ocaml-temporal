@@ -21,11 +21,12 @@ type timestamp = { seconds : int64; nanoseconds : int }
     timestamp means that Core omitted the protobuf field.
 
     The three timeouts are the effective values Core resolved for the task,
-    or [None] when Core omitted them. They are converted to whole
-    milliseconds by rounding any sub-millisecond remainder up, so a positive
-    timeout never reads as zero and conversion can never reject a task.
-    [task_heartbeat_timeout] is named apart from the context's validated
-    heartbeat interval, which rejects sub-millisecond values. *)
+    or [None] when Core omitted them or reported zero, which Temporal uses to
+    mean "not set" (#1032). They are converted to whole milliseconds by
+    rounding any sub-millisecond remainder up, so a positive timeout never
+    reads as zero and conversion can never reject a task.
+    [task_heartbeat_timeout] is named apart from the context's own heartbeat
+    interval, which the native adapter derives with the same conversion. *)
 type info = {
   namespace : string;
   workflow_id : string;

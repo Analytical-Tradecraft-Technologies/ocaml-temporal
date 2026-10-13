@@ -263,7 +263,9 @@ module Info : sig
   (** Returns the effective schedule-to-close timeout of the activity, if
       Temporal reported one. Temporal resolves defaults when the activity is
       scheduled, so this may differ from the option the workflow passed.
-      Temporal carries nanosecond precision; a sub-millisecond remainder is
+      Temporal reports an unset timeout as a zero duration; that is returned
+      as [None], never as a zero [Duration.t], for every timeout here and for
+      {!Context.heartbeat_timeout}. Temporal carries nanosecond precision; a sub-millisecond remainder is
       rounded up to the next whole millisecond, so a positive timeout is never
       reported as zero. The result is clamped to 315,576,000,000,999 ms, the
       largest value {!Duration.of_ms} accepts, so the protobuf maximum
@@ -429,7 +431,9 @@ module Context : sig
       reads. *)
   val details : t -> Payload.t list
 
-  (** Returns the configured heartbeat interval, if one was supplied. *)
+  (** Returns the configured heartbeat interval, if one was supplied. An
+      unset (zero) interval is [None]; a sub-millisecond remainder is rounded
+      up to the next whole millisecond, as in {!Info.heartbeat_timeout}. *)
   val heartbeat_timeout : t -> Duration.t option
 
   (** Returns this attempt's task metadata. Contexts created by a native worker

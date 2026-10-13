@@ -46,6 +46,26 @@ warnings`, `cargo fmt --check`, `dune build @install` and
 `dune build @test/bridge/runtest` on OCaml 5.4.1 (macOS). The in-process
 transport-fault proxy still ignores SIGPIPE for its own sockets; a Linux
 fault proxy in a separate process remains future work.
+## 2026-10-13: Unset activity timeouts read as None (#1032)
+
+Temporal reports an unset activity timeout as a zero duration. Core fills a
+local activity's absent schedule-to-close with zero, the server reports an
+unset heartbeat timeout as zero, and an unset remote schedule-to-close
+inherits a zero workflow run timeout. The native activity adapter exposed
+these as `Some 0ms` through `Activity.Info` and `Context.heartbeat_timeout`.
+Deadline arithmetic therefore treated the attempt as already expired, and
+heartbeat pacing at half the interval spun. The adapter now maps a zero
+timeout to `None`, matching the Go and Python SDKs and `Temporal.Testing`.
+`Context.heartbeat_timeout` also uses the same total conversion as `Info`, so
+a sub-millisecond heartbeat interval scheduled by another SDK rounds up to the
+next millisecond instead of failing a synchronous task non-retryably.
+
+`test/runtime/test_native_activity_execution.ml` covers a local activity
+without schedule-to-close, a remote activity with zero heartbeat and
+schedule-to-close timeouts, and a sub-millisecond heartbeat interval through
+both views. Verified with `dune build @install` and the `test/runtime` test
+alias on OCaml 5.4.1 (macOS).
+
 ## 2026-10-13: Metrics scrape test no longer waits for connection close (#1058)
 
 `test/bridge/test_runtime_metrics.ml` timed out intermittently on Windows
