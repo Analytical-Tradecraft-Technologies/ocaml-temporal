@@ -767,20 +767,65 @@ one seam: Core moves out of the per-instance graph into a reference-counted
   names `[A-Za-z_][A-Za-z0-9_]*` up to 64 bytes without `__` prefix or a
   label Core already uses, values 1..256 bytes without control characters,
   unique names) before Core is built, so a rejected document allocates
-  nothing. It then builds Core, starts Core's own
-  `start_prometheus_metric_exporter` inside Core's Tokio context, and
-  attaches the returned meter with `attach_late_init_metrics` before the
-  handle is published, so every graph attached later hands the meter to its
-  client (`ConnectionOptions::metrics_meter`) and worker. A bind failure is
+  nothing. It then builds Core, binds the public listener on
+  `bind_address` itself, starts Core's own
+  `start_prometheus_metric_exporter` on an ephemeral loopback port of the
+  same address family inside Core's Tokio context, and attaches the
+  returned meter with `attach_late_init_metrics` before the handle is
+  published, so every graph attached later hands the meter to its client
+  (`ConnectionOptions::metrics_meter`) and worker. A bind failure is
   `CONFIGURATION` naming the configured address and the `io::ErrorKind`
   only; the just-built Core is dropped on the calling thread. The success
-  value is the bound address as UTF-8 (port `0` resolved), or empty without
-  an exporter. The returned `MetricsExporter` guard is the first field of
-  `SharedCore`: dropping the last Core reference aborts the scrape task and
-  then drops Core's Tokio runtime, which joins its workers and so closes
-  the listening socket before the release returns
-  (`rust/core-bridge/tests/metrics_exporter.rs`). The scrape server runs
-  entirely on Tokio threads and never calls OCaml. Enabling it requires
+  value is the public bound address as UTF-8 (port `0` resolved), or empty
+  without an exporter.
+
+  Accept resilience (#1030). Core's scrape server returns from its accept
+  loop on the first `accept()` error, closing its listener for good, and
+  Core exposes no way to serve its registry from another listener. The
+  bridge therefore runs its own accept loop on the public listener and
+  relays each connection byte for byte to Core's loopback server.
+  Connection-scoped errors (`ConnectionAborted`, `ConnectionReset`,
+  `Interrupted`) are skipped. Any other error, such as `EMFILE`, is logged
+  as a `warn` record with its kind and OS error number and retried after a
+  backoff that doubles from 10 ms to 1 s and resets after a successful
+  accept. Core's own accept loop now sees only the bridge's relay
+  connections, so it can stop only on a resource error on its private
+  listener. A relay that then finds Core's task finished answers
+  `503 Service Unavailable` with a short explanation and logs one `error`
+  record per exporter, so a stopped server is visible to Prometheus and in
+  the log rather than a silently closed port. Recovery from that state
+  requires recreating the runtime. The bridge records go through Core's log
+  pipeline (`TEMPORAL_CORE_LOG`) like Core's own records.
+
+  Descriptor headroom. Each relayed scrape needs the public `accept()`, the
+  relay's private `connect()`, Core's `accept()` of that connection, and a
+  free descriptor for the follow-up `accept()` Core's loop makes at once:
+  Tokio keeps accepting until `WouldBlock`, and Linux allocates the new
+  descriptor before checking the queue, so that call fails with `EMFILE`
+  instead of `EAGAIN` at the limit. Any such `EMFILE` stops Core's server.
+  The relays therefore share a reserve of three spare descriptors (open handles to `/dev/null`; nothing on Windows).
+  A relay first reads the scraper's request head, dropping a connection that
+  sends nothing within 5 s. Under an async mutex it then refills the
+  reserve, releases it immediately before `connect()`, forwards the head,
+  and refills the reserve only after Core's first response bytes arrive
+  (proof that Core has accepted), or after 5 s. If the reserve cannot be
+  refilled, the scraper receives a transient `503` ("Too few file
+  descriptors ...") rather than risking Core's server. The descriptor table
+  is process-wide, so another thread opening a file in the instant between
+  release and Core's accept can still take a released descriptor. The
+  reserve removes the deterministic starvation, not that race.
+
+  The returned `MetricsExporter` guard is the first field of `SharedCore`:
+  dropping the last Core reference aborts both the accept loop and Core's
+  scrape task, then drops Core's Tokio runtime, which joins its workers and
+  so closes both listening sockets and any relayed connection before the
+  release returns (`rust/core-bridge/tests/metrics_exporter.rs`, which also
+  covers the 503 state; `rust/core-bridge/tests/metrics_accept_retry.rs`
+  provokes a real `EMFILE` from `accept()`;
+  `rust/core-bridge/tests/metrics_core_accept_headroom.rs` frees two or
+  three descriptors at a time at the limit and requires Core's server to
+  keep running). Scrapes are served entirely on
+  Tokio threads and never call OCaml. Enabling it requires
   `temporalio-common`'s `prometheus` feature, which adds only the
   Apache-2.0 `prometheus` crate (see [dependencies](../dependencies.md)).
 

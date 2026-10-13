@@ -27,6 +27,96 @@ check now rejects oversized, NUL-bearing, or malformed UTF-8 free text at the
 public boundary with a non-retryable defect, so both backends agree. Empty
 reasons and queries remain valid. A unit test covers all four inputs on the
 mock backend.
+## 2026-10-13: Metrics endpoint survives accept errors (#1030)
+
+The Prometheus endpoint no longer stops permanently and silently on the
+first `accept()` error. Core's scrape server returns from its accept loop on
+any error and Core exposes no way to serve its registry elsewhere, so the
+bridge now binds the public listener itself and relays each connection to
+Core's exporter, which listens only on an ephemeral loopback port.
+Connection-scoped errors are skipped. Other errors, such as `EMFILE`, are
+logged as `warn` records with the error kind and OS error number, and
+retried with a backoff that doubles from 10 ms to 1 s. If Core's exporter
+stops anyway (only possible through a resource error on its private
+listener), scrapes receive `503 Service Unavailable` and one `error` record
+is logged instead of the port closing silently. A relayed scrape needs a
+third descriptor for Core's `accept()` and, on Linux, a fourth for the
+follow-up `accept()` that Tokio makes until `WouldBlock`. Linux allocates the
+new descriptor before it checks the queue. Relays therefore keep a reserve of
+three spare descriptors. They release it just before the private `connect()` and
+refill it after Core first responds. When the reserve cannot be refilled,
+scrapes get a transient 503 instead of starving Core's accept loop. Bind
+failures, the reported
+address and release-time socket closure are unchanged. The bridge declares
+`tracing` (MIT, already locked) for these records, enables Tokio's `net` and
+`io-util` features (already compiled for Core), and its tests use `libc`.
+The design is recorded in the
+[Core bridge reference](reference/core-bridge.md), and
+`Runtime.create` and the [observability guide](reference/observability.md)
+document the behavior.
+
+`rust/core-bridge/tests/metrics_accept_retry.rs` lowers the descriptor limit,
+fills every descriptor and connects a scraper, so `accept()` fails with
+`EMFILE`. After descriptors are released, new scrapes are served. On Linux,
+where the kernel keeps the starved connection queued, that connection is
+served too. `rust/core-bridge/tests/metrics_exporter.rs` stops Core's server
+through a test hook and requires a 503 with the explanation on a port that
+stays open, and still requires both sockets to close on release.
+`rust/core-bridge/tests/metrics_core_accept_headroom.rs` keeps the process at
+its descriptor limit, frees two or three descriptors per scrape, and requires
+every answer to be a 200 or the transient 503 and Core's server never to
+stop. Without the reserve, the first starved scrape kills Core's server.
+Verified on macOS with OCaml 5.4.1:
+
+- `cargo test --test metrics_exporter --test metrics_accept_retry --test
+  metrics_core_accept_headroom`, run five times;
+- `cargo clippy --all-targets -D warnings` and `cargo fmt --check`;
+- `scripts/check-dependency-inventory.sh`;
+- `dune build @install` and `dune build @test/bridge/runtest`.
+
+## 2026-10-13: Server-valid inbound values no longer wedge workflows (#1015, #1016, #1017, #1049, #1050)
+
+Several values that Temporal Server or another SDK legitimately sends were
+rejected by the inbound Core-to-semantic conversion. History is immutable,
+so each rejection failed every workflow task of the run (and every replay),
+failed an activity task, or made `Client.wait` fail permanently. The Rust
+conversion and the OCaml decoders now represent these values faithfully or
+degrade them deterministically, while outbound validation stays strict:
+
+- A negative application `next_retry_delay`, which the Go SDK sends when
+  `time.Until(retryAt)` has passed, is carried as absent (#1049).
+- Fields an SDK copies into an activity or child-workflow failure wrapper
+  (including the Java SDK's empty child namespace) are bounded text instead
+  of identifiers, and an absent wrapper type or execution reads as empty;
+  `external_payloads` size details and empty payload metadata keys are
+  dropped while the payload is kept (#1050).
+- Unknown numbers in the advisory enums (continue-as-new suggestion reason,
+  retry state, timeout type, application category, Nexus retry behavior,
+  continuation initiator) read as `unspecified` (#1017).
+- Start-event priority and activity-task priority keep their exact weight
+  bits and only the 64-byte fairness-key bound applies; a start-event retry
+  policy recorded with `maximum_attempts = 1` (which the server does not
+  validate) is carried as recorded, and `Workflow.Info.retry_policy` returns
+  `None` for a policy the public type cannot represent instead of raising
+  (#1016).
+- A Temporal Schedule action carrying the previous result or failure with no
+  previous run ID is represented with an empty continuation run ID, and
+  `Workflow.Info.continued_from_run_id` reports `None` (#1015).
+
+The JSON schemas and `docs/reference/core-protocol.md` document the rules.
+`rust/core-bridge/tests/workflow_protocol.rs` covers negative delays,
+unknown enum numbers, peer-written payload details, SDK-written child
+wrappers, schedule-started runs, and inbound priority (weights 5000, 0.0005,
+NaN, a NUL fairness key) and retry policy (coefficient 0.5, empty error
+type, absent and negative intervals), each round-tripping through the
+semantic JSON while the same priorities remain rejected outbound.
+`test/bridge/test_ocaml_activity_protocol.ml`,
+`test/bridge/test_ocaml_workflow_protocol.ml` and
+`test/runtime/test_execution_info.ml` cover the OCaml decoders and public
+accessors. Verified with `dune build @install`, the `test/bridge`,
+`test/runtime` and `test/unit` aliases on OCaml 5.4.1 (macOS), and the
+focused `cargo test`, `cargo fmt --check` and `cargo clippy -D warnings`
+runs.
 ## 2026-10-13: Continue-as-new encoder errors fail only the task (#1034)
 
 `Codec.make` deliberately keeps the identity of an error that a custom encoder

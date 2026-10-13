@@ -280,12 +280,12 @@ Both language decoders validate the complete child-resolution object before an
 activation reaches the runtime. Required identifiers must be nonempty and
 within the UTF-8 safety ceiling; outcome discriminators, start causes, nullable
 payloads, and recursive failure objects are closed and type-checked; child
-failure event IDs cannot be negative. One Temporal Core edge state is explicit:
-when cancellation is reported before `ChildWorkflowExecutionStarted`, Core
-does not know a child run ID and sends `run_id: ""` with
-`started_event_id: 0`. The bilateral validators preserve that empty value only
-for this pre-start state; a child failure after start must carry a nonempty run
-ID. A malformed document returns the typed `invalid_message` protocol error and
+failure event IDs cannot be negative. When cancellation is reported before
+`ChildWorkflowExecutionStarted`, Core does not know a child run ID and sends
+`run_id: ""` with `started_event_id: 0`. The identifiers inside a child
+failure's wrapper are SDK-written copies, so the bilateral validators carry
+them, including that empty run ID, as bounded text in every state (#1050). A
+malformed document returns the typed `invalid_message` protocol error and
 has no lifecycle side effect. Runtime ordering checks happen only after this
 parse boundary: a terminal-before-start (other than the cancellation case
 above), duplicate start, duplicate terminal, or unknown sequence returns a
@@ -463,9 +463,13 @@ semantics. The successor run is not followed by the bridge or by
 
 Temporal identifiers must be nonempty but use the protocol's 65,536-byte text
 safety ceiling rather than an invented 255-byte server policy; the server's
-identifier policy is configurable. The one intentional exception is the
-pre-start child failure `run_id` described above. Application failure `type` is
-bounded text and may be empty. Activity failure event IDs are nonnegative and
+identifier policy is configurable. Fields that an SDK copies into a failure
+wrapper (activity type and ID; child namespace, workflow ID, run ID, and
+workflow type) are not server-bounded identifiers: another SDK may leave them
+empty (the Java SDK reports a child cancelled before its start command with
+namespace `""`), so both validators treat them as bounded text, and an absent
+Core activity type, child execution, or child type converts to empty text
+(#1050). Application failure `type` is bounded text and may be empty. Activity failure event IDs are nonnegative and
 worker identity is bounded text. Durations use nonnegative seconds no greater
 than protobuf's 315,576,000,000-second (10,000-year) maximum plus 0 through
 999,999,999 nanoseconds; both the OCaml decoder and the Rust validator reject
@@ -506,7 +510,7 @@ through nested child failures so the parent receives a typed child-workflow
 error instead of a bridge rejection. Application failures retain Core's
 `category` (`unspecified` or `benign`) and exact nonnegative
 `next_retry_delay` seconds/nanoseconds in nested activity, child, continuation,
-and client outcomes. The default category and absent delay are omitted from
+and client outcomes; an inbound negative delay is carried as absent (#1049). The default category and absent delay are omitted from
 the canonical JSON to preserve existing documents. These Core-only options
 are included in the bounded public error diagnostic.
 
@@ -528,6 +532,12 @@ produces the same semantic activation:
 | Failure chain longer than 100 layers (`MAX_INBOUND_FAILURE_LAYERS`) | The first 99 layers are kept exactly; the remainder becomes one final layer whose message is `[truncated by ocaml-temporal: N deeper failure causes omitted beyond 100 layers]`. Its kind preserves the omitted tail's retryability decision (the same rule as `failure_non_retryable`): `{"kind":"server","non_retryable":true}` when the tail is non-retryable, otherwise `{"kind":"absent"}`. |
 | NUL in a signal or update sender identity | Each NUL becomes U+FFFD before the length rule. |
 | Signal, query, update, or initialization header key, or memo key, that is empty, contains NUL, or exceeds 65,536 bytes | The entry is dropped. No OCaml API can name such a key, and escaping it could collide with a real key. |
+| Negative application `next_retry_delay` (the Go SDK sends `time.Until(retryAt)` after `retryAt` has passed) | Becomes absent ("no override"), in activations, client wait results, and update outcomes (#1049). |
+| Unknown enum number for a retry state, timeout type, application category, Nexus handler retry behavior, continuation initiator, or continue-as-new suggestion reason | Becomes `unspecified` (#1017). The adapter omits an unspecified suggestion reason from `Workflow.Info.continue_as_new_reasons`; `continue_as_new_suggested` is unchanged. |
+| Payload `external_payloads` size details, or a payload metadata entry with an empty key | Dropped; the payload's data and remaining metadata are kept (#1050). |
+| Start-event priority outside the outbound rules (fairness weight outside `{0} ∪ [0.001, 1000]`, non-finite, NUL in the fairness key, any priority key) | Carried with its exact bits; only the 64-byte fairness-key bound applies, as for activity tasks (#1016). |
+| Start-event retry policy that the outbound rules reject (recorded with `maximum_attempts = 1`, which the server does not validate) | Carried as recorded, with an absent or negative interval normalized to zero; `Workflow.Info.retry_policy` reports a policy the public type cannot represent as `None` (#1016). |
+| Schedule-started run carrying `last_completion_result` or `continued_failure` with no previous run ID | Represented as a continuation whose `continued_from_execution_run_id` is empty; `Workflow.Info.continued_from_run_id` is `None` (#1015). |
 
 The 100-layer cap matches prost's default 100-level decode recursion limit,
 so any chain Core can receive over gRPC converts unchanged; from the deepest
@@ -537,20 +547,21 @@ completion that rethrows it inside its own failure. Payload bytes, payload
 metadata, and identifiers that Temporal Server itself bounds (workflow,
 activity, run, and update IDs, type names, signal names, search-attribute
 names) are never rewritten and keep their strict checks. The OCaml decoder
-needs no relaxation: every degraded value satisfies its existing limits.
+applies the matching inbound rules for start-event priority and retry policy,
+activity-task priority, failure-wrapper fields, and an empty continuation run
+ID; every other degraded value satisfies its existing limits.
 Outbound semantic documents (completions, and any activation passed to
 `encode_activation` or `decode_activation`) remain strictly validated; the
 degradation exists only in the Core-to-semantic conversion.
 
-An activation with a future unsupported category or invalid delay is failed
-to Core and its lease retired. After Core accepts that rejection, the native
+An activation that still fails conversion (for example a non-normalized
+duration) is failed to Core and its lease retired. After Core accepts that rejection, the native
 poll returns `not_ready` so `Worker.run` can process other tasks; a fixed,
 internal 100 ms delay bounds immediate redelivery churn and warning volume.
 A failed Core rejection remains a fatal worker error. The rejection reason is
 static and contains no run ID or payload. Unknown
-protobuf oneofs, enum values (including a future Nexus handler retry
-behavior), external payload references, or omitted Core fields with
-non-default values fail conversion. Failure kinds are not part of this list.
+protobuf oneofs, enum values outside the advisory enums listed above, or
+omitted Core fields with non-default values fail conversion. Failure kinds are not part of this list.
 Every pinned `failure_info` kind has a variant, and an absent or future kind
 is `absent`.
 

@@ -22,7 +22,8 @@ temporalio-client = { git = "https://github.com/temporalio/sdk-core.git", rev = 
 temporalio-common = { git = "https://github.com/temporalio/sdk-core.git", rev = "8fe478ee179ed754614d230f39586f3edb57da71", default-features = false, features = ["prometheus"] }
 temporalio-sdk-core = { git = "https://github.com/temporalio/sdk-core.git", rev = "8fe478ee179ed754614d230f39586f3edb57da71", default-features = false, features = ["tls-ring"] }
 temporalio-protos = { git = "https://github.com/temporalio/sdk-core.git", rev = "8fe478ee179ed754614d230f39586f3edb57da71" }
-tokio = { version = "1.52.3", features = ["rt", "sync", "time"] }
+tokio = { version = "1.52.3", features = ["io-util", "net", "rt", "sync", "time"] }
+tracing = "0.1.44"
 uuid = { version = "1.23.4", default-features = false, features = ["v4"] }
 
 # Linked by Dune's release profile, which [opam install] and [dune build -p]
