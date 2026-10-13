@@ -27,11 +27,16 @@ logged as `warn` records with the error kind and OS error number, and
 retried with a backoff that doubles from 10 ms to 1 s. If Core's exporter
 stops anyway (only possible through a resource error on its private
 listener), scrapes receive `503 Service Unavailable` and one `error` record
-is logged instead of the port closing silently. Bind failures, the reported
+is logged instead of the port closing silently. A relayed scrape needs a
+third descriptor for Core's `accept()`, so relays keep a reserve of two
+spare descriptors. They release it just before the private `connect()` and
+refill it after Core first responds. When the reserve cannot be refilled,
+scrapes get a transient 503 instead of starving Core's accept loop. Bind
+failures, the reported
 address and release-time socket closure are unchanged. The bridge declares
 `tracing` (MIT, already locked) for these records, enables Tokio's `net` and
-`io-util` features (already compiled for Core), and adds `libc` as a
-dev-dependency. The design is recorded in the
+`io-util` features (already compiled for Core), and its tests use `libc`.
+The design is recorded in the
 [Core bridge reference](reference/core-bridge.md), and
 `Runtime.create` and the [observability guide](reference/observability.md)
 document the behavior.
@@ -42,11 +47,15 @@ fills every descriptor and connects a scraper, so `accept()` fails with
 where the kernel keeps the starved connection queued, that connection is
 served too. `rust/core-bridge/tests/metrics_exporter.rs` stops Core's server
 through a test hook and requires a 503 with the explanation on a port that
-stays open, and still requires both sockets to close on release. Verified on
-macOS with OCaml 5.4.1:
+stays open, and still requires both sockets to close on release.
+`rust/core-bridge/tests/metrics_core_accept_headroom.rs` keeps the process at
+its descriptor limit, frees two or three descriptors per scrape, and requires
+every answer to be a 200 or the transient 503 and Core's server never to
+stop. Without the reserve, the first starved scrape kills Core's server.
+Verified on macOS with OCaml 5.4.1:
 
-- `cargo test --test metrics_exporter --test metrics_accept_retry`, run three
-  times;
+- `cargo test --test metrics_exporter --test metrics_accept_retry --test
+  metrics_core_accept_headroom`, run five times;
 - `cargo clippy --all-targets -D warnings` and `cargo fmt --check`;
 - `scripts/check-dependency-inventory.sh`;
 - `dune build @install` and `dune build @test/bridge/runtest`.

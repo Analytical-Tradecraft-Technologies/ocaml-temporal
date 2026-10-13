@@ -5802,6 +5802,23 @@ pub unsafe fn test_shared_runtime_stop_core_metrics_server(shared: *const Shared
     }
 }
 
+/// Reports whether Core's own Prometheus scrape server on a shared handle has
+/// stopped (#1030); `None` for a null or released handle or one without an
+/// exporter. Not part of the C ABI.
+///
+/// # Safety
+///
+/// `shared` must be null or a live handle that is not released concurrently.
+#[doc(hidden)]
+pub unsafe fn test_shared_runtime_core_metrics_server_stopped(
+    shared: *const SharedRuntime,
+) -> Option<bool> {
+    // SAFETY: The caller promises a null or live handle.
+    let shared = unsafe { shared.as_ref() }?;
+    let exporter = shared.core.as_ref()?.metrics.as_ref()?;
+    Some(exporter.core_server_stopped())
+}
+
 /// Returns the number of live references to a shared handle's Core (the
 /// handle's own plus one per attached graph), or `None` for a null or
 /// released handle. Not part of the C ABI.

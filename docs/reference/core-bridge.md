@@ -797,13 +797,32 @@ one seam: Core moves out of the per-instance graph into a reference-counted
   requires recreating the runtime. The bridge records go through Core's log
   pipeline (`TEMPORAL_CORE_LOG`) like Core's own records.
 
+  Descriptor headroom. Each relayed scrape needs three descriptors: the
+  public `accept()`, the relay's private `connect()`, and Core's `accept()`
+  of that connection. If pressure eased by only two, Core's accept would get
+  `EMFILE` and its server would stop. The relays therefore share a reserve of
+  two spare descriptors (open handles to `/dev/null`; nothing on Windows).
+  A relay first reads the scraper's request head, dropping a connection that
+  sends nothing within 5 s. Under an async mutex it then refills the
+  reserve, releases it immediately before `connect()`, forwards the head,
+  and refills the reserve only after Core's first response bytes arrive
+  (proof that Core has accepted), or after 5 s. If the reserve cannot be
+  refilled, the scraper receives a transient `503` ("Too few file
+  descriptors ...") rather than risking Core's server. The descriptor table
+  is process-wide, so another thread opening a file in the instant between
+  release and Core's accept can still take a released descriptor. The
+  reserve removes the deterministic starvation, not that race.
+
   The returned `MetricsExporter` guard is the first field of `SharedCore`:
   dropping the last Core reference aborts both the accept loop and Core's
   scrape task, then drops Core's Tokio runtime, which joins its workers and
   so closes both listening sockets and any relayed connection before the
   release returns (`rust/core-bridge/tests/metrics_exporter.rs`, which also
   covers the 503 state; `rust/core-bridge/tests/metrics_accept_retry.rs`
-  provokes a real `EMFILE` from `accept()`). Scrapes are served entirely on
+  provokes a real `EMFILE` from `accept()`;
+  `rust/core-bridge/tests/metrics_core_accept_headroom.rs` frees two or
+  three descriptors at a time at the limit and requires Core's server to
+  keep running). Scrapes are served entirely on
   Tokio threads and never call OCaml. Enabling it requires
   `temporalio-common`'s `prometheus` feature, which adds only the
   Apache-2.0 `prometheus` crate (see [dependencies](../dependencies.md)).
