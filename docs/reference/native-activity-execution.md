@@ -540,7 +540,8 @@ payload therefore cannot permanently block later activities or make
 replacement failure remains unchanged across uncertain transport outcomes;
 the adapter retires its token only after confirmed acceptance. The
 `smoke.activity_invalid_failure_details` live acceptance scenario exercises
-duplicate keys, oversized keys, and malformed UTF-8 through the public worker,
+duplicate keys, oversized keys, and a key that is not UTF-8 through the
+public worker,
 requiring a normal activity to complete after each rejected failure.
 
 The token is copied on receipt and never converted to a diagnostic string.
