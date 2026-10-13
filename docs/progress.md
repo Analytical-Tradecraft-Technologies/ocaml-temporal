@@ -58,6 +58,19 @@ accessors. Verified with `dune build @install`, the `test/bridge`,
 `test/runtime` and `test/unit` aliases on OCaml 5.4.1 (macOS), and the
 focused `cargo test`, `cargo fmt --check` and `cargo clippy -D warnings`
 runs.
+## 2026-10-13: Empty search-attribute upserts emit no command (#1033)
+
+`Workflow.upsert_search_attributes []` used to buffer an
+`UpsertWorkflowSearchAttributes` command with an empty map. Temporal Server
+rejects that command with `BAD_SEARCH_ATTRIBUTES`, and replay emits it again,
+so every retry of the workflow task failed and the run was stuck. The
+workflow context store now treats an empty list as a no-op, as the Python SDK
+does, after the existing sealed-execution check. This is replay-safe because a
+rejected command is never recorded in history. The `Workflow` interface and
+the workflows guide now state that values must be `json/plain` encodings of
+the attribute's type, that a `binary/null` payload removes a key, and that
+`Codec.bytes` or custom codecs are rejected by the server. A runtime test
+checks that empty upserts around a non-empty one emit exactly one command.
 ## 2026-10-13: Activity retryability for unrunnable tasks, pause/reset completion, and async lease expiry (#1031, #1022, #1043)
 
 An activity task for a type the worker does not register, or with an input
