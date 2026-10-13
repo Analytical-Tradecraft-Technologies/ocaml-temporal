@@ -664,7 +664,9 @@ let test_invalid_async_payload_preserves_handle () =
       ~decode:(fun _ -> Error (Temporal_base.Error.codec
         ~message:"output-only test codec")) in
   let cases =
-    [ ("invalid-utf8", [ ("opaque", "\255") ]);
+    [ (* A binary metadata value and a NUL in a key are valid (#1048);
+         a key that is not UTF-8 is not. *)
+      ("non-utf8-key", [ ("bad\255key", "value") ]);
       ("duplicate", [ ("opaque", "one"); ("opaque", "two") ]);
       ("oversized", [ (String.make 65_537 'k', "value") ]) ]
   in
@@ -756,25 +758,24 @@ let test_async_codec_error_preserves_handle () =
   | Ok () when !(supervisor.async_leased) = [] -> ()
   | _ -> failwith "codec recovery left completion debt"
 
-(** A public codec can emit an invalid encoding marker while successfully
-    encoding its body. A corrected option value must still complete normally. *)
-let test_async_invalid_encoding_preserves_handle () =
+(** Payload metadata values are arbitrary bytes in Temporal's protocol
+    (#1048), so a public codec whose encoding marker is not UTF-8 produces a
+    valid payload. The asynchronous completion must be submitted once with the
+    marker unchanged instead of being rejected locally. *)
+let test_async_binary_encoding_is_submitted () =
   let codec = Temporal.Codec.option
       (Temporal.Codec.make ~encoding:"\255"
         ~encode:(fun value -> Ok (Bytes.of_string value))
         ~decode:(fun bytes -> Ok (Bytes.to_string bytes))) in
   let supervisor, worker, handle, _, _ = payload_validation_fixture (base_codec codec) in
   (match Temporal.Activity.Async_handle.complete handle (Some "value") with
-  | Error _ -> ()
-  | Ok () -> failwith "invalid public codec encoding was accepted");
-  if !(supervisor.async_completion_calls) <> 0 then
-    failwith "invalid public codec encoding reached the supervisor";
-  (match Temporal.Activity.Async_handle.complete handle None with
   | Ok () -> ()
   | Error error -> failwith (Temporal.Error.message error));
+  if !(supervisor.async_completion_calls) <> 1 then
+    failwith "binary encoding marker did not reach the supervisor exactly once";
   match Worker.drain worker with
   | Ok () when !(supervisor.async_leased) = [] -> ()
-  | _ -> failwith "corrected public codec output left completion debt"
+  | _ -> failwith "binary encoding completion left completion debt"
 
 (** An ambiguous [Connection] failure of a late completion keeps the handle
     and native lease and retains the exact request key (#821). Retrying it
@@ -1968,7 +1969,7 @@ let () =
   test_deferred_lifecycle ();
   test_invalid_async_payload_preserves_handle ();
   test_async_codec_error_preserves_handle ();
-  test_async_invalid_encoding_preserves_handle ();
+  test_async_binary_encoding_is_submitted ();
   test_async_completion_retry ();
   test_async_heartbeat_single_encode ();
   test_async_retry_reuses_bytes_for_equal_request_key ();
