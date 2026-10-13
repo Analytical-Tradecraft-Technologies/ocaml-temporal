@@ -404,18 +404,19 @@ let runtime_payload _path (payload : Protocol.payload) =
 
 (** Converts a runtime payload into the binary-safe protocol representation,
     validating metadata keys before copying it across the ownership boundary.
-    Values may be any bytes, so a payload received from Temporal can be
-    returned or heartbeated unchanged. *)
+    Keys follow the bridge protocol's rule (non-empty, valid UTF-8, at most
+    65536 bytes; NUL is allowed) and values may be any bytes, so a payload
+    received from Temporal can be returned or heartbeated unchanged. *)
 let protocol_payload path (payload : Temporal_base.Codec.payload) =
   (* Use the same order-preserving construction as [runtime_payload], but turn
      validated strings back into freshly owned byte buffers. *)
   let rec metadata_loop reversed = function
     | [] -> Ok (List.rev reversed)
     | (key, value) :: rest ->
-        if String.length key = 0 || String.contains key '\000' then
+        if String.length key = 0 || String.length key > 65_536 then
           Error
             (make_error ~path:(path ^ ".metadata") "invalid_message"
-               "metadata key must be non-empty and must not contain NUL")
+               "metadata key must be non-empty and at most 65536 bytes")
         else if not (Codec.valid_utf_8 key) then
           Error
             (make_error ~path:(path ^ ".metadata.key") "invalid_message"

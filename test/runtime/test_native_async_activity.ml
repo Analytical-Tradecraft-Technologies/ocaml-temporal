@@ -664,8 +664,9 @@ let test_invalid_async_payload_preserves_handle () =
       ~decode:(fun _ -> Error (Temporal_base.Error.codec
         ~message:"output-only test codec")) in
   let cases =
-    [ (* A binary metadata value is valid (#1048); a NUL key is not. *)
-      ("nul-key", [ ("bad\000key", "value") ]);
+    [ (* A binary metadata value and a NUL in a key are valid (#1048);
+         a key that is not UTF-8 is not. *)
+      ("non-utf8-key", [ ("bad\255key", "value") ]);
       ("duplicate", [ ("opaque", "one"); ("opaque", "two") ]);
       ("oversized", [ (String.make 65_537 'k', "value") ]) ]
   in

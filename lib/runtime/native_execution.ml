@@ -115,6 +115,20 @@ let validate_identifier path value : (unit, error) result =
     Error (invalid path "identifier must be valid UTF-8")
   else Ok ()
 
+(** Validates an outbound payload metadata key against the bridge protocol's
+    own rule: non-empty, valid UTF-8 and at most 65536 bytes. Unlike a
+    Temporal identifier, a key may contain NUL, because the inbound
+    conversion carries keys written by other SDKs unchanged (#1048) and such
+    a payload must be returnable, heartbeated or reused without rejection. *)
+let validate_metadata_key path value : (unit, error) result =
+  if String.length value = 0 then
+    Error (invalid path "metadata key must not be empty")
+  else if String.length value > 65_536 then
+    Error (invalid path "metadata key exceeds 65536 bytes")
+  else if not (Temporal_base.Codec.valid_utf_8 value) then
+    Error (invalid path "metadata key must be valid UTF-8")
+  else Ok ()
+
 (** Validates a bounded text field whose empty value is meaningful.  Signal
     identities are supplied by Core as text but are not Temporal identifiers;
     keeping this check local to the runtime prevents malformed bytes assembled
@@ -262,7 +276,7 @@ let protocol_payload path (value : Temporal_base.Codec.payload) =
   let rec metadata_loop reversed = function
     | [] -> Ok (List.rev reversed)
     | (key, text) :: rest ->
-        let* () = validate_identifier (path ^ ".metadata.key") key in
+        let* () = validate_metadata_key (path ^ ".metadata.key") key in
         metadata_loop ((key, Bytes.of_string text) :: reversed) rest
   in
   let* metadata = metadata_loop [] value.metadata in
