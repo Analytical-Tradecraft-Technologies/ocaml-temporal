@@ -1196,6 +1196,9 @@ let test_client_free_text_utf8_validation () =
          ~task_queue:"unit-test" ~id:"utf8-reason-validation" ~input:"ignored"
          ())
   in
+  (* Asserts that [result] is the boundary's rejection of [label]: an error
+     whose message names that field as needing valid UTF-8 and that is
+     non-retryable, so a retry loop cannot spin on the caller's mistake. *)
   let expect_utf8_defect label result =
     expect_error_message_contains "defect" (label ^ " must be valid UTF-8")
       result;
