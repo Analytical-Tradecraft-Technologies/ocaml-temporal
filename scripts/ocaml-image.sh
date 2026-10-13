@@ -7,7 +7,7 @@
 # explicit image reference. A series or series name prints the digest-pinned
 # `ocaml/opam` reference recorded on the single FROM line of
 # docker/ocaml-<series>/Dockerfile, which is the only source of truth for that
-# series (#1027). Any other selector containing `:`, `/` or `@` is an explicit
+# series (#1027). Any selector containing `:`, `/` or `@` is an explicit
 # reference for local experiments and is printed unchanged; CI and release
 # lanes only pass series names. The script prints exactly one line on success
 # and exits non-zero, printing nothing on stdout, for an unknown series or a
@@ -22,13 +22,16 @@ fi
 root=$(CDPATH='' cd -- "$(dirname "$0")/.." && pwd)
 selector=$1
 
+# Explicit references are matched first: a local image such as
+# `ocaml-5.2:custom` or `ocaml-5.2@sha256:...` also matches the series
+# patterns below and must not be mistaken for a series name.
 case "$selector" in
-  ocaml-[0-9]*.[0-9]*) series=${selector#ocaml-} ;;
-  [0-9]*.[0-9]*) series=$selector ;;
   *:* | */* | *@*)
     printf '%s\n' "$selector"
     exit 0
     ;;
+  ocaml-[0-9]*.[0-9]*) series=${selector#ocaml-} ;;
+  [0-9]*.[0-9]*) series=$selector ;;
   *)
     echo "ocaml-image: unrecognized selector '$selector'" >&2
     exit 1

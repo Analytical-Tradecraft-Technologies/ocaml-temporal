@@ -160,6 +160,26 @@ assert_rejects_base_image_mutation() {
   fi
 }
 
+# The resolver maps series selectors to their pin but passes explicit image
+# references through unchanged, even when the repository name looks like a
+# series (for example a local `ocaml-5.2:custom` build).
+assert_resolves() {
+  selector=$1
+  expected=$2
+  actual=$(sh "$root/scripts/ocaml-image.sh" "$selector")
+  if [ "$actual" != "$expected" ]; then
+    echo "ocaml-image: '$selector' resolved to '$actual', expected '$expected'" >&2
+    exit 1
+  fi
+}
+pinned_5_2=$(awk '$1 == "FROM" { print $2 }' "$root/docker/ocaml-5.2/Dockerfile")
+assert_resolves 5.2 "$pinned_5_2"
+assert_resolves ocaml-5.2 "$pinned_5_2"
+assert_resolves 5.2.1 "$pinned_5_2"
+assert_resolves ocaml-5.2:custom ocaml-5.2:custom
+assert_resolves ocaml-5.2@sha256:0123 ocaml-5.2@sha256:0123
+assert_resolves registry.example/ocaml:5.2 registry.example/ocaml:5.2
+
 prepare_fixture
 sed 's/>= 5[.]4/>= 5.9/' "$root/.github/dependabot.yml" \
   >"$fixture_root/.github/dependabot.yml"
