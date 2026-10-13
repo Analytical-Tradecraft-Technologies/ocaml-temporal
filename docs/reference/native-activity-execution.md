@@ -14,13 +14,13 @@ complete_activity :
   supervisor -> Encoded_activity_completion.t -> (unit, native_error) result
 
 record_activity_heartbeat :
-  supervisor -> Activity_protocol.heartbeat -> (unit, native_error) result
+  supervisor -> Encoded_activity_heartbeat.t -> (unit, native_error) result
 
 complete_async_activity :
   supervisor -> Encoded_activity_completion.t -> (unit, native_error) result
 
 record_async_activity_heartbeat :
-  supervisor -> Activity_protocol.heartbeat -> (unit, native_error) result
+  supervisor -> Encoded_activity_heartbeat.t -> (unit, native_error) result
 ```
 
 For a `Start` task, the native bridge has already leased the opaque task token
@@ -44,6 +44,25 @@ supervisor copies into the C call (issue #995). Only
 `Encoded_activity_completion.encode` can build the value, so an invalid
 completion cannot reach the bridge, and the supervisor never encodes it again.
 The JSON document is unchanged.
+
+Both heartbeat operations follow the same rule with the abstract
+`Temporal_protocol.Encoded_activity_heartbeat.t` (issue #1001). The adapter
+encodes each synchronous or asynchronous heartbeat exactly once, before any
+supervisor call; a heartbeat the strict encoder rejects returns a typed error
+(`Codec` for a synchronous context, a non-submitted error for an async handle)
+and never reaches the bridge. The supervisor copies the bytes into the C call
+unchanged.
+
+An asynchronous terminal request whose native outcome was uncertain
+(`Retryable_submission`) keeps its request key (`Async_activity.operation_key`)
+and its encoded bytes on the adapter's async lease. The handle admits only a
+request with that same key until it is resolved. Equal keys mean the same wire
+request even when the operations differ structurally (for example a `Fail`
+whose explicit `error_type` equals its category's default), so the adapter
+resends the physically identical string for every admitted retry instead of
+preparing and encoding the completion again. Any other completion outcome
+clears the retained bytes, and a request with a different key is prepared
+afresh and never sent them.
 
 ## Asynchronous completion
 
@@ -244,10 +263,11 @@ previous attempt's last recorded heartbeat (empty on a first attempt). The
 value is fixed for the whole attempt: heartbeats sent by the current attempt
 are recorded for the next attempt and never replace what `details` returns,
 matching the other Temporal SDKs. `heartbeat_timeout` returns the server's
-configured interval when one was supplied. `Context.heartbeat` and
-`Context.heartbeat_payloads` copy their payloads, validate them through the
-same strict activity JSON codec as completions, and send them through the
-supervisor mailbox. The mailbox serializes heartbeats with polling,
+configured interval when one was supplied, and `None` when the server reports
+zero, which Temporal uses for an unset heartbeat timeout. `Context.heartbeat`
+and `Context.heartbeat_payloads` copy their payloads, validate and encode them
+once through the same strict activity JSON codec as completions, and send
+those bytes through the supervisor mailbox. The mailbox serializes heartbeats with polling,
 completion, and shutdown; an arbitrary Rust thread never calls an OCaml
 callback.
 
@@ -257,14 +277,19 @@ and type; standalone activities are failed by the bridge before dispatch, so
 one is always present), activity ID and type, the 1-based
 attempt, whether Core runs it as a local activity, the first-scheduled,
 current-attempt-scheduled, and started timestamps that Core reported, and the
-effective schedule-to-close, start-to-close, and heartbeat timeouts. Core
+effective schedule-to-close, start-to-close, and heartbeat timeouts. Temporal
+reports an unset timeout as a zero duration (Core fills a local activity's
+absent schedule-to-close with zero, the server reports an unset heartbeat
+timeout as zero, and an unset remote schedule-to-close inherits a zero workflow
+run timeout), so a zero timeout is exposed as `None`, matching the Go and
+Python SDKs and `Temporal.Testing` (#1032). Core
 carries timeouts with nanosecond precision while `Temporal.Duration.t` holds
 whole milliseconds, so a sub-millisecond remainder is rounded up: a positive
 timeout never reads as zero. The rounded value is clamped to
 315,576,000,000,999 ms, the `Duration.of_ms` maximum, because rounding the
 protobuf maximum up would exceed it by one millisecond. The conversion is
-total, so exposing timeouts adds no task-rejection path (the separately
-validated `Context.heartbeat_timeout` keeps its existing rule). The adapter copies these
+total, so exposing timeouts adds no task-rejection path.
+`Context.heartbeat_timeout` uses the same conversion. The adapter copies these
 values from the validated start task, so the projection cannot fail; a context from a backend without a Temporal task, such as the
 in-process test backend, returns a typed defect instead. Combining the
 workflow and activity IDs (plus the attempt when each retry must be distinct)
@@ -274,23 +299,20 @@ metadata is immutable and stays readable after the attempt ends.
 because the value is immutable, external code may keep it alongside the
 retained handle.
 
-Before constructing a synchronous context, the adapter validates the server
-heartbeat timeout: it rejects negative, sub-millisecond, or out-of-range
-values instead of rounding or overflowing them. An accepted timeout is
-therefore exposed as an exact whole-millisecond `Duration.t`. Asynchronous
-definitions have no synchronous heartbeat context and skip this exact
-conversion, so a sub-millisecond heartbeat timeout does not reject their task;
-`Async_context.info` reports it rounded up like the other timeouts.
+A synchronous context's heartbeat timeout uses the same total conversion as
+`Info`. A sub-millisecond interval, which another SDK may schedule, is rounded
+up to the next whole millisecond and does not reject the task (#1032); earlier
+releases failed such a task non-retryably.
 
 Heartbeat-context conversion failures follow the same task-rejection path as
 input codec failures, for both synchronous and asynchronous definitions. For
 example, binary heartbeat metadata which cannot be represented by runtime
-strings, or (for synchronous definitions) a sub-millisecond timeout, produces a bounded non-retryable failure
+strings produces a bounded non-retryable failure
 for the exact leased token without invoking the callback. The adapter retains
 that validated failure until native acknowledgement, so a transient submission
 failure remains visible to polling and shutdown drain. Once acknowledged,
 unrelated queued activities can run normally. The deterministic adapter tests
-cover both context failures, both definition styles, and unchanged completion
+cover the context failure, both definition styles, and unchanged completion
 retries through polling and drain.
 
 The context is valid only while its activity attempt is executing. The adapter

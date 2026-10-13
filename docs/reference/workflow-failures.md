@@ -40,7 +40,14 @@ operation policies](durable-operation-policies.md#retry-policy)). In the other
 direction, an error received from an activity, a child workflow, an update, or
 a client `wait` reports the type of the innermost application failure through
 `Error.error_type`, even when Temporal nests it under an activity or
-child-workflow wrapper; its category still describes the wrapper. The cause
+child-workflow wrapper; its category still describes the wrapper. Because
+that type was written by another SDK, worker or history, it is not held to
+`Error.make`'s rules: the SDK rewrites it deterministically so that it never
+raises (#1011). Malformed UTF-8 becomes U+FFFD, each ASCII control character
+becomes a visible `\uXXXX` escape (a Python type `"Invalid\tInput"` reads as
+`"Invalid\u0009Input"`), and a type whose encoded length exceeds 65,536
+characters is cut at a character boundary and ends in `...`. Valid types are
+unchanged, and replay always yields the same text. The cause
 chain itself is not yet preserved as structure: inbound causes appear only in
 the error message, and outbound OCaml failures carry no `cause`. Every failure
 the SDK emits uses the source `"ocaml-temporal"`.

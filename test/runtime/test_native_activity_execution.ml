@@ -9,6 +9,7 @@
 
 module Protocol = Temporal_protocol.Activity_protocol
 module Encoded = Temporal_protocol.Encoded_activity_completion
+module Encoded_heartbeat = Temporal_protocol.Encoded_activity_heartbeat
 module Raw_adapter = Temporal_runtime.Native_activity_execution
 
 (** Copies a public payload into the base payload representation expected by the
@@ -174,15 +175,18 @@ let copy_completion encoded =
         failwith "adapter submitted non-canonical completion bytes";
       value
 
-(** Copies a heartbeat through the strict protocol codec so the fake source
-    cannot accidentally retain mutable buffers owned by an activity context. *)
-let copy_heartbeat heartbeat =
-  match Protocol.encode_heartbeat heartbeat with
+(** Strictly decodes the adapter's single-encode heartbeat bytes, as the
+    Rust bridge does, and checks that they are canonical. Decoding gives the
+    fake fresh storage, so it cannot retain mutable buffers owned by an
+    activity context, and it never encodes a submission itself (#1001). *)
+let copy_heartbeat encoded =
+  let json = Encoded_heartbeat.to_string encoded in
+  match Protocol.decode_heartbeat json with
   | Error _ -> failwith "adapter submitted an invalid heartbeat to fake source"
-  | Ok json -> (
-      match Protocol.decode_heartbeat json with
-      | Ok value -> value
-      | Error _ -> failwith "fake source could not reparse its own heartbeat")
+  | Ok value ->
+      if Protocol.encode_heartbeat value <> Ok json then
+        failwith "adapter submitted non-canonical heartbeat bytes";
+      value
 
 (** Removes one exact opaque token from a list and reports whether it was found.
     [Bytes.equal] is intentional: tokens are binary correlation data, not text.
@@ -277,15 +281,15 @@ module Fake_supervisor = struct
   (** Accepts progress only while the activity token is leased. The focused
       dispatch tests do not retain heartbeat bodies; the lease check still
       verifies that the adapter never sends a heartbeat after completion. *)
-  let record_activity_heartbeat supervisor (heartbeat : Protocol.heartbeat) =
+  let record_activity_heartbeat supervisor encoded =
     !(supervisor.heartbeat_hook) ();
+    let heartbeat = copy_heartbeat encoded in
     if
       List.exists
         (fun token -> Bytes.equal token heartbeat.Protocol.task_token)
         !(supervisor.leased)
     then begin
-      supervisor.heartbeats :=
-        copy_heartbeat heartbeat :: !(supervisor.heartbeats);
+      supervisor.heartbeats := heartbeat :: !(supervisor.heartbeats);
       Ok ()
     end
     else
@@ -307,7 +311,7 @@ module Fake_supervisor = struct
       }
 
   let record_async_activity_heartbeat _supervisor
-      (_heartbeat : Protocol.heartbeat) =
+      (_encoded : Encoded_heartbeat.t) =
     Error
       {
         code = "unsupported";
@@ -704,16 +708,15 @@ let test_invalid_failure_completion_retry () =
   if !calls <> 1 || !(supervisor.leased) <> [] || Queue.length supervisor.queue <> 1 then
     failwith "replacement retry reran the activity, retained its lease, or polled later work"
 
-(** Wire-valid context values which the runtime cannot represent must fail only
-    their own task. Exercise both callback styles (a sub-millisecond heartbeat
-    timeout is unrepresentable only for synchronous ones), immediate
-    acknowledgement, and transport retry through poll and drain before running
-    unrelated work. *)
+(** Wire-valid context values which the runtime cannot represent (binary
+    heartbeat metadata) must fail only their own task. Exercise both callback
+    styles, immediate acknowledgement, and transport retry through poll and
+    drain before running unrelated work. A sub-millisecond heartbeat timeout
+    is representable since #1032 (it rounds up); see
+    [test_task_timeouts_zero_is_unset]. *)
 let test_unrepresentable_context_retires_lease () =
   List.iter
     (fun async ->
-      List.iter
-        (fun binary_metadata ->
           List.iter
             (fun retry ->
               let supervisor = fake_supervisor () in
@@ -741,13 +744,9 @@ let test_unrepresentable_context_retires_lease () =
                     Ok ())
               in
               let heartbeat_details, heartbeat_timeout, path =
-                if binary_metadata then
-                  ([ Protocol.{ metadata = [ ("opaque", Bytes.of_string "\255") ];
-                       data = Bytes.of_string "private-heartbeat" } ],
-                   None, "$.variant.heartbeat_details[0].metadata.opaque")
-                else
-                  ([], Some Protocol.{ seconds = 1L; nanoseconds = 1 },
-                   "$.variant.heartbeat_timeout.nanoseconds")
+                ([ Protocol.{ metadata = [ ("opaque", Bytes.of_string "\255") ];
+                     data = Bytes.of_string "private-heartbeat" } ],
+                 None, "$.variant.heartbeat_details[0].metadata.opaque")
               in
               let token = Bytes.of_string "\000bad-context\255" in
               let task =
@@ -830,12 +829,93 @@ let test_unrepresentable_context_retires_lease () =
               | Ok () when !(supervisor.leased) = [] && Atomic.get good_calls = 1 -> ()
               | _ -> failwith "context rejection left unaccounted completion debt")
             [ false; true ])
-        (* A sub-millisecond heartbeat timeout only fails synchronous
-           definitions, whose context exposes the exact interval.
-           Asynchronous callbacks accept it and report it rounded up through
-           [Async_context.info]; test_native_async_activity covers that. *)
-        (if async then [ true ] else [ true; false ]))
     [ false; true ]
+
+(** Temporal reports an unset timeout as a zero duration: Core fills a local
+    activity's absent schedule-to-close with zero and the server reports an
+    unset heartbeat timeout as zero. Both [Info] and
+    [Context.heartbeat_timeout] must read those as [None], matching
+    [Temporal.Testing], while a positive timeout stays [Some]. A
+    sub-millisecond heartbeat interval from another SDK rounds up instead of
+    rejecting a synchronous task (#1032). *)
+let test_task_timeouts_zero_is_unset () =
+  let zero = Some Protocol.{ seconds = 0L; nanoseconds = 0 } in
+  let ms value = Option.map Temporal.Duration.to_ms value in
+  let run ~is_local ~schedule_to_close ~start_to_close ~heartbeat =
+    let supervisor = fake_supervisor () in
+    let observed = ref None in
+    let activity =
+      Temporal.Activity.define_with_context ~name:"timeouts"
+        ~input:Temporal.Codec.unit ~output:Temporal.Codec.unit
+        (fun context () ->
+          let module Info = Temporal.Activity.Info in
+          match Temporal.Activity.Context.info context with
+          | Error error -> Error error
+          | Ok info ->
+              observed :=
+                Some
+                  ( ms (Info.schedule_to_close_timeout info),
+                    ms (Info.start_to_close_timeout info),
+                    ms (Info.heartbeat_timeout info),
+                    ms (Temporal.Activity.Context.heartbeat_timeout context) );
+              Ok ())
+    in
+    let task =
+      match
+        start_task ~token:(Bytes.of_string "timeouts-token")
+          ~activity_type:"timeouts"
+          ~input:[ encode_input Temporal.Codec.unit () ]
+      with
+      | { Protocol.variant = Protocol.Start start; _ } as task ->
+          {
+            task with
+            variant =
+              Protocol.Start
+                {
+                  start with
+                  is_local;
+                  schedule_to_close_timeout = schedule_to_close;
+                  start_to_close_timeout = start_to_close;
+                  heartbeat_timeout = heartbeat;
+                };
+          }
+      | _ -> failwith "start fixture was not a start task"
+    in
+    (* Round-trip through the strict wire codec so the fixture is a task the
+       bridge could really deliver. *)
+    let task =
+      match Result.bind (Protocol.encode_task task) Protocol.decode_task with
+      | Ok task -> task
+      | Error _ -> failwith "timeout fixture is not wire-valid"
+    in
+    enqueue supervisor task;
+    let worker = worker supervisor [ Adapter.register activity ] in
+    expect_completed Adapter.Succeeded (Worker.poll worker);
+    match !observed with
+    | Some timeouts -> timeouts
+    | None -> failwith "timeout activity did not run"
+  in
+  (* A local activity scheduled without schedule-to-close. *)
+  if
+    run ~is_local:true ~schedule_to_close:zero
+      ~start_to_close:(Some Protocol.{ seconds = 5L; nanoseconds = 0 })
+      ~heartbeat:None
+    <> (None, Some 5_000L, None, None)
+  then failwith "local activity reported an unset schedule-to-close as zero";
+  (* A remote activity with the server's zero heartbeat timeout and a zero
+     schedule-to-close inherited from a workflow without a run timeout. *)
+  if
+    run ~is_local:false ~schedule_to_close:zero
+      ~start_to_close:(Some Protocol.{ seconds = 60L; nanoseconds = 0 })
+      ~heartbeat:zero
+    <> (None, Some 60_000L, None, None)
+  then failwith "remote activity reported unset timeouts as zero";
+  (* A sub-millisecond heartbeat interval rounds up in both views. *)
+  if
+    run ~is_local:false ~schedule_to_close:None ~start_to_close:None
+      ~heartbeat:(Some Protocol.{ seconds = 1L; nanoseconds = 1 })
+    <> (None, None, Some 1_001L, Some 1_001L)
+  then failwith "sub-millisecond heartbeat timeout was not rounded up"
 
 (** An unknown activity type is acknowledged with a typed non-retryable failure,
     preventing a leased task from being silently abandoned. *)
@@ -1172,6 +1252,45 @@ let test_contextual_heartbeat_lifecycle () =
         | Error _ -> ()
         | Ok () -> failwith "heartbeat succeeded after activity completion")
   end
+
+(** A synchronous heartbeat is encoded once by the adapter, which also
+    validates it (#1001): details the strict encoder rejects (here duplicate
+    metadata keys, which payload conversion alone cannot detect) fail as a
+    typed codec error without any supervisor call, and a valid heartbeat
+    from the same attempt still reaches the supervisor exactly once. *)
+let test_heartbeat_encoder_rejection_stays_local () =
+  let supervisor = fake_supervisor () in
+  let supervisor_calls = ref 0 in
+  supervisor.heartbeat_hook := (fun () -> incr supervisor_calls);
+  let activity =
+    Temporal.Activity.define_with_context ~name:"native_heartbeat_rejected"
+      ~input:Temporal.Codec.unit ~output:Temporal.Codec.string
+      (fun context () ->
+        let duplicate : Temporal.Payload.t =
+          { metadata = [ ("opaque", "one"); ("opaque", "two") ];
+            data = Bytes.of_string "invalid" }
+        in
+        (match Temporal.Activity.Context.heartbeat_payloads context [ duplicate ] with
+        | Error error when (Temporal.Error.view error).category = `Codec -> ()
+        | Error _ -> failwith "encoder-rejected heartbeat was not a codec error"
+        | Ok () -> failwith "encoder-rejected heartbeat was accepted");
+        if !supervisor_calls <> 0 then
+          failwith "encoder-rejected heartbeat reached the supervisor";
+        Result.map
+          (fun () -> "done")
+          (Temporal.Activity.Context.heartbeat context Temporal.Codec.string
+             "valid"))
+  in
+  let token = Bytes.of_string "heartbeat-rejected-token" in
+  enqueue supervisor
+    (start_task ~token ~activity_type:"native_heartbeat_rejected"
+       ~input:[ encode_input Temporal.Codec.unit () ]);
+  let worker = worker supervisor [ Adapter.register activity ] in
+  expect_completed Adapter.Succeeded (Worker.poll worker);
+  supervisor.heartbeat_hook := ignore;
+  match !supervisor_calls, !(supervisor.heartbeats) with
+  | 1, [ heartbeat ] when Bytes.equal heartbeat.Protocol.task_token token -> ()
+  | _ -> failwith "valid heartbeat was not submitted exactly once"
 
 (** The public context view must never expose mutable payload storage owned by
     the adapter. This test mutates the source details, a getter result, the
@@ -1931,9 +2050,13 @@ let test_late_sweep_delivery_is_classified () =
 (** Runs every adapter assertion with a stable test-process failure. *)
 module Observability = Temporal_base.Observability
 
-(** One SDK log record observed by [with_captured_logs]: its operation tag and
-    the full tag set for correlation assertions. *)
-type captured_record = { operation : string option; tags : Logs.Tag.set }
+(** One SDK log record observed by [with_captured_logs]: its level, its
+    operation tag, and the full tag set for correlation assertions. *)
+type captured_record = {
+  level : Logs.level;
+  operation : string option;
+  tags : Logs.Tag.set;
+}
 
 (** Runs [f] with a reporter that records every lifecycle-source record at
     [Debug], then restores the previous reporter and source level even when
@@ -1944,13 +2067,14 @@ let with_captured_logs f =
   let source = Observability.Source.lifecycle in
   let previous_reporter = Logs.reporter () in
   let previous_level = Logs.Src.level source in
-  let report src _level ~over continuation messagef =
+  let report src level ~over continuation messagef =
     if Logs.Src.equal src source then
       messagef (fun ?header:_ ?(tags = Logs.Tag.empty) format ->
           Format.ikfprintf
             (fun _ ->
               records :=
                 {
+                  level;
                   operation = Logs.Tag.find Observability.Tag.operation tags;
                   tags;
                 }
@@ -2079,6 +2203,50 @@ let test_rejection_record_carries_activity_identity () =
     <> Some "unknown_activity_type"
   then failwith "rejection record lost its error kind"
 
+(** An ordinary application [Error] is expected Temporal behaviour, not an SDK
+    rejection: the attempt yields exactly one correlated [activity_task_failed]
+    record at [Info] and no [activity_task_rejected] warning (#1024). *)
+let test_application_failure_logs_one_record () =
+  let supervisor = fake_supervisor () in
+  let activity =
+    Temporal.Activity.define ~name:"failing" ~input:Temporal.Codec.unit
+      ~output:Temporal.Codec.unit (fun () ->
+        Error
+          (Temporal.Error.make ~category:`Activity ~message:"business failure"
+             ()))
+  in
+  enqueue supervisor
+    (start_task ~token:(Bytes.of_string "failing-token")
+       ~activity_type:"failing"
+       ~input:[ encode_input Temporal.Codec.unit () ]);
+  let worker = worker supervisor [ Adapter.register activity ] in
+  let records =
+    with_captured_logs (fun () ->
+        match Worker.poll worker with
+        | Ok (Adapter.Rejected { lease_retired = true; _ }) -> ()
+        | _ -> failwith "application failure was not retired")
+  in
+  let failed =
+    List.filter
+      (fun record -> record.operation = Some "activity_task_failed")
+      records
+  in
+  (match failed with
+  | [ { level = Logs.Info; _ } ] -> ()
+  | [ _ ] -> failwith "application failure was not logged at Info"
+  | _ -> failwith "expected exactly one activity_task_failed record");
+  let tags = single_record records "activity_task_failed" in
+  expect_attempt_identity ~activity_type:"failing" tags;
+  if Logs.Tag.find Observability.Tag.error_kind tags <> Some "activity" then
+    failwith "failure record lost its error kind";
+  if
+    List.exists
+      (fun record ->
+        record.operation = Some "activity_task_rejected"
+        || record.level = Logs.Warning)
+      records
+  then failwith "an application failure was logged as an SDK rejection"
+
 (** A cancellation delivered to a running attempt through a heartbeat sweep
     names that attempt, and a bare cancellation whose start this adapter never
     saw carries no fabricated identity. *)
@@ -2115,11 +2283,13 @@ let test_cancellation_records_correlation () =
 
 let () =
   test_successful_dispatch ();
+  test_application_failure_logs_one_record ();
   test_typed_failure ();
   test_typed_failure_error_type ();
   test_invalid_failure_details_allow_next_activity ();
   test_invalid_failure_completion_retry ();
   test_unrepresentable_context_retires_lease ();
+  test_task_timeouts_zero_is_unset ();
   test_unknown_activity_retires_lease ();
   test_cancellation ();
   test_completion_retry_does_not_redo_activity ();
@@ -2127,6 +2297,7 @@ let () =
   test_completion_is_encoded_once ();
   test_non_retryable_completion_is_never_resubmitted ();
   test_contextual_heartbeat_lifecycle ();
+  test_heartbeat_encoder_rejection_stays_local ();
   test_context_payloads_are_copied ();
   test_context_callback_exception_and_invalidation ();
   test_extra_input_is_rejected ();

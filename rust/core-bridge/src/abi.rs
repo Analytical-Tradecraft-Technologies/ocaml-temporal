@@ -780,7 +780,11 @@ impl SharedRuntime {
         let (cleanup, receiver) = channel();
         std::thread::Builder::new()
             .name("ocaml-temporal-shared-runtime-cleanup".to_owned())
-            .spawn(move || run_shared_runtime_cleanup(receiver))
+            .spawn(move || {
+                // Dropping Core here can flush or close its connections.
+                crate::sigpipe::block_current_thread();
+                run_shared_runtime_cleanup(receiver)
+            })
             .map_err(|error| Failure {
                 status: STATUS_INTERNAL,
                 message: format!("could not start Temporal runtime cleanup thread: {error}"),
@@ -1053,7 +1057,12 @@ impl Runtime {
         let (cleanup, receiver) = channel();
         std::thread::Builder::new()
             .name("ocaml-temporal-runtime-cleanup".to_owned())
-            .spawn(move || run_runtime_cleanup(receiver))
+            .spawn(move || {
+                // Dropping a client or worker here can flush or close its
+                // connections.
+                crate::sigpipe::block_current_thread();
+                run_runtime_cleanup(receiver)
+            })
             .map_err(|error| Failure {
                 status: STATUS_INTERNAL,
                 message: format!("could not start Temporal runtime cleanup thread: {error}"),
@@ -3674,10 +3683,13 @@ fn failure(status: Status, message: impl Into<String>) -> Result {
     }
 }
 
-/// Initializes output, contains panics, and commits one fully formed result.
+/// Initializes output, contains panics and SIGPIPE, and commits one fully
+/// formed result.
 ///
 /// Writing the empty result before executing user logic ensures every non-null
-/// output is safe to free even when the operation panics.
+/// output is safe to free even when the operation panics. SIGPIPE is blocked
+/// on the calling thread for the duration of the operation; see
+/// [`crate::sigpipe`].
 unsafe fn invoke(output: *mut Result, operation: impl FnOnce() -> Operation) -> Status {
     if output.is_null() {
         return STATUS_INVALID_ARGUMENT;
@@ -3687,6 +3699,12 @@ unsafe fn invoke(output: *mut Result, operation: impl FnOnce() -> Operation) -> 
     // be valid and writable. `ptr::write` also permits uninitialized storage.
     unsafe { ptr::write(output, Result::default()) };
 
+    // The caller's thread belongs to the application, and `block_on` can
+    // drive socket writes (for example a TLS handshake) on it. Hold SIGPIPE
+    // blocked for the call so a peer reset surfaces as `EPIPE` rather than
+    // terminating the process, then restore the caller's mask (#1041). The
+    // guard outlives the panic boundary, so a contained panic restores too.
+    let _sigpipe = crate::sigpipe::CallerGuard::enter();
     let result = match catch_unwind(AssertUnwindSafe(operation)) {
         Ok(Ok(value)) => success(value),
         Ok(Err(error)) => failure(error.status, error.message),
@@ -3955,6 +3973,11 @@ fn create_shared_core(
     // hook are preserved; only the worker count differs from the default.
     let mut tokio_builder = TokioRuntimeBuilder::default();
     tokio_builder.inner.worker_threads(worker_threads);
+    // Core layers this hook after its own telemetry hook on every worker and
+    // blocking-pool thread. Those threads perform all of Core's socket I/O,
+    // including the vectored writes that raise SIGPIPE on Linux (#1041).
+    let block_sigpipe: Box<dyn Fn() + Send + Sync> = Box::new(crate::sigpipe::block_current_thread);
+    tokio_builder.lang_on_thread_start = Some(block_sigpipe);
     let mut core = CoreRuntime::new(options, tokio_builder).map_err(|_error| {
         Failure {
             status: STATUS_INTERNAL,
@@ -5843,6 +5866,37 @@ pub unsafe fn test_runtime_worker_threads(runtime: *const Runtime) -> Option<usi
         .core
         .as_ref()
         .map(|core| core.tokio_handle().metrics().num_workers())
+}
+
+/// Reports whether SIGPIPE is blocked on Core's Tokio threads (#1041), as
+/// `(worker_thread, blocking_pool_thread)`.
+///
+/// `None` for a null handle or one whose Core runtime was already released.
+/// One probe task runs on a runtime worker and one on the blocking pool; each
+/// reads its own thread's signal mask. Not part of the C ABI.
+///
+/// # Safety
+///
+/// `runtime` must be null or a live handle that is not used concurrently.
+#[doc(hidden)]
+pub unsafe fn test_runtime_threads_block_sigpipe(runtime: *const Runtime) -> Option<(bool, bool)> {
+    // SAFETY: The caller promises a null or live, unshared handle.
+    let runtime = unsafe { runtime.as_ref() }?;
+    let handle = runtime.core.as_ref()?.tokio_handle();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let worker_sender = sender.clone();
+    handle.spawn(async move {
+        let _ = worker_sender.send((0, crate::sigpipe::blocked_in_current_thread()));
+    });
+    handle.spawn_blocking(move || {
+        let _ = sender.send((1, crate::sigpipe::blocked_in_current_thread()));
+    });
+    let mut observed = [None, None];
+    for _ in 0..2 {
+        let (index, blocked) = receiver.recv_timeout(Duration::from_secs(10)).ok()?;
+        observed[index] = Some(blocked);
+    }
+    Some((observed[0]?, observed[1]?))
 }
 
 /// Returns the ABI category used for a worker error without exposing the

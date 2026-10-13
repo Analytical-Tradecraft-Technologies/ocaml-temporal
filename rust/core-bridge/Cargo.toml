@@ -12,6 +12,10 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [dependencies]
 base64.workspace = true
+# Signal-mask calls that keep SIGPIPE from terminating the OCaml host process
+# (#1041). Used only on Unix targets; already locked through Tokio and Core.
+# Tests also use it to lower the descriptor limit so accept() fails (#1030).
+libc.workspace = true
 prost.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -34,8 +38,6 @@ uuid.workspace = true
 flate2.workspace = true
 h2.workspace = true
 http.workspace = true
-# Lowers the descriptor limit so a test can make accept() fail (#1030).
-libc.workspace = true
 tokio = { workspace = true, features = ["net"] }
 
 # Opt-in Rust half of the #528 JSON bridge attribution; `make

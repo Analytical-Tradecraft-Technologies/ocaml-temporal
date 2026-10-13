@@ -117,7 +117,15 @@ let test_failed_result_error_type () =
       {|{"message":"activity failed","source":"core","stack_trace":"","encoded_attributes":null,"cause":{"message":"bad","source":"PythonSDK","stack_trace":"","encoded_attributes":null,"cause":null,"info":{"kind":"application","type":"InvalidInput","non_retryable":false,"details":[]}},"info":{"kind":"activity","scheduled_event_id":5,"started_event_id":6,"identity":"worker","activity_type":"activity","activity_id":"activity-1","retry_state":"non_retryable_failure"}}|}
   in
   assert (Temporal.Error.error_type nested = Some "InvalidInput");
-  assert ((Temporal.Error.view nested).category = `Workflow)
+  assert ((Temporal.Error.view nested).category = `Workflow);
+  (* Another SDK may write a type with a control character; [Error.make]
+     rejects such text, so before #1011 this conversion raised out of
+     [Client.wait] instead of returning a typed failure. *)
+  let control =
+    error_of
+      {|{"message":"failed","source":"PythonSDK","stack_trace":"","encoded_attributes":null,"cause":null,"info":{"kind":"application","type":"Invalid\tInput\n","non_retryable":true,"details":[]}}|}
+  in
+  assert (Temporal.Error.error_type control = Some "Invalid\\u0009Input\\u000A")
 
 (** The mock supplies two real exact runs; a private hook substitutes the
     protocol-decoded close event for the first. The public successor returned by

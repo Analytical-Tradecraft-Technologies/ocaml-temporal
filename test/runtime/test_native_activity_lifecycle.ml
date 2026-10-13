@@ -8,6 +8,7 @@
 
 module Protocol = Temporal_protocol.Activity_protocol
 module Encoded = Temporal_protocol.Encoded_activity_completion
+module Encoded_heartbeat = Temporal_protocol.Encoded_activity_heartbeat
 module Adapter = Temporal_runtime.Native_activity_execution
 
 (** A deterministic source error used by the fake supervisor. *)
@@ -98,7 +99,7 @@ module Fake_supervisor = struct
   (** Heartbeats are not part of this completion-ownership regression; the
       fake accepts them so the adapter's expanded supervisor contract remains
       explicit without hiding a native operation. *)
-  let record_activity_heartbeat _supervisor (_heartbeat : Protocol.heartbeat) =
+  let record_activity_heartbeat _supervisor (_encoded : Encoded_heartbeat.t) =
     Ok ()
 
   (** This lifecycle fake does not model deferred client completion; explicit
@@ -113,7 +114,7 @@ module Fake_supervisor = struct
       }
 
   let record_async_activity_heartbeat _supervisor
-      (_heartbeat : Protocol.heartbeat) =
+      (_encoded : Encoded_heartbeat.t) =
     Error
       {
         code = "unsupported";

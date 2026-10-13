@@ -51,6 +51,191 @@ macOS with OCaml 5.4.1:
 - `scripts/check-dependency-inventory.sh`;
 - `dune build @install` and `dune build @test/bridge/runtest`.
 
+## 2026-10-12: SIGPIPE containment (#1041)
+
+A peer-closed connection can no longer kill a Linux worker or client with
+SIGPIPE. Vectored socket writes (`writev`, used by h2, hyper and
+tokio-rustls) raise the signal, and an OCaml host keeps its default,
+terminating action because Rust's startup code that ignores it never runs in
+a static library. The bridge does not change the process-wide disposition;
+it blocks SIGPIPE in the signal mask of every thread it owns (Core's Tokio
+workers and blocking pool through Core's thread-start hook, the cleanup
+threads and the Core log writer) and, for the duration of each ABI call, on
+the application's calling thread, consuming any SIGPIPE raised by the call
+and restoring the caller's exact mask afterwards. The write then fails with
+`EPIPE` through the normal error path. The bridge now declares `libc` (MIT OR
+Apache-2.0, already locked) as a direct dependency, used only on Unix. The design is
+recorded under SIGPIPE containment in the
+[Core bridge reference](reference/core-bridge.md).
+
+`rust/core-bridge/tests/sigpipe_containment.rs` restores the default
+disposition and checks that Core's Tokio threads block the signal, that ABI
+calls restore both unblocked and caller-blocked masks, and that a SIGPIPE
+raised during a guarded call is consumed; on Linux it also drives `writev`
+into reset connections on a blocked thread and inside a guarded call, and
+resets 64 metrics scrapes mid-request before a final scrape succeeds.
+`test/bridge/test_runtime_metrics.ml` repeats the aborted-scrape check from an
+OCaml host with the default disposition. Verified with `cargo test --test
+sigpipe_containment` (the Linux-only cases were also compiled and run on macOS
+by temporarily widening their `cfg`), `cargo clippy --all-targets -D
+warnings`, `cargo fmt --check`, `dune build @install` and
+`dune build @test/bridge/runtest` on OCaml 5.4.1 (macOS). The in-process
+transport-fault proxy still ignores SIGPIPE for its own sockets; a Linux
+fault proxy in a separate process remains future work.
+## 2026-10-13: Inbound failure types never raise (#1011)
+
+An application failure type written by another SDK, worker or the server
+history could contain a control character, invalid UTF-8, or more than the
+65,536 encoded characters that `Error.make` allows; the Rust bridge's own
+truncation marker even begins with a newline. The inbound type went through
+`Error.make`, so `Client.wait`, `start_update` and `wait_update` raised
+`Invalid_argument` instead of returning a typed result, and a workflow
+awaiting such an activity or child failed every workflow task, including on
+replay. `Failure_diagnostic.application_failure_type` now passes the type
+through a deterministic sanitizer: malformed UTF-8 becomes U+FFFD, control
+characters become visible `\uXXXX` escapes, and over-long text is cut at a
+character boundary with a `...` marker. Valid types are unchanged and
+outbound `Error.make` validation stays strict.
+
+`test/bridge/test_failure_diagnostic.ml` covers control characters, NUL,
+invalid UTF-8, a type exactly at the limit, an over-long type ending in the
+bridge marker, multi-byte, quote and control-character cuts, and checks that
+every result is accepted by `Error.make`;
+`test/bridge/test_client_terminal_adapter.ml` drives a tab and newline type
+through the client terminal conversion. Verified with `dune build @install`
+and the focused bridge tests on OCaml 5.4.1 (macOS).
+
+## 2026-10-13: Unset activity timeouts read as None (#1032)
+
+Temporal reports an unset activity timeout as a zero duration. Core fills a
+local activity's absent schedule-to-close with zero, the server reports an
+unset heartbeat timeout as zero, and an unset remote schedule-to-close
+inherits a zero workflow run timeout. The native activity adapter exposed
+these as `Some 0ms` through `Activity.Info` and `Context.heartbeat_timeout`.
+Deadline arithmetic therefore treated the attempt as already expired, and
+heartbeat pacing at half the interval spun. The adapter now maps a zero
+timeout to `None`, matching the Go and Python SDKs and `Temporal.Testing`.
+`Context.heartbeat_timeout` also uses the same total conversion as `Info`, so
+a sub-millisecond heartbeat interval scheduled by another SDK rounds up to the
+next millisecond instead of failing a synchronous task non-retryably.
+
+`test/runtime/test_native_activity_execution.ml` covers a local activity
+without schedule-to-close, a remote activity with zero heartbeat and
+schedule-to-close timeouts, and a sub-millisecond heartbeat interval through
+both views. Verified with `dune build @install` and the `test/runtime` test
+alias on OCaml 5.4.1 (macOS).
+
+## 2026-10-13: Metrics scrape test no longer waits for connection close (#1058)
+
+`test/bridge/test_runtime_metrics.ml` timed out intermittently on Windows
+while reading a scrape until EOF with a 5 s receive timeout. Its `http_get`
+helper now treats a response as complete once the headers and the declared
+`Content-Length` body have arrived, falling back to EOF only without a
+length, so the test no longer depends on when the exporter closes the
+connection. The bound is 30 s, and a timeout now reports how many bytes
+arrived, which separates a slow close from a missing response. The helper
+was checked standalone against complete, partial and length-less responses
+on OCaml 5.4.1 (macOS); the Windows CI job is the regression gate.
+
+## 2026-10-13: Compile-checked API landing page (#1013)
+
+The quick start on the rendered API landing page (`lib/public/index.mld`)
+compiles again. Its client example now matches `Client.Completed` as the
+inline record `Completed { output = message; _ }` introduced by #837/#957. The
+shutdown comment no longer claims the client has no finalizer: it now says a
+GC finalizer is only a last-resort safeguard. The page's module index gains
+`Temporal.Runtime`, `Temporal.Replay` and `Temporal.Testing`, which the root
+module exports.
+
+odoc does not type-check code blocks, so `test/doc_snippets/` now guards the
+page in every `dune runtest`. A standard-library-only extractor writes the
+page's `{[ ... ]}` blocks, with line directives pointing back at the page,
+into a library that is compiled against the in-tree `temporal-sdk` without
+linking the Rust bridge. The same program fails if the `{!modules: ...}` index
+differs from the `module X = ...` aliases in `lib/public/temporal.ml`. Run
+against the unfixed page, the check reported the original error at
+`index.mld` line 91. Verified on OCaml 5.4.1 (macOS) with `dune build @install`
+and `dune build @test/doc_snippets/runtest @test/api_witness/runtest`.
+## 2026-10-13: Option None inputs are sent as one argument (#1012)
+
+The zero-argument convention from #819 is now decided by the input codec,
+not by the encoded payload's bytes. Previously any input payload equal to
+`{encoding=binary/null; data=""}` was sent as zero payloads, so
+`Codec.option`'s `None` (byte-for-byte identical to `Codec.unit`) reached a
+foreign handler with an optional parameter as no argument at all. Python then
+raised a missing-argument `TypeError`, and the activity or workflow task
+retried forever. Only `Codec.unit` is now sent as zero payloads. Every other
+codec, including an option's `None`, sends exactly one payload, which matches
+the Go, Java, and Python SDKs' single `binary/null` payload for a nil
+argument.
+
+The public codec carries a private `no_argument` marker that only
+`Codec.unit` sets, exposed as `Codec.is_unit`.
+`Codec_private.encode_arguments` applies the rule at every outbound site:
+client start, signal, and update; activity, local-activity, and child-workflow
+scheduling; continue-as-new; and external signals. The private runtime
+commands and backend requests now carry the argument list, so no inner layer
+inspects payload shapes. `Temporal_base.Payload.input_arguments` and
+`is_unit_null` were removed. Decoding is unchanged and backward compatible:
+OCaml receivers still map zero payloads to the unit payload, so an option
+input from an older OCaml sender still decodes as `None`. Core does not
+compare arguments on replay, so existing histories replay.
+
+`test/runtime/test_input_arguments.ml` drives the public API for unit,
+`None`, and `Some` across activities, local activities, child workflows,
+continue-as-new, and external signals, and checks `Codec.is_unit`.
+`test_native_execution` and `test_activation` cover exact forwarding of a
+`binary/null` argument. A live cross-SDK fixture with a Python or Go handler
+is not included, because this environment cannot run the Docker Compose
+stack. Verified with `dune build @install` and the `test/runtime`,
+`test/unit`, `test/bridge`, `test/sdk_supervisor`, and `test/api_witness`
+test aliases on OCaml 5.4.1 (macOS).
+## 2026-10-13: One log record per failed activity attempt (#1024)
+
+An activity attempt that fails or is rejected now produces exactly one log
+record. Previously every ordinary application `Error` was logged twice as an
+`activity_task_rejected` warning: once by the activity adapter and again,
+without correlation, by the public worker loop. The worker loop no longer logs
+retired activity rejections; the adapter's correlated record is the only one.
+The adapter also distinguishes the two causes: an `Error` returned by the
+implementation, which Temporal routinely retries, is logged at `Info` as the
+new `activity_task_failed` operation, while `activity_task_rejected` stays at
+`Warning` for SDK-side refusals (unregistered type, codec or protocol errors,
+or a raised callback). Both still return `Rejected` to the caller and submit
+the same failure completion. `docs/reference/observability.md` documents the
+new operation and drops the stale claim that an activity completion is encoded
+twice (fixed by #995).
+
+`test/runtime/test_native_activity_execution.ml` asserts that an application
+failure yields exactly one correlated `activity_task_failed` record at `Info`
+and no warning. Verified with `dune build @install` and the
+`test/runtime` test alias on OCaml 5.4.1 (macOS).
+
+## 2026-10-12: One encode per activity heartbeat (#1001)
+
+Following #995, activity heartbeats no longer pass through the encoder twice.
+The new private `Temporal_protocol.Encoded_activity_heartbeat` is the
+heartbeat counterpart of `Encoded_activity_completion`: an abstract value only
+its `encode` can build. `Native_activity_execution` encodes each synchronous
+and asynchronous heartbeat once, which still rejects an invalid heartbeat
+before any supervisor call, and `Record_activity_heartbeat` /
+`Record_async_activity_heartbeat` carry that value so the supervisor copies
+its bytes into C unchanged. `Protocol_adapter.encode_activity_heartbeat` is
+gone. An async completion whose submission had an uncertain outcome keeps its
+encoded bytes on its lease, keyed on the handle's own request key
+(`Async_activity.operation_key`, now exported), so every retry the handle
+allows resends that same string instead of re-preparing and re-encoding it. The ABI, Rust code and
+JSON documents are unchanged.
+
+The runtime fakes decode submitted heartbeats strictly and check they are
+canonical, and never encode a submission. `test_async_completion_retry` now
+requires the retried async completion to be physically the string submitted
+first (`==`), and `test_async_retry_reuses_bytes_for_equal_request_key` does
+the same for a `Fail` retried with an explicit `error_type` equal to its
+category's default. New tests cover a single canonical async heartbeat document that
+a later caller-buffer mutation cannot change, encoder-rejected synchronous and
+asynchronous heartbeats that never reach the supervisor, and the supervisor's
+heartbeat bytes and missing-worker rejection.
 ## 2026-10-12: Activity log correlation (#500)
 
 Activity lease records now name the attempt they describe. The native activity

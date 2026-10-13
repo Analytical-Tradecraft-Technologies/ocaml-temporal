@@ -144,7 +144,9 @@ recursive failure fields.
 
 `Temporal.Activity.start` keeps its original two-argument form and also accepts
 labelled options for the Core fields. The activity type comes from the
-definition name, and the input is sent as the one-element argument list.
+definition name, and the input codec decides the argument list: `Codec.unit`
+sends an empty list and every other codec sends exactly one payload, so an
+`option` input of `None` still sends one `binary/null` payload.
 Omitting an activity ID creates `ocaml-activity-<sequence>` from the
 workflow-local deterministic sequence. Omitting a task queue uses the queue
 captured in the execution context; native workers populate that value from

@@ -139,7 +139,9 @@ let start_handle ?scope ?(cancellation_type = Try_cancel) ?retry_policy
       match validate_id id with
       | Error error -> failed_handle error
       | Ok () ->
-          match Codec_private.encode_base (Workflow.input definition) input with
+          match
+            Codec_private.encode_arguments (Workflow.input definition) input
+          with
           | Error error -> failed_handle (Error_private.of_base error)
           | Ok input -> (
               match check_scope scope with

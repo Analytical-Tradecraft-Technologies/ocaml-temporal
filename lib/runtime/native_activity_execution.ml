@@ -9,6 +9,7 @@
 
 module Protocol = Temporal_protocol.Activity_protocol
 module Encoded_completion = Temporal_protocol.Encoded_activity_completion
+module Encoded_heartbeat = Temporal_protocol.Encoded_activity_heartbeat
 module Definition = Temporal_base.Definition
 module Codec = Temporal_base.Codec
 module Base_error = Temporal_base.Error
@@ -39,10 +40,13 @@ module type SUPERVISOR = sig
      never consults the worker task-token ledger. *)
   val complete_async_activity :
     t -> Encoded_completion.t -> (unit, error) result
-  val record_activity_heartbeat : t -> Protocol.heartbeat -> (unit, error) result
+  (* Both heartbeat calls likewise receive the canonical bytes from the
+     adapter's single encoder pass (issue #1001) and never encode again. *)
+  val record_activity_heartbeat :
+    t -> Encoded_heartbeat.t -> (unit, error) result
   (* Records heartbeat details through the namespace-bound async handle. *)
   val record_async_activity_heartbeat :
-    t -> Protocol.heartbeat -> (unit, error) result
+    t -> Encoded_heartbeat.t -> (unit, error) result
   val error_code : error -> string
   val error_message : error -> string
   val error_is_retryable : error -> bool
@@ -148,6 +152,15 @@ type correlation = {
   attempt : int;
 }
 
+(** Why a lease carries a failure completion. [Application_failure] is an
+    ordinary [Error] returned by the activity implementation, which Temporal
+    routinely retries; [Sdk_rejection] is an adapter-side refusal (unknown
+    activity type, codec or protocol error, raised callback) that indicates a
+    worker or caller defect. The distinction only selects the log operation and
+    level (issue #1024); both are acknowledged with the same failure completion
+    and reported to the caller as [Rejected]. *)
+type rejection_origin = Application_failure | Sdk_rejection
+
 (** What the caller should observe after a lease is acknowledged. A rejected
     task carries the original adapter diagnostic so the caller can identify a
     bad registration or payload without inspecting the completion bytes. *)
@@ -156,7 +169,7 @@ type accepted_result =
       kind : completion_kind;
       cancellation_details : cancellation_details option;
     }
-  | Rejected_result of error_view
+  | Rejected_result of { error : error_view; origin : rejection_origin }
   | Async_handoff :
       'output Temporal_base.Async_activity.handle -> accepted_result
 
@@ -191,13 +204,25 @@ type lease = {
 (** An async lease is the capability retained after Core accepts
     [WillCompleteAsync]. It is deliberately kept in a separate map from worker
     task leases because later operations use the namespace-bound Temporal
-    client and must never be sent through the worker completion ledger. *)
+    client and must never be sent through the worker completion ledger.
+
+    [uncertain_completion] holds the request key
+    ([Async_activity.operation_key]) of a terminal operation whose last
+    submission had an unknown native outcome ([Retryable_submission]),
+    together with the bytes of its single encoder pass. The handle admits
+    only a request with that same key until it is resolved, and equal keys
+    mean the same wire request even when the operations differ structurally,
+    so every admitted retry resends these physically identical bytes instead
+    of preparing and encoding the completion again (issue #1001). Any other
+    completion outcome clears it, and a request with a different key is
+    prepared afresh, so it is never sent the retained bytes. *)
 type async_lease =
   | Async_lease :
       {
         token : bytes;
         handle : 'output Temporal_base.Async_activity.handle;
         mutable in_flight : bool;
+        mutable uncertain_completion : (string * Encoded_completion.t) option;
       }
       -> async_lease
 
@@ -421,46 +446,6 @@ let protocol_payload path (payload : Temporal_base.Codec.payload) =
   let* metadata = metadata_loop [] payload.metadata in
   Ok Protocol.{ metadata; data = Bytes.copy payload.data }
 
-(** Converts a Core duration into the runtime's millisecond-only value without
-    silently rounding. Core can represent sub-millisecond durations, but the
-    public OCaml duration intentionally cannot; rejecting those values keeps a
-    heartbeat timeout exact instead of changing its meaning at the boundary. *)
-let runtime_duration path (duration : Protocol.duration) =
-  if Int64.compare duration.seconds 0L < 0 then
-    Error
-      (make_error ~path:(path ^ ".seconds") "invalid_message"
-         "duration must not be negative")
-  else if duration.nanoseconds < 0 || duration.nanoseconds >= 1_000_000_000 then
-    Error
-      (make_error ~path:(path ^ ".nanoseconds") "invalid_message"
-         "nanoseconds are outside protobuf range")
-  else if duration.nanoseconds mod 1_000_000 <> 0 then
-    Error
-      (make_error ~path:(path ^ ".nanoseconds") "unsupported"
-         "sub-millisecond durations are not representable by the runtime")
-  else
-    (* Compute the largest representable whole-millisecond value before
-       multiplying seconds, avoiding an overflowing intermediate Int64. *)
-    let milliseconds_per_second = 1_000L in
-    let milliseconds = Int64.of_int (duration.nanoseconds / 1_000_000) in
-    let maximum_seconds = Int64.div Int64.max_int milliseconds_per_second in
-    let maximum_remainder =
-      Int64.rem Int64.max_int milliseconds_per_second
-    in
-    if Int64.compare duration.seconds maximum_seconds > 0
-       || (Int64.equal duration.seconds maximum_seconds
-          && Int64.compare milliseconds maximum_remainder > 0)
-    then
-      Error
-        (make_error ~path "unsupported"
-           "duration exceeds the runtime millisecond range")
-    else
-      Ok
-        (Temporal_base.Duration.of_ms
-           (Int64.add
-              (Int64.mul duration.seconds milliseconds_per_second)
-              milliseconds))
-
 (** Converts a list of protocol payloads while preserving order and copying
     every body. The indexed path makes malformed metadata diagnosable without
     exposing the payload bytes themselves. *)
@@ -551,32 +536,15 @@ let decode_payloads definition (start : Protocol.activity_start) =
   in
   Ok (input, details)
 
-(** Converts all synchronous callback inputs before dispatch, including the
-    exact heartbeat interval behind [Temporal.Activity.Context.heartbeat_timeout].
-    Asynchronous definitions use [decode_payloads] instead: they have no
-    synchronous heartbeat context, so a sub-millisecond timeout that
-    [runtime_duration] cannot represent exactly must not reject their task;
-    [task_info] exposes it rounded up through [Async_context.info]. Error
-    routing is the same as for [decode_payloads]. *)
-let decode_start definition (start : Protocol.activity_start) =
-  let* input, details = decode_payloads definition start in
-  let* heartbeat_timeout =
-    match start.heartbeat_timeout with
-    | None -> Ok None
-    | Some timeout ->
-        Result.map (fun timeout -> Some timeout)
-          (runtime_duration "$.variant.heartbeat_timeout" timeout)
-  in
-  Ok (input, details, heartbeat_timeout)
-
 (** Converts a task timeout to whole milliseconds for
-    [Temporal.Activity.Info], rounding a sub-millisecond remainder up.
+    [Temporal.Activity.Info] and [Context.heartbeat_timeout], rounding a
+    sub-millisecond remainder up.
 
-    Unlike [runtime_duration], which rejects sub-millisecond heartbeat
-    intervals because heartbeat throttling depends on the exact value, this
-    conversion is total: metadata exposure must never add a task-rejection
-    path. Rounding up keeps a positive timeout positive (zero would read as
-    "already expired"). The result is clamped to 315,576,000,000,999 ms, the
+    The conversion is total: exposing metadata must never add a
+    task-rejection path, so a sub-millisecond heartbeat interval scheduled by
+    another SDK is accepted rather than failing the task (#1032). Rounding up
+    keeps a positive timeout positive (zero would read as "already
+    expired"). The result is clamped to 315,576,000,000,999 ms, the
     largest whole-millisecond protobuf duration and the maximum accepted by
     [Temporal.Duration.of_ms]: rounding up the valid protobuf maximum
     (315,576,000,000 s plus 999,999,999 ns) would otherwise exceed it by one
@@ -597,10 +565,35 @@ let info_duration (duration : Protocol.duration) =
   in
   Temporal_base.Duration.of_ms (Int64.min milliseconds maximum_ms)
 
+(** Projects an optional Core timeout into the public representation. Temporal
+    uses a zero duration to mean "not set": Core fills an absent local
+    schedule-to-close with zero, the server reports an unset heartbeat timeout
+    as zero, and an unset remote schedule-to-close inherits a zero workflow run
+    timeout. Exposing those as [Some 0ms] would make deadline arithmetic
+    conclude the attempt already expired and heartbeat pacing at half the
+    interval spin, so zero becomes [None] as in the Go and Python SDKs and in
+    [Temporal.Testing] (#1032). Any positive value goes through
+    [info_duration]. *)
+let configured_timeout = function
+  | None -> None
+  | Some { Protocol.seconds = 0L; nanoseconds = 0 } -> None
+  | Some duration -> Some (info_duration duration)
+
+(** Converts all synchronous callback inputs before dispatch, including the
+    heartbeat interval behind [Temporal.Activity.Context.heartbeat_timeout],
+    which uses the same total [configured_timeout] projection as
+    [Activity.Info]: an unset (zero) interval is [None] and a sub-millisecond
+    one rounds up, so only the payloads can reject the task. Asynchronous
+    definitions use [decode_payloads] instead because they have no synchronous
+    heartbeat context. Error routing is the same as for [decode_payloads]. *)
+let decode_start definition (start : Protocol.activity_start) =
+  let* input, details = decode_payloads definition start in
+  Ok (input, details, configured_timeout start.heartbeat_timeout)
+
 (** Copies the identity and scheduling facts of a start task into the
     immutable record exposed through [Temporal.Activity.Context.info]. The
     strict protocol decoder has already bounded every string and validated
-    timestamp fractions, and [info_duration] is total, so this projection
+    timestamp fractions, and [configured_timeout] is total, so this projection
     cannot fail. Core's attempt is a uint32, which always fits a native OCaml
     [int] on supported 64-bit targets. *)
 let task_info (start : Protocol.activity_start) : Activity_context.info =
@@ -623,9 +616,9 @@ let task_info (start : Protocol.activity_start) : Activity_context.info =
       timestamp start.current_attempt_scheduled_time;
     started_time = timestamp start.started_time;
     schedule_to_close_timeout =
-      Option.map info_duration start.schedule_to_close_timeout;
-    start_to_close_timeout = Option.map info_duration start.start_to_close_timeout;
-    task_heartbeat_timeout = Option.map info_duration start.heartbeat_timeout;
+      configured_timeout start.schedule_to_close_timeout;
+    start_to_close_timeout = configured_timeout start.start_to_close_timeout;
+    task_heartbeat_timeout = configured_timeout start.heartbeat_timeout;
   }
 
 (** Projects the log-correlation identity of a start task. The strict decoder
@@ -739,6 +732,15 @@ let encode_completion completion =
     (Observability.debug_timed ~src:Observability.Source.bridge
        ~operation:"activity_completion_encode" (fun () ->
          Encoded_completion.encode completion))
+
+(** Validates and serializes one heartbeat in its single strict encoder pass,
+    for both the synchronous context and an asynchronous handle. The
+    supervisor submits the returned bytes unchanged (issue #1001), so an
+    encoder rejection keeps the heartbeat away from the native bridge. *)
+let encode_heartbeat ~path heartbeat =
+  Result.map_error
+    (fun error -> protocol_error ~path error)
+    (Encoded_heartbeat.encode heartbeat)
 
 (** Converts a supervisor completion exception to a stable diagnostic without
     revealing the opaque token or native exception object. *)
@@ -964,11 +966,22 @@ module Make (Supervisor : SUPERVISOR) = struct
       in
       match convert 0 [] payloads with
       | Error _ as error -> error
-      | Ok details ->
+      | Ok details -> (
           let heartbeat = Protocol.{ task_token = Bytes.copy token; details } in
+          (* The heartbeat's only encoder pass; a rejection is a codec error
+             in user-supplied details and never reaches the supervisor. *)
+          match encode_heartbeat ~path:"$.heartbeat" heartbeat with
+          | Error error ->
+              Error
+                (Base_error.make ~category:`Codec
+                   ~message:(
+                     Printf.sprintf "activity heartbeat rejected at %s: %s"
+                       error.path error.message)
+                   ())
+          | Ok encoded -> (
           try
             match
-              Supervisor.record_activity_heartbeat adapter.supervisor heartbeat
+              Supervisor.record_activity_heartbeat adapter.supervisor encoded
             with
             | Ok () -> Ok ()
             | Error source_error ->
@@ -991,7 +1004,7 @@ module Make (Supervisor : SUPERVISOR) = struct
                  ~message:(
                    Printf.sprintf "activity heartbeat failed (%s): %s"
                      source.code source.message)
-                 ())
+                 ())))
     in
     (* Record first, then deliver: Core can only learn of a server-side
        cancellation from a heartbeat response, and the sweep runs even when
@@ -1034,12 +1047,12 @@ module Make (Supervisor : SUPERVISOR) = struct
       ()
 
   (** Owned, fully validated requests ready to cross the supervisor boundary.
-      A completion is carried as its single encoder pass's canonical bytes,
-      which the supervisor submits unchanged. Preparing these values never
-      changes either lease ledger. *)
+      Each is carried as its single encoder pass's canonical bytes, which the
+      supervisor submits unchanged (issues #995 and #1001). Preparing these
+      values never changes either lease ledger. *)
   type async_request =
     | Async_completion of Encoded_completion.t
-    | Async_heartbeat of Protocol.heartbeat
+    | Async_heartbeat of Encoded_heartbeat.t
 
   (** Copies and validates an entire late operation before any native call.
       Payload conversion alone cannot detect duplicate metadata or wire limits;
@@ -1056,8 +1069,8 @@ module Make (Supervisor : SUPERVISOR) = struct
       in
       loop [] payloads
     in
-    (* Build the typed request first; a completion is then encoded exactly
-       once below and only its bytes enter [async_request]. *)
+    (* Build the typed request first; it is then encoded exactly once below
+       and only its bytes enter [async_request]. *)
     let* request =
       match operation with
       | Async_activity.Complete payload ->
@@ -1082,9 +1095,9 @@ module Make (Supervisor : SUPERVISOR) = struct
         let* encoded = encode_completion completion in
         Ok (Async_completion encoded)
     | `Heartbeat heartbeat ->
-        (match Protocol.encode_heartbeat heartbeat with
-        | Ok _ -> Ok (Async_heartbeat heartbeat)
-        | Error error -> Error (protocol_error ~path:"$.async_heartbeat" error))
+        (* Likewise the heartbeat's only encoder pass. *)
+        let* encoded = encode_heartbeat ~path:"$.async_heartbeat" heartbeat in
+        Ok (Async_heartbeat encoded)
 
   (** Maps an adapter-local failure that never received a native answer (a
       missing lease or a supervisor exception) to a lifecycle decision. Such
@@ -1135,9 +1148,22 @@ module Make (Supervisor : SUPERVISOR) = struct
               (base_operation_error "async activity handle" (make_error
                 ~path:"$.async_handle" "busy" "asynchronous activity operation is already in flight")))
         | Some (Async_lease lease) ->
+            (* The handle's own request identity; computed only while an
+               uncertain completion is retained. *)
+            let key =
+              lazy (Async_activity.operation_key operation)
+            in
             let prepared =
-              try prepare_async_request ~token operation with exception_ ->
-                Error (exception_error ~path:"$.async_payload" exception_)
+              match lease.uncertain_completion with
+              | Some (retained_key, encoded)
+                when String.equal retained_key (Lazy.force key) ->
+                  (* A retry of an uncertain terminal submission that the
+                     handle admitted as the same request: resend the bytes
+                     already validated and encoded for it. *)
+                  Ok (Async_completion encoded)
+              | Some _ | None -> (
+                  try prepare_async_request ~token operation with exception_ ->
+                    Error (exception_error ~path:"$.async_payload" exception_))
             in
             match prepared with
             | Error error ->
@@ -1178,6 +1204,16 @@ module Make (Supervisor : SUPERVISOR) = struct
                     | Ok () | Error (Async_activity.Not_submitted _
                         | Async_activity.Rejected_submission _
                         | Async_activity.Retryable_submission _) -> ());
+                    (* Only a terminal request with an unknown native outcome
+                       keeps its bytes for the exact retry the handle allows;
+                       a heartbeat never touches the retained completion. *)
+                    (match (request, result) with
+                    | Async_completion encoded,
+                      Error (Async_activity.Retryable_submission _) ->
+                        lease.uncertain_completion <-
+                          Some (Lazy.force key, encoded)
+                    | Async_completion _, _ -> lease.uncertain_completion <- None
+                    | Async_heartbeat _, _ -> ());
                     result))
 
   (** Submits an already encoded, immutable completion and preserves lease
@@ -1235,7 +1271,13 @@ module Make (Supervisor : SUPERVISOR) = struct
           else (
             adapter.async_leases <-
               Token_map.add token
-                (Async_lease { token = Bytes.copy token; handle; in_flight = false })
+                (Async_lease
+                   {
+                     token = Bytes.copy token;
+                     handle;
+                     in_flight = false;
+                     uncertain_completion = None;
+                   })
                 adapter.async_leases;
             Ok ()))
     in
@@ -1284,10 +1326,20 @@ module Make (Supervisor : SUPERVISOR) = struct
                    kind;
                    cancellation_details;
                  })
-        | Rejected_result error ->
+        | Rejected_result { error; origin } ->
             adapter.leases <- Token_map.remove lease.token adapter.leases;
-            report Logs.Warning ~operation:"activity_task_rejected"
-              ~error_kind:error.code ?correlation:lease.correlation ();
+            (* This is the only record for an acknowledged failure: the worker
+               loop deliberately does not log [Rejected] again (issue #1024).
+               An application [Error] is expected, retried Temporal behaviour,
+               so it is reported at [Info] under its own operation; [Warning]
+               is reserved for SDK-side rejections an operator must fix. *)
+            (match origin with
+            | Application_failure ->
+                report Logs.Info ~operation:"activity_task_failed"
+                  ~error_kind:error.code ?correlation:lease.correlation ()
+            | Sdk_rejection ->
+                report Logs.Warning ~operation:"activity_task_rejected"
+                  ~error_kind:error.code ?correlation:lease.correlation ());
             Ok
               (Rejected
                  {
@@ -1355,7 +1407,7 @@ module Make (Supervisor : SUPERVISOR) = struct
              application details. Encode (and so validate) the fallback too,
              before admission. *)
           let* encoded = encode_completion fallback in
-          Ok (encoded, Rejected_result error)
+          Ok (encoded, Rejected_result { error; origin = Sdk_rejection })
     in
     let lease =
       {
@@ -1389,14 +1441,16 @@ module Make (Supervisor : SUPERVISOR) = struct
     in
     finish_lease adapter lease
 
-  (** Turns an adapter diagnostic into a non-retryable failure completion while
-      preserving the original task token. *)
-  let reject_task_with_failure adapter ~token ~correlation ~failure error =
+  (** Acknowledges the task with [failure] while preserving the original task
+      token. [origin] defaults to [Sdk_rejection]; application [Error] results
+      pass [Application_failure] so they are logged as ordinary failures. *)
+  let reject_task_with_failure ?(origin = Sdk_rejection) adapter ~token
+      ~correlation ~failure error =
     let completion =
       Protocol.{ task_token = Bytes.copy token; result = Failed failure }
     in
     enqueue_and_finish adapter ~token ~correlation ~completion
-      ~accepted_result:(Rejected_result error)
+      ~accepted_result:(Rejected_result { error; origin })
 
   (** Builds the standard adapter failure for registry, codec, and protocol
       errors, all of which are non-retryable because retrying cannot repair the
@@ -1477,8 +1531,8 @@ module Make (Supervisor : SUPERVISOR) = struct
       (start : Protocol.activity_start) =
     let correlation = Some (correlation_of_start start) in
     let process () =
-      (* [decode_payloads], not [decode_start]: the exact heartbeat interval
-         is only needed by synchronous contexts. *)
+      (* [decode_payloads], not [decode_start]: the heartbeat interval is
+         only needed by synchronous contexts. *)
       match decode_payloads definition start with
       | Error error -> reject_task adapter ~token ~correlation error
       | Ok (input, _details) ->
@@ -1554,8 +1608,8 @@ module Make (Supervisor : SUPERVISOR) = struct
                       with
                      | Error error -> reject_task adapter ~token ~correlation error
                      | Ok failure ->
-                         reject_task_with_failure adapter ~token ~correlation
-                           ~failure diagnostic)
+                         reject_task_with_failure ~origin:Application_failure
+                           adapter ~token ~correlation ~failure diagnostic)
                  | Async_activity.Will_complete_async handle ->
                      if start.is_local then begin
                        (* The callback may retain the dormant handle. Close its
@@ -1686,7 +1740,8 @@ module Make (Supervisor : SUPERVISOR) = struct
                             | Error error ->
                                 reject_task adapter ~token ~correlation error
                             | Ok failure ->
-                                reject_task_with_failure adapter ~token
+                                reject_task_with_failure
+                                  ~origin:Application_failure adapter ~token
                                   ~correlation ~failure diagnostic
                           end
                       | Ok (Ok output) ->

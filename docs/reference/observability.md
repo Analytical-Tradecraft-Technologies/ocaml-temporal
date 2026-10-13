@@ -85,7 +85,7 @@ also has a higher-level lifecycle record:
 | Source | Current operation identifiers |
 |---|---|
 | `temporal.sdk.bridge` | `check_abi_version`, `echo`, `conformance_wait_ms`, `runtime_create`, `runtime_close`, `client_connect`, `client_disconnect`, `client_start_workflow_json`, `client_begin_start_workflow_json`, `client_poll_start_workflow_json`, `client_wait_start_workflow_json`, `client_wait_workflow_json`, `client_submit_json`, `client_await_call`, `client_release_call`, `client_cancel_workflow_json`, `client_reset_workflow_json`, `client_terminate_workflow_json`, `client_list_visibility_json`, `client_signal_workflow_json`, `client_query_workflow_json`, `client_update_workflow_json`, `client_poll_update_workflow_json`, `client_complete_async_activity_json`, `client_record_async_activity_heartbeat_json`, `worker_start`, `worker_try_poll_workflow`, `worker_wait_workflow`, `worker_complete_workflow_json`, `worker_reject_workflow_json`, `worker_try_poll_activity`, `worker_wait_activity`, `worker_wait_any`, `worker_wait_activity_completion_retry_backoff`, `worker_complete_activity_json`, `worker_reject_activity_json`, `worker_record_activity_heartbeat_json`, `worker_shutdown`, `replay_worker_start`, `replay_worker_feed_history`, `replay_worker_try_poll_workflow`, `replay_worker_wait_workflow`, `replay_worker_complete_workflow`, `replay_worker_reject_workflow`, `replay_worker_finish_input`, `replay_worker_finalize`, `replay_worker_dispose`; codec timing (Debug only): `workflow_activation_decode`, `workflow_completion_encode`, `activity_task_decode`, `activity_completion_encode` |
-| `temporal.sdk.lifecycle` | `runtime_create`, `runtime_close`, `workflow_task_rejected`, `activity_task_rejected`, `activity_completion_retry`, `worker_run_started`, `worker_run_finished`, `worker_terminal_cleanup`, `worker_terminal_cleanup_failed`, `worker_shutdown`, `worker_shutdown_failed`, `activity_lane_detached`, `worker_shutdown_abandoned_work`, `worker_shutdown_teardown_detached`, `workflow_activation_completed`, `workflow_completion_diagnostic_failed`, `workflow_activation_rejected`, `workflow_poll_not_ready`, `activity_task_started`, `activity_cancellation_delivered`, `activity_task_completed`, `activity_async_handoff_accepted`, `activity_poll_not_ready` |
+| `temporal.sdk.lifecycle` | `runtime_create`, `runtime_close`, `workflow_task_rejected`, `activity_task_failed`, `activity_task_rejected`, `activity_completion_retry`, `worker_run_started`, `worker_run_finished`, `worker_terminal_cleanup`, `worker_terminal_cleanup_failed`, `worker_shutdown`, `worker_shutdown_failed`, `activity_lane_detached`, `worker_shutdown_abandoned_work`, `worker_shutdown_teardown_detached`, `workflow_activation_completed`, `workflow_completion_diagnostic_failed`, `workflow_activation_rejected`, `workflow_poll_not_ready`, `activity_task_started`, `activity_cancellation_delivered`, `activity_task_completed`, `activity_async_handoff_accepted`, `activity_poll_not_ready` |
 | `temporal.sdk.workflow` | `execution_created`, `workflow_started`, `workflow_completed`, `workflow_failed`, `workflow_task_failed`, `workflow_query_unhandled`, `workflow_query_completed`, `workflow_query_failed`, `workflow_update_unhandled`, `workflow_signal_unhandled`, `workflow_signal_received`, `workflow_signal_handled`, `workflow_cancelled`, `execution_evicted`, `activation_ignored`, `activate` |
 
 The bridge source emits a completion record for every bridge call and a
@@ -115,8 +115,8 @@ Below `Debug` these passes run without reading the clock or building tags
 in a production configuration. The records exist for benchmark attribution
 ([#528]); see the live fan-out suite in
 [benchmark-harness.md](benchmark-harness.md#live-fan-out-and-bridge-attribution).
-An activity completion is currently encoded twice, once by each of the last
-two operations.
+Each activity completion is encoded exactly once, by
+`activity_completion_encode`; a retried submission reuses those bytes.
 
 [#528]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/528
 
@@ -131,15 +131,16 @@ matters when diagnosing retries:
 | `activity_task_started` | `Debug` | The adapter is about to dispatch a start task to its registered callback (or to reject it, for example an unregistered type). Emitted before any application code runs. |
 | `activity_cancellation_delivered` | `Debug` | A Core cancellation for the running attempt was delivered to its context during a heartbeat. |
 | `activity_task_completed` | `Debug` | The native worker accepted a terminal completion for the leased task. The adapter retires that lease; it does not call the activity again. |
-| `activity_task_rejected` | `Warning` | The adapter submitted a typed task-level rejection and the lease was retired. This is acknowledged task progress, so the worker loop continues; inspect `temporal.error_kind` for the stable rejection category. |
+| `activity_task_failed` | `Info` | The activity implementation returned an ordinary `Error`, which the adapter submitted as a failure completion, and the lease was retired. This is expected Temporal behaviour: the server applies the retry policy unless the error is non-retryable. `temporal.error_kind` carries the error's kind. |
+| `activity_task_rejected` | `Warning` | The SDK refused the task itself (for example an unregistered activity type, an argument or result codec error, a malformed task, or a callback that raised) and submitted a non-retryable failure completion; the lease was retired. This is acknowledged task progress, so the worker loop continues; inspect `temporal.error_kind` for the stable rejection category. |
 | `activity_completion_retry` | `Warning` | Submission of a terminal completion returned the explicitly retryable bridge status. The exact completion remains retained for a later drain, and the activity callback is not rerun. This event is a transient lease condition, not evidence that the activity ran twice. |
 | `activity_async_handoff_accepted` | `Debug` | Core accepted `Will_complete_async`, moving the task from the worker lease to the namespace-bound asynchronous lease. This is not a terminal activity result; a later `Async_handle.complete`, `fail`, or `cancel` call must retire that lease. |
 
 #### Activity correlation
 
 The adapter's `activity_task_started`, `activity_cancellation_delivered`,
-`activity_task_completed`, `activity_task_rejected`, and
-`activity_async_handoff_accepted` records carry the attempt's identity (#500):
+`activity_task_completed`, `activity_task_failed`, `activity_task_rejected`,
+and `activity_async_handoff_accepted` records carry the attempt's identity (#500):
 `temporal.workflow_id`, `temporal.run_id`, `temporal.workflow_type`,
 `temporal.activity_id`, `temporal.activity_type`, and `temporal.attempt`.
 The started record precedes the callback and the terminal record follows it,
@@ -149,9 +150,11 @@ fields from `Temporal.Activity.Context.info`. The task token is never logged.
 
 Two records do not carry this identity. A bare cancellation whose start this
 worker never received completes with no workflow or activity ID, because
-none is known. The worker loop's own `activity_task_rejected` and
-`activity_completion_retry` records carry only `temporal.error_kind`; use the
-adapter's correlated record for the attempt. Activity records are not
+none is known. The worker loop's own `activity_completion_retry` record
+carries only `temporal.error_kind`; use the adapter's correlated record for
+the attempt. Each failed or rejected attempt produces exactly one
+`activity_task_failed` or `activity_task_rejected` record, emitted by the
+adapter; the worker loop does not log it again (#1024). Activity records are not
 replay-tagged: activities do not replay.
 
 The `activity_async_handoff_accepted` record therefore proves only that the

@@ -69,8 +69,10 @@ let run_client () =
     Temporal.Client.create ~target_url:"http://localhost:7233"
       ~namespace:"default" ()
   in
-  (* The client owns a native handle graph with no finalizer, so shut it down
-     on every path, including typed errors from start or wait. *)
+  (* The client owns a background Domain and a server connection. A GC
+     finalizer is only a last-resort safeguard that may run late or not at
+     all, so shut the client down on every path, including typed errors from
+     start or wait. *)
   let outcome =
     match
       let* handle =
@@ -88,14 +90,16 @@ let run_client () =
   let* terminal = outcome in
   let* () = shutdown in
   match terminal with
-  | Temporal.Client.Completed message -> Ok (print_endline message)
+  | Temporal.Client.Completed { output = message; _ } ->
+      Ok (print_endline message)
   | _ -> Ok (prerr_endline "workflow did not complete")
 ]}
 
 A separate activity worker registers an implementation of ["example.greet"]
 with {!Temporal.Activity.define} and {!Temporal.Worker.activity}. The
 repository's [examples/] directory contains complete, buildable workflow
-worker, activity worker, and client programs.
+worker, activity worker, and client programs. The code blocks on this page
+are compiled against the library in every test run.
 
 {1 Modules}
 
@@ -119,4 +123,7 @@ Temporal.Result_syntax
 Temporal.Duration
 Temporal.Time
 Temporal.Workflow_context
-Temporal.Runtime_info}
+Temporal.Runtime
+Temporal.Runtime_info
+Temporal.Replay
+Temporal.Testing}
