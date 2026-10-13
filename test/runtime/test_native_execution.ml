@@ -427,6 +427,81 @@ let test_activity_failure_details_are_preserved () =
         failwith "wrapped activity application type was not preserved"
   | _ -> failwith "activity failure did not become a typed runtime error"
 
+(** Payload metadata values are arbitrary bytes in Temporal's protocol, and
+    another SDK's codec may store a raw nonce or key ID there (#1048). Before
+    the fix every inbound copy of such a payload failed translation, which on
+    a live worker failed every workflow task of the run. An activity result, a
+    signal input and header, and a failure detail must all carry the bytes
+    unchanged. *)
+let test_binary_metadata_is_lossless () =
+  let binary text : Protocol.payload =
+    {
+      Protocol.metadata =
+        [
+          ("encoding", Bytes.of_string "binary/plain");
+          ("nonce", Bytes.of_string "\xff\x00");
+        ];
+      data = Bytes.of_string text;
+    }
+  in
+  let expected text : Temporal_base.Codec.payload =
+    {
+      Temporal_base.Payload.metadata =
+        [ ("encoding", "binary/plain"); ("nonce", "\xff\x00") ];
+      data = Bytes.of_string text;
+    }
+  in
+  let failure : Protocol.failure =
+    {
+      message = "failed";
+      source = "GoSDK";
+      stack_trace = "";
+      encoded_attributes = None;
+      cause = None;
+      info =
+        Protocol.Application
+          {
+            type_name = "Rejected";
+            non_retryable = true;
+            details = [ binary "detail" ];
+            category = Protocol.Application_category_unspecified;
+            next_retry_delay = None;
+          };
+    }
+  in
+  let translated =
+    unwrap "binary metadata translation"
+      (Native_execution.translate_activation
+         (activation
+            [
+              Protocol.Resolve_activity
+                { seq = 1L; result = Protocol.Completed (Some (binary "result")) };
+              Protocol.Resolve_activity { seq = 2L; result = Failed failure };
+              Protocol.Signal_workflow
+                {
+                  signal_name = "binary";
+                  input = [ binary "signal" ];
+                  identity = "go";
+                  headers = [ ("trace", binary "header") ];
+                };
+            ]))
+  in
+  begin match translated.jobs with
+  | [
+   Activation.Resolve_activity { seq = 1L; result = Ok result };
+   Activation.Resolve_activity { seq = 2L; result = Error error };
+   Activation.Signal_workflow
+     { input = [ input ]; headers = [ ("trace", header) ]; _ };
+  ] ->
+      if result <> expected "result" then
+        failwith "activity result metadata was not carried losslessly";
+      if (Temporal_base.Error.view error).details <> [ expected "detail" ] then
+        failwith "failure detail metadata was not carried losslessly";
+      if input <> expected "signal" || header <> expected "header" then
+        failwith "signal metadata was not carried losslessly"
+  | _ -> failwith "binary metadata changed the translated jobs"
+  end
+
 (** Confirms a child-workflow failure exposes the type of the application
     failure nested under Core's child-workflow wrapper, and that a failure with
     no application layer leaves the type absent instead of inventing one. *)
@@ -1967,15 +2042,53 @@ let test_activity_command_translation_and_validation () =
   expect_error_code "empty child cancellation reason" "invalid_message"
     (Native_execution.command_to_protocol
        (Activation.Cancel_child_workflow { seq = 2L; reason = "" }));
-  let invalid_metadata : Temporal_base.Codec.payload =
+  (* Metadata values are arbitrary bytes (#1048): a payload received with a
+     binary value can be returned unchanged, while keys keep the outbound
+     identifier rule. *)
+  let binary_metadata : Temporal_base.Codec.payload =
     {
-      Temporal_base.Payload.metadata = [ ("encoding", "\255") ];
+      Temporal_base.Payload.metadata =
+        [ ("encoding", "binary/plain"); ("nonce", "\255\000") ];
       data = Bytes.empty;
     }
   in
-  expect_error_code "binary metadata" "invalid_message"
+  begin match
+    unwrap "binary metadata completion"
+      (Native_execution.command_to_protocol
+         (Activation.Complete_workflow binary_metadata))
+  with
+  | Protocol.Complete_workflow { result = Some { metadata; _ } }
+    when List.assoc_opt "nonce" metadata = Some (Bytes.of_string "\255\000") ->
+      ()
+  | _ -> failwith "binary metadata value was not sent losslessly"
+  end;
+  (* A NUL in a key satisfies the bridge protocol's key rule, so a payload
+     received from another SDK can be returned unchanged (#1048). *)
+  let nul_metadata_key : Temporal_base.Codec.payload =
+    {
+      Temporal_base.Payload.metadata = [ ("nul\000key", "value") ];
+      data = Bytes.empty;
+    }
+  in
+  begin match
+    unwrap "NUL metadata key completion"
+      (Native_execution.command_to_protocol
+         (Activation.Complete_workflow nul_metadata_key))
+  with
+  | Protocol.Complete_workflow { result = Some { metadata; _ } }
+    when List.assoc_opt "nul\000key" metadata = Some (Bytes.of_string "value") ->
+      ()
+  | _ -> failwith "metadata key with NUL was not sent unchanged"
+  end;
+  let invalid_metadata_key : Temporal_base.Codec.payload =
+    {
+      Temporal_base.Payload.metadata = [ ("bad\255key", "value") ];
+      data = Bytes.empty;
+    }
+  in
+  expect_error_code "metadata key that is not UTF-8" "invalid_message"
     (Native_execution.command_to_protocol
-       (Activation.Complete_workflow invalid_metadata));
+       (Activation.Complete_workflow invalid_metadata_key));
   let duplicate_metadata : Temporal_base.Codec.payload =
     {
       Temporal_base.Payload.metadata =
@@ -2091,6 +2204,7 @@ let test_activate_translated_encodes_once () =
 
 (** Runs every native-execution translation assertion. *)
 let () =
+  test_binary_metadata_is_lossless ();
   test_start_metadata_snapshot ();
   test_activation_metadata_and_order ();
   test_retained_payloads_are_copied ();

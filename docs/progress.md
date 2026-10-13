@@ -28,6 +28,115 @@ original category and message and keeps its details and failure type, so the
 task fails with no commands and the run stays open, just as with the workflow
 result encoder. A new runtime test drives a failing encoder with every
 category and checks that only the task fails.
+## 2026-10-13: Empty search-attribute upserts emit no command (#1033)
+
+`Workflow.upsert_search_attributes []` used to buffer an
+`UpsertWorkflowSearchAttributes` command with an empty map. Temporal Server
+rejects that command with `BAD_SEARCH_ATTRIBUTES`, and replay emits it again,
+so every retry of the workflow task failed and the run was stuck. The
+workflow context store now treats an empty list as a no-op, as the Python SDK
+does, after the existing sealed-execution check. This is replay-safe because a
+rejected command is never recorded in history. The `Workflow` interface and
+the workflows guide now state that values must be `json/plain` encodings of
+the attribute's type, that a `binary/null` payload removes a key, and that
+`Codec.bytes` or custom codecs are rejected by the server. A runtime test
+checks that empty upserts around a non-empty one emit exactly one command.
+## 2026-10-13: Activity retryability for unrunnable tasks, pause/reset completion, and async lease expiry (#1031, #1022, #1043)
+
+An activity task for a type the worker does not register, or with an input
+it cannot decode, was failed non-retryably, so during a rolling deploy or on
+a queue shared by workers with different registrations the first attempt
+failed the activity permanently (#1031). For a remote activity the adapter
+now reports a retryable application failure: type `NotFoundError` with a
+message listing the registered types for an unknown type (matching the Go,
+Python, TypeScript and .NET SDKs), and the existing type for an undecodable
+input. A local activity, which always runs on the scheduling worker, still
+fails non-retryably, as does an unrepresentable heartbeat context.
+
+A synchronous activity that acknowledged an operator pause or reset was
+completed as cancelled, which the server rejects without a cancellation
+request, leaving the attempt open until it timed out (#1022). When Core's
+primary cancellation reason is `Paused` or `Reset` (Core reports those only
+when no cancellation was requested), the attempt, a start interrupted before
+admission, or a bare cancel task is now failed with a retryable
+`ActivityPause` or `ActivityReset` application failure, as in the Python
+SDK.
+
+An async lease that application code never finished stayed admitted for the
+worker's life, so every later shutdown waited the full grace period and
+reported a lost completion (#1043). Each admitted lease now records its
+attempt deadline (admission plus the shorter close timeout) and its heartbeat
+deadline (heartbeat timeout after admission or the last async heartbeat),
+which are never earlier than the server's; five seconds after either passes
+the lease is closed without a native call and logged as
+`activity_async_lease_expired`. Expiry is checked on admission, on every
+drain, and by the shutdown probe, so a stale lease no longer holds shutdown.
+The workflow guide's async example now retries the retryable "not active
+yet" error on a system thread instead of a one-shot `Domain`, and the guide
+and `Activity.Async_handle` document that every handle must be finished.
+
+`test/runtime/test_native_activity_execution.ml` covers unknown types and
+undecodable inputs for both localities and pause/reset for a running
+attempt, a bare task and a start interrupted before admission;
+`test/runtime/test_native_async_activity.ml` covers lease expiry by each
+close timeout, the slack, heartbeat renewal, the no-timeout case, and expiry
+on admission with an injected clock. Verified with `dune build @install` and
+the `test/runtime` test alias on OCaml 5.4.1 (macOS). A live two-worker or
+`temporal activity pause` test is not included.
+## 2026-10-13: Binary payload metadata is carried losslessly (#1048)
+
+Temporal payload metadata values are bytes, and the protocol layers already
+carried them losslessly as base64, but the three runtime copies of
+`runtime_payload` (workflow activations, workflow start input, and activity
+input and heartbeat details) rejected any value that was not valid UTF-8 and
+any key containing NUL. A Go or Java codec that stores a raw nonce or key ID
+in metadata, or an OCaml `Client.start` memo with binary metadata, therefore
+failed every workflow task of the run (history is immutable) or failed the
+activity non-retryably, even when the codec never looked at that entry. The
+runtime now copies inbound keys and values unchanged; an OCaml `string` is a
+byte string. Outbound `protocol_payload` keeps the strict key rule but
+accepts any value bytes, so a received payload can be returned or forwarded
+unchanged.
+
+`test/runtime/test_native_execution.ml` translates an activity result, a
+failure detail, and a signal input and header carrying a `"\xff\x00"`
+metadata value, and sends a binary value outbound while still rejecting a NUL
+key. `test/runtime/test_native_activity_execution.ml` runs an activity whose
+input carries binary metadata, and the unrepresentable-task and async-handle
+regressions now use a second input value and a NUL key, the remaining
+rejected shapes. Verified with `dune build @install` and the `test/runtime`,
+`test/unit` and `test/bridge` test aliases on OCaml 5.4.1 (macOS).
+## 2026-10-12: SIGPIPE containment (#1041)
+
+A peer-closed connection can no longer kill a Linux worker or client with
+SIGPIPE. Vectored socket writes (`writev`, used by h2, hyper and
+tokio-rustls) raise the signal, and an OCaml host keeps its default,
+terminating action because Rust's startup code that ignores it never runs in
+a static library. The bridge does not change the process-wide disposition;
+it blocks SIGPIPE in the signal mask of every thread it owns (Core's Tokio
+workers and blocking pool through Core's thread-start hook, the cleanup
+threads and the Core log writer) and, for the duration of each ABI call, on
+the application's calling thread, consuming any SIGPIPE raised by the call
+and restoring the caller's exact mask afterwards. The write then fails with
+`EPIPE` through the normal error path. The bridge now declares `libc` (MIT OR
+Apache-2.0, already locked) as a direct dependency, used only on Unix. The design is
+recorded under SIGPIPE containment in the
+[Core bridge reference](reference/core-bridge.md).
+
+`rust/core-bridge/tests/sigpipe_containment.rs` restores the default
+disposition and checks that Core's Tokio threads block the signal, that ABI
+calls restore both unblocked and caller-blocked masks, and that a SIGPIPE
+raised during a guarded call is consumed; on Linux it also drives `writev`
+into reset connections on a blocked thread and inside a guarded call, and
+resets 64 metrics scrapes mid-request before a final scrape succeeds.
+`test/bridge/test_runtime_metrics.ml` repeats the aborted-scrape check from an
+OCaml host with the default disposition. Verified with `cargo test --test
+sigpipe_containment` (the Linux-only cases were also compiled and run on macOS
+by temporarily widening their `cfg`), `cargo clippy --all-targets -D
+warnings`, `cargo fmt --check`, `dune build @install` and
+`dune build @test/bridge/runtest` on OCaml 5.4.1 (macOS). The in-process
+transport-fault proxy still ignores SIGPIPE for its own sockets; a Linux
+fault proxy in a separate process remains future work.
 ## 2026-10-13: Inbound failure types never raise (#1011)
 
 An application failure type written by another SDK, worker or the server
