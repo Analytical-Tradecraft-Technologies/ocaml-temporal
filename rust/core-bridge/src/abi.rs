@@ -427,8 +427,10 @@ enum CallScope {
     Bounded,
     /// A call that left the completion registry (read, or released by an
     /// interrupted caller) while its task was still running (#1019). Its task
-    /// has been aborted and is kept only so disconnect and close can join it;
-    /// it counts against no limit.
+    /// has been aborted and is kept only so disconnect and close can join it.
+    /// It holds no start, wait, or in-flight slot, but its handle still counts
+    /// toward the bound on retained handles: submission joins released tasks
+    /// once the map reaches the in-flight ceiling.
     Released,
 }
 
@@ -728,6 +730,9 @@ pub struct Runtime {
     /// call identifier. Finished tasks are pruned on each submission, and a
     /// call that has left the completion registry is marked
     /// [`CallScope::Released`] there so it stops counting against the limits.
+    /// Released tasks are joined before admission whenever the map has
+    /// reached the in-flight ceiling, so the map never holds more than
+    /// `client_limits.in_flight_calls` handles after a submission.
     pending_calls: HashMap<u64, PendingCall>,
     /// Admission limits of the current connection (#796). Set by a successful
     /// connect and reset to the defaults by disconnect, so a runtime without
@@ -1422,6 +1427,19 @@ impl Runtime {
             }
             _ => CallScope::Bounded,
         };
+        // Hard bound on retained task handles (Codex review on #1077). An
+        // aborted task's handle is only reaped once Tokio has run its
+        // cancellation, so a burst of release-and-resubmit could otherwise
+        // retain released handles (and their request state) without bound.
+        // When the map has reached the in-flight ceiling, join the released
+        // tasks first. They are already aborted, so the join only waits for
+        // their cancellation to run; this happens on the owner thread with
+        // the OCaml runtime lock released, like disconnect's join. Together
+        // with the live-call check below, this keeps
+        // `pending_calls.len() <= in_flight_calls` after every admission.
+        if self.pending_calls.len() >= limits.in_flight_calls {
+            self.reap_released_calls(&handle);
+        }
         let in_flight = self
             .pending_calls
             .values()
@@ -1459,6 +1477,32 @@ impl Runtime {
         crate::client_calls::attach_task(self.call_owner, call, task.abort_handle());
         self.pending_calls.insert(call, PendingCall { scope, task });
         Ok(encoded)
+    }
+
+    /// Removes every [`CallScope::Released`] call from the task map and joins
+    /// its already aborted task on `handle`. Joining waits only for Tokio to
+    /// run each cancellation, so it is bounded; it never detaches a task that
+    /// still owns a connection clone.
+    fn reap_released_calls(&mut self, handle: &tokio::runtime::Handle) {
+        let released = self
+            .pending_calls
+            .iter()
+            .filter(|(_, call)| matches!(call.scope, CallScope::Released))
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>();
+        let tasks = released
+            .into_iter()
+            .filter_map(|id| self.pending_calls.remove(&id))
+            .map(|call| call.task)
+            .collect::<Vec<_>>();
+        if tasks.is_empty() {
+            return;
+        }
+        handle.block_on(async {
+            for task in tasks {
+                let _ = task.await;
+            }
+        });
     }
 
     /// Releases every submitted call and returns task handles still to join.

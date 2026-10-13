@@ -923,9 +923,12 @@ CAMLprim value ocaml_temporal_client_submit_json(value runtime, value kind,
 
 /* Abandon one submitted call without reading it (#807), freeing its slot in
  * the runtime's call ceiling. Like the await stub it borrows no runtime and
- * never blocks on the network: Rust only unregisters and closes the cell
- * under its registry mutex. Negative values map to UINT64_MAX, which Rust
- * treats as unknown (a no-op). */
+ * never blocks on the network: Rust unregisters the cell under its registry
+ * mutex, then closes it and aborts a still-running task through its Tokio
+ * abort handle (#1019), so the call stops holding its wait, start, and
+ * in-flight slots at once. Aborting only schedules cancellation; the runtime
+ * owner still joins the task later. Negative values map to UINT64_MAX, which
+ * Rust treats as unknown (a no-op). */
 CAMLprim value ocaml_temporal_client_release_call(value owner, value call) {
   CAMLparam2(owner, call);
   CAMLlocal1(response);

@@ -34,10 +34,14 @@ At each submission the owner marks any call that has left the registry as
 `Released` and aborts it again, which is idempotent. A released call holds no
 start, wait or in-flight slot, even before its aborted task has finished.
 Its join handle stays in the owner's task map, so disconnect and close still
-join it. The C header and `docs/reference/client-protocol.md` describe the
+join it. Because an abort finishes only once Tokio runs the cancellation,
+submission joins the released tasks whenever the task map has reached the
+in-flight ceiling, so the map never retains more than `max_in_flight_calls`
+handles. The C header, the release stub comment and
+`docs/reference/client-protocol.md` describe the
 new release contract.
 
-Three new tests in `rust/core-bridge/tests/support/client_calls.rs` use the
+Four new tests in `rust/core-bridge/tests/support/client_calls.rs` use the
 callback transport, whose history long polls never answer:
 
 - releasing a pending wait drops its transport long poll with no further
@@ -45,9 +49,11 @@ callback transport, whose history long polls never answer:
 - with the default limits, `max_pending_waits` new distinct waits are
   admitted right after one wait is released;
 - with configured limits of two waits and two in-flight calls, releasing
-  both waits admits two new ones at once.
+  both waits admits two new ones at once;
+- a burst of 500 submit-and-release cycles under a two-call ceiling never
+  retains more than two task handles.
 
-All three fail without the fix. Verified with the crate's library tests and
+All four fail without the fix. Verified with the crate's library tests and
 `tests/abi.rs`, `cargo clippy --lib --tests -D warnings` and
 `cargo fmt --check` (macOS).
 

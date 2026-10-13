@@ -619,6 +619,40 @@ fn released_wait_frees_its_wait_slot() {
     assert_eq!(runtime.close(true), STATUS_OK);
 }
 
+/// A burst of release-and-resubmit never grows the owner's task map past the
+/// in-flight ceiling (Codex review on #1077). Released tasks are aborted but
+/// their handles finish only once Tokio runs the cancellation; submission
+/// joins them once the map is full, so every admission leaves at most
+/// `in_flight_calls` retained handles, and every admission still succeeds.
+#[test]
+fn release_burst_keeps_task_handles_bounded() {
+    let (mut runtime, probe) = connected_runtime();
+    let owner = runtime.call_owner;
+    runtime.client_limits = crate::client_calls::ClientLimits::from_config(Some(2), None, Some(2))
+        .expect("valid limits");
+    for index in 0..500 {
+        let call = submit(
+            &mut runtime,
+            ClientCallKind::Wait,
+            &wait_for(&format!("workflow-{index}")),
+        );
+        assert!(
+            runtime.pending_calls.len() <= 2,
+            "retained {} task handles after admission {index}",
+            runtime.pending_calls.len()
+        );
+        crate::client_calls::release_call(call.0, call.1);
+    }
+    assert_eq!(registered_calls(owner), 0);
+    assert!(runtime.disconnect_client().is_ok());
+    assert!(runtime.pending_calls.is_empty());
+    assert_eq!(
+        probe.released.load(Ordering::SeqCst),
+        probe.long_polls.load(Ordering::SeqCst)
+    );
+    assert_eq!(runtime.close(true), STATUS_OK);
+}
+
 /// With configured limits of two waits and two in-flight calls, releasing
 /// both admitted waits lets two new distinct waits in immediately (#1019):
 /// released calls count against neither limit, while a released call's task
