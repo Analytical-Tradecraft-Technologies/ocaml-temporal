@@ -161,17 +161,31 @@ type correlation = {
     and reported to the caller as [Rejected]. *)
 type rejection_origin = Application_failure | Sdk_rejection
 
+(** The server-side timeouts of an asynchronously completed attempt, in
+    seconds, copied from its start task; [None] means unset. They bound how
+    long the adapter keeps the attempt's async lease (#1043). *)
+type async_timeouts = {
+  start_to_close_s : float option;
+  schedule_to_close_s : float option;
+  heartbeat_s : float option;
+}
+
 (** What the caller should observe after a lease is acknowledged. A rejected
     task carries the original adapter diagnostic so the caller can identify a
-    bad registration or payload without inspecting the completion bytes. *)
+    bad registration or payload without inspecting the completion bytes. An
+    async handoff carries the attempt's timeouts so the admitted lease can
+    expire. *)
 type accepted_result =
   | Completed_result of {
       kind : completion_kind;
       cancellation_details : cancellation_details option;
     }
   | Rejected_result of { error : error_view; origin : rejection_origin }
-  | Async_handoff :
-      'output Temporal_base.Async_activity.handle -> accepted_result
+  | Async_handoff : {
+      handle : 'output Temporal_base.Async_activity.handle;
+      timeouts : async_timeouts;
+    }
+      -> accepted_result
 
 type lease = {
   token : bytes;
@@ -215,16 +229,79 @@ type lease = {
     so every admitted retry resends these physically identical bytes instead
     of preparing and encoding the completion again (issue #1001). Any other
     completion outcome clears it, and a request with a different key is
-    prepared afresh, so it is never sent the retained bytes. *)
+    prepared afresh, so it is never sent the retained bytes.
+
+    [correlation] names the attempt in the expiry record. [attempt_deadline]
+    and [heartbeat_s] bound the lease's life (#1043): once the server must
+    have timed the attempt out, no terminal call can succeed, so the adapter
+    closes the handle and drops the lease instead of letting it hold every
+    later worker shutdown for the full grace period. Both are measured on the
+    worker's monotonic clock, so a wall-clock step (NTP or manual) cannot
+    make a live lease look expired, from moments that are no earlier than the server's own
+    reference points: [attempt_deadline] adds the shorter of the
+    start-to-close and schedule-to-close timeouts to the time of admission,
+    which follows the attempt's start, and [last_progress] (admission, then
+    the end of each async heartbeat call that may have reached the server)
+    follows the server's last recorded heartbeat. The adapter therefore never
+    expires a lease before the server has; it may only expire it later. *)
 type async_lease =
   | Async_lease :
       {
         token : bytes;
         handle : 'output Temporal_base.Async_activity.handle;
+        correlation : correlation option;
+        attempt_deadline : float option;
+        heartbeat_s : float option;
+        mutable last_progress : float;
         mutable in_flight : bool;
         mutable uncertain_completion : (string * Encoded_completion.t) option;
       }
       -> async_lease
+
+(** Extra time, in seconds, beyond the latest moment the server could still
+    accept a terminal call for an async attempt. The deadlines above are
+    already conservative; this margin also covers the delay before the
+    server's timeout task runs. *)
+let async_lease_expiry_slack_s = 5.0
+
+(** Converts one optional task timeout to seconds, treating a zero duration
+    as unset, as [configured_timeout] does for [Activity.Info]. *)
+let timeout_seconds = function
+  | None -> None
+  | Some { Protocol.seconds = 0L; nanoseconds = 0 } -> None
+  | Some { Protocol.seconds; nanoseconds } ->
+      Some (Int64.to_float seconds +. (float_of_int nanoseconds /. 1e9))
+
+(** Copies the timeouts that bound an asynchronous attempt from its start
+    task. *)
+let async_timeouts_of_start (start : Protocol.activity_start) =
+  {
+    start_to_close_s = timeout_seconds start.start_to_close_timeout;
+    schedule_to_close_s = timeout_seconds start.schedule_to_close_timeout;
+    heartbeat_s = timeout_seconds start.heartbeat_timeout;
+  }
+
+(** The attempt deadline of an async lease admitted at [admitted_at]: the
+    shorter configured close timeout after admission, or [None] when the
+    task reported neither (the server always sets one for a remote activity,
+    so [None] only arises from a test double). *)
+let async_attempt_deadline ~admitted_at timeouts =
+  match (timeouts.start_to_close_s, timeouts.schedule_to_close_s) with
+  | None, None -> None
+  | Some timeout, None | None, Some timeout -> Some (admitted_at +. timeout)
+  | Some first, Some second -> Some (admitted_at +. Float.min first second)
+
+(** Whether the server must already have timed out the attempt behind
+    [lease] at time [now]. *)
+let async_lease_expired ~now (Async_lease lease) =
+  let past deadline = now > deadline +. async_lease_expiry_slack_s in
+  (match lease.attempt_deadline with
+  | Some deadline -> past deadline
+  | None -> false)
+  ||
+  match lease.heartbeat_s with
+  | Some timeout -> past (lease.last_progress +. timeout)
+  | None -> false
 
 (** Bounds diagnostics before they are sent to Logs or embedded in a
     non-retryable Temporal failure. Invalid UTF-8 is replaced because the
@@ -284,10 +361,20 @@ let application_error ?(path = "$") error =
   let view = Base_error.view error in
   make_error ~path (Base_error.kind error) view.message
 
-(** Builds a non-retryable application failure used when a task cannot be
-    dispatched locally. Empty details keep the failure independent of mutable
-    application payloads and make it safe to retry completion submission. *)
-let failure_of_error (error : error_view) : Protocol.failure =
+(** Builds the application failure used when a task cannot be dispatched
+    locally. Empty details keep the failure independent of mutable application
+    payloads and make it safe to retry completion submission.
+
+    The default is a non-retryable failure of type
+    ["ocaml_temporal_native_activity"], for defects that another attempt on
+    any worker would repeat (an unrepresentable heartbeat context, an output
+    that cannot be encoded). A task that another worker sharing the queue
+    might be able to run, such as an unregistered activity type or an input
+    this build cannot decode, passes [~non_retryable:false] (and, for an
+    unknown type, [~type_name:"NotFoundError"]) so the activity's retry policy
+    decides, as in the other Temporal SDKs (#1031). *)
+let failure_of_error ?(type_name = "ocaml_temporal_native_activity")
+    ?(non_retryable = true) (error : error_view) : Protocol.failure =
   Protocol.
     {
       message = error.message;
@@ -298,8 +385,8 @@ let failure_of_error (error : error_view) : Protocol.failure =
       info =
         Application
           {
-            type_name = "ocaml_temporal_native_activity";
-            non_retryable = true;
+            type_name;
+            non_retryable;
             details = [];
             category = Application_category_unspecified;
             next_retry_delay = None;
@@ -391,56 +478,36 @@ let cancellation_failure ?(details = []) reason : Protocol.failure =
     }
 
 (** Converts binary protocol metadata to the runtime's string metadata without
-    replacement decoding. Body and metadata bytes are copied so a task can be
+    replacement decoding. Metadata values are arbitrary bytes in Temporal's
+    protocol and an OCaml [string] holds bytes, so keys and values are carried
+    losslessly instead of failing the task (#1048); the protocol decoder has
+    already bounded them. Body and metadata bytes are copied so a task can be
     retained safely after the supervisor releases its source buffer. *)
-let runtime_payload path (payload : Protocol.payload) =
-  (* Accumulate backwards for linear construction, then reverse once so the
-     caller observes metadata in the same order as the protocol task. *)
-  let rec metadata_loop reversed = function
-    | [] -> Ok (List.rev reversed)
-    | (key, bytes) :: rest ->
-        if String.length key = 0 || String.contains key '\000' then
-          Error
-            (make_error ~path:(path ^ ".metadata") "invalid_message"
-               "metadata key must be non-empty and must not contain NUL")
-        else if not (Codec.valid_utf_8 key) then
-          Error
-            (make_error ~path:(path ^ ".metadata.key") "invalid_message"
-               "metadata key must be valid UTF-8")
-        else
-          let value = Bytes.to_string bytes in
-          if not (Codec.valid_utf_8 value) then
-            Error
-              (make_error
-                 ~path:(path ^ ".metadata." ^ key)
-                 "unsupported"
-                 "binary metadata cannot be represented by the runtime")
-          else metadata_loop ((key, value) :: reversed) rest
+let runtime_payload _path (payload : Protocol.payload) =
+  let metadata =
+    List.map (fun (key, bytes) -> (key, Bytes.to_string bytes)) payload.metadata
   in
-  let* metadata = metadata_loop [] payload.metadata in
   Ok { Temporal_base.Payload.metadata; data = Bytes.copy payload.data }
 
 (** Converts a runtime payload into the binary-safe protocol representation,
-    validating metadata before copying it across the ownership boundary. *)
+    validating metadata keys before copying it across the ownership boundary.
+    Keys follow the bridge protocol's rule (non-empty, valid UTF-8, at most
+    65536 bytes; NUL is allowed) and values may be any bytes, so a payload
+    received from Temporal can be returned or heartbeated unchanged. *)
 let protocol_payload path (payload : Temporal_base.Codec.payload) =
   (* Use the same order-preserving construction as [runtime_payload], but turn
      validated strings back into freshly owned byte buffers. *)
   let rec metadata_loop reversed = function
     | [] -> Ok (List.rev reversed)
     | (key, value) :: rest ->
-        if String.length key = 0 || String.contains key '\000' then
+        if String.length key = 0 || String.length key > 65_536 then
           Error
             (make_error ~path:(path ^ ".metadata") "invalid_message"
-               "metadata key must be non-empty and must not contain NUL")
+               "metadata key must be non-empty and at most 65536 bytes")
         else if not (Codec.valid_utf_8 key) then
           Error
             (make_error ~path:(path ^ ".metadata.key") "invalid_message"
                "metadata key must be valid UTF-8")
-        else if not (Codec.valid_utf_8 value) then
-          Error
-            (make_error
-               ~path:(path ^ ".metadata." ^ key)
-               "invalid_message" "metadata value must be valid UTF-8")
         else metadata_loop ((key, Bytes.of_string value) :: reversed) rest
   in
   let* metadata = metadata_loop [] payload.metadata in
@@ -525,16 +592,30 @@ let decode_input definition arguments =
   | Ok input -> Ok input
   | Error error -> Error (application_error ~path:"$.variant.input" error)
 
+(** Which part of a start task could not be converted for the callback. The
+    distinction selects the failure's retryability (#1031): an input that
+    this build cannot decode may come from a newer caller and decode on an
+    updated worker sharing the queue, so it is retried under the activity's
+    retry policy, while an unrepresentable heartbeat context is a property of
+    the recorded task itself and stays non-retryable. *)
+type decode_failure =
+  | Input_rejected of error_view
+  | Context_rejected of error_view
+
 (** Converts the callback input and heartbeat details shared by both
     definition styles. Callers must route any conversion error through
-    [reject_task]: a wire-valid task already owns a native completion lease
-    even when its heartbeat context is unsupported. *)
+    [reject_decode_failure]: a wire-valid task already owns a native
+    completion lease even when its input or heartbeat context is
+    unsupported. *)
 let decode_payloads definition (start : Protocol.activity_start) =
-  let* input = decode_input definition start.input in
-  let* details =
-    runtime_payloads "$.variant.heartbeat_details" start.heartbeat_details
-  in
-  Ok (input, details)
+  match decode_input definition start.input with
+  | Error error -> Error (Input_rejected error)
+  | Ok input -> (
+      match
+        runtime_payloads "$.variant.heartbeat_details" start.heartbeat_details
+      with
+      | Error error -> Error (Context_rejected error)
+      | Ok details -> Ok (input, details))
 
 (** Converts a task timeout to whole milliseconds for
     [Temporal.Activity.Info] and [Context.heartbeat_timeout], rounding a
@@ -640,14 +721,22 @@ let lease_activity_type (lease : lease) =
   Option.map (fun (correlation : correlation) -> correlation.activity_type)
     lease.correlation
 
-(** Finds an executable definition by the Temporal activity type. *)
+(** Finds an executable definition by the Temporal activity type. The
+    rejection names the types this worker does register, as the Go and Python
+    SDKs do, so an operator can spot a worker running an older build; the
+    message is bounded later by [make_error]. *)
 let find_definition definitions activity_type =
   match Name_map.find_opt activity_type definitions with
   | Some definition -> Ok definition
   | None ->
+      let registered = List.map fst (Name_map.bindings definitions) in
       Error
         (make_error ~path:"$.variant.activity_type" "unknown_activity_type"
-           ("no executable activity is registered for type " ^ activity_type))
+           (Printf.sprintf
+              "activity type %s is not registered on this worker; registered \
+               activity types: [%s]"
+              activity_type
+              (String.concat ", " registered)))
 
 (** Adds one definition to the immutable name map and rejects remote-only
     references before the worker can claim a task for them. *)
@@ -800,6 +889,53 @@ let undispatched_failure : Protocol.failure =
           };
     }
 
+(** Returns the failure that must complete an attempt whose Core
+    cancellation came from an operator pause or reset, or [None] when the
+    attempt is completed as cancelled.
+
+    The server accepts [RespondActivityTaskCanceled] only after a
+    cancellation request; it rejects one for a paused or reset attempt, and
+    the attempt then stays open until it times out (#1022). Pinned Core
+    reports [Paused] or [Reset] as the primary reason only when no
+    cancellation was requested (it ranks a request above a reset, and a reset
+    above a pause), so the primary reason alone decides. Like the Python SDK,
+    such an attempt is failed retryably with type ["ActivityPause"] or
+    ["ActivityReset"]: the server holds a paused activity's next attempt until
+    it is unpaused and schedules a reset activity afresh. The other reasons
+    keep the cancelled completion: Core suppresses it for [Not_found] and
+    [Timed_out], and reports it as a failure itself for [Worker_shutdown].
+    [details] are the acknowledging error's validated detail payloads. *)
+let interruption_failure ?(details = []) (cancel : Protocol.activity_cancel) :
+    Protocol.failure option =
+  let failure type_name message =
+    Some
+      Protocol.
+        {
+          message;
+          source = "ocaml-temporal";
+          stack_trace = "";
+          encoded_attributes = None;
+          cause = None;
+          info =
+            Application
+              {
+                type_name;
+                non_retryable = false;
+                details;
+                category = Application_category_unspecified;
+                next_retry_delay = None;
+              };
+        }
+  in
+  match cancel.reason with
+  | Protocol.Cancellation_paused ->
+      failure "ActivityPause" "activity attempt stopped because it was paused"
+  | Cancellation_reset ->
+      failure "ActivityReset" "activity attempt stopped because it was reset"
+  | Cancellation_requested | Cancellation_not_found | Cancellation_timed_out
+  | Cancellation_worker_shutdown ->
+      None
+
 module Make (Supervisor : SUPERVISOR) = struct
   (** State owned by one activity adapter. Definitions never change after
       construction; [leases] contains only copied completions whose opaque
@@ -846,6 +982,9 @@ module Make (Supervisor : SUPERVISOR) = struct
     (* Non-blocking, Domain-safe probe of the owning worker's stop flag,
        exposed to activity contexts. *)
     worker_shutting_down : unit -> bool;
+    (* Monotonic seconds used only to expire async leases (#1043); tests
+       inject a controllable clock. *)
+    now : unit -> float;
   }
 
   (** The public worker handle is the mutex-confined state above. *)
@@ -1018,8 +1157,9 @@ module Make (Supervisor : SUPERVISOR) = struct
       ~worker_shutting_down:adapter.worker_shutting_down ~info ~heartbeat
       ~details ~heartbeat_timeout
 
-  (** Creates the registry without contacting native Core or invoking user code. *)
-  let create ~supervisor ~activities ~worker_shutting_down =
+  (** Creates the registry without contacting native Core or invoking user
+      code. [now] is the clock that expires async leases. *)
+  let create_with_clock ~now ~supervisor ~activities ~worker_shutting_down =
     match build_definitions activities with
     | Error error -> Error error
     | Ok definitions ->
@@ -1035,7 +1175,18 @@ module Make (Supervisor : SUPERVISOR) = struct
             running = None;
             deferred = Queue.create ();
             worker_shutting_down;
+            now;
           }
+
+  (** Creates the registry with the process's monotonic clock, in seconds.
+      Lease expiry only compares elapsed times, so wall-clock adjustments
+      must not affect it. *)
+  let create ~supervisor ~activities ~worker_shutting_down =
+    let now () =
+      Int64.to_float (Temporal_core_bridge.Native_bridge.monotonic_now_ns ())
+      /. 1e9
+    in
+    create_with_clock ~now ~supervisor ~activities ~worker_shutting_down
 
   (** Converts an adapter diagnostic into the base error type expected by an
       asynchronous handle callback. The callback is a private boundary, so a
@@ -1129,6 +1280,28 @@ module Make (Supervisor : SUPERVISOR) = struct
     | Worker_policy.Rejected_live -> Async_activity.Rejected_submission diagnostic
     | Worker_policy.Retired -> Async_activity.Terminal_submission diagnostic
 
+  (** Closes and drops every admitted async lease whose attempt the server
+      must already have timed out (#1043); [async_mutex] must be held, so no
+      operation on such a lease is in flight. A later call on a closed handle
+      returns a non-retryable error, which is what the server would answer
+      with [NotFound]. Each expiry is reported once at [Warning] with the
+      attempt's identity, since it means application code never finished the
+      handle. *)
+  let retire_expired_async_leases_locked adapter =
+    let now = adapter.now () in
+    let expired, live =
+      Token_map.partition
+        (fun _ lease -> async_lease_expired ~now lease)
+        adapter.async_leases
+    in
+    adapter.async_leases <- live;
+    Token_map.iter
+      (fun _ (Async_lease lease) ->
+        ignore (Async_activity.close lease.handle);
+        report Logs.Warning ~operation:"activity_async_lease_expired"
+          ?correlation:lease.correlation ())
+      expired
+
   (** Calls the namespace-bound client only after local validation succeeds.
       The async mutex covers preparation, native submission, and registry
       updates, so shutdown cannot discard a lease during this transaction.
@@ -1196,6 +1369,15 @@ module Make (Supervisor : SUPERVISOR) = struct
                       with exception_ ->
                         Error (async_submission_error name (exception_error ~path exception_))
                     in
+                    (* A heartbeat that may have reached the server restarts
+                       its heartbeat-timeout window there, so it also defers
+                       this lease's expiry (#1043). Treating an uncertain
+                       outcome as progress errs towards keeping the lease. *)
+                    (match (request, result) with
+                    | Async_heartbeat _,
+                      (Ok () | Error (Async_activity.Retryable_submission _)) ->
+                        lease.last_progress <- adapter.now ()
+                    | Async_heartbeat _, Error _ | Async_completion _, _ -> ());
                     (match result with
                     | Ok () when terminal ->
                         adapter.async_leases <- Token_map.remove token adapter.async_leases
@@ -1257,24 +1439,33 @@ module Make (Supervisor : SUPERVISOR) = struct
       registry insertion and lifecycle activation succeed; an unexpected
       activation failure therefore leaves the accepted completion visible to
       drain diagnostics and terminal [discard] (which closes its handle)
-      instead of orphaning it; the lease is never resubmitted. *)
-  let admit_async_lease adapter ~token handle =
+      instead of orphaning it; the lease is never resubmitted. Admission
+      first retires expired leases, so a worker whose application code
+      leaks handles does not accumulate them for its whole life (#1043). *)
+  let admit_async_lease adapter ~token ~correlation ~timeouts handle =
     Mutex.lock adapter.async_mutex;
     let admission =
       Fun.protect
         ~finally:(fun () -> Mutex.unlock adapter.async_mutex)
         (fun () ->
+          retire_expired_async_leases_locked adapter;
           if Token_map.mem token adapter.async_leases then
             Error
               (make_error ~path:"$.async_handle" "duplicate_async_lease"
                  "native accepted an asynchronous activity token twice")
           else (
+            let admitted_at = adapter.now () in
             adapter.async_leases <-
               Token_map.add token
                 (Async_lease
                    {
                      token = Bytes.copy token;
                      handle;
+                     correlation;
+                     attempt_deadline =
+                       async_attempt_deadline ~admitted_at timeouts;
+                     heartbeat_s = timeouts.heartbeat_s;
+                     last_progress = admitted_at;
                      in_flight = false;
                      uncertain_completion = None;
                    })
@@ -1347,8 +1538,11 @@ module Make (Supervisor : SUPERVISOR) = struct
                    error;
                    lease_retired = true;
                  })
-        | Async_handoff handle ->
-            (match admit_async_lease adapter ~token:lease.token handle with
+        | Async_handoff { handle; timeouts } ->
+            (match
+               admit_async_lease adapter ~token:lease.token
+                 ~correlation:lease.correlation ~timeouts handle
+             with
             | Error error ->
                 (* Core has already accepted [WillCompleteAsync], so the lease
                    is retained only as a diagnostic owner of the handle until
@@ -1397,7 +1591,7 @@ module Make (Supervisor : SUPERVISOR) = struct
              that every subsequent poll would reject, and do not admit an async
              handle when its handoff was replaced with a task failure. *)
           (match accepted_result with
-          | Async_handoff handle -> ignore (Async_activity.close handle)
+          | Async_handoff { handle; _ } -> ignore (Async_activity.close handle)
           | Completed_result _ | Rejected_result _ -> ());
           let fallback =
             Protocol.{ task_token = Bytes.copy token;
@@ -1424,7 +1618,7 @@ module Make (Supervisor : SUPERVISOR) = struct
            reserved async handle so a callback cannot retain a capability for
            a task that the adapter rejected before contacting Core. *)
         (match accepted_result with
-        | Async_handoff handle -> ignore (Async_activity.close handle)
+        | Async_handoff { handle; _ } -> ignore (Async_activity.close handle)
         | Completed_result _ | Rejected_result _ -> ());
         Error error
     | Ok () -> Ok lease
@@ -1452,12 +1646,38 @@ module Make (Supervisor : SUPERVISOR) = struct
     enqueue_and_finish adapter ~token ~correlation ~completion
       ~accepted_result:(Rejected_result { error; origin })
 
-  (** Builds the standard adapter failure for registry, codec, and protocol
-      errors, all of which are non-retryable because retrying cannot repair the
-      worker configuration or malformed task. *)
+  (** Builds the standard non-retryable adapter failure for errors that
+      another attempt would repeat on any worker: an output codec or
+      completion-validation error, an unrepresentable heartbeat context, or a
+      protocol defect. An unknown type and an undecodable input use
+      [reject_unrunnable_task] instead. *)
   let reject_task adapter ~token ~correlation error =
     reject_task_with_failure adapter ~token ~correlation
       ~failure:(failure_of_error error) error
+
+  (** Rejects a task that this worker cannot run but another worker polling
+      the same queue might: an unregistered activity type
+      ([type_name = "NotFoundError"], as in the Go, Python, TypeScript and
+      .NET SDKs) or an input this build cannot decode. For a remote activity
+      the failure is retryable, so the activity's retry policy decides and a
+      retry can reach an updated worker during a rolling deploy or on a queue
+      shared by workers with different registrations (#1031). A local
+      activity always runs on the scheduling worker, where a retry would fail
+      the same way, so it stays non-retryable. *)
+  let reject_unrunnable_task ?type_name adapter ~token ~correlation
+      ~(start : Protocol.activity_start) error =
+    reject_task_with_failure adapter ~token ~correlation
+      ~failure:
+        (failure_of_error ?type_name ~non_retryable:start.is_local error)
+      error
+
+  (** Routes a start-task conversion failure: an undecodable input through
+      [reject_unrunnable_task], an unrepresentable heartbeat context through
+      [reject_task]. *)
+  let reject_decode_failure adapter ~token ~correlation ~start = function
+    | Input_rejected error ->
+        reject_unrunnable_task adapter ~token ~correlation ~start error
+    | Context_rejected error -> reject_task adapter ~token ~correlation error
 
   (** Retires a task whose application callback raised. Without [backtrace]
       it must be called directly from the exception handler so the captured
@@ -1492,10 +1712,12 @@ module Make (Supervisor : SUPERVISOR) = struct
   let observed_cancel adapter running =
     with_delivery adapter (fun () -> running.observed)
 
-  (** Completes a running attempt as cancelled after its callback returned a
-      [`Cancelled] error for a delivered Core cancellation. The error's detail
-      payloads become the canceled failure's details; Core's reason and flags
-      stay private outcome metadata, as for an unstarted cancellation. *)
+  (** Completes a running attempt after its callback returned a [`Cancelled]
+      error for a delivered Core cancellation. The error's detail payloads
+      become the details of the canceled failure or, for a pause or reset,
+      of the retryable application failure that [interruption_failure]
+      requires instead (#1022); Core's reason and flags stay private outcome
+      metadata, as for an unstarted cancellation. *)
   let complete_acknowledged_cancellation adapter ~token ~correlation
       (cancel : Protocol.activity_cancel) error =
     let rec details_loop reversed = function
@@ -1509,17 +1731,17 @@ module Make (Supervisor : SUPERVISOR) = struct
     match details_loop [] (Base_error.view error).details with
     | Error error -> reject_task adapter ~token ~correlation error
     | Ok details ->
-        let completion =
-          Protocol.
-            {
-              task_token = Bytes.copy token;
-              result = Cancelled (cancellation_failure ~details cancel.reason);
-            }
+        let result, kind =
+          match interruption_failure ~details cancel with
+          | Some failure -> (Protocol.Failed failure, Failed)
+          | None ->
+              ( Protocol.Cancelled (cancellation_failure ~details cancel.reason),
+                Cancelled )
         in
+        let completion = Protocol.{ task_token = Bytes.copy token; result } in
         enqueue_and_finish adapter ~token ~correlation ~completion
           ~accepted_result:
-            (Completed_result
-               { kind = Cancelled; cancellation_details = cancel.details })
+            (Completed_result { kind; cancellation_details = cancel.details })
 
   (** Executes an asynchronous activity callback. The handle is dormant while
       the callback runs; only an accepted remote [Will_complete_async]
@@ -1534,7 +1756,8 @@ module Make (Supervisor : SUPERVISOR) = struct
       (* [decode_payloads], not [decode_start]: the heartbeat interval is
          only needed by synchronous contexts. *)
       match decode_payloads definition start with
-      | Error error -> reject_task adapter ~token ~correlation error
+      | Error failure ->
+          reject_decode_failure adapter ~token ~correlation ~start failure
       | Ok (input, _details) ->
           (match Definition.implementation definition with
           | None ->
@@ -1641,7 +1864,13 @@ module Make (Supervisor : SUPERVISOR) = struct
                                }
                            in
                            enqueue_and_finish adapter ~token ~correlation
-                             ~completion ~accepted_result:(Async_handoff handle))
+                             ~completion
+                             ~accepted_result:
+                               (Async_handoff
+                                  {
+                                    handle;
+                                    timeouts = async_timeouts_of_start start;
+                                  }))
                with exception_ ->
                  reject_task adapter ~token ~correlation
                    (exception_error ~path:"$.implementation" exception_)))
@@ -1664,7 +1893,9 @@ module Make (Supervisor : SUPERVISOR) = struct
        outer guard catches defects so even an exception retires this lease. *)
     let process () =
       match find_definition adapter.definitions start.activity_type with
-      | Error error -> reject_task adapter ~token ~correlation error
+      | Error error ->
+          reject_unrunnable_task ~type_name:"NotFoundError" adapter ~token
+            ~correlation ~start error
       | Ok (Registered_async_definition definition) ->
           process_async_start adapter token definition start
       | Ok (Registered_definition definition) ->
@@ -1675,7 +1906,9 @@ module Make (Supervisor : SUPERVISOR) = struct
                    "registered activity has no local implementation")
           | Some implementation ->
               (match decode_start definition start with
-              | Error error -> reject_task adapter ~token ~correlation error
+              | Error failure ->
+                  reject_decode_failure adapter ~token ~correlation ~start
+                    failure
               | Ok (input, details, heartbeat_timeout) ->
                   let signal = Activity_context.cancellation_signal () in
                   let running =
@@ -1723,7 +1956,8 @@ module Make (Supervisor : SUPERVISOR) = struct
                         when is_cancelled_error implementation_error
                              && Option.is_some delivered ->
                           (* The callback acknowledged a cancellation that
-                             Core actually requested: report it as one. *)
+                             Core actually delivered: report it as one, or
+                             as the failure a pause or reset requires. *)
                           complete_acknowledged_cancellation adapter ~token
                             ~correlation (Option.get delivered)
                             implementation_error
@@ -1781,17 +2015,18 @@ module Make (Supervisor : SUPERVISOR) = struct
         (exception_error ~path:"$.implementation" exception_)
 
   (** Builds the canceled completion and accepted result for a cancellation
-      whose callback never ran. Its independent Core details are retained on
-      the private outcome for instrumentation. They remain metadata rather
-      than being copied into the Temporal failure. *)
+      whose callback never ran, or the retryable failure that a pause or
+      reset requires instead (#1022). Its independent Core details are
+      retained on the private outcome for instrumentation. They remain
+      metadata rather than being copied into the Temporal failure. *)
   let cancelled_completion token (cancel : Protocol.activity_cancel) =
-    ( Protocol.
-        {
-          task_token = Bytes.copy token;
-          result = Cancelled (cancellation_failure cancel.reason);
-        },
-      Completed_result
-        { kind = Cancelled; cancellation_details = cancel.details } )
+    let result, kind =
+      match interruption_failure cancel with
+      | Some failure -> (Protocol.Failed failure, Failed)
+      | None -> (Protocol.Cancelled (cancellation_failure cancel.reason), Cancelled)
+    in
+    ( Protocol.{ task_token = Bytes.copy token; result },
+      Completed_result { kind; cancellation_details = cancel.details } )
 
   (** Submits the cancelled completion for a task whose callback never ran:
       a bare cancellation, or a deferred start whose cancellation was also
@@ -1919,6 +2154,9 @@ module Make (Supervisor : SUPERVISOR) = struct
         Fun.protect
           ~finally:(fun () -> Mutex.unlock adapter.async_mutex)
           (fun () ->
+            (* A lease whose attempt the server has already timed out can
+               never be finished; it must not hold shutdown (#1043). *)
+            retire_expired_async_leases_locked adapter;
             if Token_map.is_empty adapter.async_leases then Ok ()
             else
               let error =
@@ -1952,7 +2190,7 @@ module Make (Supervisor : SUPERVISOR) = struct
     Token_map.iter
       (fun _ lease ->
         match lease.accepted_result with
-        | Async_handoff handle -> ignore (Async_activity.close handle)
+        | Async_handoff { handle; _ } -> ignore (Async_activity.close handle)
         | Completed_result _ | Rejected_result _ -> ())
       adapter.leases;
     adapter.leases <- Token_map.empty;
@@ -1995,13 +2233,16 @@ module Make (Supervisor : SUPERVISOR) = struct
 
   (** Counts admitted async leases under [async_mutex] only, which a running
       callback never holds. That lock can be held across an async RPC, so it
-      is only tried: a held lock proves a lease is outstanding. *)
+      is only tried: a held lock proves a lease is outstanding. Expired
+      leases are retired first, so they are not counted (#1043). *)
   let outstanding_async_leases adapter =
     if Mutex.try_lock adapter.async_mutex then
       Some
         (Fun.protect
            ~finally:(fun () -> Mutex.unlock adapter.async_mutex)
-           (fun () -> Token_map.cardinal adapter.async_leases))
+           (fun () ->
+             retire_expired_async_leases_locked adapter;
+             Token_map.cardinal adapter.async_leases))
     else None
 
   (** Serializes pending-completion retry, native polling, implementation

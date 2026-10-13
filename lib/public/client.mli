@@ -424,8 +424,9 @@ val wait :
     run of the same workflow. Supply an explicit
     value only when separate cancellation requests for the same run must be
     distinguished. An explicit [request_id] must be non-empty and valid UTF-8.
-    Both [request_id] and [reason] are limited to 65,536 bytes and may not
-    contain NUL; [reason] may be empty. [rpc_timeout] bounds this call
+    Both [request_id] and [reason] are limited to 65,536 bytes, must be valid
+    UTF-8, and may not contain NUL; [reason] may be empty. A malformed
+    [reason] is returned as a non-retryable defect on every backend. [rpc_timeout] bounds this call
     (default 3 seconds); see {{!section-rpc_deadlines} RPC deadlines}. *)
 val cancel :
   ?request_id:string ->
@@ -437,7 +438,9 @@ val cancel :
 (** Terminates the run [handle] addresses immediately. Success means
     Temporal acknowledged the termination RPC; call [wait handle] to observe
     the immutable [Terminated] terminal result. [reason] is bounded operator
-    context and may be empty. The request is re-sent only after the server
+    context and may be empty; it must be valid UTF-8, NUL-free, and no more
+    than 65,536 bytes, or a non-retryable defect is returned on every
+    backend. The request is re-sent only after the server
     rejects it as [resource_exhausted]. If the transport deadline expires or
     the server is unavailable, the returned non-retryable bridge error has
     [rpc_status] [Some `Termination_outcome_uncertain]: the server may have
@@ -459,7 +462,9 @@ val terminate :
     event creates another new run. Pass the same explicit [request_id] to
     retry one logical reset idempotently: Temporal then returns the run created
     by the first accepted request. An explicitly supplied [request_id] must be
-    non-empty, valid UTF-8, NUL-free, and no more than 65,536 bytes.
+    non-empty, valid UTF-8, NUL-free, and no more than 65,536 bytes. [reason]
+    may be empty but is otherwise held to the same rules; violations are
+    non-retryable defects on every backend.
     [workflow_task_finish_event_id] must be greater than 1 and identify a
     workflow-task finish event accepted by Temporal.
     [rpc_timeout] bounds this call (default 3 seconds); see
@@ -512,8 +517,9 @@ val query :
 (** Lists one bounded page of workflow executions using Temporal's visibility
     query language. [page_token] is opaque and may be passed unchanged to a
     later call; when supplied, it must be non-empty, valid UTF-8, NUL-free, and
-    no more than 65,536 bytes. Invalid query metadata is returned as a typed
-    defect. [rpc_timeout] bounds this call (default 10 seconds); see
+    no more than 65,536 bytes. [query] may be empty but must be valid UTF-8,
+    NUL-free, and no more than 65,536 bytes. Invalid query metadata is
+    returned as a typed defect. [rpc_timeout] bounds this call (default 10 seconds); see
     {{!section-rpc_deadlines} RPC deadlines}. *)
 val list_visibility :
   ?page_size:int ->

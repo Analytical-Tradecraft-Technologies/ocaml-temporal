@@ -381,6 +381,7 @@ the `license` field of `cargo metadata` for the locked version.
 | flate2 | 1.1.10 | 1.1.10 | dev | MIT OR Apache-2.0 | Decodes gzip-compressed gRPC requests in the test server double |
 | h2 | 0.4.19 | 0.4.20 | dev | MIT | Plaintext HTTP/2 gRPC test server double |
 | http | 1.5.0 | 1.5.0 | dev | MIT OR Apache-2.0 | HTTP types for the test server double |
+| libc | 0.2.190 | 0.2.190 | normal | MIT OR Apache-2.0 | Unix thread signal-mask calls that keep SIGPIPE from terminating the OCaml host (#1041); tests also lower the descriptor limit so the metrics endpoint's `accept()` fails (#1030) |
 | prost | 0.14.4 | 0.14.4 | normal | Apache-2.0 | Protobuf encoding and decoding of Temporal API messages and replay histories |
 | serde | 1.0.228 | 1.0.229 | normal | MIT OR Apache-2.0 | Private control protocol data model |
 | serde_json | 1.0.150 | 1.0.151 | normal | MIT OR Apache-2.0 | Private JSON control protocol |
@@ -389,7 +390,8 @@ the `license` field of `cargo metadata` for the locked version.
 | temporalio-common | Core revision | 1.1.0 | normal | MIT (reviewed `LICENSE.txt`) | Temporal Core shared types |
 | temporalio-sdk-core | Core revision | 0.10.0 | normal | MIT (reviewed `LICENSE.txt`) | Temporal Core worker state machines |
 | temporalio-protos | Core revision | 0.10.0 | normal | MIT (reviewed `LICENSE.txt`) | Temporal API protobuf types |
-| tokio | 1.52.3 | 1.53.2 | normal, dev | MIT | Core's existing executor, channels, and task handles for the guarded poll lanes; tests also enable `net` |
+| tokio | 1.52.3 | 1.53.2 | normal, dev | MIT | Core's existing executor, channels, and task handles for the guarded poll lanes; `net` and `io-util` for the metrics endpoint's accept loop and relay |
+| tracing | 0.1.44 | 0.1.44 | normal | MIT | Warning and error records from the metrics endpoint, through Core's existing log pipeline |
 | uuid | 1.23.4 | 1.27.0 | normal | Apache-2.0 OR MIT | Random v4 tickets for pending workflow-start operations |
 
 The guarded poll lanes' hand-off channels are intentionally unbounded because
