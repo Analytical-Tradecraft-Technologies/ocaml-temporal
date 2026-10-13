@@ -35,6 +35,297 @@ retargetable entry, an undigested pin, an extra series and a second pin in
 `Dockerfile.dev`. The dependency inventory reads the new pin files. Whether
 Dependabot now opens per-tag digest PRs can only be confirmed by its first
 scheduled run after merge.
+## 2026-10-14: Windows metrics scrape timeout is really 30 s (#1072)
+
+The intermittent Windows failure of `test/bridge/test_runtime_metrics.ml`
+("timed out after 30 s with 0 byte(s) received") was in the test's scrape
+client, not the metrics endpoint. The helper bounded each read with
+`Unix.setsockopt_float socket SO_RCVTIMEO 30.`. On Windows, OCaml passes that
+option as a `struct timeval`, but Winsock reads `SO_RCVTIMEO` as a `DWORD`
+of milliseconds, which is the `tv_sec` field. The bound was therefore 30 ms
+(5 ms before #1058), so any scrape the loaded runner did not answer within a
+few milliseconds failed with nothing received. Linux and macOS read the
+`timeval` correctly, which is why only Windows failed. #1053's relay adds a
+loopback hop, but the failure predates it.
+
+The helper now waits with `Unix.select` against one deadline in seconds,
+which behaves the same on every platform. A timeout raises a dedicated
+exception naming the scrape (first scrape after `create`, after the
+busy-address `create`, or after 64 reset connections), the waiting stage
+(first response byte or rest of the response), the measured elapsed time and
+the bytes received. A new case points the helper at a loopback listener that
+never accepts and requires its 1 s timeout to last about 1 s. The old helper
+fails that case on Windows after about 1 ms. Verified on OCaml 5.4.1 (macOS)
+with `dune build @install` and `dune build @test/bridge/runtest`. The Windows
+x64 CI job is the cross-platform gate. `test/integration/worker_metrics`
+still uses `SO_RCVTIMEO`, which is correct there because that test runs only
+on Linux under Docker Compose.
+
+## 2026-10-13: Temporal.Testing follows server and native-worker semantics (#1035-#1039)
+
+`Temporal.Testing` (`lib/runtime/test_environment.ml`) now matches a server
+and the native worker in five places where tests could pass but production
+would behave differently:
+
+- **Final-activation commands (#1035).** When an activation's commands
+  close the run, the engine drops activity and local-activity schedules,
+  child starts (including `Abandon` children), child cancellations, and
+  external signals and cancellations from that batch. The server records
+  these commands but never dispatches them for a closed run.
+- **Core job order (#1036).** Each activation's jobs are stable-sorted into
+  Core's order: initialization; patches and seeds; signals and updates;
+  other jobs; local-activity resolutions; queries. A signal that arrives
+  with a timer now runs its handler before the root completes, so an
+  acknowledged signal can no longer be lost.
+- **Child retry policies (#1037).** A child that fails with a retry policy
+  is retried as a new run of the same chain. The new run has `attempt + 1`
+  and a `Retry` continuation, and its first activation waits out the
+  backoff in virtual time. The child's `Workflow.info` reports the policy
+  and the command's task queue. The parent sees a non-retryable
+  `Child_workflow` error only once the retries end. Unlimited policies use
+  the `max_activity_attempts` cap.
+- **Native error shapes (#1038).** An activity's `Cancelled`-category
+  error is retried and wrapped like any other failure. Only cancellations
+  produced by the engine reach the workflow as `Cancelled`. Final activity
+  failures are non-retryable and typed with the cause's application type.
+  Dispatch and codec failures are typed `ocaml_temporal_native_activity`,
+  as in `native_activity_execution.ml`. A child that *fails* with a
+  `Cancelled` error reaches its parent as `Child_workflow` with no
+  application type, as Core reports a canceled failure.
+- **Smaller gaps (#1039).** Virtual-time additions saturate, so an
+  overflowing timeout means no limit and `skip` cannot wrap the clock
+  negative. Query-only activations no longer add to `history_length`. A
+  mock replaces the ordinary registration wherever it appears in the list.
+  The documented differences now say that workflow code is never replayed.
+
+`test/unit/test_testing.ml` adds one regression test per issue, covering
+each scenario above, including the coincident timer-and-signal case from
+#1036. Disabling the job sort makes that test fail. Verified with
+`dune build @install` and the `test/unit` test alias on OCaml 5.4.1 (macOS).
+## 2026-10-13: Client reasons and visibility queries are checked for UTF-8 (#1014)
+
+`Client.cancel`, `Client.terminate` and `Client.reset` used to check their
+`~reason` only for length and NUL, and `Client.list_visibility` did the same
+for its `~query`. On a native client, the owner Domain's JSON encoder later
+rejected invalid UTF-8, and that rejection reached the caller as a retryable
+`Bridge` protocol error. A deterministic caller mistake therefore looked
+transient, and the same call succeeded on `mock://`. A shared `validate_text`
+check now rejects oversized, NUL-bearing, or malformed UTF-8 free text at the
+public boundary with a non-retryable defect, so both backends agree. Empty
+reasons and queries remain valid. A unit test covers all four inputs on the
+mock backend.
+## 2026-10-13: Metrics endpoint survives accept errors (#1030)
+
+The Prometheus endpoint no longer stops permanently and silently on the
+first `accept()` error. Core's scrape server returns from its accept loop on
+any error and Core exposes no way to serve its registry elsewhere, so the
+bridge now binds the public listener itself and relays each connection to
+Core's exporter, which listens only on an ephemeral loopback port.
+Connection-scoped errors are skipped. Other errors, such as `EMFILE`, are
+logged as `warn` records with the error kind and OS error number, and
+retried with a backoff that doubles from 10 ms to 1 s. If Core's exporter
+stops anyway (only possible through a resource error on its private
+listener), scrapes receive `503 Service Unavailable` and one `error` record
+is logged instead of the port closing silently. A relayed scrape needs a
+third descriptor for Core's `accept()` and, on Linux, a fourth for the
+follow-up `accept()` that Tokio makes until `WouldBlock`. Linux allocates the
+new descriptor before it checks the queue. Relays therefore keep a reserve of
+three spare descriptors. They release it just before the private `connect()` and
+refill it after Core first responds. When the reserve cannot be refilled,
+scrapes get a transient 503 instead of starving Core's accept loop. Bind
+failures, the reported
+address and release-time socket closure are unchanged. The bridge declares
+`tracing` (MIT, already locked) for these records, enables Tokio's `net` and
+`io-util` features (already compiled for Core), and its tests use `libc`.
+The design is recorded in the
+[Core bridge reference](reference/core-bridge.md), and
+`Runtime.create` and the [observability guide](reference/observability.md)
+document the behavior.
+
+`rust/core-bridge/tests/metrics_accept_retry.rs` lowers the descriptor limit,
+fills every descriptor and connects a scraper, so `accept()` fails with
+`EMFILE`. After descriptors are released, new scrapes are served. On Linux,
+where the kernel keeps the starved connection queued, that connection is
+served too. `rust/core-bridge/tests/metrics_exporter.rs` stops Core's server
+through a test hook and requires a 503 with the explanation on a port that
+stays open, and still requires both sockets to close on release.
+`rust/core-bridge/tests/metrics_core_accept_headroom.rs` keeps the process at
+its descriptor limit, frees two or three descriptors per scrape, and requires
+every answer to be a 200 or the transient 503 and Core's server never to
+stop. Without the reserve, the first starved scrape kills Core's server.
+Verified on macOS with OCaml 5.4.1:
+
+- `cargo test --test metrics_exporter --test metrics_accept_retry --test
+  metrics_core_accept_headroom`, run five times;
+- `cargo clippy --all-targets -D warnings` and `cargo fmt --check`;
+- `scripts/check-dependency-inventory.sh`;
+- `dune build @install` and `dune build @test/bridge/runtest`.
+
+## 2026-10-13: Server-valid inbound values no longer wedge workflows (#1015, #1016, #1017, #1049, #1050)
+
+Several values that Temporal Server or another SDK legitimately sends were
+rejected by the inbound Core-to-semantic conversion. History is immutable,
+so each rejection failed every workflow task of the run (and every replay),
+failed an activity task, or made `Client.wait` fail permanently. The Rust
+conversion and the OCaml decoders now represent these values faithfully or
+degrade them deterministically, while outbound validation stays strict:
+
+- A negative application `next_retry_delay`, which the Go SDK sends when
+  `time.Until(retryAt)` has passed, is carried as absent (#1049).
+- Fields an SDK copies into an activity or child-workflow failure wrapper
+  (including the Java SDK's empty child namespace) are bounded text instead
+  of identifiers, and an absent wrapper type or execution reads as empty;
+  `external_payloads` size details and empty payload metadata keys are
+  dropped while the payload is kept (#1050).
+- Unknown numbers in the advisory enums (continue-as-new suggestion reason,
+  retry state, timeout type, application category, Nexus retry behavior,
+  continuation initiator) read as `unspecified` (#1017).
+- Start-event priority and activity-task priority keep their exact weight
+  bits and only the 64-byte fairness-key bound applies; a start-event retry
+  policy recorded with `maximum_attempts = 1` (which the server does not
+  validate) is carried as recorded, and `Workflow.Info.retry_policy` returns
+  `None` for a policy the public type cannot represent instead of raising
+  (#1016).
+- A Temporal Schedule action carrying the previous result or failure with no
+  previous run ID is represented with an empty continuation run ID, and
+  `Workflow.Info.continued_from_run_id` reports `None` (#1015).
+
+The JSON schemas and `docs/reference/core-protocol.md` document the rules.
+`rust/core-bridge/tests/workflow_protocol.rs` covers negative delays,
+unknown enum numbers, peer-written payload details, SDK-written child
+wrappers, schedule-started runs, and inbound priority (weights 5000, 0.0005,
+NaN, a NUL fairness key) and retry policy (coefficient 0.5, empty error
+type, absent and negative intervals), each round-tripping through the
+semantic JSON while the same priorities remain rejected outbound.
+`test/bridge/test_ocaml_activity_protocol.ml`,
+`test/bridge/test_ocaml_workflow_protocol.ml` and
+`test/runtime/test_execution_info.ml` cover the OCaml decoders and public
+accessors. Verified with `dune build @install`, the `test/bridge`,
+`test/runtime` and `test/unit` aliases on OCaml 5.4.1 (macOS), and the
+focused `cargo test`, `cargo fmt --check` and `cargo clippy -D warnings`
+runs.
+## 2026-10-13: Continue-as-new encoder errors fail only the task (#1034)
+
+`Codec.make` deliberately keeps the identity of an error that a custom encoder
+returns, and the runtime turns a `Fail_workflow` into a workflow-task failure
+only for `Bridge`, `Codec` and `Defect` errors. A continue-as-new successor
+encoder that returned, for example, a `Workflow` error therefore emitted a real
+`FailWorkflowExecution`. The run closed as failed, or started a retry run,
+which contradicted the documented contract. `Workflow.continue_as_new` now
+rewraps any other category as a `Codec` error. The new error names the
+original category and message and keeps its details and failure type, so the
+task fails with no commands and the run stays open, just as with the workflow
+result encoder. A new runtime test drives a failing encoder with every
+category and checks that only the task fails.
+## 2026-10-13: Empty search-attribute upserts emit no command (#1033)
+
+`Workflow.upsert_search_attributes []` used to buffer an
+`UpsertWorkflowSearchAttributes` command with an empty map. Temporal Server
+rejects that command with `BAD_SEARCH_ATTRIBUTES`, and replay emits it again,
+so every retry of the workflow task failed and the run was stuck. The
+workflow context store now treats an empty list as a no-op, as the Python SDK
+does, after the existing sealed-execution check. This is replay-safe because a
+rejected command is never recorded in history. The `Workflow` interface and
+the workflows guide now state that values must be `json/plain` encodings of
+the attribute's type, that a `binary/null` payload removes a key, and that
+`Codec.bytes` or custom codecs are rejected by the server. A runtime test
+checks that empty upserts around a non-empty one emit exactly one command.
+## 2026-10-13: Activity retryability for unrunnable tasks, pause/reset completion, and async lease expiry (#1031, #1022, #1043)
+
+An activity task for a type the worker does not register, or with an input
+it cannot decode, was failed non-retryably, so during a rolling deploy or on
+a queue shared by workers with different registrations the first attempt
+failed the activity permanently (#1031). For a remote activity the adapter
+now reports a retryable application failure: type `NotFoundError` with a
+message listing the registered types for an unknown type (matching the Go,
+Python, TypeScript and .NET SDKs), and the existing type for an undecodable
+input. A local activity, which always runs on the scheduling worker, still
+fails non-retryably, as does an unrepresentable heartbeat context.
+
+A synchronous activity that acknowledged an operator pause or reset was
+completed as cancelled, which the server rejects without a cancellation
+request, leaving the attempt open until it timed out (#1022). When Core's
+primary cancellation reason is `Paused` or `Reset` (Core reports those only
+when no cancellation was requested), the attempt, a start interrupted before
+admission, or a bare cancel task is now failed with a retryable
+`ActivityPause` or `ActivityReset` application failure, as in the Python
+SDK.
+
+An async lease that application code never finished stayed admitted for the
+worker's life, so every later shutdown waited the full grace period and
+reported a lost completion (#1043). Each admitted lease now records its
+attempt deadline (admission plus the shorter close timeout) and its heartbeat
+deadline (heartbeat timeout after admission or the last async heartbeat),
+which are never earlier than the server's; five seconds after either passes
+the lease is closed without a native call and logged as
+`activity_async_lease_expired`. Expiry is checked on admission, on every
+drain, and by the shutdown probe, so a stale lease no longer holds shutdown.
+The workflow guide's async example now retries the retryable "not active
+yet" error on a system thread instead of a one-shot `Domain`, and the guide
+and `Activity.Async_handle` document that every handle must be finished.
+
+`test/runtime/test_native_activity_execution.ml` covers unknown types and
+undecodable inputs for both localities and pause/reset for a running
+attempt, a bare task and a start interrupted before admission;
+`test/runtime/test_native_async_activity.ml` covers lease expiry by each
+close timeout, the slack, heartbeat renewal, the no-timeout case, and expiry
+on admission with an injected clock. Verified with `dune build @install` and
+the `test/runtime` test alias on OCaml 5.4.1 (macOS). A live two-worker or
+`temporal activity pause` test is not included.
+## 2026-10-13: Binary payload metadata is carried losslessly (#1048)
+
+Temporal payload metadata values are bytes, and the protocol layers already
+carried them losslessly as base64, but the three runtime copies of
+`runtime_payload` (workflow activations, workflow start input, and activity
+input and heartbeat details) rejected any value that was not valid UTF-8 and
+any key containing NUL. A Go or Java codec that stores a raw nonce or key ID
+in metadata, or an OCaml `Client.start` memo with binary metadata, therefore
+failed every workflow task of the run (history is immutable) or failed the
+activity non-retryably, even when the codec never looked at that entry. The
+runtime now copies inbound keys and values unchanged; an OCaml `string` is a
+byte string. Outbound `protocol_payload` keeps the strict key rule but
+accepts any value bytes, so a received payload can be returned or forwarded
+unchanged.
+
+`test/runtime/test_native_execution.ml` translates an activity result, a
+failure detail, and a signal input and header carrying a `"\xff\x00"`
+metadata value, and sends a binary value outbound while still rejecting a NUL
+key. `test/runtime/test_native_activity_execution.ml` runs an activity whose
+input carries binary metadata, and the unrepresentable-task and async-handle
+regressions now use a second input value and a NUL key, the remaining
+rejected shapes. Verified with `dune build @install` and the `test/runtime`,
+`test/unit` and `test/bridge` test aliases on OCaml 5.4.1 (macOS).
+## 2026-10-12: SIGPIPE containment (#1041)
+
+A peer-closed connection can no longer kill a Linux worker or client with
+SIGPIPE. Vectored socket writes (`writev`, used by h2, hyper and
+tokio-rustls) raise the signal, and an OCaml host keeps its default,
+terminating action because Rust's startup code that ignores it never runs in
+a static library. The bridge does not change the process-wide disposition;
+it blocks SIGPIPE in the signal mask of every thread it owns (Core's Tokio
+workers and blocking pool through Core's thread-start hook, the cleanup
+threads and the Core log writer) and, for the duration of each ABI call, on
+the application's calling thread, consuming any SIGPIPE raised by the call
+and restoring the caller's exact mask afterwards. The write then fails with
+`EPIPE` through the normal error path. The bridge now declares `libc` (MIT OR
+Apache-2.0, already locked) as a direct dependency, used only on Unix. The design is
+recorded under SIGPIPE containment in the
+[Core bridge reference](reference/core-bridge.md).
+
+`rust/core-bridge/tests/sigpipe_containment.rs` restores the default
+disposition and checks that Core's Tokio threads block the signal, that ABI
+calls restore both unblocked and caller-blocked masks, and that a SIGPIPE
+raised during a guarded call is consumed; on Linux it also drives `writev`
+into reset connections on a blocked thread and inside a guarded call, and
+resets 64 metrics scrapes mid-request before a final scrape succeeds.
+`test/bridge/test_runtime_metrics.ml` repeats the aborted-scrape check from an
+OCaml host with the default disposition. Verified with `cargo test --test
+sigpipe_containment` (the Linux-only cases were also compiled and run on macOS
+by temporarily widening their `cfg`), `cargo clippy --all-targets -D
+warnings`, `cargo fmt --check`, `dune build @install` and
+`dune build @test/bridge/runtest` on OCaml 5.4.1 (macOS). The in-process
+transport-fault proxy still ignores SIGPIPE for its own sockets; a Linux
+fault proxy in a separate process remains future work.
 ## 2026-10-13: Inbound failure types never raise (#1011)
 
 An application failure type written by another SDK, worker or the server

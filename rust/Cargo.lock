@@ -1115,6 +1115,7 @@ dependencies = [
  "flate2",
  "h2",
  "http",
+ "libc",
  "prost",
  "prost-wkt-types",
  "serde",
@@ -1124,6 +1125,7 @@ dependencies = [
  "temporalio-protos",
  "temporalio-sdk-core",
  "tokio",
+ "tracing",
  "uuid",
 ]
 
