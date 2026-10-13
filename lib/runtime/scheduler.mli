@@ -54,6 +54,14 @@ val run_label : t -> string
     fibers, and queued functions. Calling it more than once is safe. *)
 val shutdown : t -> unit
 
+(** Returns, oldest first, and clears the exceptions that escaped workflow
+    fibers after {!shutdown} deactivated the scheduler. Such an exception can
+    only come from cleanup code ([Fun.protect ~finally], an exception handler)
+    of a fiber being discontinued, so {!run} does not report it as [Failed]:
+    the terminal command or eviction that started the teardown stands, and the
+    caller only logs these as diagnostics. *)
+val take_teardown_failures : t -> exn list
+
 (** Performs the private terminal control effect. The polymorphic result gives
     public terminal helpers a natural non-returning type. *)
 val abort_workflow : unit -> 'value

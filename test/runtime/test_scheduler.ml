@@ -624,7 +624,33 @@ let test_drained_callbacks_release_memory () =
   done;
   Scheduler.shutdown scheduler
 
+(** An exception escaping a fiber's cleanup while shutdown discontinues it is
+    kept apart from activation failures (#1021): [run] must not report it, and
+    [take_teardown_failures] returns it once. An exception raised while the
+    scheduler is still active remains an ordinary [Failed] result. *)
+let test_teardown_failures_are_separate () =
+  let scheduler = Scheduler.create () in
+  let future, _resolve = promise scheduler ~outside_error in
+  Scheduler.spawn scheduler (fun () ->
+      Fun.protect
+        ~finally:(fun () -> failwith "cleanup raised")
+        (fun () -> ignore (Temporal.Future.await future)));
+  expect "teardown failure setup" "blocked" (Scheduler.run_label scheduler);
+  Scheduler.shutdown scheduler;
+  (match Scheduler.take_teardown_failures scheduler with
+  | [ Fun.Finally_raised (Failure message) ]
+    when String.equal message "cleanup raised" -> ()
+  | _ -> failwith "cleanup exception was not recorded as a teardown failure");
+  expect "teardown failures are taken once" 0
+    (List.length (Scheduler.take_teardown_failures scheduler));
+  let active = Scheduler.create () in
+  Scheduler.spawn active (fun () -> failwith "active failure");
+  expect "active failure is still reported" "failed" (Scheduler.run_label active);
+  expect "active failure is not a teardown failure" 0
+    (List.length (Scheduler.take_teardown_failures active))
+
 let () =
+  test_teardown_failures_are_separate ();
   test_drained_callbacks_release_memory ();
   test_fifo_resume ();
   test_double_resolution ();
