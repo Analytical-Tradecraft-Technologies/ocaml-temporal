@@ -64,22 +64,42 @@ module History : sig
       the native bridge's payload safety limit. *)
   val max_bytes : int
 
-  (** Accepts the binary protobuf encoding of one Temporal
-      [temporal.api.history.v1.History] message, as returned by the
-      [GetWorkflowExecutionHistory] API, together with the execution's
-      workflow ID, which the History message does not carry.
+  (** Accepts the binary protobuf encoding of one complete Temporal
+      [temporal.api.history.v1.History] message, together with the
+      execution's workflow ID.
 
-      This checks only the bounds that do not need the protobuf schema: the
-      workflow ID must be non-empty valid UTF-8 without NUL and at most 65,536
-      bytes, and the history must be non-empty and at most {!max_bytes}. The
-      protobuf itself and Core's history invariants are checked by {!replay},
-      which reports a malformed history as {!Invalid_history}.
+      Temporal Core replays the run under [workflow_id]; it is what
+      [Temporal.Workflow.info] reports and what any workflow ID derived from
+      it (for example a child workflow ID) is computed from. Histories
+      recorded by Temporal Server 1.21 or later also store the ID in their
+      start event. When that recorded ID is present, {!replay} requires
+      [workflow_id] to equal it and otherwise reports {!Invalid_history}
+      without running workflow code, so a history cannot be replayed under
+      another execution's identity. Older histories do not record it, and
+      then [workflow_id] is used as given.
+
+      This function checks only the bounds that do not need the protobuf
+      schema: the workflow ID must be non-empty valid UTF-8 without NUL and
+      at most 65,536 bytes, and the history must be non-empty and at most
+      {!max_bytes}. The protobuf, the recorded workflow ID, and Core's
+      history invariants are checked by {!replay}, which reports a problem as
+      {!Invalid_history}.
+
+      The history must be complete. One [GetWorkflowExecutionHistory]
+      response is a single page: fetch every page (following
+      [next_page_token] until it is empty) and concatenate their serialized
+      [History] messages; protobuf concatenation of repeated fields yields
+      the complete history. A truncated prefix can still replay
+      successfully, but it proves compatibility only for the tasks it
+      contains; replay cannot tell that later pages are missing.
 
       The Temporal CLI's [temporal workflow show --output json] export is
       protobuf JSON, not this binary encoding; convert it with any protobuf
       library that has the Temporal API descriptors (for example Python's
       [google.protobuf.json_format.Parse] followed by [SerializeToString])
-      before calling this function. *)
+      before calling this function. Older Web UI and [tctl] exports use
+      PascalCase enum names that plain protobuf JSON parsing rejects; see the
+      replay example's README for a conversion that normalizes them. *)
   val of_protobuf : workflow_id:string -> string -> (t, Error.t) result
 
   (** Returns the workflow ID supplied to {!of_protobuf}. *)
@@ -94,7 +114,9 @@ end
     report, and Core does not report OCaml source locations at all. *)
 type mismatch = {
   workflow_id : string;
-      (** The workflow ID supplied to {!History.of_protobuf}. *)
+      (** The workflow ID supplied to {!History.of_protobuf}, which equals
+          the ID recorded in the history whenever the history records
+          one. *)
   workflow_type : string option;
       (** The workflow type recorded in the history's start event, as
           delivered to the replayed workflow. [None] only when Core refused
@@ -147,10 +169,15 @@ type failure =
           [Error] and whose history records that failure replays
           successfully. *)
   | Invalid_history of { message : string }
-      (** The input is not a valid Temporal history: the bytes are not a
-          [History] protobuf, or Core rejected the event sequence (for
-          example a missing start event or malformed workflow-task
-          boundaries). *)
+      (** The input is not a valid Temporal history for this replay: the
+          bytes are not a [History] protobuf; the start event records a
+          different workflow ID than the one supplied, or has no task queue;
+          event IDs are not contiguous from 1, or a [WorkflowTaskStarted]
+          event has no timestamp (as after scrubbing [eventTime]); or Core
+          rejected the event sequence (for example a missing start event,
+          malformed workflow-task boundaries, or an event Core cannot apply in
+          the run's first workflow task). No workflow verdict exists for such
+          a history. *)
   | Unsupported_history of { message : string }
       (** The history is valid but uses a Temporal feature this SDK cannot
           replay yet. *)
@@ -197,8 +224,10 @@ type failure =
 val failure_message : failure -> string
 
 (** Replays [history] against [workflows] and returns [Ok ()] when Core
-    accepted every recorded workflow task. The run must be registered under
-    the workflow type recorded in the history.
+    started the recorded run, delivered it to the registered workflow, and
+    accepted every recorded workflow task. A replay in which Core never
+    started the run is never [Ok ()]; it is {!Invalid_history}. The run must
+    be registered under the workflow type recorded in the history.
 
     [namespace] (default ["default"]) and [task_queue] (default
     ["temporal-replay"]) are reported to workflow code by

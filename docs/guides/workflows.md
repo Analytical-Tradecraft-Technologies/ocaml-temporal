@@ -1407,18 +1407,29 @@ definitions. Only workflow code runs: recorded activity and child-workflow
 results come from the history. `Replay.replay_all` replays a list of
 histories, each in an isolated native graph, and keeps every result.
 
-The input is the binary protobuf encoding of Temporal's
-`temporal.api.history.v1.History` message plus the workflow ID, which the
-message does not carry. `temporal workflow show --output json` produces the
+The input is the binary protobuf encoding of one complete
+`temporal.api.history.v1.History` message plus the execution's workflow ID,
+which the workflow observes through `Workflow.info` during replay. Histories
+from Temporal Server 1.21 or later also record the ID in their start event;
+replay then requires the two to match and reports `Invalid_history` otherwise,
+so one execution's history cannot be replayed under another's ID. A single
+`GetWorkflowExecutionHistory` response is one page: fetch and concatenate
+every page, because a truncated history can still pass while covering only
+its first tasks. `temporal workflow show --output json` produces the
 protobuf **JSON** form, so convert it with a protobuf library that has the
 Temporal API descriptors, for example Python's
-`google.protobuf.json_format.Parse` followed by `SerializeToString`. Exported
-histories contain workflow inputs, results, and signal payloads; treat them as
-production data, and prefer synthetic or scrubbed executions in a repository.
+`google.protobuf.json_format.Parse` followed by `SerializeToString`; the
+[replay example](../../examples/README.md#export-a-history) has a converter
+that also accepts the legacy Web UI and `tctl` JSON shape and several pages.
+Exported histories contain workflow inputs, results, and signal payloads;
+treat them as production data, and prefer synthetic or scrubbed executions in
+a repository. Scrub payloads only: every event must keep its `eventId` and
+`eventTime`.
 
 The result distinguishes:
 
-- `Ok ()`: Core accepted every recorded workflow task, including runs that
+- `Ok ()`: Core started the recorded run, delivered it to the registered
+  workflow, and accepted every recorded workflow task, including runs that
   recorded failed tasks or a deliberate workflow failure.
 - `Nondeterminism`: the code produced a different command sequence, for
   example a removed timer. `message` is Core's complete description, and

@@ -15,6 +15,45 @@ implementation when a later entry documents that work as complete. The
 records the current tested source, named assertions and successful CI job for
 the Temporal acceptance controllers.
 
+## 2026-10-13: Replay rejects histories it cannot truly check (#1045, #1046, #1047)
+
+Offline replay could report `PASS` without running any workflow code, or
+replay a run under the wrong identity. Core auto-fails a run's first
+workflow task itself when it cannot apply an event there, and evicts the run
+with reason `Unspecified`. `Temporal.Replay` treated that reason as cache
+housekeeping, so a history scrubbed of its `eventTime`s replayed as `Ok ()`,
+even against incompatible code. Replay now classifies that eviction as
+`Invalid_history`. As an independent guard, `Ok ()` also requires that the
+registered workflow received the run's `Initialize_workflow` job.
+
+The bridge's admission gate adds the checks that Core's `HistoryInfo` lacks.
+A non-empty workflow ID recorded in the start event (Temporal Server 1.21+)
+must equal the supplied one. The documentation wrongly said histories do not
+record it, and the example CLI silently replayed `order-2.pb` as `order-1`.
+The start event must have a task queue, because Core's replay poll unwraps it
+and its panic stalled replay for 30 seconds before reporting `Replay_error`.
+Event IDs must run from 1 without gaps, and every `WorkflowTaskStarted` event
+needs a timestamp. Each rejection has its own static ABI message. The example
+CLI now reads pipes, process substitution, `/dev/stdin`, and `-` (standard
+input) without seeking. The README conversion recipe accepts legacy
+PascalCase-enum JSON from the Web UI and `tctl`, ignores unknown fields, and
+merges several pages. The docs explain that a single `GetWorkflowExecutionHistory`
+response is only one page.
+
+Evidence: new Rust unit tests in `tests/support/replay_bridge.rs` cover each
+precondition and the ABI messages. `test/bridge/test_public_replay.ml`
+derives invalid histories from a live fixture with a small protobuf wire
+editor. It requires `Invalid_history` against both compatible and changed
+code for scrubbed timestamps, an event-ID gap, a missing task queue, and a
+first-task Core auto-fail (the last case failed with `Ok` before the fix). It
+also checks the recorded-ID rules. `test/replay_cli` covers a mismatched ID,
+piped standard input, and `/dev/stdin`. The recipe was checked by converting
+the example's CLI JSON and a two-page PascalCase variant with unknown fields;
+both produced the checked-in `.pb` byte for byte. Verified with
+`dune build @install`; the `test/bridge` replay tests, `test/replay_cli`,
+`examples/replay`, and `test/history_corpus` aliases; and the Rust
+`replay_bridge`, `replay_abi`, and `application_failure_replay` tests, plus
+`cargo clippy -D warnings` and `cargo fmt --check`, on OCaml 5.4.1 (macOS).
 ## 2026-10-14: Windows metrics scrape timeout is really 30 s (#1072)
 
 The intermittent Windows failure of `test/bridge/test_runtime_metrics.ml`

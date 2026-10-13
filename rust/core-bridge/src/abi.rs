@@ -2981,10 +2981,8 @@ fn replay_worker_failure(error: ReplayWorkerError) -> Failure {
             STATUS_OUTSTANDING_TASKS,
             "Temporal replay worker has not drained all input",
         ),
-        ReplayWorkerError::InvalidHistory(_) => (
-            STATUS_PROTOCOL,
-            "Temporal replay history failed strict validation",
-        ),
+        // Each input category maps to a static, input-free sentence.
+        ReplayWorkerError::InvalidHistory(input) => (STATUS_PROTOCOL, input.abi_message()),
         ReplayWorkerError::CoreInitialization => {
             (STATUS_WORKER, "Temporal replay worker construction failed")
         }
