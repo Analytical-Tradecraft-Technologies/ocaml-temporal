@@ -92,7 +92,9 @@ const FIRST_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Spare descriptors the relays keep open. Releasing them immediately before
 /// a private `connect` leaves one descriptor for the relay's own socket and
 /// one for Core's `accept()` of it, even when the process is otherwise at its
-/// descriptor limit (#1030).
+/// descriptor limit (#1030). Windows keeps no reserve, so the constant is
+/// Unix-only.
+#[cfg(unix)]
 const RESERVED_DESCRIPTORS: usize = 2;
 
 /// Body of the `503` sent once Core's scrape server has stopped, naming the
