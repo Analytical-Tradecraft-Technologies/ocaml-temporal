@@ -57,6 +57,82 @@ close timeout, the slack, heartbeat renewal, the no-timeout case, and expiry
 on admission with an injected clock. Verified with `dune build @install` and
 the `test/runtime` test alias on OCaml 5.4.1 (macOS). A live two-worker or
 `temporal activity pause` test is not included.
+## 2026-10-13: Binary payload metadata is carried losslessly (#1048)
+
+Temporal payload metadata values are bytes, and the protocol layers already
+carried them losslessly as base64, but the three runtime copies of
+`runtime_payload` (workflow activations, workflow start input, and activity
+input and heartbeat details) rejected any value that was not valid UTF-8 and
+any key containing NUL. A Go or Java codec that stores a raw nonce or key ID
+in metadata, or an OCaml `Client.start` memo with binary metadata, therefore
+failed every workflow task of the run (history is immutable) or failed the
+activity non-retryably, even when the codec never looked at that entry. The
+runtime now copies inbound keys and values unchanged; an OCaml `string` is a
+byte string. Outbound `protocol_payload` keeps the strict key rule but
+accepts any value bytes, so a received payload can be returned or forwarded
+unchanged.
+
+`test/runtime/test_native_execution.ml` translates an activity result, a
+failure detail, and a signal input and header carrying a `"\xff\x00"`
+metadata value, and sends a binary value outbound while still rejecting a NUL
+key. `test/runtime/test_native_activity_execution.ml` runs an activity whose
+input carries binary metadata, and the unrepresentable-task and async-handle
+regressions now use a second input value and a NUL key, the remaining
+rejected shapes. Verified with `dune build @install` and the `test/runtime`,
+`test/unit` and `test/bridge` test aliases on OCaml 5.4.1 (macOS).
+## 2026-10-12: SIGPIPE containment (#1041)
+
+A peer-closed connection can no longer kill a Linux worker or client with
+SIGPIPE. Vectored socket writes (`writev`, used by h2, hyper and
+tokio-rustls) raise the signal, and an OCaml host keeps its default,
+terminating action because Rust's startup code that ignores it never runs in
+a static library. The bridge does not change the process-wide disposition;
+it blocks SIGPIPE in the signal mask of every thread it owns (Core's Tokio
+workers and blocking pool through Core's thread-start hook, the cleanup
+threads and the Core log writer) and, for the duration of each ABI call, on
+the application's calling thread, consuming any SIGPIPE raised by the call
+and restoring the caller's exact mask afterwards. The write then fails with
+`EPIPE` through the normal error path. The bridge now declares `libc` (MIT OR
+Apache-2.0, already locked) as a direct dependency, used only on Unix. The design is
+recorded under SIGPIPE containment in the
+[Core bridge reference](reference/core-bridge.md).
+
+`rust/core-bridge/tests/sigpipe_containment.rs` restores the default
+disposition and checks that Core's Tokio threads block the signal, that ABI
+calls restore both unblocked and caller-blocked masks, and that a SIGPIPE
+raised during a guarded call is consumed; on Linux it also drives `writev`
+into reset connections on a blocked thread and inside a guarded call, and
+resets 64 metrics scrapes mid-request before a final scrape succeeds.
+`test/bridge/test_runtime_metrics.ml` repeats the aborted-scrape check from an
+OCaml host with the default disposition. Verified with `cargo test --test
+sigpipe_containment` (the Linux-only cases were also compiled and run on macOS
+by temporarily widening their `cfg`), `cargo clippy --all-targets -D
+warnings`, `cargo fmt --check`, `dune build @install` and
+`dune build @test/bridge/runtest` on OCaml 5.4.1 (macOS). The in-process
+transport-fault proxy still ignores SIGPIPE for its own sockets; a Linux
+fault proxy in a separate process remains future work.
+## 2026-10-13: Inbound failure types never raise (#1011)
+
+An application failure type written by another SDK, worker or the server
+history could contain a control character, invalid UTF-8, or more than the
+65,536 encoded characters that `Error.make` allows; the Rust bridge's own
+truncation marker even begins with a newline. The inbound type went through
+`Error.make`, so `Client.wait`, `start_update` and `wait_update` raised
+`Invalid_argument` instead of returning a typed result, and a workflow
+awaiting such an activity or child failed every workflow task, including on
+replay. `Failure_diagnostic.application_failure_type` now passes the type
+through a deterministic sanitizer: malformed UTF-8 becomes U+FFFD, control
+characters become visible `\uXXXX` escapes, and over-long text is cut at a
+character boundary with a `...` marker. Valid types are unchanged and
+outbound `Error.make` validation stays strict.
+
+`test/bridge/test_failure_diagnostic.ml` covers control characters, NUL,
+invalid UTF-8, a type exactly at the limit, an over-long type ending in the
+bridge marker, multi-byte, quote and control-character cuts, and checks that
+every result is accepted by `Error.make`;
+`test/bridge/test_client_terminal_adapter.ml` drives a tab and newline type
+through the client terminal conversion. Verified with `dune build @install`
+and the focused bridge tests on OCaml 5.4.1 (macOS).
 
 ## 2026-10-13: Unset activity timeouts read as None (#1032)
 

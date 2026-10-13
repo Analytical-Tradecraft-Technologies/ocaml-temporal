@@ -74,9 +74,8 @@ known workflow/retry continuations. The server has already applied it before
 polling; the runtime must not delay the workflow again. An arbitrary previous
 run ID never bypasses validation. The public client exposes no cron/start-delay
 options, and its start documentation warns against sending them through
-another SDK. Payload metadata retains the SDK's existing UTF-8
-string boundary; unsupported binary metadata fails explicitly before workflow
-code runs.
+another SDK. Payload metadata values are arbitrary bytes and reach workflow
+code losslessly (#1048).
 
 ## Validation
 
