@@ -414,7 +414,17 @@ and bridge, read the [documentation guide](../README.md) first.
   earlier uncertain attempt of the same request) but keeps both the handle and
   lease live for a corrected or different operation. Worker drain must still
   report the outstanding obligation. Confirmed `NotFound` maps to
-  `Invalid_state` and closes the handle. The adapter removes the lease exactly
+  `Invalid_state` and closes the handle. These operations are submitted
+  client calls (#1025): the owner Domain only validates and spawns the RPC,
+  and the caller's thread awaits it, so a slow server never holds up the
+  worker's polling and completions. A submitted call reports `NotFound` as
+  the fixed outcome `not_found`, which the supervisor maps back to
+  `Invalid_state`, because an awaited `Invalid_state` means the call itself
+  was closed. The adapter's async lock covers only the claim of a lease
+  (marking it in flight, which refuses a concurrent operation on the same
+  handle) and the recording of the outcome, never the RPC. Async heartbeats
+  are not throttled: each is one server round trip. The adapter removes the
+  lease exactly
   once: on an accepted terminal operation or a retiring error. This decision
   does not change Core worker completion retry policy.
 - Worker shutdown is bounded (#495). Its end-to-end budget is the grace
@@ -425,7 +435,18 @@ and bridge, read the [documentation guide](../README.md) first.
     activity contexts report a worker shutdown. One lanes deadline (now plus
     the grace period) is published with a compare-and-set; whichever of
     `shutdown` and a stopping `run` computes it first wins, so the two agree.
-  - `run` joins its activity Domain only until that deadline. A callback
+  - Temporal Core stops polling the server at once too (#1028). A stopping
+    `run` sends `Initiate_worker_shutdown` after its workflow lane returned
+    (only for a stop, never after a lane failure), and the shutdown thread
+    sends it before the lanes phase; a per-worker atomic makes it one
+    request. The bridge moves its ledger to `Draining`, closes both readiness
+    signals (queued tasks still drain first) and calls Core's
+    `initiate_shutdown`, which never waits for the network. Leased tasks stay
+    completable and heartbeatable until the release, and Core's own
+    graceful-shutdown timer starts then, not after the grace period.
+  - `run` joins its activity Domain only until that deadline, and only while
+    the lane is busy: an idle lane, which is only in a bounded readiness
+    wait, is joined for up to 150 ms past the deadline (#1023). A callback
     still running then is detached: the Domain is not joined, keeps the
     activity adapter lock, keeps its execution-thread identity, and exits on
     its own after the callback returns. `run` then returns. A non-yielding
@@ -438,8 +459,14 @@ and bridge, read the [documentation guide](../README.md) first.
     waited for), retries an explicitly retryable retained completion until
     the same deadline, releases `run_mutex` on the same thread, and only then
     calls `Native.shutdown`. The bridge fails every task still leased to
-    OCaml (an abandoned activity retryably, an abandoned activation as a
-    failed workflow task), so Temporal retries it on another worker.
+    OCaml (an abandoned remote activity retryably, an abandoned activation as
+    a failed workflow task), so Temporal retries it on another worker. A
+    local activity, identified by Core's own local-token predicate, is
+    reported as cancelled instead: Core retries a retryable local failure
+    in-process for about a minute, which held teardown past its timeout
+    (#1029). Its workflow task is failed by the same drain, so nothing is
+    recorded and the next worker re-executes it. Disposal applies the same
+    rule.
   - The caller only waits for the shutdown thread's published outcome, at
     most the teardown timeout after the release began. If the release has
     not finished, the caller returns a report with teardown `Detached`; the
@@ -453,6 +480,12 @@ and bridge, read the [documentation guide](../README.md) first.
     native release error are an `Error`, after the graph is released. Retired
     leases with nothing abandoned stay an `Error`, so a lost lease is never a
     false success.
+  - The lanes probes (`callback_running`, which counts synchronous and
+    asynchronous callbacks alike, and the activation probe) read atomics and
+    take no lock, so the caller can use them while a lane is blocked
+    (#1023). The 250 ms lanes slack covers an idle `run`'s exit: the 150 ms
+    idle-lane allowance, one 10 ms join poll, and one 20 ms watchdog stop
+    slice.
   - Admitted asynchronous activity leases belong to external code, not to
     any callback. When the activity drain is busy (an abandoned callback
     holds the adapter lock), shutdown still counts them through the separate
@@ -498,9 +531,11 @@ and bridge, read the [documentation guide](../README.md) first.
 - Shutdown closes both readiness signals before waking Core polls, but queued
   messages always take precedence over terminal state and are drained before a
   readiness wait reports shutdown or a fatal lane error.
-- Explicit worker shutdown never waits for OCaml after initiating Core
-  shutdown: it completes every leased or queued task itself while joining both
-  poll lanes, waits at most 90 s for the join and 30 s for Core finalization,
+- The native release (`Shutdown_worker`) never waits for OCaml. Core
+  shutdown was normally initiated earlier, when the stop was observed
+  (#1028), and OCaml could complete leased tasks until the release; the
+  release initiates it if not (idempotently) and then completes every leased
+  or queued task itself while joining both poll lanes, waits at most 90 s for the join and 30 s for Core finalization,
   and keeps the worker owned (by the graph or by the finalizer task) until
   `finalize_shutdown` returns. A force-completed lease is reported as
   `Outstanding_tasks` after the worker has been released (issue #769).

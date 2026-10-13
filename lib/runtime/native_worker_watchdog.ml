@@ -38,6 +38,23 @@ let step state ~running ~tick_ms ~deadline_ms =
     watchdog Domain between ticks. *)
 type t = { stop_requested : bool Atomic.t; domain : unit Domain.t }
 
+let stop_poll_s = 0.02
+
+(** Sleeps for [seconds] in slices of at most {!stop_poll_s}, returning early
+    once [stop_requested] is set. A whole-tick sleep made [stop] wait up to
+    250 ms, which delayed [Worker.run]'s return past the bounded-shutdown
+    slack for short grace periods (#1023). The sliced sleep keeps a tick's
+    length unchanged, so detection timing is unaffected. *)
+let sleep_unless_stopped ~stop_requested seconds =
+  let rec loop remaining =
+    if remaining > 0. && not (Atomic.get stop_requested) then begin
+      let slice = Float.min remaining stop_poll_s in
+      Thread.delay slice;
+      loop (remaining -. slice)
+    end
+  in
+  loop seconds
+
 (** Samples until stopped. [Thread.delay] releases the Domain's runtime lock
     while sleeping. Callback exceptions are contained: a diagnostic defect must
     not end detection. *)
@@ -46,7 +63,7 @@ let run ~stop_requested ~deadline_ms ~running_epoch ~abandon =
   let tick_seconds = Float.of_int tick_ms /. 1_000. in
   let rec loop state =
     if not (Atomic.get stop_requested) then begin
-      Thread.delay tick_seconds;
+      sleep_unless_stopped ~stop_requested tick_seconds;
       if not (Atomic.get stop_requested) then begin
         let running = try running_epoch () with _ -> None in
         let state, fire = step state ~running ~tick_ms ~deadline_ms in
@@ -73,8 +90,8 @@ let start ~deadline_ms ~running_epoch ~abandon =
   | domain -> Ok { stop_requested; domain }
   | exception exception_ -> Error exception_
 
-(** Requests exit and joins; the Domain observes the flag after its current
-    tick. *)
+(** Requests exit and joins; the Domain observes the flag within one
+    {!stop_poll_s} sleep slice. *)
 let stop watchdog =
   Atomic.set watchdog.stop_requested true;
   Domain.join watchdog.domain

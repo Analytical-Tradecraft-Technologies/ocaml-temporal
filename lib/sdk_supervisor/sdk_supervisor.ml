@@ -986,6 +986,10 @@ module Native_backend = struct
         Client.poll_update_request ->
         (Client.poll_update_response, Client.client_error) result client_rpc
     | Rpc_visibility : Client.visibility_request -> Client.visibility_page client_rpc
+    | Rpc_async_activity_completion :
+        Temporal_protocol.Encoded_activity_completion.t -> unit client_rpc
+    | Rpc_async_activity_heartbeat :
+        Temporal_protocol.Encoded_activity_heartbeat.t -> unit client_rpc
 
   (** A submitted native call awaiting its completion cell. *)
   type 'value client_call = ('value, Bridge.client_call) Client_call.t
@@ -1060,6 +1064,7 @@ module Native_backend = struct
         Temporal_protocol.Encoded_activity_heartbeat.t -> unit operation
     | Record_async_activity_heartbeat :
         Temporal_protocol.Encoded_activity_heartbeat.t -> unit operation
+    | Initiate_worker_shutdown : unit operation
     | Shutdown_worker : unit operation
     | Disconnect_client : unit operation
     | Client_submit : 'value client_rpc -> 'value client_call operation
@@ -1105,6 +1110,33 @@ module Native_backend = struct
         Ok (Client_call.Completed (decode (Error Protocol_adapter.expired_rpc_deadline_error))))
       ~live:(fun rpc_deadline ->
         submit_encoded runtime kind ~decode (encode (with_deadline rpc_deadline)))
+
+  (** Decodes the outcome of a submitted async activity call (#1025). Rust
+      reports success as an empty value and a task token the server no
+      longer knows as the fixed value [not_found], because an awaited
+      [Invalid_state] is reserved for a call closed by its runtime. The
+      latter is mapped back to the [Invalid_state] error the synchronous
+      bridge operation returns, so the activity adapter classifies both
+      paths identically. *)
+  let decode_async_activity_outcome ~operation = function
+    | Error _ as error -> error
+    | Ok body when Bytes.length body = 0 -> Ok ()
+    | Ok body when Bytes.equal body (Bytes.of_string "not_found") ->
+        Error
+          {
+            Bridge.status = Bridge.Invalid_state;
+            message =
+              Printf.sprintf "Temporal asynchronous activity %s is no longer active"
+                operation;
+          }
+    | Ok _ ->
+        Error
+          {
+            Bridge.status = Bridge.Protocol;
+            message =
+              Printf.sprintf
+                "unexpected outcome of asynchronous activity %s" operation;
+          }
 
   (** Submits one client request on the owner Domain (#807). This only
       validates, encodes, and spawns native work; it never waits for
@@ -1167,6 +1199,16 @@ module Native_backend = struct
           ~with_deadline:(fun rpc_deadline -> { request with rpc_deadline })
           ~encode:Protocol_adapter.encode_client_visibility_request
           ~decode:Protocol_adapter.decode_client_visibility_result
+    | Rpc_async_activity_completion encoded ->
+        (* The activity adapter already encoded the completion exactly once
+           (issue #995); only the C call's owned copy is made here. *)
+        submit_encoded runtime Bridge.Call_async_activity_completion
+          ~decode:(decode_async_activity_outcome ~operation:"completion")
+          (Ok (Temporal_protocol.Encoded_activity_completion.to_bytes encoded))
+    | Rpc_async_activity_heartbeat encoded ->
+        submit_encoded runtime Bridge.Call_async_activity_heartbeat
+          ~decode:(decode_async_activity_outcome ~operation:"heartbeat")
+          (Ok (Temporal_protocol.Encoded_activity_heartbeat.to_bytes encoded))
 
   (** Revalidates the statically linked ABI without exposing the runtime. The
       state argument proves the operation remains ordered with lifecycle use. *)
@@ -1367,6 +1409,7 @@ module Native_backend = struct
            likewise submits the adapter's single-encode bytes unchanged. *)
         Bridge.client_record_async_activity_heartbeat_json runtime
           (Temporal_protocol.Encoded_activity_heartbeat.to_bytes encoded)
+    | Initiate_worker_shutdown -> Bridge.worker_initiate_shutdown runtime
     | Shutdown_worker -> Bridge.worker_shutdown runtime
     | Disconnect_client -> Bridge.client_disconnect runtime
     | Client_submit rpc -> submit_client_rpc runtime rpc
@@ -1445,6 +1488,10 @@ module Native = struct
         Client.poll_update_request ->
         (Client.poll_update_response, Client.client_error) result client_rpc
     | Rpc_visibility : Client.visibility_request -> Client.visibility_page client_rpc
+    | Rpc_async_activity_completion :
+        Temporal_protocol.Encoded_activity_completion.t -> unit client_rpc
+    | Rpc_async_activity_heartbeat :
+        Temporal_protocol.Encoded_activity_heartbeat.t -> unit client_rpc
 
   type 'value client_call = 'value Native_backend.client_call
 
@@ -1518,6 +1565,7 @@ module Native = struct
         Temporal_protocol.Encoded_activity_heartbeat.t -> unit operation
     | Record_async_activity_heartbeat :
         Temporal_protocol.Encoded_activity_heartbeat.t -> unit operation
+    | Initiate_worker_shutdown : unit operation
     | Shutdown_worker : unit operation
     | Disconnect_client : unit operation
     | Client_submit : 'value client_rpc -> 'value client_call operation

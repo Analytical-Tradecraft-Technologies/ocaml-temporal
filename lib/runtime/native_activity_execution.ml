@@ -37,7 +37,9 @@ module type SUPERVISOR = sig
   val complete_activity : t -> Encoded_completion.t -> (unit, error) result
   (* Submits a completion for an activity that has already returned
      [WillCompleteAsync]. This path uses Core's namespace-bound client and
-     never consults the worker task-token ledger. *)
+     never consults the worker task-token ledger. It and
+     [record_async_activity_heartbeat] are called with no adapter lock held
+     and may wait for the server on the calling thread (#1025). *)
   val complete_async_activity :
     t -> Encoded_completion.t -> (unit, error) result
   (* Both heartbeat calls likewise receive the canonical bytes from the
@@ -939,9 +941,11 @@ let interruption_failure ?(details = []) (cancel : Protocol.activity_cancel) :
 module Make (Supervisor : SUPERVISOR) = struct
   (** State owned by one activity adapter. Definitions never change after
       construction; [leases] contains only copied completions whose opaque
-      task-token acknowledgements are still uncertain. Every field except
-      [running] and [deferred] is accessed while [mutex] is held; those two
-      are guarded by [delivery_mutex] (see below). Supervisor calls are made
+      task-token acknowledgements are still uncertain. Every mutable field
+      except [async_leases], [running], [deferred] and [callback_active] is
+      accessed while [mutex] is held; [async_leases] is guarded by
+      [async_mutex], [running] and [deferred] by [delivery_mutex] (see
+      below), and [callback_active] is atomic. Supervisor calls are made
       under [mutex], except the heartbeat and delivery-sweep calls that a
       running callback makes, which rely on the supervisor mailbox being
       safe to call from any Domain. *)
@@ -979,6 +983,11 @@ module Make (Supervisor : SUPERVISOR) = struct
     mutable running : running_attempt option;
     (* FIFO of swept work that [poll] handles before polling the supervisor. *)
     deferred : deferred_work Queue.t;
+    (* Whether an application callback, synchronous or asynchronous, is
+       executing now. Written only by the activity lane around the callback
+       and read by bounded shutdown from any thread, so it is an atomic
+       rather than state behind a lock that a sweep may hold (#1023). *)
+    callback_active : bool Atomic.t;
     (* Non-blocking, Domain-safe probe of the owning worker's stop flag,
        exposed to activity contexts. *)
     worker_shutting_down : unit -> bool;
@@ -1174,6 +1183,7 @@ module Make (Supervisor : SUPERVISOR) = struct
             delivery_mutex = Mutex.create ();
             running = None;
             deferred = Queue.create ();
+            callback_active = Atomic.make false;
             worker_shutting_down;
             now;
           }
@@ -1281,17 +1291,20 @@ module Make (Supervisor : SUPERVISOR) = struct
     | Worker_policy.Retired -> Async_activity.Terminal_submission diagnostic
 
   (** Closes and drops every admitted async lease whose attempt the server
-      must already have timed out (#1043); [async_mutex] must be held, so no
-      operation on such a lease is in flight. A later call on a closed handle
-      returns a non-retryable error, which is what the server would answer
-      with [NotFound]. Each expiry is reported once at [Warning] with the
-      attempt's identity, since it means application code never finished the
-      handle. *)
+      must already have timed out (#1043); [async_mutex] must be held. A
+      lease with an operation in flight is kept until that operation's
+      outcome is recorded: the RPC runs without [async_mutex] (#1025), and a
+      heartbeat that reaches the server defers the expiry. A later call on a
+      closed handle returns a non-retryable error, which is what the server
+      would answer with [NotFound]. Each expiry is reported once at
+      [Warning] with the attempt's identity, since it means application code
+      never finished the handle. *)
   let retire_expired_async_leases_locked adapter =
     let now = adapter.now () in
     let expired, live =
       Token_map.partition
-        (fun _ lease -> async_lease_expired ~now lease)
+        (fun _ (Async_lease lease_fields as lease) ->
+          (not lease_fields.in_flight) && async_lease_expired ~now lease)
         adapter.async_leases
     in
     adapter.async_leases <- live;
@@ -1303,100 +1316,133 @@ module Make (Supervisor : SUPERVISOR) = struct
       expired
 
   (** Calls the namespace-bound client only after local validation succeeds.
-      The async mutex covers preparation, native submission, and registry
-      updates, so shutdown cannot discard a lease during this transaction.
-      Only accepted terminal operations or terminal native errors retire it. *)
+
+      The operation is three steps. Under [async_mutex] the lease is looked
+      up, the request prepared, and the lease marked [in_flight], which
+      refuses a concurrent operation on the same handle. The native call
+      then runs {e without} any adapter lock (#1025): it is a submitted
+      client call that waits for the server on this caller's thread, so a
+      slow server delays only this handle, never another handle's
+      operation, the admission of a new async lease by the activity lane, or
+      a shutdown probe. Finally, under [async_mutex] again, the outcome is
+      recorded and [in_flight] cleared. Only accepted terminal operations or
+      terminal native errors retire the lease.
+
+      Terminal [discard] may run while the call is in flight. It closes the
+      handle and empties the registry, so the last step then finds no lease
+      to update; the caller still receives the call's own outcome. That is
+      safe because [discard] runs only after the native release, when no
+      operation on the handle can be submitted again. *)
   let submit_async_operation adapter ~token operation
       : (unit, Async_activity.submission_error) result =
-    Mutex.lock adapter.async_mutex;
-    Fun.protect
-      ~finally:(fun () -> Mutex.unlock adapter.async_mutex)
-      (fun () ->
-        match Token_map.find_opt token adapter.async_leases with
-        | None ->
-            Error (async_submission_error "async activity handle" (make_error
-              ~path:"$.async_handle" "closed" "asynchronous activity handle is no longer active"))
-        | Some (Async_lease lease) when lease.in_flight ->
-            Error (Async_activity.Not_submitted
-              (base_operation_error "async activity handle" (make_error
-                ~path:"$.async_handle" "busy" "asynchronous activity operation is already in flight")))
-        | Some (Async_lease lease) ->
-            (* The handle's own request identity; computed only while an
-               uncertain completion is retained. *)
-            let key =
-              lazy (Async_activity.operation_key operation)
+    (* Step 1: claim the lease and prepare the request. *)
+    let claimed =
+      Mutex.lock adapter.async_mutex;
+      Fun.protect
+        ~finally:(fun () -> Mutex.unlock adapter.async_mutex)
+        (fun () ->
+          match Token_map.find_opt token adapter.async_leases with
+          | None ->
+              Error (async_submission_error "async activity handle" (make_error
+                ~path:"$.async_handle" "closed" "asynchronous activity handle is no longer active"))
+          | Some (Async_lease lease) when lease.in_flight ->
+              Error (Async_activity.Not_submitted
+                (base_operation_error "async activity handle" (make_error
+                  ~path:"$.async_handle" "busy" "asynchronous activity operation is already in flight")))
+          | Some (Async_lease lease as entry) -> (
+              (* The handle's own request identity; computed only while an
+                 uncertain completion is retained. *)
+              let key = lazy (Async_activity.operation_key operation) in
+              let prepared =
+                match lease.uncertain_completion with
+                | Some (retained_key, encoded)
+                  when String.equal retained_key (Lazy.force key) ->
+                    (* A retry of an uncertain terminal submission that the
+                       handle admitted as the same request: resend the bytes
+                       already validated and encoded for it. *)
+                    Ok (Async_completion encoded)
+                | Some _ | None -> (
+                    try prepare_async_request ~token operation with exception_ ->
+                      Error (exception_error ~path:"$.async_payload" exception_))
+              in
+              match prepared with
+              | Error error ->
+                  Error (Async_activity.Not_submitted
+                    (base_operation_error "async activity payload" error))
+              | Ok request ->
+                  lease.in_flight <- true;
+                  Ok (entry, request, key)))
+    in
+    match claimed with
+    | Error _ as error -> error
+    | Ok ((Async_lease lease as entry), request, key) ->
+        let terminal, name, path =
+          match request with
+          | Async_completion _ ->
+              (true, "async activity completion", "$.async_completion")
+          | Async_heartbeat _ ->
+              (false, "async activity heartbeat", "$.async_heartbeat")
+        in
+        (* Step 2: the native call, with no adapter lock held. Every
+           exception, including one from the supervisor, is an uncertain
+           outcome classified below, so step 3 always runs. *)
+        let result =
+          try
+            let submitted =
+              match request with
+              | Async_completion encoded ->
+                  Supervisor.complete_async_activity adapter.supervisor encoded
+              | Async_heartbeat heartbeat ->
+                  Supervisor.record_async_activity_heartbeat adapter.supervisor heartbeat
             in
-            let prepared =
-              match lease.uncertain_completion with
-              | Some (retained_key, encoded)
-                when String.equal retained_key (Lazy.force key) ->
-                  (* A retry of an uncertain terminal submission that the
-                     handle admitted as the same request: resend the bytes
-                     already validated and encoded for it. *)
-                  Ok (Async_completion encoded)
-              | Some _ | None -> (
-                  try prepare_async_request ~token operation with exception_ ->
-                    Error (exception_error ~path:"$.async_payload" exception_))
+            match submitted with
+            | Ok () -> Ok ()
+            | Error source_error ->
+                Error (async_native_submission_error ~name ~path source_error)
+          with exception_ ->
+            Error (async_submission_error name (exception_error ~path exception_))
+        in
+        (* Step 3: record the outcome on the lease, if it is still the one
+           registered for [token] (terminal [discard] may have run). *)
+        Mutex.lock adapter.async_mutex;
+        Fun.protect
+          ~finally:(fun () -> Mutex.unlock adapter.async_mutex)
+          (fun () ->
+            lease.in_flight <- false;
+            let registered =
+              match Token_map.find_opt token adapter.async_leases with
+              | Some current -> current == entry
+              | None -> false
             in
-            match prepared with
-            | Error error ->
-                Error (Async_activity.Not_submitted
-                  (base_operation_error "async activity payload" error))
-            | Ok request ->
-                lease.in_flight <- true;
-                Fun.protect ~finally:(fun () -> lease.in_flight <- false)
-                  (fun () ->
-                    let terminal, name, path =
-                      match request with
-                      | Async_completion _ ->
-                          (true, "async activity completion", "$.async_completion")
-                      | Async_heartbeat _ ->
-                          (false, "async activity heartbeat", "$.async_heartbeat")
-                    in
-                    let result =
-                      try
-                        let submitted =
-                          match request with
-                          | Async_completion encoded ->
-                              Supervisor.complete_async_activity adapter.supervisor encoded
-                          | Async_heartbeat heartbeat ->
-                              Supervisor.record_async_activity_heartbeat adapter.supervisor heartbeat
-                        in
-                        match submitted with
-                        | Ok () -> Ok ()
-                        | Error source_error ->
-                            Error (async_native_submission_error ~name ~path source_error)
-                      with exception_ ->
-                        Error (async_submission_error name (exception_error ~path exception_))
-                    in
-                    (* A heartbeat that may have reached the server restarts
-                       its heartbeat-timeout window there, so it also defers
-                       this lease's expiry (#1043). Treating an uncertain
-                       outcome as progress errs towards keeping the lease. *)
-                    (match (request, result) with
-                    | Async_heartbeat _,
-                      (Ok () | Error (Async_activity.Retryable_submission _)) ->
-                        lease.last_progress <- adapter.now ()
-                    | Async_heartbeat _, Error _ | Async_completion _, _ -> ());
-                    (match result with
-                    | Ok () when terminal ->
-                        adapter.async_leases <- Token_map.remove token adapter.async_leases
-                    | Error (Async_activity.Terminal_submission _) ->
-                        adapter.async_leases <- Token_map.remove token adapter.async_leases
-                    | Ok () | Error (Async_activity.Not_submitted _
-                        | Async_activity.Rejected_submission _
-                        | Async_activity.Retryable_submission _) -> ());
-                    (* Only a terminal request with an unknown native outcome
-                       keeps its bytes for the exact retry the handle allows;
-                       a heartbeat never touches the retained completion. *)
-                    (match (request, result) with
-                    | Async_completion encoded,
-                      Error (Async_activity.Retryable_submission _) ->
-                        lease.uncertain_completion <-
-                          Some (Lazy.force key, encoded)
-                    | Async_completion _, _ -> lease.uncertain_completion <- None
-                    | Async_heartbeat _, _ -> ());
-                    result))
+            if registered then begin
+              (* A heartbeat that may have reached the server restarts its
+                 heartbeat-timeout window there, so it also defers this
+                 lease's expiry (#1043). Treating an uncertain outcome as
+                 progress errs towards keeping the lease. *)
+              (match (request, result) with
+              | Async_heartbeat _,
+                (Ok () | Error (Async_activity.Retryable_submission _)) ->
+                  lease.last_progress <- adapter.now ()
+              | Async_heartbeat _, Error _ | Async_completion _, _ -> ());
+              (match result with
+              | Ok () when terminal ->
+                  adapter.async_leases <- Token_map.remove token adapter.async_leases
+              | Error (Async_activity.Terminal_submission _) ->
+                  adapter.async_leases <- Token_map.remove token adapter.async_leases
+              | Ok () | Error (Async_activity.Not_submitted _
+                  | Async_activity.Rejected_submission _
+                  | Async_activity.Retryable_submission _) -> ());
+              (* Only a terminal request with an unknown native outcome
+                 keeps its bytes for the exact retry the handle allows; a
+                 heartbeat never touches the retained completion. *)
+              match (request, result) with
+              | Async_completion encoded,
+                Error (Async_activity.Retryable_submission _) ->
+                  lease.uncertain_completion <- Some (Lazy.force key, encoded)
+              | Async_completion _, _ -> lease.uncertain_completion <- None
+              | Async_heartbeat _, _ -> ()
+            end;
+            result)
 
   (** Submits an already encoded, immutable completion and preserves lease
       uncertainty when a typed native error or an exception is returned. Local
@@ -1699,6 +1745,20 @@ module Make (Supervisor : SUPERVISOR) = struct
     reject_task_with_failure adapter ~token ~correlation
       ~failure:(callback_exception_failure diagnostic backtrace) diagnostic
 
+  (** Runs one application callback with [callback_active] set, clearing it
+      however the callback ends. Its exception, and the backtrace an
+      immediate handler then reads, pass through unchanged. *)
+  let with_callback_active adapter callback =
+    Atomic.set adapter.callback_active true;
+    match callback () with
+    | result ->
+        Atomic.set adapter.callback_active false;
+        result
+    | exception exception_ ->
+        let backtrace = Printexc.get_raw_backtrace () in
+        Atomic.set adapter.callback_active false;
+        Printexc.raise_with_backtrace exception_ backtrace
+
   (** Reports whether an activity error claims to acknowledge cancellation. *)
   let is_cancelled_error error =
     match (Base_error.view error).category with
@@ -1790,7 +1850,10 @@ module Make (Supervisor : SUPERVISOR) = struct
                 ~finally:(fun () -> Async_activity.close_if_dormant context_handle)
               @@ fun () ->
               (try
-                 match implementation context input with
+                 match
+                   with_callback_active adapter (fun () ->
+                       implementation context input)
+                 with
                  | exception exception_ ->
                      reject_callback_exception adapter ~token ~correlation
                        exception_
@@ -1921,6 +1984,7 @@ module Make (Supervisor : SUPERVISOR) = struct
                   in
                   with_delivery adapter (fun () ->
                       adapter.running <- Some running);
+                  Atomic.set adapter.callback_active true;
                   let context =
                     activity_context adapter ~token ~signal
                       ~info:(task_info start) ~details ~heartbeat_timeout
@@ -1939,7 +2003,8 @@ module Make (Supervisor : SUPERVISOR) = struct
                       ~finally:(fun () ->
                         Activity_context.invalidate context;
                         with_delivery adapter (fun () ->
-                            adapter.running <- None))
+                            adapter.running <- None);
+                        Atomic.set adapter.callback_active false)
                       (fun () ->
                         match implementation context input with
                         | result -> Ok result
@@ -2226,15 +2291,17 @@ module Make (Supervisor : SUPERVISOR) = struct
   let try_discard adapter =
     Option.is_some (if_idle adapter (fun () -> discard_locked adapter))
 
-  (** Reads the running attempt under the short delivery lock, which no
-      callback holds while it runs. *)
-  let callback_running adapter =
-    with_delivery adapter (fun () -> Option.is_some adapter.running)
+  (** Reads the atomic callback flag. It takes no lock: a delivery sweep
+      inside a heartbeat holds the delivery lock across supervisor calls, so
+      reading [running] under it could make the shutdown thread wait for an
+      abandoned callback (#1023). *)
+  let callback_running adapter = Atomic.get adapter.callback_active
 
   (** Counts admitted async leases under [async_mutex] only, which a running
-      callback never holds. That lock can be held across an async RPC, so it
-      is only tried: a held lock proves a lease is outstanding. Expired
-      leases are retired first, so they are not counted (#1043). *)
+      callback never holds. The lock is held only for short registry updates
+      (never across an async RPC since #1025), but the probe must never wait,
+      so it is only tried. Expired leases are retired first, so they are not
+      counted (#1043). *)
   let outstanding_async_leases adapter =
     if Mutex.try_lock adapter.async_mutex then
       Some

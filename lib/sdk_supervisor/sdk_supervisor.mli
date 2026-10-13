@@ -437,6 +437,17 @@ module Native : sig
     | Rpc_visibility :
         Temporal_protocol.Client_protocol.visibility_request ->
         Temporal_protocol.Client_protocol.visibility_page client_rpc
+    | Rpc_async_activity_completion :
+        Temporal_protocol.Encoded_activity_completion.t -> unit client_rpc
+        (** Completes, fails, or cancels an activity handed off with
+            [WillCompleteAsync] through the namespace-bound client (#1025).
+            Same request and result as [Complete_async_activity], but the
+            RPC runs on a Rust task, so the owner Domain does not wait for
+            the server while other worker operations queue behind it. *)
+    | Rpc_async_activity_heartbeat :
+        Temporal_protocol.Encoded_activity_heartbeat.t -> unit client_rpc
+        (** Heartbeats an activity handed off with [WillCompleteAsync], with
+            the same relation to [Record_async_activity_heartbeat]. *)
 
   (** A submitted native call, awaited with {!await_client_call}. *)
   type 'value client_call =
@@ -599,6 +610,13 @@ module Native : sig
         Temporal_protocol.Encoded_activity_heartbeat.t -> unit operation
         (** Records progress for an admitted asynchronous activity, with the
             same single-encode contract as [Record_activity_heartbeat]. *)
+    | Initiate_worker_shutdown : unit operation
+        (** Stops the worker from taking new tasks while leaving it owned by
+            the graph (#1028): Core stops polling the server and starts its
+            own graceful-shutdown timer, while completions and heartbeats for
+            tasks already handed to OCaml remain valid until
+            [Shutdown_worker]. It never waits for the network. Idempotent;
+            without a worker it succeeds. *)
     | Shutdown_worker : unit operation
     | Disconnect_client : unit operation
     | Client_submit : 'value client_rpc -> 'value client_call operation

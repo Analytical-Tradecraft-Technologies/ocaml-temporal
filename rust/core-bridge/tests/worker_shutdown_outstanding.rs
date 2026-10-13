@@ -1,5 +1,6 @@
 //! Regression coverage for live worker shutdown with outstanding Core tasks
-//! (issue #769).
+//! (issue #769), and for stopping Core's polling before the release
+//! (issue #1028).
 //!
 //! Core's poll APIs report `ShutDown` only after every task they produced has
 //! been completed. Worker shutdown used to join both poll lanes without
@@ -26,7 +27,8 @@ use ocaml_temporal_core_bridge::{
     Buffer, Result as AbiResult, Runtime, STATUS_NOT_READY, STATUS_OK, STATUS_OUTSTANDING_TASKS,
     Status, ocaml_temporal_core_v4_client_connect_json, ocaml_temporal_core_v4_client_disconnect,
     ocaml_temporal_core_v4_result_free, ocaml_temporal_core_v4_runtime_free,
-    ocaml_temporal_core_v4_runtime_new, ocaml_temporal_core_v4_worker_shutdown,
+    ocaml_temporal_core_v4_runtime_new, ocaml_temporal_core_v4_worker_complete_activity_json,
+    ocaml_temporal_core_v4_worker_initiate_shutdown, ocaml_temporal_core_v4_worker_shutdown,
     ocaml_temporal_core_v4_worker_start_json, ocaml_temporal_core_v4_worker_try_poll_activity,
     ocaml_temporal_core_v4_worker_wait_activity,
 };
@@ -44,6 +46,10 @@ const CALL_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Opaque task token of the single activity task the double hands out.
 const TASK_TOKEN: &[u8] = b"issue-769-activity-task";
+
+/// Semantic successful completion of [`TASK_TOKEN`] with an empty payload,
+/// as OCaml sends it; the token is base64 in the protocol document.
+const EMPTY_COMPLETION: &str = r#"{"task_token":"aXNzdWUtNzY5LWFjdGl2aXR5LXRhc2s=","result":{"kind":"completed","result":{"metadata":{},"data":{"encoding":"base64","data":""}}}}"#;
 
 /// Requests observed by the gRPC double, shared with the test thread.
 #[derive(Default)]
@@ -386,6 +392,87 @@ fn shutdown_force_completes_abandoned_lease_and_reports_it() {
         runtime,
         ocaml_temporal_core_v4_worker_shutdown,
         "repeated worker shutdown",
+    );
+    assert_eq!(status, STATUS_OK, "{message}");
+    close_runtime(runtime);
+}
+
+/// Issue #1028: once OCaml observes a stop it asks the bridge to stop Core
+/// polling, long before the release. A callback still running then finishes
+/// normally: its completion is accepted. Core takes no further task, even
+/// though the completion frees the worker's only activity slot, which
+/// without the early stop made Core poll again for a task no lane would run
+/// and the release would then fail. Nothing is abandoned, so the release
+/// succeeds cleanly.
+#[test]
+fn initiated_shutdown_stops_polling_and_accepts_running_completion() {
+    let observed = Arc::new(Observed::default());
+    let address = spawn_single_activity_server(Arc::clone(&observed));
+    let runtime = wait_for_ready_activity(start_worker(address));
+
+    let (runtime, status, message) = call_bounded(
+        runtime,
+        ocaml_temporal_core_v4_worker_try_poll_activity,
+        "activity lease",
+    );
+    assert_eq!(status, STATUS_OK, "{message}");
+
+    let (runtime, status, message) = call_bounded(
+        runtime,
+        ocaml_temporal_core_v4_worker_initiate_shutdown,
+        "initiated worker shutdown",
+    );
+    assert_eq!(status, STATUS_OK, "{message}");
+    let polls_at_stop = observed.activity_polls.load(Ordering::SeqCst);
+
+    // The running callback completes after polling stopped.
+    let mut result = AbiResult::default();
+    // SAFETY: The runtime is live and exclusively owned by this thread; the
+    // static completion stays readable for the call.
+    unsafe {
+        ocaml_temporal_core_v4_worker_complete_activity_json(
+            runtime,
+            EMPTY_COMPLETION.as_ptr(),
+            EMPTY_COMPLETION.len(),
+            &mut result,
+        );
+    }
+    let (status, message) = release(result);
+    assert_eq!(status, STATUS_OK, "{message}");
+
+    // The freed slot must not be used for another poll.
+    thread::sleep(Duration::from_millis(500));
+    assert_eq!(
+        observed.activity_polls.load(Ordering::SeqCst),
+        polls_at_stop,
+        "Core polled the server after shutdown was initiated"
+    );
+
+    // Initiation is idempotent.
+    let (runtime, status, message) = call_bounded(
+        runtime,
+        ocaml_temporal_core_v4_worker_initiate_shutdown,
+        "repeated initiated worker shutdown",
+    );
+    assert_eq!(status, STATUS_OK, "{message}");
+
+    let (runtime, status, message) = call_bounded(
+        runtime,
+        ocaml_temporal_core_v4_worker_shutdown,
+        "worker shutdown after an initiated stop",
+    );
+    assert_eq!(status, STATUS_OK, "{message}");
+    assert_eq!(
+        observed.activity_failures.load(Ordering::SeqCst),
+        0,
+        "the release failed a task although none was abandoned"
+    );
+
+    // Without a worker, initiation is the idempotent absent case.
+    let (runtime, status, message) = call_bounded(
+        runtime,
+        ocaml_temporal_core_v4_worker_initiate_shutdown,
+        "initiated shutdown without a worker",
     );
     assert_eq!(status, STATUS_OK, "{message}");
     close_runtime(runtime);

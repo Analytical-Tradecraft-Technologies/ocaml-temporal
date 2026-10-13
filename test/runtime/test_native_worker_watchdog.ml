@@ -550,11 +550,34 @@ let test_public_options () =
       | Error _ -> failwith "mock worker shutdown failed")
   | Error _ -> failwith "mock worker creation failed"
 
+(** #1023: [stop] must not wait out a whole tick. With the default 2 s
+    activation deadline the tick is 250 ms; the run loop stops the watchdog
+    before it releases its lifecycle lock, so a whole-tick wait pushed
+    [Worker.run]'s exit past bounded shutdown's lanes slack. *)
+let test_stop_does_not_wait_for_tick () =
+  if Watchdog.tick_ms ~deadline_ms:2_000 <> 250 then
+    failwith "the default deadline no longer uses the longest tick";
+  match
+    Watchdog.start ~deadline_ms:2_000
+      ~running_epoch:(fun () -> None)
+      ~abandon:(fun ~epoch:_ ~elapsed_ms:_ -> ())
+  with
+  | Error _ -> failwith "watchdog Domain did not start"
+  | Ok watchdog ->
+      (* Stop shortly after a tick began, when nearly all of it remains. *)
+      Thread.delay 0.03;
+      let started = Unix.gettimeofday () in
+      Watchdog.stop watchdog;
+      let elapsed = Unix.gettimeofday () -. started in
+      if elapsed > Watchdog.stop_poll_s +. 0.08 then
+        failwith (Printf.sprintf "watchdog stop took %.3fs" elapsed)
+
 (** Runs the watchdog regressions. *)
 let () =
   test_step_rule ();
   test_abandon_drops_late_completion ();
   test_watchdog_domain_detects_once ();
+  test_stop_does_not_wait_for_tick ();
   test_finished_epoch_is_not_abandoned ();
   test_stuck_query_reports_failed_queries ();
   test_stuck_eviction_reports_acknowledgement ();

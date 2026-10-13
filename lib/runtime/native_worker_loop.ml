@@ -81,11 +81,25 @@ type activity_detach = {
   now : unit -> float;
   deadline : unit -> float;
   on_detached : unit -> unit;
+  on_stop : unit -> unit;
 }
 
 (** Interval at which a bounded join checks whether the activity lane has
     finished. [Thread.delay] releases the runtime lock meanwhile. *)
 let join_poll_interval_s = 0.01
+
+let idle_detach_allowance_s = 0.15
+
+(** Whether the bounded join should stop waiting for the activity lane at
+    [now]. A lane busy past [deadline] is running a callback (or a native call
+    made for one) and is detached at once. An idle lane is only in a bounded
+    readiness wait or local yield and observes the stop by itself, so it is
+    given {!idle_detach_allowance_s} more: detaching it would log a spurious
+    [activity_lane_detached] and report abandoned work after a short grace
+    period (#1023). The allowance still bounds the join if the idle lane's
+    wait is itself stuck behind the supervisor. *)
+let detach_due ~now ~deadline ~busy =
+  now >= deadline && (busy || now >= deadline +. idle_detach_allowance_s)
 
 (** Runs the workflow and capacity-one activity lanes concurrently. The caller
     joins the activity Domain on every ordinary result before returning; its
@@ -93,7 +107,11 @@ let join_poll_interval_s = 0.01
     use an adapter or the native supervisor. With [detach], an activity
     callback that outlives the deadline is left running on its Domain instead
     of blocking this join forever (#495); the [finished] flag is set by that
-    Domain as its last action, so a [true] read means the join is immediate. *)
+    Domain as its last action, so a [true] read means the join is immediate.
+    [detach.on_stop] runs once on this thread, after the workflow lane
+    returned because [closed] holds and before the activity lane is joined,
+    so the caller can stop native polling while a callback still finishes
+    (#1028). *)
 let run ~detach ~closed ~poll_workflow ~poll_activity ~wait_for_lane
     ~retry_pending =
   let stop = Atomic.make false in
@@ -134,10 +152,19 @@ let run ~detach ~closed ~poll_workflow ~poll_activity ~wait_for_lane
   let joined =
     match detach with
     | None -> true
-    | Some { now; deadline; on_detached } ->
+    | Some { now; deadline; on_detached; on_stop } ->
+        (* Only a genuine stop, never a lane failure, ends native polling:
+           after a failure without a stop the worker may still be run again.
+           A defect in the callback must not prevent the join below. *)
+        if closed () then (try on_stop () with _ -> ());
         if not (Atomic.get activity_finished) then begin
           let deadline = deadline () in
-          while (not (Atomic.get activity_finished)) && now () < deadline do
+          while
+            (not (Atomic.get activity_finished))
+            && not
+                 (detach_due ~now:(now ()) ~deadline
+                    ~busy:(Atomic.get activity_busy))
+          do
             Thread.delay join_poll_interval_s
           done
         end;
