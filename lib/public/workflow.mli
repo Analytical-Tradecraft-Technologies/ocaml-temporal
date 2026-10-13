@@ -306,7 +306,20 @@ val deprecate_patch : id:string -> unit
 (** Merges encoded values into Temporal's indexed search attributes. The
     update is deterministic and becomes visible only after the workflow task
     is accepted. Duplicate, empty, malformed, or oversized keys raise
-    [Invalid_argument] as programmer misuse; payload ownership is copied. *)
+    [Invalid_argument] as programmer misuse; payload ownership is copied. An
+    empty list is a no-op and emits no command, because Temporal rejects an
+    empty upsert.
+
+    Temporal Server decodes search-attribute values itself rather than
+    through the worker's codecs. Each value must therefore be a [json/plain]
+    encoding of the attribute's registered type, such as the output of
+    {!Codec.string}, {!Codec.int}, or {!Codec.bool}; a [binary/null] payload
+    (for example {!Codec.option} encoding [None]) removes the key. A custom
+    codec built with [~encoding:"json/plain"] that emits valid JSON of the
+    registered type is accepted like a built-in one. Other encodings, such
+    as {!Codec.bytes} ([binary/plain]) or a custom encoding name, are
+    rejected by the server, which fails the workflow task on every retry
+    until the code is corrected. *)
 val upsert_search_attributes : (string * Payload.t) list -> unit
 
 (** Ends the current run and starts a new run of [definition] with [input].

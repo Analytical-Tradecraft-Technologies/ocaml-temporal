@@ -204,7 +204,10 @@ val with_randomness_disabled : t -> (unit -> 'value) -> 'value
 
 (** Emits one durable command that merges encoded values into the workflow's
     indexed search attributes. Keys and payloads are validated by the strict
-    protocol encoder before Core receives the completion. *)
+    protocol encoder before Core receives the completion. An empty list emits
+    no command, because Temporal Server rejects an empty upsert and replay
+    would repeat the rejection on every task retry. Raises [Invalid_argument]
+    after the execution has ended, even for an empty list. *)
 val upsert_search_attributes :
    t -> (string * Temporal_base.Codec.payload) list -> unit
 

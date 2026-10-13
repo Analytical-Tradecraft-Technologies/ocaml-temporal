@@ -155,7 +155,26 @@ module Make (Supervisor : SUPERVISOR) : sig
       or user implementation runs during creation. [worker_shutting_down] is
       exposed to every synchronous activity context as its worker-shutdown
       signal; it must be non-blocking and safe to call from any Domain, which
-      reading the owner's lifecycle atomics is. *)
+      reading the owner's lifecycle atomics is. Async leases expire by the
+      process's monotonic clock, so wall-clock steps cannot expire a live
+      lease; see [create_with_clock]. *)
+
+  val create_with_clock :
+    now:(unit -> float) ->
+    supervisor:Supervisor.t ->
+    activities:registered_activity list ->
+    worker_shutting_down:(unit -> bool) ->
+    (t, error_view) result
+  (** [create] with an explicit clock, in seconds, for expiring async leases
+      (#1043). An admitted [Will_complete_async] lease is closed and dropped,
+      without a native call, once the server must have timed its attempt
+      out: a few seconds after the shorter of its start-to-close and
+      schedule-to-close timeouts has elapsed since admission, or after its
+      heartbeat timeout has elapsed since admission or the last async
+      heartbeat that may have reached the server. Expiry is checked when a
+      lease is admitted, by [drain], and by [outstanding_async_leases]. [now]
+      must be safe to call while the adapter's locks are held; tests inject a
+      controllable clock. *)
 
   val poll : t -> (outcome, error_view) result
   (** Polls at most one task. A pending completion blocks new tasks, so an
@@ -185,7 +204,11 @@ module Make (Supervisor : SUPERVISOR) : sig
       [Error] in the [`Cancelled] category completes it as cancelled only when
       a cancellation was delivered to its context, and is an ordinary failure
       otherwise; any other [Error] fails it; an exception fails it as a
-      defect. A cancellation that arrives after the callback returned is an
+      defect. A delivered cancellation whose reason is [Paused] or [Reset]
+      completes the attempt (and a cancelled-before-admission start) as a
+      retryable application failure of type ["ActivityPause"] or
+      ["ActivityReset"] instead, because the server accepts a cancelled
+      completion only after a cancellation request (#1022). A cancellation that arrives after the callback returned is an
       update to a start whose completion is already owned, so it never creates
       a second completion. *)
 
@@ -200,7 +223,10 @@ module Make (Supervisor : SUPERVISOR) : sig
       leaves the exact completion retained. The caller must either retry it
       after an explicitly safe transient classification or force-retire the
       native graph and then call [discard] on a terminal path; it must never
-      silently drop the token while Rust still owns it. *)
+      silently drop the token while Rust still owns it. An admitted async
+      lease returns the retryable [outstanding_async_leases] error, unless it
+      has expired (see [create_with_clock]); an expired lease is closed and
+      dropped first, so it never holds shutdown (#1043). *)
   val drain : t -> (unit, error_view) result
 
   (** Discards copied completion leases after terminal native cleanup. This is
