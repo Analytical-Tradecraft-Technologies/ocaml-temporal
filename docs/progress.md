@@ -54,6 +54,32 @@ both produced the checked-in `.pb` byte for byte. Verified with
 `examples/replay`, and `test/history_corpus` aliases; and the Rust
 `replay_bridge`, `replay_abi`, and `application_failure_replay` tests, plus
 `cargo clippy -D warnings` and `cargo fmt --check`, on OCaml 5.4.1 (macOS).
+## 2026-10-14: Windows metrics scrape timeout is really 30 s (#1072)
+
+The intermittent Windows failure of `test/bridge/test_runtime_metrics.ml`
+("timed out after 30 s with 0 byte(s) received") was in the test's scrape
+client, not the metrics endpoint. The helper bounded each read with
+`Unix.setsockopt_float socket SO_RCVTIMEO 30.`. On Windows, OCaml passes that
+option as a `struct timeval`, but Winsock reads `SO_RCVTIMEO` as a `DWORD`
+of milliseconds, which is the `tv_sec` field. The bound was therefore 30 ms
+(5 ms before #1058), so any scrape the loaded runner did not answer within a
+few milliseconds failed with nothing received. Linux and macOS read the
+`timeval` correctly, which is why only Windows failed. #1053's relay adds a
+loopback hop, but the failure predates it.
+
+The helper now waits with `Unix.select` against one deadline in seconds,
+which behaves the same on every platform. A timeout raises a dedicated
+exception naming the scrape (first scrape after `create`, after the
+busy-address `create`, or after 64 reset connections), the waiting stage
+(first response byte or rest of the response), the measured elapsed time and
+the bytes received. A new case points the helper at a loopback listener that
+never accepts and requires its 1 s timeout to last about 1 s. The old helper
+fails that case on Windows after about 1 ms. Verified on OCaml 5.4.1 (macOS)
+with `dune build @install` and `dune build @test/bridge/runtest`. The Windows
+x64 CI job is the cross-platform gate. `test/integration/worker_metrics`
+still uses `SO_RCVTIMEO`, which is correct there because that test runs only
+on Linux under Docker Compose.
+
 ## 2026-10-13: Temporal.Testing follows server and native-worker semantics (#1035-#1039)
 
 `Temporal.Testing` (`lib/runtime/test_environment.ml`) now matches a server
