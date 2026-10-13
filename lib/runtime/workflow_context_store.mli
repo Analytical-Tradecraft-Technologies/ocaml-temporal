@@ -315,8 +315,12 @@ val schedule_local_activity :
 
 (** Assigns a private correlation sequence, records how to decode the child
     result, emits a command containing the application-supplied durable [id]
-    and optional Core-owned retry policy, and returns the child result future
-    together with a cancellation operation.
+    and optional Core-owned retry policy, and returns the child result future,
+    the start-stage future, and a cancellation operation. The start-stage
+    future resolves with the child's run ID when Core reports the start
+    acknowledgment, or with the start failure (or pre-start cancellation)
+    that also resolves the result future; it never waits for the child to
+    finish.
     The default policy is [Child_try_cancel], so cancellation requests the
     child unless a caller explicitly chooses [Child_abandon]. The operation is
     valid only while this context is current; it emits at most one cancellation
@@ -337,6 +341,7 @@ val start_child_workflow :
   decode:(Temporal_base.Codec.payload -> ('output, Temporal_base.Error.t) result) ->
   unit ->
   ( ('output, Temporal_base.Error.t) Future_store.t
+  * (string, Temporal_base.Error.t) Future_store.t
   * (reason:string -> (unit, Temporal_base.Error.t) result) )
 
 (** Sends a signal to an external workflow and returns a future resolved by
