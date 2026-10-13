@@ -97,7 +97,17 @@ end
     including errors from I/O libraries that raise, such as [Unix.Unix_error].
     The failure's stack trace contains the OCaml backtrace when
     [Printexc.record_backtrace] is enabled. The same applies to local and
-    asynchronous activity callbacks. *)
+    asynchronous activity callbacks.
+
+    A worker that receives a task it cannot run fails the attempt without
+    calling any implementation: an activity type it does not register (an
+    application failure of type ["NotFoundError"] naming the registered
+    types, as in the other Temporal SDKs), or an input that [input] cannot
+    decode. For an activity scheduled on a task queue the failure is
+    retryable, so the activity's retry policy applies and a later attempt can
+    reach a worker that has the type or a compatible codec, for example
+    during a rolling deploy. A local activity always runs on the worker that
+    scheduled it, so there the failure is non-retryable. *)
 val define :
   name:string ->
   input:'input Codec.t ->
@@ -194,7 +204,17 @@ val implementation_async :
     - Acceptance of [complete], [fail], or [cancel], or the server reporting
       that the activity no longer exists, closes the handle. After an
       uncertain terminal call, "no longer exists" can mean that call was
-      applied. *)
+      applied.
+
+    Every handle must eventually be completed, failed, or cancelled: until
+    then the worker keeps a lease for it, and shutting the worker down waits
+    for it for the whole graceful shutdown period and then reports it as
+    lost. A handle that is never finished expires when Temporal must already
+    have timed out its attempt (a few seconds after the attempt's
+    start-to-close or schedule-to-close timeout, or its heartbeat timeout
+    since the last {!Async_handle.heartbeat}); the worker then closes it
+    without contacting the server, and later calls return a non-retryable
+    error. *)
 module Async_handle : sig
   (** The handle type paired with one asynchronous activity output. *)
   type 'output t = 'output async_handle
@@ -313,6 +333,16 @@ end
     observes as a [`Cancelled] activity error. Returning [Ok] still completes
     the attempt successfully.
 
+    An operator pause or reset ([Paused] or [Reset] as the primary
+    {!Cancellation.type-reason}) is delivered the same way, but Temporal
+    accepts a cancelled completion only after a cancellation request.
+    Returning the [`Cancelled] error for a pause or reset therefore fails the
+    attempt with a retryable application failure of type ["ActivityPause"] or
+    ["ActivityReset"], as the Python SDK does: Temporal holds a paused activity's next attempt until it is unpaused,
+    and schedules a reset activity afresh. When a cancellation was also
+    requested, the primary reason is [Requested] and the attempt is
+    cancelled.
+
     A cancellation can only reach an activity that heartbeats: Temporal
     returns it in the response to a heartbeat, and the worker delivers it
     when the activity next heartbeats. Configure a [heartbeat_timeout] when
@@ -372,7 +402,10 @@ module Cancellation : sig
   val reasons : t -> reason list
 
   (** Builds the non-retryable [`Cancelled] error that an activity returns to
-      acknowledge this cancellation. *)
+      acknowledge this cancellation. For a [Paused] or [Reset] reason the
+      worker reports the acknowledged attempt as a retryable
+      ["ActivityPause"] or ["ActivityReset"] failure rather than as
+      cancelled; see the module description. *)
   val to_error : t -> Error.t
 end
 

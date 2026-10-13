@@ -451,6 +451,17 @@ ordinary contextual activity value: it is intentionally invalid after the
 callback returns.
 
 ```ocaml
+(* Retries a handle call while its error is retryable: the worker may not have
+   accepted the handoff yet, or the RPC outcome may be uncertain. The budget
+   bounds the loop; a real completer would usually back off further. *)
+let rec deliver ?(attempts = 100) submit =
+  match submit () with
+  | Error error
+    when attempts > 1 && not (Temporal.Error.view error).non_retryable ->
+      Thread.delay 0.05;
+      deliver ~attempts:(attempts - 1) submit
+  | result -> result
+
 let delayed_summary =
   Temporal.Activity.define_async
     ~name:"delayed_summary"
@@ -459,16 +470,28 @@ let delayed_summary =
     (fun context document ->
       let handle = Temporal.Activity.Async_context.handle context in
       ignore
-        (Domain.spawn (fun () ->
+        (Thread.create
+           (fun () ->
              let value = String.trim document in
-             match Temporal.Activity.Async_handle.complete handle value with
+             match
+               deliver (fun () ->
+                   Temporal.Activity.Async_handle.complete handle value)
+             with
              | Ok () -> ()
              | Error error ->
                  Logs.err (fun report ->
                      report "delayed_summary completion failed: %s"
-                       (Temporal.Error.message error))));
+                       (Temporal.Error.message error)))
+           ());
       Temporal.Activity.Will_complete_async handle)
 ```
+
+The completer usually starts before the worker has accepted the
+`Will_complete_async` handoff, and a call made then returns a retryable error
+without sending anything, so it must retry rather than give up after one
+attempt. The example uses a system thread (the `threads.posix` library)
+rather than a `Domain` per activity, because the number of Domains is small
+and fixed; in production, hand the work to an existing pool or event loop.
 
 The handle is tied to one activity attempt and one output codec. A completion
 or failure can be submitted once; heartbeat calls keep the lease non-terminal.
@@ -485,6 +508,14 @@ activity itself and acknowledges `complete`, which then returns `Ok`. A failed `
 a later heartbeat or the terminal call. Only acceptance of a terminal call, or
 the server reporting that the activity no longer exists, closes the handle, so
 a later call fails predictably instead of leaving worker shutdown blocked.
+
+Every handle must eventually be completed, failed, or cancelled. Until then
+the worker keeps a lease for it, and a worker shutdown waits for that lease
+for the whole graceful shutdown period and then reports it as lost. A handle
+that is never finished expires a few seconds after Temporal must have timed
+its attempt out (its start-to-close or schedule-to-close timeout, or its
+heartbeat timeout since the last heartbeat); the worker then closes it
+without contacting the server, and later calls return a non-retryable error.
 
 Use `Activity.remote` or `Workflow.remote` when another worker owns the
 implementation. A remote definition keeps the name and codecs needed to

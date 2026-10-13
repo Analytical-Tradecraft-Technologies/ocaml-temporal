@@ -1442,6 +1442,159 @@ let test_async_drain_and_discard () =
     | Ok () -> failwith "discarded async handle remained usable"
   end
 
+(** Builds a remote start task carrying explicit server timeouts, given in
+    whole seconds; [None] leaves a timeout unset. *)
+let start_task_with_timeouts ?start_to_close ?schedule_to_close ?heartbeat
+    ~token ~activity_type () : Protocol.task =
+  let duration seconds = { Protocol.seconds = Int64.of_int seconds; nanoseconds = 0 } in
+  match
+    start_task ~token ~activity_type ~input:[ encode_input Temporal.Codec.unit () ]
+  with
+  | { variant = Protocol.Start start; _ } as task ->
+      {
+        task with
+        variant =
+          Protocol.Start
+            {
+              start with
+              start_to_close_timeout = Option.map duration start_to_close;
+              schedule_to_close_timeout = Option.map duration schedule_to_close;
+              heartbeat_timeout = Option.map duration heartbeat;
+            };
+      }
+  | _ -> assert false
+
+(** An async activity whose callback hands its handle to [retained] and
+    never finishes it, like the leaking completer described in #1043. *)
+let leaked_async_activity retained =
+  Temporal.Activity.define_async ~name:"leaked_async" ~input:Temporal.Codec.unit
+    ~output:Temporal.Codec.unit (fun context () ->
+      let handle = Temporal.Activity.Async_context.handle context in
+      retained := Some handle;
+      Temporal.Activity.Will_complete_async handle)
+
+(** Requires [drain] to report the retryable outstanding-lease diagnostic. *)
+let expect_outstanding label worker =
+  match Worker.drain worker with
+  | Error { code = "outstanding_async_leases"; retryable = true; _ } -> ()
+  | Ok () -> failwith (label ^ ": a live async lease was expired early")
+  | Error error -> failwith (label ^ ": unexpected drain error " ^ error.code)
+
+(** An admitted async lease that application code never finishes expires
+    once the server must have timed its attempt out (#1043): after the
+    shorter close timeout, or the heartbeat timeout since the last async
+    heartbeat, plus a few seconds of slack, all measured from admission on
+    the worker's clock. An expired lease no longer holds [drain] (and so
+    shutdown), is not counted as outstanding, closes its handle with a
+    non-retryable error, and sends nothing to the server. A lease whose task
+    reports no timeout never expires, and admitting a new lease retires
+    expired ones so a leaking worker does not accumulate them. *)
+let test_async_lease_expiry () =
+  let clock = ref 1_000. in
+  let make_worker supervisor activities =
+    match
+      Worker.create_with_clock
+        ~now:(fun () -> !clock)
+        ~supervisor ~activities
+        ~worker_shutting_down:(fun () -> false)
+    with
+    | Ok worker -> worker
+    | Error (error : Raw_adapter.error_view) -> failwith error.message
+  in
+  let expect_closed label handle =
+    match Temporal.Activity.Async_handle.complete handle () with
+    | Error error when (Temporal.Error.view error).non_retryable -> ()
+    | Error _ -> failwith (label ^ ": an expired handle returned a retryable error")
+    | Ok () -> failwith (label ^ ": an expired handle still completed")
+  in
+  (* The shorter close timeout bounds the attempt; slack is respected. *)
+  List.iter
+    (fun (label, task) ->
+      clock := 1_000.;
+      let supervisor = fake_supervisor () and retained = ref None in
+      enqueue supervisor task;
+      let worker =
+        make_worker supervisor [ Adapter.register_async (leaked_async_activity retained) ]
+      in
+      expect_deferred (Worker.poll worker);
+      clock := 1_000. +. 30. +. 4.;
+      expect_outstanding label worker;
+      if Worker.outstanding_async_leases worker <> Some 1 then
+        failwith (label ^ ": the live lease was not counted");
+      clock := 1_000. +. 30. +. 6.;
+      if Worker.outstanding_async_leases worker <> Some 0 then
+        failwith (label ^ ": an expired lease was still counted");
+      (match Worker.drain worker with
+      | Ok () -> ()
+      | Error error -> failwith (label ^ ": an expired lease held drain: " ^ error.code));
+      expect_closed label (Option.get !retained);
+      if !(supervisor.async_completion_calls) <> 0 then
+        failwith (label ^ ": expiry contacted the server"))
+    [
+      ( "start-to-close",
+        start_task_with_timeouts ~start_to_close:30 ~schedule_to_close:600
+          ~token:(Bytes.of_string "expiry-stc") ~activity_type:"leaked_async" () );
+      ( "schedule-to-close",
+        start_task_with_timeouts ~start_to_close:600 ~schedule_to_close:30
+          ~token:(Bytes.of_string "expiry-s2c") ~activity_type:"leaked_async" () );
+    ];
+  (* A successful async heartbeat restarts the heartbeat window. *)
+  clock := 0.;
+  let supervisor = fake_supervisor () and retained = ref None in
+  enqueue supervisor
+    (start_task_with_timeouts ~start_to_close:3_600 ~heartbeat:10
+       ~token:(Bytes.of_string "expiry-heartbeat") ~activity_type:"leaked_async" ());
+  let worker =
+    make_worker supervisor [ Adapter.register_async (leaked_async_activity retained) ]
+  in
+  expect_deferred (Worker.poll worker);
+  let handle = Option.get !retained in
+  clock := 8.;
+  (match Temporal.Activity.Async_handle.heartbeat handle [] with
+  | Ok () -> ()
+  | Error error -> failwith ("async heartbeat failed: " ^ Temporal.Error.message error));
+  clock := 22.;
+  expect_outstanding "heartbeat" worker;
+  clock := 24.;
+  (match Worker.drain worker with
+  | Ok () -> ()
+  | Error error -> failwith ("a heartbeat-expired lease held drain: " ^ error.code));
+  expect_closed "heartbeat" handle;
+  (* Without any reported timeout the lease is kept indefinitely. *)
+  clock := 0.;
+  let supervisor = fake_supervisor () and retained = ref None in
+  enqueue supervisor
+    (start_task_with_timeouts ~token:(Bytes.of_string "expiry-none")
+       ~activity_type:"leaked_async" ());
+  let worker =
+    make_worker supervisor [ Adapter.register_async (leaked_async_activity retained) ]
+  in
+  expect_deferred (Worker.poll worker);
+  clock := 1e9;
+  expect_outstanding "no timeout" worker;
+  (match Temporal.Activity.Async_handle.complete (Option.get !retained) () with
+  | Ok () -> ()
+  | Error error -> failwith ("an unexpired handle failed: " ^ Temporal.Error.message error));
+  (* Admission retires expired leases, bounding a leaking worker. *)
+  clock := 0.;
+  let supervisor = fake_supervisor () and retained = ref None in
+  enqueue supervisor
+    (start_task_with_timeouts ~start_to_close:10
+       ~token:(Bytes.of_string "expiry-first") ~activity_type:"leaked_async" ());
+  let worker =
+    make_worker supervisor [ Adapter.register_async (leaked_async_activity retained) ]
+  in
+  expect_deferred (Worker.poll worker);
+  let first = Option.get !retained in
+  clock := 100.;
+  enqueue supervisor
+    (start_task_with_timeouts ~start_to_close:10
+       ~token:(Bytes.of_string "expiry-second") ~activity_type:"leaked_async" ());
+  expect_deferred (Worker.poll worker);
+  expect_closed "admission" first;
+  if Worker.outstanding_async_leases worker <> Some 1 then
+    failwith "admitting a lease did not retire the expired one"
+
 (** A handle retained from a synchronously completed attempt must not be
     attachable to the next attempt. Its submit callback still captures the old
     token, so accepting it would orphan the current asynchronous lease. *)
@@ -1982,6 +2135,7 @@ let () =
   test_async_context_info ();
   test_async_context_info_maximum_timeouts ();
   test_async_drain_and_discard ();
+  test_async_lease_expiry ();
   test_stale_handle_rejected ();
   test_completion_racing_handoff_is_retryable ();
   test_completer_domain_retries_until_handoff ();
