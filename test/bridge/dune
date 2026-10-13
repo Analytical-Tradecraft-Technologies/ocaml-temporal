@@ -76,7 +76,7 @@
 
 (test
  (name test_failure_diagnostic)
- (libraries temporal_protocol))
+ (libraries temporal_base temporal_protocol))
 
 (test
  (name test_client_input_limits)
