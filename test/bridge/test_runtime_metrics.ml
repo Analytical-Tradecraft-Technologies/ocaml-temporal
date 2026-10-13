@@ -3,7 +3,8 @@
     A runtime created with [~metrics] must bind its Prometheus endpoint
     before [create] returns, report the resolved address, answer scrapes,
     reject a busy address as a typed [`Bridge] error without leaking a
-    runtime, and close the endpoint once [Runtime.shutdown] has returned.
+    runtime, survive scrapers that reset the connection mid-response, and
+    close the endpoint once [Runtime.shutdown] has returned.
     Invalid options are typed defects raised before any native work. *)
 open Temporal
 
@@ -137,6 +138,34 @@ let test_endpoint_lifecycle () =
   assert (Runtime.metrics_address runtime = Some address);
   assert (refused address)
 
+(** Scrapers that send a request and then reset the connection make the
+    endpoint write into dead sockets on Core's Tokio threads. With SIGPIPE
+    at its default, terminating action (as in any OCaml program that does
+    not change it), the process must survive and the endpoint must keep
+    serving (#1041). On Linux this is the [writev] path that used to kill
+    the process with status 141; macOS sockets never raise the signal, and
+    Windows has none. *)
+let test_aborted_scrapes_do_not_kill_the_process () =
+  if not Sys.win32 then Sys.set_signal Sys.sigpipe Sys.Signal_default;
+  let metrics = get (Runtime.Metrics.prometheus ~bind_address:"127.0.0.1:0" ()) in
+  let runtime = get (Runtime.create ~io_threads:1 ~metrics ()) in
+  let address = Option.get (Runtime.metrics_address runtime) in
+  let request =
+    Printf.sprintf "GET /metrics HTTP/1.1\r\nHost: %s\r\n\r\n" address
+  in
+  for round = 1 to 64 do
+    let socket = Unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+    Unix.connect socket (socket_of address);
+    ignore (Unix.write_substring socket request 0 (String.length request));
+    (* Let the response start before the reset on half the rounds. *)
+    if round mod 2 = 0 then Unix.sleepf 0.001;
+    (* A zero linger time makes [close] send RST instead of FIN. *)
+    Unix.setsockopt_optint socket Unix.SO_LINGER (Some 0);
+    Unix.close socket
+  done;
+  assert (String.starts_with ~prefix:"HTTP/1.1 200" (http_get address "/metrics"));
+  get (Runtime.shutdown runtime)
+
 (** Without [~metrics] no endpoint exists. *)
 let test_no_metrics_by_default () =
   let runtime = get (Runtime.create ~io_threads:1 ()) in
@@ -158,6 +187,7 @@ let test_invalid_options () =
 
 let () =
   test_endpoint_lifecycle ();
+  test_aborted_scrapes_do_not_kill_the_process ();
   test_no_metrics_by_default ();
   test_invalid_options ();
   print_endline "runtime metrics: ok"

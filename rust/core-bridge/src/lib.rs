@@ -11,6 +11,8 @@ mod client_protocol;
 pub mod diagnostics;
 pub mod protocol;
 mod replay_bridge;
+#[doc(hidden)]
+pub mod sigpipe;
 mod telemetry;
 #[doc(hidden)]
 pub mod worker_bridge;
