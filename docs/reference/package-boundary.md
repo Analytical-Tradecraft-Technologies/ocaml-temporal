@@ -213,6 +213,30 @@ require. Running `opam install .` from a Git checkout still needs network
 access for Cargo, so it works only where the build may reach the network;
 installing a release archive is the supported sandboxed path.
 
+The master and release CI tiers prove that path on every run. Their
+`opam-source-offline` job (macOS ARM64, OCaml 5.5) creates the archive with
+`scripts/create-source-archive.sh` and passes it to
+`scripts/check-opam-source-archive.sh`, which unpacks it and runs the
+package's opam build command, `dune build -p temporal-sdk -j <jobs>`, inside an
+opam build sandbox. It uses opam's own wrapper,
+`<opam root>/opam-init/hooks/sandbox.sh build`, when the switch has sandboxing
+enabled, and otherwise the same macOS `sandbox-exec` policy: network denied
+except Unix sockets, and writes denied outside the build directory, the
+temporary directories, and the Dune cache. Before building, the script sends a
+request to crates.io through the same wrapper and fails if it succeeds, so a
+sandbox that does not isolate the network cannot produce a pass. It also clears
+`CARGO_TARGET_DIR`, `TEMPORAL_RUST_BRIDGE_DIR`/`KEY`, and `CARGO_NET_OFFLINE`,
+leaves `CARGO_HOME` at the user's default as `opam install` would, and fails
+unless the build leaves a `temporal-sdk.install` that lists the Rust bridge.
+Run it locally with
+`sh scripts/check-opam-source-archive.sh <archive> [work-dir]`; it needs the
+locked opam dependencies, Rust and `protoc`, and several gigabytes for the
+optimized Rust build. The job runs on the master and release tiers rather than
+on pull requests because of that full optimized build; a release cannot
+publish unless it passes. `test/smoke/test_opam_source_archive_check.sh`
+checks the script's own decisions on every `dune runtest` with stand-ins for
+opam's hook, curl, and dune.
+
 ## Regression evidence
 
 The installed-package smoke test is deliberately run against a fresh consumer

@@ -15,6 +15,38 @@ implementation when a later entry documents that work as complete. The
 records the current tested source, named assertions and successful CI job for
 the Temporal acceptance controllers.
 
+## 2026-10-13: CI builds the source archive inside an opam sandbox (#778)
+
+The vendored release source archive (2026-10-06 entry) had only been proven
+offline by hand; no CI job ran a sandboxed opam build from it.
+`scripts/check-opam-source-archive.sh` now unpacks an archive and runs the
+package's opam build command, `dune build -p temporal-sdk -j <jobs>`, through
+opam's own build wrapper (`opam-init/hooks/sandbox.sh build`) or, on macOS
+without one, an equivalent `sandbox-exec` policy. It first proves the sandbox
+blocks a request to crates.io, clears every variable that would bypass the
+archive's vendored sources while leaving `CARGO_HOME` at its default, and
+requires the resulting `temporal-sdk.install` to list the Rust bridge. The new
+`opam-source-offline` job in `build-pr.yml` creates the archive with
+`scripts/create-source-archive.sh` and runs the check on macOS ARM64 for the
+master and release tiers, so a release cannot publish unless it passes. The
+job's archive is created on macOS from the same commit with the same script;
+the published bytes still come from the Linux publish job, whose GNU tar output
+is normalised but not byte-identical to macOS tar.
+
+`test/smoke/test_opam_source_archive_check.sh`, part of `dune runtest`, drives
+the script with stand-in opam hook, curl and dune executables: a complete
+archive builds through the hook's `build` mode with the bypass variables
+cleared, a sandbox that lets the probe through is refused before building, and
+archives without `rust/vendor.tar` or with a changed opam build command are
+rejected; removing the variable clearing makes it fail. Locally on macOS
+(opam 2.5.2, OCaml 5.4.1), an archive created by
+`scripts/create-source-archive.sh` from this branch built successfully with the
+optimized Rust bridge through both the real opam 2.5.2 sandbox wrapper and the
+`sandbox-exec` fallback, with the network probe denied in each.
+`dune build @test/smoke/runtest` and `test/smoke/test_quality_contract.sh`
+pass. The new job itself has not run yet; its first result comes from the next
+master build after merge.
+
 ## 2026-10-13: Inbound failure types never raise (#1011)
 
 An application failure type written by another SDK, worker or the server

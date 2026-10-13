@@ -98,7 +98,9 @@ Open **Actions → Release → Run workflow**, select `master`, and enter the sa
 
 The release contains four compiler-independent Rust bridge archives, sixteen
 compiled OCaml SDK archives, an offline-buildable source archive for
-[`opam install`](package-boundary.md#offline-opam-source-builds), `manifest.json`, the Cargo SBOM, the
+[`opam install`](package-boundary.md#offline-opam-source-builds) (the release
+build's `opam-source-offline` job builds that archive inside an opam build
+sandbox before publication), `manifest.json`, the Cargo SBOM, the
 third-party notices, and `SHA256SUMS`. Each bridge and SDK archive carries
 `LICENSE` and `THIRD-PARTY-NOTICES.txt` at its root, so redistributing any one
 archive keeps the licence texts of the statically linked Rust packages with it
