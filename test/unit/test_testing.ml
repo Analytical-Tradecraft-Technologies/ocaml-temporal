@@ -946,6 +946,17 @@ let history_workflow =
       let* info = T.Workflow.info () in
       Ok (T.Workflow.Info.history_length info))
 
+(** Sleeps for a day forever; used to check that a finite timeout still
+    bounds a workflow whose timers keep landing on the saturated clock. *)
+let endless_sleep_workflow =
+  T.Workflow.define ~name:"endless-sleep" ~input:T.Codec.unit
+    ~output:T.Codec.unit (fun () ->
+      let rec loop () =
+        let* () = T.Workflow.sleep one_day in
+        loop ()
+      in
+      loop ())
+
 (** Virtual time saturates instead of overflowing, queries do not inflate
     the history length, and a mock replaces a registration regardless of
     list order (#1039). *)
@@ -964,6 +975,18 @@ let test_time_history_and_mock_order () =
       ok "overflowing skip" (T.Testing.skip environment one_day);
       if T.Time.compare (T.Testing.now environment) near_end < 0 then
         failwith "virtual time wrapped backwards");
+  (* Once the clock saturates, a finite timeout must still end the wait
+     rather than firing the workflow's timers at the last instant forever. *)
+  with_environment ~start_time:near_end
+    ~workflows:[ T.Testing.workflow endless_sleep_workflow ]
+    ~activities:[]
+    (fun environment ->
+      let handle =
+        ok "start endless" (T.Testing.start environment endless_sleep_workflow ())
+      in
+      ignore
+        (expect_error "saturated finite timeout" `Timeout
+           (T.Testing.result ~timeout:one_day handle)));
   let history_length ~queries =
     with_environment
       ~workflows:
@@ -1003,7 +1026,26 @@ let test_time_history_and_mock_order () =
   | Ok environment ->
       T.Testing.shutdown environment;
       failwith "duplicate mock registration was accepted"
-  | Error error -> expect_contains "duplicate mock" ~needle:"duplicate mock" (T.Error.message error)
+  | Error error -> (
+      expect_contains "duplicate mock" ~needle:"duplicate mock" (T.Error.message error);
+      (* Two ordinary registrations stay a defect even when a mock between
+         them wins the name. *)
+      match
+        T.Testing.create ~workflows:[]
+          ~activities:
+            [
+              T.Testing.activity compose_greeting;
+              T.Testing.mock_activity compose_greeting (fun name -> Ok name);
+              T.Testing.activity compose_greeting;
+            ]
+          ()
+      with
+      | Ok environment ->
+          T.Testing.shutdown environment;
+          failwith "duplicate ordinary registration around a mock was accepted"
+      | Error error ->
+          expect_contains "duplicate ordinary" ~needle:"duplicate activity"
+            (T.Error.message error))
 
 let () =
   test_timer_skipping ();

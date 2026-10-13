@@ -279,21 +279,32 @@ let validate_workflow_id workflow_id =
     registration list. Two ordinary registrations, or two overrides, with
     one name are a defect. *)
 let register kind ~name_of ~override_of ~value_of items =
-  let* map =
+  (* [ordinary] and [mocks] record every name seen of each kind, separately
+     from the winning entry in [map], so a duplicate is caught whatever its
+     position relative to a mock (e.g. [ordinary; mock; ordinary]). *)
+  let* map, _ordinary, _mocks =
     List.fold_left
       (fun acc item ->
-        let* map = acc in
+        let* map, ordinary, mocks = acc in
         let name = name_of item and override = override_of item in
-        match Name_map.find_opt name map with
-        | Some existing when Bool.equal (override_of existing) override ->
-            Error
-              (defect
-                 (Printf.sprintf "duplicate %s%s registration: %s"
-                    (if override then "mock " else "")
-                    kind name))
-        | Some existing when override_of existing -> Ok map
-        | Some _ | None -> Ok (Name_map.add name item map))
-      (Ok Name_map.empty) items
+        let seen = if override then mocks else ordinary in
+        if Name_map.mem name seen then
+          Error
+            (defect
+               (Printf.sprintf "duplicate %s%s registration: %s"
+                  (if override then "mock " else "")
+                  kind name))
+        else if override then
+          Ok (Name_map.add name item map, ordinary, Name_map.add name () mocks)
+        else
+          let map =
+            match Name_map.find_opt name map with
+            | Some existing when override_of existing -> map
+            | Some _ | None -> Name_map.add name item map
+          in
+          Ok (map, Name_map.add name () ordinary, mocks))
+      (Ok (Name_map.empty, Name_map.empty, Name_map.empty))
+      items
   in
   Ok (Name_map.map value_of map)
 
@@ -1250,15 +1261,24 @@ let fire_due environment at =
 
 (** Runs the environment until [finished] holds, skipping virtual time to
     the next event whenever nothing else can progress. [describe] names the
-    awaited operation in the blocked and timeout diagnostics. A timeout
-    whose deadline lies past the end of representable virtual time is no
-    deadline at all, so [Int64.max_int] means "no limit" instead of
-    overflowing into an already-expired deadline. *)
+    awaited operation in the blocked and timeout diagnostics. A deadline past
+    the end of representable virtual time saturates at [Int64.max_int]
+    instead of overflowing into an already-expired one. A finite timeout
+    stays a bound even then: once the clock has reached [Int64.max_int],
+    time cannot advance, so an event due there again (for example a timer a
+    looping workflow keeps scheduling) ends the wait with [Timeout] rather
+    than firing forever. *)
 let run_until environment ?timeout_ms ~describe finished =
   let deadline =
-    Option.bind timeout_ms (fun timeout_ms ->
-        let deadline = saturating_add environment.now_ms timeout_ms in
-        if Int64.equal deadline Int64.max_int then None else Some deadline)
+    Option.map
+      (fun timeout_ms -> saturating_add environment.now_ms timeout_ms)
+      timeout_ms
+  in
+  (* Whether the next event at [at] lies beyond the caller's bound. *)
+  let past_deadline at deadline =
+    Int64.compare at deadline > 0
+    || Int64.equal at Int64.max_int
+       && Int64.equal environment.now_ms Int64.max_int
   in
   let rec loop () =
     drain environment;
@@ -1274,7 +1294,7 @@ let run_until environment ?timeout_ms ~describe finished =
                ))
       | Some at -> (
           match deadline with
-          | Some deadline when Int64.compare at deadline > 0 ->
+          | Some deadline when past_deadline at deadline ->
               if Int64.compare deadline environment.now_ms > 0 then
                 environment.now_ms <- deadline;
               Error

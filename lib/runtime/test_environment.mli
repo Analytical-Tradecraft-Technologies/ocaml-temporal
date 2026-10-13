@@ -127,7 +127,9 @@ val run_id : handle -> string
     signal nobody sends) and a [Timeout] error when the next scheduled event
     lies more than [timeout_ms] of virtual time after the call started. A
     deadline past the last representable instant ([Int64.max_int]
-    milliseconds) is treated as no deadline. *)
+    milliseconds) saturates there; once the clock has reached that instant
+    and another event is due at it, time can no longer advance, so the call
+    returns [Timeout] instead of running forever. *)
 val result :
   ?timeout_ms:int64 -> handle -> (Temporal_base.Codec.payload, Temporal_base.Error.t) result
 
