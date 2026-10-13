@@ -231,7 +231,9 @@ fn validate_replay_preconditions(
         if event.event_id != expected {
             return Err(ReplayInputError::NonContiguousEventIds);
         }
-        if event.event_type == EventType::WorkflowTaskStarted as i32 && event.event_time.is_none() {
+        if event.event_type == i32::from(EventType::WorkflowTaskStarted)
+            && event.event_time.is_none()
+        {
             return Err(ReplayInputError::MissingWorkflowTaskTimestamp);
         }
     }
