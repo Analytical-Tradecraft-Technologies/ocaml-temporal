@@ -361,10 +361,14 @@ or close. The OCaml await loop calls the release symbol from a
 `Fun.protect` finalizer whenever it is left without a terminal read (an
 exception, including an asynchronous one), so in practice only a caller that
 never awaits at all holds a slot until shutdown; there is no time-based
-reclaim of such cells. Releasing drops any published outcome and frees the
-slot; a still-running task finishes into the closed cell at its own
-deadline. Release, like await, takes no runtime, and a mismatched owner or
-unknown call is a silent no-op.
+reclaim of such cells. Releasing drops any published outcome, frees the
+slot, and aborts a still-running task through its Tokio abort handle, so an
+abandoned exact-run wait stops long-polling at once instead of running
+until the run closes (#1019). From that moment the call no longer counts
+against the wait, start, or in-flight limits, even before the aborted task
+has finished unwinding; the owner keeps the task's join handle so
+disconnect and close still join it. Release, like await, takes no runtime,
+and a mismatched owner or unknown call is a silent no-op.
 Admission beyond a bound returns `RESOURCE_EXHAUSTED` (status `15`) before
 any task exists, which the public client reports as `Client.is_at_capacity`.
 
