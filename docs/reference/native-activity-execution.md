@@ -219,8 +219,10 @@ adapter mutex:
    then invoke the implementation and convert its typed `result` into either an
    encoded payload or a structured application failure. Application failure
    retryability and each detail body supplied in `Error.t` are copied into the
-   Temporal failure without text conversion; metadata keys still follow the
-   strict non-empty, NUL-free UTF-8 identifier rule, while metadata values are
+   Temporal failure without text conversion; metadata keys follow the
+   bridge protocol's key rule (non-empty, valid UTF-8, at most 65536 bytes;
+   NUL allowed, so keys written by other SDKs round-trip), while metadata
+   values are
    arbitrary bytes carried losslessly (#1048). Inbound task input and
    heartbeat details are never rejected for their metadata.
 5. Encode the entire completion once through the strict activity-protocol

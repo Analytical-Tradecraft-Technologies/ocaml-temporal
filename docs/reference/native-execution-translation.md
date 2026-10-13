@@ -197,8 +197,8 @@ arbitrary bytes in Temporal's protocol, and the runtime's string metadata map
 holds them losslessly (an OCaml `string` is a byte string), so inbound
 metadata never fails translation (#1048): a rejection would fail every
 workflow task replaying the same history. Outbound runtime metadata keys are
-validated as non-empty, NUL-free UTF-8 identifiers before they become protocol
-bytes; values may be any bytes, so a received payload can be returned
+validated against the bridge protocol's own key rule (non-empty, valid UTF-8,
+at most 65536 bytes; NUL allowed) before they become protocol bytes; values may be any bytes, so a received payload can be returned
 unchanged. Failure causes
 are traversed with a fixed depth limit so malformed recursive values cannot
 consume unbounded stack or memory.
