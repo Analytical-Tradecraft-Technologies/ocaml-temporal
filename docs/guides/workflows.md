@@ -251,9 +251,11 @@ Temporal Server decodes them itself with its default converter rather than
 through the worker's codecs. Each value must be a `json/plain` encoding of the
 attribute's registered type, such as the output of `Temporal.Codec.string`,
 `Temporal.Codec.int`, or `Temporal.Codec.bool`. A `binary/null` payload, such
-as `Temporal.Codec.option` encoding `None`, removes the key. Any other encoding,
-including `Temporal.Codec.bytes` or a custom codec, is rejected by the server
-with `BAD_SEARCH_ATTRIBUTES`; that fails the workflow task on every retry until
+as `Temporal.Codec.option` encoding `None`, removes the key. A custom codec made
+with `~encoding:"json/plain"` that emits valid JSON of the registered type is
+accepted like a built-in one. Any other encoding, such as
+`Temporal.Codec.bytes` (`binary/plain`) or a custom encoding name, is rejected
+by the server with `BAD_SEARCH_ATTRIBUTES`; that fails the workflow task on every retry until
 the workflow code is corrected. Keys must be unique, non-empty, valid UTF-8
 strings no longer than 65,536 bytes; invalid keys are programmer errors and are
 rejected before the command is buffered. Upserting an empty list is a no-op and
