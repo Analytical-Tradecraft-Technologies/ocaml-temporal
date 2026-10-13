@@ -79,9 +79,12 @@ type activity_request = {
 
 (** A workflow ID's sequence of runs. [current] is [None] only while the
     first run is being constructed. [outcome] is set exactly once, when the
-    last run closes; continue-as-new replaces [current] without setting it.
-    [parent] identifies the parent run and the child command sequence to
-    resolve when the chain closes. *)
+    last run closes; continue-as-new and a retry replace [current] without
+    setting it. [parent] identifies the parent run and the child command
+    sequence to resolve when the chain closes. [retry_policy] is the child
+    command's workflow retry policy, which the server applies to every run
+    of the chain; top-level starts have none. [task_queue] is the queue
+    reported by [Workflow.info] for every run of the chain. *)
 type chain = {
   workflow_id : string;
   mutable current : run option;
@@ -89,17 +92,29 @@ type chain = {
   mutable outcome : (Codec.payload, Error.t) result option;
   parent : (run * int64) option;
   parent_close_policy : Activation.child_workflow_parent_close_policy option;
+  retry_policy : Activation.retry_policy option;
+  task_queue : string;
 }
 
 (** One workflow run and the engine-side state of its outstanding commands.
     [jobs] holds activation jobs not yet delivered, newest first; [queued]
     records membership in the environment's ready queue so a run is queued
-    at most once. A closed run keeps its execution so it stays queryable. *)
+    at most once. A closed run keeps its execution so it stays queryable.
+    [attempt] and [input] are the run's retry attempt (1 for a first run or
+    a continue-as-new successor) and encoded start input, kept so a failed
+    run can be retried with the same input. A retry run waits out its
+    backoff before its first activation: until [started] is set its jobs
+    accumulate without queueing the run, and [start_event] is the pending
+    virtual-time event that starts it. *)
 and run = {
   run_id : string;
   workflow_type : string;
   chain : chain;
   execution : execution;
+  attempt : int;
+  input : Codec.payload;
+  mutable started : bool;
+  mutable start_event : event option;
   mutable jobs : Activation.job list;
   mutable queued : bool;
   mutable closed : bool;
@@ -116,10 +131,12 @@ and run = {
     queue drops dead events lazily when they reach the front. *)
 and event = { at : int64; order : int; mutable live : bool; action : action }
 
-(** The work performed when an event falls due. *)
+(** The work performed when an event falls due. [Start_run] delivers the
+    first activation of a retry run once its backoff has elapsed. *)
 and action =
   | Fire_timer of run * int64
   | Retry_activity of run * int64 * activity_request * int
+  | Start_run of run
 
 (** Events ordered by due time and then by creation order, so simultaneous
     events fire in the order their commands were emitted. *)
@@ -193,13 +210,53 @@ let activity_timestamp milliseconds : Activity_context.timestamp =
     nanoseconds = Int64.to_int (Int64.rem milliseconds 1_000L) * 1_000_000;
   }
 
-(** Rebuilds an error with a new category and message prefix while retaining
-    its retryability, application type, and details, mirroring how Core wraps
-    a cause in an activity or child-workflow failure. *)
-let wrap ~category ~prefix error =
-  let view = Error.view error in
-  Error.make ~non_retryable:view.non_retryable ?error_type:view.error_type
-    ~details:view.details ~category ~message:(prefix ^ view.message) ()
+(** Adds a non-negative virtual-time offset to an instant, saturating at
+    [Int64.max_int] instead of wrapping to a negative time. A saturated
+    deadline lies beyond every reachable instant, which is what a caller
+    asking for an enormous duration means. *)
+let saturating_add at offset =
+  if Int64.compare offset 0L > 0 && Int64.compare at (Int64.sub Int64.max_int offset) > 0
+  then Int64.max_int
+  else Int64.add at offset
+
+(** The application failure type the native activity adapter reports for a
+    task it cannot dispatch: an unknown or non-executable activity type, an
+    unsupported argument list, and an input or output codec failure
+    (including a codec that raises). See [failure_of_error] in
+    [Native_activity_execution]; the literal is repeated here because that
+    module is the worker's private adapter, not a shared classification
+    API. Only an exception raised by the activity callback itself is typed
+    [ocaml_exception]. *)
+let native_dispatch_failure_type = "ocaml_temporal_native_activity"
+
+(** The [error_type] the native worker reports for a child-workflow failure
+    caused by [cause]. The native path sets it to the innermost Temporal
+    application failure's type ([Failure_diagnostic.application_failure_type]).
+    A workflow failing with a [Cancelled] error is encoded as a canceled
+    failure, and a termination as a terminated failure, so neither carries
+    an application type; every other error is encoded as an application
+    failure typed by {!Error.application_failure_type}. (An activity's
+    error is always encoded as an application failure, so activity
+    failures always carry that type.) *)
+let child_error_type cause =
+  match (Error.view cause).category with
+  | `Cancelled | `Terminated -> None
+  | `Activity | `Bridge | `Child_workflow | `Codec | `Defect | `Nexus
+  | `Timeout | `Update | `Workflow ->
+      Some (Error.application_failure_type cause)
+
+(** Wraps [cause] as the activity or child-workflow failure a workflow
+    observes, mirroring the native worker's translation of Core's wrapper
+    failure ([runtime_error_of_failure]): the new [category], the cause's
+    details, the innermost application type [error_type], and the given
+    retryability. Retryability is decided by the caller because it follows
+    Temporal's retry state: an activity whose retries ended, or a child
+    whose retry policy ended, is non-retryable, while a child without a
+    retry policy inherits its cause's flag. *)
+let wrap ~category ~error_type ~non_retryable ~prefix cause =
+  let view = Error.view cause in
+  Error.make ~non_retryable ?error_type ~details:view.details ~category
+    ~message:(prefix ^ view.message) ()
 
 (** The error a workflow observes for a cancelled operation or run. *)
 let cancelled message = Error.make ~category:`Cancelled ~message ()
@@ -216,18 +273,29 @@ let validate_workflow_id workflow_id =
     Error (defect "workflow ID must be valid UTF-8")
   else Ok ()
 
-(** Folds registrations into a name map. A repeated name is a defect unless
-    the later registration is an override, which replaces the earlier one. *)
+(** Folds registrations into a name map. An override (a mock) replaces the
+    ordinary registration with the same name wherever it appears in the
+    list, so a test may prepend or append its mocks to an application's
+    registration list. Two ordinary registrations, or two overrides, with
+    one name are a defect. *)
 let register kind ~name_of ~override_of ~value_of items =
-  List.fold_left
-    (fun acc item ->
-      let* map = acc in
-      let name = name_of item in
-      if Name_map.mem name map && not (override_of item) then
-        Error
-          (defect (Printf.sprintf "duplicate %s registration: %s" kind name))
-      else Ok (Name_map.add name (value_of item) map))
-    (Ok Name_map.empty) items
+  let* map =
+    List.fold_left
+      (fun acc item ->
+        let* map = acc in
+        let name = name_of item and override = override_of item in
+        match Name_map.find_opt name map with
+        | Some existing when Bool.equal (override_of existing) override ->
+            Error
+              (defect
+                 (Printf.sprintf "duplicate %s%s registration: %s"
+                    (if override then "mock " else "")
+                    kind name))
+        | Some existing when override_of existing -> Ok map
+        | Some _ | None -> Ok (Name_map.add name item map))
+      (Ok Name_map.empty) items
+  in
+  Ok (Name_map.map value_of map)
 
 (** Rejects a workflow registration that names two signal, query, or update
     handlers alike. [Execution.start] treats such a list as a programming error
@@ -328,11 +396,14 @@ let fresh_request_id environment prefix =
   environment.next_request <- environment.next_request + 1;
   Printf.sprintf "%s-%d" prefix environment.next_request
 
-(** Schedules [action] [delay_ms] after the current virtual time. *)
+(** Schedules [action] [delay_ms] after the current virtual time. A delay
+    past the end of representable time saturates (see {!saturating_add}),
+    so an enormous timer stays in the future instead of wrapping into the
+    past and firing at once. *)
 let schedule environment ~delay_ms action =
   let event =
     {
-      at = Int64.add environment.now_ms delay_ms;
+      at = saturating_add environment.now_ms delay_ms;
       order = environment.next_order;
       live = true;
       action;
@@ -354,20 +425,30 @@ let rec next_event_time environment =
   | Some (_, event) -> Some event.at
 
 (** Appends a job for [run]'s next activation and queues the run. Jobs for a
-    closed run are dropped: Core never activates a closed run either. *)
+    closed run are dropped: Core never activates a closed run either. A
+    retry run still in its backoff keeps the job for its first activation
+    but is not queued until its [Start_run] event starts it. *)
 let push_job environment run job =
   if not run.closed then begin
     run.jobs <- job :: run.jobs;
-    if not run.queued then begin
+    if run.started && not run.queued then begin
       run.queued <- true;
       Queue.push run environment.ready
     end
   end
 
 (** Records [chain]'s final outcome once and resolves the parent's child
-    future. Cancellation keeps its category so the parent can distinguish it
-    from a child failure; every other error is wrapped as Core does. *)
-let rec close_chain environment chain outcome =
+    future. [cancelled] marks a run that closed by acknowledging a
+    cancellation request ([Cancel_workflow_execution]); only that outcome
+    reaches the parent as a cancellation, as Core resolves it with a
+    cancelled child result. Every other error, including a workflow failure
+    whose error merely has the [Cancelled] category, is wrapped as a
+    [Child_workflow] failure. [retries_exhausted] marks a chain whose retry
+    policy ended its retries, which the server reports with a
+    non-retryable retry state; otherwise the failure inherits the cause's
+    retryability, as Core reports a child without a retry policy. *)
+let rec close_chain ?(cancelled = false) ?(retries_exhausted = false)
+    environment chain outcome =
   if Option.is_none chain.outcome then begin
     chain.outcome <- Some outcome;
     match chain.parent with
@@ -376,11 +457,13 @@ let rec close_chain environment chain outcome =
         let result =
           match outcome with
           | Ok payload -> Ok payload
-          | Error error when (Error.view error).category = `Cancelled ->
-              Error error
+          | Error error when cancelled -> Error error
           | Error error ->
               Error
                 (wrap ~category:`Child_workflow
+                   ~error_type:(child_error_type error)
+                   ~non_retryable:
+                     (retries_exhausted || (Error.view error).non_retryable)
                    ~prefix:
                      (Printf.sprintf "child workflow %s failed: "
                         chain.workflow_id)
@@ -400,6 +483,8 @@ and close_run environment run =
   if not run.closed then begin
     run.closed <- true;
     run.jobs <- [];
+    Option.iter (fun event -> event.live <- false) run.start_event;
+    run.start_event <- None;
     Hashtbl.iter (fun _ event -> event.live <- false) run.timers;
     Hashtbl.reset run.timers;
     Hashtbl.iter (fun _ event -> event.live <- false) run.activity_retries;
@@ -427,16 +512,36 @@ and close_run environment run =
       children
   end
 
-(** Closes [run] and, when it is its chain's current run, the chain. *)
-let finish environment run outcome =
-  close_run environment run;
-  if current run.chain == run then close_chain environment run.chain outcome
+(** Converts a whole-millisecond interval to a protocol duration. *)
+let protocol_duration milliseconds : Protocol.duration =
+  {
+    seconds = Int64.div milliseconds 1_000L;
+    nanoseconds = Int64.to_int (Int64.rem milliseconds 1_000L) * 1_000_000;
+  }
+
+(** Converts a command retry policy to the form [Workflow.info] reports, as
+    Core echoes a child's policy in its initialization job. *)
+let protocol_retry_policy (policy : Activation.retry_policy) :
+    Protocol.retry_policy =
+  {
+    initial_interval = protocol_duration policy.initial_interval;
+    backoff_coefficient_bits = policy.backoff_coefficient_bits;
+    maximum_interval = protocol_duration policy.maximum_interval;
+    maximum_attempts = policy.maximum_attempts;
+    non_retryable_error_types = policy.non_retryable_error_types;
+  }
 
 (** Creates the next run of [chain], decoding [input] with the registered
     codec, installing the run identity, and queueing its initialization
     activation. Nothing is allocated when the type is unknown or the input
-    does not decode. *)
-let create_run environment chain ~workflow_type ~input =
+    does not decode. [initiator] records why a successor exists (the
+    previous run is the chain's current run) and [attempt] is the run's
+    retry attempt. With [delay_ms] the initialization activation waits for
+    that much virtual time, as the server delays a retry run's first
+    workflow task by the retry backoff. *)
+let create_run ?(attempt = 1) ?delay_ms
+    ?(initiator = Protocol.Continue_as_new_workflow) environment (chain : chain)
+    ~workflow_type ~input =
   match Name_map.find_opt workflow_type environment.workflows with
   | None ->
       Error
@@ -457,7 +562,7 @@ let create_run environment chain ~workflow_type ~input =
           (* The run counter is deterministic, so it also serves as a
              reproducible seed for [Temporal.Workflow.random_int]. *)
           let execution =
-            Execution.start ~task_queue:environment.task_queue
+            Execution.start ~task_queue:chain.task_queue
               ~namespace:environment.namespace
               ~randomness_seed:(string_of_int environment.next_run)
               ~signal_handlers ~query_handlers ~update_handlers definition
@@ -478,7 +583,7 @@ let create_run environment chain ~workflow_type ~input =
                  Workflow_context_store.workflow_id = chain.workflow_id;
                  run_id;
                  workflow_type;
-                 attempt = 1;
+                 attempt;
                  first_execution_run_id = chain.first_run_id;
                  parent =
                    Option.map
@@ -490,19 +595,18 @@ let create_run environment chain ~workflow_type ~input =
                        })
                      chain.parent;
                  start_time = Some (protocol_timestamp environment.now_ms);
-                 (* The environment records no workflow timeouts or retry
-                    policy, matching a server start without those options. *)
+                 (* The environment records no workflow timeouts, matching a
+                    server start without those options. Only a child command
+                    supplies a retry policy. *)
                  execution_timeout = None;
                  run_timeout = None;
                  task_timeout = None;
-                 retry_policy = None;
+                 retry_policy = Option.map protocol_retry_policy chain.retry_policy;
                  (* [chain.current] still names the predecessor here: it is
-                    replaced only after this run is built, and the
-                    environment's only successor path is continue-as-new. *)
+                    replaced only after this run is built. *)
                  continued_from =
                    Option.map
-                     (fun (previous : run) ->
-                       (previous.run_id, Protocol.Continue_as_new_workflow))
+                     (fun (previous : run) -> (previous.run_id, initiator))
                      chain.current;
                });
           let run =
@@ -511,6 +615,10 @@ let create_run environment chain ~workflow_type ~input =
               workflow_type;
               chain;
               execution = Execution execution;
+              attempt;
+              input;
+              started = Option.is_none delay_ms;
+              start_event = None;
               jobs = [];
               queued = false;
               closed = false;
@@ -526,6 +634,11 @@ let create_run environment chain ~workflow_type ~input =
           chain.current <- Some run;
           environment.runs <- run :: environment.runs;
           push_job environment run Activation.Start_workflow;
+          Option.iter
+            (fun delay_ms ->
+              run.start_event <-
+                Some (schedule environment ~delay_ms (Start_run run)))
+            delay_ms;
           Ok run)
 
 (** Returns the chain registered for [workflow_id] when it is still open and,
@@ -539,9 +652,10 @@ let find_open_chain environment ~workflow_id ~run_id =
       Some chain
   | Some _ | None -> None
 
-(** Creates and registers a chain whose first run is [workflow_type]. *)
-let new_chain environment ~workflow_id ~workflow_type ~input ~parent
-    ~parent_close_policy =
+(** Creates and registers a chain whose first run is [workflow_type].
+    [task_queue] defaults to the environment's queue. *)
+let new_chain ?retry_policy ?task_queue environment ~workflow_id
+    ~workflow_type ~input ~parent ~parent_close_policy =
   let chain =
     {
       workflow_id;
@@ -550,6 +664,8 @@ let new_chain environment ~workflow_id ~workflow_type ~input ~parent
       outcome = None;
       parent;
       parent_close_policy;
+      retry_policy;
+      task_queue = Option.value task_queue ~default:environment.task_queue;
     }
   in
   let* _run = create_run environment chain ~workflow_type ~input in
@@ -563,16 +679,20 @@ let float_of_bits bits =
   | None -> Float.nan
 
 (** Returns the virtual delay before the next attempt, or [None] when the
-    failure is final. This follows Temporal's activity retry rules: a
-    non-retryable error, a listed non-retryable error type, or an exhausted
-    attempt budget ends the activity; otherwise the delay grows by the
-    backoff coefficient up to the maximum interval. Unset fields take the
-    server defaults (1s initial interval, coefficient 2.0, maximum 100 times
-    the initial interval), and an unlimited budget is capped at the
-    environment's [max_activity_attempts]. *)
+    failure is final. This follows Temporal's retry rules, which the server
+    applies alike to activity attempts and to the runs of a child workflow
+    with a retry policy: a non-retryable error, a listed non-retryable
+    error type, or an exhausted attempt budget ends the retries; otherwise
+    the delay grows by the backoff coefficient up to the maximum interval.
+    Unset fields take the server defaults (1s initial interval, coefficient
+    2.0, maximum 100 times the initial interval), and an unlimited budget is
+    capped at the environment's [max_activity_attempts]. An error with the
+    [Cancelled] category is an ordinary failure here: the native worker
+    treats it as a cancellation only when Core actually delivered one, and
+    the engine never routes its own cancellations through this function. *)
 let retry_delay environment policy ~attempt error =
   let view = Error.view error in
-  if view.non_retryable || view.category = `Cancelled then None
+  if view.non_retryable then None
   else
     let initial, coefficient, maximum_interval, maximum_attempts, non_retryable =
       match (policy : Activation.retry_policy option) with
@@ -607,14 +727,50 @@ let retry_delay environment policy ~attempt error =
         Some maximum_interval
       else Some (Int64.of_float (Float.ceil delay))
 
+(** How a run's terminal command closed it. Only [Run_failed] is eligible
+    for a child's workflow retry policy, and only [Run_cancelled] reaches a
+    parent as a cancellation. [Task_failed] is the environment's stand-in
+    for a workflow task failure, which a server would retry rather than
+    close the run with, so it is never retried as a workflow failure. *)
+type closure = Run_completed | Run_failed | Run_cancelled | Task_failed
+
+(** Closes [run] and, when it is its chain's current run, either retries the
+    chain under its retry policy or closes the chain. A retry creates the
+    next run of the same workflow type and input with [attempt + 1], linked
+    by a retry continuation, whose first activation waits out the backoff;
+    the parent is not told, exactly as with server-side child retries. *)
+let finish environment run closure outcome =
+  close_run environment run;
+  if current run.chain == run then
+    let chain = run.chain in
+    match (closure, outcome, chain.retry_policy) with
+    | Run_failed, Error error, (Some _ as policy) -> (
+        match retry_delay environment policy ~attempt:run.attempt error with
+        | Some delay_ms -> (
+            match
+              create_run ~attempt:(run.attempt + 1) ~delay_ms
+                ~initiator:Protocol.Continue_as_new_retry environment chain
+                ~workflow_type:run.workflow_type ~input:run.input
+            with
+            | Ok _ -> ()
+            | Error error -> close_chain environment chain (Error error))
+        | None -> close_chain ~retries_exhausted:true environment chain outcome)
+    | Run_cancelled, _, _ -> close_chain ~cancelled:true environment chain outcome
+    | (Run_completed | Run_failed | Task_failed), _, _ ->
+        close_chain environment chain outcome
+
 (** Runs one attempt of [request] synchronously, outside every workflow
     context, and returns its encoded output or failure. Activities take zero
-    virtual time. Exceptions follow the worker contract: they become
-    non-retryable [ocaml_exception] failures. *)
+    virtual time. Failures are classified as the native activity adapter
+    classifies them: a task that cannot be dispatched (unknown or
+    unsupported type, bad argument list, codec failure or a raising codec)
+    fails non-retryably with {!native_dispatch_failure_type}, and an
+    exception from the callback itself fails non-retryably as
+    [ocaml_exception]. *)
 let attempt_activity environment run request ~attempt =
-  let failure ?error_type message =
+  let failure ?(error_type = native_dispatch_failure_type) message =
     Error
-      (Error.make ~non_retryable:true ?error_type ~category:`Activity ~message
+      (Error.make ~non_retryable:true ~error_type ~category:`Activity ~message
          ())
   in
   match Name_map.find_opt request.activity_type environment.activities with
@@ -644,10 +800,10 @@ let attempt_activity environment run request ~attempt =
             match Codec.decode (Definition.input definition) payload with
             | Ok input -> Ok input
             | Error error ->
-                failure ~error_type:"codec"
+                failure
                   ("activity input decoding failed: " ^ Error.message error)
             | exception exn ->
-                failure ~error_type:"ocaml_exception"
+                failure
                   ("activity input decoder raised: " ^ Printexc.to_string exn)
           in
           let milliseconds = Option.map Temporal_base.Duration.of_ms in
@@ -694,17 +850,21 @@ let attempt_activity environment run request ~attempt =
               match Codec.encode (Definition.output definition) output with
               | Ok payload -> Ok payload
               | Error error ->
-                  failure ~error_type:"codec"
+                  failure
                     ("activity output encoding failed: " ^ Error.message error)
               | exception exn ->
-                  failure ~error_type:"ocaml_exception"
+                  failure
                     ("activity output encoder raised: " ^ Printexc.to_string exn)
               )))
 
 (** Runs attempt [attempt] of the activity identified by [seq] and either
     queues its resolution for [run] or schedules the next attempt after the
-    retry delay. A final failure is wrapped as an [Activity] error, as Core
-    reports it; a cancellation keeps its category. *)
+    retry delay. A final failure is wrapped as a non-retryable [Activity]
+    error, as the native worker reports a failure whose retry state is
+    [NON_RETRYABLE_FAILURE] or [MAXIMUM_ATTEMPTS_REACHED], the only ways
+    the simulated retries end. An error with the [Cancelled] category
+    returned by the activity is wrapped too: only {!cancel_activity}
+    produces a workflow-visible activity cancellation. *)
 let run_activity environment run seq request ~attempt =
   match attempt_activity environment run request ~attempt with
   | Ok payload ->
@@ -720,12 +880,10 @@ let run_activity environment run seq request ~attempt =
           Hashtbl.replace run.activity_retries seq event
       | None ->
           let error =
-            if (Error.view error).category = `Cancelled then error
-            else
-              wrap ~category:`Activity
-                ~prefix:
-                  (Printf.sprintf "activity %s failed: " request.activity_type)
-                error
+            wrap ~category:`Activity ~non_retryable:true
+              ~error_type:(Some (Error.application_failure_type error))
+              ~prefix:(Printf.sprintf "activity %s failed: " request.activity_type)
+              error
           in
           push_job environment run
             (Activation.Resolve_activity { seq; result = Error error }))
@@ -768,8 +926,12 @@ let workflow_input_of_arguments = function
 
 (** Starts a child chain for a [Start_child_workflow] command and queues the
     start acknowledgement. A running workflow ID, an unregistered type, or an
-    input the child cannot decode fails the start instead. *)
-let start_child environment run ~seq ~id ~name ~input ~parent_close_policy =
+    input the child cannot decode fails the start instead. The child's
+    [retry_policy] governs its runs as on a server, and [task_queue] is
+    reported by its [Workflow.info]; every registered workflow runs
+    regardless of the queue, as if a worker polled each one. *)
+let start_child environment run ~seq ~id ~name ~input ~parent_close_policy
+    ~retry_policy ~task_queue =
   let start_failed cause =
     push_job environment run
       (Activation.Resolve_child_workflow_start
@@ -790,8 +952,9 @@ let start_child environment run ~seq ~id ~name ~input ~parent_close_policy =
   else
     match
       Result.bind (workflow_input_of_arguments input) (fun input ->
-          new_chain environment ~workflow_id:id ~workflow_type:name ~input
-            ~parent:(Some (run, seq)) ~parent_close_policy)
+          new_chain ?retry_policy ?task_queue environment ~workflow_id:id
+            ~workflow_type:name ~input ~parent:(Some (run, seq))
+            ~parent_close_policy)
     with
     | Error error -> start_failed (Error.message error)
     | Ok chain ->
@@ -905,8 +1068,11 @@ let rec apply_command environment run command =
           event.live <- false;
           Hashtbl.remove run.timers seq
       | None -> ())
-  | Start_child_workflow { seq; id; name; input; parent_close_policy; _ } ->
+  | Start_child_workflow
+      { seq; id; name; input; parent_close_policy; retry_policy; task_queue; _ }
+    ->
       start_child environment run ~seq ~id ~name ~input ~parent_close_policy
+        ~retry_policy ~task_queue
   | Cancel_child_workflow { seq; _ } -> (
       match Hashtbl.find_opt run.children seq with
       | Some child ->
@@ -926,10 +1092,11 @@ let rec apply_command environment run command =
         ~resolve:(fun result ->
           Activation.Resolve_request_cancel_external_workflow { seq; result })
   | Set_patch_marker _ | Upsert_search_attributes _ -> ()
-  | Complete_workflow payload -> finish environment run (Ok payload)
-  | Fail_workflow error -> finish environment run (Error error)
+  | Complete_workflow payload -> finish environment run Run_completed (Ok payload)
+  | Fail_workflow error -> finish environment run Run_failed (Error error)
   | Cancel_workflow_execution ->
-      finish environment run (Error (cancelled "workflow cancelled"))
+      finish environment run Run_cancelled
+        (Error (cancelled "workflow cancelled"))
   | Continue_as_new { workflow_type; input } -> (
       close_run environment run;
       match
@@ -939,14 +1106,52 @@ let rec apply_command environment run command =
       | Ok _ -> ()
       | Error error -> close_chain environment run.chain (Error error))
 
+(** Reports whether [command] closes the run that emitted it. *)
+and is_terminal_command : Activation.command -> bool = function
+  | Complete_workflow _ | Fail_workflow _ | Cancel_workflow_execution
+  | Continue_as_new _ ->
+      true
+  | Schedule_activity _ | Schedule_local_activity _ | Start_child_workflow _
+  | Cancel_child_workflow _ | Signal_external_workflow _
+  | Request_cancel_external_workflow _ | Request_cancel_activity _
+  | Request_cancel_local_activity _ | Start_timer _ | Cancel_timer _
+  | Query_result _ | Update_response _ | Set_patch_marker _
+  | Upsert_search_attributes _ ->
+      false
+
+(** Reports whether [command] asks the server to act outside the emitting
+    run. The server records such a command but drops its transfer task when
+    the same workflow task also closed the run: an activity task fails with
+    "workflow completed" (and eager dispatch is skipped), a child start is
+    abandoned even under [Parent_abandon], and external signals and
+    cancellations, including a child cancellation, are never sent. Core
+    likewise never runs a local activity for a completed run. *)
+and is_dispatched_by_server : Activation.command -> bool = function
+  | Schedule_activity _ | Schedule_local_activity _ | Start_child_workflow _
+  | Cancel_child_workflow _ | Signal_external_workflow _
+  | Request_cancel_external_workflow _ ->
+      true
+  | Request_cancel_activity _ | Request_cancel_local_activity _
+  | Start_timer _ | Cancel_timer _ | Query_result _ | Update_response _
+  | Set_patch_marker _ | Upsert_search_attributes _ | Complete_workflow _
+  | Fail_workflow _ | Cancel_workflow_execution | Continue_as_new _ ->
+      false
+
 (** Delivers [jobs] to [run] in one activation stamped with the current
-    virtual time and interprets the resulting commands in emission order. A
-    workflow task failure closes the run with that error: the environment
-    does not retry tasks, so the defect is reported to the test instead of
-    being retried forever. *)
-and activate environment run jobs =
+    virtual time and interprets the resulting commands in emission order.
+    When the batch closes the run, the commands a server would never
+    dispatch for a closed run ({!is_dispatched_by_server}) are dropped, so a
+    test cannot observe an activity, child, or external signal that
+    production never runs. A workflow task failure closes the run with that
+    error: the environment does not retry tasks, so the defect is reported
+    to the test instead of being retried forever. [counts_toward_history]
+    is [false] for a query-only activation, which Core answers without
+    appending workflow history, so [Workflow.Info.history_length] does not
+    grow with test queries. *)
+and activate ?(counts_toward_history = true) environment run jobs =
   let (Execution execution) = run.execution in
-  run.history_length <- run.history_length + List.length jobs + 2;
+  if counts_toward_history then
+    run.history_length <- run.history_length + List.length jobs + 2;
   Execution.set_activation_timestamp execution
     (Some (protocol_timestamp environment.now_ms));
   Execution.set_activation_is_replaying execution false;
@@ -959,17 +1164,52 @@ and activate environment run jobs =
     };
   let commands = Execution.activate execution jobs in
   (match Execution.task_failure execution with
-  | Some error when not run.closed -> finish environment run (Error error)
+  | Some error when not run.closed ->
+      finish environment run Task_failed (Error error)
   | Some _ | None -> ());
+  let commands =
+    if List.exists is_terminal_command commands then
+      List.filter (fun command -> not (is_dispatched_by_server command)) commands
+    else commands
+  in
   List.iter (apply_command environment run) commands
 
+(** Ranks [job] in Core's activation order: initialization; patch
+    notifications and random-seed updates; signals and updates; every other
+    job; local-activity resolutions; queries (see the pinned Core
+    [workflow_activation.proto]). The workflow runtime relies on this order,
+    for example to run a signal handler before a root continuation woken by
+    a timer in the same activation. A [Resolve_activity] is a local-activity
+    resolution when [run] scheduled that sequence as a local activity. *)
+let job_rank (run : run) : Activation.job -> int = function
+  | Start_workflow -> 0
+  | Notify_has_patch _ | Update_random_seed _ -> 1
+  | Signal_workflow _ | Do_update _ -> 2
+  | Resolve_local_activity_backoff _ -> 4
+  | Resolve_activity { seq; _ } -> (
+      match Hashtbl.find_opt run.activities seq with
+      | Some { is_local = true; _ } -> 4
+      | Some { is_local = false; _ } | None -> 3)
+  | Query_workflow _ -> 5
+  | Resolve_child_workflow_start _ | Resolve_child_workflow _
+  | Resolve_signal_external_workflow _
+  | Resolve_request_cancel_external_workflow _ | Fire_timer _
+  | Cancel_workflow | Remove_from_cache ->
+      3
+
 (** Activates runnable executions in FIFO order until none has undelivered
-    jobs. Virtual time does not move. *)
+    jobs. Each run's jobs are stable-sorted into Core's order
+    ({!job_rank}), so jobs of one rank keep their arrival order. Virtual
+    time does not move. *)
 let drain environment =
   while not (Queue.is_empty environment.ready) do
     let run = Queue.pop environment.ready in
     run.queued <- false;
-    let jobs = List.rev run.jobs in
+    let jobs =
+      List.rev run.jobs
+      |> List.stable_sort (fun left right ->
+             Int.compare (job_rank run left) (job_rank run right))
+    in
     run.jobs <- [];
     if (not run.closed) && jobs <> [] then activate environment run jobs
   done
@@ -990,7 +1230,18 @@ let fire_due environment at =
            | Retry_activity (run, seq, request, attempt) ->
                Hashtbl.remove run.activity_retries seq;
                if not run.closed then
-                 run_activity environment run seq request ~attempt);
+                 run_activity environment run seq request ~attempt
+           | Start_run run ->
+               (* The retry backoff has elapsed: release the jobs gathered
+                  since the run was created, led by its initialization. *)
+               run.start_event <- None;
+               if not run.closed then begin
+                 run.started <- true;
+                 if (not run.queued) && run.jobs <> [] then begin
+                   run.queued <- true;
+                   Queue.push run environment.ready
+                 end
+               end);
         loop ()
     | Some _ | None -> ()
   in
@@ -999,9 +1250,16 @@ let fire_due environment at =
 
 (** Runs the environment until [finished] holds, skipping virtual time to
     the next event whenever nothing else can progress. [describe] names the
-    awaited operation in the blocked and timeout diagnostics. *)
+    awaited operation in the blocked and timeout diagnostics. A timeout
+    whose deadline lies past the end of representable virtual time is no
+    deadline at all, so [Int64.max_int] means "no limit" instead of
+    overflowing into an already-expired deadline. *)
 let run_until environment ?timeout_ms ~describe finished =
-  let deadline = Option.map (Int64.add environment.now_ms) timeout_ms in
+  let deadline =
+    Option.bind timeout_ms (fun timeout_ms ->
+        let deadline = saturating_add environment.now_ms timeout_ms in
+        if Int64.equal deadline Int64.max_int then None else Some deadline)
+  in
   let rec loop () =
     drain environment;
     if finished () then Ok ()
@@ -1086,10 +1344,19 @@ let query { environment; target = chain } ~name ~arguments =
   let* () = ensure_open environment in
   drain environment;
   let run = current chain in
+  let* () =
+    if run.started then Ok ()
+    else
+      Error
+        (defect
+           ("query cannot be answered while a retry run waits for its first \
+             workflow task: " ^ chain.workflow_id))
+  in
   let query_id = fresh_request_id environment "query" in
   (* A query is answered in its own activation, as Core delivers it, so it
-     cannot run workflow fibers or append commands. *)
-  activate environment run
+     cannot run workflow fibers or append commands, and it appends no
+     history. *)
+  activate ~counts_toward_history:false environment run
     [
       Activation.Query_workflow
         { query_id; query_type = name; arguments; headers = [] };
@@ -1151,7 +1418,9 @@ let skip environment ~milliseconds =
   if Int64.compare milliseconds 0L < 0 then
     Error (defect "skip duration must not be negative")
   else begin
-    let target = Int64.add environment.now_ms milliseconds in
+    (* Saturate so an enormous skip pins the clock at the last
+       representable instant instead of wrapping it negative. *)
+    let target = saturating_add environment.now_ms milliseconds in
     drain environment;
     let rec loop () =
       match next_event_time environment with

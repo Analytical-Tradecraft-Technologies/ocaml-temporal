@@ -14,8 +14,14 @@
     deliberately an approximation of the server, not a replay of real history:
     activities complete in zero virtual time, activity timeouts are not
     enforced, workflow task retries are not simulated (a task failure ends the
-    run with that error), and every identifier is a deterministic counter so
-    two runs of the same test observe the same values.
+    run with that error), workflow code is never replayed, and every
+    identifier is a deterministic counter so two runs of the same test
+    observe the same values. Where it does simulate a behavior it follows
+    the native worker and server: jobs reach an execution in Core's
+    activation order, activity and child failures carry the native error
+    shape, child retry policies are applied, and commands that a server
+    would never dispatch because the same activation closed the run are
+    dropped.
 
     Threading: an environment, its handles, and every workflow and activity
     callback it invokes run on the caller's system thread. An environment must
@@ -28,10 +34,11 @@
 type workflow
 
 (** Packs a local workflow definition for {!create}. [override] marks a
-    replacement registration: it replaces an earlier registration with the
-    same name instead of being reported as a duplicate, which lets a test swap
-    a child workflow for a stub while reusing an application's registration
-    list. *)
+    replacement registration: it replaces the ordinary registration with the
+    same name, wherever either appears in the list, instead of being
+    reported as a duplicate, which lets a test swap a child workflow for a
+    stub while reusing an application's registration list. Two ordinary
+    registrations, or two replacements, with one name are a defect. *)
 val workflow :
   ?override:bool ->
   ?signal_handlers:Execution.signal_handler list ->
@@ -80,7 +87,9 @@ type handle
     unlimited attempts (including the server default used when a workflow
     supplies none) is capped at [max_activity_attempts] attempts, default
     [10], so a permanently failing activity cannot spin the virtual clock
-    forever. Duplicate registration names without [override], an invalid
+    forever; the same cap bounds the runs of a child workflow whose retry
+    policy is unlimited. Duplicate registration names (see
+    {!val-workflow}), an invalid
     namespace or task queue, and a non-positive attempt cap return defects. *)
 val create :
   ?namespace:string ->
@@ -116,7 +125,9 @@ val run_id : handle -> string
     cancellation, termination, or task-failure error. Returns a defect when
     the chain is blocked with nothing scheduled (for example, waiting for a
     signal nobody sends) and a [Timeout] error when the next scheduled event
-    lies more than [timeout_ms] of virtual time after the call started. *)
+    lies more than [timeout_ms] of virtual time after the call started. A
+    deadline past the last representable instant ([Int64.max_int]
+    milliseconds) is treated as no deadline. *)
 val result :
   ?timeout_ms:int64 -> handle -> (Temporal_base.Codec.payload, Temporal_base.Error.t) result
 
@@ -130,7 +141,8 @@ val signal :
   (unit, Temporal_base.Error.t) result
 
 (** Runs pending work, then answers one query from the chain's current run in
-    a query-only activation. Closed runs remain queryable. *)
+    a query-only activation, which does not count toward the run's history
+    length. Closed runs remain queryable. *)
 val query :
   handle ->
   name:string ->
@@ -154,7 +166,8 @@ val cancel : handle -> (unit, Temporal_base.Error.t) result
 
 (** Advances virtual time by [milliseconds], firing every timer and activity
     retry that falls due in time order and running the executions they wake.
-    A negative value returns a defect and changes nothing. *)
+    The clock saturates at [Int64.max_int] milliseconds rather than
+    wrapping. A negative value returns a defect and changes nothing. *)
 val skip : t -> milliseconds:int64 -> (unit, Temporal_base.Error.t) result
 
 (** Returns the current virtual time in milliseconds since the Unix epoch. *)
