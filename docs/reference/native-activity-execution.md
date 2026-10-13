@@ -247,6 +247,28 @@ callbacks. A cancellation task for the running callback reaches it only
 cooperatively, through the heartbeat sweep described under
 [Cancellation](#cancellation).
 
+### Tasks this worker cannot run
+
+Steps 2 and 3 can fail for a task that another worker polling the same queue
+could run: during a rolling deploy an older worker may receive a newly added
+activity type, workers with different registrations may share a queue, and a
+newer caller may encode an input that an older codec cannot decode. Such a
+task is acknowledged with an application failure and the callback never runs
+(#1031). An unregistered type fails with type `NotFoundError` and a message
+that lists the types this worker registers, matching the Go, Python,
+TypeScript, and .NET SDKs; an undecodable input (including more than one
+argument) keeps the `ocaml_temporal_native_activity` type. For a remote
+activity both failures are **retryable**, so the activity's retry policy
+decides and a later attempt can be matched to an updated worker. A local
+activity always runs on the worker that scheduled it, where another attempt
+would fail the same way, so its failure stays non-retryable. Failures that
+another attempt would repeat on every worker, such as an unrepresentable
+heartbeat context or an output the codec cannot encode, remain
+non-retryable. The focused tests in
+[`test_native_activity_execution.ml`](../../test/runtime/test_native_activity_execution.ml)
+cover both localities for an unknown type, an extra argument, and a codec
+decode failure.
+
 The context-aware form is authored with `Temporal.Activity.define_with_context`:
 
 ```ocaml
@@ -308,7 +330,9 @@ up to the next whole millisecond and does not reject the task (#1032); earlier
 releases failed such a task non-retryably.
 
 Heartbeat-context conversion failures follow the same task-rejection path as
-input codec failures, for both synchronous and asynchronous definitions. For
+input codec failures, for both synchronous and asynchronous definitions, but
+unlike an undecodable input they are always non-retryable (see
+[Tasks this worker cannot run](#tasks-this-worker-cannot-run)). For
 example, binary heartbeat metadata which cannot be represented by runtime
 strings produces a bounded non-retryable failure
 for the exact leased token without invoking the callback. The adapter retains
@@ -331,8 +355,10 @@ behavior; Temporal Core owns timeout decisions and subsequent task delivery.
 If Core has already timed out an attempt, the synchronous adapter has no stale
 completion recovery. An asynchronous handle remains owned by the SDK until a
 terminal client operation is accepted or a confirmed terminal bridge failure
-closes it. Neither an uncertain heartbeat RPC outcome nor a definitive
-non-`NotFound` heartbeat rejection can retire that lease. A shutdown that
+closes it, or until the lease expires as described under
+[Async lease expiry](#async-lease-expiry). Neither an uncertain heartbeat RPC
+outcome nor a definitive non-`NotFound` heartbeat rejection can retire that
+lease. A shutdown that
 finds an admitted asynchronous lease treats its retryable outstanding-lease
 diagnostic like any retryable retained completion: it retries the drain until
 the grace period ends, so external code can still finish the handle. If the
@@ -343,6 +369,44 @@ counted through the separate async lock, so it is never mistaken for the
 callback's own lease; Temporal then times the activity out
 under its own timeouts. Before #495 shutdown returned at once and left the
 worker open for a manual retry.
+
+### Async lease expiry
+
+Rust retires its own state at the `WillCompleteAsync` handoff, so the
+adapter's async-lease table is the only holder of an admitted handle. A
+handle that application code never finishes (the completer crashed, dropped
+an error, or the attempt already timed out on the server) would otherwise
+stay admitted for the worker's life, and every later shutdown would wait the
+full grace period and then report a lost completion (#1043). Each admitted
+lease therefore records two bounds from its start task, measured on the
+worker's monotonic clock so that an NTP or manual wall-clock step cannot make
+a live lease look expired:
+
+- an attempt deadline: the time of admission plus the shorter of the
+  start-to-close and schedule-to-close timeouts; and
+- a heartbeat deadline, when a heartbeat timeout is set: the heartbeat
+  timeout after admission, or after the end of the last
+  `Async_handle.heartbeat` call that may have reached the server (accepted or
+  uncertain).
+
+Admission follows the attempt's start and each local progress time follows
+the server's own record of that heartbeat, so these bounds are never earlier
+than the server's timeouts; with five seconds of slack for the server's
+timeout processing and small clock adjustments, the adapter never expires a
+lease that could still be completed. Once a bound has passed, the lease is
+closed and dropped without a native call: later handle calls return the
+non-retryable "handle is closed" error the server's `NotFound` would
+otherwise produce, and a warning record `activity_async_lease_expired`
+carries the attempt's identity. Expiry is checked when a new lease is
+admitted (so a leaking worker does not accumulate them), by every drain, and
+by the shutdown probe that counts outstanding leases, so an expired lease
+never holds shutdown; a lease that expires during the grace period is
+dropped at the next drain retry. A task that reports no close timeout (only
+a test double can) never expires. The clock is injectable through
+`create_with_clock`, and the focused test
+[`test_native_async_activity.ml`](../../test/runtime/test_native_async_activity.ml)
+covers both close timeouts, the slack, heartbeat renewal, the no-timeout
+case, and expiry on admission.
 
 ### Heartbeat-timeout retry ownership
 
@@ -366,8 +430,10 @@ adapter preserves them as private outcome metadata while submitting the one
 `Cancelled` completion required for that token. Remapping a timed-out cancel
 to an OCaml `Failed` result, or submitting a locally generated retry, would
 race Core's ownership of the expired token and could send a duplicate or
-incorrect completion. The same rule protects worker-shutdown, pause, reset,
-and ordinary cancellation paths.
+incorrect completion. The same rule protects the worker-shutdown and
+ordinary cancellation paths. Pause and reset are the exception described
+under [Pause and reset](#pause-and-reset): the server rejects a cancelled
+completion for them, so their one completion is a retryable failure.
 
 The bilateral tests
 [`test_native_activity_execution.ml`](../../test/runtime/test_native_activity_execution.ml)
@@ -420,7 +486,8 @@ combinations still need dedicated live cases, and interceptors remain absent.
 
 A `Cancel` task has no activity type or input.  The adapter returns a
 `Cancelled` completion with a standard Temporal `Canceled` failure and copies
-the exact token unchanged.  The closed cancellation-reason variant is rendered
+the exact token unchanged (a pause or reset is failed retryably instead; see
+[Pause and reset](#pause-and-reset)).  The closed cancellation-reason variant is rendered
 with stable labels (`not_found`, `cancelled`, `timed_out`, `worker_shutdown`,
 `paused`, or `reset`).  Cancellation details remain task metadata owned by the
 native protocol; they are not re-encoded into an unrelated application
@@ -466,7 +533,9 @@ Core (in a heartbeat response):
    `` `Cancelled `` category completes it as cancelled (a Temporal `Canceled`
    failure carrying the error's detail payloads, with Core's reason and flags
    kept as outcome metadata) only when a cancellation was delivered, and is an
-   ordinary application failure otherwise; any other `Error` fails it, and an
+   ordinary application failure otherwise (a delivered pause or reset fails
+   it instead; see [Pause and reset](#pause-and-reset)); any other `Error`
+   fails it, and an
    exception fails it as a defect. Classifying before step 4 would race a
    heartbeat that delivers the cancellation after the callback returned its
    `` `Cancelled `` error. Because the attempt is cleared before its one
@@ -519,6 +588,33 @@ activity under `Wait_cancellation_completed` (the activity observes
 `Requested` and the workflow sees a `` `Cancelled `` activity error), a
 heartbeat-timeout cancellation (`Not_found` or `Timed_out`), and the shutdown
 flag of an activity-only worker shut down mid-callback.
+
+### Pause and reset
+
+An operator `temporal activity pause` or `reset` reaches a heartbeating
+attempt through the same channel: pinned Core turns the heartbeat response's
+`activity_paused` or `activity_reset` flag into a `Cancel` task whose
+primary reason is `Paused` or `Reset`. Core ranks a cancellation request
+above a reset and a reset above a pause, so the primary reason is `Paused`
+or `Reset` only when no cancellation was requested. The server, however,
+accepts `RespondActivityTaskCanceled` only after a cancellation request;
+Core would send the rejected call, log the network error, and still report
+success, leaving the attempt open until it timed out (#1022).
+
+When the delivered reason is `Paused` or `Reset`, the adapter therefore
+completes an attempt whose callback returned the `` `Cancelled `` error with
+a **retryable** application failure of type `ActivityPause` or
+`ActivityReset`, carrying the error's detail payloads, as the Python SDK
+does (Go likewise answers with a cancellation only when one was requested).
+Temporal holds a paused activity's next attempt until it is unpaused and
+schedules a reset activity afresh. A start whose pause or reset was swept
+before admission, and a bare `Cancel` task with either reason, are failed the
+same way without running a callback. The outcome kind is `Failed` and Core's
+reason and flags remain outcome metadata. The other reasons keep the
+cancelled completion: Core suppresses it for `Not_found` and `Timed_out` and
+itself reports `Worker_shutdown` as a failure. The focused test
+`test_pause_and_reset_fail_retryably` covers a running attempt, a bare task,
+and a start interrupted before admission for each reason.
 
 Workflow-side [scope hooks](workflow-scopes.md) buffer activity/child
 cancellation commands; they do not interrupt activity code. Focused lifecycle
