@@ -15,6 +15,50 @@ implementation when a later entry documents that work as complete. The
 records the current tested source, named assertions and successful CI job for
 the Temporal acceptance controllers.
 
+## 2026-10-13: Server-valid inbound values no longer wedge workflows (#1015, #1016, #1017, #1049, #1050)
+
+Several values that Temporal Server or another SDK legitimately sends were
+rejected by the inbound Core-to-semantic conversion. History is immutable,
+so each rejection failed every workflow task of the run (and every replay),
+failed an activity task, or made `Client.wait` fail permanently. The Rust
+conversion and the OCaml decoders now represent these values faithfully or
+degrade them deterministically, while outbound validation stays strict:
+
+- A negative application `next_retry_delay`, which the Go SDK sends when
+  `time.Until(retryAt)` has passed, is carried as absent (#1049).
+- Fields an SDK copies into an activity or child-workflow failure wrapper
+  (including the Java SDK's empty child namespace) are bounded text instead
+  of identifiers, and an absent wrapper type or execution reads as empty;
+  `external_payloads` size details and empty payload metadata keys are
+  dropped while the payload is kept (#1050).
+- Unknown numbers in the advisory enums (continue-as-new suggestion reason,
+  retry state, timeout type, application category, Nexus retry behavior,
+  continuation initiator) read as `unspecified` (#1017).
+- Start-event priority and activity-task priority keep their exact weight
+  bits and only the 64-byte fairness-key bound applies; a start-event retry
+  policy recorded with `maximum_attempts = 1` (which the server does not
+  validate) is carried as recorded, and `Workflow.Info.retry_policy` returns
+  `None` for a policy the public type cannot represent instead of raising
+  (#1016).
+- A Temporal Schedule action carrying the previous result or failure with no
+  previous run ID is represented with an empty continuation run ID, and
+  `Workflow.Info.continued_from_run_id` reports `None` (#1015).
+
+The JSON schemas and `docs/reference/core-protocol.md` document the rules.
+`rust/core-bridge/tests/workflow_protocol.rs` covers negative delays,
+unknown enum numbers, peer-written payload details, SDK-written child
+wrappers, schedule-started runs, and inbound priority (weights 5000, 0.0005,
+NaN, a NUL fairness key) and retry policy (coefficient 0.5, empty error
+type, absent and negative intervals), each round-tripping through the
+semantic JSON while the same priorities remain rejected outbound.
+`test/bridge/test_ocaml_activity_protocol.ml`,
+`test/bridge/test_ocaml_workflow_protocol.ml` and
+`test/runtime/test_execution_info.ml` cover the OCaml decoders and public
+accessors. Verified with `dune build @install`, the `test/bridge`,
+`test/runtime` and `test/unit` aliases on OCaml 5.4.1 (macOS), and the
+focused `cargo test`, `cargo fmt --check` and `cargo clippy -D warnings`
+runs.
+
 ## 2026-10-13: Unset activity timeouts read as None (#1032)
 
 Temporal reports an unset activity timeout as a zero duration. Core fills a
