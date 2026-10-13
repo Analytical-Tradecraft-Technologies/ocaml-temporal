@@ -28,6 +28,28 @@ original category and message and keeps its details and failure type, so the
 task fails with no commands and the run stays open, just as with the workflow
 result encoder. A new runtime test drives a failing encoder with every
 category and checks that only the task fails.
+## 2026-10-13: Inbound failure types never raise (#1011)
+
+An application failure type written by another SDK, worker or the server
+history could contain a control character, invalid UTF-8, or more than the
+65,536 encoded characters that `Error.make` allows; the Rust bridge's own
+truncation marker even begins with a newline. The inbound type went through
+`Error.make`, so `Client.wait`, `start_update` and `wait_update` raised
+`Invalid_argument` instead of returning a typed result, and a workflow
+awaiting such an activity or child failed every workflow task, including on
+replay. `Failure_diagnostic.application_failure_type` now passes the type
+through a deterministic sanitizer: malformed UTF-8 becomes U+FFFD, control
+characters become visible `\uXXXX` escapes, and over-long text is cut at a
+character boundary with a `...` marker. Valid types are unchanged and
+outbound `Error.make` validation stays strict.
+
+`test/bridge/test_failure_diagnostic.ml` covers control characters, NUL,
+invalid UTF-8, a type exactly at the limit, an over-long type ending in the
+bridge marker, multi-byte, quote and control-character cuts, and checks that
+every result is accepted by `Error.make`;
+`test/bridge/test_client_terminal_adapter.ml` drives a tab and newline type
+through the client terminal conversion. Verified with `dune build @install`
+and the focused bridge tests on OCaml 5.4.1 (macOS).
 
 ## 2026-10-13: Unset activity timeouts read as None (#1032)
 
