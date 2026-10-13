@@ -648,6 +648,45 @@ The Rust integration suite invokes the common wrapper with a deliberate panic;
 the panic test hook is not exported in the C header and is not part of the
 stable ABI.
 
+### SIGPIPE containment (#1041)
+
+The bridge never changes the process-wide SIGPIPE disposition. A Rust
+executable starts with SIGPIPE ignored, but that startup code does not run
+when the bridge is a static library in an OCaml executable, and OCaml keeps
+the default, terminating action. Rust std's scalar socket writes pass
+`MSG_NOSIGNAL`, while vectored writes (used by h2, hyper and tokio-rustls for
+gRPC, TLS and the Prometheus endpoint) are a plain `writev`. On Linux a
+`writev` to a connection the peer has reset therefore raised SIGPIPE and
+killed the process with status 141. macOS sockets created by std and mio set
+`SO_NOSIGPIPE`; Windows has no SIGPIPE.
+
+A SIGPIPE raised by a write is directed at the writing thread, so the bridge
+blocks it in thread signal masks instead (`rust/core-bridge/src/sigpipe.rs`):
+
+- every Tokio worker and blocking-pool thread of Core's runtime blocks it at
+  start, through Core's `lang_on_thread_start` hook, as do the runtime
+  cleanup threads and the Core log writer;
+- on Linux, the common ABI wrapper (`invoke`) blocks it for the duration of
+  each call on the application's thread, where `block_on` can drive connection setup
+  such as a TLS handshake. On return it consumes a SIGPIPE that became
+  pending during the call and restores the caller's exact mask. A caller that
+  had already blocked SIGPIPE is left untouched. Threads Core spawns during a
+  guarded call inherit the blocked mask. The drain is a zero-timeout
+  `sigtimedwait`, so it cannot block if another thread accepted a
+  process-directed SIGPIPE first. Other platforms skip the guard: macOS
+  bridge sockets never raise SIGPIPE, and without `sigtimedwait` a drain
+  could block indefinitely.
+
+The write then fails with `EPIPE` and follows the ordinary error path.
+Setting `SIG_IGN` instead (as the Rust, Python and Node runtimes do) was
+rejected because it silently changes an application setting that is also
+inherited by every child process the application later executes. An
+application that sets its own disposition or handler is unaffected.
+`rust/core-bridge/tests/sigpipe_containment.rs` covers both halves with the
+default disposition restored, including Linux `writev` into reset
+connections and aborted metrics scrapes; `test/bridge/test_runtime_metrics.ml`
+aborts scrapes from an OCaml host.
+
 ## Stateful handle ownership
 
 The reserved runtime, client, and worker types are opaque references to
