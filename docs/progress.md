@@ -15,6 +15,27 @@ implementation when a later entry documents that work as complete. The
 records the current tested source, named assertions and successful CI job for
 the Temporal acceptance controllers.
 
+## 2026-10-13: Bytecode consumers link outside the SDK workspace (#1020)
+
+The documented Dune `(modes byte)` link mode worked only inside the SDK's own
+workspace, whose `dune-workspace` disables dynamically linked foreign
+archives. The installed `temporal_core_bridge.cma` records the stub and Rust
+archives as `-dllib` entries, but only the static `.a` files are installed.
+An ordinary consumer project therefore linked a byte executable in
+dynamic-stub mode, and `ocamlc` failed looking for
+`dllocaml_temporal_core_bridge`. The bridge library is now archived with
+`ocamlc -a -custom` and `-ccopt -L"$CAMLORIGIN"` (through `ocamlc_flags`,
+because `ocamlopt` rejects `-custom`). Every bytecode link of the SDK,
+including Dune `(modes byte)` and `ocamlfind ocamlc -linkpkg`, now builds a
+custom runtime that embeds the static archives and finds them in the
+relocatable install directory. Supporting bytecode was kept rather than
+dropped: the custom runtime needs nothing the static archives do not already
+provide. The install-consumer fixture now links `main` as `exe` and `byte`.
+`test/bridge/test_install.sh` and the prebuilt-library consumer build and run
+`main.bc` in a separate Dune root without the SDK's `dune-workspace`. The
+README, workflow guide and Core bridge reference describe the supported modes;
+the toplevel and native plugins remain unsupported.
+
 ## 2026-10-13: Unset activity timeouts read as None (#1032)
 
 Temporal reports an unset activity timeout as a zero duration. Core fills a

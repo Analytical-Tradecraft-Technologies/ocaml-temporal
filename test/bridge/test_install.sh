@@ -141,9 +141,14 @@ fi
 (
   OCAMLPATH=$consumer_ocamlpath
   export OCAMLPATH
-  opam_dune build --root "$dune_output_dir" ./main.exe ./worker_environment.exe
+  opam_dune build --root "$dune_output_dir" ./main.exe ./main.bc ./worker_environment.exe
 )
 "$output_dir/_build/default/main.exe"
+# The same consumer as a Dune (modes byte) executable, built in its own Dune
+# root without the SDK's dune-workspace (#1020). The installed bridge archive
+# forces a custom runtime, so this must link the static archives and run
+# without looking for a dllocaml_temporal_core_bridge shared library.
+"$output_dir/_build/default/main.bc"
 
 # Malformed legacy settings used to fail before native client configuration.
 # The installed worker now reaches the same native path with either namespace
