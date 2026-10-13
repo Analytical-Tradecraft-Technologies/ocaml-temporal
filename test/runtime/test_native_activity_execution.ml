@@ -776,7 +776,9 @@ let test_unrepresentable_context_retires_lease () =
               in
               (* Binary heartbeat metadata is representable since #1048, so
                  the remaining unrepresentable shape is a second input value,
-                 which the single-input definition cannot accept. *)
+                 which the single-input definition cannot accept. A remote
+                 attempt with undecodable input fails retryably so the retry
+                 policy can reach an updated worker (#1031). *)
               let unit_input = encode_input Temporal.Codec.unit () in
               let path = "$.variant.input" in
               let token = Bytes.of_string "\000bad-context\255" in
@@ -818,7 +820,7 @@ let test_unrepresentable_context_retires_lease () =
               let completion = latest_completion supervisor in
               (match completion.result with
               | Protocol.Failed { message; info = Protocol.Application
-                  { non_retryable = true; details = []; _ }; _ }
+                  { non_retryable = false; details = []; _ }; _ }
                 when String.length message <= 1_024 -> ()
               | _ -> failwith "context failure did not produce a bounded rejection");
               if not (Bytes.equal completion.task_token token)
