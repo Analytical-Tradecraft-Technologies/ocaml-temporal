@@ -108,13 +108,21 @@ let owner scheduler =
           Temporal_base.Ordered_registry.remove handle))
 
 (** Records an exception that escaped a workflow fiber. While the scheduler is
-    active the exception is an activation defect reported by {!run}. After
-    {!shutdown} has deactivated it, every fiber that still runs is being
-    discontinued, so the exception came from that fiber's cleanup code and is
-    kept apart for {!take_teardown_failures}: it must not invalidate the
-    terminal command or eviction that caused the teardown (#1021). *)
+    active the exception is an activation defect reported by {!run}. Two
+    windows instead keep it apart for {!take_teardown_failures}, because the
+    only code that can run in them is cleanup of a fiber being unwound after
+    the run's outcome was chosen, and it must not invalidate the terminal
+    command or eviction that caused the teardown (#1021):
+    - after {!shutdown} has deactivated the scheduler (terminal command
+      emitted through the execution, eviction, adapter shutdown);
+    - after a terminal operation performed [Abort_workflow] in this drain
+      (continue-as-new or [terminate]): the terminal command is already
+      buffered, and the drain loop runs no other fiber once
+      [abort_requested] is set, so only the aborted fiber's own cleanup
+      handlers can raise. *)
 let record_failure scheduler exception_ =
-  if scheduler.active then scheduler.failures <- exception_ :: scheduler.failures
+  if scheduler.active && not scheduler.abort_requested then
+    scheduler.failures <- exception_ :: scheduler.failures
   else
     scheduler.teardown_failures <- exception_ :: scheduler.teardown_failures
 

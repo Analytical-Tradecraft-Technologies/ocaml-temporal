@@ -29,10 +29,13 @@ eviction completion with a task failure, which the Rust bridge rejects, so
 `Worker.run` stopped with the eviction lease outstanding.
 
 The scheduler now records exceptions that escape fibers after shutdown
-separately (`Scheduler.take_teardown_failures`), and `run` reports only
-failures raised while it was active. The execution logs those teardown
+separately (`Scheduler.take_teardown_failures`), as it does for exceptions
+raised by the aborted fiber's own cleanup after continue-as-new or `terminate`
+buffered the terminal command, and `run` reports only failures raised while
+it was active and not aborting. The execution logs those teardown
 failures as a warning with a count only, and a task-failing error reported by
-workflow code once the run is terminal or evicted is logged and dropped
+workflow code once the run is terminal, has a buffered terminal command, or
+is evicted is logged and dropped
 instead of poisoning the task; after eviction every error takes that path. A
 defect raised before the terminal command still discards the batch.
 `Native_execution.activate_translated` always acknowledges a cache eviction
@@ -43,8 +46,9 @@ and Rust eviction validators agree.
 whose `finally` starts a timer, upserts search attributes or raises, for both
 completion and eviction; a catch-all root or handler that converts the
 shutdown exception into a defect; a pre-terminal handler defect that must
-still fail the task; and native eviction acknowledgements for a failing
-cleanup and for a poisoned generation. `test/runtime/test_scheduler.ml`
+still fail the task; native eviction acknowledgements for a failing
+cleanup and for a poisoned generation; and a raising `finally` around
+continue-as-new in the root and in a handler, and around a cancelled root. `test/runtime/test_scheduler.ml`
 checks that a cleanup exception after shutdown is a teardown failure while an
 active one is still `Failed`. Verified with the full `test/runtime` and
 `test/unit` aliases on OCaml 5.4.1 (macOS).

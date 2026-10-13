@@ -55,9 +55,10 @@ val run_label : t -> string
 val shutdown : t -> unit
 
 (** Returns, oldest first, and clears the exceptions that escaped workflow
-    fibers after {!shutdown} deactivated the scheduler. Such an exception can
-    only come from cleanup code ([Fun.protect ~finally], an exception handler)
-    of a fiber being discontinued, so {!run} does not report it as [Failed]:
+    fibers after {!shutdown} deactivated the scheduler, or after a terminal
+    {!abort_workflow} in the current drain. Such an exception can only come
+    from cleanup code ([Fun.protect ~finally], an exception handler) of a
+    fiber being unwound, so {!run} does not report it as [Failed]:
     the terminal command or eviction that started the teardown stands, and the
     caller only logs these as diagnostics. *)
 val take_teardown_failures : t -> exn list

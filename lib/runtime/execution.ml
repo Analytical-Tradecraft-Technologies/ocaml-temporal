@@ -351,8 +351,10 @@ let poison_task execution error =
   end
 
 (** Fails the task for an error a workflow fiber returned or raised, unless the
-    run has already ended. Once a terminal command was emitted, or Core evicted
-    the run, every fiber still running is being discontinued, so the error can
+    run has already ended. Once a terminal command was emitted or buffered
+    (continue-as-new and [terminate] buffer it and abort the fiber before
+    [terminal] is set after the drain), or Core evicted the run, every fiber
+    still running is being discontinued, so the error can
     only come from its cleanup code or from a catch-all handler that caught the
     private shutdown exception. Such an error must not discard the terminal
     command, nor turn an eviction into a failed completion that Core rejects;
@@ -361,7 +363,8 @@ let poison_task execution error =
 let fail_task execution error =
   if
     Option.is_none execution.task_failure
-    && (execution.terminal || execution.evicted)
+    && (execution.terminal || execution.evicted
+       || Workflow_context_store.has_buffered_terminal execution.context)
   then
     report ~src:Observability.Source.workflow Logs.Warning
       ~tags:

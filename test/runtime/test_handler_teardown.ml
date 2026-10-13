@@ -307,6 +307,42 @@ let test_defect_before_terminal_still_fails () =
         (Temporal_base.Error.view error).category
   | None -> failwith "defect raised before the terminal command was ignored"
 
+(** Terminal operations whose own fiber is unwound by the run's ending. *)
+type terminal_unwind = Continue_root | Continue_handler | Cancel_root
+
+(** A [Fun.protect] whose [finally] raises around the code that ends the run
+    must not discard the terminal command (#1021). Continue-as-new buffers its
+    command and aborts its own fiber while the scheduler is still active, so
+    the cleanup exception arrives before [terminal] is set; a cancellation
+    discontinues the parked root after the cancel command was emitted. *)
+let test_raising_finally_around_terminal shape =
+  let raising body =
+    Fun.protect ~finally:(fun () -> failwith "finally raised") body
+  in
+  let continue () = T.Workflow.continue_as_new successor () in
+  let root, handler =
+    match shape with
+    | Continue_root -> ((fun () -> raising continue), sleep)
+    | Continue_handler -> (sleep, fun () -> raising continue)
+    | Cancel_root -> ((fun () -> raising sleep), sleep)
+  in
+  let execution, job = execution Signal ~root ~handler in
+  let first = Execution.activate execution [ Activation.Start_workflow ] in
+  let commands, expected =
+    let continued =
+      [ Activation.Continue_as_new { workflow_type = "successor"; input = [] } ]
+    in
+    match shape with
+    | Continue_root -> (first, continued)
+    | Continue_handler -> (Execution.activate execution [ job ], continued)
+    | Cancel_root ->
+        ( Execution.activate execution [ Activation.Cancel_workflow ],
+          [ Activation.Cancel_workflow_execution ] )
+  in
+  expect "raising finally keeps the terminal command" expected commands;
+  expect "raising finally is not a task failure" None
+    (Execution.task_failure execution)
+
 module Protocol = Temporal_protocol.Workflow_protocol
 module Native_execution = Temporal_runtime.Native_execution
 
@@ -368,4 +404,6 @@ let () =
   test_catch_all_during_teardown Evict;
   test_defect_before_terminal_still_fails ();
   test_native_eviction_acknowledges_cleanly ~poisoned:false;
-  test_native_eviction_acknowledges_cleanly ~poisoned:true
+  test_native_eviction_acknowledges_cleanly ~poisoned:true;
+  List.iter test_raising_finally_around_terminal
+    [ Continue_root; Continue_handler; Cancel_root ]
