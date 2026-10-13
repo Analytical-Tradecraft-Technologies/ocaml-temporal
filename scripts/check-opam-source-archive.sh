@@ -143,7 +143,7 @@ else
   exit 1
 fi
 
-cd "$package_root"
+cd "$package_root" || exit 1
 
 # The probe must fail inside the sandbox. A probe that reaches the registry
 # means the wrapper is not isolating the network and the build proves nothing.
