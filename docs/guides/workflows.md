@@ -246,10 +246,19 @@ without calling the external service again.
 ### Update indexed search attributes
 
 Workflows can publish indexed search attributes by emitting one deterministic
-merge command. The values are ordinary `Temporal.Payload.t` values, so the
-same codecs used for activity and workflow inputs can be reused. Keys must be
-unique, non-empty, valid UTF-8 strings no longer than 65,536 bytes; invalid
-keys are programmer errors and are rejected before the command is buffered.
+merge command. The values are ordinary `Temporal.Payload.t` values, but
+Temporal Server decodes them itself with its default converter rather than
+through the worker's codecs. Each value must be a `json/plain` encoding of the
+attribute's registered type, such as the output of `Temporal.Codec.string`,
+`Temporal.Codec.int`, or `Temporal.Codec.bool`. A `binary/null` payload, such
+as `Temporal.Codec.option` encoding `None`, removes the key. Any other encoding,
+including `Temporal.Codec.bytes` or a custom codec, is rejected by the server
+with `BAD_SEARCH_ATTRIBUTES`; that fails the workflow task on every retry until
+the workflow code is corrected. Keys must be unique, non-empty, valid UTF-8
+strings no longer than 65,536 bytes; invalid keys are programmer errors and are
+rejected before the command is buffered. Upserting an empty list is a no-op and
+emits no command, so a filtered list of changed attributes can be passed
+directly.
 
 ```ocaml
 let classify_workflow () =
