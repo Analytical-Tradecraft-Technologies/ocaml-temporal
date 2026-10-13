@@ -2,9 +2,13 @@
 //! `accept()` (#1030).
 //!
 //! Each relayed scrape needs the public `accept()`, the relay's private
-//! `connect()`, and Core's `accept()` of that connection. Core's accept loop
-//! ends for good on `EMFILE`, so if only the first two descriptors were
-//! available, a naive relay would kill Core's server. This binary keeps the
+//! `connect()`, Core's `accept()` of that connection, and (on Linux) a free
+//! descriptor for the follow-up `accept()` Core's loop makes before it sees
+//! `WouldBlock`. Core's accept loop ends for good on `EMFILE`, so if only the
+//! first two descriptors were available, a naive relay would kill Core's
+//! server. Freeing three per round covers the in-process scraper, the public
+//! `accept()` and the relay's `connect()`, so both of Core's `accept()` calls
+//! depend on the relay's reserve. This binary keeps the
 //! process at its descriptor limit and frees only two or three descriptors
 //! per scrape (the in-process scraper's own socket takes one), checking
 //! after every round that Core's server is still running. Descriptor limits

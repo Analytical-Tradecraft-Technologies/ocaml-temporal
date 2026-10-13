@@ -28,8 +28,10 @@ retried with a backoff that doubles from 10 ms to 1 s. If Core's exporter
 stops anyway (only possible through a resource error on its private
 listener), scrapes receive `503 Service Unavailable` and one `error` record
 is logged instead of the port closing silently. A relayed scrape needs a
-third descriptor for Core's `accept()`, so relays keep a reserve of two
-spare descriptors. They release it just before the private `connect()` and
+third descriptor for Core's `accept()` and, on Linux, a fourth for the
+follow-up `accept()` that Tokio makes until `WouldBlock`. Linux allocates the
+new descriptor before it checks the queue. Relays therefore keep a reserve of
+three spare descriptors. They release it just before the private `connect()` and
 refill it after Core first responds. When the reserve cannot be refilled,
 scrapes get a transient 503 instead of starving Core's accept loop. Bind
 failures, the reported

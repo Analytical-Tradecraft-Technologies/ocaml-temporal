@@ -797,11 +797,13 @@ one seam: Core moves out of the per-instance graph into a reference-counted
   requires recreating the runtime. The bridge records go through Core's log
   pipeline (`TEMPORAL_CORE_LOG`) like Core's own records.
 
-  Descriptor headroom. Each relayed scrape needs three descriptors: the
-  public `accept()`, the relay's private `connect()`, and Core's `accept()`
-  of that connection. If pressure eased by only two, Core's accept would get
-  `EMFILE` and its server would stop. The relays therefore share a reserve of
-  two spare descriptors (open handles to `/dev/null`; nothing on Windows).
+  Descriptor headroom. Each relayed scrape needs the public `accept()`, the
+  relay's private `connect()`, Core's `accept()` of that connection, and a
+  free descriptor for the follow-up `accept()` Core's loop makes at once:
+  Tokio keeps accepting until `WouldBlock`, and Linux allocates the new
+  descriptor before checking the queue, so that call fails with `EMFILE`
+  instead of `EAGAIN` at the limit. Any such `EMFILE` stops Core's server.
+  The relays therefore share a reserve of three spare descriptors (open handles to `/dev/null`; nothing on Windows).
   A relay first reads the scraper's request head, dropping a connection that
   sends nothing within 5 s. Under an async mutex it then refills the
   reserve, releases it immediately before `connect()`, forwards the head,

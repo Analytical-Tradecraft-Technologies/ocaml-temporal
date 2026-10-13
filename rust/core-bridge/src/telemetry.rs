@@ -89,13 +89,17 @@ const REQUEST_HEAD_MAX_BYTES: usize = 8 * 1024;
 /// connection.
 const FIRST_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Spare descriptors the relays keep open. Releasing them immediately before
-/// a private `connect` leaves one descriptor for the relay's own socket and
-/// one for Core's `accept()` of it, even when the process is otherwise at its
-/// descriptor limit (#1030). Windows keeps no reserve, so the constant is
-/// Unix-only.
+/// Spare descriptors the relays keep open (#1030). Releasing them immediately
+/// before a private `connect` leaves, even when the process is otherwise at
+/// its descriptor limit, one descriptor for the relay's own socket, one for
+/// Core's `accept()` of it, and one for the `accept()` Core's loop makes
+/// straight afterwards. Tokio keeps calling `accept()` until it returns
+/// `WouldBlock`, and Linux allocates the new descriptor before it looks at
+/// the queue, so that follow-up call fails with `EMFILE` (ending Core's loop)
+/// rather than `EAGAIN` when no descriptor is free. Windows keeps no reserve,
+/// so the constant is Unix-only.
 #[cfg(unix)]
-const RESERVED_DESCRIPTORS: usize = 2;
+const RESERVED_DESCRIPTORS: usize = 3;
 
 /// Body of the `503` sent once Core's scrape server has stopped, naming the
 /// cause and the recovery.
@@ -220,19 +224,25 @@ impl Drop for MetricsExporter {
 /// headroom for Core's private `accept()`.
 ///
 /// Core's accept loop ends for good on `EMFILE`, and every relayed scrape
-/// makes Core accept one connection. Without a reserve, a process at its
-/// descriptor limit that frees exactly the two descriptors the relay needs
-/// (the public `accept()` and the private `connect()`) would leave Core's
-/// `accept()` with none. A relay therefore refills the reserve first,
-/// releases it immediately before connecting, and refills it only after
-/// Core has answered, so the released descriptors are what the connect and
-/// Core's `accept()` use. Relays use the reserve one at a time, under the
+/// makes Core accept one connection and then call `accept()` once more,
+/// which on Linux needs a free descriptor even though nothing is queued (see
+/// [`RESERVED_DESCRIPTORS`]). Without a reserve, a process at its descriptor
+/// limit that frees exactly the descriptors the relay needs (the public
+/// `accept()` and the private `connect()`) would leave Core's `accept()`
+/// calls with none. A relay therefore refills the reserve first, releases it
+/// immediately before connecting, and refills it only after Core has
+/// answered. Core makes both `accept()` calls in the same poll of its accept
+/// loop, before the spawned connection task can answer, so they draw on the
+/// released descriptors. Relays use the reserve one at a time, under the
 /// mutex in [`RelayShared`].
 ///
 /// The descriptor table is process-wide, so another thread that opens a file
-/// in the instant between release and Core's `accept()` can still take a
-/// released descriptor; the reserve removes the deterministic starvation,
-/// not that race. Windows has no comparable per-process descriptor limit for
+/// in the instant between release and Core's `accept()` calls can still take
+/// a released descriptor. With several Tokio workers, Core's connection task
+/// could in principle answer on another worker before its accept loop's
+/// follow-up call; that window is a few instructions against a full HTTP
+/// exchange. The reserve removes the deterministic starvation, not these
+/// races. Windows has no comparable per-process descriptor limit for
 /// sockets, so the reserve holds nothing there.
 #[derive(Debug, Default)]
 struct DescriptorReserve {
