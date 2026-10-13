@@ -372,7 +372,12 @@ let activity_start path json =
   let* retry_json = get "retry_policy" in
   let* retry_policy = Shared.nullable (path ^ ".retry_policy") retry_policy retry_json in
   let* priority_json = get "priority" in
-  let* priority = Shared.nullable (path ^ ".priority") Shared.workflow_priority priority_json in
+  (* A task's priority was accepted by the server, which clamps rather than
+     rejects fairness weights, so it is decoded with the inbound rule that the
+     Rust activity decoder also applies (#1016). *)
+  let* priority =
+    Shared.nullable (path ^ ".priority") Shared.inbound_workflow_priority priority_json
+  in
   let* standalone_json = get "standalone_run_id" in
   let* standalone_run_id = Shared.string (path ^ ".standalone_run_id") standalone_json in
   Ok

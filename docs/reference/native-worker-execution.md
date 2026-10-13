@@ -147,9 +147,9 @@ already been accepted.
    looked up in the immutable registration map. Duplicate run IDs, unknown
    workflow types, remote-only definitions, and invalid input argument counts
    become typed bridge failures.
-4. The input payload is copied into the runtime representation. Binary metadata
-   is rejected because runtime codec metadata is text; no replacement encoding
-   is attempted. Zero arguments are decoded as the canonical `binary/null`
+4. The input payload is copied into the runtime representation. Metadata
+   values are arbitrary bytes and are carried losslessly in OCaml strings
+   (#1048); no replacement encoding is attempted. Zero arguments are decoded as the canonical `binary/null`
    unit payload, one argument is decoded normally, and additional arguments
    are rejected rather than dropped.
 5. A typed `Execution.t` is inserted under the run ID before activation jobs
