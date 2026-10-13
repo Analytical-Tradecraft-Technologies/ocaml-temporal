@@ -160,3 +160,12 @@
  (deps
   (alias decoder-fuzz)
   (alias concurrent-stress)))
+
+; A raising signal handler pending at stub entry must not leak borrows (#1018).
+(test
+ (name test_signal_borrow_release)
+ (libraries temporal_core_bridge)
+ (foreign_stubs
+  (language c)
+  (names signal_test_stubs)
+  (flags :standard -Wall -Wextra -Werror)))
