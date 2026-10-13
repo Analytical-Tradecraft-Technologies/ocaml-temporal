@@ -8,7 +8,8 @@ set -eu
 # checks the script's own decisions without a toolchain or network:
 # - a complete archive is built with the package's opam build command through
 #   the opam hook's "build" mode, with every variable that would bypass the
-#   archive's vendored sources cleared;
+#   archive's vendored sources cleared and a fresh, empty CARGO_HOME inside
+#   the build directory in place of the caller's warm one;
 # - a sandbox that lets the network probe through is refused before building;
 # - an archive without the vendored crates is rejected; and
 # - an opam file whose build command changed is reported instead of being
@@ -56,11 +57,25 @@ printf 'dune %s\n' "$*" >>"$CHECK_LOG"
 printf 'env CARGO_TARGET_DIR=%s TEMPORAL_RUST_BRIDGE_DIR=%s CARGO_NET_OFFLINE=%s\n' \
   "${CARGO_TARGET_DIR-unset}" "${TEMPORAL_RUST_BRIDGE_DIR-unset}" \
   "${CARGO_NET_OFFLINE-unset}" >>"$CHECK_LOG"
+# The Cargo home must be the cold directory the check created in the build
+# directory, never the caller's.
+if [ "${CARGO_HOME-}" = "$(pwd -P)/_opam-check-cargo-home" ] && [ -d "$CARGO_HOME" ] &&
+  [ -z "$(ls -A "$CARGO_HOME")" ]; then
+  printf 'cargo-home cold\n' >>"$CHECK_LOG"
+else
+  printf 'cargo-home %s\n' "${CARGO_HOME-unset}" >>"$CHECK_LOG"
+fi
 test -f rust/vendor.tar
 mkdir -p _build/default
 printf '"lib/libocaml_temporal_core_bridge.a"\n' >_build/default/temporal-sdk.install
 EOF
 chmod +x "$temporary_root/bin/opam" "$temporary_root/bin/curl" "$temporary_root/bin/dune"
+
+# A Cargo home already populated, as `cargo vendor` leaves the default one
+# when it creates the archive.
+warm_cargo_home=$temporary_root/warm-cargo-home
+mkdir -p "$warm_cargo_home/registry/cache"
+: >"$warm_cargo_home/registry/cache/crate.crate"
 
 # Builds a source archive at $1 shipping opam file $2 and the empty rust/
 # files named by the remaining arguments.
@@ -88,6 +103,7 @@ run_check() {
     FAKE_CURL_STATUS=$2 CHECK_LOG=$temporary_root/check.log \
     CARGO_TARGET_DIR=$temporary_root/shared-target \
     TEMPORAL_RUST_BRIDGE_DIR=$temporary_root/prebuilt CARGO_NET_OFFLINE=false \
+    CARGO_HOME=$warm_cargo_home \
     sh "$check" "$1" "$temporary_root/work" >"$temporary_root/output" 2>&1
   status=$?
   set -e
@@ -116,6 +132,7 @@ grep -Fqx 'build dune' "$temporary_root/check.log"
 grep -Eq '^dune build -p temporal-sdk -j [1-9][0-9]*$' "$temporary_root/check.log"
 grep -Fqx 'env CARGO_TARGET_DIR=unset TEMPORAL_RUST_BRIDGE_DIR=unset CARGO_NET_OFFLINE=unset' \
   "$temporary_root/check.log"
+grep -Fqx 'cargo-home cold' "$temporary_root/check.log"
 
 # A sandbox that lets the probe reach the network proves nothing.
 run_check "$temporary_root/complete.tar.gz" 0

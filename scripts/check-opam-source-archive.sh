@@ -29,10 +29,13 @@ set -eu
 #
 # Before building, the script runs a network probe through the same wrapper
 # and fails if it reaches crates.io, so a wrapper that does not actually deny
-# the network can never produce a passing result. The Cargo environment is
-# what an opam user has: CARGO_HOME is left at its default and the variables
-# that select a prebuilt bridge, a shared target directory, or offline mode
-# are cleared, so the archive itself must select the vendored build.
+# the network can never produce a passing result. Cargo runs with a fresh,
+# empty CARGO_HOME inside the writable build directory, as for a user who has
+# never run Cargo: a default home warmed by `cargo vendor` (which created the
+# archive) could otherwise satisfy an offline build for a source the archive's
+# replacement omits. The variables that select a prebuilt bridge, a shared
+# target directory, or offline mode are cleared, so the archive itself must
+# select the vendored build.
 #
 # The script needs OCaml, the locked opam dependencies, Rust and protoc on
 # PATH, as `opam install` would. It writes only below WORK_DIRECTORY and the
@@ -161,6 +164,17 @@ fi
 
 # Clear every input that would bypass or pre-empt the archive's own selection.
 unset TEMPORAL_RUST_BRIDGE_DIR TEMPORAL_RUST_BRIDGE_KEY CARGO_TARGET_DIR CARGO_NET_OFFLINE
+# A cold, writable Cargo home below the build directory (which every sandbox
+# leaves writable). Dune ignores directories whose names start with "_", so
+# it never becomes part of the package build. rustup locates toolchains
+# through RUSTUP_HOME, which is unaffected.
+CARGO_HOME=$(pwd -P)/_opam-check-cargo-home
+if [ -e "$CARGO_HOME" ]; then
+  echo "source archive unexpectedly contains $CARGO_HOME" >&2
+  exit 1
+fi
+mkdir "$CARGO_HOME"
+export CARGO_HOME
 sandboxed dune build -p "$package" -j "$jobs"
 
 install_file=_build/default/$package.install

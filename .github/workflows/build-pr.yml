@@ -500,14 +500,15 @@ jobs:
 
   # Builds the release source archive exactly as opam would install it: inside
   # a network-denying opam build sandbox, from the vendored Rust sources only
-  # (#778). It needs a full optimized Rust build, so it runs for master and
-  # release builds rather than every pull request; a release cannot publish
-  # unless it passes. scripts/check-opam-source-archive.sh uses opam's own
-  # build wrapper when the switch has sandboxing enabled and otherwise the
-  # same macOS sandbox-exec policy, and it first proves the sandbox blocks a
-  # network request.
+  # (#778). It needs a full optimized Rust build, so it runs on master builds
+  # as an early warning rather than on every pull request. Releases do not use
+  # it: release.yml's source-archive-check job builds the exact archive it
+  # publishes. scripts/check-opam-source-archive.sh uses opam's own build
+  # wrapper when the switch has sandboxing enabled and otherwise the same
+  # macOS sandbox-exec policy, gives Cargo an empty home, and first proves the
+  # sandbox blocks a network request.
   opam-source-offline:
-    if: ${{ !cancelled() && needs.changes.outputs.code == 'true' && (inputs.tier == 'master' || inputs.tier == 'release') }}
+    if: ${{ !cancelled() && needs.changes.outputs.code == 'true' && inputs.tier == 'master' }}
     needs: changes
     name: Sandboxed opam build from the source archive / macOS ARM64
     runs-on: macos-15

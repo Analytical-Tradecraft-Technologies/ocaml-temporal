@@ -24,28 +24,33 @@ package's opam build command, `dune build -p temporal-sdk -j <jobs>`, through
 opam's own build wrapper (`opam-init/hooks/sandbox.sh build`) or, on macOS
 without one, an equivalent `sandbox-exec` policy. It first proves the sandbox
 blocks a request to crates.io, clears every variable that would bypass the
-archive's vendored sources while leaving `CARGO_HOME` at its default, and
-requires the resulting `temporal-sdk.install` to list the Rust bridge. The new
-`opam-source-offline` job in `build-pr.yml` creates the archive with
-`scripts/create-source-archive.sh` and runs the check on macOS ARM64 for the
-master and release tiers, so a release cannot publish unless it passes. The
-job's archive is created on macOS from the same commit with the same script;
-the published bytes still come from the Linux publish job, whose GNU tar output
-is normalised but not byte-identical to macOS tar.
+archive's vendored sources, gives Cargo a fresh, empty `CARGO_HOME` so a home
+warmed by `cargo vendor` cannot hide a source the archive omits, and requires
+the resulting `temporal-sdk.install` to list the Rust bridge. The Release
+workflow now creates the archive and audited notices once in a
+`source-archive` job, and its macOS ARM64 `source-archive-check` job runs the
+check on that artifact after confirming its SHA-256; `publish` needs both and
+confirms the digest again before publishing the same file, so the archive
+users download is the one that passed. Master builds also run an
+`opam-source-offline` job in `build-pr.yml` on an archive it creates itself,
+as an early warning.
 
 `test/smoke/test_opam_source_archive_check.sh`, part of `dune runtest`, drives
 the script with stand-in opam hook, curl and dune executables: a complete
 archive builds through the hook's `build` mode with the bypass variables
 cleared, a sandbox that lets the probe through is refused before building, and
 archives without `rust/vendor.tar` or with a changed opam build command are
-rejected; removing the variable clearing makes it fail. Locally on macOS
+rejected; Cargo must see a cold home in place of the caller's warm one.
+Removing the variable clearing or keeping the caller's `CARGO_HOME` makes it
+fail. Locally on macOS
 (opam 2.5.2, OCaml 5.4.1), an archive created by
 `scripts/create-source-archive.sh` from this branch built successfully with the
 optimized Rust bridge through both the real opam 2.5.2 sandbox wrapper and the
-`sandbox-exec` fallback, with the network probe denied in each.
+`sandbox-exec` fallback, with the network probe denied in each, and again
+through the opam wrapper with the empty `CARGO_HOME`.
 `dune build @test/smoke/runtest` and `test/smoke/test_quality_contract.sh`
-pass. The new job itself has not run yet; its first result comes from the next
-master build after merge.
+pass. The new jobs have not run yet: the master job's first result comes from
+the next master build, and the release jobs from the next release.
 
 ## 2026-10-13: Inbound failure types never raise (#1011)
 
