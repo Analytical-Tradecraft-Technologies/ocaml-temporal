@@ -15,6 +15,47 @@ implementation when a later entry documents that work as complete. The
 records the current tested source, named assertions and successful CI job for
 the Temporal acceptance controllers.
 
+## 2026-10-13: Temporal.Testing follows server and native-worker semantics (#1035-#1039)
+
+`Temporal.Testing` (`lib/runtime/test_environment.ml`) now matches a server
+and the native worker in five places where tests could pass but production
+would behave differently:
+
+- **Final-activation commands (#1035).** When an activation's commands
+  close the run, the engine drops activity and local-activity schedules,
+  child starts (including `Abandon` children), child cancellations, and
+  external signals and cancellations from that batch. The server records
+  these commands but never dispatches them for a closed run.
+- **Core job order (#1036).** Each activation's jobs are stable-sorted into
+  Core's order: initialization; patches and seeds; signals and updates;
+  other jobs; local-activity resolutions; queries. A signal that arrives
+  with a timer now runs its handler before the root completes, so an
+  acknowledged signal can no longer be lost.
+- **Child retry policies (#1037).** A child that fails with a retry policy
+  is retried as a new run of the same chain. The new run has `attempt + 1`
+  and a `Retry` continuation, and its first activation waits out the
+  backoff in virtual time. The child's `Workflow.info` reports the policy
+  and the command's task queue. The parent sees a non-retryable
+  `Child_workflow` error only once the retries end. Unlimited policies use
+  the `max_activity_attempts` cap.
+- **Native error shapes (#1038).** An activity's `Cancelled`-category
+  error is retried and wrapped like any other failure. Only cancellations
+  produced by the engine reach the workflow as `Cancelled`. Final activity
+  failures are non-retryable and typed with the cause's application type.
+  Dispatch and codec failures are typed `ocaml_temporal_native_activity`,
+  as in `native_activity_execution.ml`. A child that *fails* with a
+  `Cancelled` error reaches its parent as `Child_workflow` with no
+  application type, as Core reports a canceled failure.
+- **Smaller gaps (#1039).** Virtual-time additions saturate, so an
+  overflowing timeout means no limit and `skip` cannot wrap the clock
+  negative. Query-only activations no longer add to `history_length`. A
+  mock replaces the ordinary registration wherever it appears in the list.
+  The documented differences now say that workflow code is never replayed.
+
+`test/unit/test_testing.ml` adds one regression test per issue, covering
+each scenario above, including the coincident timer-and-signal case from
+#1036. Disabling the job sort makes that test fail. Verified with
+`dune build @install` and the `test/unit` test alias on OCaml 5.4.1 (macOS).
 ## 2026-10-13: Client reasons and visibility queries are checked for UTF-8 (#1014)
 
 `Client.cancel`, `Client.terminate` and `Client.reset` used to check their
