@@ -34,13 +34,18 @@ supervisor's cleanup could already be scheduled. The supervisor now has a
 private `delegate_abandoned_cleanup` switch that turns its own finalizer into
 a no-op; `Native_worker.create` sets it, making the worker's
 drain-then-shutdown finalizer the only path that closes an abandoned worker's
-graph. When that finalizer cannot spawn a thread it now closes supervisor
-admission itself, as the supervisor's finalizer used to.
+graph. Every finalizer path that cannot spawn its cleanup or terminal-retry
+thread, including the pending-retry path, now closes supervisor admission
+itself (`Native_worker_policy.spawn_or_close_admission`), as the supervisor's
+finalizer used to, so the owner Domain stops and the native custom-block
+finalizer can still reclaim the graph and its shared-runtime lease.
 
 `test/sdk_supervisor/test_sdk_supervisor.ml` abandons an owner and its
 delegated supervisor together and checks that the backend closes exactly
 once and only after the owner's slow drain; with the switch disabled the test
-fails on every run. Verified with `dune build @install`, the `test/sdk_supervisor`,
+fails on every run. `test/runtime/test_native_worker_policy.ml` checks that a
+failed spawn closes admission, a successful one does not, and a raising close
+is contained. Verified with `dune build @install`, the `test/sdk_supervisor`,
 `test/unit` and `test/runtime` aliases and `test_shared_runtime` on OCaml 5.4.1
 (macOS).
 
