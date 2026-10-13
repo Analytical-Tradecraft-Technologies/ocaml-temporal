@@ -56,6 +56,18 @@ would behave differently:
 each scenario above, including the coincident timer-and-signal case from
 #1036. Disabling the job sort makes that test fail. Verified with
 `dune build @install` and the `test/unit` test alias on OCaml 5.4.1 (macOS).
+## 2026-10-13: Client reasons and visibility queries are checked for UTF-8 (#1014)
+
+`Client.cancel`, `Client.terminate` and `Client.reset` used to check their
+`~reason` only for length and NUL, and `Client.list_visibility` did the same
+for its `~query`. On a native client, the owner Domain's JSON encoder later
+rejected invalid UTF-8, and that rejection reached the caller as a retryable
+`Bridge` protocol error. A deterministic caller mistake therefore looked
+transient, and the same call succeeded on `mock://`. A shared `validate_text`
+check now rejects oversized, NUL-bearing, or malformed UTF-8 free text at the
+public boundary with a non-retryable defect, so both backends agree. Empty
+reasons and queries remain valid. A unit test covers all four inputs on the
+mock backend.
 ## 2026-10-13: Metrics endpoint survives accept errors (#1030)
 
 The Prometheus endpoint no longer stops permanently and silently on the
