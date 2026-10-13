@@ -748,6 +748,43 @@ let encode_visibility_request (value : visibility_request) =
         ]
         @ rpc))
 
+(** Prefix Rust uses for a Temporal [WorkflowExecutionStatus] it does not
+    name, followed by the canonical decimal wire value (for example
+    [unknown_9]). *)
+let unknown_visibility_status_prefix = "unknown_"
+
+(** Highest [WorkflowExecutionStatus] wire value with a fixed name. *)
+let max_known_visibility_status = 8
+
+(** Returns whether [status] is a visibility status name the Rust bridge can
+    emit, mirroring [is_visibility_status_name] in
+    [rust/core-bridge/src/client_protocol.rs]. Besides the fixed names (and the
+    legacy [unspecified]), a value a newer server added is accepted as
+    [unknown_<n>] (#1078), where [n] is the canonical decimal spelling of a
+    32-bit value outside the named range, so each wire value has exactly one
+    accepted spelling. *)
+let is_visibility_status_name status =
+  match status with
+  | "running" | "completed" | "failed" | "canceled" | "terminated"
+  | "continued_as_new" | "timed_out" | "paused" | "unspecified" ->
+      true
+  | _ -> (
+      let prefix_length = String.length unknown_visibility_status_prefix in
+      String.starts_with ~prefix:unknown_visibility_status_prefix status
+      &&
+      let digits =
+        String.sub status prefix_length (String.length status - prefix_length)
+      in
+      match int_of_string_opt digits with
+      | None -> false
+      | Some value ->
+          (* [int_of_string_opt] also accepts [+], [_], and radix prefixes;
+             comparing against the canonical rendering rejects them. *)
+          String.equal (string_of_int value) digits
+          && value >= Int32.to_int Int32.min_int
+          && value <= Int32.to_int Int32.max_int
+          && (value < 0 || value > max_known_visibility_status))
+
 let decode_visibility_response input : (visibility_page, error) result =
   let* json = decode_object input in
   let* entries = exact_object "$" [ "executions"; "next_page_token" ] json in
@@ -772,11 +809,8 @@ let decode_visibility_response input : (visibility_page, error) result =
               let* status_json = field path "status" row in
               let* status = identifier (path ^ ".status") status_json in
               let* status =
-                match status with
-                | "running" | "completed" | "failed" | "canceled"
-                | "terminated" | "continued_as_new" | "timed_out"
-                | "paused" | "unspecified" -> Ok status
-                | _ -> Error (invalid ~path:(path ^ ".status") "unknown visibility status")
+                if is_visibility_status_name status then Ok status
+                else Error (invalid ~path:(path ^ ".status") "unknown visibility status")
               in
               loop (index + 1) ({ workflow_id; run_id; workflow_type; task_queue; status } :: acc) rest
         in

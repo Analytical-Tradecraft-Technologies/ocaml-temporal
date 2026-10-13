@@ -15,6 +15,32 @@ implementation when a later entry documents that work as complete. The
 records the current tested source, named assertions and successful CI job for
 the Temporal acceptance controllers.
 
+## 2026-10-13: Unknown update stages and visibility statuses degrade (#1078)
+
+The client protocol rejected two server enums when a newer server sent a value
+this SDK does not know, so an added update lifecycle stage made
+`start_update` fail and an added execution status failed a whole
+`list_visibility` page. Start-update now trusts an outcome whatever stage
+accompanies it, and reads an unknown stage without an outcome as "not yet
+accepted": the update is re-issued under the same ID until a known `Accepted`
+stage or the typed `deadline_exceeded` error, so it never becomes a handle
+without established durability. A `Completed` stage without an outcome still
+fails closed. A visibility row with an unknown status is reported as
+`unknown_<n>` with its canonical decimal wire value; an unspecified (`0`)
+status is still a malformed row. The Rust encoder and OCaml decoder accept the
+same vocabulary, including rejecting non-canonical spellings and
+`unknown_<n>` for a named value, and the public `Client.visibility_execution`
+status field documents it.
+
+`rust/core-bridge/tests/support/client_update.rs` drives a scripted Core
+connection that returns an outcome with an unknown stage and an unknown stage
+before `Accepted`; `client_protocol.rs` unit tests cover status conversion and
+the shared vocabulary; `test/bridge/test_ocaml_client_protocol.ml` decodes
+`unknown_<n>` rows and rejects malformed spellings. Verified with the scoped
+`cargo test --lib client_protocol`, `cargo clippy -D warnings`, `cargo fmt
+--check`, `dune build @install` and the OCaml client protocol test on OCaml
+5.4.1 (macOS).
+
 ## 2026-10-13: Inbound failure types never raise (#1011)
 
 An application failure type written by another SDK, worker or the server

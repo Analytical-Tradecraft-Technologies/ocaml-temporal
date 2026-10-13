@@ -1105,7 +1105,14 @@ between attempts. Every attempt carries the remaining budget as its gRPC
 deadline, and the whole loop is bounded by 30 seconds; when the budget expires
 first, `start_update` returns the typed `deadline_exceeded` RPC error and the
 caller may retry with the same update ID (#772). A `Completed` stage without an
-outcome or an unknown stage fails closed as a Core protocol error.
+outcome fails closed as a Core protocol error. A lifecycle stage this bridge
+does not know, as a newer server might add, never fails the call (#1078): with
+an outcome the outcome is returned, because a server attaches one only to a
+completed or rejected update; without one the stage is read as "not yet
+accepted" and the update is re-issued like `Admitted`, so it becomes a handle
+only after a known `Accepted` stage. `wait_update` polls do not interpret the
+stage at all; they return the outcome when present and otherwise report the
+update as still pending.
 
 The normative schemas are
 [`client-update-request.schema.json`](../schemas/bridge/client-update-request.schema.json),
@@ -1235,9 +1242,16 @@ size from 1 through 1,000, and an optional opaque continuation token. OCaml
 validates the query and token metadata, then serializes one closed JSON object;
 Rust validates it again, decodes the token as base64 protobuf bytes, and calls
 the official Temporal visibility RPC. Rust reduces each server row to workflow
-ID, run ID, workflow type, task queue, and a closed status string before
-encoding the response. OCaml strictly rejects unknown fields, missing row
-fields, empty identifiers, malformed tokens, and unexpected status values.
+ID, run ID, workflow type, task queue, and a status string before encoding
+the response. Known statuses use the fixed names `running`, `completed`,
+`failed`, `canceled`, `terminated`, `continued_as_new`, `timed_out`, and
+`paused`. A status value a newer server adds is reported as `unknown_<n>`,
+where `<n>` is the canonical decimal wire value (for example `unknown_9`),
+instead of failing the whole page (#1078); a row whose status is unspecified
+(`0`) is still a malformed response. OCaml strictly rejects unknown fields,
+missing row fields, empty identifiers, malformed tokens, and status strings
+outside that vocabulary, including non-canonical `unknown_` spellings and
+`unknown_<n>` for a value that has a fixed name.
 
 The token is never interpreted by OCaml and must be passed unchanged to fetch
 the next page. The private request and response shapes are defined by

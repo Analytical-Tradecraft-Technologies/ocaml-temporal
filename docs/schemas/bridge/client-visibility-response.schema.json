@@ -19,7 +19,13 @@
           "task_queue": { "type": "string", "minLength": 1, "maxLength": 65536 },
           "status": {
             "type": "string",
-            "enum": ["running", "completed", "failed", "canceled", "terminated", "continued_as_new", "timed_out", "paused", "unspecified"]
+            "anyOf": [
+              { "enum": ["running", "completed", "failed", "canceled", "terminated", "continued_as_new", "timed_out", "paused", "unspecified"] },
+              {
+                "description": "A WorkflowExecutionStatus value this SDK does not name, as its canonical decimal value outside 0..8 within the signed 32-bit range.",
+                "pattern": "^unknown_-?[1-9][0-9]{0,9}$"
+              }
+            ]
           }
         }
       }

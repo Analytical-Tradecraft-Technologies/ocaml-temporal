@@ -465,13 +465,39 @@ let test_visibility_protocol () =
       assert (String.equal row.workflow_id "workflow-1");
       assert (String.equal row.status "running")
   | _ -> failwith "visibility response changed shape");
+  let row_with_status status =
+    Printf.sprintf
+      {|{"executions":[{"workflow_id":"workflow-1","run_id":"run-1","workflow_type":"Smoke","task_queue":"queue","status":%S}],"next_page_token":null}|}
+      status
+  in
+  (* A status a newer server added arrives as [unknown_<n>] and must not fail
+     the whole page (#1078); the spellings match the Rust encoder's. *)
+  List.iter
+    (fun status ->
+      match unwrap (Protocol.decode_visibility_response (row_with_status status)) with
+      | { executions = [ row ]; _ } -> assert (String.equal row.status status)
+      | _ -> failwith "unknown visibility status changed shape")
+    [ "unknown_9"; "unknown_-1"; "unknown_2147483647"; "unknown_-2147483648"; "paused" ];
   List.iter
     (fun malformed -> require_error (Protocol.decode_visibility_response malformed))
-    [
-      {|{"executions":[],"next_page_token":null,"extra":true}|};
-      {|{"executions":[{"workflow_id":"","run_id":"run-1","workflow_type":"Smoke","task_queue":"queue","status":"running"}],"next_page_token":null}|};
-      {|{"executions":[{"workflow_id":"workflow-1","run_id":"run-1","workflow_type":"Smoke","task_queue":"queue","status":"future_status"}],"next_page_token":null}|};
-    ]
+    ([
+       {|{"executions":[],"next_page_token":null,"extra":true}|};
+       {|{"executions":[{"workflow_id":"","run_id":"run-1","workflow_type":"Smoke","task_queue":"queue","status":"running"}],"next_page_token":null}|};
+     ]
+    @ List.map row_with_status
+        [
+          "future_status";
+          "unknown_";
+          "unknown_0";
+          "unknown_1";
+          "unknown_8";
+          "unknown_09";
+          "unknown_+9";
+          "unknown_-0";
+          "unknown_0x9";
+          "unknown_1_0";
+          "unknown_2147483648";
+        ])
 
 (** Exercises the asynchronous-start capability and all three terminal outcome
     variants. The request-bound ticket is deliberately opaque: this test can
