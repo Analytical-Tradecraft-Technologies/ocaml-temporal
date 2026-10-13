@@ -15,6 +15,30 @@ implementation when a later entry documents that work as complete. The
 records the current tested source, named assertions and successful CI job for
 the Temporal acceptance controllers.
 
+## 2026-10-13: Binary payload metadata is carried losslessly (#1048)
+
+Temporal payload metadata values are bytes, and the protocol layers already
+carried them losslessly as base64, but the three runtime copies of
+`runtime_payload` (workflow activations, workflow start input, and activity
+input and heartbeat details) rejected any value that was not valid UTF-8 and
+any key containing NUL. A Go or Java codec that stores a raw nonce or key ID
+in metadata, or an OCaml `Client.start` memo with binary metadata, therefore
+failed every workflow task of the run (history is immutable) or failed the
+activity non-retryably, even when the codec never looked at that entry. The
+runtime now copies inbound keys and values unchanged; an OCaml `string` is a
+byte string. Outbound `protocol_payload` keeps the strict key rule but
+accepts any value bytes, so a received payload can be returned or forwarded
+unchanged.
+
+`test/runtime/test_native_execution.ml` translates an activity result, a
+failure detail, and a signal input and header carrying a `"\xff\x00"`
+metadata value, and sends a binary value outbound while still rejecting a NUL
+key. `test/runtime/test_native_activity_execution.ml` runs an activity whose
+input carries binary metadata, and the unrepresentable-task and async-handle
+regressions now use a second input value and a NUL key, the remaining
+rejected shapes. Verified with `dune build @install` and the `test/runtime`,
+`test/unit` and `test/bridge` test aliases on OCaml 5.4.1 (macOS).
+
 ## 2026-10-13: Unset activity timeouts read as None (#1032)
 
 Temporal reports an unset activity timeout as a zero duration. Core fills a

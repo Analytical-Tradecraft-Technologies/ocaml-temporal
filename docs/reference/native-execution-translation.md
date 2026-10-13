@@ -192,10 +192,14 @@ represented without losing meaning. Programmer defects remain exceptions in
 the underlying execution kernel, while expected Temporal outcomes are typed
 results.
 
-Every payload crossing this boundary is copied. Binary protocol metadata cannot
-be represented by the runtime's string metadata map and therefore returns
-`unsupported` instead of being decoded with replacement characters. Runtime
-metadata is validated as UTF-8 before it becomes protocol bytes. Failure causes
+Every payload crossing this boundary is copied. Payload metadata values are
+arbitrary bytes in Temporal's protocol, and the runtime's string metadata map
+holds them losslessly (an OCaml `string` is a byte string), so inbound
+metadata never fails translation (#1048): a rejection would fail every
+workflow task replaying the same history. Outbound runtime metadata keys are
+validated as non-empty, NUL-free UTF-8 identifiers before they become protocol
+bytes; values may be any bytes, so a received payload can be returned
+unchanged. Failure causes
 are traversed with a fixed depth limit so malformed recursive values cannot
 consume unbounded stack or memory.
 

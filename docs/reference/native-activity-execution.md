@@ -219,9 +219,10 @@ adapter mutex:
    then invoke the implementation and convert its typed `result` into either an
    encoded payload or a structured application failure. Application failure
    retryability and each detail body supplied in `Error.t` are copied into the
-   Temporal failure without text conversion; metadata still follows the
-   runtime's strict UTF-8 key/value rules rather than becoming an unvalidated
-   side channel.
+   Temporal failure without text conversion; metadata keys still follow the
+   strict non-empty, NUL-free UTF-8 identifier rule, while metadata values are
+   arbitrary bytes carried losslessly (#1048). Inbound task input and
+   heartbeat details are never rejected for their metadata.
 5. Encode the entire completion once through the strict activity-protocol
    encoder before admitting it to the pending-completion map. The lease keeps
    only the resulting immutable bytes. Invalid application
