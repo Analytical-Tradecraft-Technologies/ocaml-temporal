@@ -13,7 +13,7 @@
 #[path = "support/descriptor_pressure.rs"]
 mod descriptor_pressure;
 
-use std::net::TcpStream;
+use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
 use descriptor_pressure::{
@@ -52,9 +52,14 @@ fn the_endpoint_keeps_serving_after_accept_fails_with_emfile() {
 
     // Linux leaves the connection in the backlog when accept() fails with
     // EMFILE, so it is served now. macOS dequeues and closes it inside the
-    // failing accept(), so the scraper sees an empty, closed response; no
-    // server can recover that connection.
-    let pending = finish_scrape(starved, address);
+    // failing accept(), so the scraper sees the connection closed: either an
+    // empty response or, if the close arrives before the request is written,
+    // a broken pipe or reset. No server can recover that connection.
+    let pending = if cfg!(target_os = "linux") {
+        finish_scrape(starved, address)
+    } else {
+        scrape_closed_or_served(starved, address)
+    };
     if cfg!(target_os = "linux") {
         assert!(
             pending.starts_with("HTTP/1.1 200"),
@@ -76,4 +81,34 @@ fn the_endpoint_keeps_serving_after_accept_fails_with_emfile() {
         unsafe { ocaml_temporal_core_v4_shared_runtime_free(&mut shared) },
         STATUS_OK
     );
+}
+
+/// Completes a scrape on a connection the kernel may already have closed.
+/// A broken pipe or reset while writing the request or reading the response
+/// means the connection was closed before it could be served, which is
+/// reported as an empty response, like a clean close.
+fn scrape_closed_or_served(mut stream: TcpStream, address: SocketAddr) -> String {
+    use std::io::{ErrorKind, Read, Write};
+    let closed = |error: &std::io::Error| {
+        matches!(
+            error.kind(),
+            ErrorKind::BrokenPipe | ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted
+        )
+    };
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("read timeout");
+    if let Err(error) = write!(
+        stream,
+        "GET /metrics HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+    ) {
+        assert!(closed(&error), "scrape request: {error:?}");
+        return String::new();
+    }
+    let mut response = String::new();
+    match stream.read_to_string(&mut response) {
+        Ok(_) => response,
+        Err(error) if closed(&error) => String::new(),
+        Err(error) => panic!("scrape response: {error:?}"),
+    }
 }
