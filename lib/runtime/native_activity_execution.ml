@@ -391,56 +391,36 @@ let cancellation_failure ?(details = []) reason : Protocol.failure =
     }
 
 (** Converts binary protocol metadata to the runtime's string metadata without
-    replacement decoding. Body and metadata bytes are copied so a task can be
+    replacement decoding. Metadata values are arbitrary bytes in Temporal's
+    protocol and an OCaml [string] holds bytes, so keys and values are carried
+    losslessly instead of failing the task (#1048); the protocol decoder has
+    already bounded them. Body and metadata bytes are copied so a task can be
     retained safely after the supervisor releases its source buffer. *)
-let runtime_payload path (payload : Protocol.payload) =
-  (* Accumulate backwards for linear construction, then reverse once so the
-     caller observes metadata in the same order as the protocol task. *)
-  let rec metadata_loop reversed = function
-    | [] -> Ok (List.rev reversed)
-    | (key, bytes) :: rest ->
-        if String.length key = 0 || String.contains key '\000' then
-          Error
-            (make_error ~path:(path ^ ".metadata") "invalid_message"
-               "metadata key must be non-empty and must not contain NUL")
-        else if not (Codec.valid_utf_8 key) then
-          Error
-            (make_error ~path:(path ^ ".metadata.key") "invalid_message"
-               "metadata key must be valid UTF-8")
-        else
-          let value = Bytes.to_string bytes in
-          if not (Codec.valid_utf_8 value) then
-            Error
-              (make_error
-                 ~path:(path ^ ".metadata." ^ key)
-                 "unsupported"
-                 "binary metadata cannot be represented by the runtime")
-          else metadata_loop ((key, value) :: reversed) rest
+let runtime_payload _path (payload : Protocol.payload) =
+  let metadata =
+    List.map (fun (key, bytes) -> (key, Bytes.to_string bytes)) payload.metadata
   in
-  let* metadata = metadata_loop [] payload.metadata in
   Ok { Temporal_base.Payload.metadata; data = Bytes.copy payload.data }
 
 (** Converts a runtime payload into the binary-safe protocol representation,
-    validating metadata before copying it across the ownership boundary. *)
+    validating metadata keys before copying it across the ownership boundary.
+    Keys follow the bridge protocol's rule (non-empty, valid UTF-8, at most
+    65536 bytes; NUL is allowed) and values may be any bytes, so a payload
+    received from Temporal can be returned or heartbeated unchanged. *)
 let protocol_payload path (payload : Temporal_base.Codec.payload) =
   (* Use the same order-preserving construction as [runtime_payload], but turn
      validated strings back into freshly owned byte buffers. *)
   let rec metadata_loop reversed = function
     | [] -> Ok (List.rev reversed)
     | (key, value) :: rest ->
-        if String.length key = 0 || String.contains key '\000' then
+        if String.length key = 0 || String.length key > 65_536 then
           Error
             (make_error ~path:(path ^ ".metadata") "invalid_message"
-               "metadata key must be non-empty and must not contain NUL")
+               "metadata key must be non-empty and at most 65536 bytes")
         else if not (Codec.valid_utf_8 key) then
           Error
             (make_error ~path:(path ^ ".metadata.key") "invalid_message"
                "metadata key must be valid UTF-8")
-        else if not (Codec.valid_utf_8 value) then
-          Error
-            (make_error
-               ~path:(path ^ ".metadata." ^ key)
-               "invalid_message" "metadata value must be valid UTF-8")
         else metadata_loop ((key, Bytes.of_string value) :: reversed) rest
   in
   let* metadata = metadata_loop [] payload.metadata in
