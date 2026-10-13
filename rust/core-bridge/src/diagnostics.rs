@@ -302,6 +302,9 @@ impl CoreLogWriter {
         let thread = std::thread::Builder::new()
             .name("ocaml-temporal-core-log".to_owned())
             .spawn(move || {
+                // stderr may be a pipe whose reader has exited; a write must
+                // then fail quietly rather than terminate the process.
+                crate::sigpipe::block_current_thread();
                 let _ = catch_unwind(AssertUnwindSafe(|| {
                     run_core_log_writer(&receiver, &writer_shared, sink)
                 }));

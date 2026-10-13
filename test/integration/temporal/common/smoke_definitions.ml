@@ -22,7 +22,9 @@ let mock_transform =
 
 (** Supplies invalid application failure details through the public activity
     API. Each case must become a valid, non-retryable task failure rather than
-    stopping the worker or poisoning its completion retry queue. *)
+    stopping the worker or poisoning its completion retry queue. Metadata
+    values are arbitrary bytes (#1048), so the malformed-UTF-8 case puts the
+    bad bytes in a key, which must still be valid UTF-8. *)
 let invalid_failure_details_activity =
   Temporal.Activity.define ~name:"smoke.invalid_failure_details_activity"
     ~input:Temporal.Codec.string ~output:Temporal.Codec.string (fun case ->
@@ -30,7 +32,7 @@ let invalid_failure_details_activity =
         match case with
         | "duplicate" -> [ ("encoding", "one"); ("encoding", "two") ]
         | "oversized" -> [ (String.make 65_537 'k', "value") ]
-        | _ -> [ ("encoding", "\255") ]
+        | _ -> [ ("\255", "value") ]
       in
       let detail =
         Temporal.Codec.{ metadata; data = Bytes.of_string "invalid detail" }
