@@ -156,7 +156,8 @@ module Make (Supervisor : SUPERVISOR) : sig
       exposed to every synchronous activity context as its worker-shutdown
       signal; it must be non-blocking and safe to call from any Domain, which
       reading the owner's lifecycle atomics is. Async leases expire by the
-      system wall clock; see [create_with_clock]. *)
+      process's monotonic clock, so wall-clock steps cannot expire a live
+      lease; see [create_with_clock]. *)
 
   val create_with_clock :
     now:(unit -> float) ->

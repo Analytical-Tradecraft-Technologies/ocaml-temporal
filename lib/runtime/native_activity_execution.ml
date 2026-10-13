@@ -236,7 +236,8 @@ type lease = {
     have timed the attempt out, no terminal call can succeed, so the adapter
     closes the handle and drops the lease instead of letting it hold every
     later worker shutdown for the full grace period. Both are measured on the
-    worker's clock from moments that are no earlier than the server's own
+    worker's monotonic clock, so a wall-clock step (NTP or manual) cannot
+    make a live lease look expired, from moments that are no earlier than the server's own
     reference points: [attempt_deadline] adds the shorter of the
     start-to-close and schedule-to-close timeouts to the time of admission,
     which follows the attempt's start, and [last_progress] (admission, then
@@ -260,8 +261,7 @@ type async_lease =
 (** Extra time, in seconds, beyond the latest moment the server could still
     accept a terminal call for an async attempt. The deadlines above are
     already conservative; this margin also covers the delay before the
-    server's timeout task runs and small forward adjustments of the worker's
-    wall clock. *)
+    server's timeout task runs. *)
 let async_lease_expiry_slack_s = 5.0
 
 (** Converts one optional task timeout to seconds, treating a zero duration
@@ -982,7 +982,7 @@ module Make (Supervisor : SUPERVISOR) = struct
     (* Non-blocking, Domain-safe probe of the owning worker's stop flag,
        exposed to activity contexts. *)
     worker_shutting_down : unit -> bool;
-    (* Wall-clock seconds used only to expire async leases (#1043); tests
+    (* Monotonic seconds used only to expire async leases (#1043); tests
        inject a controllable clock. *)
     now : unit -> float;
   }
@@ -1178,10 +1178,15 @@ module Make (Supervisor : SUPERVISOR) = struct
             now;
           }
 
-  (** Creates the registry with the system wall clock. *)
+  (** Creates the registry with the process's monotonic clock, in seconds.
+      Lease expiry only compares elapsed times, so wall-clock adjustments
+      must not affect it. *)
   let create ~supervisor ~activities ~worker_shutting_down =
-    create_with_clock ~now:Unix.gettimeofday ~supervisor ~activities
-      ~worker_shutting_down
+    let now () =
+      Int64.to_float (Temporal_core_bridge.Native_bridge.monotonic_now_ns ())
+      /. 1e9
+    in
+    create_with_clock ~now ~supervisor ~activities ~worker_shutting_down
 
   (** Converts an adapter diagnostic into the base error type expected by an
       asynchronous handle callback. The callback is a private boundary, so a

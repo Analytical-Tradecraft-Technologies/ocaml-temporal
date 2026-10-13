@@ -379,7 +379,8 @@ an error, or the attempt already timed out on the server) would otherwise
 stay admitted for the worker's life, and every later shutdown would wait the
 full grace period and then report a lost completion (#1043). Each admitted
 lease therefore records two bounds from its start task, measured on the
-worker's wall clock:
+worker's monotonic clock so that an NTP or manual wall-clock step cannot make
+a live lease look expired:
 
 - an attempt deadline: the time of admission plus the shorter of the
   start-to-close and schedule-to-close timeouts; and
