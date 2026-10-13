@@ -652,9 +652,8 @@ let test_invalid_failure_details_allow_next_activity () =
     [ ("duplicate", [ ("encoding", "binary/plain"); ("encoding", "binary/plain") ]);
       ("oversized", [ (String.make 65_537 'k', "value") ]);
       ("empty", [ ("", "value") ]);
-      ("nul", [ ("bad\000key", "value") ]);
-      (* A binary metadata value is valid Temporal data (#1048), so only
-         malformed keys remain in this list. *)
+      (* A binary metadata value and a NUL in a key are valid Temporal data
+         (#1048), so only keys outside the protocol's key rule remain. *)
       ("invalid-key", [ ("\255", "value") ]) ]
   in
   List.iter

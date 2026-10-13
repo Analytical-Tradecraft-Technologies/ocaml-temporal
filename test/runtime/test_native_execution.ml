@@ -2062,13 +2062,31 @@ let test_activity_command_translation_and_validation () =
       ()
   | _ -> failwith "binary metadata value was not sent losslessly"
   end;
-  let invalid_metadata_key : Temporal_base.Codec.payload =
+  (* A NUL in a key satisfies the bridge protocol's key rule, so a payload
+     received from another SDK can be returned unchanged (#1048). *)
+  let nul_metadata_key : Temporal_base.Codec.payload =
     {
-      Temporal_base.Payload.metadata = [ ("bad\000key", "value") ];
+      Temporal_base.Payload.metadata = [ ("nul\000key", "value") ];
       data = Bytes.empty;
     }
   in
-  expect_error_code "metadata key with NUL" "invalid_message"
+  begin match
+    unwrap "NUL metadata key completion"
+      (Native_execution.command_to_protocol
+         (Activation.Complete_workflow nul_metadata_key))
+  with
+  | Protocol.Complete_workflow { result = Some { metadata; _ } }
+    when List.assoc_opt "nul\000key" metadata = Some (Bytes.of_string "value") ->
+      ()
+  | _ -> failwith "metadata key with NUL was not sent unchanged"
+  end;
+  let invalid_metadata_key : Temporal_base.Codec.payload =
+    {
+      Temporal_base.Payload.metadata = [ ("bad\255key", "value") ];
+      data = Bytes.empty;
+    }
+  in
+  expect_error_code "metadata key that is not UTF-8" "invalid_message"
     (Native_execution.command_to_protocol
        (Activation.Complete_workflow invalid_metadata_key));
   let duplicate_metadata : Temporal_base.Codec.payload =
