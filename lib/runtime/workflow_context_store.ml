@@ -580,22 +580,33 @@ let with_randomness_disabled context action =
 
 (** Buffers a search-attribute merge without consulting wall-clock or process
     state. The payload list is copied at the public boundary before this
-    command is retained by the execution context. *)
+    command is retained by the execution context.
+
+    An empty list buffers nothing (#1033). Temporal Server rejects an upsert
+    command whose indexed fields are empty with [BAD_SEARCH_ATTRIBUTES], and
+    replay would emit the same command again, so every retry of the workflow
+    task would fail. Skipping it is replay-safe because a rejected command is
+    never recorded in history, and an empty merge has no observable effect.
+    The sealed check still runs first, so use after the execution ended stays
+    a programmer error whether or not the list is empty. *)
 let upsert_search_attributes context search_attributes =
   if context.sealed then
     invalid_arg
       "Temporal workflow search attributes used after workflow execution ended";
-  let copied =
-    List.map
-      (fun (key, { Temporal_base.Payload.metadata; data }) ->
-        (snapshot_identifier key,
-         { Temporal_base.Payload.metadata = List.map Fun.id metadata;
-           data = Bytes.copy data }))
-      search_attributes
-  in
-  context.commands_rev <-
-    Activation.Upsert_search_attributes { search_attributes = copied }
-    :: context.commands_rev
+  match search_attributes with
+  | [] -> ()
+  | _ :: _ ->
+      let copied =
+        List.map
+          (fun (key, { Temporal_base.Payload.metadata; data }) ->
+            (snapshot_identifier key,
+             { Temporal_base.Payload.metadata = List.map Fun.id metadata;
+               data = Bytes.copy data }))
+          search_attributes
+      in
+      context.commands_rev <-
+        Activation.Upsert_search_attributes { search_attributes = copied }
+        :: context.commands_rev
 
 (** Makes [context] current on the calling thread while [action] runs, then
     restores the previous value even if [action] raises. This prevents later

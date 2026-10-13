@@ -12,6 +12,10 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [dependencies]
 base64.workspace = true
+# Signal-mask calls that keep SIGPIPE from terminating the OCaml host process
+# (#1041). Used only on Unix targets; already locked through Tokio and Core.
+# Tests also use it to lower the descriptor limit so accept() fails (#1030).
+libc.workspace = true
 prost.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -21,6 +25,9 @@ temporalio-common.workspace = true
 temporalio-sdk-core.workspace = true
 temporalio-protos.workspace = true
 tokio.workspace = true
+# Warning and error records from the metrics endpoint's accept loop (#1030),
+# delivered through Core's log pipeline like Core's own records.
+tracing.workspace = true
 uuid.workspace = true
 
 # Test-only doubles. These crates are already locked transitively through
