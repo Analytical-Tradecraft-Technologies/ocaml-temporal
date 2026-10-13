@@ -603,10 +603,12 @@ let lanes_deadline worker =
     heartbeats and completes during the grace period, and Core starts its
     own graceful-shutdown timer now rather than after the grace period.
 
-    Called by a stopping [run] (after its workflow lane returned) and first
-    by the shutdown thread; whichever comes first sends the one supervisor
-    request. It waits for the mailbox but never for the network. A failure
-    is only logged: the release stops polling in any case. *)
+    Called by a stopping [run] (after its workflow lane returned, on a
+    detached thread that [run] never awaits, so a mailbox occupied by a stuck
+    activity-lane native call cannot hold [run]) and first by the shutdown
+    thread; whichever comes first sends the one supervisor request. It waits
+    for the mailbox but never for the network. A failure is only logged: the
+    release stops polling in any case. *)
 let stop_native_polling worker =
   if Atomic.compare_and_set worker.native_polling_stopped false true then
     match Native.perform worker.supervisor Native.Initiate_worker_shutdown with

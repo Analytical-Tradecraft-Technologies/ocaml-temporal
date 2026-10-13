@@ -185,11 +185,13 @@ let test_idle () =
     (the native readiness wait lasts up to 100 ms); the workflow lane always
     waits 5 ms. Returns a flag set when the loop has returned. *)
 let start_run ?(deadline = fun () -> Unix.gettimeofday () +. 0.3)
-    ?(activity_wait = 0.005) worker ~poll_workflow ~poll_activity =
+    ?(activity_wait = 0.005) ?(on_stop_blocks_on = None) worker ~poll_workflow
+    ~poll_activity =
   let on_stop () =
     if Atomic.get worker.callback_running then
       Atomic.set worker.loop_stopped_during_callback true;
-    ignore (Atomic.fetch_and_add worker.loop_stops 1)
+    ignore (Atomic.fetch_and_add worker.loop_stops 1);
+    Option.iter block_on on_stop_blocks_on
   in
   let returned = Atomic.make false in
   let ready = Atomic.make false in
@@ -698,6 +700,38 @@ let test_stuck_idle_lane_detached_after_allowance () =
     (Printf.sprintf "a stuck idle lane held run for %.3fs" elapsed);
   open_gate release_wait
 
+(** Codex review on #1081: the run loop's polling stop is a supervisor
+    request, and an activity lane stuck in a native call (a completion to an
+    unreachable server) occupies that supervisor, so the request waits. The
+    loop must not await it: [run] still detaches the stuck lane at the
+    deadline and returns, releasing its lifecycle lock, and shutdown stays
+    within its bound. The fake [on_stop] blocks until the stuck call ends. *)
+let test_blocked_polling_stop_does_not_hold_run () =
+  let worker = fake () in
+  let mailbox_free = gate () in
+  let entered = Atomic.make false in
+  let started = Unix.gettimeofday () in
+  let returned =
+    start_run
+      ~deadline:(fun () -> started +. 0.3)
+      ~on_stop_blocks_on:(Some mailbox_free) worker ~poll_workflow:idle
+      ~poll_activity:
+        (activity_once worker (fun () ->
+             Atomic.set entered true;
+             block_on mailbox_free))
+  in
+  await "native call entered" (fun () -> Atomic.get entered);
+  let outcome, elapsed =
+    shutdown ~lanes_deadline:(started +. 0.3) worker (operations worker)
+  in
+  ignore (shut_down outcome);
+  require_bound ~grace:0.3 ~teardown:0.3 elapsed;
+  require (Atomic.get returned) "run waited for the blocked polling stop";
+  require (Atomic.get worker.detached) "run did not detach the stuck lane";
+  require (Atomic.get worker.loop_stops = 1) "the polling stop was not started";
+  open_gate mailbox_free;
+  await "stuck call returned" (fun () -> not (Atomic.get worker.callback_running))
+
 (** #1028: [on_stop] belongs to a genuine stop. A lane failure without a
     stop must not stop native polling, because the worker may run again. *)
 let test_lane_failure_does_not_stop_polling () =
@@ -752,4 +786,6 @@ let () =
         test_stuck_idle_lane_detached_after_allowance );
       ( "lane failure does not stop polling",
         test_lane_failure_does_not_stop_polling );
+      ( "blocked polling stop does not hold run",
+        test_blocked_polling_stop_does_not_hold_run );
     ]

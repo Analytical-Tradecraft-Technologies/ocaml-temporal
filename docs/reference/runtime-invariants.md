@@ -437,7 +437,9 @@ and bridge, read the [documentation guide](../README.md) first.
     `shutdown` and a stopping `run` computes it first wins, so the two agree.
   - Temporal Core stops polling the server at once too (#1028). A stopping
     `run` sends `Initiate_worker_shutdown` after its workflow lane returned
-    (only for a stop, never after a lane failure), and the shutdown thread
+    (only for a stop, never after a lane failure), from a detached thread it
+    never awaits, so a mailbox occupied by a stuck activity-lane native call
+    cannot keep `run` past the deadline; the shutdown thread
     sends it before the lanes phase; a per-worker atomic makes it one
     request. The bridge moves its ledger to `Draining`, closes both readiness
     signals (queued tasks still drain first) and calls Core's

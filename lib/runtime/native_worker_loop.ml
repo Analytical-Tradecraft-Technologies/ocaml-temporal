@@ -108,10 +108,10 @@ let detach_due ~now ~deadline ~busy =
     callback that outlives the deadline is left running on its Domain instead
     of blocking this join forever (#495); the [finished] flag is set by that
     Domain as its last action, so a [true] read means the join is immediate.
-    [detach.on_stop] runs once on this thread, after the workflow lane
-    returned because [closed] holds and before the activity lane is joined,
-    so the caller can stop native polling while a callback still finishes
-    (#1028). *)
+    [detach.on_stop] is started once, after the workflow lane returned
+    because [closed] holds and before the activity lane is joined, so the
+    caller can stop native polling while a callback still finishes (#1028).
+    It runs on a detached system thread and is never awaited. *)
 let run ~detach ~closed ~poll_workflow ~poll_activity ~wait_for_lane
     ~retry_pending =
   let stop = Atomic.make false in
@@ -155,8 +155,20 @@ let run ~detach ~closed ~poll_workflow ~poll_activity ~wait_for_lane
     | Some { now; deadline; on_detached; on_stop } ->
         (* Only a genuine stop, never a lane failure, ends native polling:
            after a failure without a stop the worker may still be run again.
-           A defect in the callback must not prevent the join below. *)
-        if closed () then (try on_stop () with _ -> ());
+           The callback runs fire-and-forget on its own system thread: it may
+           wait for a supervisor mailbox occupied by the very activity-lane
+           native call this join must be able to abandon, so awaiting it here
+           could hold [run] (and the caller's lifecycle lock) past the
+           deadline. A defect in it, or a failed thread creation, must not
+           prevent the join below; the caller's shutdown path stops polling
+           in any case. *)
+        if closed () then begin
+          match
+            Thread.create (fun () -> try on_stop () with _ -> ()) ()
+          with
+          | _thread -> ()
+          | exception _ -> ()
+        end;
         if not (Atomic.get activity_finished) then begin
           let deadline = deadline () in
           while

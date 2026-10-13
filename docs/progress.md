@@ -29,7 +29,9 @@ stops polling and starts its own graceful-shutdown timer, while leased tasks
 stay completable and heartbeatable. A stopping `Worker.run` sends it right
 after its workflow lane returns (never after a lane failure), and the
 bounded-shutdown thread sends it before the lanes phase; one atomic makes it
-a single request.
+a single request. `run` starts its request on a detached thread and never
+awaits it, so a supervisor mailbox occupied by a stuck activity-lane native
+call cannot keep `run` past the grace deadline (Codex review).
 
 Shutdown and disposal completed a retired local-activity token with a
 retryable failure, which Core's local-activity manager retries in-process
@@ -73,7 +75,7 @@ a fast heartbeat completing while a slow one is still held by the server.
 OCaml tests: `test_native_worker_bounded_shutdown.ml` (polling stopped by
 both `run` and the shutdown thread during the grace period, a zero-grace
 idle worker not detached, a stuck idle wait still bounded, no stop after a
-lane failure), `test_bounded_shutdown.ml` (the stop queued behind a blocked
+lane failure, a blocked polling stop not holding `run`), `test_bounded_shutdown.ml` (the stop queued behind a blocked
 supervisor operation keeps shutdown bounded), `test_native_worker_watchdog.ml`
 (prompt stop) and `test_native_async_activity.ml` (an async callback reported
 running; the lease probe and a new handoff proceed while an async RPC is in

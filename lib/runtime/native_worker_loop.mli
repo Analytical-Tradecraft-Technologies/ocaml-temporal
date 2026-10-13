@@ -22,11 +22,15 @@ type progress =
     {!idle_detach_allowance_s} past the deadline, so a short grace period
     never detaches a lane that has no callback (#1023).
 
-    [on_stop] is called once on the calling thread when the workflow lane has
-    returned because [closed] holds, before the activity lane is joined. The
-    native worker uses it to stop Temporal Core polling at once rather than
-    after the grace period (#1028). It is not called after a lane failure
-    without a stop. An exception it raises is ignored. *)
+    [on_stop] is started once, when the workflow lane has returned because
+    [closed] holds, before the activity lane is joined. The native worker
+    uses it to stop Temporal Core polling at once rather than after the grace
+    period (#1028). It runs fire-and-forget on its own system thread, so it
+    may block (for example on a supervisor mailbox that a stuck activity-lane
+    native call occupies) without delaying the bounded join: [run] still
+    returns by the deadline. If no thread can be created it is skipped; the
+    caller must then stop polling another way. It is not called after a lane
+    failure without a stop. An exception it raises is ignored. *)
 type activity_detach = {
   now : unit -> float;
   deadline : unit -> float;
