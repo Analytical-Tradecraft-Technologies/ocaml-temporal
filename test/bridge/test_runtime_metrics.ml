@@ -23,9 +23,55 @@ let socket_of address =
       in
       Unix.ADDR_INET (Unix.inet_addr_of_string host, port)
 
-(** Upper bound, in seconds, on one scrape. Generous because Windows CI
-    runners can stall a loopback round trip for several seconds (#1058). *)
+(** Upper bound, in seconds, on one scrape. A loaded CI runner can delay a
+    loopback round trip, so the bound is generous; it is enforced with
+    [Unix.select] rather than [SO_RCVTIMEO] (see {!wait_readable}). *)
 let scrape_timeout_seconds = 30.
+
+(** Raised when a scrape misses its deadline. [stage] names the step that was
+    waiting, [elapsed] is in seconds, and [received] counts the response
+    bytes that had arrived, so a missing response is told apart from a
+    truncated one (#1072). *)
+exception
+  Scrape_timeout of {
+    label : string;
+    address : string;
+    stage : string;
+    elapsed : float;
+    received : int;
+  }
+
+(** A one-line rendering of {!Scrape_timeout}, so an uncaught timeout names
+    the scrape and the stage in the test log. *)
+let () =
+  Printexc.register_printer (function
+    | Scrape_timeout { label; address; stage; elapsed; received } ->
+        Some
+          (Printf.sprintf
+             "%s: scrape of %s/metrics timed out after %.3f s while %s, with \
+              %d byte(s) received"
+             label address elapsed stage received)
+    | _ -> None)
+
+(** Waits until [socket] is readable or [deadline] (an absolute
+    [Unix.gettimeofday] time) passes; returns whether it became readable.
+
+    [SO_RCVTIMEO] cannot express this portably from OCaml: on Windows,
+    [Unix.setsockopt_float] passes a [struct timeval], while Winsock reads
+    the option as a [DWORD] of milliseconds, i.e. the [tv_sec] field. A
+    "30 s" timeout was therefore 30 ms there, which made a scrape on a busy
+    runner fail with nothing received (#1058, #1072). [Unix.select] takes
+    seconds on every platform. An interrupted wait is resumed with the
+    remaining time. *)
+let rec wait_readable socket deadline =
+  let remaining = deadline -. Unix.gettimeofday () in
+  if remaining <= 0. then false
+  else
+    match Unix.select [ socket ] [] [] remaining with
+    | [], _, _ -> wait_readable socket deadline
+    | _ -> true
+    | exception Unix.Unix_error (Unix.EINTR, _, _) ->
+        wait_readable socket deadline
 
 (** The [Content-Length] of a response whose header block is [headers], if
     present. Header names are case-insensitive. *)
@@ -64,14 +110,20 @@ let complete response =
     The response is complete once its headers and [Content-Length] body have
     arrived; the helper does not wait for the server to close the
     connection, whose timing is not part of the endpoint's contract and
-    varies on Windows (#1058). A timeout fails with the number of bytes
-    received, which tells a slow close apart from a missing response. *)
-let http_get address path =
+    varies on Windows (#1058). The whole exchange shares one [timeout]
+    (seconds, default {!scrape_timeout_seconds}); missing it raises
+    {!Scrape_timeout} naming [label] (which scrape of the test this is) and
+    the stage that was waiting. Connecting is a blocking loopback [connect],
+    which the listen backlog completes without the server's participation, so
+    a server that never accepts shows up as a timeout while waiting for the
+    first response byte. *)
+let http_get ?(timeout = scrape_timeout_seconds) ~label address path =
+  let started = Unix.gettimeofday () in
+  let deadline = started +. timeout in
   let socket = Unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
   Fun.protect
     ~finally:(fun () -> Unix.close socket)
     (fun () ->
-      Unix.setsockopt_float socket Unix.SO_RCVTIMEO scrape_timeout_seconds;
       Unix.connect socket (socket_of address);
       let request =
         Printf.sprintf
@@ -83,17 +135,25 @@ let http_get address path =
       let chunk = Bytes.create 4096 in
       let rec read () =
         if not (complete buffer) then
-          match Unix.read socket chunk 0 (Bytes.length chunk) with
-          | 0 -> ()
-          | count ->
-              Buffer.add_subbytes buffer chunk 0 count;
-              read ()
-          | exception Unix.Unix_error ((Unix.ETIMEDOUT | Unix.EAGAIN), _, _) ->
-              failwith
-                (Printf.sprintf
-                   "scrape of %s%s timed out after %.0f s with %d byte(s) \
-                    received"
-                   address path scrape_timeout_seconds (Buffer.length buffer))
+          if not (wait_readable socket deadline) then
+            raise
+              (Scrape_timeout
+                 {
+                   label;
+                   address;
+                   stage =
+                     (if Buffer.length buffer = 0 then
+                        "waiting for the first response byte"
+                      else "reading the rest of the response");
+                   elapsed = Unix.gettimeofday () -. started;
+                   received = Buffer.length buffer;
+                 })
+          else
+            match Unix.read socket chunk 0 (Bytes.length chunk) with
+            | 0 -> ()
+            | count ->
+                Buffer.add_subbytes buffer chunk 0 count;
+                read ()
       in
       read ();
       Buffer.contents buffer)
@@ -123,7 +183,7 @@ let test_endpoint_lifecycle () =
   in
   assert (String.starts_with ~prefix:"127.0.0.1:" address);
   assert (not (String.ends_with ~suffix:":0" address));
-  let scrape = http_get address "/metrics" in
+  let scrape = http_get ~label:"first scrape after create" address "/metrics" in
   assert (String.starts_with ~prefix:"HTTP/1.1 200" scrape);
   (* A second exporter cannot take the same address; the failed create
      leaves no runtime behind and the first endpoint keeps serving. *)
@@ -133,7 +193,10 @@ let test_endpoint_lifecycle () =
   | Error error ->
       assert ((Error.view error).category = `Bridge);
       assert (String.length (Error.message error) > 0));
-  assert (String.starts_with ~prefix:"HTTP/1.1 200" (http_get address "/metrics"));
+  let scrape =
+    http_get ~label:"scrape after the busy-address create" address "/metrics"
+  in
+  assert (String.starts_with ~prefix:"HTTP/1.1 200" scrape);
   get (Runtime.shutdown runtime);
   assert (Runtime.metrics_address runtime = Some address);
   assert (refused address)
@@ -163,7 +226,10 @@ let test_aborted_scrapes_do_not_kill_the_process () =
     Unix.setsockopt_optint socket Unix.SO_LINGER (Some 0);
     Unix.close socket
   done;
-  assert (String.starts_with ~prefix:"HTTP/1.1 200" (http_get address "/metrics"));
+  let scrape =
+    http_get ~label:"scrape after 64 reset connections" address "/metrics"
+  in
+  assert (String.starts_with ~prefix:"HTTP/1.1 200" scrape);
   get (Runtime.shutdown runtime)
 
 (** Without [~metrics] no endpoint exists. *)
@@ -185,7 +251,40 @@ let test_invalid_options () =
       ("127.0.0.1:0", [ ("ok", "") ]);
     ]
 
+(** The scrape helper's timeout is measured in seconds on every platform
+    (#1072). A listener that never accepts completes the TCP handshake from
+    its backlog but sends nothing, so a 1 s scrape must fail at the first
+    response byte no sooner than about 1 s. The previous [SO_RCVTIMEO]
+    helper failed this on Windows after about 1 ms, which is how a "30 s"
+    bound became a 30 ms one there. *)
+let test_scrape_timeout_is_in_seconds () =
+  let listener = Unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  Fun.protect
+    ~finally:(fun () -> Unix.close listener)
+    (fun () ->
+      Unix.bind listener (Unix.ADDR_INET (Unix.inet_addr_loopback, 0));
+      Unix.listen listener 1;
+      let address =
+        match Unix.getsockname listener with
+        | Unix.ADDR_INET (host, port) ->
+            Printf.sprintf "%s:%d" (Unix.string_of_inet_addr host) port
+        | Unix.ADDR_UNIX _ -> failwith "loopback listener has no port"
+      in
+      let timeout = 1. in
+      match http_get ~timeout ~label:"silent listener" address "/metrics" with
+      | _ -> failwith "a silent listener produced a response"
+      | exception Scrape_timeout { stage; elapsed; received; _ } ->
+          assert (stage = "waiting for the first response byte");
+          assert (received = 0);
+          (* [select] may wake one clock tick early; Windows ticks are
+             about 16 ms. *)
+          if elapsed < timeout -. 0.1 then
+            failwith
+              (Printf.sprintf "a %.1f s scrape timed out after %.3f s" timeout
+                 elapsed))
+
 let () =
+  test_scrape_timeout_is_in_seconds ();
   test_endpoint_lifecycle ();
   test_aborted_scrapes_do_not_kill_the_process ();
   test_no_metrics_by_default ();
