@@ -611,7 +611,7 @@ module Internal : sig
   val inbound_workflow_priority :
     string -> Yojson.Safe.t -> (workflow_priority, error) result
   (** Decodes a priority received from Temporal, such as an activity task's.
-      Unlike {!workflow_priority}, which applies the outbound command rules,
+      Unlike {!val-workflow_priority}, which applies the outbound command rules,
       it checks only the 64-byte fairness-key bound and keeps the weight's
       exact bits, because the server clamps weights instead of rejecting
       them (#1016). *)
