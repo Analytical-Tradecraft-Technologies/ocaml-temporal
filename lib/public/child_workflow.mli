@@ -29,8 +29,8 @@ end
 type 'output handle
 
 (** Starts a child workflow and retains a handle that can cancel it. The
-    command is emitted immediately; [future] remains pending until Core reports
-    a start or terminal result. The default [Try_cancel] policy asks Core to
+    command is emitted immediately; {!started} resolves when Temporal starts
+    the child and {!future} when it finishes or fails to start. The default [Try_cancel] policy asks Core to
     cancel the child when [cancel] is called; choose [Abandon] explicitly when
     the child should keep running. [retry_policy], when supplied, is handed to
     Temporal Core so retryable child failures are retried by the durable state
@@ -42,7 +42,11 @@ type 'output handle
     omission inherits the parent's queue. A supplied queue must be a non-empty
     UTF-8 identifier of at most 65,536 bytes without NUL. [parent_close_policy]
     controls the server action after parent closure; omission keeps the server
-    default. Choose [Parent_close_policy.Abandon] for independently paid work. *)
+    default. Choose [Parent_close_policy.Abandon] for work that must outlive
+    the parent, and await {!started} before the parent returns: Temporal Server
+    does not start a child whose parent has already closed, whatever the
+    policy, so a child scheduled in the parent's last workflow task is
+    silently never started. *)
 val start_handle :
   ?scope:Scope.t ->
   ?cancellation_type:cancellation_type ->
@@ -56,6 +60,25 @@ val start_handle :
 
 (** Returns the typed future owned by a child operation handle. *)
 val future : 'output handle -> ('output, Error.t) Future.t
+
+(** [started handle] resolves with the child's run ID once Temporal has
+    started the child, without waiting for it to finish. If the child never
+    starts (for example its workflow ID is already in use, or it was cancelled
+    first) it resolves with the same error as {!future}. Await it before the
+    parent completes when the child should keep running after the parent
+    closes, as the official Temporal SDKs do:
+
+    {[
+      let child =
+        Child_workflow.start_handle
+          ~parent_close_policy:Child_workflow.Parent_close_policy.Abandon
+          ~id:("bill-" ^ order) bill order
+      in
+      match Future.await (Child_workflow.started child) with
+      | Ok _run_id -> Ok ()
+      | Error error -> Error error
+    ]} *)
+val started : 'output handle -> (string, Error.t) Future.t
 
 (** Requests cancellation of the exact child represented by [handle]. The
     default reason is stable and replay-safe. Repeated calls are idempotent;
@@ -75,7 +98,9 @@ val cancel :
     Starting several operations before awaiting them lets Temporal run them
     concurrently. The default cancellation policy is [Try_cancel]. A supplied
     [retry_policy] controls retries in Temporal Core. A supplied [scope]
-    attaches server-side child cancellation to the scope. *)
+    attaches server-side child cancellation to the scope. The returned future
+    resolves only when the child finishes; use {!start_handle} and {!started}
+    to wait for the child to be started instead. *)
 val start :
   ?scope:Scope.t ->
   ?cancellation_type:cancellation_type ->
