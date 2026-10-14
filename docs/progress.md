@@ -15,6 +15,26 @@ implementation when a later entry documents that work as complete. The
 records the current tested source, named assertions and successful CI job for
 the Temporal acceptance controllers.
 
+## 2026-10-13: Per-series ocaml/opam pins Dependabot can refresh (#1027)
+
+The daily Dependabot Docker job failed or proposed retargeting a compiler
+stage to another series instead of refreshing the pinned `ocaml/opam`
+digests. All four stages lived in `Dockerfile.dev`, which Dependabot treated
+as a single dependency. Its `semver-minor`/`semver-major` ignore also had no
+effect: candidate tags such as `debian-12-ocaml-5.3` are compared by their
+trailing number (5.3), but the ignore ranges are derived from the whole current
+tag, read as 12.5.2. Each series now pins its image on the single `FROM` line
+of `docker/ocaml-<series>/Dockerfile`, which has its own Dependabot entry
+ignoring `ocaml/opam` versions from the next series upwards. The current tag
+stays eligible, so only its digest moves. `Dockerfile.dev` no longer names
+`ocaml/opam`, and the Makefile and live-test scripts resolve a series to its
+pinned reference with `scripts/ocaml-image.sh`.
+`test_build_tool_dependencies.sh` checks that the pin files, the Dependabot
+ranges and the CI matrix agree, and its mutation companion rejects a
+retargetable entry, an undigested pin, an extra series and a second pin in
+`Dockerfile.dev`. The dependency inventory reads the new pin files. Whether
+Dependabot now opens per-tag digest PRs can only be confirmed by its first
+scheduled run after merge.
 ## 2026-10-13: Replay rejects histories it cannot truly check (#1045, #1046, #1047)
 
 Offline replay could report `PASS` without running any workflow code, or
