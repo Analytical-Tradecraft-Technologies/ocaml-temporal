@@ -15,6 +15,165 @@ implementation when a later entry documents that work as complete. The
 records the current tested source, named assertions and successful CI job for
 the Temporal acceptance controllers.
 
+## 2026-10-13: A raising signal handler no longer leaks bridge borrows (#1018)
+
+In OCaml 5, `caml_enter_blocking_section` runs pending signal handlers and
+re-raises their exceptions. The bridge stubs entered it after taking a counted
+runtime or shared-runtime borrow, after `runtime_close` had detached the
+native pointer, or while holding a `malloc`'d input copy. A raising handler,
+such as `Sys.Break` under `Sys.catch_break true`, therefore unwound the stub
+and leaked that resource: the next close spun forever on the leaked borrow,
+the GC finalizer could spin while holding the domain lock, or a detached Core
+graph was never freed. Every stub in `lib/core_bridge/native_stubs.c` now
+releases the lock through one helper that calls
+`caml_enter_blocking_section_no_pending`, which every supported compiler
+series (5.2 to 5.5) provides. A pending handler still runs, at the first OCaml
+poll point after the stub has returned and released everything it owns.
+
+`test/bridge/test_signal_borrow_release.ml` makes SIGUSR1 pending with a test
+C helper that does not run OCaml handlers, then calls the production stubs
+directly: the no-input and JSON runtime paths, client submit, shared-runtime
+attach, and close. It checks that each stub returns and the raising handler
+then runs exactly once, and that every runtime and the shared runtime close
+afterwards. Without the fix the test fails at the first stub. It is skipped on
+Windows, which has no SIGUSR1. Verified with `dune build @install` and
+`dune build @test/bridge/runtest` on OCaml 5.4.1 (macOS).
+
+## 2026-10-13: Teardown cleanup keeps the terminal command and eviction ack (#1021)
+
+When a run completed or was evicted, the scheduler discontinued every parked
+fiber inline, so user `Fun.protect ~finally` blocks and exception handlers ran
+during teardown. If that cleanup raised (for example `Workflow.start_sleep`,
+`Activity.start` or `upsert_search_attributes` after the run ended), or a
+catch-all around an await turned the private shutdown exception into a
+defect, the error reached `fail_task`. On the terminal path that discarded the
+already-buffered `Complete_workflow`, `Fail_workflow` or cancellation command
+and failed every replay of the task; on the eviction path it produced an
+eviction completion with a task failure, which the Rust bridge rejects, so
+`Worker.run` stopped with the eviction lease outstanding.
+
+The scheduler now records exceptions that escape fibers after shutdown
+separately (`Scheduler.take_teardown_failures`), as it does for exceptions
+raised by the aborted fiber's own cleanup after continue-as-new or `terminate`
+buffered the terminal command, and `run` reports only failures raised while
+it was active and not aborting. The execution logs those teardown
+failures as a warning with a count only, and a task-failing error reported by
+workflow code once the run is terminal, has a buffered terminal command, or
+is evicted is logged and dropped
+instead of poisoning the task; after eviction every error takes that path. A
+defect raised before the terminal command still discards the batch.
+`Native_execution.activate_translated` always acknowledges a cache eviction
+with an empty completion, even for a generation poisoned earlier, so the OCaml
+and Rust eviction validators agree.
+
+`test/runtime/test_handler_teardown.ml` covers signal and update handlers
+whose `finally` starts a timer, upserts search attributes or raises, for both
+completion and eviction; a catch-all root or handler that converts the
+shutdown exception into a defect; a pre-terminal handler defect that must
+still fail the task; native eviction acknowledgements for a failing
+cleanup and for a poisoned generation; and a raising `finally` around
+continue-as-new in the root and in a handler, and around a cancelled root. `test/runtime/test_scheduler.ml`
+checks that a cleanup exception after shutdown is a teardown failure while an
+active one is still `Failed`. Verified with the full `test/runtime` and
+`test/unit` aliases on OCaml 5.4.1 (macOS).
+## 2026-10-13: Runtime attachment and abandoned-worker cleanup contracts (#1044)
+
+`runtime.mli` said a client or worker stays attached to a shared runtime
+until its own `shutdown` has returned, but a worker whose bounded shutdown
+returned with a `Detached` native teardown stays attached until that
+background teardown finishes, as `worker.mli` already said, so a following
+`Runtime.shutdown` returned an unexpected "still attached" defect. The
+runtime interface, `Runtime.shutdown`, `Worker.Shutdown_report.teardown` and
+the defect message now state the real rule: attachment ends when native
+teardown completes.
+
+The abandoned-worker finalizer comment claimed that keeping the worker
+reachable from its cleanup thread stopped the supervisor's own finalizer from
+closing the native graph before the drain finished. `Gc.finalise` runs the
+finalizers of every value found unreachable in the same collection, so the
+supervisor's cleanup could already be scheduled. The supervisor now has a
+private `delegate_abandoned_cleanup` switch that turns its own finalizer into
+a no-op; `Native_worker.create` sets it, making the worker's
+drain-then-shutdown finalizer the only path that closes an abandoned worker's
+graph. Every finalizer path that cannot spawn its cleanup or terminal-retry
+thread, including the pending-retry path, now closes supervisor admission
+itself (`Native_worker_policy.spawn_or_close_admission`), as the supervisor's
+finalizer used to, so the owner Domain stops and the native custom-block
+finalizer can still reclaim the graph and its shared-runtime lease.
+
+`test/sdk_supervisor/test_sdk_supervisor.ml` abandons an owner and its
+delegated supervisor together and checks that the backend closes exactly
+once and only after the owner's slow drain; with the switch disabled the test
+fails on every run. `test/runtime/test_native_worker_policy.ml` checks that a
+failed spawn closes admission, a successful one does not, and a raising close
+is contained. Verified with `dune build @install`, the `test/sdk_supervisor`,
+`test/unit` and `test/runtime` aliases and `test_shared_runtime` on OCaml 5.4.1
+(macOS).
+
+## 2026-10-13: Child-start acknowledgement for abandoned children (#1040)
+
+Temporal Server does not start a child whose parent has already closed, even
+with `Parent_close_policy.Abandon`, and the public API had no way to wait for
+the child's start: `Child_workflow.start` and `start_handle` resolved only on a
+failed start or on the child's result. The documented "start an `Abandon`
+child and return" pattern therefore lost the child silently whenever the
+parent completed in the same workflow task.
+
+`Child_workflow.started : 'output handle -> (string, Error.t) Future.t` now
+resolves with the child's run ID when Core reports the start acknowledgement,
+and with the same error as the result future when the child never starts
+(start failure, or cancellation before the start). The runtime allocates both
+futures with the child command, so the start stage is settled by the same
+activation jobs and stays replay-safe. `child_workflow.mli`, the workflow
+guide and the [operation policy reference](reference/durable-operation-policies.md)
+now tell parents to await `started` before returning when the child must
+outlive them, matching the Go, Java, Python and TypeScript SDKs.
+
+`test/runtime/test_activation.ml` checks that a parent awaiting `started`
+emits its completion only after the acknowledgement and receives the run ID
+while the result stays pending, and that a start failure and a pre-start
+cancellation settle the start stage with the result's error. The install
+consumer fixture pins the new signature. Verified with `dune build @install`,
+the `test/runtime` and `test/unit` aliases, and the install-consumer fixture on
+OCaml 5.4.1 (macOS).
+
+## 2026-10-13: Reference documents match the code and evidence (#1026)
+
+Four reference statements had drifted from the code or their own evidence.
+The live-evidence record's Pins row named Core `8fe478ee` for the
+September 19 audited run, but the manifest at that baseline (`beae10d0a58e`)
+pins `95e97686`. The row now names `95e97686`. The Core v1.1.0 upgrade's own
+live evidence is cited separately: the successful Temporal/PostgreSQL job of
+the Build run at the upgrade commit `acbda8da`. `native-interactions.md` now
+describes the fail-closed signal policy from #811 (a missing handler or
+undecodable signal fails the workflow task, not the run). `package-boundary.md`
+lists six, not four, public types equal to package-private types, adding
+`Runtime.t` and the constructor-bearing `Activity.Cancellation.reason`. The
+child-start row of `native-execution-translation.md` now says that task queue
+and parent-close policy are carried end to end. Each claim was checked against
+`lib/runtime/execution.ml`, the public `.mli` files,
+`lib/runtime/native_execution.ml`, `rust/core-bridge/src/workflow_protocol.rs`,
+and the CI run and job logs. Documentation only; no behavior changed.
+## 2026-10-13: Bytecode consumers link outside the SDK workspace (#1020)
+
+The documented Dune `(modes byte)` link mode worked only inside the SDK's own
+workspace, whose `dune-workspace` disables dynamically linked foreign
+archives. The installed `temporal_core_bridge.cma` records the stub and Rust
+archives as `-dllib` entries, but only the static `.a` files are installed.
+An ordinary consumer project therefore linked a byte executable in
+dynamic-stub mode, and `ocamlc` failed looking for
+`dllocaml_temporal_core_bridge`. The bridge library is now archived with
+`ocamlc -a -custom` and `-ccopt -L"$CAMLORIGIN"` (through `ocamlc_flags`,
+because `ocamlopt` rejects `-custom`). Every bytecode link of the SDK,
+including Dune `(modes byte)` and `ocamlfind ocamlc -linkpkg`, now builds a
+custom runtime that embeds the static archives and finds them in the
+relocatable install directory. Supporting bytecode was kept rather than
+dropped: the custom runtime needs nothing the static archives do not already
+provide. The install-consumer fixture now links `main` as `exe` and `byte`.
+`test/bridge/test_install.sh` and the prebuilt-library consumer build and run
+`main.bc` in a separate Dune root without the SDK's `dune-workspace`. The
+README, workflow guide and Core bridge reference describe the supported modes;
+the toplevel and native plugins remain unsupported.
 ## 2026-10-13: Per-series ocaml/opam pins Dependabot can refresh (#1027)
 
 The daily Dependabot Docker job failed or proposed retargeting a compiler

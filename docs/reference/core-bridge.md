@@ -1250,8 +1250,23 @@ constructing an intermediate OCaml stub DLL. Keeping the C and Rust inputs as
 static foreign archives removes that unnecessary link step without changing
 the installed OCaml API or final executable.
 
-Because only the static archives are installed, bytecode consumers must link
-with `-custom` (or as a Dune `(modes byte)` executable); dynamically loaded
-bytecode and the toplevel cannot load the bridge. The user-facing statement of
+Because only the static archives are installed, a bytecode consumer can only
+use them through a custom runtime. `ocamlc` nevertheless records the foreign
+archives in the `.cma` as `-dllib` entries. Outside a workspace that sets
+`disable_dynamically_linked_foreign_archives`, an ordinary bytecode link would
+therefore look for the absent `dllocaml_temporal_core_bridge` shared library
+(#1020). The bridge library is archived with `ocamlc -a -custom`, which stores
+"force custom" in the `.cma`. Every bytecode executable that links the SDK
+(Dune `(modes byte)`, `ocamlfind ocamlc -linkpkg`) is then linked in custom
+mode: the static archives are embedded and no shared library is loaded at
+startup. A custom link does not search the library's own directory, so the
+`.cma` also carries `-ccopt -L"$CAMLORIGIN"`. OCaml expands that to the
+installed directory, which keeps relocated installations working. These are
+`ocamlc_flags` rather than `library_flags` because `ocamlopt` rejects
+`-custom`. The toplevel still cannot load the bridge, because loading into a
+running interpreter needs a shared stub library. `test/bridge/test_install.sh`
+and the prebuilt-library consumer build and run the install-consumer fixture
+as a Dune `(modes byte)` executable in its own Dune root, without the SDK's
+`dune-workspace`. The user-facing statement of
 this constraint, together with the related `Unix.fork` restriction, is in the
 [workflow guide](../guides/workflows.md#process-and-linking-constraints).
