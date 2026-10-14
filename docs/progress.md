@@ -15,6 +15,43 @@ implementation when a later entry documents that work as complete. The
 records the current tested source, named assertions and successful CI job for
 the Temporal acceptance controllers.
 
+## 2026-10-13: Teardown cleanup keeps the terminal command and eviction ack (#1021)
+
+When a run completed or was evicted, the scheduler discontinued every parked
+fiber inline, so user `Fun.protect ~finally` blocks and exception handlers ran
+during teardown. If that cleanup raised (for example `Workflow.start_sleep`,
+`Activity.start` or `upsert_search_attributes` after the run ended), or a
+catch-all around an await turned the private shutdown exception into a
+defect, the error reached `fail_task`. On the terminal path that discarded the
+already-buffered `Complete_workflow`, `Fail_workflow` or cancellation command
+and failed every replay of the task; on the eviction path it produced an
+eviction completion with a task failure, which the Rust bridge rejects, so
+`Worker.run` stopped with the eviction lease outstanding.
+
+The scheduler now records exceptions that escape fibers after shutdown
+separately (`Scheduler.take_teardown_failures`), as it does for exceptions
+raised by the aborted fiber's own cleanup after continue-as-new or `terminate`
+buffered the terminal command, and `run` reports only failures raised while
+it was active and not aborting. The execution logs those teardown
+failures as a warning with a count only, and a task-failing error reported by
+workflow code once the run is terminal, has a buffered terminal command, or
+is evicted is logged and dropped
+instead of poisoning the task; after eviction every error takes that path. A
+defect raised before the terminal command still discards the batch.
+`Native_execution.activate_translated` always acknowledges a cache eviction
+with an empty completion, even for a generation poisoned earlier, so the OCaml
+and Rust eviction validators agree.
+
+`test/runtime/test_handler_teardown.ml` covers signal and update handlers
+whose `finally` starts a timer, upserts search attributes or raises, for both
+completion and eviction; a catch-all root or handler that converts the
+shutdown exception into a defect; a pre-terminal handler defect that must
+still fail the task; native eviction acknowledgements for a failing
+cleanup and for a poisoned generation; and a raising `finally` around
+continue-as-new in the root and in a handler, and around a cancelled root. `test/runtime/test_scheduler.ml`
+checks that a cleanup exception after shutdown is a teardown failure while an
+active one is still `Failed`. Verified with the full `test/runtime` and
+`test/unit` aliases on OCaml 5.4.1 (macOS).
 ## 2026-10-13: Runtime attachment and abandoned-worker cleanup contracts (#1044)
 
 `runtime.mli` said a client or worker stays attached to a shared runtime
