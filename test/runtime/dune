@@ -1,6 +1,7 @@
 (tests
  (names
   test_activation
+  test_continue_as_new_encode_error
   test_handler_teardown
   test_initial_handlers
   test_native_execution

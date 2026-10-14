@@ -48,11 +48,20 @@ SMOKE_REPLAY_WORKFLOW_ID ?= two-binary-worker-restart-replay
 SERVICE ?= dev
 OCAML_VERSION ?= 5.2
 OCAML_SERIES = $(shell printf '%s' "$(OCAML_VERSION)" | cut -d. -f1,2)
-# Dockerfile.dev stage holding the digest-pinned ocaml/opam image for this
-# compiler series. An explicit image reference may still be supplied locally.
+# Base image selector for this compiler series: `ocaml-<series>` names the
+# digest-pinned ocaml/opam reference in docker/ocaml-<series>/Dockerfile (the
+# only copy of each pin, tracked per series by Dependabot, #1027). An explicit
+# image reference may still be supplied locally. The override below replaces
+# the selector, including one given on the command line, with the resolved
+# immutable reference, so every Compose build argument, recursive Make, and
+# live-test script receives the pinned image rather than a series name.
 OCAML_IMAGE ?= ocaml-$(OCAML_SERIES)
+# An unknown series resolves to empty after the script reports it on stderr.
+# That is not fatal here because native targets never build the image; a
+# Docker target then fails in Dockerfile.dev, which has no default base image.
+override OCAML_IMAGE := $(shell sh scripts/ocaml-image.sh '$(OCAML_IMAGE)')
 # Immutable base image behind OCAML_IMAGE, recorded in benchmark reports.
-OCAML_IMAGE_REFERENCE = $(or $(shell awk '$$1 == "FROM" && $$3 == "AS" && $$4 == "$(OCAML_IMAGE)" { print $$2 }' Dockerfile.dev),$(OCAML_IMAGE))
+OCAML_IMAGE_REFERENCE = $(OCAML_IMAGE)
 HOST_UID ?= $(shell id -u)
 HOST_GID ?= $(shell id -g)
 # Dune links many test executables concurrently, each against the large Rust

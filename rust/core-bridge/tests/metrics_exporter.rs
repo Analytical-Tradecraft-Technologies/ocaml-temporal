@@ -17,6 +17,7 @@ use ocaml_temporal_core_bridge::{
     ocaml_temporal_core_v4_result_free, ocaml_temporal_core_v4_runtime_free,
     ocaml_temporal_core_v4_runtime_new_attached, ocaml_temporal_core_v4_shared_runtime_free,
     ocaml_temporal_core_v4_shared_runtime_new_with_telemetry_json, test_runtime_has_metrics_meter,
+    test_shared_runtime_stop_core_metrics_server,
 };
 
 /// Copies one bridge buffer into owned bytes.
@@ -69,6 +70,20 @@ fn free_shared(shared: &mut *mut SharedRuntime) {
         STATUS_OK
     );
     assert!(shared.is_null());
+}
+
+/// Sends one HTTP/1.1 GET and returns the raw response text, or the I/O
+/// error that interrupted the exchange.
+fn try_http_get(address: SocketAddr, path: &str) -> std::io::Result<String> {
+    let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(5))?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+    )?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response)?;
+    Ok(response)
 }
 
 /// Sends one HTTP/1.1 GET and returns the raw response text.
@@ -242,4 +257,44 @@ fn busy_port_is_a_configuration_error() {
     assert!(shared.is_null());
     assert!(message.contains(&address.to_string()), "{message}");
     assert!(message.contains("AddrInUse"), "{message}");
+}
+
+/// If Core's own scrape server stops (as an accept error on its private
+/// listener would make it), the public endpoint keeps accepting and answers
+/// every scrape with an explicit 503 instead of going silent (#1030).
+#[test]
+fn a_stopped_core_server_is_reported_as_503_not_a_closed_port() {
+    let (status, mut shared, address) = create(br#"{"prometheus":{"bind_address":"127.0.0.1:0"}}"#);
+    assert_eq!(status, STATUS_OK, "{address}");
+    let address: SocketAddr = address.parse().expect("bound socket address");
+    assert!(http_get(address, "/metrics").starts_with("HTTP/1.1 200"));
+
+    // SAFETY: `shared` is live and released only below.
+    assert!(unsafe { test_shared_runtime_stop_core_metrics_server(shared) });
+    // Aborting is asynchronous; the relay reports 503 once Core's task is
+    // gone. Until then a scrape may still be served or closed.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let unavailable = loop {
+        let response = try_http_get(address, "/metrics").unwrap_or_default();
+        if response.starts_with("HTTP/1.1 503") {
+            break response;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the endpoint never reported the stopped server: {response:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(
+        unavailable.contains("metrics server stopped"),
+        "{unavailable}"
+    );
+    // The port stays open and keeps answering.
+    assert!(http_get(address, "/metrics").starts_with("HTTP/1.1 503"));
+
+    free_shared(&mut shared);
+    assert!(
+        TcpStream::connect_timeout(&address, Duration::from_secs(1)).is_err(),
+        "the public socket must be closed once Core is destroyed"
+    );
 }
