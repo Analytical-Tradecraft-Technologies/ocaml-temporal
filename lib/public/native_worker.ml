@@ -730,7 +730,9 @@ let terminal_cleanup_once worker =
     supervisor and adapter maps remain alive until the attempt returns. A failed
     thread creation leaves [terminal_cleanup_pending] set; the worker finalizer
     can make another attempt when the value is eventually abandoned. The pending
-    flag is intentionally not cleared after an exception. *)
+    flag is intentionally not cleared after an exception. Returns [false] only
+    when no retry thread exists afterwards (thread creation failed), so a
+    finalizer caller knows it must close supervisor admission itself. *)
 let schedule_terminal_cleanup worker =
   if Atomic.compare_and_set worker.terminal_cleanup_scheduled false true then
     match
@@ -740,8 +742,22 @@ let schedule_terminal_cleanup worker =
           Atomic.set instance.terminal_cleanup_scheduled false)
         worker
     with
-    | _thread -> ()
-    | exception _ -> Atomic.set worker.terminal_cleanup_scheduled false
+    | _thread -> true
+    | exception _ ->
+        Atomic.set worker.terminal_cleanup_scheduled false;
+        false
+  else true
+
+(** Schedules the terminal retry from a finalizer path. Because the
+    supervisor's own finalizer is delegated to the worker (#1044), a failed
+    thread creation must close supervisor admission here; that call never
+    blocks and lets the mailbox owner stop, so the native custom-block
+    finalizer can still reclaim the graph and release a shared-runtime
+    lease. *)
+let schedule_terminal_cleanup_or_close worker =
+  Worker_policy.spawn_or_close_admission
+    ~spawn:(fun () -> schedule_terminal_cleanup worker)
+    ~close_admission:(fun () -> Native.initiate_shutdown worker.supervisor)
 
 (** Releases the native graph on the bounded-shutdown thread and classifies
     the result for {!Bounded_shutdown.run}. [Native.shutdown] always asks the
@@ -760,7 +776,7 @@ let release_native worker =
       Atomic.set worker.terminal_cleanup_pending true;
       report Logs.Error ~operation:"worker_shutdown_failed"
         ~error_kind:"exception" ();
-      schedule_terminal_cleanup worker;
+      ignore (schedule_terminal_cleanup worker);
       raise exception_
   | result -> (
       request_discard worker;
@@ -945,14 +961,24 @@ let shutdown worker =
     the narrow native retry path and keeps adapter maps retained until that path
     returns. If a system thread cannot be created during process teardown, the
     native custom-block finalizer remains the last-resort reclaim mechanism
-    rather than discarding a still-owned lease. *)
+    rather than discarding a still-owned lease; every path that fails to
+    create a thread first closes supervisor admission so the owner Domain
+    stops and that finalizer can run.
+
+    A worker and its supervisor usually become unreachable in the same
+    collection, and [Gc.finalise] then runs both finalizers in no guaranteed
+    order; resurrecting [worker] here does not cancel one already scheduled
+    for the supervisor. [create] therefore delegates the supervisor's
+    abandoned cleanup to this function (#1044), which makes it the only path
+    that closes the native graph of an abandoned worker. *)
 let cleanup_abandoned worker =
   if Atomic.get worker.terminal_cleanup_pending then
-    schedule_terminal_cleanup worker
+    schedule_terminal_cleanup_or_close worker
   else if not (Atomic.get worker.closed) then
-    (* Keep [worker] (and therefore [supervisor]) reachable for the lifetime of
-       the cleanup thread so the supervisor's own finalizer cannot tear the
-       native graph down before drain completes. The thread owns this root. *)
+    (* The thread captures [worker] (and therefore [supervisor]) so both stay
+       alive until the drain-then-shutdown path has returned. Because the
+       supervisor's own finalizer was disabled in [create], nothing else can
+       close the graph while that drain delivers retained completions. *)
     match
       Thread.create
         (fun instance ->
@@ -960,7 +986,7 @@ let cleanup_abandoned worker =
           with _ ->
             Atomic.set instance.closed true;
             Atomic.set instance.terminal_cleanup_pending true;
-            schedule_terminal_cleanup instance)
+            schedule_terminal_cleanup_or_close instance)
         worker
     with
     | _thread -> ()
@@ -968,10 +994,14 @@ let cleanup_abandoned worker =
         (* Cannot spawn a helper. Do not block the finalizer Domain on the
            mailbox owner. Mark closed and request a terminal retry path without
            awaiting drain; residual native reclaim still goes through the
-           runtime custom-block finalizer. *)
+           runtime custom-block finalizer. Closing admission is what the
+           supervisor's own (now delegated) finalizer would have done here,
+           and never blocks; it is done whether or not the retry thread can
+           be created. *)
+        (try Native.initiate_shutdown worker.supervisor with _ -> ());
         Atomic.set worker.closed true;
         Atomic.set worker.terminal_cleanup_pending true;
-        schedule_terminal_cleanup worker
+        ignore (schedule_terminal_cleanup worker)
 
 (** Builds the native graph and both OCaml registries. Every failure after
     [Native.create] enters [cleanup], which joins the supervisor owner Domain
@@ -1100,6 +1130,7 @@ let create ?max_cached_workflows
          resort for abandoned workers: it schedules the same drain-then-native
          teardown so GC of a live [t] cannot leave Core leases without an
          OCaml completion document. *)
+      Native.delegate_abandoned_cleanup worker.supervisor;
       Gc.finalise cleanup_abandoned worker;
       Ok worker
   | Error error -> cleanup error

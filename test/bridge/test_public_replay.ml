@@ -14,6 +14,132 @@ let read_fixture name =
        (name ^ ".pb"))
     In_channel.input_all
 
+(** Just enough of the protobuf wire format to derive deliberately invalid
+    histories from a valid fixture, so each negative case differs from a real
+    server export in exactly one documented way. Fields keep their original
+    bytes and order; only the edited fields change. Test-only: it trusts its
+    input, which is always a checked-in fixture. *)
+module Wire = struct
+  type field = { number : int; wire_type : int; value : string }
+  (** One field. [value] is the field's payload bytes: the encoded varint for
+      wire type 0, the content without its length prefix for wire type 2,
+      and the fixed-width bytes for wire types 1 and 5. *)
+
+  (** Decodes the varint at [index] in [bytes], returning it and the index
+      after it. Values above [max_int] do not occur in the fixtures. *)
+  let read_varint bytes index =
+    let rec loop index shift acc =
+      let byte = Char.code bytes.[index] in
+      let acc = acc lor ((byte land 0x7f) lsl shift) in
+      if byte < 0x80 then (acc, index + 1) else loop (index + 1) (shift + 7) acc
+    in
+    loop index 0 0
+
+  (** Encodes a non-negative integer as a varint. *)
+  let varint value =
+    let buffer = Buffer.create 10 in
+    let rec loop value =
+      if value < 0x80 then Buffer.add_char buffer (Char.chr value)
+      else (
+        Buffer.add_char buffer (Char.chr (value land 0x7f lor 0x80));
+        loop (value lsr 7))
+    in
+    loop value;
+    Buffer.contents buffer
+
+  (** Splits one serialized message into its fields, in wire order. *)
+  let parse bytes =
+    let rec loop index acc =
+      if index >= String.length bytes then List.rev acc
+      else
+        let key, index = read_varint bytes index in
+        let wire_type = key land 7 in
+        let value, next =
+          match wire_type with
+          | 0 ->
+              let _, next = read_varint bytes index in
+              (String.sub bytes index (next - index), next)
+          | 1 -> (String.sub bytes index 8, index + 8)
+          | 2 ->
+              let length, start = read_varint bytes index in
+              (String.sub bytes start length, start + length)
+          | 5 -> (String.sub bytes index 4, index + 4)
+          | _ -> failwith "Wire.parse: unsupported wire type"
+        in
+        loop next ({ number = key lsr 3; wire_type; value } :: acc)
+    in
+    loop 0 []
+
+  (** Serializes fields back into one message. *)
+  let serialize fields =
+    String.concat ""
+      (List.map
+         (fun { number; wire_type; value } ->
+           varint ((number lsl 3) lor wire_type)
+           ^ (if wire_type = 2 then varint (String.length value) else "")
+           ^ value)
+         fields)
+
+  (** Removes every occurrence of field [number]. *)
+  let drop number fields = List.filter (fun field -> field.number <> number) fields
+
+  (** Applies [edit] to the fields of each embedded message [number]. *)
+  let map_message number edit fields =
+    List.map
+      (fun field ->
+        if field.number = number then
+          { field with value = serialize (edit (parse field.value)) }
+        else field)
+      fields
+end
+
+(** [temporal.api.history.v1] field numbers used by the edits below. *)
+module History_fields = struct
+  (** [History.events]. *)
+  let events = 1
+
+  (** [HistoryEvent.event_id]. *)
+  let event_id = 1
+
+  (** [HistoryEvent.event_time]. *)
+  let event_time = 2
+
+  (** [HistoryEvent.workflow_execution_started_event_attributes]. *)
+  let started_attributes = 6
+
+  (** [HistoryEvent.workflow_task_scheduled_event_attributes]. *)
+  let task_scheduled_attributes = 10
+
+  (** [WorkflowExecutionStartedEventAttributes.task_queue]. *)
+  let task_queue = 5
+
+  (** [WorkflowExecutionStartedEventAttributes.workflow_id]. *)
+  let workflow_id = 28
+end
+
+(** Rewrites a serialized History by applying [edit index fields] to every
+    event, where [index] counts events from 0 in history order. *)
+let map_events edit history =
+  let index = ref 0 in
+  Wire.parse history
+  |> List.map (fun (field : Wire.field) ->
+         if field.number <> History_fields.events then field
+         else
+           let event_index = !index in
+           incr index;
+           {
+             field with
+             value = Wire.serialize (edit event_index (Wire.parse field.value));
+           })
+  |> Wire.serialize
+
+(** Rewrites only the start event's attributes. *)
+let map_started_attributes edit =
+  map_events (fun index fields ->
+      if index = 0 then
+        Wire.map_message History_fields.started_attributes edit fields
+      else fields)
+
 (** Builds the history recorded for the live fixture case [name]. *)
 let history name =
   match
@@ -185,13 +311,20 @@ let contains text needle =
     copied verbatim into a log line: line breaks, a tab, a backslash, an
     escape byte, a multi-byte character, and about 60 KB of padding. The
     rendered [failure_message] stays one bounded line while the [mismatch]
-    record keeps the exact ID. *)
+    record keeps the exact ID. The fixture records its real workflow ID, so
+    the ID field is removed first, as in a history from a server older than
+    1.21; replay then uses the supplied ID as given. *)
 let test_hostile_workflow_id () =
   let workflow_id =
     "multi\nline\r\tid\\\027" ^ "\xc3\xa9" ^ String.make 60_000 'w'
   in
+  let unrecorded =
+    map_started_attributes
+      (Wire.drop History_fields.workflow_id)
+      (read_fixture "body")
+  in
   let history =
-    match R.History.of_protobuf ~workflow_id (read_fixture "body") with
+    match R.History.of_protobuf ~workflow_id unrecorded with
     | Ok history -> history
     | Error error -> failwith (Temporal.Error.message error)
   in
@@ -260,6 +393,85 @@ let test_invalid_input () =
   (* A well-formed protobuf with no events fails Core's invariant checks. *)
   expect_invalid "no events" (replay_bytes "no events" "\x12\x00")
 
+(** Requires an [Invalid_history] whose rendered line contains [fragment],
+    so each negative case fails for its documented reason. *)
+let expect_invalid_because label fragment result =
+  expect_invalid label result;
+  match result with
+  | Error failure ->
+      let line = R.failure_message failure in
+      if not (contains line fragment) then
+        failwith (label ^ ": expected " ^ fragment ^ " in " ^ line)
+  | Ok () -> ()
+
+(** Replays [bytes] as the [body] fixture's execution against [definition],
+    which defaults to the compatible code. *)
+let replay_body ?(workflow_id = "task-failure-body")
+    ?(definition = compatible "body") bytes =
+  match R.History.of_protobuf ~workflow_id bytes with
+  | Error error -> failwith (Temporal.Error.message error)
+  | Ok history -> R.replay ~workflows:[ R.workflow definition ] history
+
+(** The supplied workflow ID must match the one the history records
+    (issue #1046): replaying [body] under [encoder]'s ID is rejected before
+    any workflow code runs, while the recorded ID and, for a history that
+    records none, any ID are accepted. *)
+let test_recorded_workflow_id () =
+  let body = read_fixture "body" in
+  expect_invalid_because "other execution's ID"
+    "records a different workflow ID than the one supplied"
+    (replay_body ~workflow_id:"task-failure-encoder" body);
+  expect_invalid_because "forged ID"
+    "records a different workflow ID than the one supplied"
+    (replay_body ~workflow_id:"first\nPASS forged" body);
+  expect_ok "recorded ID" (replay_body body);
+  let unrecorded =
+    map_started_attributes (Wire.drop History_fields.workflow_id) body
+  in
+  expect_ok "unrecorded ID" (replay_body ~workflow_id:"any-execution" unrecorded)
+
+(** Histories that Core accepts structurally but cannot replay are
+    [Invalid_history] promptly, whatever the registered code does
+    (issues #1045 and #1047). Each case also replays against incompatible
+    code: an invalid history must never look like a passing replay. *)
+let test_core_rejected_histories () =
+  let body = read_fixture "body" in
+  let both label fragment bytes =
+    expect_invalid_because label fragment (replay_body bytes);
+    expect_invalid_because (label ^ " (changed code)") fragment
+      (replay_body ~definition:(timer_removed "body") bytes)
+  in
+  (* A scrubber that deletes every eventTime (#1045). *)
+  both "scrubbed timestamps" "WorkflowTaskStarted event without an event time"
+    (map_events (fun _ -> Wire.drop History_fields.event_time) body);
+  (* Event 3 is missing, so later IDs are out of order. *)
+  both "event ID gap" "event IDs are not contiguous from 1"
+    (map_events
+       (fun index fields ->
+         if index < 2 then fields
+         else
+           List.map
+             (fun (field : Wire.field) ->
+               if field.number = History_fields.event_id then
+                 { field with value = Wire.varint (index + 2) }
+               else field)
+             fields)
+       body);
+  (* Core's replay poll would panic on the missing task queue and stall for
+     the 30-second idle bound, ending in [Replay_error] (#1047). *)
+  both "missing task queue" "start event has no task queue"
+    (map_started_attributes (Wire.drop History_fields.task_queue) body);
+  (* Event 2 (WorkflowTaskScheduled) without attributes passes the bridge's
+     checks, but Core cannot apply it inside the first workflow task. Core
+     auto-fails that task itself and evicts the run with reason Unspecified,
+     which must be a refusal rather than housekeeping (#1045). *)
+  both "first task auto-failed by Core" "invalid history: "
+    (map_events
+       (fun index fields ->
+         if index = 1 then Wire.drop History_fields.task_scheduled_attributes fields
+         else fields)
+       body)
+
 (** Registration problems are reported before native resources exist. *)
 let test_registration_errors () =
   expect_replay_error "duplicate"
@@ -314,6 +526,8 @@ let () =
   test_hostile_workflow_id ();
   test_task_failures ();
   test_invalid_input ();
+  test_recorded_workflow_id ();
+  test_core_rejected_histories ();
   test_registration_errors ();
   test_replay_all ();
   test_repeated_cleanup ()

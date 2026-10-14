@@ -26,6 +26,10 @@ end
 type 'output handle = {
   (* Future resolved by Core for the child start and terminal outcome. *)
   future : ('output, Error.t) Future.t;
+  (* Start-stage future: the child's run ID once Core reports the start
+     acknowledgment, or the error that also settles [future] when the child
+     never starts (#1040). *)
+  started : (string, Error.t) Future.t;
   (* Owner-checked operation that emits at most one cancellation command for
      this child and preserves the caller's reason for replay diagnostics. *)
   cancel : reason:string -> (unit, Error.t) result;
@@ -111,7 +115,11 @@ let validate_task_queue = function
     emitted. The future is ready and cancellation returns the same typed
     defect, so invalid lifecycle requests cannot leave hidden state. *)
 let failed_handle error =
-  { future = resolved (Error error); cancel = (fun ~reason:_ -> Error error) }
+  {
+    future = resolved (Error error);
+    started = resolved (Error error);
+    cancel = (fun ~reason:_ -> Error error);
+  }
 
 (** Verifies an optional structured-cancellation scope before encoding and
     again afterward, since application codec code can cancel that scope. A
@@ -150,7 +158,7 @@ let start_handle ?scope ?(cancellation_type = Try_cancel) ?retry_policy
               match Temporal_sdk_kernel.Workflow_context_store.current () with
               | None -> failed_handle (outside_error ())
               | Some context ->
-                  let future, cancel =
+                  let future, started, cancel =
                     Temporal_sdk_kernel.Workflow_context_store.start_child_workflow
                       context ~id ~name:(Workflow.name definition) ~input ?task_queue
                       ?parent_close_policy:(Option.map runtime_parent_close_policy parent_close_policy)
@@ -180,11 +188,16 @@ let start_handle ?scope ?(cancellation_type = Try_cancel) ?retry_policy
                   in
                   {
                     future = Future_private.of_internal future;
+                    started = Future_private.of_internal started;
                     cancel = request_cancel;
                   })
 
 (** Returns the typed future associated with an operation handle. *)
 let future handle = handle.future
+
+(** Returns the start-stage future. It is settled by the same activation jobs
+    as [future], so awaiting it is replay-safe. *)
+let started handle = handle.started
 
 (** Requests cancellation of one child. Repeating the request is idempotent
     for this handle, including a valid late call after natural completion or a

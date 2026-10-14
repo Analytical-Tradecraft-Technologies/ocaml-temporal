@@ -622,17 +622,6 @@ let identifier path value =
     Error (invalid path "identifier must be valid UTF-8")
   else Ok value
 
-(** Validates the run ID carried by a child-workflow failure. Temporal Core
-    reports cancellation while a child start is still in flight with an empty
-    run ID and [started_event_id = 0]; once a child has started, the normal
-    non-empty identifier contract applies. *)
-let child_failure_run_id path ~started_event_id value =
-  let* value = string path value in
-  if String.equal value "" then
-    if Int64.equal started_event_id 0L then Ok value
-    else Error (invalid path "child failure run_id may be empty only before the child starts")
-  else identifier path (`String value)
-
 (** Validates a canonical unsigned 64-bit decimal representation. *)
 let uint64_decimal path value =
   let* value = string path value in
@@ -915,10 +904,13 @@ let failure_info path json =
       in
       let* identity_json = field path "identity" entries in
       let* identity = string (path ^ ".identity") identity_json in
+      (* The type and ID are copies an SDK (possibly another language's)
+         wrote into the failure, not server-bounded identifiers, so they are
+         bounded text like the Rust side (#1050). *)
       let* activity_type_json = field path "activity_type" entries in
-      let* activity_type = identifier (path ^ ".activity_type") activity_type_json in
+      let* activity_type = string (path ^ ".activity_type") activity_type_json in
       let* activity_id_json = field path "activity_id" entries in
-      let* activity_id = identifier (path ^ ".activity_id") activity_id_json in
+      let* activity_id = string (path ^ ".activity_id") activity_id_json in
       let* retry_json = field path "retry_state" entries in
       let* retry_name = string (path ^ ".retry_state") retry_json in
       let* retry_state = retry_state (path ^ ".retry_state") retry_name in
@@ -947,20 +939,22 @@ let failure_info path json =
           ]
           json
       in
+      (* SDK-written copies: the Java SDK reports a child cancelled before its
+         start command with namespace "", and a wrapper may omit the run ID
+         after the start event. They are bounded text, not identifiers
+         (#1050). *)
       let* namespace_json = field path "namespace" entries in
-      let* namespace = identifier (path ^ ".namespace") namespace_json in
+      let* namespace = string (path ^ ".namespace") namespace_json in
       let* workflow_id_json = field path "workflow_id" entries in
-      let* workflow_id = identifier (path ^ ".workflow_id") workflow_id_json in
+      let* workflow_id = string (path ^ ".workflow_id") workflow_id_json in
       let* workflow_type_json = field path "workflow_type" entries in
-      let* workflow_type = identifier (path ^ ".workflow_type") workflow_type_json in
+      let* workflow_type = string (path ^ ".workflow_type") workflow_type_json in
       let* initiated_json = field path "initiated_event_id" entries in
       let* initiated_event_id = nonnegative_int64 (path ^ ".initiated_event_id") initiated_json in
       let* started_json = field path "started_event_id" entries in
       let* started_event_id = nonnegative_int64 (path ^ ".started_event_id") started_json in
       let* run_id_json = field path "run_id" entries in
-      let* run_id =
-        child_failure_run_id (path ^ ".run_id") ~started_event_id run_id_json
-      in
+      let* run_id = string (path ^ ".run_id") run_id_json in
       let* retry_json = field path "retry_state" entries in
       let* retry_name = string (path ^ ".retry_state") retry_json in
       let* retry_state = retry_state (path ^ ".retry_state") retry_name in
@@ -1092,7 +1086,10 @@ let continuation_initiator_string = function
   | Continue_as_new_cron_schedule -> "cron_schedule"
 
 (** Decodes continuation provenance without collapsing optional failure or
-    completion payloads into an absent value. *)
+    completion payloads into an absent value. An empty
+    [continued_from_execution_run_id] is a Temporal Schedule action: a fresh
+    run with no predecessor that still carries the previous action's result or
+    failure (#1015). A non-empty run ID keeps the identifier contract. *)
 let continuation path json =
   let* entries =
     exact_object path
@@ -1106,7 +1103,9 @@ let continuation path json =
   in
   let* run_id_json = field path "continued_from_execution_run_id" entries in
   let* continued_from_execution_run_id =
-    identifier (path ^ ".continued_from_execution_run_id") run_id_json
+    match run_id_json with
+    | `String "" -> Ok ""
+    | _ -> identifier (path ^ ".continued_from_execution_run_id") run_id_json
   in
   let* initiator_json = field path "initiator" entries in
   let* initiator_name = string (path ^ ".initiator") initiator_json in
@@ -1685,6 +1684,26 @@ let workflow_priority path json =
            "fairness weight must be zero or finite in [0.001, 1000]")
     else Ok { priority_key; fairness_key; fairness_weight_bits }
 
+(** Decodes a priority received from Temporal (a workflow's start event or an
+    activity task). The server clamps fairness weights rather than rejecting
+    them and does not police NUL in the fairness key, so the strict
+    [workflow_priority] rules used for commands would reject server-valid
+    values (#1016). Inbound, only what the record must represent is checked,
+    matching the Rust bridge: the 64-byte fairness-key bound. The weight's
+    exact bits and the priority key are carried unchanged. *)
+let inbound_workflow_priority path json =
+  let* entries = exact_object path [ "priority_key"; "fairness_key"; "fairness_weight_bits" ] json in
+  let* key_json = field path "priority_key" entries in
+  let* priority_key = int32 (path ^ ".priority_key") key_json in
+  let* fairness_json = field path "fairness_key" entries in
+  let* fairness_key = string (path ^ ".fairness_key") fairness_json in
+  if String.length fairness_key > 64 then
+    Error (invalid (path ^ ".fairness_key") "fairness key exceeds Core's 64-byte limit")
+  else
+    let* bits_json = field path "fairness_weight_bits" entries in
+    let* fairness_weight_bits = uint32 (path ^ ".fairness_weight_bits") bits_json in
+    Ok { priority_key; fairness_key; fairness_weight_bits }
+
 (** Decodes the canonical unsigned decimal used for an IEEE-754 bit pattern.
     The two limbs keep every intermediate value below [2^64] while avoiding
     machine-sized integers and preserving patterns whose sign bit is set. *)
@@ -1802,6 +1821,58 @@ let retry_policy path json =
           non_retryable_error_types;
         }
 
+(** Decodes the effective retry policy recorded in a workflow's start event.
+    The server skips every retry-policy check when [maximum_attempts] is 1, so
+    a recorded policy can have a coefficient below 1.0, an empty
+    non-retryable type, or a zero interval (the Rust bridge normalizes an
+    absent or negative interval to zero) (#1016). Only what the record must
+    represent is checked here: valid non-negative durations, a canonical
+    coefficient bit pattern, and an attempt count within signed 32-bit range.
+    [Workflow.Info.retry_policy] reports a policy the public type cannot
+    represent as [None]. *)
+let inbound_retry_policy path json =
+  let* entries =
+    exact_object path
+      [
+        "initial_interval";
+        "backoff_coefficient_bits";
+        "maximum_interval";
+        "maximum_attempts";
+        "non_retryable_error_types";
+      ] json
+  in
+  let* initial_json = field path "initial_interval" entries in
+  let* initial_interval = duration (path ^ ".initial_interval") initial_json in
+  let* maximum_json = field path "maximum_interval" entries in
+  let* maximum_interval = duration (path ^ ".maximum_interval") maximum_json in
+  let* coefficient_json = field path "backoff_coefficient_bits" entries in
+  let* backoff_coefficient_bits =
+    uint64_decimal (path ^ ".backoff_coefficient_bits") coefficient_json
+  in
+  let* _bits = uint64_bits (path ^ ".backoff_coefficient_bits") coefficient_json in
+  let* attempts_json = field path "maximum_attempts" entries in
+  let* maximum_attempts = int64 (path ^ ".maximum_attempts") attempts_json in
+  if
+    Int64.compare maximum_attempts 0L < 0
+    || Int64.compare maximum_attempts 2_147_483_647L > 0
+  then
+    Error
+      (invalid (path ^ ".maximum_attempts")
+         "maximum attempts is outside signed 32-bit range")
+  else
+    let* error_types_json = field path "non_retryable_error_types" entries in
+    let* non_retryable_error_types =
+      list (path ^ ".non_retryable_error_types") string error_types_json
+    in
+    Ok
+      {
+        initial_interval;
+        backoff_coefficient_bits;
+        maximum_interval;
+        maximum_attempts = Int64.to_int maximum_attempts;
+        non_retryable_error_types;
+      }
+
 (** Decodes the normal fields attached to a first workflow initialization. *)
 let initialize_context path json =
   let fields =
@@ -1855,9 +1926,11 @@ let initialize_context path json =
   let* root_json = field path "root_workflow" entries in
   let* root_workflow = nullable (path ^ ".root_workflow") workflow_execution root_json in
   let* priority_json = field path "priority" entries in
-  let* priority = nullable (path ^ ".priority") workflow_priority priority_json in
+  let* priority = nullable (path ^ ".priority") inbound_workflow_priority priority_json in
   let* retry_policy_json = field path "retry_policy" entries in
-  let* retry_policy = nullable (path ^ ".retry_policy") retry_policy retry_policy_json in
+  let* retry_policy =
+    nullable (path ^ ".retry_policy") inbound_retry_policy retry_policy_json
+  in
   let* continuation_json = field path "continuation" entries in
   let* continuation = nullable (path ^ ".continuation") continuation continuation_json in
   Ok
@@ -1879,25 +1952,37 @@ let initialize_context path json =
       continuation;
     }
 
-(** Encodes a retry policy and immediately validates its representation by
-    passing the generated object through the same decoder used for input. *)
+(** Builds the JSON object for a retry policy without validating it; the
+    callers below choose the outbound or inbound rule. *)
+let retry_policy_object value =
+  `Assoc
+    [
+      ( "initial_interval",
+        time_json value.initial_interval.seconds value.initial_interval.nanoseconds );
+      ( "backoff_coefficient_bits",
+        `String value.backoff_coefficient_bits );
+      ( "maximum_interval",
+        time_json value.maximum_interval.seconds value.maximum_interval.nanoseconds );
+      ( "maximum_attempts",
+        `Intlit (Int64.to_string (Int64.of_int value.maximum_attempts)) );
+      ( "non_retryable_error_types",
+        `List (List.map (fun value -> `String value) value.non_retryable_error_types) );
+    ]
+
+(** Encodes a command retry policy and immediately validates its
+    representation by passing the generated object through the same strict
+    decoder used for input. *)
 let retry_policy_json value =
-  let json =
-    `Assoc
-      [
-        ( "initial_interval",
-          time_json value.initial_interval.seconds value.initial_interval.nanoseconds );
-        ( "backoff_coefficient_bits",
-          `String value.backoff_coefficient_bits );
-        ( "maximum_interval",
-          time_json value.maximum_interval.seconds value.maximum_interval.nanoseconds );
-        ( "maximum_attempts",
-          `Intlit (Int64.to_string (Int64.of_int value.maximum_attempts)) );
-        ( "non_retryable_error_types",
-          `List (List.map (fun value -> `String value) value.non_retryable_error_types) );
-      ]
-  in
+  let json = retry_policy_object value in
   let* _ = retry_policy "$.retry_policy" json in
+  Ok json
+
+(** Encodes the retry policy recorded in a start event, validated with the
+    inbound rule because the server may have recorded a policy the command
+    rule rejects (#1016). *)
+let inbound_retry_policy_json value =
+  let json = retry_policy_object value in
+  let* _ = inbound_retry_policy "$.context.retry_policy" json in
   Ok json
 
 (** Encodes a first-workflow initialization context. *)
@@ -1928,7 +2013,7 @@ let initialize_context_json value =
   let* retry_policy =
     match value.retry_policy with
     | None -> Ok `Null
-    | Some value -> retry_policy_json value
+    | Some value -> inbound_retry_policy_json value
   in
   let* continuation =
     match value.continuation with
@@ -3266,6 +3351,7 @@ module Internal = struct
   let time_json = time_json
   let workflow_execution = workflow_execution
   let workflow_priority = workflow_priority
+  let inbound_workflow_priority = inbound_workflow_priority
   let failure = failure
   let failure_json = failure_json
   let retry_policy_json = retry_policy_json

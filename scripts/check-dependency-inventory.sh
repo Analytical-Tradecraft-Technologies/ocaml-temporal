@@ -146,7 +146,8 @@ compare 'Linking-exception scope'
 # service, or workflow pulls. Recorded provenance in test fixtures is not a
 # pin and is deliberately excluded. Documented rows put the image in column 1
 # and its digest in column 2 (the builder table's stage sits in column 2).
-for source in "$root/Dockerfile.dev" "$root/Dockerfile.rust-ci" \
+for source in "$root/Dockerfile.dev" "$root"/docker/ocaml-*/Dockerfile \
+  "$root/Dockerfile.rust-ci" \
   "$root/test/integration/temporal/compose.yaml" \
   "$root"/.github/workflows/*.yml "$root"/.github/actions/*/action.yml; do
   [ -f "$source" ] || continue

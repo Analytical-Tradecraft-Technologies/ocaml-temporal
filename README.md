@@ -170,10 +170,11 @@ Two process constraints apply to applications that link the SDK (see
   the rest of the process once any Domain has been spawned. Starting
   subprocesses with `Unix.create_process` or `Unix.open_process*` still works,
   and is the only option on Windows, where `Unix.fork` is unavailable.
-- Build native executables, `-custom` bytecode executables, or Dune
-  `(modes byte)` executables. The Rust bridge is installed only as a static
-  archive, so dynamically loaded bytecode (`ocamlc -linkpkg` without
-  `-custom`) and the toplevel (`#require "temporal-sdk"`) are not supported.
+- Build native executables or bytecode executables. The Rust bridge is
+  installed only as a static archive, so the SDK makes every bytecode link
+  (Dune `(modes byte)`, `ocamlfind ocamlc -linkpkg`) use a custom runtime that
+  embeds it, with or without a project `dune-workspace`. The toplevel
+  (`#require "temporal-sdk"`) and native plugins are not supported.
 
 ### The real Temporal smoke
 

@@ -171,6 +171,17 @@ and bridge, read the [documentation guide](../README.md) first.
   handler must release its continuation without turning teardown into a task
   defect or discarding the chosen terminal command. This does not drain
   unfinished handlers or imply that an accepted update completed.
+- The same holds for user cleanup code that runs while a parked fiber is
+  discontinued (#1021): a `Fun.protect ~finally` block or exception handler
+  that raises, or that calls an SDK operation which raises because the run has
+  ended, and a catch-all that turns the private shutdown exception into a
+  defect. The scheduler keeps exceptions that escape fibers after shutdown
+  apart from activation failures, and the execution logs and drops any
+  task-failing error reported once the run is terminal or evicted. A defect
+  raised while the scheduler was still active still discards the whole batch.
+  A cache-eviction activation is always acknowledged with an empty completion,
+  never one carrying a task failure, because Core rejects it and workflow
+  completions are not retried.
 - The implementation uses typed closures and GADTs, not `Obj.magic` or a
   heterogeneous untyped value store.
 

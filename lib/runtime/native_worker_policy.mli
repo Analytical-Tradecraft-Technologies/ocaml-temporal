@@ -39,3 +39,14 @@ val reentrant_same_domain_shutdown : closed_flag_action * bool
     the loop). The [bool] is the [shutdown_retryable] value to raise so the
     admission failure can be retried from another Domain after the loop exits. *)
 
+
+val spawn_or_close_admission :
+  spawn:(unit -> bool) -> close_admission:(unit -> unit) -> unit
+(** Runs [spawn], which tries to start an abandoned-worker cleanup thread and
+    returns [false] when no thread exists to finish the cleanup. In that case
+    [close_admission] is called, and any exception it raises is contained.
+    The worker delegates its supervisor's own finalizer (#1044), so every
+    finalizer path that fails to spawn must close supervisor admission itself:
+    otherwise the mailbox owner Domain keeps the native graph reachable, the
+    runtime custom-block finalizer can never run, and a shared-runtime lease
+    stays attached. [close_admission] must not block. *)

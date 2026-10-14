@@ -6,8 +6,12 @@ services:
       context: ../../..
       dockerfile: Dockerfile.dev
       args:
-        # A digest-pinned compiler stage name from Dockerfile.dev.
-        OCAML_IMAGE: ${OCAML_IMAGE:-ocaml-5.2}
+        # The digest-pinned ocaml/opam reference that the Makefile and the
+        # live-test scripts resolve from docker/ocaml-<series>/Dockerfile with
+        # scripts/ocaml-image.sh. It is empty only for commands that never
+        # build (logs, config, down); a build without it fails in
+        # Dockerfile.dev rather than using an unpinned image.
+        OCAML_IMAGE: ${OCAML_IMAGE:-}
     working_dir: /workspace
     environment:
       # All worker/driver services extend dev, including isolated Dune trees.
