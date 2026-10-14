@@ -564,12 +564,15 @@ let test_stop_does_not_wait_for_tick () =
   with
   | Error _ -> failwith "watchdog Domain did not start"
   | Ok watchdog ->
-      (* Stop shortly after a tick began, when nearly all of it remains. *)
+      (* Stop shortly after a tick began, when nearly all of it remains:
+         waiting out the tick would take at least about 0.22 s. The bound
+         sits well below that but leaves room for Domain join latency on a
+         loaded CI runner, which reached 0.116 s on macOS. *)
       Thread.delay 0.03;
       let started = Unix.gettimeofday () in
       Watchdog.stop watchdog;
       let elapsed = Unix.gettimeofday () -. started in
-      if elapsed > Watchdog.stop_poll_s +. 0.08 then
+      if elapsed > 0.17 then
         failwith (Printf.sprintf "watchdog stop took %.3fs" elapsed)
 
 (** Runs the watchdog regressions. *)
