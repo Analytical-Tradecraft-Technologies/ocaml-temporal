@@ -171,6 +171,17 @@ and bridge, read the [documentation guide](../README.md) first.
   handler must release its continuation without turning teardown into a task
   defect or discarding the chosen terminal command. This does not drain
   unfinished handlers or imply that an accepted update completed.
+- The same holds for user cleanup code that runs while a parked fiber is
+  discontinued (#1021): a `Fun.protect ~finally` block or exception handler
+  that raises, or that calls an SDK operation which raises because the run has
+  ended, and a catch-all that turns the private shutdown exception into a
+  defect. The scheduler keeps exceptions that escape fibers after shutdown
+  apart from activation failures, and the execution logs and drops any
+  task-failing error reported once the run is terminal or evicted. A defect
+  raised while the scheduler was still active still discards the whole batch.
+  A cache-eviction activation is always acknowledged with an empty completion,
+  never one carrying a task failure, because Core rejects it and workflow
+  completions are not retried.
 - The implementation uses typed closures and GADTs, not `Obj.magic` or a
   heterogeneous untyped value store.
 
@@ -291,6 +302,14 @@ and bridge, read the [documentation guide](../README.md) first.
 ## Core boundary assumptions
 
 - Core and every Cargo dependency are pinned and license-audited.
+- No bridge C stub can raise between taking an unmanaged resource and
+  releasing it. Every stub releases the OCaml runtime lock with
+  `caml_enter_blocking_section_no_pending`, never the plain function, because
+  the plain function runs pending OCaml signal handlers and re-raises their
+  exceptions after the stub has already taken a counted runtime borrow,
+  detached the native pointer, or copied its input to C memory (#1018). A
+  pending handler still runs, at the first OCaml poll point after the stub
+  returns.
 - Rust alone handles Temporal/Core protobuf. Strict JSON activation and
   completion documents cross the language boundary as owned buffers with one
   explicit free path; OCaml copies them into typed values before execution.

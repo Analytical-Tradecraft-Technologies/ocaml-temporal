@@ -816,10 +816,20 @@ let test_invalid_documents () =
       "activation-child-start-invalid-cause";
       "activation-child-terminal-missing-payload";
       "activation-child-terminal-missing-failure-info";
-      "activation-child-failure-empty-run-id-after-start";
-      "activation-child-failure-empty-workflow-id";
       "activation-child-failure-negative-event-id";
       "activation-child-unknown-terminal-kind";
+    ];
+  (* Child-failure wrapper identifiers are SDK-written copies, so an empty
+     workflow ID or a run ID left empty after the start event is text the
+     protocol carries (#1050). *)
+  List.iter
+    (fun name ->
+      match Protocol.decode_activation (fixture [ "valid"; name ^ ".json" ]) with
+      | Ok _ -> ()
+      | Error _ -> failwith (name ^ " was rejected"))
+    [
+      "activation-child-failure-empty-run-id-after-start";
+      "activation-child-failure-empty-workflow-id";
     ];
   List.iter
     (fun name ->

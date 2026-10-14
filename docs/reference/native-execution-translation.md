@@ -112,7 +112,7 @@ its discarded commands into an execution failure. See the
 | --- | --- | --- |
 | `Request_cancel_activity` | `Request_cancel_activity` | The sequence is range-checked. |
 | `Schedule_activity` | `Schedule_activity` | Activity ID, type, task queue, argument payloads, timeout policies, optional retry policy, validated priority/fairness metadata, cancellation policy, and eager-execution flag are validated and copied. Priority weight bits remain single-precision IEEE-754 data rather than passing through a JSON float. Defaults are applied by the workflow context before this boundary; the translator never invents them. |
-| `Start_child_workflow` | `Start_child_workflow` | The sequence, child workflow ID and type, the input argument list (empty for the canonical unit input, otherwise one copied payload), explicit child-cancellation policy, and optional retry policy are retained. Retry intervals and coefficient bits are validated before Core conversion. Namespace is worker-scoped rather than repeated in the OCaml command: Rust injects the already validated worker namespace before sending the command to Core. Task queue, workflow timeouts, close/reuse policies, cron, headers, memo, search attributes, versioning, and priority are not represented by the current OCaml command, so Rust sends their Core defaults and its reverse conversion rejects a non-default Core value instead of silently discarding it. |
+| `Start_child_workflow` | `Start_child_workflow` | The sequence, child workflow ID and type, the input argument list (empty for the canonical unit input, otherwise one copied payload), explicit child-cancellation policy, optional retry policy, optional task queue, and optional parent-close policy (`terminate`, `abandon`, or `request_cancel`) are retained. An explicit task queue is validated as an identifier; an omitted queue or parent-close policy keeps the Core/server default (the parent's queue, and terminate). Retry intervals and coefficient bits are validated before Core conversion. Namespace is worker-scoped rather than repeated in the OCaml command: Rust injects the already validated worker namespace before sending the command to Core. Workflow timeouts, the ID reuse policy, cron, headers, memo, search attributes, versioning, and priority are not represented by the current OCaml command, so Rust sends their Core defaults and its reverse conversion rejects a non-default Core value instead of silently discarding it. |
 | `Cancel_child_workflow` | `Cancel_child_workflow` | The sequence and validated reason are copied into Core's `CancelChildWorkflowExecution` command. The policy from the matching start command determines whether Core reports immediately or waits for cancellation progress. |
 | `Start_timer` | `Start_timer` | Non-negative milliseconds are split into exact seconds and nanoseconds; no floating-point conversion is used. |
 | `Cancel_timer` | `Cancel_timer` | The sequence is range-checked. |
@@ -192,10 +192,14 @@ represented without losing meaning. Programmer defects remain exceptions in
 the underlying execution kernel, while expected Temporal outcomes are typed
 results.
 
-Every payload crossing this boundary is copied. Binary protocol metadata cannot
-be represented by the runtime's string metadata map and therefore returns
-`unsupported` instead of being decoded with replacement characters. Runtime
-metadata is validated as UTF-8 before it becomes protocol bytes. Failure causes
+Every payload crossing this boundary is copied. Payload metadata values are
+arbitrary bytes in Temporal's protocol, and the runtime's string metadata map
+holds them losslessly (an OCaml `string` is a byte string), so inbound
+metadata never fails translation (#1048): a rejection would fail every
+workflow task replaying the same history. Outbound runtime metadata keys are
+validated against the bridge protocol's own key rule (non-empty, valid UTF-8,
+at most 65536 bytes; NUL allowed) before they become protocol bytes; values may be any bytes, so a received payload can be returned
+unchanged. Failure causes
 are traversed with a fixed depth limit so malformed recursive values cannot
 consume unbounded stack or memory.
 

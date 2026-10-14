@@ -341,6 +341,115 @@ fn history_document_rejects_encoding_and_history_errors() {
     ));
 }
 
+/// Wraps `history` in a replay document for `workflow_id` without going
+/// through [`encode_history_document`], which itself validates and would
+/// reject the deliberately invalid histories below before decoding.
+fn raw_history_document(workflow_id: &str, history: &History) -> String {
+    serde_json::json!({
+        "workflow_id": workflow_id,
+        "history": {"encoding": "base64", "data": STANDARD.encode(history.encode_to_vec())},
+    })
+    .to_string()
+}
+
+/// Applies `edit` to the fixture's start-event attributes.
+fn with_started_attributes(
+    edit: impl FnOnce(&mut WorkflowExecutionStartedEventAttributes),
+) -> History {
+    let mut history = complete_history();
+    let Some(history_event::Attributes::WorkflowExecutionStartedEventAttributes(started)) =
+        history.events[0].attributes.as_mut()
+    else {
+        panic!("fixture must begin with a workflow start event");
+    };
+    edit(started);
+    history
+}
+
+/// A recorded workflow ID must equal the supplied one (issue #1046); an
+/// empty recorded ID, as written by servers before 1.21, accepts any ID.
+#[test]
+fn history_document_checks_the_recorded_workflow_id() {
+    let recorded = with_started_attributes(|started| {
+        started.workflow_id = "recorded-id".to_owned();
+    });
+    decode_history_document(&raw_history_document("recorded-id", &recorded))
+        .expect("the recorded workflow ID should be accepted");
+    assert_eq!(
+        decode_history_document(&raw_history_document("other-id", &recorded)).err(),
+        Some(ReplayInputError::WorkflowIdMismatch)
+    );
+    assert_eq!(
+        encode_history_document("other-id", &recorded).err(),
+        Some(ReplayInputError::WorkflowIdMismatch)
+    );
+    decode_history_document(&raw_history_document("any-id", &complete_history()))
+        .expect("a history without a recorded workflow ID accepts any ID");
+}
+
+/// A start event without a task queue is rejected at admission instead of
+/// panicking Core's replay poll inside a Tokio task (issue #1047).
+#[test]
+fn history_document_requires_a_task_queue() {
+    let history = with_started_attributes(|started| started.task_queue = None);
+    assert_eq!(
+        decode_history_document(&raw_history_document("run", &history)).err(),
+        Some(ReplayInputError::MissingTaskQueue)
+    );
+}
+
+/// Event-ID gaps and a timestamp-free `WorkflowTaskStarted` pass Core's
+/// structural gate but are fatal inside Core's first workflow task, so the
+/// bridge rejects them before Core can auto-fail the task (issue #1045).
+#[test]
+fn history_document_rejects_core_fatal_event_shapes() {
+    let mut gap = complete_history();
+    for event in gap.events.iter_mut().skip(2) {
+        event.event_id += 1;
+    }
+    assert_eq!(
+        decode_history_document(&raw_history_document("run", &gap)).err(),
+        Some(ReplayInputError::NonContiguousEventIds)
+    );
+
+    let mut not_from_one = complete_history();
+    for event in &mut not_from_one.events {
+        event.event_id += 10;
+    }
+    assert_eq!(
+        decode_history_document(&raw_history_document("run", &not_from_one)).err(),
+        Some(ReplayInputError::NonContiguousEventIds)
+    );
+
+    let mut scrubbed = complete_history();
+    for event in &mut scrubbed.events {
+        event.event_time = None;
+    }
+    assert_eq!(
+        decode_history_document(&raw_history_document("run", &scrubbed)).err(),
+        Some(ReplayInputError::MissingWorkflowTaskTimestamp)
+    );
+}
+
+/// The ABI message for each category a caller can act on is distinct and
+/// static, while malformed input keeps the shared generic sentence.
+#[test]
+fn replay_input_errors_have_static_abi_messages() {
+    let actionable = [
+        ReplayInputError::WorkflowIdMismatch,
+        ReplayInputError::MissingTaskQueue,
+        ReplayInputError::NonContiguousEventIds,
+        ReplayInputError::MissingWorkflowTaskTimestamp,
+    ];
+    let generic = ReplayInputError::InvalidProtobuf.abi_message();
+    let mut seen = std::collections::HashSet::new();
+    for error in actionable {
+        assert_ne!(error.abi_message(), generic);
+        assert!(seen.insert(error.abi_message()));
+    }
+    assert_eq!(ReplayInputError::InvalidDocument.abi_message(), generic);
+}
+
 /// Core can construct and shut down a workflow-only replay worker with no
 /// network client, proving feeder and lane ownership are self-contained.
 #[test]

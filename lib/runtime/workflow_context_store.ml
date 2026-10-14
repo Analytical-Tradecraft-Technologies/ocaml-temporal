@@ -100,9 +100,13 @@ type child_workflow_resolution =
     mistaken for completion and gives duplicate acknowledgments a typed error.
     [cancellation_requested] is the same cell the public handle's [cancel]
     closure sets; sharing it lets the resolver accept Core's cancelled
-    resolution for a child that never reported a start acknowledgment. *)
+    resolution for a child that never reported a start acknowledgment.
+    [resolve_started] settles the handle's start-stage future exactly once:
+    with the run ID on acknowledgment, or with the same error as the result
+    future when the child never starts (#1040). *)
 type child_workflow_state = {
   resolve : child_workflow_resolution;
+  resolve_started : (string, Temporal_base.Error.t) result -> unit;
   mutable start_run_id : string option;
   cancellation_requested : bool ref;
 }
@@ -580,22 +584,33 @@ let with_randomness_disabled context action =
 
 (** Buffers a search-attribute merge without consulting wall-clock or process
     state. The payload list is copied at the public boundary before this
-    command is retained by the execution context. *)
+    command is retained by the execution context.
+
+    An empty list buffers nothing (#1033). Temporal Server rejects an upsert
+    command whose indexed fields are empty with [BAD_SEARCH_ATTRIBUTES], and
+    replay would emit the same command again, so every retry of the workflow
+    task would fail. Skipping it is replay-safe because a rejected command is
+    never recorded in history, and an empty merge has no observable effect.
+    The sealed check still runs first, so use after the execution ended stays
+    a programmer error whether or not the list is empty. *)
 let upsert_search_attributes context search_attributes =
   if context.sealed then
     invalid_arg
       "Temporal workflow search attributes used after workflow execution ended";
-  let copied =
-    List.map
-      (fun (key, { Temporal_base.Payload.metadata; data }) ->
-        (snapshot_identifier key,
-         { Temporal_base.Payload.metadata = List.map Fun.id metadata;
-           data = Bytes.copy data }))
-      search_attributes
-  in
-  context.commands_rev <-
-    Activation.Upsert_search_attributes { search_attributes = copied }
-    :: context.commands_rev
+  match search_attributes with
+  | [] -> ()
+  | _ :: _ ->
+      let copied =
+        List.map
+          (fun (key, { Temporal_base.Payload.metadata; data }) ->
+            (snapshot_identifier key,
+             { Temporal_base.Payload.metadata = List.map Fun.id metadata;
+               data = Bytes.copy data }))
+          search_attributes
+      in
+      context.commands_rev <-
+        Activation.Upsert_search_attributes { search_attributes = copied }
+        :: context.commands_rev
 
 (** Makes [context] current on the calling thread while [action] runs, then
     restores the previous value even if [action] raises. This prevents later
@@ -890,7 +905,9 @@ let schedule_local_activity context ~name ~input ?activity_id
 (** Saves a child resolver before emitting its command. The explicit [id] is
     application-owned durable identity; an optional retry policy is copied
     into the command for Core's durable retry state machine; the private [seq]
-    only correlates Core completion jobs with this in-memory execution. *)
+    only correlates Core completion jobs with this in-memory execution. Both
+    returned futures are allocated before the command so the start stage and
+    the result share the sequence's lifetime. *)
 let start_child_workflow context ~id ~name ~input
     ?retry_policy ?task_queue ?parent_close_policy ?(cancellation_type = Activation.Child_try_cancel) ~decode () =
   let seq = allocate_sequence context in
@@ -907,8 +924,12 @@ let start_child_workflow context ~id ~name ~input
      defect. *)
   let terminal = ref false in
   let future, resolve = Scheduler.promise context.scheduler ~outside_error in
+  let started, resolve_started =
+    Scheduler.promise context.scheduler ~outside_error
+  in
   Hashtbl.add context.child_workflows seq
     {
+      resolve_started;
       resolve =
         (fun result ->
           terminal := true;
@@ -967,7 +988,7 @@ let start_child_workflow context ~id ~name ~input
           (Temporal_base.Error.defect
              ~message:"child workflow cancellation used outside its workflow")
   in
-  (future, cancel)
+  (future, started, cancel)
 
 (** Starts a timer whose future completes with [()] because a timer firing has
     no result payload. *)
@@ -1114,8 +1135,9 @@ let resolve_local_activity_backoff context ~seq ~attempt ~backoff_milliseconds
       Scheduler.spawn context.scheduler start_timer;
       Ok ()
 
-(** Records the start acknowledgment or removes the child resolver on a start
-    failure. Once a run ID is recorded, every later start result is rejected so
+(** Records the start acknowledgment, settling the start-stage future with the
+    run ID, or removes the child resolver on a start failure, settling both
+    futures with the failure. Once a run ID is recorded, every later start result is rejected so
     a conflicting acknowledgment cannot complete or discard the child future. *)
 let resolve_child_workflow_start context ~seq result =
   match Hashtbl.find_opt context.child_workflows seq with
@@ -1136,9 +1158,11 @@ let resolve_child_workflow_start context ~seq result =
             Error (bridge_error "child workflow start returned an empty run ID")
           else (
             state.start_run_id <- Some run_id;
+            state.resolve_started (Ok run_id);
             Ok ())
       | _, Error error ->
           Hashtbl.remove context.child_workflows seq;
+          state.resolve_started (Error error);
           state.resolve (Error error);
           Ok ())
 
@@ -1169,6 +1193,11 @@ let resolve_child_workflow context ~seq result =
       match state.start_run_id with
       | None when cancelled_before_start ->
           Hashtbl.remove context.child_workflows seq;
+          (* The child never started, so its start stage settles with the
+             same cancellation error as the result. *)
+          (match result with
+          | Error error -> state.resolve_started (Error error)
+          | Ok _ -> ());
           state.resolve result;
           Ok ()
       | None ->

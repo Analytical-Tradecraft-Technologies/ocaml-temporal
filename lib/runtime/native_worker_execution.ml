@@ -351,30 +351,18 @@ let failure_of_error (error : error_view) : Protocol.failure =
           };
     }
 
-(** Converts one protocol payload into the runtime payload representation. The
-    runtime stores metadata as strings, so binary metadata is rejected rather
-    than decoded with replacement characters. Both metadata and body bytes are
-    copied before a workflow execution can retain them. *)
-let runtime_payload path (payload : Protocol.payload) =
-  (* Validate metadata in input order while accumulating it backwards; the
-     final reversal restores the protocol's declared ordering without a
-     quadratic append. *)
-  let rec metadata_loop reversed = function
-    | [] -> Ok (List.rev reversed)
-    | (key, bytes) :: rest ->
-        if String.length key = 0 || String.contains key '\000' then
-          Error
-            (make_error ~path:(path ^ ".metadata") "invalid_message"
-               "metadata key must be non-empty and must not contain NUL")
-        else
-          let value = Bytes.to_string bytes in
-          if not (Codec.valid_utf_8 value) then
-            Error
-              (make_error ~path:(path ^ ".metadata." ^ key) "unsupported"
-                 "binary metadata cannot be represented by the runtime")
-          else metadata_loop ((key, value) :: reversed) rest
+(** Converts one protocol payload into the runtime payload representation.
+    Metadata values are arbitrary bytes in Temporal's protocol and an OCaml
+    [string] holds bytes, so values and keys are carried losslessly rather
+    than rejected (#1048): the input is replayed from immutable history, so a
+    rejection would fail every workflow task of the run. Both metadata and
+    body bytes are copied before a workflow execution can retain them. *)
+let runtime_payload _path (payload : Protocol.payload) =
+  let metadata =
+    List.map
+      (fun (key, bytes) -> (key, Bytes.to_string bytes))
+      payload.metadata
   in
-  let* metadata = metadata_loop [] payload.metadata in
   Ok
     {
       Temporal_base.Payload.metadata;

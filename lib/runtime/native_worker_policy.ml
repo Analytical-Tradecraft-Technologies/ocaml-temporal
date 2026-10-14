@@ -58,3 +58,9 @@ type closed_flag_action =
     perform the real drain-then-native-shutdown once the loop exits. *)
 let reentrant_same_domain_shutdown : closed_flag_action * bool =
   (Leave_unchanged, true)
+
+(** See the interface: [close_admission] runs only when [spawn] reports that no
+    cleanup thread exists, and its exceptions are contained because this runs
+    on the garbage-collector finalizer path. *)
+let spawn_or_close_admission ~spawn ~close_admission =
+  if not (spawn ()) then try close_admission () with _ -> ()

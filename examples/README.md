@@ -144,12 +144,27 @@ replayed 1 history: 1 passed, 0 failed
 ```
 
 Pass several files to check several executions in one run. Each file uses the
-most recent `--workflow-id` before it, because the History protobuf does not
-record the workflow ID:
+most recent `--workflow-id` before it:
 
 ```sh
 replay_history.exe --workflow-id order-1 order-1.pb \
   --workflow-id order-2 order-2.pb
+```
+
+The workflow is replayed under that ID, so it must be the execution's own ID.
+Histories from Temporal Server 1.21 or later record the ID in their start
+event, and a history whose recorded ID differs from `--workflow-id` fails with
+exit status 3 instead of replaying under the wrong identity; for example,
+`--workflow-id order-1 order-1.pb order-2.pb` rejects `order-2.pb`. Older
+histories do not record the ID, and then `--workflow-id` is used as given.
+
+A `FILE` of `-` reads the history from standard input, and pipes, process
+substitution and `/dev/stdin` work like regular files, so an exported history
+can be streamed in without a temporary file (use `./-` for a file literally
+named `-`):
+
+```sh
+cat order-1.pb | replay_history.exe --workflow-id order-1 -
 ```
 
 Every history is replayed and printed, as `PASS FILE workflow_id=ID` or
@@ -169,7 +184,7 @@ command-line order:
 | 0 | Every history replayed cleanly. |
 | 1 | Nondeterminism: the code produces different commands from the recorded history, for example a removed timer. Do not deploy it without a [patch marker](../docs/guides/workflows.md#introduce-a-new-branch-with-a-patch-marker). |
 | 2 | Workflow task failed: the workflow raised, returned a defect, could not decode its input, or its type is not registered. |
-| 3 | Invalid history: the file is empty, too large, or not a binary `History` protobuf. |
+| 3 | Invalid history: the file is empty, too large, or not a binary `History` protobuf; it records a different workflow ID than `--workflow-id`; or Temporal Core rejects its events (for example a start event without a task queue, missing event IDs, or `WorkflowTaskStarted` events stripped of their `eventTime`). |
 | 4 | Unsupported history: the history uses a feature this SDK cannot replay yet. |
 | 5 | The replay could not run (an invalid registration list or an SDK runtime failure); the verdict is unknown. |
 | 64 | Usage error. |
@@ -192,17 +207,20 @@ temporal workflow show --namespace my-namespace \
 
 The conversion needs a protobuf library and the Temporal API definitions
 (MIT-licensed, from `https://github.com/temporalio/api`). With `protoc` and
-Python's `protobuf` package:
+Python's `protobuf` package, the script below writes `order-1.pb` from one or
+more JSON files:
 
 ```sh
 git clone --depth 1 https://github.com/temporalio/api.git temporal-api
 protoc -I temporal-api --include_imports --descriptor_set_out=history.desc \
   temporal-api/temporal/api/history/v1/message.proto
-python3 - history.desc order-1.json order-1.pb <<'EOF'
+python3 - history.desc order-1.pb order-1.json <<'EOF'
+import json
+import re
 import sys
-from google.protobuf import descriptor_pb2, descriptor_pool, json_format, message_factory
+from google.protobuf import descriptor, descriptor_pb2, descriptor_pool, json_format, message_factory
 
-descriptor_path, json_path, protobuf_path = sys.argv[1:]
+descriptor_path, protobuf_path, *json_paths = sys.argv[1:]
 files = descriptor_pb2.FileDescriptorSet()
 with open(descriptor_path, "rb") as source:
     files.ParseFromString(source.read())
@@ -211,21 +229,79 @@ for file in files.file:
     pool.Add(file)
 History = message_factory.GetMessageClass(
     pool.FindMessageTypeByName("temporal.api.history.v1.History"))
-with open(json_path) as source:
-    history = json_format.Parse(source.read(), History())
+
+
+def enum_name(value, enum):
+    """Maps a legacy PascalCase name such as "WorkflowExecutionStarted" to the
+    proto name "EVENT_TYPE_WORKFLOW_EXECUTION_STARTED"; other values are kept."""
+    if not isinstance(value, str) or value in enum.values_by_name:
+        return value
+    prefix = enum.values_by_number[0].name.removesuffix("UNSPECIFIED")
+    snake = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", value).upper()
+    return prefix + snake if prefix + snake in enum.values_by_name else value
+
+
+def normalize(value, message):
+    """Rewrites enum names throughout one JSON object of type `message`."""
+    if not isinstance(value, dict):
+        return value
+    for field in message.fields:
+        for key in {field.json_name, field.name} & value.keys():
+            value[key] = normalize_field(value[key], field)
+    return value
+
+
+def normalize_field(value, field):
+    if field.type == descriptor.FieldDescriptor.TYPE_ENUM:
+        if isinstance(value, list):
+            return [enum_name(item, field.enum_type) for item in value]
+        return enum_name(value, field.enum_type)
+    if field.type != descriptor.FieldDescriptor.TYPE_MESSAGE:
+        return value
+    if field.message_type.GetOptions().map_entry:
+        entry = field.message_type.fields_by_name["value"]
+        return {key: normalize_field(item, entry) for key, item in value.items()}
+    if isinstance(value, list):
+        return [normalize(item, field.message_type) for item in value]
+    return normalize(value, field.message_type)
+
+
+# Each JSON file is the whole history or one page of it; the events of every
+# page are appended in the order the files are given.
+history = History()
+for json_path in json_paths:
+    with open(json_path) as source:
+        page = normalize(json.load(source), History.DESCRIPTOR)
+    history.MergeFrom(json_format.ParseDict(page, History(), ignore_unknown_fields=True))
 with open(protobuf_path, "wb") as target:
     target.write(history.SerializeToString())
 EOF
 ```
 
-Any other protobuf JSON-to-binary converter with the same message definitions
-works too. Programs that already call the `GetWorkflowExecutionHistory` gRPC
-API receive the binary form directly. The export needs read access to the
-namespace; replaying the exported file does not.
+The script accepts the CLI's output unchanged. It also accepts the older
+JSON shape written by the legacy Web UI and `tctl`, whose enum values are
+PascalCase names such as `"WorkflowExecutionStarted"` (plain
+`json_format.Parse` rejects them as invalid enum values), and it ignores
+fields that the API definitions do not know. Any other protobuf JSON-to-binary
+converter with the same message definitions and the same handling works too.
+
+The replay must see the **complete** history. The CLI fetches every page
+itself. A program that calls the `GetWorkflowExecutionHistory` gRPC API
+receives the binary form directly, but each response holds only one page:
+keep requesting with the returned `next_page_token` until it is empty, then
+concatenate the serialized `history` of every response in order (serialized
+`History` messages concatenate into one valid `History`), or pass every JSON
+page to the script above. A history cut off after the first page passes
+replay's input checks and can report `PASS` while checking only the tasks in
+that page. The export needs read access to the namespace; replaying the
+exported file does not.
 
 Exported histories contain workflow inputs, results and signal payloads.
 Treat them as production data, and prefer synthetic or scrubbed executions for
-histories committed to a repository.
+histories committed to a repository. Scrub payload contents only: keep every
+event, its `eventId`, and its `eventTime`, which Temporal Core needs to replay
+the history. A scrubber that deletes `eventTime` makes the history invalid
+(exit status 3).
 
 ### Run it in CI
 

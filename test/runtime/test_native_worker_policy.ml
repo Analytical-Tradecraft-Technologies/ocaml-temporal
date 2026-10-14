@@ -102,8 +102,23 @@ let test_reentrant_same_domain_shutdown_preserves_closed () =
        concurrent shutdown; the run loop would never exit and deadlock the \
        waiting caller"
 
+(** Every abandoned-worker finalizer path that cannot create its cleanup
+    thread must close supervisor admission, because the supervisor's own
+    finalizer is delegated to the worker (#1044). A successful spawn must not
+    close admission, and an exception from closing is contained. *)
+let test_spawn_failure_closes_admission () =
+  let closes = ref 0 in
+  let close_admission () = incr closes in
+  Policy.spawn_or_close_admission ~spawn:(fun () -> true) ~close_admission;
+  if !closes <> 0 then failwith "a spawned cleanup thread also closed admission";
+  Policy.spawn_or_close_admission ~spawn:(fun () -> false) ~close_admission;
+  if !closes <> 1 then failwith "a failed spawn did not close admission";
+  Policy.spawn_or_close_admission ~spawn:(fun () -> false)
+    ~close_admission:(fun () -> failwith "close raised")
+
 (** Runs all pure policy regressions. *)
 let () =
   test_activity_completion_policy ();
   test_async_operation_policy ();
-  test_reentrant_same_domain_shutdown_preserves_closed ()
+  test_reentrant_same_domain_shutdown_preserves_closed ();
+  test_spawn_failure_closes_admission ()

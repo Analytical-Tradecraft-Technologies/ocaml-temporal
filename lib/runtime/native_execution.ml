@@ -86,10 +86,6 @@ let make_error code path message : error = { code; path; message }
     peer. The protocol validator supplies the same code for JSON failures. *)
 let invalid path message = make_error "invalid_message" path message
 
-(** Errors caused by a value that is valid in one layer but has no exact
-    representation in the other layer. *)
-let unsupported path message = make_error "unsupported" path message
-
 (** Converts the protocol module's privacy-safe diagnostic without exposing any
     of its internal error representation. *)
 let protocol_error error =
@@ -117,6 +113,20 @@ let validate_identifier path value : (unit, error) result =
     Error (invalid path "identifier exceeds 65536 bytes")
   else if not (Temporal_base.Codec.valid_utf_8 value) then
     Error (invalid path "identifier must be valid UTF-8")
+  else Ok ()
+
+(** Validates an outbound payload metadata key against the bridge protocol's
+    own rule: non-empty, valid UTF-8 and at most 65536 bytes. Unlike a
+    Temporal identifier, a key may contain NUL, because the inbound
+    conversion carries keys written by other SDKs unchanged (#1048) and such
+    a payload must be returnable, heartbeated or reused without rejection. *)
+let validate_metadata_key path value : (unit, error) result =
+  if String.length value = 0 then
+    Error (invalid path "metadata key must not be empty")
+  else if String.length value > 65_536 then
+    Error (invalid path "metadata key exceeds 65536 bytes")
+  else if not (Temporal_base.Codec.valid_utf_8 value) then
+    Error (invalid path "metadata key must be valid UTF-8")
   else Ok ()
 
 (** Validates a bounded text field whose empty value is meaningful.  Signal
@@ -241,40 +251,33 @@ let copy_initialize_context (value : Protocol.initialize_context) =
       continuation = Option.map copy_continuation value.continuation;
     }
 
-(** Converts one protocol payload into the runtime payload type. Runtime codecs
-    intentionally expose metadata values as strings; a binary metadata value
-    therefore cannot be represented losslessly and is reported as an explicit
-    unsupported boundary instead of being silently decoded with a replacement
-    character. *)
-let runtime_payload path (value : Protocol.payload) =
-  let rec metadata_loop reversed = function
-    | [] -> Ok (List.rev reversed)
-    | (key, bytes) :: rest ->
-        let* () = validate_identifier (path ^ ".metadata.key") key in
-        let value = Bytes.to_string bytes in
-        if not (Temporal_base.Codec.valid_utf_8 value) then
-          Error
-            (unsupported
-               (path ^ ".metadata." ^ key)
-               "binary metadata is not representable by the runtime string \
-                metadata type")
-        else metadata_loop ((key, value) :: reversed) rest
+(** Converts one protocol payload into the runtime payload type.
+
+    Temporal payload metadata values are arbitrary bytes, and an OCaml
+    [string] is a byte string, so every value is carried losslessly (#1048).
+    Keys are copied as the protocol decoder accepted them: it has already
+    bounded their length, and a key written by another SDK may legitimately
+    contain bytes the outbound identifier rule forbids. Rejecting such a
+    payload here would fail every workflow task of the run, because the same
+    immutable history is replayed on each retry, so inbound conversion never
+    fails. *)
+let runtime_payload _path (value : Protocol.payload) =
+  let metadata =
+    List.map (fun (key, bytes) -> (key, Bytes.to_string bytes)) value.metadata
   in
-  let* metadata = metadata_loop [] value.metadata in
   Ok { Temporal_base.Payload.metadata; data = Bytes.copy value.data }
 
 (** Converts a runtime payload back to the protocol's binary-safe payload.
     Copying both metadata bytes and the body makes ownership independent of the
-    mutable [bytes] values held by workflow code. *)
+    mutable [bytes] values held by workflow code. Keys keep the strict
+    identifier rule for values the SDK sends; values may be any bytes, so a
+    payload received from Temporal can be returned or forwarded unchanged. *)
 let protocol_payload path (value : Temporal_base.Codec.payload) =
   let rec metadata_loop reversed = function
     | [] -> Ok (List.rev reversed)
     | (key, text) :: rest ->
-        let* () = validate_identifier (path ^ ".metadata.key") key in
-        if not (Temporal_base.Codec.valid_utf_8 text) then
-          Error
-            (invalid (path ^ ".metadata." ^ key) "metadata must be valid UTF-8")
-        else metadata_loop ((key, Bytes.of_string text) :: reversed) rest
+        let* () = validate_metadata_key (path ^ ".metadata.key") key in
+        metadata_loop ((key, Bytes.of_string text) :: reversed) rest
   in
   let* metadata = metadata_loop [] value.metadata in
   Ok { Protocol.metadata; data = Bytes.copy value.data }
@@ -1412,15 +1415,23 @@ let activate_translated execution (translated : translated_activation) =
                        context.retry_policy);
                  (* Only provenance is retained: the predecessor's failure and
                     completion payloads are not part of the public run info,
-                    so their mutable payload bytes are never shared here. *)
+                    so their mutable payload bytes are never shared here. A
+                    Temporal Schedule action carries the previous action's
+                    result or failure with an empty run ID (#1015); it has no
+                    predecessor run, so it is stored as [None] to keep the
+                    store's "[None] for a first run" invariant. *)
                  continued_from =
                    Option.bind context
                      (fun (context : Protocol.initialize_context) ->
-                       Option.map
+                       Option.bind context.continuation
                          (fun (continuation : Protocol.continuation) ->
-                           ( continuation.continued_from_execution_run_id,
-                             continuation.initiator ))
-                         context.continuation);
+                           if String.equal
+                                continuation.continued_from_execution_run_id ""
+                           then None
+                           else
+                             Some
+                               ( continuation.continued_from_execution_run_id,
+                                 continuation.initiator )));
                });
         Ok ()
   in
@@ -1473,9 +1484,19 @@ let activate_translated execution (translated : translated_activation) =
      before the query and eviction checks below, in the same order as before
      the encoded bytes were retained. *)
   let* checked =
-    match Execution.task_failure execution with
-    | None -> encoded_completion_of_commands ~run_id:translated.run_id commands
-    | Some error ->
+    match (translated.cache_removal, Execution.task_failure execution) with
+    | None, None ->
+        encoded_completion_of_commands ~run_id:translated.run_id commands
+    | Some _, _ ->
+        (* A pure cache eviction is always acknowledged with an empty
+           completion: Core rejects anything else, and because workflow
+           completions are not retried, a failure here would stop the worker
+           with the eviction lease outstanding (#1021). The execution already
+           drops errors raised while evicted fibers unwind; ignoring
+           [task_failure] here keeps that rule even for a failure recorded
+           earlier, and the commands check below rejects anything else. *)
+        encoded_completion_of_commands ~run_id:translated.run_id commands
+    | None, Some error ->
         let* failure = protocol_failure "$.task_failure" error in
         let completion = Protocol.{
           run_id = translated.run_id; commands = []; task_failure = Some failure

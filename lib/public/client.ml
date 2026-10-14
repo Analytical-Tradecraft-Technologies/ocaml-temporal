@@ -128,6 +128,24 @@ let validate_name field value =
     Error (Error.defect ~message:(field ^ " must not contain NUL"))
   else Ok ()
 
+(** Validates optional free text, such as an operator reason or a visibility
+    query, before it enters a backend request. Unlike {!validate_name}, the
+    empty string is allowed. The bounds are the ones the native JSON encoder
+    enforces on the owner Domain: there, invalid UTF-8 surfaced only as a
+    retryable [Bridge] protocol error while [mock://] accepted the same text
+    (#1014). Checking here makes both backends return the same
+    non-retryable defect, since such input can never succeed on retry. *)
+let validate_text field value =
+  if String.length value > 65_536 then
+    Error
+      (Error.defect
+         ~message:(field ^ " exceeds the protocol safety limit"))
+  else if String.contains value '\000' then
+    Error (Error.defect ~message:(field ^ " must not contain NUL"))
+  else if not (Temporal_base.Codec.valid_utf_8 value) then
+    Error (Error.defect ~message:(field ^ " must be valid UTF-8"))
+  else Ok ()
+
 (** Builds the private backend configuration after checking every user-facing
     connection field. Routine configuration failures remain [result] values.
     An omitted identity is derived once here as [<pid>@<hostname>]; this runs
@@ -560,7 +578,8 @@ let wait (handle : ('input, 'output) handle) =
 
 (** Validates cancellation metadata before it reaches the backend. The length
     limit protects the JSON bridge and matches the Rust-side bound; NUL is
-    rejected because it cannot be represented safely by the C ABI contract. *)
+    rejected because it cannot be represented safely by the C ABI contract,
+    and invalid UTF-8 because the JSON request encoder cannot carry it. *)
 let validate_cancel_fields ~request_id ~reason =
   let request_result =
     match request_id with
@@ -569,13 +588,7 @@ let validate_cancel_fields ~request_id ~reason =
   in
   match request_result with
   | Error _ as error -> error
-  | Ok () when String.length reason > 65_536 ->
-      Error
-        (Error.defect
-           ~message:"cancellation reason exceeds the protocol safety limit")
-  | Ok () when String.contains reason '\000' ->
-      Error (Error.defect ~message:"cancellation reason must not contain NUL")
-  | Ok () -> Ok ()
+  | Ok () -> validate_text "cancellation reason" reason
 
 (** Validates signal metadata before encoding input or entering the backend.
     Signal names are validated when their definitions are built; the request
@@ -632,14 +645,7 @@ let cancel ?request_id ?(reason = "") ?rpc_timeout
 
 (** Validates operator reason text before it crosses either the deterministic
     mock or native JSON bridge. *)
-let validate_terminate_reason reason =
-  if String.length reason > 65_536 then
-    Error
-      (Error.defect
-         ~message:"termination reason exceeds the protocol safety limit")
-  else if String.contains reason '\000' then
-    Error (Error.defect ~message:"termination reason must not contain NUL")
-  else Ok ()
+let validate_terminate_reason reason = validate_text "termination reason" reason
 
 (** Terminates the run [handle] addresses. The acknowledgement is deliberately separate
     from [wait], which observes the server's terminal history event. *)
@@ -678,12 +684,7 @@ let validate_reset_fields ~request_id ~reason ~workflow_task_finish_event_id =
       Error
         (Error.defect
            ~message:"reset workflow-task finish event ID must be greater than 1")
-  | Ok () when String.length reason > 65_536 ->
-      Error
-        (Error.defect ~message:"reset reason exceeds the protocol safety limit")
-  | Ok () when String.contains reason '\000' ->
-      Error (Error.defect ~message:"reset reason must not contain NUL")
-  | Ok () -> Ok ()
+  | Ok () -> validate_text "reset reason" reason
 
 (** Allocates a fresh request ID for a reset whose caller did not supply one.
     Resetting the same run at the same event again is a legitimate operator
@@ -820,13 +821,9 @@ let list_visibility ?(page_size = 100) ?page_token ?rpc_timeout client ~query
       (Error.defect
          ~message:"visibility page_size must be between 1 and 1000")
   else
-    if String.length query > 65_536 then
-      Error
-        (Error.defect
-           ~message:"visibility query exceeds the protocol safety limit")
-    else if String.contains query '\000' then
-      Error (Error.defect ~message:"visibility query must not contain NUL")
-    else (
+    match validate_text "visibility query" query with
+    | Error _ as error -> error
+    | Ok () -> (
         match page_token with
         | Some token when String.equal token "" ->
             Error

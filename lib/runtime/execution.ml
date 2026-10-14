@@ -311,15 +311,38 @@ let is_task_failure error =
   | `Bridge | `Codec | `Defect -> true
   | _ -> false
 
+(** Logs, and forgets, exceptions that escaped cleanup code of fibers the
+    scheduler discontinued after it was shut down. The terminal command or
+    eviction that started the teardown has already been chosen and cannot be
+    retried, so these are diagnostics, never task failures (#1021). Only the
+    count is logged: exception text can carry workflow data. *)
+let report_teardown_failures execution =
+  match Scheduler.take_teardown_failures execution.scheduler with
+  | [] -> ()
+  | failures ->
+      report ~src:Observability.Source.workflow Logs.Warning
+        ~tags:
+          (Observability.tags ~operation:"workflow_teardown_cleanup_failed"
+             ~workflow_type:(workflow_type execution)
+             ~error_kind:"exception" ())
+        (Printf.sprintf
+           "%d workflow cleanup handler(s) raised while parked fibers were \
+            released; the run's terminal command or eviction is unaffected"
+           (List.length failures))
+
 (** Discards the entire unsafe command batch and closes this cache generation.
-    The adapter retains the failed completion separately until acknowledged. *)
-let fail_task execution error =
+    The adapter retains the failed completion separately until acknowledged.
+    This unconditional form is for failures that belong to the activation
+    itself: a fiber that raised while the scheduler was still active, or an
+    invalid terminal batch. Workflow fibers report through {!fail_task}. *)
+let poison_task execution error =
   if Option.is_none execution.task_failure then begin
     execution.task_failure <- Some error;
     execution.terminal <- true;
     clear_pending_updates execution;
     (try Workflow_context_store.shutdown execution.context with _ -> ());
     ignore (Workflow_context_store.take_commands execution.context);
+    report_teardown_failures execution;
     report ~src:Observability.Source.workflow Logs.Error
       ~tags:(Observability.tags ~operation:"workflow_task_failed"
         ~workflow_type:(workflow_type execution)
@@ -327,13 +350,40 @@ let fail_task execution error =
       "workflow task failed; execution remains recoverable"
   end
 
+(** Fails the task for an error a workflow fiber returned or raised, unless the
+    run has already ended. Once a terminal command was emitted or buffered
+    (continue-as-new and [terminate] buffer it and abort the fiber before
+    [terminal] is set after the drain), or Core evicted the run, every fiber
+    still running is being discontinued, so the error can
+    only come from its cleanup code or from a catch-all handler that caught the
+    private shutdown exception. Such an error must not discard the terminal
+    command, nor turn an eviction into a failed completion that Core rejects;
+    it is logged and dropped (#1021). Jobs are never applied after either
+    point, so no activation-level failure reaches this function then. *)
+let fail_task execution error =
+  if
+    Option.is_none execution.task_failure
+    && (execution.terminal || execution.evicted
+       || Workflow_context_store.has_buffered_terminal execution.context)
+  then
+    report ~src:Observability.Source.workflow Logs.Warning
+      ~tags:
+        (Observability.tags ~operation:"workflow_teardown_error_ignored"
+           ~workflow_type:(workflow_type execution)
+           ~error_kind:(Temporal_base.Error.kind error) ())
+      "workflow code returned a task-failing error while its parked fibers \
+       were released after the run ended; the error is ignored"
+  else poison_task execution error
+
 (** Exposes the poisoned generation's task failure to the native adapter. *)
 let task_failure execution = execution.task_failure
 
 (** Deliberate application/operational failures close the execution; defects
-    reject only the current task so corrected code can replay the same run. *)
+    reject only the current task so corrected code can replay the same run.
+    After eviction no command may be emitted at all, so every error, whatever
+    its category, goes through {!fail_task}, which drops it (#1021). *)
 let fail execution error =
-  if is_task_failure error then fail_task execution error
+  if is_task_failure error || execution.evicted then fail_task execution error
   else begin
   if not execution.terminal then (
     let tags =
@@ -706,7 +756,8 @@ let process_job execution = function
       report ~src:Observability.Source.workflow Logs.Debug ~tags
         "workflow execution evicted";
       clear_pending_updates execution;
-      Workflow_context_store.shutdown execution.context
+      Workflow_context_store.shutdown execution.context;
+      report_teardown_failures execution
 
 (** Runs queued fibers with this workflow installed as the current context. An
     uncaught OCaml exception becomes a non-retryable defect instead of escaping
@@ -725,11 +776,15 @@ let run_scheduler execution =
     Workflow_context_store.with_context execution.context (fun () ->
         Scheduler.run ~on_idle execution.scheduler)
   in
+  report_teardown_failures execution;
   match status with
   | Scheduler.Failed exception_ ->
       (* A defect invalidates this whole activation, including commands that
-         a sibling buffered before the exception. Core must replay it. *)
-      fail_task execution
+         a sibling buffered before the exception. Core must replay it. The
+         scheduler reports only exceptions raised while it was still active,
+         so this stays unconditional even when a terminal command was later
+         buffered in the same drain. *)
+      poison_task execution
         (Temporal_base.Error.defect ~message:(Printexc.to_string exception_))
   | Scheduler.Complete | Scheduler.Blocked -> ()
 
@@ -743,7 +798,8 @@ let shutdown execution =
   (* Teardown must not raise into lease-ack bookkeeping. Continuations that
      mishandle the private shutdown exception are contained here. *)
   clear_pending_updates execution;
-  try Workflow_context_store.shutdown execution.context with _ -> ()
+  (try Workflow_context_store.shutdown execution.context with _ -> ());
+  report_teardown_failures execution
 
 (** Processes jobs in order, runs fibers, and returns new commands. Cache
     removal stops processing immediately and returns no commands for the old
@@ -798,7 +854,7 @@ let activate execution jobs =
                   | _ -> None) commands
               with
               | None -> commands
-              | Some error -> fail_task execution error; []
+              | Some error -> poison_task execution error; []
             in
             (* Terminal commands emitted through [terminate] (continue-as-new or
                a Fail_workflow from a failed continue-as-new encode) do not go
@@ -817,7 +873,8 @@ let activate execution jobs =
             then (
               execution.terminal <- true;
               clear_pending_updates execution;
-              Workflow_context_store.shutdown execution.context);
+              Workflow_context_store.shutdown execution.context;
+              report_teardown_failures execution);
             commands)))
   in
   let tags =

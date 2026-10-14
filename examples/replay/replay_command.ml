@@ -31,8 +31,10 @@ module Exit_status = struct
       defect, could not decode its input, or its type is not registered. *)
   let workflow_task_failed = 2
 
-  (** The file is not a valid Temporal [History] protobuf, or it is empty or
-      larger than {!Temporal.Replay.History.max_bytes}. *)
+  (** The file is not a valid Temporal [History] protobuf, it is empty or
+      larger than {!Temporal.Replay.History.max_bytes}, it records a
+      different workflow ID than the one given, or Temporal Core rejects its
+      events. *)
   let invalid_history = 3
 
   (** The history is valid but uses a feature this SDK cannot replay yet. *)
@@ -49,9 +51,11 @@ module Exit_status = struct
   let unreadable_input = 66
 end
 
-(** One history to replay: the file to read and the workflow ID it belongs
-    to. The History protobuf does not carry the workflow ID, so the caller
-    must supply it. *)
+(** One history to replay: the file to read ([-] for standard input) and the
+    workflow ID it belongs to. Core replays the run under that ID. Histories
+    from Temporal Server 1.21 or later also record it, and replay rejects a
+    history whose recorded ID differs from this one as an invalid history;
+    older histories do not record it, so the command line must supply it. *)
 type input = { path : string; workflow_id : string }
 
 (** A fully parsed command line. [namespace] and [task_queue] are only
@@ -69,7 +73,8 @@ let usage program =
       "";
       "Replays each binary Temporal History protobuf FILE offline against the";
       "workflows linked into this program. Each FILE uses the most recent";
-      "--workflow-id before it.";
+      "--workflow-id before it, which must be the execution's own workflow ID.";
+      "A FILE of - reads standard input.";
       "";
       "exit status: 0 every history replayed, 1 nondeterminism,";
       "2 workflow task failed, 3 invalid history, 4 unsupported history,";
@@ -155,18 +160,37 @@ let parse arguments =
   loop ~namespace:"default" ~task_queue:"temporal-replay" ~workflow_id:None
     ~options_done:false [] arguments
 
-(** Reads one history file. The size is checked before reading so an
-    unexpectedly large file is rejected without loading it into memory.
-    Returns [`Unreadable] for I/O failures and [`Invalid] for content that
-    cannot be a replayable history. *)
+(** Reads [channel] to end of input, stopping with [`Too_large] as soon as
+    more than {!Temporal.Replay.History.max_bytes} bytes have arrived. The
+    size check runs before each chunk is appended, so the buffer never grows
+    past the limit (an append beyond its capacity would double it). Only
+    sequential reads are used: [In_channel.length] would need a seekable
+    file and fails with [Illegal seek] on a pipe, a process substitution, or
+    [/dev/stdin]. *)
+let read_bounded channel =
+  let limit = Temporal.Replay.History.max_bytes in
+  let chunk = Bytes.create 65_536 in
+  let buffer = Buffer.create 65_536 in
+  let rec loop () =
+    match In_channel.input channel chunk 0 (Bytes.length chunk) with
+    | 0 -> Ok (Buffer.contents buffer)
+    | count when count > limit - Buffer.length buffer -> Error `Too_large
+    | count ->
+        Buffer.add_subbytes buffer chunk 0 count;
+        loop ()
+  in
+  loop ()
+
+(** Reads one history from [path], or from standard input when [path] is
+    [-] (a file literally named [-] can be given as [./-]). Returns
+    [`Unreadable] for I/O failures and [`Invalid] for content that cannot be
+    a replayable history. *)
 let read_history path =
   match
-    In_channel.with_open_bin path (fun channel ->
-        let length = In_channel.length channel in
-        if Int64.compare length (Int64.of_int Temporal.Replay.History.max_bytes)
-           > 0
-        then Error `Too_large
-        else Ok (In_channel.input_all channel))
+    if String.equal path "-" then (
+      set_binary_mode_in stdin true;
+      read_bounded stdin)
+    else In_channel.with_open_bin path read_bounded
   with
   | Ok bytes -> Ok bytes
   | Error `Too_large ->
