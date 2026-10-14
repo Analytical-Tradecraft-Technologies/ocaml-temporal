@@ -15,6 +15,23 @@ implementation when a later entry documents that work as complete. The
 records the current tested source, named assertions and successful CI job for
 the Temporal acceptance controllers.
 
+## 2026-10-13: Reference documents match the code and evidence (#1026)
+
+Four reference statements had drifted from the code or their own evidence.
+The live-evidence record's Pins row named Core `8fe478ee` for the
+September 19 audited run, but the manifest at that baseline (`beae10d0a58e`)
+pins `95e97686`. The row now names `95e97686`. The Core v1.1.0 upgrade's own
+live evidence is cited separately: the successful Temporal/PostgreSQL job of
+the Build run at the upgrade commit `acbda8da`. `native-interactions.md` now
+describes the fail-closed signal policy from #811 (a missing handler or
+undecodable signal fails the workflow task, not the run). `package-boundary.md`
+lists six, not four, public types equal to package-private types, adding
+`Runtime.t` and the constructor-bearing `Activity.Cancellation.reason`. The
+child-start row of `native-execution-translation.md` now says that task queue
+and parent-close policy are carried end to end. Each claim was checked against
+`lib/runtime/execution.ml`, the public `.mli` files,
+`lib/runtime/native_execution.ml`, `rust/core-bridge/src/workflow_protocol.rs`,
+and the CI run and job logs. Documentation only; no behavior changed.
 ## 2026-10-13: Bytecode consumers link outside the SDK workspace (#1020)
 
 The documented Dune `(modes byte)` link mode worked only inside the SDK's own
