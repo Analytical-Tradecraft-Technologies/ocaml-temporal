@@ -90,20 +90,31 @@ without a private CMI. `Duration.t`, `Error.t`, `Codec.t`, `Workflow.t`, and
 adapters use the documented `name`, `input`, `output`, and `implementation`
 accessors; they do not rely on record layout.
 
-Four public types deliberately keep a type equality with a package-private
+Six public types deliberately keep a type equality with a package-private
 library so private runtime adapters can pass SDK-owned values through the
 facade without unsafe casts:
 
 - `Future.t` equals `Temporal_sdk_kernel.Future.t`, an alias of the generic
   `temporal_future_kernel` future;
+- `Runtime.t` equals `Temporal_sdk_kernel.Shared_runtime.t`, the shared
+  Core runtime handle owned by the application: `Runtime.create` makes it,
+  the application releases it with `Runtime.shutdown` after every attached
+  client and worker has shut down, and each attached supervisor holds only
+  a lease on it;
 - `Activity.context` equals `Temporal_base.Activity_context.t`;
 - `Activity.async_handle` and `Activity.async_context` equal
-  `Temporal_base.Async_activity.handle` and `.context`.
+  `Temporal_base.Async_activity.handle` and `.context`;
+- `Activity.Cancellation.reason` re-exports the variant
+  `Temporal_base.Activity_context.cancel_reason`, constructors included.
 
-Each target type is abstract in its private interface. The public `Temporal`
-root does not re-export those modules, and neither `Future.mli` nor
-`Activity.mli` exposes a constructor or record field for these types, so an
-application cannot build one directly. `Future.mli` also exposes no callback or
+The first five target types are abstract in their private interfaces. The
+public `Temporal` root does not re-export those modules, and neither
+`Future.mli`, `Runtime.mli` nor `Activity.mli` exposes a constructor or record
+field for them, so an application cannot build one directly; `Runtime.t`
+values come only from `Runtime.create`. `Activity.Cancellation.reason` is the
+exception: its constructors are public so activity code can match on why it
+was cancelled, and the equality only lets the private activity runtime report
+a reason without a conversion. `Future.mli` also exposes no callback or
 scheduler lifecycle operation. `Activity.mli` deliberately exposes the
 supported activity operations on values the SDK supplies: the context
 operations, `Async_context.handle`, and the `Async_handle` completion,

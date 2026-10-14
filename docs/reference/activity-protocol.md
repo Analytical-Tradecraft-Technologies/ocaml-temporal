@@ -133,7 +133,11 @@ delivers those facts asynchronously in a later `ActivityTask::Cancel`; no
 synchronous status is invented at the heartbeat call boundary. The normal
 adapter must later submit a terminal completion, including a `Cancelled`
 result when it receives that cancellation task, and only that terminal path
-removes the worker token from its ledger. An asynchronous heartbeat instead
+removes the worker token from its ledger. Because the server accepts a
+cancelled completion only after a cancellation request, a task whose
+primary reason is a pause or reset is instead completed with a retryable
+`ActivityPause` or `ActivityReset` application failure (#1022; see
+[pause and reset](native-activity-execution.md#pause-and-reset)). An asynchronous heartbeat instead
 uses the namespace-bound client path and is checked by Core's async activity
 handle; its separate async lease remains non-terminal until an async terminal
 operation is accepted or a non-retryable bridge failure closes and removes it.

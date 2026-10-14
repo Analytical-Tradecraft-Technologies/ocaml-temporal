@@ -40,10 +40,15 @@ One history is represented by the closed document in
 }
 ```
 
-`workflow_id` is separate because Temporal's `History` protobuf carries event
-data but does not carry the workflow identity needed to construct a replay
-task. `history.data` is the official Temporal Core `History` protobuf encoded
-as padded standard base64. JSON is only the private OCaml/Rust representation;
+`workflow_id` is separate because Core's replay worker takes the run's
+workflow identity from its caller, not from the history: the ID becomes
+`Workflow.info().workflow_id` and the input to every ID-derived command.
+Histories recorded by Temporal Server 1.21 or later also store it in
+`WorkflowExecutionStartedEventAttributes.workflow_id` (field 28); when that
+field is non-empty, the bridge requires it to equal the document's
+`workflow_id` (#1046). Histories from older servers leave it empty, and the
+supplied ID is then used as given. `history.data` is the official Temporal
+Core `History` protobuf encoded as padded standard base64. JSON is only the private OCaml/Rust representation;
 the Temporal Server never receives this document.
 
 The schema describes the shape, but it is not the complete security or
@@ -55,15 +60,33 @@ FFI boundary and also:
   in both the outer and nested objects;
 - rejects empty, NUL-containing, or over-limit workflow IDs;
 - accepts only `encoding: "base64"`, decodes at most the bridge payload limit,
-  and compares the input with a canonical re-encoding; and
+  and compares the input with a canonical re-encoding;
 - decodes the protobuf and runs Core's `HistoryInfo` invariant validation
-  before constructing `HistoryForReplay`.
+  before constructing `HistoryForReplay`; and
+- adds the checks `HistoryInfo` lacks but Core relies on later
+  (`validate_replay_preconditions`): a non-empty recorded workflow ID must
+  equal the supplied one; the start event must have a task queue, because
+  Core's replay mock poll unwraps it and would otherwise panic inside a Tokio
+  task and stall the replay for the 30-second idle bound (#1047); event IDs
+  must run 1, 2, 3, ... without gaps; and every `WorkflowTaskStarted` event
+  must carry `event_time`. The last two are fatal machine errors in Core
+  ("History is out of order", "Workflow task started event must contain
+  timestamp"); inside a run's first task Core reports them only through its
+  autonomous auto-fail path (see [verdicts](#public-offline-replay-api)), so
+  rejecting them at admission gives a precise message instead. The history is
+  rejected, not normalized: a server never writes such a history, so the
+  input is not a faithful export.
 
 The encoder uses the same invariant gate and immediately decodes its own JSON
 output. This makes a future OCaml adapter fail at the Rust boundary instead
 of handing a partially checked history to Core. Parser and Core diagnostics
 are mapped to stable private categories; workflow-controlled bytes and server
-error text are not copied into an ABI diagnostic.
+error text are not copied into an ABI diagnostic. Malformed documents and
+Core's own invariant failures share the message "Temporal replay history
+failed strict validation"; each of the four precondition failures above has
+its own constant sentence (`ReplayInputError::abi_message`), for example
+"Temporal replay history records a different workflow ID than the one
+supplied", so the user knows what to fix.
 
 ## OCaml supervisor operation
 
@@ -169,12 +192,27 @@ text:
 
 | Signal | Public result |
 | --- | --- |
-| Finalization succeeds with no refusal recorded | `Ok ()` |
+| Finalization succeeds with no refusal recorded, after an `Initialize_workflow` job was delivered | `Ok ()` |
+| Finalization succeeds with no refusal recorded, but no `Initialize_workflow` job was ever delivered | `Invalid_history`: Core never started the run, so no workflow code was checked |
 | `Remove_from_cache` with reason `Nondeterminism` | `Nondeterminism { run_id; message; mismatch }` with Core's mismatch text |
 | A completion carrying `task_failure`, an adapter rejection that retired its lease (for example an unregistered workflow type), or eviction reason `Lang_fail`/`Unhandled_command` | `Workflow_task_failed` |
-| `Feed_replay_history` returns `PROTOCOL`, or eviction reason `Fatal` | `Invalid_history` with the bridge's constant category message |
+| `Feed_replay_history` returns `PROTOCOL` | `Invalid_history` with the bridge's constant category message |
+| Eviction reason `Fatal` or `Unspecified` | `Invalid_history` with Core's eviction message |
 | A replay activation the OCaml protocol cannot represent (poll `PROTOCOL`) | `Unsupported_history` |
 | Registration, options, runtime start, or any other supervisor failure | `Replay_error` |
+
+Eviction reason `Unspecified` is a refusal, not housekeeping (#1045). A
+machines error raised while Core applies a run's **first** workflow task
+happens before any language completion exists, so Core auto-fails the task
+itself (`ActivationOrAuto::AutoFail`) and its workflow stream evicts the run
+with `EvictionReason::Unspecified` when the failed completion is an
+auto-completion (`workflow_stream.rs` at the pinned revision). The same error
+in a later task keeps its `Fatal` or `Nondeterminism` reason. No other replay
+path at the pinned revision produces `Unspecified`. Before this rule, such a
+history was acknowledged as routine cache housekeeping and replayed as
+`Ok ()` without running any workflow code. The `Initialize_workflow` rule
+above is an independent second guard: whatever Core's eviction says, `Ok ()`
+requires that the registered workflow actually received the run.
 
 The first refusal wins; later evictions are consequences of it. Every copied
 message is truncated to 4,096 bytes on a UTF-8 boundary. Core's
@@ -354,6 +392,11 @@ cover:
 - valid history encode/decode round trips;
 - duplicate and unknown JSON field rejection;
 - base64 and malformed-protobuf rejection;
+- the admission preconditions: a recorded workflow ID that differs from the
+  supplied one, a start event without a task queue, event IDs with a gap or
+  not starting at 1, and timestamp-free `WorkflowTaskStarted` events are each
+  rejected with their own category and distinct static ABI message, while a
+  history that records no workflow ID accepts any;
 - construction and clean shutdown without a Temporal client; and
 - admission, activation completion, natural shutdown, and finalization of one
   valid history through the bounded feeder; and
@@ -440,14 +483,22 @@ histories. Compatible code replays all five (including histories with earlier
 failed tasks and deliberately failed executions); a removed timer and an
 activity scheduled in place of a timer are `Nondeterminism`; a defect and an
 unregistered type are `Workflow_task_failed`; non-protobuf, truncated, and
-event-free inputs are `Invalid_history`; invalid registrations and options are
+event-free inputs are `Invalid_history`; the `body` history replayed under
+another execution's ID is `Invalid_history` while its recorded ID, or any ID
+once the recorded one is removed, replays cleanly; histories derived from
+`body` by a small test-only protobuf wire editor (all `eventTime`s scrubbed,
+an event-ID gap, no start-event task queue, and a `WorkflowTaskScheduled`
+event without attributes, which Core auto-fails inside the first task with
+eviction reason `Unspecified`) are `Invalid_history` against both the
+compatible and a deliberately changed definition, never `Ok ()`; invalid registrations and options are
 `Replay_error`; and 140 alternating successful and nondeterministic replays,
 more than OCaml's 128 simultaneous Domains, prove that each call releases its
 supervisor Domain and native graph. Its nondeterminism cases also assert the
 `mismatch` fields: a removed timer is event 5 `TimerStarted` against a
 `Complete workflow` command, an activity in its place is the same event
 against an `Activity` command, and an added second timer is event 16
-`WorkflowExecutionCompleted` against a `Timer` command. A workflow ID with
+`WorkflowExecutionCompleted` against a `Timer` command. Replayed against
+`body` with its recorded workflow ID removed, a workflow ID with
 line breaks, a tab, a backslash, an escape byte, a multi-byte character, and
 60 KB of padding must render as one valid UTF-8 line of at most 3,072 bytes
 with the escapes and truncation marker, while `mismatch.workflow_id` stays

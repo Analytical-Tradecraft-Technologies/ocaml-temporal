@@ -2327,6 +2327,31 @@ let test_workflow_search_attribute_upsert () =
         failwith "search-attribute payload was not retained"
   | _ -> failwith "search-attribute upsert emitted an unexpected command sequence"
 
+(** Verifies an empty search-attribute upsert emits no command (#1033).
+    Temporal Server rejects an upsert with empty indexed fields, and replay
+    would re-emit it on every task retry, so the only safe encoding of an
+    empty merge is no command at all. A non-empty upsert in the same
+    activation must still be emitted exactly once, in order. *)
+let test_workflow_empty_search_attribute_upsert () =
+  let workflow =
+    Temporal.Workflow.define ~name:"empty_search_attribute_upsert"
+      ~input:Temporal.Codec.unit ~output:Temporal.Codec.unit (fun () ->
+        Temporal.Workflow.upsert_search_attributes [];
+        let value =
+          match Temporal.Codec.encode Temporal.Codec.string "ready" with
+          | Ok value -> value
+          | Error error -> failwith (Temporal.Error.message error)
+        in
+        Temporal.Workflow.upsert_search_attributes [ ("status", value) ];
+        Temporal.Workflow.upsert_search_attributes [];
+        Ok ())
+  in
+  let execution = Execution.start workflow () in
+  match Execution.activate execution [ Activation.Start_workflow ] with
+  | [ Activation.Upsert_search_attributes { search_attributes = [ ("status", _) ] };
+      Activation.Complete_workflow _ ] -> ()
+  | _ -> failwith "empty search-attribute upsert emitted a command"
+
 (** Verifies public child routing and parent closure remain separate from
     explicit cancellation, and survive the native protocol translation. *)
 let test_child_routing_and_parent_close () =
@@ -2416,4 +2441,5 @@ let () =
   test_incoming_patch_notification_snapshot ();
   test_workflow_random_int_is_replay_stable ();
   test_update_validator_cannot_consume_workflow_randomness ();
-  test_workflow_search_attribute_upsert ()
+  test_workflow_search_attribute_upsert ();
+  test_workflow_empty_search_attribute_upsert ()
