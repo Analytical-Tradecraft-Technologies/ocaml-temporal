@@ -45,6 +45,34 @@ let run program arguments =
   | Unix.WSIGNALED signal | Unix.WSTOPPED signal ->
       failwith (Printf.sprintf "%s stopped by signal %d" program signal)
 
+(** Like {!run}, but feeds [input] to the program's standard input through a
+    pipe, which cannot seek, exactly like [cat FILE | program ...]. The
+    whole input is written and the pipe closed before the output is read;
+    this cannot deadlock because the command reads its history completely
+    before printing anything, and its output is a few short lines. *)
+let run_with_stdin program arguments input =
+  let child_stdin, parent_stdin = Unix.pipe ~cloexec:true () in
+  let parent_stdout, child_stdout = Unix.pipe ~cloexec:true () in
+  let pid =
+    Unix.create_process program
+      (Array.of_list (program :: arguments))
+      child_stdin child_stdout Unix.stderr
+  in
+  Unix.close child_stdin;
+  Unix.close child_stdout;
+  let to_child = Unix.out_channel_of_descr parent_stdin in
+  set_binary_mode_out to_child true;
+  Out_channel.output_string to_child input;
+  Out_channel.close to_child;
+  let from_child = Unix.in_channel_of_descr parent_stdout in
+  set_binary_mode_in from_child true;
+  let output = In_channel.input_all from_child in
+  In_channel.close from_child;
+  match snd (Unix.waitpid [] pid) with
+  | Unix.WEXITED code -> (code, output)
+  | Unix.WSIGNALED signal | Unix.WSTOPPED signal ->
+      failwith (Printf.sprintf "%s stopped by signal %d" program signal)
+
 (** Returns whether [needle] occurs in [haystack]. *)
 let contains haystack needle =
   let length = String.length needle in
@@ -56,9 +84,14 @@ let contains haystack needle =
   search 0
 
 (** Runs one case and fails with the full output unless the exit code is
-    [expected] and the output contains every string in [expect_output]. *)
-let check ~name ?(expect_output = []) ~expected program arguments =
-  let code, output = run program arguments in
+    [expected] and the output contains every string in [expect_output].
+    With [stdin], the program reads that text from a pipe. *)
+let check ~name ?(expect_output = []) ?stdin ~expected program arguments =
+  let code, output =
+    match stdin with
+    | None -> run program arguments
+    | Some input -> run_with_stdin program arguments input
+  in
   let missing =
     List.filter (fun needle -> not (contains output needle)) expect_output
   in
@@ -174,20 +207,46 @@ let () =
         example
         [ "--workflow-id=" ^ workflow_id; empty ];
       (* Every history is replayed and reported; the first failure in
-         command-line order decides the status. *)
+         command-line order decides the status. The history records its
+         workflow ID, so replaying it under another execution's ID is an
+         invalid history rather than a pass (issue #1046). *)
       check ~name:"several histories" ~expected:3
         ~expect_output:
           [
             "PASS " ^ shown history ^ " workflow_id=" ^ workflow_id;
             "FAIL " ^ shown not_history;
-            "PASS " ^ shown history ^ " workflow_id=another-execution";
-            "replayed 3 histories: 2 passed, 1 failed";
+            "FAIL " ^ shown history
+            ^ " workflow_id=another-execution: invalid history: Temporal \
+               replay history records a different workflow ID than the one \
+               supplied";
+            "PASS " ^ shown history ^ " workflow_id=" ^ workflow_id;
+            "replayed 4 histories: 2 passed, 2 failed";
           ]
         example
         [
           "--workflow-id"; workflow_id; history; not_history;
           "--workflow-id"; "another-execution"; history;
+          "--workflow-id"; workflow_id; history;
         ];
+      check ~name:"mismatched workflow id with changed code" ~expected:3
+        ~expect_output:[ "records a different workflow ID" ]
+        altered
+        [ "nondeterministic"; "--workflow-id"; "another-execution"; history ];
+      (* Non-seekable inputs (issue #1047): [-] is standard input. *)
+      let history_bytes = In_channel.with_open_bin history In_channel.input_all in
+      check ~name:"history from a pipe" ~expected:0 ~stdin:history_bytes
+        ~expect_output:[ "PASS - workflow_id=" ^ workflow_id ]
+        example
+        [ "--workflow-id"; workflow_id; "-" ];
+      check ~name:"changed code from a pipe" ~expected:1 ~stdin:history_bytes
+        ~expect_output:[ "FAIL - workflow_id="; ": nondeterminism (run " ]
+        altered
+        [ "nondeterministic"; "--workflow-id"; workflow_id; "-" ];
+      if not Sys.win32 then
+        check ~name:"history from /dev/stdin" ~expected:0 ~stdin:history_bytes
+          ~expect_output:[ "PASS /dev/stdin workflow_id=" ^ workflow_id ]
+          example
+          [ "--workflow-id"; workflow_id; "/dev/stdin" ];
       check ~name:"nondeterminism" ~expected:1
         ~expect_output:[ "FAIL " ^ shown history; ": nondeterminism (run " ]
         altered
@@ -205,9 +264,12 @@ let () =
         ~expect_output:[ ": workflow task failed"; "\\nPASS forged.pb" ]
         altered
         [ "multiline"; "--workflow-id"; workflow_id; history; history ];
+      (* The forged ID differs from the recorded one, so the record is a
+         FAIL line, which must still be exactly one line. *)
       check_one_line_per_history ~name:"multi-line workflow id" ~records:1
-        ~expected:0
-        ~expect_output:[ "workflow_id=first\\nPASS forged" ]
+        ~expected:3
+        ~expect_output:
+          [ "FAIL "; "workflow_id=first\\nPASS forged: invalid history" ]
         example
         [ "--workflow-id"; "first\nPASS forged"; history ];
       check ~name:"replay could not run" ~expected:5

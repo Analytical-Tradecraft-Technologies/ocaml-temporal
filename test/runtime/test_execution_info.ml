@@ -438,6 +438,67 @@ let test_workflow_start_policy_clamps () =
   let execution, _, _ = observed.timeouts in
   expect "clamped execution timeout" (Some 315_576_000_000_999L) execution
 
+(** Start-event shapes the server accepts but the outbound rules reject must
+    reach workflow code without raising. A Temporal Schedule action carries
+    the previous result with an empty predecessor run ID (#1015), which reads
+    as no predecessor. A policy recorded with [maximum_attempts = 1] skips
+    server validation (#1016), so its coefficient may be below 1.0 with an
+    empty non-retryable type and a zero interval; [Info.retry_policy]
+    reports it as [None] instead of raising [Invalid_argument]. *)
+let test_workflow_start_policy_inbound_shapes () =
+  let schedule : Protocol.continuation =
+    {
+      continued_from_execution_run_id = "";
+      initiator = Protocol.Continue_as_new_unspecified;
+      continued_failure = None;
+      last_completion_result =
+        Some [ { Protocol.metadata = []; data = Bytes.of_string "42" } ];
+    }
+  in
+  let job =
+    match initialize_with_policy ~continuation:(Some schedule) with
+    | Protocol.Initialize_workflow ({ context = Some context; _ } as init) ->
+        Protocol.Initialize_workflow
+          {
+            init with
+            context =
+              Some
+                {
+                  context with
+                  (* Clamped, not rejected, by the server (#1016). *)
+                  priority =
+                    Some
+                      {
+                        priority_key = 1;
+                        fairness_key = "nul\000key";
+                        fairness_weight_bits =
+                          Int64.of_int32 (Int32.bits_of_float 5000.);
+                      };
+                  retry_policy =
+                    Some
+                      {
+                        initial_interval = { seconds = 0L; nanoseconds = 0 };
+                        backoff_coefficient_bits =
+                          Int64.to_string (Int64.bits_of_float 0.5);
+                        maximum_interval = { seconds = 0L; nanoseconds = 0 };
+                        maximum_attempts = 1;
+                        non_retryable_error_types = [ "" ];
+                      };
+                };
+          }
+    | _ -> failwith "unexpected initialization fixture"
+  in
+  List.iter
+    (fun replaying ->
+      let before, after = run_start_policy ~replaying job in
+      List.iter
+        (fun observed ->
+          expect "schedule continued from" None observed.continued_from_run_id;
+          expect "schedule initiator" None observed.initiator;
+          expect "unrepresentable retry policy" None observed.retry)
+        [ before; after ])
+    [ false; true ]
+
 (** Detached code has no run: [info] fails closed and nothing is replaying. *)
 let test_workflow_info_outside_workflow () =
   (match Temporal.Workflow.info () with
@@ -611,6 +672,7 @@ let () =
   test_unspecified_continue_as_new_reasons ();
   test_workflow_start_policy ();
   test_workflow_start_policy_clamps ();
+  test_workflow_start_policy_inbound_shapes ();
   test_workflow_info_outside_workflow ();
   test_workflow_info_synthetic_context ();
   test_activity_info ();
