@@ -1284,21 +1284,24 @@ This applies to Unix platforms such as Linux and macOS. On Windows,
 not the SDK has started; use `Unix.create_process` or `Unix.open_process*` to
 run other processes there.
 
-**Link a native or `-custom` bytecode executable.** The private Rust bridge and
-its C stubs are installed only as static archives; no shared library is
-installed for the bytecode runtime to load. These link modes are supported:
+**Link a native or bytecode executable.** The private Rust bridge and its C
+stubs are installed only as static archives; no shared library is installed
+for the bytecode runtime to load. These link modes are supported:
 
 - native executables (`ocamlfind ocamlopt ... -linkpkg`, or Dune executables
   in the default native mode);
-- bytecode executables linked with `-custom`, which embed the static archives
-  in a custom runtime;
-- Dune `(modes byte)` executables.
+- bytecode executables, including Dune `(modes byte)` executables and
+  `ocamlfind ocamlc -package temporal-sdk -linkpkg`. The installed bridge
+  library forces `-custom`, so `ocamlc` always builds a custom runtime that
+  embeds the static archives. Such an executable runs without
+  `dllocaml_temporal_core_bridge` and needs no `dune-workspace` setting in your
+  project;
+- Dune `(modes byte_complete)` executables.
 
-Plain dynamically loaded bytecode (`ocamlfind ocamlc -package temporal-sdk
--linkpkg` without `-custom`) fails at startup because the runtime cannot find
-`dllocaml_temporal_core_bridge`, and the toplevel or utop
-(`#require "temporal-sdk";;`) fails with a shared-library loading error. Native
-plugins (`.cmxs`) are also unsupported. The design reasons are recorded in the
+The toplevel or utop (`#require "temporal-sdk";;`) cannot load the bridge and
+fails with a shared-library loading error, because loading a library into a
+running bytecode interpreter needs the shared stub library that is not
+installed. Native plugins (`.cmxs`) are also unsupported. The design reasons are recorded in the
 [Core bridge reference](../reference/core-bridge.md#supported-link-modes).
 
 ## Test workflows in-process
