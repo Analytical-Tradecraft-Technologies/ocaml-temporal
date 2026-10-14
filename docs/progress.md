@@ -32,6 +32,26 @@ and parent-close policy are carried end to end. Each claim was checked against
 `lib/runtime/execution.ml`, the public `.mli` files,
 `lib/runtime/native_execution.ml`, `rust/core-bridge/src/workflow_protocol.rs`,
 and the CI run and job logs. Documentation only; no behavior changed.
+## 2026-10-13: Bytecode consumers link outside the SDK workspace (#1020)
+
+The documented Dune `(modes byte)` link mode worked only inside the SDK's own
+workspace, whose `dune-workspace` disables dynamically linked foreign
+archives. The installed `temporal_core_bridge.cma` records the stub and Rust
+archives as `-dllib` entries, but only the static `.a` files are installed.
+An ordinary consumer project therefore linked a byte executable in
+dynamic-stub mode, and `ocamlc` failed looking for
+`dllocaml_temporal_core_bridge`. The bridge library is now archived with
+`ocamlc -a -custom` and `-ccopt -L"$CAMLORIGIN"` (through `ocamlc_flags`,
+because `ocamlopt` rejects `-custom`). Every bytecode link of the SDK,
+including Dune `(modes byte)` and `ocamlfind ocamlc -linkpkg`, now builds a
+custom runtime that embeds the static archives and finds them in the
+relocatable install directory. Supporting bytecode was kept rather than
+dropped: the custom runtime needs nothing the static archives do not already
+provide. The install-consumer fixture now links `main` as `exe` and `byte`.
+`test/bridge/test_install.sh` and the prebuilt-library consumer build and run
+`main.bc` in a separate Dune root without the SDK's `dune-workspace`. The
+README, workflow guide and Core bridge reference describe the supported modes;
+the toplevel and native plugins remain unsupported.
 ## 2026-10-13: Per-series ocaml/opam pins Dependabot can refresh (#1027)
 
 The daily Dependabot Docker job failed or proposed retargeting a compiler

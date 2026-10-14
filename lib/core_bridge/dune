@@ -77,6 +77,19 @@
  (modules native_bridge)
  (libraries temporal_base temporal_protocol yojson)
  (foreign_archives temporal_native_stubs ocaml_temporal_core_bridge)
+ ;; Only the static stub and Rust archives are installed, yet ocamlc records
+ ;; them in the .cma as -dllib entries too. Outside a workspace that disables
+ ;; dynamically linked foreign archives, a plain bytecode link would then look
+ ;; for dllocaml_temporal_core_bridge and fail (#1020). [ocamlc -a -custom]
+ ;; stores "force custom" in the .cma, so every bytecode executable that links
+ ;; the SDK (Dune [(modes byte)], [ocamlfind ocamlc -linkpkg]) is built with a
+ ;; custom runtime that embeds the static archives and never loads a DLL. A
+ ;; custom link does not search the library's own directory, so the -L, which
+ ;; OCaml relocates through $CAMLORIGIN, points the C linker at the installed
+ ;; archives. These are [ocamlc_flags], not [library_flags], because ocamlopt
+ ;; rejects -custom; native archives already find the stubs through -I.
+ (ocamlc_flags
+  (:standard -custom -ccopt "-L\"$CAMLORIGIN\""))
  (library_flags (:include rust_ocaml_link_flags.sexp))
  (c_library_flags
   (:include rust_static_link_flags.sexp)))
