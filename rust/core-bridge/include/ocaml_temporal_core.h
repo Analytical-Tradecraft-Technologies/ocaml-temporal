@@ -296,9 +296,10 @@ ocaml_temporal_core_status ocaml_temporal_core_v4_client_await_call(
 
 /* Abandon a submitted call without reading it, freeing its slot in the
  * 4,096-call ceiling (an unread completed call keeps counting until it is
- * read, released, or its runtime closes). Any published outcome is dropped.
- * Takes no runtime; a mismatched owner, retired call, or unknown identifier
- * is a successful no-op. */
+ * read, released, or its runtime closes). Any published outcome is dropped
+ * and a still-running task is aborted, so the call stops holding its wait,
+ * start, and in-flight slots at once. Takes no runtime; a mismatched owner,
+ * retired call, or unknown identifier is a successful no-op. */
 ocaml_temporal_core_status ocaml_temporal_core_v4_client_release_call(
     uint64_t owner, uint64_t call, ocaml_temporal_core_result *output);
 

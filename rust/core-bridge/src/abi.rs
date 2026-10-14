@@ -716,6 +716,13 @@ enum CallScope {
     Wait(client_protocol::WaitWorkflowRequest),
     /// Any other RPC, bounded by its own deadline.
     Bounded,
+    /// A call that left the completion registry (read, or released by an
+    /// interrupted caller) while its task was still running (#1019). Its task
+    /// has been aborted and is kept only so disconnect and close can join it.
+    /// It holds no start, wait, or in-flight slot, but its handle still counts
+    /// toward the bound on retained handles: submission joins released tasks
+    /// once the map reaches the in-flight ceiling.
+    Released,
 }
 
 /// One submitted call's Tokio task, retained by the runtime owner so that
@@ -1011,7 +1018,12 @@ pub struct Runtime {
     /// release every call registered under it.
     call_owner: u64,
     /// Tasks of submitted client calls that may still be running, keyed by
-    /// call identifier. Finished tasks are pruned on each submission.
+    /// call identifier. Finished tasks are pruned on each submission, and a
+    /// call that has left the completion registry is marked
+    /// [`CallScope::Released`] there so it stops counting against the limits.
+    /// Released tasks are joined before admission whenever the map has
+    /// reached the in-flight ceiling, so the map never holds more than
+    /// `client_limits.in_flight_calls` handles after a submission.
     pending_calls: HashMap<u64, PendingCall>,
     /// Admission limits of the current connection (#796). Set by a successful
     /// connect and reset to the defaults by disconnect, so a runtime without
@@ -1624,7 +1636,10 @@ impl Runtime {
     /// Starts and waits keep their own limits (distinct request IDs and
     /// distinct runs, by default 64 each; repeats share a slot) and every
     /// class shares the in-flight ceiling (by default [`MAX_PENDING_CALLS`]),
-    /// all read from the connection's `client_limits` (#796). Admission
+    /// all read from the connection's `client_limits` (#796). Only calls
+    /// still in the completion registry count: a call that was read or
+    /// released stops counting here even if its task is still running, and
+    /// that task is aborted (#1019). Admission
     /// beyond a limit returns
     /// `STATUS_RESOURCE_EXHAUSTED` before any task or RPC exists. A start
     /// whose `request_id` is in flight for a different request is rejected
@@ -1642,6 +1657,25 @@ impl Runtime {
         // future, and with it the connection clone, has already completed.
         self.pending_calls
             .retain(|_, call| !call.task.is_finished());
+        // A call that left the registry while its task still runs was read
+        // (its task is about to end) or released by an interrupted caller
+        // (#1019). Release already aborts the task, and a read call's task
+        // has already published its outcome, so aborting here is idempotent
+        // and harmless. The handle stays so disconnect can still join it, but
+        // the call no longer holds a start, wait, or in-flight slot.
+        let unregistered = crate::client_calls::unregistered_calls(
+            self.call_owner,
+            self.pending_calls
+                .iter()
+                .filter(|(_, call)| !matches!(call.scope, CallScope::Released))
+                .map(|(id, _)| *id),
+        );
+        for id in unregistered {
+            if let Some(call) = self.pending_calls.get_mut(&id) {
+                call.task.abort();
+                call.scope = CallScope::Released;
+            }
+        }
         let scope = match &rpc {
             ClientRpc::Start(request) => {
                 let mut distinct = HashSet::new();
@@ -1695,7 +1729,25 @@ impl Runtime {
             }
             _ => CallScope::Bounded,
         };
-        if self.pending_calls.len() >= limits.in_flight_calls
+        // Hard bound on retained task handles (Codex review on #1077). An
+        // aborted task's handle is only reaped once Tokio has run its
+        // cancellation, so a burst of release-and-resubmit could otherwise
+        // retain released handles (and their request state) without bound.
+        // When the map has reached the in-flight ceiling, join the released
+        // tasks first. They are already aborted, so the join only waits for
+        // their cancellation to run; this happens on the owner thread with
+        // the OCaml runtime lock released, like disconnect's join. Together
+        // with the live-call check below, this keeps
+        // `pending_calls.len() <= in_flight_calls` after every admission.
+        if self.pending_calls.len() >= limits.in_flight_calls {
+            self.reap_released_calls(&handle);
+        }
+        let in_flight = self
+            .pending_calls
+            .values()
+            .filter(|call| !matches!(call.scope, CallScope::Released))
+            .count();
+        if in_flight >= limits.in_flight_calls
             || crate::client_calls::registered_calls(self.call_owner) >= limits.in_flight_calls
         {
             return Err(Failure {
@@ -1722,8 +1774,37 @@ impl Runtime {
             let outcome = future.await;
             guard.complete(outcome);
         });
+        // Let a release from any thread abort this task (#1019). This runs
+        // before the handle reaches OCaml, so no release can precede it.
+        crate::client_calls::attach_task(self.call_owner, call, task.abort_handle());
         self.pending_calls.insert(call, PendingCall { scope, task });
         Ok(encoded)
+    }
+
+    /// Removes every [`CallScope::Released`] call from the task map and joins
+    /// its already aborted task on `handle`. Joining waits only for Tokio to
+    /// run each cancellation, so it is bounded; it never detaches a task that
+    /// still owns a connection clone.
+    fn reap_released_calls(&mut self, handle: &tokio::runtime::Handle) {
+        let released = self
+            .pending_calls
+            .iter()
+            .filter(|(_, call)| matches!(call.scope, CallScope::Released))
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>();
+        let tasks = released
+            .into_iter()
+            .filter_map(|id| self.pending_calls.remove(&id))
+            .map(|call| call.task)
+            .collect::<Vec<_>>();
+        if tasks.is_empty() {
+            return;
+        }
+        handle.block_on(async {
+            for task in tasks {
+                let _ = task.await;
+            }
+        });
     }
 
     /// Releases every submitted call and returns task handles still to join.

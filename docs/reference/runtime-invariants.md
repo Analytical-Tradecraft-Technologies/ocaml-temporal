@@ -302,6 +302,14 @@ and bridge, read the [documentation guide](../README.md) first.
 ## Core boundary assumptions
 
 - Core and every Cargo dependency are pinned and license-audited.
+- No bridge C stub can raise between taking an unmanaged resource and
+  releasing it. Every stub releases the OCaml runtime lock with
+  `caml_enter_blocking_section_no_pending`, never the plain function, because
+  the plain function runs pending OCaml signal handlers and re-raises their
+  exceptions after the stub has already taken a counted runtime borrow,
+  detached the native pointer, or copied its input to C memory (#1018). A
+  pending handler still runs, at the first OCaml poll point after the stub
+  returns.
 - Rust alone handles Temporal/Core protobuf. Strict JSON activation and
   completion documents cross the language boundary as owned buffers with one
   explicit free path; OCaml copies them into typed values before execution.
