@@ -16,6 +16,9 @@ set -eu
 # test/smoke/test_live_regressions_contract.sh requires the same membership.
 root=$(CDPATH='' cd -- "$(dirname "$0")/../../../.." && pwd)
 fixture="$root/test/integration/temporal"
+# The digest-pinned base image (docker/ocaml-<series>/Dockerfile). Make passes
+# an already resolved reference; a direct run defaults to the 5.2 series.
+ocaml_image=$(sh "$root/scripts/ocaml-image.sh" "${OCAML_IMAGE:-ocaml-5.2}")
 compose_file="$fixture/compose.yaml"
 project=${TEMPORAL_COMPOSE_PROJECT:-ocaml-temporal-integration}
 # Seconds for one regression process, including its fresh-worker replays. The
@@ -43,7 +46,7 @@ done
 # Applies one normalized Compose invocation, matching the other controllers so
 # the existing development image and network are reused rather than rebuilt.
 compose() {
-  OCAML_IMAGE=${OCAML_IMAGE:-ocaml-5.2} \
+  OCAML_IMAGE=$ocaml_image \
     HOST_UID=${HOST_UID:-$(id -u)} HOST_GID=${HOST_GID:-$(id -g)} \
     docker compose --project-directory "$fixture" --file "$compose_file" \
       --project-name "$project" --profile temporal "$@"

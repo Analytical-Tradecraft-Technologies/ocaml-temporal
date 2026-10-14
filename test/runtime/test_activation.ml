@@ -1084,7 +1084,7 @@ let test_child_cancelled_before_start_acknowledgment () =
 let test_child_start_conflicting_result_keeps_future_pending () =
   let scheduler = Scheduler.create () in
   let context = Workflow_context_store.create scheduler in
-  let future, _cancel =
+  let future, _started, _cancel =
     Workflow_context_store.start_child_workflow context ~id:"child-id"
       ~name:"child-workflow" ~input:[ payload "Ada" ]
       ~decode:(fun value -> Ok value) ()
@@ -1349,7 +1349,7 @@ let test_activity_cancel_owner_check () =
 let test_child_cancel_after_natural_completion_is_noop () =
   let scheduler = Scheduler.create () in
   let context = Workflow_context_store.create scheduler in
-  let future, cancel =
+  let future, _started, cancel =
     Workflow_context_store.start_child_workflow context ~id:"late-cancel-child"
       ~name:"child-workflow" ~input:[ payload "Ada" ]
       ~decode:(fun value -> Ok value) ()
@@ -1405,7 +1405,7 @@ let test_child_cancel_after_natural_completion_is_noop () =
 let test_child_cancel_after_start_failure_is_noop () =
   let scheduler = Scheduler.create () in
   let context = Workflow_context_store.create scheduler in
-  let future, cancel =
+  let future, _started, cancel =
     Workflow_context_store.start_child_workflow context ~id:"failed-child"
       ~name:"child-workflow" ~input:[ payload "Ada" ]
       ~decode:(fun value -> Ok value) ()
@@ -1452,7 +1452,7 @@ let test_child_cancel_after_start_failure_is_noop () =
 let test_child_resolution_rejections_preserve_lifecycle_state () =
   let scheduler = Scheduler.create () in
   let context = Workflow_context_store.create scheduler in
-  let future, _cancel =
+  let future, _started, _cancel =
     Workflow_context_store.start_child_workflow context ~id:"ordered-child"
       ~name:"child-workflow" ~input:[ payload "Ada" ]
       ~decode:(fun value -> Ok value) ()
@@ -1515,6 +1515,91 @@ let test_child_resolution_rejections_preserve_lifecycle_state () =
         ("duplicate terminal changed the result: " ^ public_error_message error)
   | Some (Ok _) -> failwith "duplicate terminal overwrote the result"
   | None -> failwith "duplicate terminal removed the resolved result")
+
+(** A parent that keeps an [Abandon] child running after it closes awaits the
+    start stage, so its completion is emitted only after Core acknowledges the
+    child start (#1040). The run ID is returned through the public future, and
+    the result future stays pending. *)
+let test_child_started_acknowledgment () =
+  let parent =
+    Temporal.Workflow.define ~name:"abandoning_parent"
+      ~input:Temporal.Codec.unit ~output:Temporal.Codec.string (fun () ->
+        let child =
+          Temporal.Child_workflow.start_handle
+            ~parent_close_policy:Temporal.Child_workflow.Parent_close_policy.Abandon
+            ~id:"bill-1" greeting_child "Ada"
+        in
+        match Temporal.Future.await (Temporal.Child_workflow.started child) with
+        | Error error -> Error error
+        | Ok run_id ->
+            if Temporal.Future.is_ready (Temporal.Child_workflow.future child)
+            then Error (Temporal.Error.defect ~message:"child result settled at start")
+            else Ok run_id)
+  in
+  let execution = Execution.start parent () in
+  (match Execution.activate execution [ Activation.Start_workflow ] with
+  | [ Activation.Start_child_workflow { seq = 1L; _ } ] -> ()
+  | _ -> failwith "parent completed before the child start was acknowledged");
+  expect "parent completes after the start acknowledgment"
+    [ Activation.Complete_workflow (payload "child-run") ]
+    (Execution.activate execution [ child_started 1L ])
+
+(** A child that never starts settles its start stage with the same typed
+    error as its result, whether Core rejects the start or the parent cancels
+    it first, so a parent awaiting [started] is never left blocked. *)
+let test_child_started_failure_paths () =
+  let start_failure =
+    Temporal_base.Error.make ~non_retryable:true ~category:`Child_workflow
+      ~message:"child workflow start failed" ()
+  in
+  let cancelled =
+    Temporal_base.Error.make ~category:`Cancelled ~message:"child cancelled" ()
+  in
+  List.iter
+    (fun (label, cancel_first, job, kind) ->
+      let parent =
+        Temporal.Workflow.define ~name:"started_failure_parent"
+          ~input:Temporal.Codec.unit ~output:Temporal.Codec.string (fun () ->
+            let child =
+              Temporal.Child_workflow.start_handle
+                ~cancellation_type:Temporal.Child_workflow.Try_cancel
+                ~id:"never-started" greeting_child "Ada"
+            in
+            let cancelled =
+              if cancel_first then Temporal.Child_workflow.cancel child
+              else Ok ()
+            in
+            match cancelled with
+            | Error error -> Error error
+            | Ok () -> (
+                match
+                  ( Temporal.Future.await (Temporal.Child_workflow.started child),
+                    Temporal.Future.peek (Temporal.Child_workflow.future child) )
+                with
+                | Error started, Some (Error result)
+                  when Temporal.Error.kind started = Temporal.Error.kind result ->
+                    Ok (Temporal.Error.kind started)
+                | Ok _, _ -> Error (Temporal.Error.defect ~message:"child started")
+                | Error _, _ ->
+                    Error
+                      (Temporal.Error.defect
+                         ~message:"start stage and result disagree")))
+      in
+      let execution = Execution.start parent () in
+      ignore (Execution.activate execution [ Activation.Start_workflow ]);
+      expect label [ Activation.Complete_workflow (payload kind) ]
+        (Execution.activate execution [ job ]))
+    [
+      ( "start failure settles the start stage",
+        false,
+        Activation.Resolve_child_workflow_start
+          { seq = 1L; result = Error start_failure },
+        "child_workflow" );
+      ( "pre-start cancellation settles the start stage",
+        true,
+        Activation.Resolve_child_workflow { seq = 1L; result = Error cancelled },
+        "cancelled" );
+    ]
 
 (** Verifies cancellation emits once and cache removal releases blocked state
     without producing a workflow command. *)
@@ -2242,6 +2327,31 @@ let test_workflow_search_attribute_upsert () =
         failwith "search-attribute payload was not retained"
   | _ -> failwith "search-attribute upsert emitted an unexpected command sequence"
 
+(** Verifies an empty search-attribute upsert emits no command (#1033).
+    Temporal Server rejects an upsert with empty indexed fields, and replay
+    would re-emit it on every task retry, so the only safe encoding of an
+    empty merge is no command at all. A non-empty upsert in the same
+    activation must still be emitted exactly once, in order. *)
+let test_workflow_empty_search_attribute_upsert () =
+  let workflow =
+    Temporal.Workflow.define ~name:"empty_search_attribute_upsert"
+      ~input:Temporal.Codec.unit ~output:Temporal.Codec.unit (fun () ->
+        Temporal.Workflow.upsert_search_attributes [];
+        let value =
+          match Temporal.Codec.encode Temporal.Codec.string "ready" with
+          | Ok value -> value
+          | Error error -> failwith (Temporal.Error.message error)
+        in
+        Temporal.Workflow.upsert_search_attributes [ ("status", value) ];
+        Temporal.Workflow.upsert_search_attributes [];
+        Ok ())
+  in
+  let execution = Execution.start workflow () in
+  match Execution.activate execution [ Activation.Start_workflow ] with
+  | [ Activation.Upsert_search_attributes { search_attributes = [ ("status", _) ] };
+      Activation.Complete_workflow _ ] -> ()
+  | _ -> failwith "empty search-attribute upsert emitted a command"
+
 (** Verifies public child routing and parent closure remain separate from
     explicit cancellation, and survive the native protocol translation. *)
 let test_child_routing_and_parent_close () =
@@ -2314,6 +2424,8 @@ let () =
   test_child_cancel_after_natural_completion_is_noop ();
   test_child_cancel_after_start_failure_is_noop ();
   test_child_resolution_rejections_preserve_lifecycle_state ();
+  test_child_started_acknowledgment ();
+  test_child_started_failure_paths ();
   test_cancel_and_evict ();
   test_continue_as_new_terminal ();
   test_codec_callback_preserves_terminal_control ();
@@ -2329,4 +2441,5 @@ let () =
   test_incoming_patch_notification_snapshot ();
   test_workflow_random_int_is_replay_stable ();
   test_update_validator_cannot_consume_workflow_randomness ();
-  test_workflow_search_attribute_upsert ()
+  test_workflow_search_attribute_upsert ();
+  test_workflow_empty_search_attribute_upsert ()

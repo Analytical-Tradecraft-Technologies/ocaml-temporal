@@ -471,7 +471,14 @@ checks that the execution's IDs never appear in the scrape.
 ### Failure isolation and resource use
 
 The scrape server is Core's own Prometheus exporter, running as one task on
-the runtime's background I/O threads. It never runs OCaml code and is not on
+the runtime's background I/O threads behind the SDK's own listener. The SDK
+accepts scrape connections on `bind_address` and relays each one to Core's
+exporter on a private loopback port, so an `accept()` error (for example
+descriptor exhaustion, or a client that resets before it is accepted) is
+logged and retried with a backoff of at most one second instead of stopping
+the endpoint (#1030). If Core's exporter itself stops, scrapes receive
+`503 Service Unavailable` and one `error` record is logged; recreating the
+runtime restores the endpoint. It never runs OCaml code and is not on
 the workflow or activity path: instruments are updated in memory, so a slow,
 failing, or absent scraper cannot block, fail, or reorder workflow and
 activity execution or change durable behavior. Memory is bounded by the

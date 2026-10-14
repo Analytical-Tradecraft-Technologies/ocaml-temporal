@@ -1,5 +1,9 @@
+; [main] is also linked as bytecode: the documented Dune [(modes byte)]
+; consumer must link outside the SDK workspace, which does not inherit its
+; [disable_dynamically_linked_foreign_archives] setting (#1020).
 (executable
  (name main)
+ (modes exe byte)
  (modules main public_api)
  (libraries temporal-sdk))
 

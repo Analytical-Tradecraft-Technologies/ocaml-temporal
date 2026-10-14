@@ -49,12 +49,16 @@ module Make (Backend : Backend) = struct
       progress transitions; it must never be held across [Mailbox.await] or
       [Mailbox.join], so [initiate_shutdown] cannot block behind full teardown.
       [shutdown_finished] lets the finalizer skip redundant cleanup after
-      explicit closure. All native graph access remains in [mailbox]. *)
+      explicit closure. [cleanup_delegated] is set by an owning wrapper that
+      takes over abandoned-instance cleanup (see {!delegate_abandoned_cleanup});
+      the supervisor's own finalizer then does nothing. All native graph access
+      remains in [mailbox]. *)
   type t = {
     mailbox : Mailbox.t;
     shutdown_mutex : Mutex.t;
     mutable shutdown_progress : shutdown_progress;
     shutdown_finished : bool Atomic.t;
+    cleanup_delegated : bool Atomic.t;
   }
 
   (** Runs an operation with [mutex] held and always releases it. *)
@@ -216,9 +220,17 @@ module Make (Backend : Backend) = struct
       via [Mailbox.close], which would contradict the finalizer contract and
       can raise [Sys_error] on an error-checking mutex already held by this
       Domain. The runtime custom-block finalizer remains the last-resort native
-      reclaim path if the owner never drains. *)
+      reclaim path if the owner never drains.
+
+      When an owner has delegated cleanup, this finalizer does nothing: the
+      owner and this supervisor typically become unreachable in the same
+      collection, and [Gc.finalise] then runs both finalizers, so only one of
+      them may start the shutdown (#1044). *)
   let cleanup_abandoned supervisor =
-    if not (Atomic.get supervisor.shutdown_finished) then
+    if
+      (not (Atomic.get supervisor.cleanup_delegated))
+      && not (Atomic.get supervisor.shutdown_finished)
+    then
       match
         Thread.create
           (fun instance -> ignore (shutdown instance))
@@ -227,6 +239,16 @@ module Make (Backend : Backend) = struct
       | _thread -> ()
       | exception _ -> (
           try initiate_shutdown supervisor with _ -> ())
+
+  (** Hands abandoned-instance cleanup to the caller. OCaml gives no ordering
+      between the finalizers of values that become unreachable in the same
+      collection, and resurrecting an owner from its own finalizer does not
+      cancel a finalizer already scheduled for this supervisor. An owner that
+      must drain its own state before the graph closes therefore calls this
+      once it holds the supervisor, and its own finalizer becomes the only
+      path that shuts the supervisor down. *)
+  let delegate_abandoned_cleanup supervisor =
+    Atomic.set supervisor.cleanup_delegated true
 
   (** Starts the mailbox first so backend construction itself occurs on the
       owner Domain. Failed initialization stops and joins that Domain before
@@ -254,6 +276,7 @@ module Make (Backend : Backend) = struct
             shutdown_mutex = Mutex.create ();
             shutdown_progress = Shutdown_open;
             shutdown_finished = Atomic.make false;
+            cleanup_delegated = Atomic.make false;
           }
         in
         Gc.finalise cleanup_abandoned supervisor;

@@ -7,8 +7,13 @@
     [Workflow.sleep], [Child_workflow.execute], [Scope], [Condition],
     signals, queries, updates, and [Workflow.continue_as_new] behave as they
     do against a server. A small simulator stands in for the server: it runs
-    activities when they are scheduled, starts child workflows, routes
-    signals and cancellations, and fires timers.
+    activities when they are scheduled, starts child workflows (retrying a
+    failed child run under its retry policy), routes signals and
+    cancellations, and fires timers. It delivers each activation's jobs in
+    Temporal Core's order, reports activity and child failures with the
+    native worker's error categories, types, and retryability, and, like a
+    server, never dispatches an activity, child start, or external signal
+    or cancellation emitted in the same activation that closes the run.
 
     Time is virtual. It starts at a fixed instant (2024-01-01T00:00:00Z by
     default) and moves only when {!result} or {!update} waits for a workflow
@@ -35,8 +40,12 @@
     Differences from a server, which a test should not rely on:
     - Activities complete in zero virtual time; schedule-to-start,
       start-to-close, schedule-to-close, and heartbeat timeouts are not
-      enforced. Activity retry policies are honored, with backoff delays in
-      virtual time; an unlimited policy is capped (see {!create}).
+      enforced. Activity and child-workflow retry policies are honored,
+      with backoff delays in virtual time; an unlimited policy is capped
+      (see {!create}).
+    - Workflow code is never replayed, so nondeterministic workflow code is
+      not detected; use [Temporal.Replay] against recorded histories for
+      that.
     - A workflow task failure (an exception, a [Defect], [Codec], or [Bridge]
       error, or an unhandled signal) ends the run with that error instead of
       being retried until the code is fixed.
@@ -69,7 +78,8 @@ val workflow :
   registered_workflow
 
 (** Registers [implementation] under the name and codecs of [workflow],
-    replacing any other registration with that name. Use it to stub a child
+    replacing any other registration with that name wherever it appears in
+    the list. Use it to stub a child
     workflow, including a [Workflow.remote] reference implemented by another
     worker. The stub runs as a real workflow, so it may itself use workflow
     operations. *)
@@ -92,7 +102,8 @@ type registered_activity
 val activity : ('input, 'output) Activity.t -> registered_activity
 
 (** Registers [implementation] under the name and codecs of [activity],
-    replacing any other registration with that name. This is the usual way
+    replacing any other registration with that name wherever it appears in
+    the list. This is the usual way
     to isolate workflow logic from external I/O: the workflow still encodes
     the input, and the stub's output is still decoded through the
     activity's codecs. *)
@@ -105,13 +116,14 @@ val mock_activity :
 type t
 
 (** Creates an environment. Registering two definitions with the same name
-    is a defect unless the later one comes from {!mock_workflow} or
-    {!mock_activity}, which replace it. [namespace] and [task_queue] default
+    is a defect unless exactly one comes from {!mock_workflow} or
+    {!mock_activity}, which replaces the other regardless of order. [namespace] and [task_queue] default
     to ["default"] and ["temporal-testing"] and are reported by
     [Workflow.info]. [start_time] is the initial virtual time.
     [max_activity_attempts] (default [10]) caps the attempts of an activity
     whose retry policy is unlimited, which includes the server default used
-    when a workflow supplies no policy. Invalid settings return a defect. *)
+    when a workflow supplies no policy, and the runs of a child workflow
+    whose retry policy is unlimited. Invalid settings return a defect. *)
 val create :
   ?namespace:string ->
   ?task_queue:string ->

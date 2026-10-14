@@ -246,10 +246,21 @@ without calling the external service again.
 ### Update indexed search attributes
 
 Workflows can publish indexed search attributes by emitting one deterministic
-merge command. The values are ordinary `Temporal.Payload.t` values, so the
-same codecs used for activity and workflow inputs can be reused. Keys must be
-unique, non-empty, valid UTF-8 strings no longer than 65,536 bytes; invalid
-keys are programmer errors and are rejected before the command is buffered.
+merge command. The values are ordinary `Temporal.Payload.t` values, but
+Temporal Server decodes them itself with its default converter rather than
+through the worker's codecs. Each value must be a `json/plain` encoding of the
+attribute's registered type, such as the output of `Temporal.Codec.string`,
+`Temporal.Codec.int`, or `Temporal.Codec.bool`. A `binary/null` payload, such
+as `Temporal.Codec.option` encoding `None`, removes the key. A custom codec made
+with `~encoding:"json/plain"` that emits valid JSON of the registered type is
+accepted like a built-in one. Any other encoding, such as
+`Temporal.Codec.bytes` (`binary/plain`) or a custom encoding name, is rejected
+by the server with `BAD_SEARCH_ATTRIBUTES`; that fails the workflow task on every retry until
+the workflow code is corrected. Keys must be unique, non-empty, valid UTF-8
+strings no longer than 65,536 bytes; invalid keys are programmer errors and are
+rejected before the command is buffered. Upserting an empty list is a no-op and
+emits no command, so a filtered list of changed attributes can be passed
+directly.
 
 ```ocaml
 let classify_workflow () =
@@ -760,6 +771,16 @@ and `execute`, so an ordinary `cancel` call requests cancellation; select
 `Abandon` explicitly when the child should keep running. The reason is
 validated before it becomes a durable command, and the handle cannot be forged
 for another child sequence.
+
+`Temporal.Child_workflow.started child` resolves with the child's run ID once
+Temporal has started it, without waiting for the result; if the child never
+starts, it resolves with the same error as the result future. A parent that
+starts a child with `~parent_close_policy:Abandon` so the child outlives it
+must await `started` before returning: Temporal Server does not start a child
+whose parent has already closed, so a child scheduled in the parent's last
+workflow task is otherwise silently never started. The Go and Java SDKs make
+the same requirement through their child-execution futures, and the Python and
+TypeScript `start_child` calls wait for the start themselves.
 
 The definitions and calls above compile, and the synthetic runtime tests cover
 child scheduling and deterministic future resolution. The native protocol and
@@ -1273,21 +1294,24 @@ This applies to Unix platforms such as Linux and macOS. On Windows,
 not the SDK has started; use `Unix.create_process` or `Unix.open_process*` to
 run other processes there.
 
-**Link a native or `-custom` bytecode executable.** The private Rust bridge and
-its C stubs are installed only as static archives; no shared library is
-installed for the bytecode runtime to load. These link modes are supported:
+**Link a native or bytecode executable.** The private Rust bridge and its C
+stubs are installed only as static archives; no shared library is installed
+for the bytecode runtime to load. These link modes are supported:
 
 - native executables (`ocamlfind ocamlopt ... -linkpkg`, or Dune executables
   in the default native mode);
-- bytecode executables linked with `-custom`, which embed the static archives
-  in a custom runtime;
-- Dune `(modes byte)` executables.
+- bytecode executables, including Dune `(modes byte)` executables and
+  `ocamlfind ocamlc -package temporal-sdk -linkpkg`. The installed bridge
+  library forces `-custom`, so `ocamlc` always builds a custom runtime that
+  embeds the static archives. Such an executable runs without
+  `dllocaml_temporal_core_bridge` and needs no `dune-workspace` setting in your
+  project;
+- Dune `(modes byte_complete)` executables.
 
-Plain dynamically loaded bytecode (`ocamlfind ocamlc -package temporal-sdk
--linkpkg` without `-custom`) fails at startup because the runtime cannot find
-`dllocaml_temporal_core_bridge`, and the toplevel or utop
-(`#require "temporal-sdk";;`) fails with a shared-library loading error. Native
-plugins (`.cmxs`) are also unsupported. The design reasons are recorded in the
+The toplevel or utop (`#require "temporal-sdk";;`) cannot load the bridge and
+fails with a shared-library loading error, because loading a library into a
+running bytecode interpreter needs the shared stub library that is not
+installed. Native plugins (`.cmxs`) are also unsupported. The design reasons are recorded in the
 [Core bridge reference](../reference/core-bridge.md#supported-link-modes).
 
 ## Test workflows in-process
@@ -1396,18 +1420,29 @@ definitions. Only workflow code runs: recorded activity and child-workflow
 results come from the history. `Replay.replay_all` replays a list of
 histories, each in an isolated native graph, and keeps every result.
 
-The input is the binary protobuf encoding of Temporal's
-`temporal.api.history.v1.History` message plus the workflow ID, which the
-message does not carry. `temporal workflow show --output json` produces the
+The input is the binary protobuf encoding of one complete
+`temporal.api.history.v1.History` message plus the execution's workflow ID,
+which the workflow observes through `Workflow.info` during replay. Histories
+from Temporal Server 1.21 or later also record the ID in their start event;
+replay then requires the two to match and reports `Invalid_history` otherwise,
+so one execution's history cannot be replayed under another's ID. A single
+`GetWorkflowExecutionHistory` response is one page: fetch and concatenate
+every page, because a truncated history can still pass while covering only
+its first tasks. `temporal workflow show --output json` produces the
 protobuf **JSON** form, so convert it with a protobuf library that has the
 Temporal API descriptors, for example Python's
-`google.protobuf.json_format.Parse` followed by `SerializeToString`. Exported
-histories contain workflow inputs, results, and signal payloads; treat them as
-production data, and prefer synthetic or scrubbed executions in a repository.
+`google.protobuf.json_format.Parse` followed by `SerializeToString`; the
+[replay example](../../examples/README.md#export-a-history) has a converter
+that also accepts the legacy Web UI and `tctl` JSON shape and several pages.
+Exported histories contain workflow inputs, results, and signal payloads;
+treat them as production data, and prefer synthetic or scrubbed executions in
+a repository. Scrub payloads only: every event must keep its `eventId` and
+`eventTime`.
 
 The result distinguishes:
 
-- `Ok ()`: Core accepted every recorded workflow task, including runs that
+- `Ok ()`: Core started the recorded run, delivered it to the registered
+  workflow, and accepted every recorded workflow task, including runs that
   recorded failed tasks or a deliberate workflow failure.
 - `Nondeterminism`: the code produced a different command sequence, for
   example a removed timer. `message` is Core's complete description, and

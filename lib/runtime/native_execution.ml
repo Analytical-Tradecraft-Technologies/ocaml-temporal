@@ -1415,15 +1415,23 @@ let activate_translated execution (translated : translated_activation) =
                        context.retry_policy);
                  (* Only provenance is retained: the predecessor's failure and
                     completion payloads are not part of the public run info,
-                    so their mutable payload bytes are never shared here. *)
+                    so their mutable payload bytes are never shared here. A
+                    Temporal Schedule action carries the previous action's
+                    result or failure with an empty run ID (#1015); it has no
+                    predecessor run, so it is stored as [None] to keep the
+                    store's "[None] for a first run" invariant. *)
                  continued_from =
                    Option.bind context
                      (fun (context : Protocol.initialize_context) ->
-                       Option.map
+                       Option.bind context.continuation
                          (fun (continuation : Protocol.continuation) ->
-                           ( continuation.continued_from_execution_run_id,
-                             continuation.initiator ))
-                         context.continuation);
+                           if String.equal
+                                continuation.continued_from_execution_run_id ""
+                           then None
+                           else
+                             Some
+                               ( continuation.continued_from_execution_run_id,
+                                 continuation.initiator )));
                });
         Ok ()
   in
@@ -1476,9 +1484,19 @@ let activate_translated execution (translated : translated_activation) =
      before the query and eviction checks below, in the same order as before
      the encoded bytes were retained. *)
   let* checked =
-    match Execution.task_failure execution with
-    | None -> encoded_completion_of_commands ~run_id:translated.run_id commands
-    | Some error ->
+    match (translated.cache_removal, Execution.task_failure execution) with
+    | None, None ->
+        encoded_completion_of_commands ~run_id:translated.run_id commands
+    | Some _, _ ->
+        (* A pure cache eviction is always acknowledged with an empty
+           completion: Core rejects anything else, and because workflow
+           completions are not retried, a failure here would stop the worker
+           with the eviction lease outstanding (#1021). The execution already
+           drops errors raised while evicted fibers unwind; ignoring
+           [task_failure] here keeps that rule even for a failure recorded
+           earlier, and the commands check below rejects anything else. *)
+        encoded_completion_of_commands ~run_id:translated.run_id commands
+    | None, Some error ->
         let* failure = protocol_failure "$.task_failure" error in
         let completion = Protocol.{
           run_id = translated.run_id; commands = []; task_failure = Some failure

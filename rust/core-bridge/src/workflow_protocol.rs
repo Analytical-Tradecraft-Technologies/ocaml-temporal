@@ -1240,9 +1240,12 @@ pub(crate) fn validate_failure(value: &Failure, path: &str) -> Result<(), Protoc
                     "activity failure event IDs must not be negative",
                 ));
             }
+            // The type and ID are copies written into the failure by an SDK
+            // (possibly another language's), not values the server bounds as
+            // identifiers, so they are checked only as bounded text (#1050).
             bounded_text(identity, path)?;
-            identifier(activity_type, path)?;
-            identifier(activity_id, path)?;
+            bounded_text(activity_type, path)?;
+            bounded_text(activity_id, path)?;
         }
         FailureInfo::ChildWorkflow {
             namespace,
@@ -1253,16 +1256,18 @@ pub(crate) fn validate_failure(value: &Failure, path: &str) -> Result<(), Protoc
             started_event_id,
             retry_state: _,
         } => {
-            identifier(namespace, path)?;
-            identifier(workflow_id, path)?;
-            identifier(workflow_type, path)?;
+            // SDK-written copies: the Java SDK, for example, reports a child
+            // cancelled before its start command was sent with namespace "".
+            // They are bounded text, not server identifiers (#1050).
+            for text in [namespace, workflow_id, workflow_type, run_id] {
+                bounded_text(text, path)?;
+            }
             if *initiated_event_id < 0 || *started_event_id < 0 {
                 return Err(ProtocolError::invalid(
                     path,
                     "child workflow failure event IDs must not be negative",
                 ));
             }
-            validate_child_failure_run_id(run_id, *started_event_id, path)?;
         }
         FailureInfo::Timeout {
             last_heartbeat_details,
@@ -1302,33 +1307,6 @@ pub(crate) fn validate_failure(value: &Failure, path: &str) -> Result<(), Protoc
         validate_failure(cause, path)?;
     }
     Ok(())
-}
-
-/// Validates the execution ID carried by a child-workflow failure.
-///
-/// Temporal Core emits a child failure while the child start is still in
-/// flight when a parent cancels it before `ChildWorkflowExecutionStarted`.
-/// In that narrow state Core has no concrete run ID yet and therefore emits
-/// an empty string together with `started_event_id == 0`.  The empty value is
-/// meaningful protocol state, not a missing field, so the bridge preserves it
-/// while retaining the ordinary identifier checks once the child has started.
-fn validate_child_failure_run_id(
-    run_id: &str,
-    started_event_id: i64,
-    path: &str,
-) -> Result<(), ProtocolError> {
-    if run_id.is_empty() {
-        if started_event_id == 0 {
-            Ok(())
-        } else {
-            Err(ProtocolError::invalid(
-                path,
-                "child failure run_id may be empty only before the child starts",
-            ))
-        }
-    } else {
-        identifier(run_id, path)
-    }
 }
 
 /// Applies invariants that derive-based closed-shape validation cannot express.
@@ -1512,16 +1490,20 @@ fn validate_activation(value: &Activation) -> Result<(), ProtocolError> {
                         identifier(&root.run_id, "$.jobs.context.root_workflow.run_id")?;
                     }
                     if let Some(priority) = &context.priority {
-                        validate_priority(priority, "$.jobs.context.priority")?;
+                        validate_inbound_priority(priority, "$.jobs.context.priority")?;
                     }
                     if let Some(retry_policy) = &context.retry_policy {
-                        validate_retry_policy(retry_policy, "$.jobs.context.retry_policy")?;
+                        validate_inbound_retry_policy(retry_policy, "$.jobs.context.retry_policy")?;
                     }
                     if let Some(continuation) = &context.continuation {
-                        identifier(
-                            &continuation.continued_from_execution_run_id,
-                            "$.jobs.context.continuation.continued_from_execution_run_id",
-                        )?;
+                        // Empty means a schedule-started run that carries the
+                        // previous action's result or failure (#1015).
+                        if !continuation.continued_from_execution_run_id.is_empty() {
+                            identifier(
+                                &continuation.continued_from_execution_run_id,
+                                "$.jobs.context.continuation.continued_from_execution_run_id",
+                            )?;
+                        }
                         if let Some(failure) = &continuation.continued_failure {
                             validate_failure(
                                 failure,
@@ -2093,6 +2075,67 @@ fn validate_priority(value: &WorkflowPriority, path: &str) -> Result<(), Protoco
     Ok(())
 }
 
+/// Validates a priority received from Temporal (workflow initialization).
+///
+/// The server only rejects a negative priority key, a fairness key over 64
+/// bytes, or a negative weight, and the API documents that weights are
+/// *clamped* to [0.001, 1000] rather than rejected; another SDK may also put
+/// a NUL in the fairness key. The strict [`validate_priority`] rules are for
+/// values this SDK sends. Inbound, only what the semantic record must
+/// represent is checked: the 64-byte fairness-key bound. The weight's exact
+/// bits are carried unchanged (#1016).
+fn validate_inbound_priority(value: &WorkflowPriority, path: &str) -> Result<(), ProtocolError> {
+    if value.fairness_key.len() > 64 {
+        return Err(ProtocolError::invalid(
+            path,
+            "fairness key exceeds Core's 64-byte limit",
+        ));
+    }
+    Ok(())
+}
+
+/// Validates a workflow retry policy received from Temporal.
+///
+/// The server skips every retry-policy check when `maximum_attempts` is 1,
+/// so a started run can legitimately carry a backoff coefficient below 1.0,
+/// an empty non-retryable error type, or intervals that the outbound
+/// [`validate_retry_policy`] would reject (#1016). Inbound, only what the
+/// semantic record must represent is checked: normalized non-negative
+/// durations (the conversion clamps negative or absent intervals to zero), a
+/// canonical coefficient bit pattern, a non-negative attempt count, and
+/// bounded error-type text.
+fn validate_inbound_retry_policy(value: &RetryPolicy, path: &str) -> Result<(), ProtocolError> {
+    validate_time(
+        value.initial_interval.seconds,
+        value.initial_interval.nanoseconds,
+        true,
+        &format!("{path}.initial_interval"),
+    )?;
+    validate_time(
+        value.maximum_interval.seconds,
+        value.maximum_interval.nanoseconds,
+        true,
+        &format!("{path}.maximum_interval"),
+    )?;
+    validate_uint64_decimal(
+        &value.backoff_coefficient_bits,
+        &format!("{path}.backoff_coefficient_bits"),
+    )?;
+    if value.maximum_attempts < 0 {
+        return Err(ProtocolError::invalid(
+            format!("{path}.maximum_attempts"),
+            "maximum attempts must not be negative",
+        ));
+    }
+    for (index, error_type) in value.non_retryable_error_types.iter().enumerate() {
+        bounded_text(
+            error_type,
+            &format!("{path}.non_retryable_error_types[{index}]"),
+        )?;
+    }
+    Ok(())
+}
+
 /// Strictly decodes one workflow activation.
 pub fn decode_activation(input: &str) -> Result<Activation, ProtocolError> {
     let value = protocol::decode_payload_object(input)?;
@@ -2260,13 +2303,20 @@ fn inbound_payload_map_from_core<'a>(
         .collect()
 }
 
-/// Copies one Core payload while rejecting external references this JSON slice cannot preserve.
+/// Copies one inbound Core payload.
+///
+/// `external_payloads` is the API's external-storage size information
+/// written by a peer SDK that offloads large payloads. It describes storage
+/// the OCaml SDK cannot resolve, and the payload's own data and metadata are
+/// still meaningful (a codec decides how to interpret them), so the size
+/// details are dropped rather than rejecting the whole activation, task or
+/// client result (#1050). A metadata entry with an empty key, which a peer
+/// codec may write but no OCaml codec can name, is likewise dropped
+/// deterministically. Both rules are pure functions of the payload, so replay
+/// observes the same value. Byte limits and over-long keys remain errors.
 pub(crate) fn payload_from_core(
     value: &api_common::Payload,
 ) -> Result<Payload, CoreConversionError> {
-    if !value.external_payloads.is_empty() {
-        return Err(unsupported("external payload references are not supported"));
-    }
     if value.data.len() > MAX_PAYLOAD_BYTES
         || value
             .metadata
@@ -2278,7 +2328,7 @@ pub(crate) fn payload_from_core(
     if value
         .metadata
         .keys()
-        .any(|key| key.is_empty() || key.len() > MAX_STRING_BYTES)
+        .any(|key| key.len() > MAX_STRING_BYTES)
     {
         return Err(invalid_core(
             "Core payload metadata key is outside protocol limits",
@@ -2288,6 +2338,7 @@ pub(crate) fn payload_from_core(
         metadata: value
             .metadata
             .iter()
+            .filter(|(key, _)| !key.is_empty())
             .map(|(key, bytes)| (key.clone(), bytes.clone()))
             .collect(),
         data: value.data.clone(),
@@ -2371,21 +2422,22 @@ fn payloads_to_core(values: &[Payload]) -> Result<api_common::Payloads, CoreConv
     })
 }
 
-/// Maps the official retry enum without accepting future unknown integer values.
-fn retry_state_from_core(value: i32) -> Result<RetryState, CoreConversionError> {
+/// Maps the official retry enum. A number the pinned enum does not know
+/// (written by a newer server or another SDK) becomes `Unspecified`: the
+/// retry state is advisory diagnostic metadata inside an immutable failure,
+/// and rejecting it would fail every replay of the workflow task (#1017).
+fn retry_state_from_core(value: i32) -> RetryState {
     use api_enums::RetryState as Core;
-    Ok(
-        match Core::try_from(value).map_err(|_| invalid_core("unknown Core retry state"))? {
-            Core::Unspecified => RetryState::Unspecified,
-            Core::InProgress => RetryState::InProgress,
-            Core::NonRetryableFailure => RetryState::NonRetryableFailure,
-            Core::Timeout => RetryState::Timeout,
-            Core::MaximumAttemptsReached => RetryState::MaximumAttemptsReached,
-            Core::RetryPolicyNotSet => RetryState::RetryPolicyNotSet,
-            Core::InternalServerError => RetryState::InternalServerError,
-            Core::CancelRequested => RetryState::CancelRequested,
-        },
-    )
+    match Core::try_from(value).unwrap_or(Core::Unspecified) {
+        Core::Unspecified => RetryState::Unspecified,
+        Core::InProgress => RetryState::InProgress,
+        Core::NonRetryableFailure => RetryState::NonRetryableFailure,
+        Core::Timeout => RetryState::Timeout,
+        Core::MaximumAttemptsReached => RetryState::MaximumAttemptsReached,
+        Core::RetryPolicyNotSet => RetryState::RetryPolicyNotSet,
+        Core::InternalServerError => RetryState::InternalServerError,
+        Core::CancelRequested => RetryState::CancelRequested,
+    }
 }
 
 /// Maps a semantic retry state to the exact official protobuf number.
@@ -2403,20 +2455,19 @@ fn retry_state_to_core(value: RetryState) -> i32 {
     }) as i32
 }
 
-/// Maps Core's timeout enum without accepting unknown values from a newer
-/// protobuf revision. Rejecting an unknown integer is safer than silently
-/// changing timeout semantics during replay.
-fn timeout_type_from_core(value: i32) -> Result<TimeoutType, CoreConversionError> {
+/// Maps Core's timeout enum. An unknown number from a newer protobuf
+/// revision becomes `Unspecified`, which names no timeout kind rather than
+/// guessing one; the mapping is a pure function of history, so replay stays
+/// deterministic, and the failure is still delivered (#1017).
+fn timeout_type_from_core(value: i32) -> TimeoutType {
     use api_enums::TimeoutType as Core;
-    Ok(
-        match Core::try_from(value).map_err(|_| invalid_core("unknown Core timeout type"))? {
-            Core::Unspecified => TimeoutType::Unspecified,
-            Core::StartToClose => TimeoutType::StartToClose,
-            Core::ScheduleToStart => TimeoutType::ScheduleToStart,
-            Core::ScheduleToClose => TimeoutType::ScheduleToClose,
-            Core::Heartbeat => TimeoutType::Heartbeat,
-        },
-    )
+    match Core::try_from(value).unwrap_or(Core::Unspecified) {
+        Core::Unspecified => TimeoutType::Unspecified,
+        Core::StartToClose => TimeoutType::StartToClose,
+        Core::ScheduleToStart => TimeoutType::ScheduleToStart,
+        Core::ScheduleToClose => TimeoutType::ScheduleToClose,
+        Core::Heartbeat => TimeoutType::Heartbeat,
+    }
 }
 
 /// Converts the semantic timeout enum to the official protobuf number.
@@ -2431,16 +2482,15 @@ fn timeout_type_to_core(value: TimeoutType) -> i32 {
     }) as i32
 }
 
-/// Maps only the categories supported by the pinned Core protobuf schema.
-fn application_category_from_core(
-    value: i32,
-) -> Result<ApplicationFailureCategory, CoreConversionError> {
+/// Maps the categories of the pinned Core protobuf schema. Go's
+/// `ApplicationErrorCategory` is a plain integer, so another SDK can send a
+/// number this schema does not define; it becomes `Unspecified` (the
+/// ordinary category) instead of rejecting the failure (#1017).
+fn application_category_from_core(value: i32) -> ApplicationFailureCategory {
     use api_enums::ApplicationErrorCategory as Core;
-    match Core::try_from(value)
-        .map_err(|_| invalid_core("unknown Core application failure category"))?
-    {
-        Core::Unspecified => Ok(ApplicationFailureCategory::Unspecified),
-        Core::Benign => Ok(ApplicationFailureCategory::Benign),
+    match Core::try_from(value).unwrap_or(Core::Unspecified) {
+        Core::Unspecified => ApplicationFailureCategory::Unspecified,
+        Core::Benign => ApplicationFailureCategory::Benign,
     }
 }
 
@@ -2453,17 +2503,15 @@ fn application_category_to_core(value: ApplicationFailureCategory) -> i32 {
     })
 }
 
-/// Maps Core's Nexus handler retry override without accepting future values.
-fn nexus_retry_behavior_from_core(
-    value: i32,
-) -> Result<NexusHandlerRetryBehavior, CoreConversionError> {
+/// Maps Core's Nexus handler retry override. An unknown future number
+/// becomes `Unspecified`, meaning "no override", instead of rejecting the
+/// failure that carries it (#1017).
+fn nexus_retry_behavior_from_core(value: i32) -> NexusHandlerRetryBehavior {
     use api_enums::NexusHandlerErrorRetryBehavior as Core;
-    match Core::try_from(value)
-        .map_err(|_| invalid_core("unknown Core Nexus handler retry behavior"))?
-    {
-        Core::Unspecified => Ok(NexusHandlerRetryBehavior::Unspecified),
-        Core::Retryable => Ok(NexusHandlerRetryBehavior::Retryable),
-        Core::NonRetryable => Ok(NexusHandlerRetryBehavior::NonRetryable),
+    match Core::try_from(value).unwrap_or(Core::Unspecified) {
+        Core::Unspecified => NexusHandlerRetryBehavior::Unspecified,
+        Core::Retryable => NexusHandlerRetryBehavior::Retryable,
+        Core::NonRetryable => NexusHandlerRetryBehavior::NonRetryable,
     }
 }
 
@@ -2503,12 +2551,13 @@ fn failure_from_core_at(
             type_name: inbound_text(&info.r#type),
             non_retryable: info.non_retryable,
             details: payloads_from_core(info.details.as_ref())?,
-            category: application_category_from_core(info.category)?,
+            category: application_category_from_core(info.category),
             next_retry_delay: info
                 .next_retry_delay
                 .as_ref()
-                .map(duration_from_core)
-                .transpose()?,
+                .map(inbound_retry_delay_from_core)
+                .transpose()?
+                .flatten(),
         },
         Core::CanceledFailureInfo(info) => FailureInfo::Canceled {
             details: payloads_from_core(info.details.as_ref())?,
@@ -2521,36 +2570,40 @@ fn failure_from_core_at(
             scheduled_event_id: info.scheduled_event_id,
             started_event_id: info.started_event_id,
             identity: inbound_text(&info.identity),
-            activity_type: info
-                .activity_type
-                .as_ref()
-                .ok_or_else(|| invalid_core("Core activity failure type is absent"))?
-                .name
-                .clone(),
-            activity_id: info.activity_id.clone(),
-            retry_state: retry_state_from_core(info.retry_state)?,
+            // An SDK-written wrapper may omit the type; absent is empty text.
+            activity_type: inbound_text(
+                info.activity_type
+                    .as_ref()
+                    .map_or("", |activity_type| activity_type.name.as_str()),
+            ),
+            activity_id: inbound_text(&info.activity_id),
+            retry_state: retry_state_from_core(info.retry_state),
         },
         Core::ChildWorkflowExecutionFailureInfo(info) => {
-            let execution = info
+            // SDK-written wrapper fields: an absent execution or type is
+            // carried as empty text rather than rejecting the failure (#1050).
+            let (workflow_id, run_id) = info
                 .workflow_execution
                 .as_ref()
-                .ok_or_else(|| invalid_core("Core child failure execution is absent"))?;
-            let workflow_type = info
-                .workflow_type
-                .as_ref()
-                .ok_or_else(|| invalid_core("Core child failure workflow type is absent"))?;
+                .map_or(("", ""), |execution| {
+                    (execution.workflow_id.as_str(), execution.run_id.as_str())
+                });
             FailureInfo::ChildWorkflow {
-                namespace: info.namespace.clone(),
-                workflow_id: execution.workflow_id.clone(),
-                run_id: execution.run_id.clone(),
-                workflow_type: workflow_type.name.clone(),
+                namespace: inbound_text(&info.namespace),
+                workflow_id: inbound_text(workflow_id),
+                run_id: inbound_text(run_id),
+                workflow_type: inbound_text(
+                    info.workflow_type
+                        .as_ref()
+                        .map_or("", |workflow_type| workflow_type.name.as_str()),
+                ),
                 initiated_event_id: info.initiated_event_id,
                 started_event_id: info.started_event_id,
-                retry_state: retry_state_from_core(info.retry_state)?,
+                retry_state: retry_state_from_core(info.retry_state),
             }
         }
         Core::TimeoutFailureInfo(info) => FailureInfo::Timeout {
-            timeout_type: timeout_type_from_core(info.timeout_type)?,
+            timeout_type: timeout_type_from_core(info.timeout_type),
             last_heartbeat_details: payloads_from_core(info.last_heartbeat_details.as_ref())?,
         },
         Core::ServerFailureInfo(info) => FailureInfo::Server {
@@ -2575,7 +2628,7 @@ fn failure_from_core_at(
         }
         Core::NexusHandlerFailureInfo(info) => FailureInfo::NexusHandler {
             type_name: inbound_text(&info.r#type),
-            retry_behavior: nexus_retry_behavior_from_core(info.retry_behavior)?,
+            retry_behavior: nexus_retry_behavior_from_core(info.retry_behavior),
         },
     };
     failure_layer_from_core(value, info, layer)
@@ -2868,18 +2921,16 @@ fn failure_info_to_core(
     }))
 }
 
-/// Maps Core's continuation initiator enum without accepting future values.
-fn continuation_initiator_from_core(
-    value: i32,
-) -> Result<ContinueAsNewInitiator, CoreConversionError> {
+/// Maps Core's continuation initiator enum. An unknown future number becomes
+/// `Unspecified`, which the public API reports as "no reason" rather than
+/// guessing one, instead of rejecting the run's first activation (#1017).
+fn continuation_initiator_from_core(value: i32) -> ContinueAsNewInitiator {
     use api_enums::ContinueAsNewInitiator as Core;
-    match Core::try_from(value)
-        .map_err(|_| invalid_core("unknown Core continue-as-new initiator"))?
-    {
-        Core::Unspecified => Ok(ContinueAsNewInitiator::Unspecified),
-        Core::Workflow => Ok(ContinueAsNewInitiator::Workflow),
-        Core::Retry => Ok(ContinueAsNewInitiator::Retry),
-        Core::CronSchedule => Ok(ContinueAsNewInitiator::CronSchedule),
+    match Core::try_from(value).unwrap_or(Core::Unspecified) {
+        Core::Unspecified => ContinueAsNewInitiator::Unspecified,
+        Core::Workflow => ContinueAsNewInitiator::Workflow,
+        Core::Retry => ContinueAsNewInitiator::Retry,
+        Core::CronSchedule => ContinueAsNewInitiator::CronSchedule,
     }
 }
 
@@ -2887,6 +2938,12 @@ fn continuation_initiator_from_core(
 /// failure and completion payload field. Core's ordinary initialization uses
 /// an empty run ID, initiator zero, and absent optional values; only that exact
 /// default is represented as [None] in semantic JSON.
+///
+/// A Temporal Schedule starts each action as a fresh run (empty previous run
+/// ID, unspecified initiator) but copies the previous action's result or
+/// failure into `last_completion_result` / `continued_failure` (#1015). That
+/// shape is represented with an empty `continued_from_execution_run_id`,
+/// which the OCaml adapter reports as "no predecessor run".
 fn continuation_from_core(
     value: &core_activation::InitializeWorkflow,
 ) -> Result<Option<Continuation>, CoreConversionError> {
@@ -2897,16 +2954,14 @@ fn continuation_from_core(
     {
         return Ok(None);
     }
-    if value.continued_from_execution_run_id.is_empty()
-        || value.continued_from_execution_run_id.len() > MAX_STRING_BYTES
-    {
+    if value.continued_from_execution_run_id.len() > MAX_STRING_BYTES {
         return Err(invalid_core(
-            "Core continuation run ID is empty or exceeds the protocol limit",
+            "Core continuation run ID exceeds the protocol limit",
         ));
     }
     Ok(Some(Continuation {
         continued_from_execution_run_id: value.continued_from_execution_run_id.clone(),
-        initiator: continuation_initiator_from_core(value.continued_initiator)?,
+        initiator: continuation_initiator_from_core(value.continued_initiator),
         continued_failure: value
             .continued_failure
             .as_ref()
@@ -3132,19 +3187,23 @@ fn validate_initialize_subset(
     Ok(())
 }
 
-/// Maps one pinned Core suggestion reason and rejects future enum numbers.
-fn suggestion_from_core(value: i32) -> Result<SuggestContinueAsNewReason, CoreConversionError> {
+/// Maps one Core continue-as-new suggestion reason.
+///
+/// Reasons are advisory, and Core copies the raw numbers from the latest
+/// workflow-task-started event into every later activation of the run. A
+/// number the pinned enum does not know (value 4, now reserved, from an older
+/// server, or a reason added by a newer one) therefore becomes `Unspecified`
+/// instead of rejecting every later activation (#1017). The OCaml adapter
+/// drops `Unspecified` from `Workflow.Info.continue_as_new_reasons`, while
+/// `continue_as_new_suggested` itself is carried unchanged.
+fn suggestion_from_core(value: i32) -> SuggestContinueAsNewReason {
     use api_enums::SuggestContinueAsNewReason as Core;
-    Ok(
-        match Core::try_from(value)
-            .map_err(|_| invalid_core("unknown Core continue-as-new suggestion reason"))?
-        {
-            Core::Unspecified => SuggestContinueAsNewReason::Unspecified,
-            Core::HistorySizeTooLarge => SuggestContinueAsNewReason::HistorySizeTooLarge,
-            Core::TooManyHistoryEvents => SuggestContinueAsNewReason::TooManyHistoryEvents,
-            Core::TooManyUpdates => SuggestContinueAsNewReason::TooManyUpdates,
-        },
-    )
+    match Core::try_from(value).unwrap_or(Core::Unspecified) {
+        Core::Unspecified => SuggestContinueAsNewReason::Unspecified,
+        Core::HistorySizeTooLarge => SuggestContinueAsNewReason::HistorySizeTooLarge,
+        Core::TooManyHistoryEvents => SuggestContinueAsNewReason::TooManyHistoryEvents,
+        Core::TooManyUpdates => SuggestContinueAsNewReason::TooManyUpdates,
+    }
 }
 
 /// Converts an official pinned-Core activation.
@@ -3252,6 +3311,7 @@ pub fn activation_from_core(
                                     run_id: root.run_id.clone(),
                                 }
                             }),
+                            // Carried as recorded; see validate_inbound_priority.
                             priority: value.priority.as_ref().map(|priority| WorkflowPriority {
                                 priority_key: priority.priority_key,
                                 fairness_key: priority.fairness_key.clone(),
@@ -3260,7 +3320,7 @@ pub fn activation_from_core(
                             retry_policy: value
                                 .retry_policy
                                 .as_ref()
-                                .map(retry_policy_from_core)
+                                .map(inbound_retry_policy_from_core)
                                 .transpose()?,
                             continuation,
                         })),
@@ -3414,7 +3474,7 @@ pub fn activation_from_core(
                 .iter()
                 .copied()
                 .map(suggestion_from_core)
-                .collect::<Result<_, _>>()?,
+                .collect(),
             target_worker_deployment_version_changed: value
                 .target_worker_deployment_version_changed,
         }),
@@ -3429,6 +3489,27 @@ pub(crate) fn duration_to_core(value: Duration) -> prost_wkt_types::Duration {
     prost_wkt_types::Duration {
         seconds: value.seconds,
         nanos: value.nanoseconds,
+    }
+}
+
+/// Converts an inbound application failure's `next_retry_delay`.
+///
+/// The Go SDK writes `durationpb.New(d)` for any non-zero delay, so an
+/// activity that computes `time.Until(retryAt)` after `retryAt` has passed
+/// sends a negative duration, which the server accepts and records in
+/// history (#1049). A negative delay requests no positive wait, so it is
+/// mapped deterministically to `None` (no override) rather than rejecting
+/// the activation, client wait or update outcome that carries it; replay of
+/// the same history always makes the same choice. A non-negative delay is
+/// validated exactly like any other duration. Outbound failures keep the
+/// strict non-negative rule in [`validate_failure`].
+fn inbound_retry_delay_from_core(
+    value: &prost_wkt_types::Duration,
+) -> Result<Option<Duration>, CoreConversionError> {
+    if value.seconds < 0 || value.nanos < 0 {
+        Ok(None)
+    } else {
+        duration_from_core(value).map(Some)
     }
 }
 
@@ -3491,6 +3572,39 @@ fn retry_policy_from_core(
     validate_retry_policy(&policy, "$.commands.retry_policy")
         .map_err(|_| invalid_core("Core retry policy violates semantic invariants"))?;
     Ok(policy)
+}
+
+/// Converts the effective workflow retry policy recorded in a started event.
+///
+/// Unlike [`retry_policy_from_core`], which checks commands against the
+/// outbound rules, this accepts every policy the server recorded (#1016): an
+/// absent or negative interval becomes zero, which Temporal itself treats as
+/// unset, and the remaining fields are carried unchanged for
+/// [`validate_inbound_retry_policy`]. The conversion is a pure function of
+/// history, so replay is deterministic.
+fn inbound_retry_policy_from_core(
+    value: &api_common::RetryPolicy,
+) -> Result<RetryPolicy, CoreConversionError> {
+    let interval = |duration: Option<&prost_wkt_types::Duration>| match duration {
+        Some(duration) if duration.seconds >= 0 && duration.nanos >= 0 => {
+            duration_from_core(duration)
+        }
+        Some(_) | None => Ok(Duration {
+            seconds: 0,
+            nanoseconds: 0,
+        }),
+    };
+    Ok(RetryPolicy {
+        initial_interval: interval(value.initial_interval.as_ref())?,
+        backoff_coefficient_bits: value.backoff_coefficient.to_bits().to_string(),
+        maximum_interval: interval(value.maximum_interval.as_ref())?,
+        maximum_attempts: value.maximum_attempts,
+        non_retryable_error_types: value
+            .non_retryable_error_types
+            .iter()
+            .map(|error_type| inbound_text(error_type))
+            .collect(),
+    })
 }
 
 /// Maps an OCaml-facing cancellation choice to the pinned Core enum.
