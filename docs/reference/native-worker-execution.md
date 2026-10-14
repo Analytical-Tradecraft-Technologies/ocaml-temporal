@@ -359,7 +359,8 @@ timer, set to the same period, also starts then.
 | Native teardown that cannot finish (unreachable server) | The caller stops waiting after the teardown timeout; the shutdown thread still owns and finishes the one release within the bridge's own Core bounds. | `native_teardown = Detached` |
 
 An idle activity lane is never abandoned: at the deadline `run` detaches the
-activity Domain only while it is busy, and otherwise keeps joining it for up
+activity Domain only while an activity callback is running, and otherwise
+keeps joining it for up
 to 150 ms more, which covers its bounded readiness wait (#1023). The
 watchdog Domain stops within one 20 ms sleep slice. A worker stopped with a
 short grace period, including zero, therefore reports `lanes_stopped = true`

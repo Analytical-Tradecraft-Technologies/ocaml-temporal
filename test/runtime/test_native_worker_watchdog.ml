@@ -557,23 +557,29 @@ let test_public_options () =
 let test_stop_does_not_wait_for_tick () =
   if Watchdog.tick_ms ~deadline_ms:2_000 <> 250 then
     failwith "the default deadline no longer uses the longest tick";
-  match
-    Watchdog.start ~deadline_ms:2_000
-      ~running_epoch:(fun () -> None)
-      ~abandon:(fun ~epoch:_ ~elapsed_ms:_ -> ())
-  with
-  | Error _ -> failwith "watchdog Domain did not start"
-  | Ok watchdog ->
-      (* Stop shortly after a tick began, when nearly all of it remains:
-         waiting out the tick would take at least about 0.22 s. The bound
-         sits well below that but leaves room for Domain join latency on a
-         loaded CI runner, which reached 0.116 s on macOS. *)
-      Thread.delay 0.03;
-      let started = Unix.gettimeofday () in
-      Watchdog.stop watchdog;
-      let elapsed = Unix.gettimeofday () -. started in
-      if elapsed > 0.17 then
-        failwith (Printf.sprintf "watchdog stop took %.3fs" elapsed)
+  (* One trial: stop shortly after a tick began, when nearly all of it
+     remains, and return how long [stop] took. Waiting out the tick would
+     take at least about 0.22 s whatever the machine's load. *)
+  let trial () =
+    match
+      Watchdog.start ~deadline_ms:2_000
+        ~running_epoch:(fun () -> None)
+        ~abandon:(fun ~epoch:_ ~elapsed_ms:_ -> ())
+    with
+    | Error _ -> failwith "watchdog Domain did not start"
+    | Ok watchdog ->
+        Thread.delay 0.03;
+        let started = Unix.gettimeofday () in
+        Watchdog.stop watchdog;
+        Unix.gettimeofday () -. started
+  in
+  (* Scheduling and Domain-join latency on a loaded runner only lengthen a
+     trial, and a whole-tick wait can never be shorter than about 0.22 s, so
+     the fastest of several trials separates the two behaviors without a
+     load-sensitive bound (a single trial reached 0.116 s on CI). *)
+  let fastest = List.fold_left Float.min infinity (List.init 5 (fun _ -> trial ())) in
+  if fastest > 0.17 then
+    failwith (Printf.sprintf "watchdog stop took at least %.3fs" fastest)
 
 (** Runs the watchdog regressions. *)
 let () =

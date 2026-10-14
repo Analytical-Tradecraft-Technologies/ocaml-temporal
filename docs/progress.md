@@ -47,7 +47,9 @@ The bounded-shutdown report miscounted (#1023). `callback_running` now reads
 an atomic set around both synchronous and asynchronous callbacks, so an
 abandoned `define_async` callback is reported as `activity_callback` and the
 probe never waits on the delivery lock a heartbeat sweep holds. The run loop
-detaches the activity lane at the deadline only while it is busy, joining an
+detaches the activity lane at the deadline only while a callback runs (the
+atomic probe, not the lane's per-poll busy flag, which CI showed could be
+sampled mid-poll on an idle lane), joining an
 idle lane for up to 150 ms more; the watchdog sleeps in 20 ms slices so its
 stop is prompt. A worker with a grace period of zero or a few milliseconds
 no longer logs `activity_lane_detached` or reports `lanes_stopped = false`

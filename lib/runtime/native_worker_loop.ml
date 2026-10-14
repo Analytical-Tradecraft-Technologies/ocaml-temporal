@@ -82,6 +82,7 @@ type activity_detach = {
   deadline : unit -> float;
   on_detached : unit -> unit;
   on_stop : unit -> unit;
+  callback_running : unit -> bool;
 }
 
 (** Interval at which a bounded join checks whether the activity lane has
@@ -91,15 +92,20 @@ let join_poll_interval_s = 0.01
 let idle_detach_allowance_s = 0.15
 
 (** Whether the bounded join should stop waiting for the activity lane at
-    [now]. A lane busy past [deadline] is running a callback (or a native call
-    made for one) and is detached at once. An idle lane is only in a bounded
-    readiness wait or local yield and observes the stop by itself, so it is
-    given {!idle_detach_allowance_s} more: detaching it would log a spurious
-    [activity_lane_detached] and report abandoned work after a short grace
-    period (#1023). The allowance still bounds the join if the idle lane's
-    wait is itself stuck behind the supervisor. *)
-let detach_due ~now ~deadline ~busy =
-  now >= deadline && (busy || now >= deadline +. idle_detach_allowance_s)
+    [now]. A lane whose callback is still running past [deadline] is detached
+    at once. Any other lane observes the stop by itself within one bounded
+    wait, so it is given {!idle_detach_allowance_s} more: detaching it would
+    log a spurious [activity_lane_detached] and report abandoned work after a
+    short grace period (#1023). The allowance still bounds the join if that
+    lane is itself stuck behind the supervisor.
+
+    The lane's scheduling [busy] flag is deliberately not used: it is also
+    set for each poll, including one that finds no task, so sampling it at
+    the deadline detached an idle lane whenever the sample fell inside a
+    poll (CI on #1081). *)
+let detach_due ~now ~deadline ~callback_running =
+  now >= deadline
+  && (callback_running || now >= deadline +. idle_detach_allowance_s)
 
 (** Runs the workflow and capacity-one activity lanes concurrently. The caller
     joins the activity Domain on every ordinary result before returning; its
@@ -152,7 +158,7 @@ let run ~detach ~closed ~poll_workflow ~poll_activity ~wait_for_lane
   let joined =
     match detach with
     | None -> true
-    | Some { now; deadline; on_detached; on_stop } ->
+    | Some { now; deadline; on_detached; on_stop; callback_running } ->
         (* Only a genuine stop, never a lane failure, ends native polling:
            after a failure without a stop the worker may still be run again.
            The callback runs fire-and-forget on its own system thread: it may
@@ -175,7 +181,8 @@ let run ~detach ~closed ~poll_workflow ~poll_activity ~wait_for_lane
             (not (Atomic.get activity_finished))
             && not
                  (detach_due ~now:(now ()) ~deadline
-                    ~busy:(Atomic.get activity_busy))
+                    ~callback_running:
+                      (try callback_running () with _ -> false))
           do
             Thread.delay join_poll_interval_s
           done

@@ -466,8 +466,9 @@ and bridge, read the [documentation guide](../README.md) first.
     completable and heartbeatable until the release, and Core's own
     graceful-shutdown timer starts then, not after the grace period.
   - `run` joins its activity Domain only until that deadline, and only while
-    the lane is busy: an idle lane, which is only in a bounded readiness
-    wait, is joined for up to 150 ms past the deadline (#1023). A callback
+    an activity callback is running (the adapter's atomic probe, not the
+    lane's transient poll flag): any other lane, normally in a bounded
+    readiness wait, is joined for up to 150 ms past the deadline (#1023). A callback
     still running then is detached: the Domain is not joined, keeps the
     activity adapter lock, keeps its execution-thread identity, and exits on
     its own after the callback returns. `run` then returns. A non-yielding

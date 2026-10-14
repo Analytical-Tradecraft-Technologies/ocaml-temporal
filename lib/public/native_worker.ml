@@ -637,6 +637,7 @@ let activity_detach worker =
         Atomic.set worker.activity_detached true;
         report Logs.Warning ~operation:"activity_lane_detached" ());
     on_stop = (fun () -> stop_native_polling worker);
+    callback_running = (fun () -> Activity.callback_running worker.activities);
   }
 
 (** Discards both adapters' copied state if neither lock is held. Returns

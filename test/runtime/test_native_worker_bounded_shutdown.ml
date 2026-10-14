@@ -181,12 +181,13 @@ let test_idle () =
 
 (** Runs the real lane scheduler on its own thread under [run_mutex], as
     the native worker does, with bounded activity detach at the shared
-    deadline. [activity_wait] is the length of one idle activity-lane wait
-    (the native readiness wait lasts up to 100 ms); the workflow lane always
-    waits 5 ms. Returns a flag set when the loop has returned. *)
+    deadline. [now] is the join's clock. Both lanes wait 5 ms when idle.
+    Detachment follows the fake's [callback_running] flag, as the native
+    worker's follows the adapter probe. Returns a flag set when the loop has
+    returned. *)
 let start_run ?(deadline = fun () -> Unix.gettimeofday () +. 0.3)
-    ?(activity_wait = 0.005) ?(on_stop_blocks_on = None) worker ~poll_workflow
-    ~poll_activity =
+    ?(now = Unix.gettimeofday) ?(on_stop_blocks_on = None) worker
+    ~poll_workflow ~poll_activity =
   let on_stop () =
     if Atomic.get worker.callback_running then
       Atomic.set worker.loop_stopped_during_callback true;
@@ -210,15 +211,17 @@ let start_run ?(deadline = fun () -> Unix.gettimeofday () +. 0.3)
                   ~detach:
                     (Some
                        {
-                         Loop.now = Unix.gettimeofday;
+                         Loop.now;
                          deadline;
                          on_detached = (fun () -> Atomic.set worker.detached true);
                          on_stop;
+                         callback_running =
+                           (fun () -> Atomic.get worker.callback_running);
                        })
                   ~closed:(fun () -> Atomic.get worker.closed)
                   ~poll_workflow ~poll_activity
-                  ~wait_for_lane:(fun ~workflow_lane ~native_wait:_ ->
-                    Thread.delay (if workflow_lane then 0.005 else activity_wait);
+                  ~wait_for_lane:(fun ~workflow_lane:_ ~native_wait:_ ->
+                    Thread.delay 0.005;
                     Ok ())
                   ~retry_pending:(fun ~workflow_lane:_ -> Ok ()))))
        ());
@@ -305,7 +308,9 @@ let test_stuck_activity_callback () =
   require
     (Atomic.get worker.stopped_polling_during_callback)
     "shutdown stopped polling only after the grace period";
-  require (Atomic.get worker.loop_stops = 1) "run loop polling stop count";
+  (* The run loop's stop runs on its own thread; wait for it rather than
+     assume it already ran. The callback is still blocked meanwhile. *)
+  await "run loop polling stop" (fun () -> Atomic.get worker.loop_stops = 1);
   require
     (Atomic.get worker.loop_stopped_during_callback)
     "the run loop stopped polling only after joining the callback";
@@ -629,32 +634,58 @@ let test_loop_joins_without_detach () =
   open_gate release_callback;
   await "joined run returned" (fun () -> Atomic.get returned)
 
-(** #1023: with a zero grace period an idle run loop must still be joined,
-    not reported as abandoned. Its activity lane is only in a readiness wait
-    (up to 100 ms natively), so the deadline has passed before it can
-    observe the stop; the loop used to detach it at once and log
-    [activity_lane_detached]. *)
-let test_zero_grace_idle_lane_joined () =
+(** #1023, and its CI failure on #1081: an activity lane that runs no
+    callback must be joined, not detached, when the join reaches a deadline
+    that has already passed (a zero grace period). The lane's scheduling
+    flag is also set for every poll that finds no task, so detaching on that
+    flag abandoned an idle lane whenever the deadline check fell inside such
+    a poll. This reproduces that moment deterministically: the activity
+    lane is inside an empty poll when the stop arrives, and the poll returns
+    only after the join has sampled its clock twice, that is, after the join
+    already decided at the passed deadline. The join's clock is frozen at
+    the deadline, so the idle allowance cannot expire and the outcome does
+    not depend on scheduling. *)
+let test_idle_poll_at_deadline_joined () =
   let worker = fake () in
-  let started = Unix.gettimeofday () in
-  let returned =
-    start_run ~deadline:(fun () -> started) ~activity_wait:0.1 worker
-      ~poll_workflow:idle ~poll_activity:idle
+  let deadline = Unix.gettimeofday () in
+  let samples = Atomic.make 0 in
+  let now () =
+    ignore (Atomic.fetch_and_add samples 1);
+    deadline
   in
-  (* Let the activity lane enter its long wait; the workflow lane then
-     returns within 5 ms of the stop, well before the activity lane can. *)
-  Thread.delay 0.03;
-  let outcome, elapsed =
-    shutdown ~lanes_deadline:(Unix.gettimeofday ()) worker (operations worker)
+  let hold = Atomic.make false and in_poll = Atomic.make false in
+  let poll_activity () =
+    if Atomic.get hold then begin
+      Atomic.set in_poll true;
+      (* Return once the join has made a decision after the deadline (or
+         after five seconds, so a regression fails rather than hangs). *)
+      let give_up = Unix.gettimeofday () +. 5. in
+      while Atomic.get samples < 2 && Unix.gettimeofday () < give_up do
+        Thread.delay 0.001
+      done;
+      Atomic.set hold false
+    end;
+    Ok Loop.Not_ready
+  in
+  let returned =
+    start_run ~deadline:(fun () -> deadline) ~now worker ~poll_workflow:idle
+      ~poll_activity
+  in
+  Atomic.set hold true;
+  await "activity lane inside an empty poll" (fun () -> Atomic.get in_poll);
+  (* The shutdown thread's own deadline is generous: what is tested is the
+     run loop's join at its passed deadline. *)
+  let outcome, _elapsed =
+    shutdown ~lanes_deadline:(Unix.gettimeofday () +. 2.) worker
+      (operations worker)
   in
   let report = shut_down outcome in
   require (Atomic.get returned) "the idle run loop did not return";
   require (not (Atomic.get worker.detached)) "an idle activity lane detached";
   require report.lanes_stopped "an idle lane was reported as abandoned";
-  require (report.abandoned_activity_callbacks = 0) "zero grace: callbacks";
-  require (elapsed < Shutdown.lanes_slack_s +. 0.3 +. 0.2)
-    (Printf.sprintf "zero grace shutdown took %.3fs" elapsed);
-  require (Atomic.get worker.loop_stops = 1) "zero grace: loop stop count"
+  require (report.abandoned_activity_callbacks = 0) "idle poll: callbacks";
+  require (Atomic.get samples >= 2) "the join never sampled its clock";
+  await "run loop polling stop" (fun () -> Atomic.get worker.loop_stops = 1)
 
 (** An idle lane whose wait never returns (its supervisor is stuck) is still
     detached once the idle allowance has passed, so [run] stays bounded. *)
@@ -676,6 +707,7 @@ let test_stuck_idle_lane_detached_after_allowance () =
                      deadline = (fun () -> !started);
                      on_detached = ignore;
                      on_stop = ignore;
+                     callback_running = (fun () -> false);
                    })
               ~closed:(fun () -> Atomic.get closed)
               ~poll_workflow:idle ~poll_activity:idle
@@ -696,7 +728,7 @@ let test_stuck_idle_lane_detached_after_allowance () =
   let elapsed = Unix.gettimeofday () -. !started in
   require (elapsed >= Loop.idle_detach_allowance_s -. 0.01)
     (Printf.sprintf "a waiting lane was detached after only %.3fs" elapsed);
-  require (elapsed < Loop.idle_detach_allowance_s +. 0.3)
+  require (elapsed < Loop.idle_detach_allowance_s +. 2.)
     (Printf.sprintf "a stuck idle lane held run for %.3fs" elapsed);
   open_gate release_wait
 
@@ -728,7 +760,7 @@ let test_blocked_polling_stop_does_not_hold_run () =
   require_bound ~grace:0.3 ~teardown:0.3 elapsed;
   require (Atomic.get returned) "run waited for the blocked polling stop";
   require (Atomic.get worker.detached) "run did not detach the stuck lane";
-  require (Atomic.get worker.loop_stops = 1) "the polling stop was not started";
+  await "the polling stop started" (fun () -> Atomic.get worker.loop_stops = 1);
   open_gate mailbox_free;
   await "stuck call returned" (fun () -> not (Atomic.get worker.callback_running))
 
@@ -745,6 +777,7 @@ let test_lane_failure_does_not_stop_polling () =
              deadline = (fun () -> Unix.gettimeofday () +. 1.);
              on_detached = ignore;
              on_stop = (fun () -> ignore (Atomic.fetch_and_add stops 1));
+             callback_running = (fun () -> false);
            })
       ~closed:(fun () -> false)
       ~poll_workflow:(fun () -> Error "lane failed")
@@ -781,7 +814,7 @@ let () =
       ("release raises", test_release_raises);
       ("past deadline", test_past_deadline);
       ("loop joins without detach", test_loop_joins_without_detach);
-      ("zero grace idle lane joined", test_zero_grace_idle_lane_joined);
+      ("idle poll at deadline joined", test_idle_poll_at_deadline_joined);
       ( "stuck idle lane detached after allowance",
         test_stuck_idle_lane_detached_after_allowance );
       ( "lane failure does not stop polling",

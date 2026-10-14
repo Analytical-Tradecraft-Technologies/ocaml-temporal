@@ -15,12 +15,15 @@ type progress =
 
 (** Bounds how long [run] waits for the activity lane once the workflow lane
     has returned (#495). [deadline ()] is called once, when the workflow lane
-    returns, and yields an absolute time on the [now] clock. If the activity
-    lane is still busy (polling or running a callback) at that time, [run]
-    calls [on_detached] and returns without joining it. An idle lane, which
-    is only waiting for readiness, is joined instead for up to
+    returns, and yields an absolute time on the [now] clock. If
+    [callback_running ()] reports an activity callback still executing at or
+    after that time, [run] calls [on_detached] and returns without joining
+    it. Any other lane (idle in a readiness wait, between polls, or in a
+    short native call) is joined instead for up to
     {!idle_detach_allowance_s} past the deadline, so a short grace period
-    never detaches a lane that has no callback (#1023).
+    never detaches a lane that has no callback (#1023). [callback_running]
+    must be non-blocking; it is sampled every join poll, so a callback that
+    starts after the deadline is still detached.
 
     [on_stop] is started once, when the workflow lane has returned because
     [closed] holds, before the activity lane is joined. The native worker
@@ -36,6 +39,7 @@ type activity_detach = {
   deadline : unit -> float;
   on_detached : unit -> unit;
   on_stop : unit -> unit;
+  callback_running : unit -> bool;
 }
 
 (** How long past its deadline the bounded join keeps waiting for an idle
