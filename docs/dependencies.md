@@ -253,9 +253,9 @@ the pin files, the Dependabot entries and the CI matrix stay in step.
 
 | Image | Pin file | Manifest index digest |
 |---|---|---|
-| `ocaml/opam:debian-12-ocaml-5.2` | `docker/ocaml-5.2/Dockerfile` | `sha256:b06c7348b6ed3e83b5f66267254504a8f066ec9be9c020c30a8e28ce10ab3ef6` |
+| `ocaml/opam:debian-12-ocaml-5.2` | `docker/ocaml-5.2/Dockerfile` | `sha256:3f7f5f5adffbb0f69172d69ec34450695257aaf148d4549b3227c6998c5eb2a4` |
 | `ocaml/opam:debian-12-ocaml-5.3` | `docker/ocaml-5.3/Dockerfile` | `sha256:bbaac53e502f6602013d8967c3a54cfcb898b556f453ab72e8e23966c3c681df` |
-| `ocaml/opam:debian-12-ocaml-5.4` | `docker/ocaml-5.4/Dockerfile` | `sha256:ba37cf7a29709fa2f19124fda8f4cabdea3156a648276fc98c9d528998ae2e59` |
+| `ocaml/opam:debian-12-ocaml-5.4` | `docker/ocaml-5.4/Dockerfile` | `sha256:56c9ab2e2f9e8fa926efbc36bedf75fbdb0dd7661765440397def7a24d4e3bfa` |
 | `ocaml/opam:debian-12-ocaml-5.5` | `docker/ocaml-5.5/Dockerfile` | `sha256:57f87030c6082e3f46f59988fbf12a84947945baf2974d4567a9dcee85780090` |
 
 Each index contains native `linux/amd64` and `linux/arm64` images. The image
@@ -396,7 +396,7 @@ the `license` field of `cargo metadata` for the locked version.
 | libc | 0.2.190 | 0.2.190 | normal | MIT OR Apache-2.0 | Unix thread signal-mask calls that keep SIGPIPE from terminating the OCaml host (#1041); tests also lower the descriptor limit so the metrics endpoint's `accept()` fails (#1030) |
 | prost | 0.14.4 | 0.14.4 | normal | Apache-2.0 | Protobuf encoding and decoding of Temporal API messages and replay histories |
 | serde | 1.0.228 | 1.0.229 | normal | MIT OR Apache-2.0 | Private control protocol data model |
-| serde_json | 1.0.150 | 1.0.151 | normal | MIT OR Apache-2.0 | Private JSON control protocol |
+| serde_json | 1.0.150 | 1.0.154 | normal | MIT OR Apache-2.0 | Private JSON control protocol |
 | prost-wkt-types | 0.7.1 | 0.7.2 | normal | Apache-2.0 AND BSD-3-Clause | Exact protobuf timestamps and durations in the semantic adapter |
 | temporalio-client | Core revision | 1.1.0 | normal | MIT (reviewed `LICENSE.txt`) | Temporal Core client |
 | temporalio-common | Core revision | 1.1.0 | normal | MIT (reviewed `LICENSE.txt`) | Temporal Core shared types |
@@ -404,7 +404,7 @@ the `license` field of `cargo metadata` for the locked version.
 | temporalio-protos | Core revision | 0.10.0 | normal | MIT (reviewed `LICENSE.txt`) | Temporal API protobuf types |
 | tokio | 1.52.3 | 1.53.2 | normal, dev | MIT | Core's existing executor, channels, and task handles for the guarded poll lanes; `net` and `io-util` for the metrics endpoint's accept loop and relay |
 | tracing | 0.1.44 | 0.1.44 | normal | MIT | Warning and error records from the metrics endpoint, through Core's existing log pipeline |
-| uuid | 1.23.4 | 1.27.0 | normal | Apache-2.0 OR MIT | Random v4 tickets for pending workflow-start operations |
+| uuid | 1.23.4 | 1.28.0 | normal | Apache-2.0 OR MIT | Random v4 tickets for pending workflow-start operations |
 
 The guarded poll lanes' hand-off channels are intentionally unbounded because
 Core's outstanding-task permits provide the bound and a bounded send could
@@ -648,7 +648,7 @@ version comment recorded beside a commit pin.
 | `actions/download-artifact` | `9000827ccba6bdab643e8b6fd33ac0654aef8333` | v8 | MIT | Consuming those artifacts |
 | `msys2/setup-msys2` | `ec48f7c5447b3140e2b088413ae3a55687bccb6e` | v2 | MIT | MinGW build tools for the Windows Rust producer |
 | `ocaml/setup-ocaml` | `93303b622b2522e4411e295f9e77411a24912ac7` | v3.9.0 | MIT | Native macOS and Windows OCaml compilers |
-| `taiki-e/install-action` | `f7e5d7c961414b23f5b25b2da9294395d08513ad` | v2.87.26 | Apache-2.0 OR MIT | Installing the pinned CI-only quality tools |
+| `taiki-e/install-action` | `ab6895351a88b908e96a4697860d4ffea5e57dbe` | v2.87.27 | Apache-2.0 OR MIT | Installing the pinned CI-only quality tools |
 
 `actions/checkout` is referenced by its major-version tag rather than an
 immutable commit; every other action is pinned by commit.
