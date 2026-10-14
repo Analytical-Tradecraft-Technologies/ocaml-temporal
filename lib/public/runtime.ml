@@ -45,7 +45,9 @@ let shutdown runtime =
            ~message:
              (Printf.sprintf
                 "Runtime.shutdown: %d client(s) or worker(s) are still \
-                 attached; shut them down first"
+                 attached; shut them down first (a worker whose shutdown \
+                 reported a detached native teardown stays attached until \
+                 that teardown finishes)"
                 count))
   | Error (Shared.Native { Temporal_sdk_kernel.Bridge.message; _ }) ->
       Error

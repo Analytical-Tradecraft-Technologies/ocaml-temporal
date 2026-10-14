@@ -413,6 +413,53 @@ let test_abandoned_supervisor_is_cleaned_up () =
   collect 5_000;
   expect "abandoned cleanup count" 1 (Atomic.get config.closes)
 
+(** An owner that wraps a supervisor, like a native worker: its abandoned
+    cleanup must drain its own state before the supervisor closes the graph. *)
+type owner = { supervisor : Supervisor.t; drained : bool Atomic.t }
+
+(** After [delegate_abandoned_cleanup], the owner's finalizer is the only
+    cleanup path even though owner and supervisor become unreachable in the
+    same collection, so [Gc.finalise] runs both finalizers (#1044). The owner's
+    cleanup thread drains slowly; the backend must not be closed before the
+    drain has finished, and it must still be closed exactly once. *)
+let test_delegated_abandoned_cleanup_waits_for_owner () =
+  let config = backend_config () in
+  let create_and_drop () =
+    let supervisor = Result.get_ok (Supervisor.create ~capacity:2 config) in
+    Supervisor.delegate_abandoned_cleanup supervisor;
+    let owner = { supervisor; drained = Atomic.make false } in
+    Gc.finalise
+      (fun owner ->
+        ignore
+          (Thread.create
+             (fun owner ->
+               Thread.delay 0.05;
+               Atomic.set owner.drained true;
+               ignore (Supervisor.shutdown owner.supervisor))
+             owner))
+      owner;
+    (* Only the flag escapes, so owner and supervisor become unreachable
+       together. *)
+    owner.drained
+  in
+  let drained = create_and_drop () in
+  let rec collect attempts =
+    let closes = Atomic.get config.closes in
+    if closes > 0 && not (Atomic.get drained) then
+      failwith "supervisor finalizer closed the graph before the owner drained"
+    else if closes = 1 then ()
+    else if attempts = 0 then
+      failwith "abandoned owner did not release its backend graph"
+    else (
+      Gc.full_major ();
+      Thread.delay 0.001;
+      collect (attempts - 1))
+  in
+  collect 5_000;
+  (* Let any stray finalizer thread run before the exact-count check. *)
+  Thread.delay 0.1;
+  expect "delegated cleanup count" 1 (Atomic.get config.closes)
+
 (** Concurrent shutdown callers all receive one cached expected backend error
     while the backend release operation executes exactly once. *)
 let test_concurrent_shutdown_callers_share_result () =
@@ -474,6 +521,7 @@ let () =
   test_shutdown_initiation_closes_admission_and_shares_result ();
   test_shutdown_error_is_cached ();
   test_abandoned_supervisor_is_cleaned_up ();
+  test_delegated_abandoned_cleanup_waits_for_owner ();
   test_concurrent_shutdown_callers_share_result ();
   test_creation_exception_is_contained ();
   test_shutdown_exception_is_contained_and_cached ()

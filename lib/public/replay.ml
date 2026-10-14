@@ -419,7 +419,15 @@ let native_failure operation error =
 (** Eviction reasons that mean Core refused the replayed run. Other reasons
     (cache pressure, a requested eviction, or the end of the history) are
     normal replay housekeeping. [workflow_id] and [workflow_type] are the
-    context the SDK adds to a nondeterminism diagnostic. *)
+    context the SDK adds to a nondeterminism diagnostic.
+
+    [Eviction_unspecified] is a refusal, not housekeeping (issue #1045). At
+    the pinned Core revision it is produced only when Core auto-fails a
+    workflow task itself, which happens when applying the run's first
+    workflow task raises a machines error before any language completion
+    exists (for example an event Core cannot interpret). No OCaml code ran
+    for that task, so the history, not the workflow, is at fault. Every other
+    refusal Core makes during replay carries a specific reason. *)
 let classify_eviction ~workflow_id ~workflow_type ~run_id ~message = function
   | Protocol.Nondeterminism ->
       Some
@@ -429,13 +437,13 @@ let classify_eviction ~workflow_id ~workflow_type ~run_id ~message = function
              message;
              mismatch = mismatch_of_message ~workflow_id ~workflow_type message;
            })
-  | Protocol.Fatal -> Some (Invalid_history { message })
+  | Protocol.Fatal | Protocol.Eviction_unspecified ->
+      Some (Invalid_history { message })
   | Protocol.Lang_fail | Protocol.Unhandled_command ->
       Some (Workflow_task_failed { run_id = Some run_id; message })
-  | Protocol.Eviction_unspecified | Protocol.Cache_full | Protocol.Cache_miss
-  | Protocol.Lang_requested | Protocol.Task_not_found
-  | Protocol.Pagination_or_history_fetch | Protocol.Workflow_execution_ending
-    ->
+  | Protocol.Cache_full | Protocol.Cache_miss | Protocol.Lang_requested
+  | Protocol.Task_not_found | Protocol.Pagination_or_history_fetch
+  | Protocol.Workflow_execution_ending ->
       None
 
 (** Replay-mode task source for the shared workflow adapter. It forwards to
@@ -646,6 +654,20 @@ let run_replay ~native ~config ~runner_slot ~namespace ~task_queue ~workflows
                  draining later also failed: the later failure is cleanup. *)
               match (source.verdict, drained) with
               | Some failure, _ -> Error failure
+              | None, Ok () when Option.is_none source.workflow_type ->
+                  (* Independent of how Core classified any eviction, [Ok ()]
+                     claims that workflow code replayed the history. Without
+                     an [Initialize_workflow] job no workflow code ran at
+                     all, so Core must have dropped the run before its first
+                     task (issue #1045). *)
+                  Error
+                    (Invalid_history
+                       {
+                         message =
+                           "Core finished the replay without starting the \
+                            history's workflow run; no workflow task was \
+                            replayed";
+                       })
               | None, result -> result)))
 
 let replay ?(namespace = "default") ?(task_queue = "temporal-replay")

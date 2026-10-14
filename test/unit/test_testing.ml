@@ -681,6 +681,372 @@ let test_external_signal () =
         (expect_error "missing target" `Workflow
            (T.Testing.execute environment sender_workflow "plum")))
 
+(** Every side effect a fire-and-forget operation performed, newest first. *)
+let side_effects = ref []
+
+(** Records that a server dispatched the receipt activity. *)
+let send_receipt =
+  T.Activity.define ~name:"send_receipt" ~input:T.Codec.string
+    ~output:T.Codec.unit (fun id ->
+      side_effects := ("activity " ^ id) :: !side_effects;
+      Ok ())
+
+(** Records that a server started the abandoned child. The write is
+    test-only instrumentation; this workflow is never replayed. *)
+let abandoned_child =
+  T.Workflow.define ~name:"abandoned_child" ~input:T.Codec.string
+    ~output:T.Codec.unit (fun id ->
+      side_effects := ("child " ^ id) :: !side_effects;
+      Ok ())
+
+(** Starts an activity, an abandoned child, and an external signal without
+    awaiting any of them, then completes in the same activation. A server
+    never dispatches commands recorded in a run's closing workflow task. *)
+let fire_and_forget_workflow =
+  T.Workflow.define ~name:"fire_and_forget" ~input:T.Codec.string
+    ~output:T.Codec.unit (fun id ->
+      ignore (T.Activity.start send_receipt id);
+      ignore
+        (T.Child_workflow.start
+           ~parent_close_policy:T.Child_workflow.Parent_close_policy.Abandon
+           ~id:("abandoned-" ^ id) abandoned_child id);
+      ignore
+        (T.Workflow.signal_external_workflow ~workflow_id:"cart-final"
+           ~run_id:"" ~signal:add_item_signal ~input:id);
+      Ok ())
+
+(** Commands emitted in a run's final activation are not executed (#1035). *)
+let test_final_activation_commands_dropped () =
+  with_environment
+    ~workflows:
+      [
+        cart_registration;
+        T.Testing.workflow fire_and_forget_workflow;
+        T.Testing.workflow abandoned_child;
+      ]
+    ~activities:[ T.Testing.activity send_receipt ]
+    (fun environment ->
+      side_effects := [];
+      let cart =
+        ok "start cart" (T.Testing.start ~id:"cart-final" environment cart_workflow ())
+      in
+      ok "fire and forget" (T.Testing.execute environment fire_and_forget_workflow "x");
+      expect "no activity, child, or signal ran" [] !side_effects;
+      ok "close cart" (T.Testing.signal cart close_signal ());
+      expect "cart never received the signal" "" (ok "cart result" (T.Testing.result cart)))
+
+let bump_signal = T.Signal.define ~name:"bump" ~input:T.Codec.unit
+
+(** The number of [bump] signals the current run has handled. *)
+let hits : int T.Workflow_context.Local.t = T.Workflow_context.Local.create ()
+
+(** Reads the run's hit count, defaulting to zero. *)
+let current_hits () =
+  match T.Workflow_context.Local.get hits with
+  | Ok (Some value) -> value
+  | Ok None -> 0
+  | Error error -> failwith (T.Error.message error)
+
+(** Sleeps one second and returns how many bumps its handler counted. *)
+let counter_workflow =
+  T.Workflow.define ~name:"counter" ~input:T.Codec.unit ~output:T.Codec.int
+    (fun () ->
+      let* () = T.Workflow.sleep (T.Duration.of_ms 1_000L) in
+      Ok (current_hits ()))
+
+(** Sleeps one second, then bumps the workflow with ID [r]. *)
+let bumper_workflow =
+  T.Workflow.define ~name:"bumper" ~input:T.Codec.unit ~output:T.Codec.unit
+    (fun () ->
+      let* () = T.Workflow.sleep (T.Duration.of_ms 1_000L) in
+      T.Future.await
+        (T.Workflow.signal_external_workflow ~workflow_id:"r" ~run_id:""
+           ~signal:bump_signal ~input:()))
+
+(** A signal and a timer that land in one activation are delivered in Core's
+    order, signal first, so the acknowledged signal's handler runs before the
+    root completes (#1036). *)
+let test_core_job_order () =
+  with_environment
+    ~workflows:
+      [
+        T.Testing.workflow bumper_workflow;
+        T.Testing.workflow counter_workflow
+          ~signals:
+            [
+              T.Signal.Handler.make bump_signal (fun () ->
+                  T.Workflow_context.Local.set hits (current_hits () + 1));
+            ];
+      ]
+    ~activities:[]
+    (fun environment ->
+      let bumper = ok "start bumper" (T.Testing.start environment bumper_workflow ()) in
+      let counter = ok "start counter" (T.Testing.start ~id:"r" environment counter_workflow ()) in
+      expect "signal handled before completion" 1
+        (ok "counter result" (T.Testing.result counter));
+      ok "bumper result" (T.Testing.result bumper))
+
+(** Fails retryably until its [succeed_at] attempt, then reports what
+    [Workflow.info] says about the run. *)
+let retrying_child =
+  T.Workflow.define ~name:"retrying_child" ~input:T.Codec.int
+    ~output:T.Codec.string (fun succeed_at ->
+      let* info = T.Workflow.info () in
+      let attempt = T.Workflow.Info.attempt info in
+      if attempt < succeed_at then
+        Error (T.Error.make ~category:`Workflow ~message:"transient child failure" ())
+      else
+        Ok
+          (Printf.sprintf "attempt=%d initiator=%s policy=%b queue=%s" attempt
+             (match T.Workflow.Info.continuation_initiator info with
+             | Some `Retry -> "retry"
+             | Some (`Continue_as_new | `Cron_schedule) | None -> "none")
+             (Option.is_some (T.Workflow.Info.retry_policy info))
+             (T.Workflow.Info.task_queue info)))
+
+(** Runs [retrying_child] on another queue with a three-attempt policy. *)
+let retrying_parent =
+  T.Workflow.define ~name:"retrying_parent" ~input:T.Codec.int
+    ~output:T.Codec.string (fun succeed_at ->
+      T.Child_workflow.execute ~retry_policy:(retry_policy ~maximum_attempts:3)
+        ~task_queue:"child-queue" ~id:"retrying-child" retrying_child succeed_at)
+
+(** Runs [retrying_child] without a retry policy. *)
+let single_attempt_parent =
+  T.Workflow.define ~name:"single_attempt_parent" ~input:T.Codec.int
+    ~output:T.Codec.string (fun succeed_at ->
+      T.Child_workflow.execute ~id:"single-attempt-child" retrying_child succeed_at)
+
+(** A child retry policy retries failed runs with backoff in virtual time,
+    and the child reports its attempt, retry continuation, policy, and task
+    queue (#1037). *)
+let test_child_retry_policy () =
+  with_environment
+    ~workflows:
+      [
+        T.Testing.workflow retrying_parent;
+        T.Testing.workflow single_attempt_parent;
+        T.Testing.workflow retrying_child;
+      ]
+    ~activities:[]
+    (fun environment ->
+      let started = epoch_ms (T.Testing.now environment) in
+      expect "third attempt succeeded"
+        "attempt=3 initiator=retry policy=true queue=child-queue"
+        (ok "retried child" (T.Testing.execute environment retrying_parent 3));
+      expect "backoff of 1s then 2s in virtual time" 3_000L
+        (Int64.sub (epoch_ms (T.Testing.now environment)) started);
+      let error =
+        expect_error "exhausted child retries" `Child_workflow
+          (T.Testing.execute environment retrying_parent 4)
+      in
+      expect "exhausted child is non-retryable" true (T.Error.view error).non_retryable;
+      expect "child failure type" (Some "workflow") (T.Error.error_type error);
+      expect_contains "child failure cause" ~needle:"transient child failure"
+        (T.Error.message error);
+      let error =
+        expect_error "child without policy" `Child_workflow
+          (T.Testing.execute environment single_attempt_parent 2)
+      in
+      expect "child without policy inherits retryability" false
+        (T.Error.view error).non_retryable)
+
+(** Counts [cancelled_activity] attempts. *)
+let cancelled_attempts = ref 0
+
+(** Returns a retryable [Cancelled]-category error without any cancellation
+    having been requested. *)
+let cancelled_activity =
+  T.Activity.define ~name:"cancelled_activity" ~input:T.Codec.unit
+    ~output:T.Codec.unit (fun () ->
+      incr cancelled_attempts;
+      Error (T.Error.make ~category:`Cancelled ~message:"aborted" ()))
+
+(** Runs [cancelled_activity] under a two-attempt policy. *)
+let cancelled_activity_workflow =
+  T.Workflow.define ~name:"cancelled_activity_workflow" ~input:T.Codec.unit
+    ~output:T.Codec.unit (fun () ->
+      T.Activity.execute ~retry_policy:(retry_policy ~maximum_attempts:2)
+        cancelled_activity ())
+
+(** Shares [flaky]'s name with an incompatible input codec, so the engine
+    cannot decode the input the workflow encoded for [flaky]. *)
+let flaky_with_int_input =
+  T.Activity.define ~name:"flaky" ~input:T.Codec.int ~output:T.Codec.int
+    (fun value -> Ok value)
+
+(** Fails with a [Cancelled]-category error: a workflow failure, not an
+    acknowledged cancellation. *)
+let cancelled_failure_child =
+  T.Workflow.define ~name:"cancelled_failure_child" ~input:T.Codec.unit
+    ~output:T.Codec.unit (fun () ->
+      Error (T.Error.make ~category:`Cancelled ~message:"gave up" ()))
+
+(** Runs [cancelled_failure_child] and returns its failure. *)
+let cancelled_failure_parent =
+  T.Workflow.define ~name:"cancelled_failure_parent" ~input:T.Codec.unit
+    ~output:T.Codec.unit (fun () ->
+      T.Child_workflow.execute ~id:"cancelled-failure-child"
+        cancelled_failure_child ())
+
+(** Activity and child failures are classified and shaped as the native
+    worker delivers them (#1038). *)
+let test_native_error_shapes () =
+  with_environment
+    ~workflows:
+      [
+        T.Testing.workflow cancelled_activity_workflow;
+        T.Testing.workflow flaky_workflow;
+        T.Testing.workflow cancelled_failure_parent;
+        T.Testing.workflow cancelled_failure_child;
+      ]
+    ~activities:[ T.Testing.activity cancelled_activity; T.Testing.activity flaky ]
+    (fun environment ->
+      cancelled_attempts := 0;
+      let error =
+        expect_error "cancelled-category activity error" `Activity
+          (T.Testing.execute environment cancelled_activity_workflow ())
+      in
+      expect "cancelled-category error is retried" 2 !cancelled_attempts;
+      expect "type is the category label" (Some "cancelled") (T.Error.error_type error);
+      expect "exhausted activity is non-retryable" true (T.Error.view error).non_retryable;
+      flaky_attempts := [];
+      let error =
+        expect_error "exhausted untyped activity" `Activity
+          (T.Testing.execute environment flaky_workflow 2)
+      in
+      expect "untyped failure reports its category" (Some "activity")
+        (T.Error.error_type error);
+      expect "exhausted retries are non-retryable" true (T.Error.view error).non_retryable;
+      let error =
+        expect_error "child failing with a cancelled-category error" `Child_workflow
+          (T.Testing.execute environment cancelled_failure_parent ())
+      in
+      expect "canceled cause carries no application type" None
+        (T.Error.error_type error));
+  with_environment
+    ~workflows:[ T.Testing.workflow flaky_workflow ]
+    ~activities:[ T.Testing.activity flaky_with_int_input ]
+    (fun environment ->
+      let error =
+        expect_error "codec failure" `Activity
+          (T.Testing.execute environment flaky_workflow 2)
+      in
+      expect "codec failure uses the native adapter type"
+        (Some "ocaml_temporal_native_activity") (T.Error.error_type error))
+
+(** Answers a query without touching workflow state. *)
+let ping_query = T.Query.define ~name:"ping" ~output:T.Codec.string
+
+(** Sleeps, then reports [Workflow.Info.history_length]. *)
+let history_workflow =
+  T.Workflow.define ~name:"history" ~input:T.Codec.unit ~output:T.Codec.int
+    (fun () ->
+      let* () = T.Workflow.sleep (T.Duration.of_ms 1_000L) in
+      let* info = T.Workflow.info () in
+      Ok (T.Workflow.Info.history_length info))
+
+(** Sleeps for a day forever; used to check that a finite timeout still
+    bounds a workflow whose timers keep landing on the saturated clock. *)
+let endless_sleep_workflow =
+  T.Workflow.define ~name:"endless-sleep" ~input:T.Codec.unit
+    ~output:T.Codec.unit (fun () ->
+      let rec loop () =
+        let* () = T.Workflow.sleep one_day in
+        loop ()
+      in
+      loop ())
+
+(** Virtual time saturates instead of overflowing, queries do not inflate
+    the history length, and a mock replaces a registration regardless of
+    list order (#1039). *)
+let test_time_history_and_mock_order () =
+  let near_end =
+    ok "near end" (T.Time.of_unix ~seconds:(Int64.sub (Int64.div Int64.max_int 1_000L) 100L) ~nanoseconds:0)
+  in
+  with_environment ~start_time:near_end
+    ~workflows:[ T.Testing.workflow sleepy_workflow ]
+    ~activities:[]
+    (fun environment ->
+      let handle = ok "start sleepy" (T.Testing.start environment sleepy_workflow ()) in
+      (* The one-day timer saturates at the last instant; the one-day
+         timeout cannot be represented either, so it is no limit. *)
+      ignore (ok "result with overflowing timeout" (T.Testing.result ~timeout:one_day handle));
+      ok "overflowing skip" (T.Testing.skip environment one_day);
+      if T.Time.compare (T.Testing.now environment) near_end < 0 then
+        failwith "virtual time wrapped backwards");
+  (* Once the clock saturates, a finite timeout must still end the wait
+     rather than firing the workflow's timers at the last instant forever. *)
+  with_environment ~start_time:near_end
+    ~workflows:[ T.Testing.workflow endless_sleep_workflow ]
+    ~activities:[]
+    (fun environment ->
+      let handle =
+        ok "start endless" (T.Testing.start environment endless_sleep_workflow ())
+      in
+      ignore
+        (expect_error "saturated finite timeout" `Timeout
+           (T.Testing.result ~timeout:one_day handle)));
+  let history_length ~queries =
+    with_environment
+      ~workflows:
+        [
+          T.Testing.workflow history_workflow
+            ~queries:[ T.Query.Handler.make ping_query (fun () -> Ok "pong") ];
+        ]
+      ~activities:[]
+      (fun environment ->
+        let handle = ok "start history" (T.Testing.start environment history_workflow ()) in
+        for _ = 1 to queries do
+          expect "ping" "pong" (ok "query" (T.Testing.query handle ping_query))
+        done;
+        ok "history result" (T.Testing.result handle))
+  in
+  expect "queries do not grow history" (history_length ~queries:0)
+    (history_length ~queries:5);
+  with_environment
+    ~workflows:[ T.Testing.workflow greeting_workflow ]
+    ~activities:
+      [
+        T.Testing.mock_activity compose_greeting (fun name -> Ok ("mocked " ^ name));
+        T.Testing.activity compose_greeting;
+      ]
+    (fun environment ->
+      expect "prepended mock wins" "mocked OCaml"
+        (ok "execute" (T.Testing.execute environment greeting_workflow "OCaml")));
+  match
+    T.Testing.create ~workflows:[]
+      ~activities:
+        [
+          T.Testing.mock_activity compose_greeting (fun name -> Ok name);
+          T.Testing.mock_activity compose_greeting (fun name -> Ok name);
+        ]
+      ()
+  with
+  | Ok environment ->
+      T.Testing.shutdown environment;
+      failwith "duplicate mock registration was accepted"
+  | Error error -> (
+      expect_contains "duplicate mock" ~needle:"duplicate mock" (T.Error.message error);
+      (* Two ordinary registrations stay a defect even when a mock between
+         them wins the name. *)
+      match
+        T.Testing.create ~workflows:[]
+          ~activities:
+            [
+              T.Testing.activity compose_greeting;
+              T.Testing.mock_activity compose_greeting (fun name -> Ok name);
+              T.Testing.activity compose_greeting;
+            ]
+          ()
+      with
+      | Ok environment ->
+          T.Testing.shutdown environment;
+          failwith "duplicate ordinary registration around a mock was accepted"
+      | Error error ->
+          expect_contains "duplicate ordinary" ~needle:"duplicate activity"
+            (T.Error.message error))
+
 let () =
   test_timer_skipping ();
   test_activity_and_override ();
@@ -695,4 +1061,9 @@ let () =
   test_determinism ();
   test_local_activity_and_heartbeat_details ();
   test_external_signal ();
-  test_registration_rules ()
+  test_registration_rules ();
+  test_final_activation_commands_dropped ();
+  test_core_job_order ();
+  test_child_retry_policy ();
+  test_native_error_shapes ();
+  test_time_history_and_mock_order ()
