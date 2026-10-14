@@ -142,6 +142,37 @@ assert_ignores_build_workspace() {
   fi
 }
 
+# Removing the locked-closure install from one native lane must fail even
+# though other jobs in the workflow still install it.
+assert_rejects_native_lane_without_locked_closure() {
+  lane=$1
+  log="$fixture_root/native-$lane.log"
+  next_workflow="$fixture_root/build-pr.yml.next"
+
+  prepare_fixture
+  awk -v lane="  $lane:" '
+    $0 == lane { inside = 1; print; next }
+    /^  [a-z][a-z0-9-]*:$/ { inside = 0 }
+    inside && $0 == "        run: sh scripts/opam-locked-deps.sh install --assume-depexts" {
+      print "        run: echo skipped"
+      removed = 1
+      next
+    }
+    { print }
+    END { if (!removed) exit 2 }
+  ' "$fixture_root/.github/workflows/build-pr.yml" >"$next_workflow"
+  mv "$next_workflow" "$fixture_root/.github/workflows/build-pr.yml"
+  if sh "$checker" "$fixture_root" >"$log" 2>&1; then
+    echo "install consumer metadata mutation: $lane without the locked closure unexpectedly passed" >&2
+    exit 1
+  fi
+  if ! grep -F "native macOS/Windows lanes do not install the locked closure" "$log" >/dev/null; then
+    cat "$log" >&2
+    echo "install consumer metadata mutation: $lane failed for the wrong reason" >&2
+    exit 1
+  fi
+}
+
 # A per-series base-image pin must stay tracked without retargeting (#1027):
 # each mutation below must fail with the named diagnostic.
 assert_rejects_base_image_mutation() {
@@ -205,6 +236,8 @@ assert_rejects_base_image_mutation 'a second ocaml/opam pin in Dockerfile.dev' \
   'Dockerfile.dev must take its ocaml/opam base image'
 
 assert_accepts_crlf_metadata
+assert_rejects_native_lane_without_locked_closure native-macos
+assert_rejects_native_lane_without_locked_closure native-windows
 assert_rejects_failed_tool opam 'could not parse'
 assert_rejects_failed_tool dune 'could not format'
 assert_ignores_build_workspace

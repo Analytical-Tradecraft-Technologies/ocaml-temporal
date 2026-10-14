@@ -15,6 +15,43 @@ implementation when a later entry documents that work as complete. The
 records the current tested source, named assertions and successful CI job for
 the Temporal acceptance controllers.
 
+## 2026-10-13: CI builds the source archive inside an opam sandbox (#778)
+
+The vendored release source archive (2026-10-06 entry) had only been proven
+offline by hand; no CI job ran a sandboxed opam build from it.
+`scripts/check-opam-source-archive.sh` now unpacks an archive and runs the
+package's opam build command, `dune build -p temporal-sdk -j <jobs>`, through
+opam's own build wrapper (`opam-init/hooks/sandbox.sh build`) or, on macOS
+without one, an equivalent `sandbox-exec` policy. It first proves the sandbox
+blocks a request to crates.io, clears every variable that would bypass the
+archive's vendored sources, gives Cargo a fresh, empty `CARGO_HOME` so a home
+warmed by `cargo vendor` cannot hide a source the archive omits, and requires
+the resulting `temporal-sdk.install` to list the Rust bridge. The Release
+workflow now creates the archive and audited notices once in a
+`source-archive` job, and its macOS ARM64 `source-archive-check` job runs the
+check on that artifact after confirming its SHA-256; `publish` needs both and
+confirms the digest again before publishing the same file, so the archive
+users download is the one that passed. Master builds also run an
+`opam-source-offline` job in `build-pr.yml` on an archive it creates itself,
+as an early warning.
+
+`test/smoke/test_opam_source_archive_check.sh`, part of `dune runtest`, drives
+the script with stand-in opam hook, curl and dune executables: a complete
+archive builds through the hook's `build` mode with the bypass variables
+cleared, a sandbox that lets the probe through is refused before building, and
+archives without `rust/vendor.tar` or with a changed opam build command are
+rejected; Cargo must see a cold home in place of the caller's warm one.
+Removing the variable clearing or keeping the caller's `CARGO_HOME` makes it
+fail. Locally on macOS
+(opam 2.5.2, OCaml 5.4.1), an archive created by
+`scripts/create-source-archive.sh` from this branch built successfully with the
+optimized Rust bridge through both the real opam 2.5.2 sandbox wrapper and the
+`sandbox-exec` fallback, with the network probe denied in each, and again
+through the opam wrapper with the empty `CARGO_HOME`.
+`dune build @test/smoke/runtest` and `test/smoke/test_quality_contract.sh`
+pass. The new jobs have not run yet: the master job's first result comes from
+the next master build, and the release jobs from the next release.
+
 ## 2026-10-13: Unknown update stages and visibility statuses degrade (#1078)
 
 The client protocol rejected two server enums when a newer server sent a value
