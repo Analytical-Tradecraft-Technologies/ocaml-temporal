@@ -8,6 +8,9 @@ set -eu
 
 root=$(CDPATH='' cd -- "$(dirname "$0")/../../../.." && pwd)
 fixture="$root/test/integration/temporal"
+# The digest-pinned base image (docker/ocaml-<series>/Dockerfile). Make passes
+# an already resolved reference; a direct run defaults to the 5.2 series.
+ocaml_image=$(sh "$root/scripts/ocaml-image.sh" "${OCAML_IMAGE:-ocaml-5.2}")
 compose_file="$fixture/compose.yaml"
 project=${TEMPORAL_COMPOSE_PROJECT:-ocaml-temporal-integration}
 patch_id=smoke.patch_replay_history.activity.v1
@@ -59,7 +62,7 @@ driver_pid=''
 # identity are explicit so bind-mounted Dune output has the same ownership in
 # every worker and client process.
 compose() {
-  OCAML_IMAGE=${OCAML_IMAGE:-ocaml-5.2} \
+  OCAML_IMAGE=$ocaml_image \
     HOST_UID=${HOST_UID:-$(id -u)} HOST_GID=${HOST_GID:-$(id -g)} \
     SMOKE_DRIVER_TIMEOUT_SECONDS=${SMOKE_DRIVER_TIMEOUT_SECONDS:-300} \
     docker compose --project-directory "$fixture" --file "$compose_file" \
