@@ -95,20 +95,46 @@ if ! grep -F 'protobuf-compiler \' "$root/Dockerfile.dev" >/dev/null ||
 fi
 
 # Every compiler series in the CI matrix must build from its own ocaml/opam
-# stage pinned to an immutable manifest digest, and no other base reference
-# may name ocaml/opam by tag alone.
+# image pinned to an immutable manifest digest. The pin is the single FROM line
+# of docker/ocaml-<series>/Dockerfile (#1027), each tracked by its own
+# Dependabot docker entry whose `versions` ignore range starts at the next
+# series, so Dependabot refreshes the digest but never retargets the tag.
+# Dockerfile.dev must not name ocaml/opam itself: a second copy of a pin would
+# be invisible to that per-series tracking.
 compilers=$(tr -d '\r' <"$root/scripts/ci-matrix.py" |
   sed -n 's/^COMPILERS = (\(.*\))$/\1/p' | tr -d '",')
 [ -n "$compilers" ] || fail "could not read compiler series from scripts/ci-matrix.py"
+tr -d '\r' <"$root/.github/dependabot.yml" >"$metadata_dir/dependabot.yml"
+expected_series=
 for compiler in $compilers; do
   series=${compiler%.*}
-  if ! grep -E "^FROM ocaml/opam:debian-12-ocaml-$series@sha256:[0-9a-f]{64} AS ocaml-$series\$" \
-      "$root/Dockerfile.dev" >/dev/null; then
-    fail "Dockerfile.dev has no digest-pinned ocaml-$series stage"
+  expected_series="$expected_series ocaml-$series"
+  pin="$root/docker/ocaml-$series/Dockerfile"
+  [ -f "$pin" ] || fail "docker/ocaml-$series/Dockerfile is missing"
+  tr -d '\r' <"$pin" | grep '^FROM ' >"$metadata_dir/from" || true
+  if [ "$(wc -l <"$metadata_dir/from" | tr -d ' ')" != 1 ] ||
+    ! grep -E "^FROM ocaml/opam:debian-12-ocaml-$series@sha256:[0-9a-f]{64}\$" \
+      "$metadata_dir/from" >/dev/null; then
+    fail "docker/ocaml-$series/Dockerfile must have exactly one FROM line, pinning ocaml/opam:debian-12-ocaml-$series by digest"
+  fi
+  # The next series is the lower bound of the ignore range: 5.2 -> '>= 5.3'.
+  next="${series%.*}.$((${series#*.} + 1))"
+  if ! awk -v dir="/docker/ocaml-$series" -v range="'>= $next'" '
+      /^- package-ecosystem: / { docker = ($3 == "docker"); matched = 0; dep = ""; next }
+      docker && $1 == "directory:" { matched = ($2 == dir); next }
+      matched && $1 == "-" && $2 == "dependency-name:" { dep = $3; next }
+      matched && dep == "ocaml/opam" && $1 == "-" && ($2 " " $3) == range { found = 1 }
+      END { exit !found }
+    ' "$metadata_dir/dependabot.yml"; then
+    fail ".github/dependabot.yml has no docker entry for /docker/ocaml-$series ignoring ocaml/opam '>= $next'"
   fi
 done
-if grep -E 'ocaml/opam:' "$root/Dockerfile.dev" | grep -Ev '@sha256:[0-9a-f]{64}' >/dev/null; then
-  fail "Dockerfile.dev references an ocaml/opam image without a digest"
+actual_series=$(cd "$root/docker" && ls -d ocaml-* 2>/dev/null | LC_ALL=C sort | tr '\n' ' ')
+wanted_series=$(printf '%s\n' $expected_series | LC_ALL=C sort | tr '\n' ' ')
+[ "$actual_series" = "$wanted_series" ] ||
+  fail "docker/ocaml-* directories ($actual_series) differ from scripts/ci-matrix.py ($wanted_series)"
+if grep -v '^#' "$root/Dockerfile.dev" | grep -F 'ocaml/opam' >/dev/null; then
+  fail "Dockerfile.dev must take its ocaml/opam base image from docker/ocaml-<series>/Dockerfile"
 fi
 
 for workflow in "$root/.github/workflows/build.yml" "$root/.github/workflows/build-pr.yml"; do

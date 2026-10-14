@@ -15,7 +15,9 @@ type start_metadata = {
     server recorded on this run's start event ([None] when absent); they are
     metadata only and the runtime never schedules them. [continued_from]
     pairs the predecessor run ID with Core's reason for creating this run and
-    is [None] for the first run of a chain. All fields are immutable values
+    is [None] for the first run of a chain, including a Temporal Schedule
+    action whose continuation carries an empty run ID (#1015); a [Some]
+    always names a real predecessor run. All fields are immutable values
     from history, so live execution and replay observe the same record. *)
 type run_info = {
   workflow_id : string;
@@ -204,7 +206,10 @@ val with_randomness_disabled : t -> (unit -> 'value) -> 'value
 
 (** Emits one durable command that merges encoded values into the workflow's
     indexed search attributes. Keys and payloads are validated by the strict
-    protocol encoder before Core receives the completion. *)
+    protocol encoder before Core receives the completion. An empty list emits
+    no command, because Temporal Server rejects an empty upsert and replay
+    would repeat the rejection on every task retry. Raises [Invalid_argument]
+    after the execution has ended, even for an empty list. *)
 val upsert_search_attributes :
    t -> (string * Temporal_base.Codec.payload) list -> unit
 
@@ -315,8 +320,12 @@ val schedule_local_activity :
 
 (** Assigns a private correlation sequence, records how to decode the child
     result, emits a command containing the application-supplied durable [id]
-    and optional Core-owned retry policy, and returns the child result future
-    together with a cancellation operation.
+    and optional Core-owned retry policy, and returns the child result future,
+    the start-stage future, and a cancellation operation. The start-stage
+    future resolves with the child's run ID when Core reports the start
+    acknowledgment, or with the start failure (or pre-start cancellation)
+    that also resolves the result future; it never waits for the child to
+    finish.
     The default policy is [Child_try_cancel], so cancellation requests the
     child unless a caller explicitly chooses [Child_abandon]. The operation is
     valid only while this context is current; it emits at most one cancellation
@@ -337,6 +346,7 @@ val start_child_workflow :
   decode:(Temporal_base.Codec.payload -> ('output, Temporal_base.Error.t) result) ->
   unit ->
   ( ('output, Temporal_base.Error.t) Future_store.t
+  * (string, Temporal_base.Error.t) Future_store.t
   * (reason:string -> (unit, Temporal_base.Error.t) result) )
 
 (** Sends a signal to an external workflow and returns a future resolved by

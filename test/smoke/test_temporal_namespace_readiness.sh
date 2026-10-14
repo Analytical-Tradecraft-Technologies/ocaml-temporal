@@ -29,6 +29,22 @@ case "$*" in
       cli_deadline_permanent)
         echo "Error: failed connecting to Temporal server at $TEMPORAL_ADDRESS: context deadline exceeded" >&2
         exit 1 ;;
+      # Current CLI releases follow the deadline error with diagnostics.
+      cli_deadline_diagnostics_once) if [ "$count" -eq 1 ]; then
+        printf '%s\n' \
+          "Error: failed connecting to Temporal server at $TEMPORAL_ADDRESS: context deadline exceeded" \
+          '  Namespace: readiness-test' '  TLS: false' '' \
+          "  Connection checks for $TEMPORAL_ADDRESS" \
+          '    ✓ DNS resolved (1 address)' '    ✓ TCP connection established' \
+          '    ? gRPC failure could not be diagnosed before its deadline' >&2
+        exit 1
+      fi ;;
+      # Only the first line classifies an error: a fatal error whose
+      # diagnostics mention the deadline text must still fail at once.
+      cli_auth_mentions_deadline)
+        printf '%s\n' 'Error: authentication failed: invalid API key' \
+          "Error: failed connecting to Temporal server at $TEMPORAL_ADDRESS: context deadline exceeded" >&2
+        exit 1 ;;
       cli_auth) echo 'Error: authentication failed: invalid API key' >&2; exit 1 ;;
       cli_bad_config) echo 'Error: invalid Temporal server configuration' >&2; exit 1 ;;
       pending) if [ "$count" -eq 2 ]; then
@@ -169,6 +185,10 @@ run_case ready 0 1 cli_deadline_once no 3 1
 run_case ready 1 0 cli_deadline_permanent yes 3 0
 grep -F 'describe timed out after 3 attempts' "$fixture/output" >/dev/null
 grep -F 'failed connecting to Temporal server at custom:7233: context deadline exceeded' "$fixture/output" >/dev/null
+run_case ready 0 1 cli_deadline_diagnostics_once yes 2 0
+run_case ready 0 1 cli_deadline_diagnostics_once no 3 1
+run_case ready 1 0 cli_auth_mentions_deadline yes 1 0
+grep -F 'authentication failed: invalid API key' "$fixture/output" >/dev/null
 run_case ready 1 0 cli_auth yes 1 0
 grep -F 'authentication failed: invalid API key' "$fixture/output" >/dev/null
 run_case ready 1 0 cli_bad_config yes 1 0

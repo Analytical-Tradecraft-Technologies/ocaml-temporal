@@ -336,6 +336,10 @@ let _child_future :
     'output T.Child_workflow.handle -> ('output, T.Error.t) T.Future.t =
   T.Child_workflow.future
 
+let _child_started :
+    'output T.Child_workflow.handle -> (string, T.Error.t) T.Future.t =
+  T.Child_workflow.started
+
 let _child_cancel :
     ?reason:string ->
     'output T.Child_workflow.handle -> (unit, T.Error.t) result =

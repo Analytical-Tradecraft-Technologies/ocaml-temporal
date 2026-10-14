@@ -425,6 +425,13 @@ enum CallScope {
     Wait(client_protocol::WaitWorkflowRequest),
     /// Any other RPC, bounded by its own deadline.
     Bounded,
+    /// A call that left the completion registry (read, or released by an
+    /// interrupted caller) while its task was still running (#1019). Its task
+    /// has been aborted and is kept only so disconnect and close can join it.
+    /// It holds no start, wait, or in-flight slot, but its handle still counts
+    /// toward the bound on retained handles: submission joins released tasks
+    /// once the map reaches the in-flight ceiling.
+    Released,
 }
 
 /// One submitted call's Tokio task, retained by the runtime owner so that
@@ -720,7 +727,12 @@ pub struct Runtime {
     /// release every call registered under it.
     call_owner: u64,
     /// Tasks of submitted client calls that may still be running, keyed by
-    /// call identifier. Finished tasks are pruned on each submission.
+    /// call identifier. Finished tasks are pruned on each submission, and a
+    /// call that has left the completion registry is marked
+    /// [`CallScope::Released`] there so it stops counting against the limits.
+    /// Released tasks are joined before admission whenever the map has
+    /// reached the in-flight ceiling, so the map never holds more than
+    /// `client_limits.in_flight_calls` handles after a submission.
     pending_calls: HashMap<u64, PendingCall>,
     /// Admission limits of the current connection (#796). Set by a successful
     /// connect and reset to the defaults by disconnect, so a runtime without
@@ -780,7 +792,11 @@ impl SharedRuntime {
         let (cleanup, receiver) = channel();
         std::thread::Builder::new()
             .name("ocaml-temporal-shared-runtime-cleanup".to_owned())
-            .spawn(move || run_shared_runtime_cleanup(receiver))
+            .spawn(move || {
+                // Dropping Core here can flush or close its connections.
+                crate::sigpipe::block_current_thread();
+                run_shared_runtime_cleanup(receiver)
+            })
             .map_err(|error| Failure {
                 status: STATUS_INTERNAL,
                 message: format!("could not start Temporal runtime cleanup thread: {error}"),
@@ -1053,7 +1069,12 @@ impl Runtime {
         let (cleanup, receiver) = channel();
         std::thread::Builder::new()
             .name("ocaml-temporal-runtime-cleanup".to_owned())
-            .spawn(move || run_runtime_cleanup(receiver))
+            .spawn(move || {
+                // Dropping a client or worker here can flush or close its
+                // connections.
+                crate::sigpipe::block_current_thread();
+                run_runtime_cleanup(receiver)
+            })
             .map_err(|error| Failure {
                 status: STATUS_INTERNAL,
                 message: format!("could not start Temporal runtime cleanup thread: {error}"),
@@ -1323,7 +1344,10 @@ impl Runtime {
     /// Starts and waits keep their own limits (distinct request IDs and
     /// distinct runs, by default 64 each; repeats share a slot) and every
     /// class shares the in-flight ceiling (by default [`MAX_PENDING_CALLS`]),
-    /// all read from the connection's `client_limits` (#796). Admission
+    /// all read from the connection's `client_limits` (#796). Only calls
+    /// still in the completion registry count: a call that was read or
+    /// released stops counting here even if its task is still running, and
+    /// that task is aborted (#1019). Admission
     /// beyond a limit returns
     /// `STATUS_RESOURCE_EXHAUSTED` before any task or RPC exists. A start
     /// whose `request_id` is in flight for a different request is rejected
@@ -1340,6 +1364,25 @@ impl Runtime {
         // future, and with it the connection clone, has already completed.
         self.pending_calls
             .retain(|_, call| !call.task.is_finished());
+        // A call that left the registry while its task still runs was read
+        // (its task is about to end) or released by an interrupted caller
+        // (#1019). Release already aborts the task, and a read call's task
+        // has already published its outcome, so aborting here is idempotent
+        // and harmless. The handle stays so disconnect can still join it, but
+        // the call no longer holds a start, wait, or in-flight slot.
+        let unregistered = crate::client_calls::unregistered_calls(
+            self.call_owner,
+            self.pending_calls
+                .iter()
+                .filter(|(_, call)| !matches!(call.scope, CallScope::Released))
+                .map(|(id, _)| *id),
+        );
+        for id in unregistered {
+            if let Some(call) = self.pending_calls.get_mut(&id) {
+                call.task.abort();
+                call.scope = CallScope::Released;
+            }
+        }
         let scope = match &rpc {
             ClientRpc::Start(request) => {
                 let mut distinct = HashSet::new();
@@ -1393,7 +1436,25 @@ impl Runtime {
             }
             _ => CallScope::Bounded,
         };
-        if self.pending_calls.len() >= limits.in_flight_calls
+        // Hard bound on retained task handles (Codex review on #1077). An
+        // aborted task's handle is only reaped once Tokio has run its
+        // cancellation, so a burst of release-and-resubmit could otherwise
+        // retain released handles (and their request state) without bound.
+        // When the map has reached the in-flight ceiling, join the released
+        // tasks first. They are already aborted, so the join only waits for
+        // their cancellation to run; this happens on the owner thread with
+        // the OCaml runtime lock released, like disconnect's join. Together
+        // with the live-call check below, this keeps
+        // `pending_calls.len() <= in_flight_calls` after every admission.
+        if self.pending_calls.len() >= limits.in_flight_calls {
+            self.reap_released_calls(&handle);
+        }
+        let in_flight = self
+            .pending_calls
+            .values()
+            .filter(|call| !matches!(call.scope, CallScope::Released))
+            .count();
+        if in_flight >= limits.in_flight_calls
             || crate::client_calls::registered_calls(self.call_owner) >= limits.in_flight_calls
         {
             return Err(Failure {
@@ -1420,8 +1481,37 @@ impl Runtime {
             let outcome = future.await;
             guard.complete(outcome);
         });
+        // Let a release from any thread abort this task (#1019). This runs
+        // before the handle reaches OCaml, so no release can precede it.
+        crate::client_calls::attach_task(self.call_owner, call, task.abort_handle());
         self.pending_calls.insert(call, PendingCall { scope, task });
         Ok(encoded)
+    }
+
+    /// Removes every [`CallScope::Released`] call from the task map and joins
+    /// its already aborted task on `handle`. Joining waits only for Tokio to
+    /// run each cancellation, so it is bounded; it never detaches a task that
+    /// still owns a connection clone.
+    fn reap_released_calls(&mut self, handle: &tokio::runtime::Handle) {
+        let released = self
+            .pending_calls
+            .iter()
+            .filter(|(_, call)| matches!(call.scope, CallScope::Released))
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>();
+        let tasks = released
+            .into_iter()
+            .filter_map(|id| self.pending_calls.remove(&id))
+            .map(|call| call.task)
+            .collect::<Vec<_>>();
+        if tasks.is_empty() {
+            return;
+        }
+        handle.block_on(async {
+            for task in tasks {
+                let _ = task.await;
+            }
+        });
     }
 
     /// Releases every submitted call and returns task handles still to join.
@@ -2972,10 +3062,8 @@ fn replay_worker_failure(error: ReplayWorkerError) -> Failure {
             STATUS_OUTSTANDING_TASKS,
             "Temporal replay worker has not drained all input",
         ),
-        ReplayWorkerError::InvalidHistory(_) => (
-            STATUS_PROTOCOL,
-            "Temporal replay history failed strict validation",
-        ),
+        // Each input category maps to a static, input-free sentence.
+        ReplayWorkerError::InvalidHistory(input) => (STATUS_PROTOCOL, input.abi_message()),
         ReplayWorkerError::CoreInitialization => {
             (STATUS_WORKER, "Temporal replay worker construction failed")
         }
@@ -3674,10 +3762,13 @@ fn failure(status: Status, message: impl Into<String>) -> Result {
     }
 }
 
-/// Initializes output, contains panics, and commits one fully formed result.
+/// Initializes output, contains panics and SIGPIPE, and commits one fully
+/// formed result.
 ///
 /// Writing the empty result before executing user logic ensures every non-null
-/// output is safe to free even when the operation panics.
+/// output is safe to free even when the operation panics. SIGPIPE is blocked
+/// on the calling thread for the duration of the operation; see
+/// [`crate::sigpipe`].
 unsafe fn invoke(output: *mut Result, operation: impl FnOnce() -> Operation) -> Status {
     if output.is_null() {
         return STATUS_INVALID_ARGUMENT;
@@ -3687,6 +3778,12 @@ unsafe fn invoke(output: *mut Result, operation: impl FnOnce() -> Operation) -> 
     // be valid and writable. `ptr::write` also permits uninitialized storage.
     unsafe { ptr::write(output, Result::default()) };
 
+    // The caller's thread belongs to the application, and `block_on` can
+    // drive socket writes (for example a TLS handshake) on it. Hold SIGPIPE
+    // blocked for the call so a peer reset surfaces as `EPIPE` rather than
+    // terminating the process, then restore the caller's mask (#1041). The
+    // guard outlives the panic boundary, so a contained panic restores too.
+    let _sigpipe = crate::sigpipe::CallerGuard::enter();
     let result = match catch_unwind(AssertUnwindSafe(operation)) {
         Ok(Ok(value)) => success(value),
         Ok(Err(error)) => failure(error.status, error.message),
@@ -3955,6 +4052,11 @@ fn create_shared_core(
     // hook are preserved; only the worker count differs from the default.
     let mut tokio_builder = TokioRuntimeBuilder::default();
     tokio_builder.inner.worker_threads(worker_threads);
+    // Core layers this hook after its own telemetry hook on every worker and
+    // blocking-pool thread. Those threads perform all of Core's socket I/O,
+    // including the vectored writes that raise SIGPIPE on Linux (#1041).
+    let block_sigpipe: Box<dyn Fn() + Send + Sync> = Box::new(crate::sigpipe::block_current_thread);
+    tokio_builder.lang_on_thread_start = Some(block_sigpipe);
     let mut core = CoreRuntime::new(options, tokio_builder).map_err(|_error| {
         Failure {
             status: STATUS_INTERNAL,
@@ -5756,6 +5858,46 @@ pub unsafe fn test_runtime_has_metrics_meter(runtime: *const Runtime) -> Option<
     Some(core.telemetry().get_temporal_metric_meter().is_some())
 }
 
+/// Stops Core's own Prometheus scrape server on a shared handle while the
+/// bridge's public accept loop keeps running, reproducing the state an accept
+/// error on Core's private listener leaves behind (#1030). Returns whether
+/// the handle had an exporter. Not part of the C ABI.
+///
+/// # Safety
+///
+/// `shared` must be null or a live handle that is not released concurrently.
+#[doc(hidden)]
+pub unsafe fn test_shared_runtime_stop_core_metrics_server(shared: *const SharedRuntime) -> bool {
+    // SAFETY: The caller promises a null or live handle.
+    let Some(shared) = (unsafe { shared.as_ref() }) else {
+        return false;
+    };
+    match shared.core.as_ref().and_then(|core| core.metrics.as_ref()) {
+        Some(exporter) => {
+            exporter.stop_core_server();
+            true
+        }
+        None => false,
+    }
+}
+
+/// Reports whether Core's own Prometheus scrape server on a shared handle has
+/// stopped (#1030); `None` for a null or released handle or one without an
+/// exporter. Not part of the C ABI.
+///
+/// # Safety
+///
+/// `shared` must be null or a live handle that is not released concurrently.
+#[doc(hidden)]
+pub unsafe fn test_shared_runtime_core_metrics_server_stopped(
+    shared: *const SharedRuntime,
+) -> Option<bool> {
+    // SAFETY: The caller promises a null or live handle.
+    let shared = unsafe { shared.as_ref() }?;
+    let exporter = shared.core.as_ref()?.metrics.as_ref()?;
+    Some(exporter.core_server_stopped())
+}
+
 /// Returns the number of live references to a shared handle's Core (the
 /// handle's own plus one per attached graph), or `None` for a null or
 /// released handle. Not part of the C ABI.
@@ -5820,6 +5962,37 @@ pub unsafe fn test_runtime_worker_threads(runtime: *const Runtime) -> Option<usi
         .core
         .as_ref()
         .map(|core| core.tokio_handle().metrics().num_workers())
+}
+
+/// Reports whether SIGPIPE is blocked on Core's Tokio threads (#1041), as
+/// `(worker_thread, blocking_pool_thread)`.
+///
+/// `None` for a null handle or one whose Core runtime was already released.
+/// One probe task runs on a runtime worker and one on the blocking pool; each
+/// reads its own thread's signal mask. Not part of the C ABI.
+///
+/// # Safety
+///
+/// `runtime` must be null or a live handle that is not used concurrently.
+#[doc(hidden)]
+pub unsafe fn test_runtime_threads_block_sigpipe(runtime: *const Runtime) -> Option<(bool, bool)> {
+    // SAFETY: The caller promises a null or live, unshared handle.
+    let runtime = unsafe { runtime.as_ref() }?;
+    let handle = runtime.core.as_ref()?.tokio_handle();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let worker_sender = sender.clone();
+    handle.spawn(async move {
+        let _ = worker_sender.send((0, crate::sigpipe::blocked_in_current_thread()));
+    });
+    handle.spawn_blocking(move || {
+        let _ = sender.send((1, crate::sigpipe::blocked_in_current_thread()));
+    });
+    let mut observed = [None, None];
+    for _ in 0..2 {
+        let (index, blocked) = receiver.recv_timeout(Duration::from_secs(10)).ok()?;
+        observed[index] = Some(blocked);
+    }
+    Some((observed[0]?, observed[1]?))
 }
 
 /// Returns the ABI category used for a worker error without exposing the

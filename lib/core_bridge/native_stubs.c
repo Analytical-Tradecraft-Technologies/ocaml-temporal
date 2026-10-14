@@ -6,6 +6,7 @@
 #include <caml/fail.h>
 #include <caml/memory.h>
 #include <caml/mlvalues.h>
+#include <caml/signals.h>
 #include <caml/threads.h>
 
 #if defined(_WIN32)
@@ -96,6 +97,25 @@ static void runtime_thread_yield(void) {
 #else
   (void)sched_yield();
 #endif
+}
+
+/* Release the OCaml runtime lock for a native call without running pending
+ * OCaml signal handlers first (#1018). Every stub below enters its blocking
+ * section while it already holds an unmanaged resource: a counted runtime or
+ * shared-runtime borrow, a detached native pointer, or a malloc'd input copy.
+ * Plain [caml_enter_blocking_section] runs pending handlers and re-raises
+ * their exceptions, so a handler that raises (for example [Sys.Break] after
+ * [Sys.catch_break true]) would unwind the stub and leak that resource: close
+ * would then spin forever on the leaked borrow, or the detached Core graph
+ * would never be freed. The [_no_pending] variant, available in every
+ * supported OCaml 5 series, only releases the lock. A signal that was
+ * pending stays recorded and [caml_leave_blocking_section] re-arms the
+ * pending-action check, so the handler still runs at the first OCaml poll
+ * point after the stub has returned and released everything it owns. Every
+ * stub therefore uses this helper, never the plain function, so no blocking
+ * section in this file can raise. */
+static void bridge_enter_blocking_section(void) {
+  caml_enter_blocking_section_no_pending();
 }
 
 /* Wait for every operation that was admitted before close to finish. The
@@ -191,10 +211,12 @@ static void finalize_runtime(value runtime) {
   /* Custom-block finalizers have a deliberately tiny contract: they may
    * inspect their C payload and release foreign resources, but they must not
    * call OCaml runtime operations such as [caml_enter_blocking_section]. The
-   * runtime value is rooted by every admitted C primitive, so an ordinary
-   * finalizer cannot overlap an active call; retain the atomic wait as a
-   * defensive barrier for unusual shutdown/GC ordering without releasing or
-   * reacquiring the OCaml lock here. */
+   * runtime value is rooted by every admitted C primitive, and no primitive
+   * can unwind between its acquire and release because its blocking section
+   * never runs signal handlers ([bridge_enter_blocking_section]), so an
+   * ordinary finalizer cannot overlap an active call; retain the atomic wait
+   * as a defensive barrier for unusual shutdown/GC ordering without releasing
+   * or reacquiring the OCaml lock here. */
   wait_for_runtime_calls(owned);
   if (native_runtime != NULL) {
     (void)ocaml_temporal_core_v4_runtime_dispose(&native_runtime);
@@ -300,7 +322,7 @@ static value invoke_runtime_json(value runtime, value input,
   }
 
   admitted = acquire_runtime(owned, &native_runtime);
-  caml_enter_blocking_section();
+  bridge_enter_blocking_section();
   (void)operation(native_runtime, input_copy, input_length, &native_result);
   if (admitted) {
     /* Release the C borrow while the OCaml lock is still released. A
@@ -328,7 +350,7 @@ static value invoke_runtime(value runtime, runtime_operation operation) {
 
   response = alloc_response();
   admitted = acquire_runtime(owned, &native_runtime);
-  caml_enter_blocking_section();
+  bridge_enter_blocking_section();
   (void)operation(native_runtime, &native_result);
   if (admitted) {
     /* See [invoke_runtime_json]: the borrow is independent of the OCaml
@@ -422,7 +444,7 @@ CAMLprim value ocaml_temporal_echo(value input) {
     memcpy(input_copy, Bytes_val(input), input_length);
   }
 
-  caml_enter_blocking_section();
+  bridge_enter_blocking_section();
   (void)ocaml_temporal_core_v4_echo(input_copy, input_length, &native_result);
   caml_leave_blocking_section();
   free(input_copy);
@@ -478,7 +500,7 @@ CAMLprim value ocaml_temporal_conformance_wait_ms(value milliseconds) {
                                                        : (uint32_t)requested;
 
   response = alloc_response();
-  caml_enter_blocking_section();
+  bridge_enter_blocking_section();
   (void)ocaml_temporal_core_v4_conformance_wait_ms(bounded_request,
                                                    &native_result);
   caml_leave_blocking_section();
@@ -507,7 +529,7 @@ CAMLprim value ocaml_temporal_runtime_create(value worker_threads) {
   runtime = alloc_runtime();
   response = alloc_response();
 
-  caml_enter_blocking_section();
+  bridge_enter_blocking_section();
   (void)ocaml_temporal_core_v4_runtime_new_with_worker_threads(
       bounded_request, &native_runtime, &native_result);
   caml_leave_blocking_section();
@@ -643,7 +665,7 @@ CAMLprim value ocaml_temporal_shared_runtime_create(value worker_threads) {
   shared = alloc_shared_runtime();
   response = alloc_response();
 
-  caml_enter_blocking_section();
+  bridge_enter_blocking_section();
   (void)ocaml_temporal_core_v4_shared_runtime_new(bounded_request,
                                                   &native_shared,
                                                   &native_result);
@@ -688,7 +710,7 @@ CAMLprim value ocaml_temporal_shared_runtime_create_with_telemetry(
     memcpy(input_copy, String_val(telemetry), input_length);
   }
 
-  caml_enter_blocking_section();
+  bridge_enter_blocking_section();
   (void)ocaml_temporal_core_v4_shared_runtime_new_with_telemetry_json(
       bounded_request, input_copy, input_length, &native_shared,
       &native_result);
@@ -723,7 +745,7 @@ CAMLprim value ocaml_temporal_runtime_attach(value shared) {
   response = alloc_response();
 
   admitted = acquire_shared_runtime(shared_owner, &native_shared);
-  caml_enter_blocking_section();
+  bridge_enter_blocking_section();
   (void)ocaml_temporal_core_v4_runtime_new_attached(
       native_shared, &native_runtime, &native_result);
   if (admitted) {
@@ -751,7 +773,7 @@ CAMLprim value ocaml_temporal_shared_runtime_close(value shared) {
   ocaml_temporal_core_shared_runtime *native_shared;
   ocaml_temporal_core_status status;
 
-  caml_enter_blocking_section();
+  bridge_enter_blocking_section();
   native_shared = detach_shared_runtime(owned);
   status = ocaml_temporal_core_v4_shared_runtime_free(&native_shared);
   caml_leave_blocking_section();
@@ -907,7 +929,7 @@ CAMLprim value ocaml_temporal_client_submit_json(value runtime, value kind,
   }
 
   admitted = acquire_runtime(owned, &native_runtime);
-  caml_enter_blocking_section();
+  bridge_enter_blocking_section();
   (void)ocaml_temporal_core_v4_client_submit_json(
       native_runtime, native_kind, input_copy, input_length, &native_result);
   if (admitted) {
@@ -923,9 +945,12 @@ CAMLprim value ocaml_temporal_client_submit_json(value runtime, value kind,
 
 /* Abandon one submitted call without reading it (#807), freeing its slot in
  * the runtime's call ceiling. Like the await stub it borrows no runtime and
- * never blocks on the network: Rust only unregisters and closes the cell
- * under its registry mutex. Negative values map to UINT64_MAX, which Rust
- * treats as unknown (a no-op). */
+ * never blocks on the network: Rust unregisters the cell under its registry
+ * mutex, then closes it and aborts a still-running task through its Tokio
+ * abort handle (#1019), so the call stops holding its wait, start, and
+ * in-flight slots at once. Aborting only schedules cancellation; the runtime
+ * owner still joins the task later. Negative values map to UINT64_MAX, which
+ * Rust treats as unknown (a no-op). */
 CAMLprim value ocaml_temporal_client_release_call(value owner, value call) {
   CAMLparam2(owner, call);
   CAMLlocal1(response);
@@ -938,7 +963,7 @@ CAMLprim value ocaml_temporal_client_release_call(value owner, value call) {
   ocaml_temporal_core_result native_result = {0};
 
   response = alloc_response();
-  caml_enter_blocking_section();
+  bridge_enter_blocking_section();
   (void)ocaml_temporal_core_v4_client_release_call(native_owner, native_call,
                                                    &native_result);
   caml_leave_blocking_section();
@@ -972,7 +997,7 @@ CAMLprim value ocaml_temporal_client_await_call(value owner, value call,
   ocaml_temporal_core_result native_result = {0};
 
   response = alloc_response();
-  caml_enter_blocking_section();
+  bridge_enter_blocking_section();
   (void)ocaml_temporal_core_v4_client_await_call(
       native_owner, native_call, native_timeout, &native_result);
   caml_leave_blocking_section();
@@ -1188,7 +1213,7 @@ CAMLprim value ocaml_temporal_runtime_close(value runtime) {
   ocaml_temporal_core_runtime *native_runtime = detach_runtime(owned);
   ocaml_temporal_core_status status;
 
-  caml_enter_blocking_section();
+  bridge_enter_blocking_section();
   wait_for_runtime_calls(owned);
   status = ocaml_temporal_core_v4_runtime_free(&native_runtime);
   caml_leave_blocking_section();

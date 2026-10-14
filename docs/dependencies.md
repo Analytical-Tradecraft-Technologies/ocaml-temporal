@@ -31,7 +31,7 @@ here. It uses only POSIX tools and needs neither OPAM, Cargo, nor Docker.
 | [Linking-exception scope](#linking-exception-scope) | The locked versions of `ocaml`, `ocaml-base-compiler`, and `ocamlbuild` in `temporal-sdk.opam.locked`, and of `tyxml`, `re`, and `camlp-streams` in `scripts/docs-tools.locked` |
 | [CI-only documentation tooling](#ci-only-documentation-tooling) | `scripts/docs-tools.locked` |
 | [CI-only interoperability tooling](#ci-only-interoperability-tooling) | Every `name==version` line of `test/integration/sdk_interop/python/requirements.lock` |
-| [Builder image tooling](#builder-image-tooling), [toolchain and CI images](#toolchain-and-ci-images), and [local integration service images](#local-integration-service-images) | Every digest-pinned image reference in `Dockerfile.dev`, `Dockerfile.rust-ci`, `test/integration/temporal/compose.yaml`, and the GitHub workflows and composite actions |
+| [Builder image tooling](#builder-image-tooling), [toolchain and CI images](#toolchain-and-ci-images), and [local integration service images](#local-integration-service-images) | Every digest-pinned image reference in `Dockerfile.dev`, `docker/ocaml-*/Dockerfile`, `Dockerfile.rust-ci`, `test/integration/temporal/compose.yaml`, and the GitHub workflows and composite actions |
 | [Locked Cargo closure](#locked-cargo-closure) | The `[[package]]` count in `rust/Cargo.lock` and the Temporal Core revision in `rust/Cargo.toml` |
 | [Direct Rust dependencies](#direct-rust-dependencies) | Every crate in `[workspace.dependencies]` in `rust/Cargo.toml` or declared by the bridge (inherited or directly), every locked version of each crate in `rust/Cargo.lock`, and the bridge's normal and dev dependency sections; any other bridge dependency table fails the check |
 | [CI-only quality tools](#ci-only-quality-tools) | The `taiki-e/install-action` tool list and the Makefile `QUALITY_*_VERSION` defaults |
@@ -228,23 +228,35 @@ A lock change must also update the table below, which
 ## Builder image tooling
 
 The development image starts from one `ocaml/opam:debian-12-ocaml-<series>`
-stage per supported compiler series (5.2 through 5.5, matching
-`scripts/ci-matrix.py`). Each stage in `Dockerfile.dev` is pinned to the
-multi-architecture manifest index digest below; those `FROM` lines are the
-single source of truth. The Makefile selects the stage `ocaml-<series>` from
-`OCAML_VERSION`, and the Compose file and live-test scripts default to
-`ocaml-5.2`. BuildKit resolves only the selected stage. Dependabot's `docker`
-ecosystem refreshes the digests in place; it is configured to ignore minor and
-major `ocaml/opam` tag updates so a stage is never retargeted to another
-compiler series. An explicit `OCAML_IMAGE=<image reference>` is still accepted
-for local experiments but is not used by CI or release lanes.
+image per supported compiler series (5.2 through 5.5, matching
+`scripts/ci-matrix.py`). Each series is pinned to the multi-architecture
+manifest index digest below on the single `FROM` line of
+`docker/ocaml-<series>/Dockerfile`; those files are the single source of truth
+and `Dockerfile.dev` names no `ocaml/opam` image itself. The Makefile resolves
+`OCAML_VERSION` (or a series name such as `OCAML_IMAGE=ocaml-5.4`) to the
+pinned reference with `scripts/ocaml-image.sh` and passes it to
+`Dockerfile.dev` as `OCAML_IMAGE`; run directly, the live-test scripts default
+to the 5.2 series. An explicit `OCAML_IMAGE=<image reference>` is still
+accepted for local experiments but is not used by CI or release lanes.
 
-| Image | Stage | Manifest index digest |
+Dependabot's `docker` ecosystem has one entry per series directory, so each
+job tracks exactly one tag and refreshes its digest in place (#1027). A single
+file holding all four stages was treated as one dependency and could not be
+refreshed. Dependabot compares candidate tags by their trailing number (`5.3`)
+but computes `update-types` ranges from the whole current tag, so a
+`semver-minor` ignore never stopped a retarget to another series. Each entry
+therefore ignores `ocaml/opam` versions from the next series upwards (for
+example `>= 5.3` for the 5.2 directory). The current tag is not ignored, which
+keeps its digest refresh eligible.
+`test/fixtures/install-consumer/test_build_tool_dependencies.sh` checks that
+the pin files, the Dependabot entries and the CI matrix stay in step.
+
+| Image | Pin file | Manifest index digest |
 |---|---|---|
-| `ocaml/opam:debian-12-ocaml-5.2` | `ocaml-5.2` | `sha256:b06c7348b6ed3e83b5f66267254504a8f066ec9be9c020c30a8e28ce10ab3ef6` |
-| `ocaml/opam:debian-12-ocaml-5.3` | `ocaml-5.3` | `sha256:bbaac53e502f6602013d8967c3a54cfcb898b556f453ab72e8e23966c3c681df` |
-| `ocaml/opam:debian-12-ocaml-5.4` | `ocaml-5.4` | `sha256:ba37cf7a29709fa2f19124fda8f4cabdea3156a648276fc98c9d528998ae2e59` |
-| `ocaml/opam:debian-12-ocaml-5.5` | `ocaml-5.5` | `sha256:57f87030c6082e3f46f59988fbf12a84947945baf2974d4567a9dcee85780090` |
+| `ocaml/opam:debian-12-ocaml-5.2` | `docker/ocaml-5.2/Dockerfile` | `sha256:3f7f5f5adffbb0f69172d69ec34450695257aaf148d4549b3227c6998c5eb2a4` |
+| `ocaml/opam:debian-12-ocaml-5.3` | `docker/ocaml-5.3/Dockerfile` | `sha256:bbaac53e502f6602013d8967c3a54cfcb898b556f453ab72e8e23966c3c681df` |
+| `ocaml/opam:debian-12-ocaml-5.4` | `docker/ocaml-5.4/Dockerfile` | `sha256:56c9ab2e2f9e8fa926efbc36bedf75fbdb0dd7661765440397def7a24d4e3bfa` |
+| `ocaml/opam:debian-12-ocaml-5.5` | `docker/ocaml-5.5/Dockerfile` | `sha256:36803e379c31545ef00dfb64f8bdf3226b5e8c7b76746b636caedda811c625f3` |
 
 Each index contains native `linux/amd64` and `linux/arm64` images. The image
 build recipes are MIT (`ocurrent/docker-base-images`); the OCaml and OPAM
@@ -381,16 +393,18 @@ the `license` field of `cargo metadata` for the locked version.
 | flate2 | 1.1.10 | 1.1.10 | dev | MIT OR Apache-2.0 | Decodes gzip-compressed gRPC requests in the test server double |
 | h2 | 0.4.19 | 0.4.20 | dev | MIT | Plaintext HTTP/2 gRPC test server double |
 | http | 1.5.0 | 1.5.0 | dev | MIT OR Apache-2.0 | HTTP types for the test server double |
+| libc | 0.2.190 | 0.2.190 | normal | MIT OR Apache-2.0 | Unix thread signal-mask calls that keep SIGPIPE from terminating the OCaml host (#1041); tests also lower the descriptor limit so the metrics endpoint's `accept()` fails (#1030) |
 | prost | 0.14.4 | 0.14.4 | normal | Apache-2.0 | Protobuf encoding and decoding of Temporal API messages and replay histories |
 | serde | 1.0.228 | 1.0.229 | normal | MIT OR Apache-2.0 | Private control protocol data model |
-| serde_json | 1.0.150 | 1.0.151 | normal | MIT OR Apache-2.0 | Private JSON control protocol |
+| serde_json | 1.0.150 | 1.0.154 | normal | MIT OR Apache-2.0 | Private JSON control protocol |
 | prost-wkt-types | 0.7.1 | 0.7.2 | normal | Apache-2.0 AND BSD-3-Clause | Exact protobuf timestamps and durations in the semantic adapter |
 | temporalio-client | Core revision | 1.1.0 | normal | MIT (reviewed `LICENSE.txt`) | Temporal Core client |
 | temporalio-common | Core revision | 1.1.0 | normal | MIT (reviewed `LICENSE.txt`) | Temporal Core shared types |
 | temporalio-sdk-core | Core revision | 0.10.0 | normal | MIT (reviewed `LICENSE.txt`) | Temporal Core worker state machines |
 | temporalio-protos | Core revision | 0.10.0 | normal | MIT (reviewed `LICENSE.txt`) | Temporal API protobuf types |
-| tokio | 1.52.3 | 1.53.2 | normal, dev | MIT | Core's existing executor, channels, and task handles for the guarded poll lanes; tests also enable `net` |
-| uuid | 1.23.4 | 1.27.0 | normal | Apache-2.0 OR MIT | Random v4 tickets for pending workflow-start operations |
+| tokio | 1.52.3 | 1.53.2 | normal, dev | MIT | Core's existing executor, channels, and task handles for the guarded poll lanes; `net` and `io-util` for the metrics endpoint's accept loop and relay |
+| tracing | 0.1.44 | 0.1.44 | normal | MIT | Warning and error records from the metrics endpoint, through Core's existing log pipeline |
+| uuid | 1.23.4 | 1.28.0 | normal | Apache-2.0 OR MIT | Random v4 tickets for pending workflow-start operations |
 
 The guarded poll lanes' hand-off channels are intentionally unbounded because
 Core's outstanding-task permits provide the bound and a bounded send could
@@ -634,7 +648,7 @@ version comment recorded beside a commit pin.
 | `actions/download-artifact` | `9000827ccba6bdab643e8b6fd33ac0654aef8333` | v8 | MIT | Consuming those artifacts |
 | `msys2/setup-msys2` | `ec48f7c5447b3140e2b088413ae3a55687bccb6e` | v2 | MIT | MinGW build tools for the Windows Rust producer |
 | `ocaml/setup-ocaml` | `93303b622b2522e4411e295f9e77411a24912ac7` | v3.9.0 | MIT | Native macOS and Windows OCaml compilers |
-| `taiki-e/install-action` | `f7e5d7c961414b23f5b25b2da9294395d08513ad` | v2.87.26 | Apache-2.0 OR MIT | Installing the pinned CI-only quality tools |
+| `taiki-e/install-action` | `ab6895351a88b908e96a4697860d4ffea5e57dbe` | v2.87.27 | Apache-2.0 OR MIT | Installing the pinned CI-only quality tools |
 
 `actions/checkout` is referenced by its major-version tag rather than an
 immutable commit; every other action is pinned by commit.

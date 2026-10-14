@@ -58,9 +58,12 @@ Consequently:
   including its name, repeated payload list, sender identity, and headers.
   The handler is queued on the execution scheduler. The public handler policy
   accepts one payload and decodes zero payloads as the canonical `binary/null`
-  unit payload; a missing handler or more than one payload is logged and
-  completed as a non-retryable workflow failure rather than acknowledged as a
-  no-op.
+  unit payload. Delivery is fail-closed (#811): a missing handler, an
+  undecodable payload, or more than one payload fails the workflow task
+  rather than closing the run or being acknowledged as a no-op, so the run
+  stays open until a worker with a matching handler replays it. Only a
+  deliberate application error returned by the handler fails the workflow.
+  See [unknown and undecodable signals](../reference/interactive-workflows.md#unknown-and-undecodable-signals).
 - `QueryWorkflow` is deliverable to a registered output-only or exactly-one-
   input OCaml query handler. Core's repeated arguments and headers remain in
   the private runtime record. Output-only definitions reject non-empty
@@ -200,9 +203,9 @@ A signal handler is mutating workflow code but has no result command of its
 own. Its state changes and any ordinary activity, child, or timer commands are
 returned in the completion for the containing activation. The handler observes
 the Core-provided ordering relative to other signal and update jobs. A missing
-handler, invalid arity or payload, or handler exception follows the SDK's typed
-non-retryable workflow-defect path; raw exceptions and payload values never
-cross the bridge. Public `Temporal.Signal.Handler.t` currently receives the
+handler, invalid arity or payload, or handler exception becomes a typed
+non-retryable `Defect` or `Codec` error that fails the workflow task, not the
+run; raw exceptions and payload values never cross the bridge. Public `Temporal.Signal.Handler.t` currently receives the
 single typed payload only. Identity and headers remain validated runtime data
 until a metadata-aware public handler API is designed.
 
