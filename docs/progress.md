@@ -40,6 +40,29 @@ the shared vocabulary; `test/bridge/test_ocaml_client_protocol.ml` decodes
 `cargo test --lib client_protocol`, `cargo clippy -D warnings`, `cargo fmt
 --check`, `dune build @install` and the OCaml client protocol test on OCaml
 5.4.1 (macOS).
+## 2026-10-13: A raising signal handler no longer leaks bridge borrows (#1018)
+
+In OCaml 5, `caml_enter_blocking_section` runs pending signal handlers and
+re-raises their exceptions. The bridge stubs entered it after taking a counted
+runtime or shared-runtime borrow, after `runtime_close` had detached the
+native pointer, or while holding a `malloc`'d input copy. A raising handler,
+such as `Sys.Break` under `Sys.catch_break true`, therefore unwound the stub
+and leaked that resource: the next close spun forever on the leaked borrow,
+the GC finalizer could spin while holding the domain lock, or a detached Core
+graph was never freed. Every stub in `lib/core_bridge/native_stubs.c` now
+releases the lock through one helper that calls
+`caml_enter_blocking_section_no_pending`, which every supported compiler
+series (5.2 to 5.5) provides. A pending handler still runs, at the first OCaml
+poll point after the stub has returned and released everything it owns.
+
+`test/bridge/test_signal_borrow_release.ml` makes SIGUSR1 pending with a test
+C helper that does not run OCaml handlers, then calls the production stubs
+directly: the no-input and JSON runtime paths, client submit, shared-runtime
+attach, and close. It checks that each stub returns and the raising handler
+then runs exactly once, and that every runtime and the shared runtime close
+afterwards. Without the fix the test fails at the first stub. It is skipped on
+Windows, which has no SIGUSR1. Verified with `dune build @install` and
+`dune build @test/bridge/runtest` on OCaml 5.4.1 (macOS).
 
 ## 2026-10-13: Teardown cleanup keeps the terminal command and eviction ack (#1021)
 
