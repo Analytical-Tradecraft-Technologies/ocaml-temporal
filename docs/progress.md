@@ -15,6 +15,37 @@ implementation when a later entry documents that work as complete. The
 records the current tested source, named assertions and successful CI job for
 the Temporal acceptance controllers.
 
+## 2026-10-14: Live-regression logs retained; coverage inventory, sizing guide and release checklist (#498, #504, #510, #519)
+
+The Temporal/PostgreSQL job now uploads `_build/live-regressions/*.log` and the
+official-SDK interoperability evidence as a `live-regressions-<run>-<attempt>`
+artifact, in an `always()` step with the same seven-day retention and pinned
+`upload-artifact` revision as the diagnostic bundles. Before, those logs were
+only printed to the job output. The copied admin-tools CLI in the same
+directory is excluded.
+
+[Live acceptance coverage](reference/live-acceptance-coverage.md#worker-crash-restart-shutdown-and-eviction-inventory)
+now maps the three #519 boundaries (worker removal during pending work,
+shutdown with outstanding work, eviction followed by continued progress) to the
+crash-recovery, cache-eviction and parent/child restart controllers and the
+`interaction_recovery` and `bounded_shutdown` regressions, with the commands
+that reproduce each. It names the remaining gap: no suite kills a worker
+while an activity callback is running.
+
+The [worker sizing guide](guides/worker-sizing.md) (#498) covers the validated
+`Worker.Options`, `io_threads` and shared runtimes, the sticky cache, small and
+production starting points, and the metrics that show saturation. It states
+that each worker runs one activity callback at a time (#777, #492). The
+[release checklist](reference/release-checklist.md) (#510) lists the version,
+gate, tag and verification steps and the sign-off roles, marks #506 to #510 and
+#489 as open, and describes how to supersede a bad candidate or release
+because the version-tag ruleset forbids moving or deleting a tag.
+
+This is documentation and CI configuration only; none of the four issues is
+complete. Verified with `actionlint` on the edited workflow, a YAML parse of it,
+`make test-quality-contract` (Docker-free contracts), and a relative-link check
+of the edited Markdown.
+
 ## 2026-10-13: Teardown cleanup keeps the terminal command and eviction ack (#1021)
 
 When a run completed or was evicted, the scheduler discontinued every parked

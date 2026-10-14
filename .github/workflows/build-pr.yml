@@ -239,6 +239,21 @@ jobs:
           path: _build/live-diagnostics/
           retention-days: 7
           if-no-files-found: warn
+      - name: Upload live regression suite logs
+        # run-live-regressions.sh writes one log per suite and the official-SDK
+        # interop evidence under _build/live-regressions (#504, #519). The
+        # copied admin-tools CLI binary in that directory is deliberately
+        # excluded. Upload failure is reported here, not as a scenario failure.
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: live-regressions-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            _build/live-regressions/*.log
+            _build/live-regressions/sdk_interop/
+          retention-days: 7
+          if-no-files-found: warn
       - name: Link live diagnostics and collection status
         if: always()
         env:

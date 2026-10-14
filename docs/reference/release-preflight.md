@@ -120,7 +120,9 @@ silently replace an existing draft or release. If a published release is found
 defective, preserve its tag and assets for audit,
 mark it superseded in its notes, and issue a corrected version under a new tag.
 The source SHA and checksums in the manifest identify what was built, but are
-not a signed provenance attestation.
+not a signed provenance attestation. The
+[release checklist](release-checklist.md) collects these steps, the sign-off,
+the open qualification gates, and the remediation procedure in one place.
 
 ## Local gate
 
