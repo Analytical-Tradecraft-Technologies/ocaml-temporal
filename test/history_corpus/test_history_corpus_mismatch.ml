@@ -27,7 +27,19 @@
     still reports nondeterminism, but its declared [expected_message] is
     replaced by a fragment of a different real Core mismatch. The runner must
     fail exactly that case, so a negative control cannot pass for a reason
-    other than the documented one (issue #531). *)
+    other than the documented one (issue #531).
+
+    {b Unmutated malformed-history control.} [invalid-event-id-gap-timer]
+    loses its [history_mutation], so the committed timer history replays
+    cleanly where a refusal was required. The runner must fail exactly that
+    case with actual outcome [replays_ok], so a malformed-history control
+    whose edit stopped applying cannot pass (issue #503).
+
+    {b Unclassified and stale coverage.} [live-2026-10-08-activity] gains a
+    tag with no row in the feature coverage table and the tag of a feature
+    the table lists as not yet captured. The runner must report exactly
+    those two coverage problems, so a new feature cannot skip the table and
+    a captured gap must be promoted to a covered row (issue #503). *)
 
 (** The two mutated entries, in manifest order, with their new definition
     sets. *)
@@ -154,6 +166,39 @@ let mutate_reason manifest =
       List.map
         (function
           | "expected_message", _ -> ("expected_message", `String wrong_reason)
+          | member -> member)
+        members)
+    manifest
+
+(** Malformed-history control whose edit the unmutated scenario removes. *)
+let unmutated_entry = "invalid-event-id-gap-timer"
+
+(** Unmutated scenario: drops {!unmutated_entry}'s [history_mutation], failing
+    if it had none so the scenario cannot silently stop testing the edit. *)
+let remove_mutation manifest =
+  edit_entries [ unmutated_entry ]
+    (fun _ members ->
+      if not (List.mem_assoc "history_mutation" members) then
+        fail "%s has no history_mutation" unmutated_entry;
+      List.remove_assoc "history_mutation" members)
+    manifest
+
+(** Entry the coverage scenario tags with {!coverage_tags}. *)
+let coverage_entry = "live-2026-10-08-activity"
+
+(** A tag with no coverage row, and a feature the table lists as not yet
+    captured. *)
+let coverage_tags = [ "unclassified-feature"; "local-activity" ]
+
+(** Coverage scenario: appends {!coverage_tags} to {!coverage_entry}. *)
+let add_coverage_tags manifest =
+  edit_entries [ coverage_entry ]
+    (fun _ members ->
+      List.map
+        (function
+          | "features", `List features ->
+              ( "features",
+                `List (features @ List.map (fun tag -> `String tag) coverage_tags) )
           | member -> member)
         members)
     manifest
@@ -286,6 +331,53 @@ let check_reason ~status ~stdout ~stderr report =
   if not (contains (string_at [ "message" ] case) "expected failure text containing")
   then fail "%s: diagnostic does not name the declared reason" reason_entry
 
+(** Checks the unmutated scenario: only {!unmutated_entry} fails, and it
+    failed because the unedited history replayed. *)
+let check_unmutated ~status ~stdout ~stderr report =
+  let open Yojson.Safe.Util in
+  if status <> 1 then fail "runner exited %d, expected 1\n%s\n%s" status stdout stderr;
+  if
+    List.map to_string (report |> member "failing_cases" |> to_list)
+    <> [ unmutated_entry ]
+  then fail "report failing_cases is not exactly %s:\n%s" unmutated_entry stderr;
+  let case =
+    report |> member "cases" |> to_list
+    |> List.find (fun case -> string_at [ "id" ] case = unmutated_entry)
+  in
+  if
+    string_at [ "expected" ] case <> "invalid_history"
+    || string_at [ "actual" ] case <> "replays_ok"
+  then fail "%s: expected invalid_history and actual replays_ok" unmutated_entry
+
+(** Checks the coverage scenario: exactly the two coverage problems are
+    reported, every case still replays, and the run fails. *)
+let check_coverage ~status ~stdout ~stderr report =
+  let open Yojson.Safe.Util in
+  if status <> 1 then fail "runner exited %d, expected 1\n%s\n%s" status stdout stderr;
+  let expected_problems =
+    [
+      Printf.sprintf
+        "entry %s: feature unclassified-feature has no row in the corpus \
+         feature coverage table"
+        coverage_entry;
+      Printf.sprintf
+        "feature local-activity is listed as not yet captured, but entry %s \
+         replays it; mark it replayed"
+        coverage_entry;
+    ]
+  in
+  let problems = List.map to_string (report |> member "problems" |> to_list) in
+  if problems <> expected_problems then
+    fail "report problems differ:\n%s" (String.concat "\n" problems);
+  List.iter
+    (fun problem ->
+      if not (contains stderr problem) then
+        fail "stderr does not report %S:\n%s" problem stderr)
+    expected_problems;
+  if report |> member "failing_cases" |> to_list <> [] then
+    fail "a coverage problem must not fail any replayed case";
+  if string_at [ "status" ] report <> "fail" then fail "report status is not fail"
+
 (** Copies the corpus next to [manifest_path] into a fresh temporary
     directory, lets [prepare] edit the copy and return the manifest to write,
     runs [runner] on it, and passes the outcome and report to [check]. The
@@ -363,4 +455,14 @@ let () =
     ~prepare:(fun ~directory:_ manifest -> mutate_reason manifest)
     check_reason;
   print_endline
-    "PASS history corpus runner rejects a negative control with the wrong reason"
+    "PASS history corpus runner rejects a negative control with the wrong reason";
+  run_scenario ~runner ~manifest_path ~cargo_lock
+    ~prepare:(fun ~directory:_ manifest -> remove_mutation manifest)
+    check_unmutated;
+  print_endline
+    "PASS history corpus runner fails a malformed-history control that replays";
+  run_scenario ~runner ~manifest_path ~cargo_lock
+    ~prepare:(fun ~directory:_ manifest -> add_coverage_tags manifest)
+    check_coverage;
+  print_endline
+    "PASS history corpus runner rejects unclassified and stale feature coverage"

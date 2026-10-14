@@ -3,15 +3,18 @@
 
     {v
     history_corpus_runner.exe MANIFEST [--report FILE] [--cargo-lock FILE]
-                                       [--sdk-commit SHA]
+                                       [--sdk-commit SHA] [--coverage-doc FILE]
     v}
 
     1. Validates [MANIFEST] against the v1 schema, every checksum, every cross
        reference, each JSON history's recorded workflow type and run ID, and
        the absence of orphaned history files.
-    2. Requires the corpus to cover the feature set promised in
-       [docs/reference/history-corpus.md], including at least one negative
-       control.
+    2. Checks the feature coverage table ({!Corpus_coverage}): every
+       supported feature has a corpus case of the required verdict (a
+       replayed history, a nondeterminism control or a malformed-history
+       control) or an explicit not-applicable or not-yet-captured reason,
+       every manifest feature tag is classified, and, with [--coverage-doc],
+       the table in [docs/reference/history-corpus.md] matches.
     3. Replays every entry through the public [Temporal.Replay] API against
        its named frozen definition set and requires the manifest's expected
        outcome.
@@ -25,54 +28,23 @@
     identifiers. The corpus is read-only here: nothing is regenerated or
     rewritten. *)
 
-(** Feature tags that must each have at least one [replays_ok] entry. Removing
-    a tag from this list is a deliberate corpus-scope change and must be
-    reflected in docs/reference/history-corpus.md. Queries are deliberately
-    absent: they record no history events, so replaying a history never runs
-    a query handler and a "query" tag could not be checked by this gate. *)
-let required_features =
-  [
-    "activity"; "timer"; "activity-retry"; "signal"; "update";
-    "child-workflow"; "continue-as-new"; "patch-marker-free"; "patch-active";
-    "patch-deprecated"; "workflow-failure"; "workflow-task-failure-recovery";
-    (* Patch lifecycle boundaries added for issue #531. *)
-    "patch-removed"; "patch-multiple"; "patch-loop"; "patch-signal-handler";
-    "patch-update-handler"; "patch-mid-run-upgrade"; "patch-upgrade";
-    "patch-rollback";
-  ]
-
-(** Checks the coverage contract and returns its failures. *)
-let coverage_failures (manifest : Corpus_manifest.t) =
-  let ok_features =
-    List.concat_map
-      (fun (entry : Corpus_manifest.entry) ->
-        if entry.expected = Replays_ok then entry.features else [])
-      manifest.entries
-  in
-  let missing =
-    List.filter (fun feature -> not (List.mem feature ok_features)) required_features
-    |> List.map (fun feature -> "no replays_ok entry covers feature " ^ feature)
-  in
-  if
-    List.exists
-      (fun (entry : Corpus_manifest.entry) -> entry.expected = Nondeterminism)
-      manifest.entries
-  then missing
-  else missing @ [ "the corpus has no nondeterminism negative control" ]
-
 (** Command-line options. *)
 type options = {
   manifest_path : string;
   report_path : string option;
   cargo_lock : string option;
   sdk_commit : string option;
+  coverage_doc : string option;
+      (** The corpus reference document whose feature coverage table must
+          match {!Corpus_coverage.table}. The Dune test passes it; the
+          upgrade command does not need it. *)
 }
 
 (** Prints usage and exits 2. *)
 let usage () =
   prerr_endline
     "usage: history_corpus_runner.exe MANIFEST [--report FILE] [--cargo-lock \
-     FILE] [--sdk-commit SHA]";
+     FILE] [--sdk-commit SHA] [--coverage-doc FILE]";
   exit 2
 
 (** Parses [Sys.argv]. An empty [--sdk-commit] (for example from a Make
@@ -90,13 +62,21 @@ let parse_options () =
     | "--sdk-commit" :: commit :: rest ->
         let sdk_commit = if commit = "" then None else Some commit in
         parse { options with sdk_commit } manifest rest
+    | "--coverage-doc" :: path :: rest ->
+        parse { options with coverage_doc = Some path } manifest rest
     | argument :: rest
       when manifest = None && not (String.starts_with ~prefix:"--" argument) ->
         parse options (Some argument) rest
     | _ -> usage ()
   in
   parse
-    { manifest_path = ""; report_path = None; cargo_lock = None; sdk_commit = None }
+    {
+      manifest_path = "";
+      report_path = None;
+      cargo_lock = None;
+      sdk_commit = None;
+      coverage_doc = None;
+    }
     None
     (List.tl (Array.to_list Sys.argv))
 
@@ -108,12 +88,19 @@ let () =
     Corpus_runner.candidate ~sdk_commit:options.sdk_commit
       ~cargo_lock:options.cargo_lock
   in
-  let problems, cases =
+  let document_problems =
+    match options.coverage_doc with
+    | None -> []
+    | Some path -> Corpus_coverage.check_document path
+  in
+  let problems, entries, cases =
     match Corpus_manifest.load options.manifest_path with
-    | Error errors -> (errors, [])
+    | Error errors -> (errors @ document_problems, [], [])
     | Ok manifest ->
         let root = Filename.dirname options.manifest_path in
-        (coverage_failures manifest, Corpus_runner.run ~root manifest)
+        ( Corpus_coverage.check manifest.entries @ document_problems,
+          manifest.entries,
+          Corpus_runner.run ~root manifest )
   in
   Corpus_runner.print_table candidate cases;
   Printf.printf "history corpus: %s\n%!" Corpus_runner.scope_note;
@@ -121,7 +108,9 @@ let () =
     (fun path ->
       Corpus_runner.write_report path
         (Corpus_runner.report ~manifest_path:options.manifest_path ~candidate
-           ~problems cases);
+           ~problems
+           ~feature_coverage:(Corpus_coverage.report_json entries)
+           cases);
       Printf.printf "history corpus: report written to %s\n%!" path)
     options.report_path;
   match (problems, Corpus_runner.failing_ids cases) with
