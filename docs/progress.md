@@ -15,6 +15,48 @@ implementation when a later entry documents that work as complete. The
 records the current tested source, named assertions and successful CI job for
 the Temporal acceptance controllers.
 
+## 2026-10-13: Released client calls free their capacity at once (#1019)
+
+`Client_call.await` releases a call it leaves without a terminal read, for
+example when an asynchronous exception or a decoder exception interrupts
+`Client.wait`. Release unregistered the call's completion cell but left its
+Tokio task running. The owner pruned only finished tasks and counted every
+remaining task against the wait and in-flight limits. An exact-run wait has
+no total deadline, so each abandoned wait on an open run kept a server long
+poll and both slots until the run closed or the client shut down. After
+`max_pending_waits` such abandonments, every new wait returned
+`Resource_exhausted`.
+
+The completion registry now holds each task's Tokio `AbortHandle`, attached
+by the owner right after spawning. `release_call` closes the cell and aborts
+the task from whichever thread releases it. This needs no runtime pointer.
+At each submission the owner marks any call that has left the registry as
+`Released` and aborts it again, which is idempotent. A released call holds no
+start, wait or in-flight slot, even before its aborted task has finished.
+Its join handle stays in the owner's task map, so disconnect and close still
+join it. Because an abort finishes only once Tokio runs the cancellation,
+submission joins the released tasks whenever the task map has reached the
+in-flight ceiling, so the map never retains more than `max_in_flight_calls`
+handles. The C header, the release stub comment and
+`docs/reference/client-protocol.md` describe the
+new release contract.
+
+Four new tests in `rust/core-bridge/tests/support/client_calls.rs` use the
+callback transport, whose history long polls never answer:
+
+- releasing a pending wait drops its transport long poll with no further
+  submit or disconnect;
+- with the default limits, `max_pending_waits` new distinct waits are
+  admitted right after one wait is released;
+- with configured limits of two waits and two in-flight calls, releasing
+  both waits admits two new ones at once;
+- a burst of 500 submit-and-release cycles under a two-call ceiling never
+  retains more than two task handles.
+
+All four fail without the fix. Verified with the crate's library tests and
+`tests/abi.rs`, `cargo clippy --lib --tests -D warnings` and
+`cargo fmt --check` (macOS).
+
 ## 2026-10-13: A raising signal handler no longer leaks bridge borrows (#1018)
 
 In OCaml 5, `caml_enter_blocking_section` runs pending signal handlers and
