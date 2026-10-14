@@ -1718,17 +1718,19 @@ pub(crate) async fn update_workflow_within(
         let response_stage = response.stage;
         let converted = update_response_from_core(&request, response)?;
         if converted.outcome.is_some() {
-            // An outcome is final, but its stage must still be a known one so
-            // a malformed or forward-incompatible response fails closed.
-            validate_update_stage_with_outcome(response_stage)?;
+            // An outcome is final whatever stage accompanies it: the server
+            // only attaches one once the update completed or was rejected, so
+            // a stage this bridge does not know (a newer server's) cannot
+            // change its meaning (#1078).
             return Ok(converted);
         }
         if update_stage_is_accepted(response_stage)? {
             return Ok(converted);
         }
-        // Admitted (or an older server's unspecified stage) without an
-        // outcome: the update is not yet durable. Re-issue it if the budget
-        // still allows one more attempt.
+        // Admitted, an older server's unspecified stage, or a stage this
+        // bridge does not know, without an outcome: the update is not known
+        // to be durable. Re-issue it if the budget still allows one more
+        // attempt.
         let pause_until = tokio::time::Instant::now() + UPDATE_READMISSION_PAUSE;
         if pause_until >= deadline {
             return Err(deadline_exceeded());
@@ -1741,36 +1743,26 @@ pub(crate) async fn update_workflow_within(
 /// outcome. Returns `true` once the update is at least accepted, `false` for
 /// `Admitted` and `Unspecified` (both mean "not yet accepted" and are retried,
 /// matching the official SDKs' `stage < Accepted` loop), and a Core conversion
-/// error for `Completed` without an outcome or an unknown future stage, so an
-/// unexpected server state never becomes a handle.
+/// error for `Completed` without an outcome, which no conforming server sends.
+///
+/// A numeric stage this bridge does not know, as a newer server might add,
+/// is also classified as "not yet accepted" (#1078). That is the conservative
+/// reading: re-issuing the update under the same update ID is deduplicated
+/// by Temporal, so the loop either observes a known stage or ends with the
+/// typed `deadline_exceeded` error, and an update whose durability is not
+/// established never becomes a handle.
 fn update_stage_is_accepted(stage: i32) -> Result<bool, ClientOperationError> {
     match UpdateWorkflowExecutionLifecycleStage::try_from(stage) {
-        Ok(
-            UpdateWorkflowExecutionLifecycleStage::Unspecified
-            | UpdateWorkflowExecutionLifecycleStage::Admitted,
-        ) => Ok(false),
         Ok(UpdateWorkflowExecutionLifecycleStage::Accepted) => Ok(true),
         Ok(UpdateWorkflowExecutionLifecycleStage::Completed) => Err(ClientOperationError::Core(
             workflow_protocol::invalid_core("Temporal completed update omitted its outcome"),
         )),
-        Err(_) => Err(ClientOperationError::Core(workflow_protocol::invalid_core(
-            "Temporal update response used an unknown lifecycle stage",
-        ))),
+        Ok(
+            UpdateWorkflowExecutionLifecycleStage::Unspecified
+            | UpdateWorkflowExecutionLifecycleStage::Admitted,
+        )
+        | Err(_) => Ok(false),
     }
-}
-
-/// Checks the lifecycle stage of an update response that carried an outcome.
-/// Any known stage is accepted (servers report `Completed`, and older ones
-/// may leave it unspecified), while an unknown numeric stage is a Core
-/// conversion error so the bridge never trusts a forward-incompatible reply.
-fn validate_update_stage_with_outcome(stage: i32) -> Result<(), ClientOperationError> {
-    UpdateWorkflowExecutionLifecycleStage::try_from(stage)
-        .map(|_| ())
-        .map_err(|_| {
-            ClientOperationError::Core(workflow_protocol::invalid_core(
-                "Temporal update response used an unknown lifecycle stage",
-            ))
-        })
 }
 
 /// Converts one `UpdateWorkflowExecution` response into the closed bridge
@@ -2749,7 +2741,12 @@ fn validate_visibility_page(value: &VisibilityPage) -> Result<(), protocol::Prot
         validate_identifier(&execution.run_id, &format!("{path}.run_id"))?;
         validate_identifier(&execution.workflow_type, &format!("{path}.workflow_type"))?;
         validate_identifier(&execution.task_queue, &format!("{path}.task_queue"))?;
-        validate_identifier(&execution.status, &format!("{path}.status"))?;
+        if !is_visibility_status_name(&execution.status) {
+            return Err(protocol::ProtocolError::invalid(
+                format!("{path}.status"),
+                "unknown visibility status",
+            ));
+        }
     }
     if let Some(token) = &value.next_page_token {
         base64::engine::general_purpose::STANDARD
@@ -2761,22 +2758,57 @@ fn validate_visibility_page(value: &VisibilityPage) -> Result<(), protocol::Prot
     Ok(())
 }
 
-/// Converts Temporal's numeric visibility enum into a stable closed string.
+/// Highest `WorkflowExecutionStatus` wire value this bridge names. Other
+/// nonzero values are reported with [`UNKNOWN_STATUS_PREFIX`].
+const MAX_KNOWN_VISIBILITY_STATUS: i32 = 8;
+
+/// Prefix of the fallback status name for a `WorkflowExecutionStatus` this
+/// bridge does not know, followed by the canonical decimal wire value (for
+/// example `unknown_9`). The OCaml decoder accepts exactly the same shape.
+const UNKNOWN_STATUS_PREFIX: &str = "unknown_";
+
+/// Converts Temporal's numeric visibility enum into a stable status string.
+///
+/// Known statuses map to fixed lowercase names. A value a newer server may
+/// add is reported as `unknown_<n>` rather than failing the whole listing
+/// (#1078), so callers can still page through and identify the row. Only
+/// `0` (unspecified) is rejected: every server sets a status on a
+/// visibility row, so an omitted one is a malformed response.
 fn visibility_status(status: i32) -> Result<String, ClientOperationError> {
+    let known = match status {
+        0 => {
+            return Err(ClientOperationError::Core(workflow_protocol::invalid_core(
+                "visibility row has an unspecified execution status",
+            )));
+        }
+        1 => "running",
+        2 => "completed",
+        3 => "failed",
+        4 => "canceled",
+        5 => "terminated",
+        6 => "continued_as_new",
+        7 => "timed_out",
+        8 => "paused",
+        _ => return Ok(format!("{UNKNOWN_STATUS_PREFIX}{status}")),
+    };
+    Ok(known.to_owned())
+}
+
+/// Returns whether `status` is a name [`visibility_status`] can produce (or
+/// the legacy `unspecified` name the schema has always allowed). An unknown
+/// status must use the canonical decimal form of a value outside the named
+/// range, so one wire value has exactly one spelling.
+fn is_visibility_status_name(status: &str) -> bool {
     match status {
-        1 => Ok("running"),
-        2 => Ok("completed"),
-        3 => Ok("failed"),
-        4 => Ok("canceled"),
-        5 => Ok("terminated"),
-        6 => Ok("continued_as_new"),
-        7 => Ok("timed_out"),
-        8 => Ok("paused"),
-        _ => Err(ClientOperationError::Core(workflow_protocol::invalid_core(
-            "visibility row has an unknown execution status",
-        ))),
+        "running" | "completed" | "failed" | "canceled" | "terminated" | "continued_as_new"
+        | "timed_out" | "paused" | "unspecified" => true,
+        _ => status
+            .strip_prefix(UNKNOWN_STATUS_PREFIX)
+            .and_then(|digits| digits.parse::<i32>().ok().map(|value| (digits, value)))
+            .is_some_and(|(digits, value)| {
+                !(0..=MAX_KNOWN_VISIBILITY_STATUS).contains(&value) && value.to_string() == digits
+            }),
     }
-    .map(str::to_owned)
 }
 
 /// Validates one execution reference.
@@ -2943,12 +2975,47 @@ mod tests {
     use temporalio_client::tonic::codegen::Bytes;
 
     #[test]
-    /// Unknown and omitted Temporal visibility enum values fail closed instead
-    /// of being converted into a valid-looking status string.
-    fn unknown_visibility_status_is_rejected() {
+    /// An omitted visibility status fails closed, while a value a newer
+    /// server may add degrades to the documented `unknown_<n>` name (#1078).
+    fn visibility_status_names_unknown_values() {
         assert!(visibility_status(0).is_err());
-        assert!(visibility_status(99).is_err());
         assert_eq!(visibility_status(1).unwrap(), "running");
+        assert_eq!(visibility_status(8).unwrap(), "paused");
+        assert_eq!(visibility_status(9).unwrap(), "unknown_9");
+        assert_eq!(visibility_status(-3).unwrap(), "unknown_-3");
+        for status in [1, 8, 9, 99, -3, i32::MAX, i32::MIN] {
+            let name = visibility_status(status).unwrap();
+            assert!(is_visibility_status_name(&name), "{name}");
+        }
+    }
+
+    #[test]
+    /// The encoder accepts only names the converter can produce, with one
+    /// canonical spelling per unknown wire value, matching the OCaml decoder.
+    fn visibility_status_name_vocabulary() {
+        for accepted in [
+            "running",
+            "paused",
+            "unspecified",
+            "unknown_9",
+            "unknown_-1",
+        ] {
+            assert!(is_visibility_status_name(accepted), "{accepted}");
+        }
+        for rejected in [
+            "future_status",
+            "unknown_",
+            "unknown_1",
+            "unknown_0",
+            "unknown_8",
+            "unknown_09",
+            "unknown_+9",
+            "unknown_-0",
+            "unknown_9x",
+            "unknown_99999999999",
+        ] {
+            assert!(!is_visibility_status_name(rejected), "{rejected}");
+        }
     }
 
     /// Builds the smallest valid start document used by strict-parser tests.

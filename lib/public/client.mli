@@ -153,6 +153,12 @@ type visibility_execution = {
   workflow_type : string;
   task_queue : string;
   status : string;
+      (** Execution status: one of ["running"], ["completed"], ["failed"],
+          ["canceled"], ["terminated"], ["continued_as_new"], ["timed_out"],
+          or ["paused"]. A status added by a newer Temporal server than this
+          SDK knows is reported as ["unknown_<n>"] with its decimal wire
+          value (for example ["unknown_9"]) rather than failing the listing,
+          so match on the known names and treat anything else as unknown. *)
 }
 
 (** A bounded visibility page and its opaque continuation token. *)
