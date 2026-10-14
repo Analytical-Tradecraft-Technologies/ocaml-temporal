@@ -52,6 +52,32 @@ continue-as-new in the root and in a handler, and around a cancelled root. `test
 checks that a cleanup exception after shutdown is a teardown failure while an
 active one is still `Failed`. Verified with the full `test/runtime` and
 `test/unit` aliases on OCaml 5.4.1 (macOS).
+## 2026-10-13: Child-start acknowledgement for abandoned children (#1040)
+
+Temporal Server does not start a child whose parent has already closed, even
+with `Parent_close_policy.Abandon`, and the public API had no way to wait for
+the child's start: `Child_workflow.start` and `start_handle` resolved only on a
+failed start or on the child's result. The documented "start an `Abandon`
+child and return" pattern therefore lost the child silently whenever the
+parent completed in the same workflow task.
+
+`Child_workflow.started : 'output handle -> (string, Error.t) Future.t` now
+resolves with the child's run ID when Core reports the start acknowledgement,
+and with the same error as the result future when the child never starts
+(start failure, or cancellation before the start). The runtime allocates both
+futures with the child command, so the start stage is settled by the same
+activation jobs and stays replay-safe. `child_workflow.mli`, the workflow
+guide and the [operation policy reference](reference/durable-operation-policies.md)
+now tell parents to await `started` before returning when the child must
+outlive them, matching the Go, Java, Python and TypeScript SDKs.
+
+`test/runtime/test_activation.ml` checks that a parent awaiting `started`
+emits its completion only after the acknowledgement and receives the run ID
+while the result stays pending, and that a start failure and a pre-start
+cancellation settle the start stage with the result's error. The install
+consumer fixture pins the new signature. Verified with `dune build @install`,
+the `test/runtime` and `test/unit` aliases, and the install-consumer fixture on
+OCaml 5.4.1 (macOS).
 
 ## 2026-10-13: Reference documents match the code and evidence (#1026)
 

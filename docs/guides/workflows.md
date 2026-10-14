@@ -772,6 +772,16 @@ and `execute`, so an ordinary `cancel` call requests cancellation; select
 validated before it becomes a durable command, and the handle cannot be forged
 for another child sequence.
 
+`Temporal.Child_workflow.started child` resolves with the child's run ID once
+Temporal has started it, without waiting for the result; if the child never
+starts, it resolves with the same error as the result future. A parent that
+starts a child with `~parent_close_policy:Abandon` so the child outlives it
+must await `started` before returning: Temporal Server does not start a child
+whose parent has already closed, so a child scheduled in the parent's last
+workflow task is otherwise silently never started. The Go and Java SDKs make
+the same requirement through their child-execution futures, and the Python and
+TypeScript `start_child` calls wait for the start themselves.
+
 The definitions and calls above compile, and the synthetic runtime tests cover
 child scheduling and deterministic future resolution. The native protocol and
 worker adapter also carry the child-start acknowledgment and terminal
