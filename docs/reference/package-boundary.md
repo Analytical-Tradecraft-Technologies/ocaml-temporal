@@ -224,6 +224,37 @@ require. Running `opam install .` from a Git checkout still needs network
 access for Cargo, so it works only where the build may reach the network;
 installing a release archive is the supported sandboxed path.
 
+CI proves that path with `scripts/check-opam-source-archive.sh`, which unpacks
+an archive and runs the package's opam build command,
+`dune build -p temporal-sdk -j <jobs>`, inside an opam build sandbox. It uses
+opam's own wrapper, `<opam root>/opam-init/hooks/sandbox.sh build`, when the
+switch has sandboxing enabled, and otherwise the same macOS `sandbox-exec`
+policy: network denied except Unix sockets, and writes denied outside the build
+directory, the temporary directories, and the Dune cache. Before building, the
+script sends a request to crates.io through the same wrapper and fails if it
+succeeds, so a sandbox that does not isolate the network cannot produce a pass.
+Cargo runs with a fresh, empty `CARGO_HOME` inside the build directory, as for
+a user who has never run Cargo, so a home warmed by the `cargo vendor` that
+created the archive cannot hide a source the archive's replacement omits. The
+script also clears `CARGO_TARGET_DIR`, `TEMPORAL_RUST_BRIDGE_DIR`/`KEY`, and
+`CARGO_NET_OFFLINE`, and fails unless the build leaves a
+`temporal-sdk.install` that lists the Rust bridge.
+
+The Release workflow gates publication on the exact published file: its
+`source-archive` job creates the archive and audited notices once and uploads
+them as the `release-source` artifact with the archive's SHA-256; the
+`source-archive-check` job (macOS ARM64, OCaml 5.5) downloads that artifact,
+confirms the digest, and runs the check; and `publish`, which needs both,
+confirms the digest again before adding the same file to the release. Master
+builds also run the `opam-source-offline` job in `build-pr.yml`, which checks
+an archive it creates itself, as an early warning; pull requests skip both
+because of the full optimized Rust build. Run the check locally with
+`sh scripts/check-opam-source-archive.sh <archive> [work-dir]`; it needs the
+locked opam dependencies, Rust and `protoc`, and several gigabytes.
+`test/smoke/test_opam_source_archive_check.sh` checks the script's own
+decisions on every `dune runtest` with stand-ins for opam's hook, curl, and
+dune.
+
 ## Regression evidence
 
 The installed-package smoke test is deliberately run against a fresh consumer

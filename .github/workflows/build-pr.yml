@@ -497,3 +497,50 @@ jobs:
           if-no-files-found: error
           retention-days: ${{ vars.RUST_BRIDGE_ARTIFACT_RETENTION_DAYS || '90' }}
           compression-level: 0
+
+  # Builds the release source archive exactly as opam would install it: inside
+  # a network-denying opam build sandbox, from the vendored Rust sources only
+  # (#778). It needs a full optimized Rust build, so it runs on master builds
+  # as an early warning rather than on every pull request. Releases do not use
+  # it: release.yml's source-archive-check job builds the exact archive it
+  # publishes. scripts/check-opam-source-archive.sh uses opam's own build
+  # wrapper when the switch has sandboxing enabled and otherwise the same
+  # macOS sandbox-exec policy, gives Cargo an empty home, and first proves the
+  # sandbox blocks a network request.
+  opam-source-offline:
+    if: ${{ !cancelled() && needs.changes.outputs.code == 'true' && inputs.tier == 'master' }}
+    needs: changes
+    name: Sandboxed opam build from the source archive / macOS ARM64
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      RUSTUP_TOOLCHAIN: 1.99.0-aarch64-apple-darwin
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+      - name: Set up the exact OCaml compiler
+        uses: ocaml/setup-ocaml@93303b622b2522e4411e295f9e77411a24912ac7 # v3.9.0
+        with:
+          ocaml-compiler: "5.5.1"
+      - name: Set up pinned Rust toolchain
+        shell: bash
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+      - name: Install Protocol Buffers compiler on macOS
+        run: brew install protobuf
+      - name: Install and verify locked OCaml dependencies
+        shell: bash
+        run: sh scripts/opam-locked-deps.sh install --assume-depexts
+      - name: Create the release source archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^version: "\(.*\)"$/\1/p' temporal-sdk.opam)
+          test -n "$version"
+          # The archive prefix uses the release tag spelling (hyphen for "~").
+          sh scripts/create-source-archive.sh . "v${version//\~/-}" \
+            "$RUNNER_TEMP/ocaml-temporal-source.tar.gz"
+      - name: Build the archive inside the opam build sandbox
+        shell: bash
+        run: >-
+          sh scripts/check-opam-source-archive.sh
+          "$RUNNER_TEMP/ocaml-temporal-source.tar.gz" "$RUNNER_TEMP/opam-source-check"
