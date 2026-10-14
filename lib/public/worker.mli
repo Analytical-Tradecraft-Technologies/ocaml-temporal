@@ -238,9 +238,11 @@ module Shutdown_report : sig
   (** Whether native teardown finished before {!shutdown_with_report}
       returned. [`Detached] means the teardown timeout elapsed first: the
       teardown continues on an SDK-owned background thread, which still
-      releases every native resource exactly once. A process that exits
-      right away may cut it short; Temporal then recovers the worker's
-      tasks through its ordinary timeouts. *)
+      releases every native resource exactly once. Until it finishes, a
+      worker created with [~runtime] stays attached to that {!Runtime.t},
+      so {!Runtime.shutdown} still returns its "still attached" defect. A
+      process that exits right away may cut it short; Temporal then recovers
+      the worker's tasks through its ordinary timeouts. *)
   type teardown = [ `Completed | `Detached ]
 
   (** Counts are taken when the grace period ended.
