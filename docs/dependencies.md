@@ -396,7 +396,7 @@ the `license` field of `cargo metadata` for the locked version.
 | libc | 0.2.190 | 0.2.190 | normal | MIT OR Apache-2.0 | Unix thread signal-mask calls that keep SIGPIPE from terminating the OCaml host (#1041); tests also lower the descriptor limit so the metrics endpoint's `accept()` fails (#1030) |
 | prost | 0.14.4 | 0.14.4 | normal | Apache-2.0 | Protobuf encoding and decoding of Temporal API messages and replay histories |
 | serde | 1.0.228 | 1.0.229 | normal | MIT OR Apache-2.0 | Private control protocol data model |
-| serde_json | 1.0.150 | 1.0.151 | normal | MIT OR Apache-2.0 | Private JSON control protocol |
+| serde_json | 1.0.150 | 1.0.154 | normal | MIT OR Apache-2.0 | Private JSON control protocol |
 | prost-wkt-types | 0.7.1 | 0.7.2 | normal | Apache-2.0 AND BSD-3-Clause | Exact protobuf timestamps and durations in the semantic adapter |
 | temporalio-client | Core revision | 1.1.0 | normal | MIT (reviewed `LICENSE.txt`) | Temporal Core client |
 | temporalio-common | Core revision | 1.1.0 | normal | MIT (reviewed `LICENSE.txt`) | Temporal Core shared types |
