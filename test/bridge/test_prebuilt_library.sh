@@ -29,7 +29,10 @@ case "$(uname -s)" in
   MINGW* | MSYS* | CYGWIN*) library_path=$(cygpath -w "$library_path") ;;
 esac
 export OCAMLPATH=$library_path DUNE_CACHE=disabled
-opam_dune build --root . ./main.exe ./worker_environment.exe
+opam_dune build --root . ./main.exe ./main.bc ./worker_environment.exe
 ./_build/default/main.exe
+# Dune (modes byte) consumer of the relocated package (#1020): the forced
+# custom runtime must find the static archives through $CAMLORIGIN.
+./_build/default/main.bc
 ./_build/default/worker_environment.exe
 printf '%s\n' 'Precompiled SDK consumer passed; no SDK OCaml, C, or Rust compilation.'

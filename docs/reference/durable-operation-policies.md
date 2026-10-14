@@ -148,9 +148,19 @@ server to leave an accepted child running when its parent closes. `Terminate`
 and `Request_cancel` select the other explicit policies; omission retains the
 server default. Parent-close policy is independent of `~cancellation_type`,
 which controls an explicit cancellation request made through a child handle or
-scope. These options do not expose a child-start acknowledgement: callers that
-close a parent immediately after scheduling must not assume the child has
-already been accepted by the server.
+scope.
+
+Temporal Server does not start a child whose parent has already closed, even
+under `Abandon`: the start-child transfer task finds the parent closed and
+drops the child. A parent that schedules a child and completes in the same
+workflow task therefore loses it silently. `Child_workflow.started` exposes
+Core's child-start acknowledgement (`ResolveChildWorkflowExecutionStart`) as a
+future of the child's run ID, so a parent awaits it before returning when the
+child must outlive it. A start failure or a cancellation before the start
+settles it with the same typed error as the result future. This matches the
+official SDKs: Go's `GetChildWorkflowExecution().Get` and Java's
+`Workflow.getWorkflowExecution(child).get()` wait for the start, and the
+Python and TypeScript `start_child` calls return only once the child started.
 
 The deterministic runtime and bilateral bridge tests cover all three policies,
 queue validation, default compatibility, and lossless Core conversion. This

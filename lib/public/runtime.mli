@@ -95,7 +95,11 @@ end
     [`Bridge] error naming the address, and nothing is left running. The
     endpoint is served by the runtime's background threads and never runs
     OCaml code, so a slow or failing scraper cannot block or fail workflow
-    and activity execution.
+    and activity execution. A failed [accept] (for example under
+    file-descriptor pressure) is logged and retried rather than stopping the
+    endpoint; in the unlikely case that the underlying exporter stops,
+    scrapes receive [503 Service Unavailable] until the runtime is
+    recreated.
 
     Creating a runtime needs no Temporal Server. *)
 val create :

@@ -281,8 +281,11 @@ module Info = struct
   (** Continuation reason; see the interface. *)
   type continuation_initiator = [ `Continue_as_new | `Retry | `Cron_schedule ]
 
-  (** Returns the predecessor run recorded by Core, if any. *)
-  let continued_from_run_id info = Option.map fst info.run.continued_from
+  (** Returns the predecessor run recorded by Core, if any. A Temporal
+      Schedule action's empty run ID (#1015) is already stored as [None] by
+      the runtime, so a [Some] here always names a real predecessor. *)
+  let continued_from_run_id info =
+    Option.map fst info.run.continued_from
 
   (** Maps Core's initiator to the public variant. The unspecified zero value
       names no reason, so it is reported as [None] rather than guessed. *)
@@ -327,33 +330,29 @@ module Info = struct
   (** Returns the recorded workflow task timeout. *)
   let task_timeout info = Option.map duration info.run.task_timeout
 
-  (** Rebuilds the public policy from the bridge-validated record. Both the
-      Rust and OCaml protocol layers enforce the same constraints as
-      [Activity.Retry_policy.make], and rounding both intervals up preserves
-      their order, so a construction failure is a violated internal
-      invariant rather than a routine error. A new value is built on every
-      call; the public policy is immutable. *)
+  (** Rebuilds the public policy from the recorded start event. The server
+      skips retry-policy validation when [maximum_attempts] is 1, so a
+      recorded policy can violate [Activity.Retry_policy.make]'s rules (a
+      coefficient below 1.0, an empty non-retryable type, a zero interval)
+      and the protocol layers deliberately accept it (#1016). Such a policy
+      has no public representation and is reported as [None] rather than
+      raising inside workflow code; with at most one attempt it never retries
+      anyway. The result depends only on history, so it is replay-stable. A
+      new value is built on every call; the public policy is immutable. *)
   let retry_policy info =
-    Option.map
+    Option.bind info.run.retry_policy
       (fun (policy : Temporal_sdk_kernel.Workflow_protocol.retry_policy) ->
         let coefficient =
           Int64.float_of_bits
             (Int64.of_string ("0u" ^ policy.backoff_coefficient_bits))
         in
-        match
-          Activity.Retry_policy.make
-            ~initial_interval:(duration policy.initial_interval)
-            ~backoff_coefficient:coefficient
-            ~maximum_interval:(duration policy.maximum_interval)
-            ~maximum_attempts:policy.maximum_attempts
-            ~non_retryable_error_types:policy.non_retryable_error_types ()
-        with
-        | Ok policy -> policy
-        | Error error ->
-            invalid_arg
-              ("workflow retry policy escaped protocol validation: "
-              ^ Error.message error))
-      info.run.retry_policy
+        Result.to_option
+          (Activity.Retry_policy.make
+             ~initial_interval:(duration policy.initial_interval)
+             ~backoff_coefficient:coefficient
+             ~maximum_interval:(duration policy.maximum_interval)
+             ~maximum_attempts:policy.maximum_attempts
+             ~non_retryable_error_types:policy.non_retryable_error_types ()))
 
   (** Projects the private protocol record into the public parent type. *)
   let parent info =
@@ -520,13 +519,35 @@ let upsert_search_attributes values =
       let values = List.map (fun (key, payload) -> (key, Payload_private.to_base payload)) values in
       Temporal_sdk_kernel.Workflow_context_store.upsert_search_attributes context values
 
+(** Makes a continue-as-new input encoder failure fail only the workflow task.
+    The runtime treats a [Fail_workflow] as a task failure only for [Bridge],
+    [Codec], and [Defect] errors, but [Codec.make] deliberately preserves the
+    identity of whatever error a custom encoder returns. An encoder returning,
+    say, a [`Workflow] error would otherwise close the run as failed or start
+    a retry run (#1034). Such an error is rewrapped as a [Codec] error whose
+    message names the original category and message and which keeps the
+    original details and failure type; task-failure categories pass through
+    unchanged so their identity is preserved. *)
+let continue_as_new_encode_error error =
+  let view = Temporal_base.Error.view error in
+  match view.category with
+  | `Bridge | `Codec | `Defect -> error
+  | _ ->
+      Temporal_base.Error.make ~category:`Codec ~details:view.details
+        ?error_type:view.error_type
+        ~message:
+          (Printf.sprintf "continue-as-new input encoding failed (%s): %s"
+             (Temporal_base.Error.kind error) view.message)
+        ()
+
 (** Requests a fresh run of the same workflow type with [input]. This is a
     terminal direct-style operation: it encodes the successor input, buffers a
     Core continue-as-new command, and aborts the current private workflow
-    fiber. If encoding fails, the typed codec error terminates the fiber
-    instead of raising through the worker loop; the runtime classifies a
-    [Codec] error as a workflow-task failure, so the task fails with no
-    commands and the run stays open for a corrected worker to replay. *)
+    fiber. If encoding fails, the typed error terminates the fiber instead of
+    raising through the worker loop. Whatever category the encoder returned,
+    {!continue_as_new_encode_error} ensures the runtime classifies it as a
+    workflow-task failure, so the task fails with no commands and the run
+    stays open for a corrected worker to replay. *)
 let continue_as_new definition next_input =
   match Temporal_sdk_kernel.Workflow_context_store.current () with
   | None ->
@@ -538,7 +559,8 @@ let continue_as_new definition next_input =
             ~workflow_type:(name definition) ~input:arguments
       | Error error ->
           Temporal_sdk_kernel.Workflow_context_store.terminate context
-            (Temporal_sdk_kernel.Activation.Fail_workflow error))
+            (Temporal_sdk_kernel.Activation.Fail_workflow
+               (continue_as_new_encode_error error)))
 
 (** Independently owned metadata observed on the run's durable start event. *)
 type start_metadata = {

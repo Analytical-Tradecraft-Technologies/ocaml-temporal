@@ -34,6 +34,12 @@ fresh_fixture() {
     mkdir -p "$scratch/fixture/$(dirname "$path")"
     cp "$root/$path" "$scratch/fixture/$path"
   done
+  # One digest-pinned ocaml/opam base image per compiler series (#1027).
+  for pin in "$root"/docker/ocaml-*/Dockerfile; do
+    series_dir=$(basename "$(dirname "$pin")")
+    mkdir -p "$scratch/fixture/docker/$series_dir"
+    cp "$pin" "$scratch/fixture/docker/$series_dir/"
+  done
   mkdir -p "$scratch/fixture/.github/workflows" "$scratch/fixture/.github/actions"
   cp "$root"/.github/workflows/*.yml "$scratch/fixture/.github/workflows/"
   for action in "$root"/.github/actions/*/; do
@@ -149,7 +155,7 @@ edit test/integration/temporal/compose.yaml 's/postgres:[0-9.]*-bookworm/postgre
 expect_drift 'Compose image tag' 'local integration service images'
 
 fresh_fixture
-edit Dockerfile.dev 's/ocaml-5.3@sha256:[0-9a-f]*/ocaml-5.3@sha256:0000000000000000000000000000000000000000000000000000000000000000/'
+edit docker/ocaml-5.3/Dockerfile 's/ocaml-5.3@sha256:[0-9a-f]*/ocaml-5.3@sha256:0000000000000000000000000000000000000000000000000000000000000000/'
 expect_drift 'builder image digest' 'local integration service images'
 
 fresh_fixture

@@ -648,6 +648,45 @@ The Rust integration suite invokes the common wrapper with a deliberate panic;
 the panic test hook is not exported in the C header and is not part of the
 stable ABI.
 
+### SIGPIPE containment (#1041)
+
+The bridge never changes the process-wide SIGPIPE disposition. A Rust
+executable starts with SIGPIPE ignored, but that startup code does not run
+when the bridge is a static library in an OCaml executable, and OCaml keeps
+the default, terminating action. Rust std's scalar socket writes pass
+`MSG_NOSIGNAL`, while vectored writes (used by h2, hyper and tokio-rustls for
+gRPC, TLS and the Prometheus endpoint) are a plain `writev`. On Linux a
+`writev` to a connection the peer has reset therefore raised SIGPIPE and
+killed the process with status 141. macOS sockets created by std and mio set
+`SO_NOSIGPIPE`; Windows has no SIGPIPE.
+
+A SIGPIPE raised by a write is directed at the writing thread, so the bridge
+blocks it in thread signal masks instead (`rust/core-bridge/src/sigpipe.rs`):
+
+- every Tokio worker and blocking-pool thread of Core's runtime blocks it at
+  start, through Core's `lang_on_thread_start` hook, as do the runtime
+  cleanup threads and the Core log writer;
+- on Linux, the common ABI wrapper (`invoke`) blocks it for the duration of
+  each call on the application's thread, where `block_on` can drive connection setup
+  such as a TLS handshake. On return it consumes a SIGPIPE that became
+  pending during the call and restores the caller's exact mask. A caller that
+  had already blocked SIGPIPE is left untouched. Threads Core spawns during a
+  guarded call inherit the blocked mask. The drain is a zero-timeout
+  `sigtimedwait`, so it cannot block if another thread accepted a
+  process-directed SIGPIPE first. Other platforms skip the guard: macOS
+  bridge sockets never raise SIGPIPE, and without `sigtimedwait` a drain
+  could block indefinitely.
+
+The write then fails with `EPIPE` and follows the ordinary error path.
+Setting `SIG_IGN` instead (as the Rust, Python and Node runtimes do) was
+rejected because it silently changes an application setting that is also
+inherited by every child process the application later executes. An
+application that sets its own disposition or handler is unaffected.
+`rust/core-bridge/tests/sigpipe_containment.rs` covers both halves with the
+default disposition restored, including Linux `writev` into reset
+connections and aborted metrics scrapes; `test/bridge/test_runtime_metrics.ml`
+aborts scrapes from an OCaml host.
+
 ## Stateful handle ownership
 
 The reserved runtime, client, and worker types are opaque references to
@@ -728,20 +767,65 @@ one seam: Core moves out of the per-instance graph into a reference-counted
   names `[A-Za-z_][A-Za-z0-9_]*` up to 64 bytes without `__` prefix or a
   label Core already uses, values 1..256 bytes without control characters,
   unique names) before Core is built, so a rejected document allocates
-  nothing. It then builds Core, starts Core's own
-  `start_prometheus_metric_exporter` inside Core's Tokio context, and
-  attaches the returned meter with `attach_late_init_metrics` before the
-  handle is published, so every graph attached later hands the meter to its
-  client (`ConnectionOptions::metrics_meter`) and worker. A bind failure is
+  nothing. It then builds Core, binds the public listener on
+  `bind_address` itself, starts Core's own
+  `start_prometheus_metric_exporter` on an ephemeral loopback port of the
+  same address family inside Core's Tokio context, and attaches the
+  returned meter with `attach_late_init_metrics` before the handle is
+  published, so every graph attached later hands the meter to its client
+  (`ConnectionOptions::metrics_meter`) and worker. A bind failure is
   `CONFIGURATION` naming the configured address and the `io::ErrorKind`
   only; the just-built Core is dropped on the calling thread. The success
-  value is the bound address as UTF-8 (port `0` resolved), or empty without
-  an exporter. The returned `MetricsExporter` guard is the first field of
-  `SharedCore`: dropping the last Core reference aborts the scrape task and
-  then drops Core's Tokio runtime, which joins its workers and so closes
-  the listening socket before the release returns
-  (`rust/core-bridge/tests/metrics_exporter.rs`). The scrape server runs
-  entirely on Tokio threads and never calls OCaml. Enabling it requires
+  value is the public bound address as UTF-8 (port `0` resolved), or empty
+  without an exporter.
+
+  Accept resilience (#1030). Core's scrape server returns from its accept
+  loop on the first `accept()` error, closing its listener for good, and
+  Core exposes no way to serve its registry from another listener. The
+  bridge therefore runs its own accept loop on the public listener and
+  relays each connection byte for byte to Core's loopback server.
+  Connection-scoped errors (`ConnectionAborted`, `ConnectionReset`,
+  `Interrupted`) are skipped. Any other error, such as `EMFILE`, is logged
+  as a `warn` record with its kind and OS error number and retried after a
+  backoff that doubles from 10 ms to 1 s and resets after a successful
+  accept. Core's own accept loop now sees only the bridge's relay
+  connections, so it can stop only on a resource error on its private
+  listener. A relay that then finds Core's task finished answers
+  `503 Service Unavailable` with a short explanation and logs one `error`
+  record per exporter, so a stopped server is visible to Prometheus and in
+  the log rather than a silently closed port. Recovery from that state
+  requires recreating the runtime. The bridge records go through Core's log
+  pipeline (`TEMPORAL_CORE_LOG`) like Core's own records.
+
+  Descriptor headroom. Each relayed scrape needs the public `accept()`, the
+  relay's private `connect()`, Core's `accept()` of that connection, and a
+  free descriptor for the follow-up `accept()` Core's loop makes at once:
+  Tokio keeps accepting until `WouldBlock`, and Linux allocates the new
+  descriptor before checking the queue, so that call fails with `EMFILE`
+  instead of `EAGAIN` at the limit. Any such `EMFILE` stops Core's server.
+  The relays therefore share a reserve of three spare descriptors (open handles to `/dev/null`; nothing on Windows).
+  A relay first reads the scraper's request head, dropping a connection that
+  sends nothing within 5 s. Under an async mutex it then refills the
+  reserve, releases it immediately before `connect()`, forwards the head,
+  and refills the reserve only after Core's first response bytes arrive
+  (proof that Core has accepted), or after 5 s. If the reserve cannot be
+  refilled, the scraper receives a transient `503` ("Too few file
+  descriptors ...") rather than risking Core's server. The descriptor table
+  is process-wide, so another thread opening a file in the instant between
+  release and Core's accept can still take a released descriptor. The
+  reserve removes the deterministic starvation, not that race.
+
+  The returned `MetricsExporter` guard is the first field of `SharedCore`:
+  dropping the last Core reference aborts both the accept loop and Core's
+  scrape task, then drops Core's Tokio runtime, which joins its workers and
+  so closes both listening sockets and any relayed connection before the
+  release returns (`rust/core-bridge/tests/metrics_exporter.rs`, which also
+  covers the 503 state; `rust/core-bridge/tests/metrics_accept_retry.rs`
+  provokes a real `EMFILE` from `accept()`;
+  `rust/core-bridge/tests/metrics_core_accept_headroom.rs` frees two or
+  three descriptors at a time at the limit and requires Core's server to
+  keep running). Scrapes are served entirely on
+  Tokio threads and never call OCaml. Enabling it requires
   `temporalio-common`'s `prometheus` feature, which adds only the
   Apache-2.0 `prometheus` crate (see [dependencies](../dependencies.md)).
 
@@ -1166,8 +1250,23 @@ constructing an intermediate OCaml stub DLL. Keeping the C and Rust inputs as
 static foreign archives removes that unnecessary link step without changing
 the installed OCaml API or final executable.
 
-Because only the static archives are installed, bytecode consumers must link
-with `-custom` (or as a Dune `(modes byte)` executable); dynamically loaded
-bytecode and the toplevel cannot load the bridge. The user-facing statement of
+Because only the static archives are installed, a bytecode consumer can only
+use them through a custom runtime. `ocamlc` nevertheless records the foreign
+archives in the `.cma` as `-dllib` entries. Outside a workspace that sets
+`disable_dynamically_linked_foreign_archives`, an ordinary bytecode link would
+therefore look for the absent `dllocaml_temporal_core_bridge` shared library
+(#1020). The bridge library is archived with `ocamlc -a -custom`, which stores
+"force custom" in the `.cma`. Every bytecode executable that links the SDK
+(Dune `(modes byte)`, `ocamlfind ocamlc -linkpkg`) is then linked in custom
+mode: the static archives are embedded and no shared library is loaded at
+startup. A custom link does not search the library's own directory, so the
+`.cma` also carries `-ccopt -L"$CAMLORIGIN"`. OCaml expands that to the
+installed directory, which keeps relocated installations working. These are
+`ocamlc_flags` rather than `library_flags` because `ocamlopt` rejects
+`-custom`. The toplevel still cannot load the bridge, because loading into a
+running interpreter needs a shared stub library. `test/bridge/test_install.sh`
+and the prebuilt-library consumer build and run the install-consumer fixture
+as a Dune `(modes byte)` executable in its own Dune root, without the SDK's
+`dune-workspace`. The user-facing statement of
 this constraint, together with the related `Unix.fork` restriction, is in the
 [workflow guide](../guides/workflows.md#process-and-linking-constraints).
