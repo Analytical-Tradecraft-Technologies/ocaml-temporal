@@ -482,8 +482,23 @@ runtime restores the endpoint. It never runs OCaml code and is not on
 the workflow or activity path: instruments are updated in memory, so a slow,
 failing, or absent scraper cannot block, fail, or reorder workflow and
 activity execution or change durable behavior. Memory is bounded by the
-label cardinality above. Each scrape connection is served by a short-lived
-task; Core imposes no connection limit, so bind the endpoint to a loopback or
+label cardinality above.
+
+Connections are bounded (#500). At most 8 scrape connections are relayed at
+once; a Prometheus server keeps one connection per target, so this leaves room
+for an HA pair, an agent and an operator's `curl`. A connection beyond the cap
+never reaches Core: it receives `503 Service Unavailable` ("Too many
+concurrent metrics scrapes; retry later.") within one second, or is closed at
+once while 16 such answers are already pending, and the first rejection logs
+one `warn` record (later ones are `debug`). Every relayed connection is also
+bounded in time: one that sends no request within 5 s is closed, one on which
+no byte moves for 10 s (for example a keep-alive scraper between scrapes) is
+closed, and none stays open longer than 60 s, after which a keep-alive scraper
+simply reconnects. Slow or idle clients therefore free their slot within a
+minute, and a connection flood costs a bounded number of descriptors and
+tasks. The limits are fixed constants rather than configuration. They protect
+the process, not the availability of the endpoint: a client that keeps
+reconnecting can still hold every slot, so bind the endpoint to a loopback or
 private interface (or put a scraping agent in front of it) rather than a
 public one. The endpoint has no authentication or TLS.
 
