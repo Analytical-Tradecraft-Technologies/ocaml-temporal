@@ -166,7 +166,9 @@ Two process constraints apply to applications that link the SDK (see
 [Process and linking constraints](docs/guides/workflows.md#process-and-linking-constraints)):
 
 - On Linux and macOS, fork or daemonise before creating any native `Client` or
-  `Worker`. Each one spawns an OCaml Domain, and OCaml 5 rejects `Unix.fork` for
+  `Worker`. Each one spawns an OCaml Domain (a running worker that registers
+  activities uses one more; see the Domain budget in `Temporal.Worker`), and
+  OCaml 5 rejects `Unix.fork` for
   the rest of the process once any Domain has been spawned. Starting
   subprocesses with `Unix.create_process` or `Unix.open_process*` still works,
   and is the only option on Windows, where `Unix.fork` is unavailable.
@@ -346,6 +348,7 @@ are excluded from log messages. See the [observability reference](docs/reference
 - [Documentation guide and glossary](docs/README.md)
 - [Supported public API map](docs/reference/public-api-map.md)
 - [Workflow authoring guide](docs/guides/workflows.md)
+- [Worker sizing guide](docs/guides/worker-sizing.md)
 - [Architecture specification](docs/design/sdk-architecture.md)
 - [Implementation roadmap](docs/implementation-roadmap.md)
 - [Runtime invariants](docs/reference/runtime-invariants.md)
@@ -370,6 +373,7 @@ are excluded from log messages. See the [observability reference](docs/reference
 - [Installed package boundary](docs/reference/package-boundary.md)
 - [Local Temporal and PostgreSQL stack](docs/reference/local-temporal-stack.md)
 - [Quality and security gates](docs/reference/quality-gates.md)
+- [Release checklist and bad-release remediation](docs/reference/release-checklist.md)
 - [Dependency and license inventory](docs/dependencies.md)
 - [Verified progress](docs/progress.md)
 

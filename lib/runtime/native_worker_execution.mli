@@ -41,7 +41,7 @@ module type SUPERVISOR = sig
       owned by workflow code, so unlike the bytes it is not a snapshot. The
       production supervisor ignores it.
 
-      [abandon_activation] calls this from the watchdog Domain while the
+      [abandon_activation] calls this from the watchdog thread while the
       workflow lane is still inside workflow code, so an implementation must
       accept a call from a Domain other than the one that polled. The two
       calls never overlap for one adapter. *)

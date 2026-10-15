@@ -22,6 +22,12 @@ type expected =
   | Nondeterminism
       (** Core evicted the run with a nondeterminism reason: the registered
           definitions are incompatible with the history. *)
+  | Invalid_history
+      (** [Temporal.Replay] refused the input itself (malformed bytes, a
+          broken event sequence, a missing task queue, a run Core would not
+          start, or a workflow ID other than the recorded one), so no
+          workflow verdict exists. Used by the malformed-history negative
+          controls. *)
 
 (** Paths and checksums of one history. [protobuf] is the replay input;
     [json] is the optional human-readable source it was encoded from. *)
@@ -45,12 +51,17 @@ type entry = {
   replay_definitions : string;
   expected : expected;
   negative_control_of : string option;
-      (** For a [Nondeterminism] entry, the [Replays_ok] entry whose history
-          it reuses. *)
+      (** For a negative control (any entry not expected to replay), the
+          [Replays_ok] entry whose history it reuses. *)
   expected_message : string option;
-      (** For a [Nondeterminism] entry, an optional non-empty fragment that
-          the replay failure text must contain, so a negative control fails
-          for its documented reason rather than for any mismatch. *)
+      (** For a negative control, an optional non-empty fragment that the
+          replay failure text must contain, so it fails for its documented
+          reason rather than for any mismatch. *)
+  history_mutation : Corpus_history_mutation.t option;
+      (** For an [Invalid_history] entry, the deterministic edit the runner
+          applies in memory to the source history's bytes before replay. The
+          committed file itself is never changed, so its checksum and
+          recorded identity are checked as for any other entry. *)
 }
 
 (** The provenance fields of one capture that replay reports compare with the
@@ -234,7 +245,8 @@ let check_entry errors index json =
         [
           "id"; "purpose"; "features"; "workflow_type"; "workflow_id"; "run_id";
           "capture"; "generation"; "history"; "replay_definitions"; "expected";
-          "negative_control_of"; "expected_message"; "notes";
+          "negative_control_of"; "expected_message"; "history_mutation";
+          "notes";
         ]
         members;
       let id = string_member errors location members "id" in
@@ -250,6 +262,7 @@ let check_entry errors index json =
         match string_member errors location members "expected" with
         | "replays_ok" -> Replays_ok
         | "nondeterminism" -> Nondeterminism
+        | "invalid_history" -> Invalid_history
         | other ->
             error errors location ("unknown expected outcome " ^ other);
             Replays_ok
@@ -257,20 +270,47 @@ let check_entry errors index json =
       (* A negative control states which entry's history it reuses, so a
          reviewer can see that the expected failure is deliberate. *)
       (match (expected, List.assoc_opt "negative_control_of" members) with
-      | Nondeterminism, Some (`String _) | Replays_ok, None -> ()
-      | Nondeterminism, _ ->
-          error errors location "a nondeterminism entry needs negative_control_of"
+      | (Nondeterminism | Invalid_history), Some (`String _) | Replays_ok, None
+        ->
+          ()
+      | (Nondeterminism | Invalid_history), _ ->
+          error errors location "a negative control needs negative_control_of"
       | Replays_ok, Some _ ->
           error errors location "only a negative control has negative_control_of");
       (* The failure-reason fragment narrows a negative control only. *)
       (match (expected, List.assoc_opt "expected_message" members) with
-      | Nondeterminism, Some (`String "") ->
+      | (Nondeterminism | Invalid_history), Some (`String "") ->
           error errors location "expected_message must not be empty"
       | Replays_ok, Some _ ->
           error errors location "only a negative control has expected_message"
-      | _, None | Nondeterminism, Some _ ->
+      | _, None | (Nondeterminism | Invalid_history), Some _ ->
           (* A non-string value is reported by the type check below. *)
           ());
+      (* Only a malformed-history control may edit the bytes it replays; a
+         replays_ok or nondeterminism entry must replay its history exactly
+         as recorded. *)
+      let history_mutation =
+        match (expected, List.assoc_opt "history_mutation" members) with
+        | _, None -> None
+        | Invalid_history, Some (`String name) -> (
+            match Corpus_history_mutation.of_string name with
+            | Some mutation -> Some mutation
+            | None ->
+                error errors location
+                  (Printf.sprintf "unknown history_mutation %s (expected one of %s)"
+                     name
+                     (String.concat ", "
+                        (List.map Corpus_history_mutation.to_string
+                           Corpus_history_mutation.all)));
+                None)
+        | Invalid_history, Some _ ->
+            error errors location "history_mutation must be a string";
+            None
+        | (Replays_ok | Nondeterminism), Some _ ->
+            error errors location
+              "only an invalid_history entry has history_mutation";
+            None
+      in
       List.iter
         (fun name ->
           match List.assoc_opt name members with
@@ -298,6 +338,7 @@ let check_entry errors index json =
             (match List.assoc_opt "expected_message" members with
             | Some (`String value) -> Some value
             | _ -> None);
+          history_mutation;
         }
   | _ ->
       error errors location "entry must be an object";
@@ -454,7 +495,9 @@ let load manifest_path =
         in
         (* Negative controls must point at an existing replays_ok entry with
            the same history, so the expected failure is attributable to the
-           definitions rather than to a different or corrupt history. *)
+           definitions (nondeterminism) or to the documented edit or workflow
+           ID (invalid_history) rather than to a different or corrupt
+           committed history. *)
         List.iter
           (fun entry ->
             match entry.negative_control_of with

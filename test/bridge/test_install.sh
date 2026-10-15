@@ -131,6 +131,10 @@ cp "$root/test/fixtures/install-consumer/dune" "$output_dir/"
 cp "$root/test/fixtures/install-consumer/main.ml" "$output_dir/"
 cp "$root/test/fixtures/install-consumer/public_api.ml" "$output_dir/"
 cp "$root/test/fixtures/install-consumer/worker_environment.ml" "$output_dir/"
+cp "$root/test/fixtures/install-consumer/installed_replay.ml" "$output_dir/"
+# The installed replay check reuses a frozen history-corpus capture (#497).
+cp "$root/test/fixtures/history-corpus/histories/live-2026-10-08-timer.pb" \
+  "$output_dir/timer-history.pb"
 cp "$root/test/fixtures/install-consumer/negative-dune" "$output_dir/dune-negative"
 cp "$root/test/fixtures/install-consumer/negative/forbidden_"*.ml "$output_dir/"
 consumer_ocamlpath=$dune_install_root
@@ -141,7 +145,8 @@ fi
 (
   OCAMLPATH=$consumer_ocamlpath
   export OCAMLPATH
-  opam_dune build --root "$dune_output_dir" ./main.exe ./main.bc ./worker_environment.exe
+  opam_dune build --root "$dune_output_dir" ./main.exe ./main.bc ./worker_environment.exe \
+    ./installed_replay.exe
 )
 "$output_dir/_build/default/main.exe"
 # The same consumer as a Dune (modes byte) executable, built in its own Dune
@@ -149,6 +154,15 @@ fi
 # forces a custom runtime, so this must link the static archives and run
 # without looking for a dllocaml_temporal_core_bridge shared library.
 "$output_dir/_build/default/main.bc"
+
+# Offline replay through the installed package: the recorded code must pass and
+# the same workflow type without its timer must be nondeterministic (#497).
+# The history is passed as a relative path from the consumer directory: the
+# executable is native, so on Windows it cannot open a Cygwin /cygdrive path.
+(
+  cd "$output_dir"
+  ./_build/default/installed_replay.exe timer-history.pb
+)
 
 # Malformed legacy settings used to fail before native client configuration.
 # The installed worker now reaches the same native path with either namespace

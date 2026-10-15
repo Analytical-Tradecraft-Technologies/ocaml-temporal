@@ -25,6 +25,10 @@ module Make (Backend : Backend) = struct
       | Initialize : Backend.config -> (unit, error) result t
       | Perform : 'result Backend.operation -> ('result, error) result t
       | Shutdown : (unit, error) result t
+      | Spawn_thread : (unit -> unit) -> (unit, exn) result t
+          (** Starts a companion system thread on the owner Domain (#1042).
+              The result is the [Thread.create] outcome, so a thread that
+              cannot be created is reported rather than failing the owner. *)
   end
 
   module Mailbox = Mailbox_processor.Make (Request)
@@ -123,6 +127,12 @@ module Make (Backend : Backend) = struct
                   raise exn)
           | Closed_graph result -> result
           | Not_started -> Ok ())
+      | Spawn_thread body ->
+          (* The new thread never receives [state]; it shares only this
+             Domain and its runtime lock with the owner thread. *)
+          (match Thread.create body () with
+          | _thread -> Ok ()
+          | exception exn -> Error exn)
     in
     { Mailbox.handle }
 
@@ -136,6 +146,17 @@ module Make (Backend : Backend) = struct
   let perform supervisor operation =
     match Mailbox.call supervisor.mailbox (Perform operation) with
     | Ok result -> result
+    | Error failure -> Error (mailbox_failure failure)
+
+  (** Asks the owner to start [body] on a system thread of its own Domain, so
+      a helper that must stay independent of every producer Domain's runtime
+      lock costs no extra Domain (#1042). The thread sees only [body]'s
+      closure, never backend state. The owner Domain cannot be joined until
+      that thread has returned, so [body] must return promptly once the
+      instance begins shutting down. *)
+  let spawn_owner_thread supervisor body =
+    match Mailbox.call supervisor.mailbox (Spawn_thread body) with
+    | Ok spawned -> Ok spawned
     | Error failure -> Error (mailbox_failure failure)
 
   (** Atomically submits the terminal request while the shutdown mutex is held.

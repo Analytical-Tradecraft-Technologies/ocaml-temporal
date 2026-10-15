@@ -81,9 +81,11 @@ git push origin refs/tags/v0.1.0-rc.1
 Open **Actions → Release → Run workflow**, select `master`, and enter the same
 **Version tag**. Dispatch must still resolve to the approved SHA. The workflow:
 
-1. Require master, matching version metadata, a clean source checkout, and a
-   remote tag that peels to the exact dispatch commit. A missing, retargeted,
-   or unreachable tag fails before the release build.
+1. Require master, matching version metadata, the committed release notes
+   `docs/releases/<tag>.md` (checked by `scripts/check-release-notes.sh`), a
+   clean source checkout, and a remote tag that peels to the exact dispatch
+   commit. A missing, retargeted, or unreachable tag, or missing or incomplete
+   notes, fails before the release build.
 2. Build/test all four Rust platforms and all sixteen OCaml combinations, plus
    the single live smoke job, quality/security scans, and dependency audits.
 3. Generate and audit `THIRD-PARTY-NOTICES.txt` from the locked Cargo graph,
@@ -94,7 +96,9 @@ Open **Actions → Release → Run workflow**, select `master`, and enter the sa
 4. Fetch and verify the remote tag again before creating the draft and before
    publishing it. The workflow never creates or moves the protected tag.
 5. Upload assets to a draft release and publish it as a prerelease when the tag
-   has a prerelease suffix. No manual asset upload is required.
+   has a prerelease suffix. The release notes are `docs/releases/<tag>.md`
+   followed by a generated description of the assets. No manual asset upload
+   or notes editing is required.
 
 The release contains four compiler-independent Rust bridge archives, sixteen
 compiled OCaml SDK archives, an offline-buildable source archive for
@@ -110,7 +114,9 @@ directly without rebuilding them. Each SDK records its exact compiler and compil
 dependency identities; incompatible environments must use matching dependencies
 or build from source. Linux assets target Debian 12/glibc, not musl/Alpine.
 
-For the next version, first update the three version files and `SDK_VERSION` in a PR and obtain
+For the next version, first update the three version files and `SDK_VERSION`,
+and add the version's release notes as `docs/releases/<tag>.md` (see the
+[release checklist](release-checklist.md#1-prepare-the-version)), in a PR and obtain
 maintainer approval of the candidate and its evidence. Create the matching
 protected tag at the approved master commit, then dispatch the workflow. The
 tag must be protected against updates and deletion as well as unauthorized
@@ -122,7 +128,9 @@ silently replace an existing draft or release. If a published release is found
 defective, preserve its tag and assets for audit,
 mark it superseded in its notes, and issue a corrected version under a new tag.
 The source SHA and checksums in the manifest identify what was built, but are
-not a signed provenance attestation.
+not a signed provenance attestation. The
+[release checklist](release-checklist.md) collects these steps, the sign-off,
+the open qualification gates, and the remediation procedure in one place.
 
 ## Local gate
 
@@ -221,6 +229,9 @@ before publishing.
 ## Tag consistency gate
 
 Before creating a release tag, run `make release-tag-check RELEASE_TAG=vX.Y.Z`.
+It also runs `scripts/check-release-notes.sh`, which requires complete
+`docs/releases/vX.Y.Z.md` notes; `test/smoke/test_release_notes_contract.sh`
+covers that check and the Release workflow's use of the notes.
 For a prerelease, the Git tag uses the SemVer hyphen spelling
 `v1.0.0-beta.1`, while `.release-version` and both opam files use the OPAM
 spelling `1.0.0~beta.1`, because OPAM's tilde ordering keeps the beta below

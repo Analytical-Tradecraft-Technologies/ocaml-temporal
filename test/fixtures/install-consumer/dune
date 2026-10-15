@@ -11,3 +11,10 @@
  (name worker_environment)
  (modules worker_environment)
  (libraries temporal-sdk))
+
+; Runs Temporal.Replay from the installed package against a history-corpus
+; history that the install scripts copy next to this fixture (#497).
+(executable
+ (name installed_replay)
+ (modules installed_replay)
+ (libraries temporal-sdk))

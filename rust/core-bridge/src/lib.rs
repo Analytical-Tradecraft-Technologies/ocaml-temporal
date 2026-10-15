@@ -20,6 +20,10 @@ pub mod worker_bridge;
 pub mod workflow_protocol;
 
 pub use abi::*;
+/// Concurrent metrics scrape connections the bridge relays before answering
+/// `503`; exported so the integration tests can saturate exactly the cap.
+#[doc(hidden)]
+pub use telemetry::MAX_CONCURRENT_SCRAPES;
 
 /// Immutable Temporal Core revision linked by this bridge.
 pub const TEMPORAL_CORE_REVISION: &str = "8fe478ee179ed754614d230f39586f3edb57da71";

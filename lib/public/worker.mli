@@ -1,7 +1,39 @@
 (** Worker registration and execution for OCaml workflow and activity code.
 
     Definitions are packed existentially only at the registration boundary;
-    workflow bodies and activity bodies remain ordinary typed OCaml functions. *)
+    workflow bodies and activity bodies remain ordinary typed OCaml functions.
+
+    {1 Domain budget}
+
+    OCaml limits how many Domains a process may run at once, and the SDK
+    spends that budget as follows (#1042):
+
+    - every native [Client], [Replay] and [Worker] holds one supervisor
+      Domain from [create] until [shutdown] (a shared {!Runtime.t} does not
+      change this);
+    - a running worker that polls activity tasks (it registers at least one
+      activity) holds one more Domain for its activity lane while {!run} is
+      active, so a slow activity cannot hold up workflow tasks. A
+      workflow-only worker needs none;
+    - the workflow lane runs on the thread that called {!run}, and the
+      activation watchdog is a system thread on the supervisor's Domain, so
+      neither costs a Domain of its own.
+
+    The main Domain counts too. OCaml 5.2 allows at most 128 Domains per
+    process; OCaml 5.3 and later default to 128 and read a higher limit from
+    [OCAMLRUNPARAM=d=N]. With no clients, that means at most 63 running
+    workers that poll activities (127 workflow-only ones) when they are run
+    on system threads of the main Domain, or 42 (63 workflow-only) when each
+    {!run} gets a Domain of its own; subtract one Domain per [Client] or
+    [Replay]. A [create] beyond the limit returns a [`Bridge] error naming
+    the Domain limit, and so does a {!run} whose activity Domain cannot
+    start; both are retryable once another instance has shut down.
+
+    Every Domain, even an idle one, takes part in each minor garbage
+    collection, so each extra Domain also makes allocation-heavy code
+    anywhere in the process a little slower to collect. Prefer a few workers
+    that each register many workflows and activities over many small
+    workers in one process. *)
 
 (** A heterogeneous workflow registration item. The existential package keeps
     each definition's input and output codecs paired with its implementation. *)
@@ -355,6 +387,11 @@ val create :
     which {!shutdown_with_report} then reports as abandoned. A workflow
     activation runs on the thread that called [run], so a non-yielding one
     keeps [run] from returning (see {!health}).
+    A worker that registers activities spawns its activity Domain here; if
+    the runtime's Domain limit leaves no Domain for it, [run] returns a
+    retryable [`Bridge] error naming the limit without polling anything,
+    and may be called again once a Domain is free (see the Domain budget
+    above).
     Each accepted task is decoded, dispatched to its registered OCaml function,
     encoded, and completed before the next task is admitted. This is a blocking
     call: invoke it from an ordinary dedicated Domain or system thread, not

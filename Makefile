@@ -503,8 +503,11 @@ release-preflight:
 # Validates a concrete vMAJOR.MINOR.PATCH tag against the package manifests.
 # This is deliberately host-only so a release cannot spend time building an
 # artifact whose version metadata is inconsistent.
+# It also requires the reviewed release notes, docs/releases/<tag>.md, that
+# the Release workflow publishes.
 release-tag-check:
 	@sh scripts/check-release-tag.sh .
+	@sh scripts/check-release-notes.sh .
 
 # Source-only documentation inventory, shared by the Linux/native test gates.
 .PHONY: check-live-acceptance-inventory update-live-acceptance-inventory test-live-acceptance-inventory-contract
@@ -522,6 +525,7 @@ test-quality-contract: check-live-acceptance-inventory test-live-acceptance-inve
 	sh test/smoke/test_build_jobs_contract.sh .
 	sh test/smoke/test_opam_locked_deps.sh .
 	sh test/smoke/test_release_tag_contract.sh .
+	sh test/smoke/test_release_notes_contract.sh .
 	sh test/smoke/test_release_tag_commit_contract.sh .
 	sh test/smoke/test_prebuilt_install_tag_contract.sh .
 	sh test/smoke/test_make_docker_commands.sh .
