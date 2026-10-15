@@ -38,12 +38,16 @@ Network I/O runs on separate background threads (below). Workflow and activity
 code never runs on those threads.
 
 Each worker also holds OCaml Domains of its own: the supervisor that owns its
-native handles and, while `Worker.run` is active, the activity lane and (for a
-worker that polls workflow tasks with the activation deadline enabled) the
-watchdog. Each client holds a supervisor Domain too. OCaml 5
-limits how many Domains a process can run, and a creation that cannot spawn
-one returns a typed error, so prefer more processes over many workers in one
-process.
+native handles and, while `Worker.run` is active, an activity-lane Domain if
+the worker registers activities. A workflow-only worker uses only its
+supervisor Domain; the activation watchdog is a thread on that Domain, not a
+Domain of its own. Each client and each replay holds a supervisor Domain too.
+OCaml 5 limits how many Domains a process can run. A creation that cannot
+spawn its supervisor fails with an error naming the limit, and `Worker.run`
+returns a retryable `domain_unavailable` error if it cannot spawn the
+activity lane, so prefer more processes over many workers in one process. See
+[Domain budget](../reference/native-worker-execution.md#domain-budget) for
+the cost per instance and the practical worker counts per OCaml version.
 
 ## The options
 

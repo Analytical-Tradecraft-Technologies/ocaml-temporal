@@ -97,7 +97,7 @@ type stuck_activation = {
 type lease_claim = Unclaimed | Lane_claimed | Watchdog_claimed
 
 (** The activation the workflow lane is processing, published atomically so
-    the watchdog Domain can observe it without the adapter mutex (which the
+    the watchdog thread can observe it without the adapter mutex (which the
     lane holds for the whole activation). [epoch] distinguishes successive
     activations, including two activations of the same run. Every field except
     the two atomics is immutable after publication. *)
@@ -615,7 +615,7 @@ module Make (Supervisor : SUPERVISOR) = struct
     on_completion : (activation_info -> unit) option;
     (* The activation currently between poll and completion on the workflow
        lane. Written only by the lane (while it holds [mutex]); read by the
-       watchdog Domain without [mutex]. *)
+       watchdog thread without [mutex]. *)
     in_flight : in_flight option Atomic.t;
     (* Next activation epoch. Changed only while [mutex] is held. *)
     mutable next_epoch : int;

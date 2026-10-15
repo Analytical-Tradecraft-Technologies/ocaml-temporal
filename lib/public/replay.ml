@@ -407,7 +407,9 @@ let native_error_view (error : Supervisor.error) =
       (code, bounded message)
   | Supervisor.Closed -> ("closed", "replay supervisor is shut down")
   | Supervisor.Owner_unavailable _ ->
-      ("owner_unavailable", "replay supervisor Domain could not start")
+      ( "owner_unavailable",
+        "replay supervisor Domain could not start (the OCaml runtime's \
+         Domain limit may be reached; see Temporal.Worker)" )
   | Supervisor.Supervisor_failed _ ->
       ("supervisor_failed", "replay supervisor failed")
 

@@ -430,7 +430,15 @@ let test_unacknowledged_abandonment () =
   if completions supervisor <> [] then
     failwith "fake accepted a completion for a revoked lease"
 
-(** The real watchdog Domain detects a stuck activation within its declared
+(** Hosts the sampling thread on the calling Domain, as a test stand-in for
+    the supervisor's owner Domain: the lanes under test run on other Domains,
+    so the test lane never holds this Domain's runtime lock. *)
+let thread_spawn body =
+  match Thread.create body () with
+  | _thread -> Ok ()
+  | exception exception_ -> Error exception_
+
+(** The real watchdog thread detects a stuck activation within its declared
     bound and leaves quick activations alone. *)
 let test_watchdog_domain_detects_once () =
   let supervisor = fake_supervisor () in
@@ -439,7 +447,9 @@ let test_watchdog_domain_detects_once () =
   let fired = Atomic.make 0 in
   let watchdog =
     match
-      Watchdog.start ~deadline_ms:50
+      Watchdog.start ~spawn:thread_spawn
+        ~host_closing:(fun () -> false)
+        ~deadline_ms:50
         ~running_epoch:(fun () -> Worker.running_epoch worker)
         ~abandon:(fun ~epoch ~elapsed_ms ->
           match Worker.abandon_activation worker ~epoch ~elapsed_ms with
@@ -447,7 +457,7 @@ let test_watchdog_domain_detects_once () =
           | None -> ())
     with
     | Ok watchdog -> watchdog
-    | Error _ -> failwith "watchdog Domain did not start"
+    | Error _ -> failwith "watchdog thread did not start"
   in
   Fun.protect
     ~finally:(fun () ->
@@ -562,11 +572,13 @@ let test_stop_does_not_wait_for_tick () =
      take at least about 0.22 s whatever the machine's load. *)
   let trial () =
     match
-      Watchdog.start ~deadline_ms:2_000
+      Watchdog.start ~spawn:thread_spawn
+        ~host_closing:(fun () -> false)
+        ~deadline_ms:2_000
         ~running_epoch:(fun () -> None)
         ~abandon:(fun ~epoch:_ ~elapsed_ms:_ -> ())
     with
-    | Error _ -> failwith "watchdog Domain did not start"
+    | Error _ -> failwith "watchdog thread did not start"
     | Ok watchdog ->
         Thread.delay 0.03;
         let started = Unix.gettimeofday () in
@@ -581,6 +593,59 @@ let test_stop_does_not_wait_for_tick () =
   if fastest > 0.17 then
     failwith (Printf.sprintf "watchdog stop took at least %.3fs" fastest)
 
+(** #1042: once [host_closing] holds, the sampling thread exits by itself
+    and reports nothing more, so the host Domain can be joined even though
+    the run loop never stops a watchdog whose lane is stuck. A later [stop]
+    returns at once. *)
+let test_host_closing_ends_sampling () =
+  let closing = Atomic.make false in
+  let samples = Atomic.make 0 in
+  let abandoned = Atomic.make 0 in
+  let exited = Atomic.make false in
+  let spawn body =
+    thread_spawn (fun () ->
+        Fun.protect ~finally:(fun () -> Atomic.set exited true) body)
+  in
+  let watchdog =
+    match
+      Watchdog.start ~spawn ~host_closing:(fun () -> Atomic.get closing)
+        ~deadline_ms:1_000
+        ~running_epoch:(fun () ->
+          Atomic.incr samples;
+          Some 1)
+        ~abandon:(fun ~epoch:_ ~elapsed_ms:_ -> Atomic.incr abandoned)
+    with
+    | Ok watchdog -> watchdog
+    | Error _ -> failwith "watchdog thread did not start"
+  in
+  await ~what:"first sample" (fun () -> Atomic.get samples > 0);
+  Atomic.set closing true;
+  await ~what:"sampling thread exit" (fun () -> Atomic.get exited);
+  let after_exit = Atomic.get samples in
+  Thread.delay 0.05;
+  if Atomic.get samples <> after_exit then
+    failwith "watchdog kept sampling after its host began closing";
+  if Atomic.get abandoned <> 0 then
+    failwith "watchdog reported an activation below its deadline";
+  let started = Unix.gettimeofday () in
+  Watchdog.stop watchdog;
+  if Unix.gettimeofday () -. started > 0.5 then
+    failwith "stop waited for a thread that had already exited"
+
+(** A failed [spawn] is returned unchanged, so the caller can map it to a
+    typed error; no thread is left to stop. *)
+let test_spawn_failure_is_returned () =
+  match
+    Watchdog.start
+      ~spawn:(fun _body -> Error `No_thread)
+      ~host_closing:(fun () -> false)
+      ~deadline_ms:50
+      ~running_epoch:(fun () -> None)
+      ~abandon:(fun ~epoch:_ ~elapsed_ms:_ -> ())
+  with
+  | Error `No_thread -> ()
+  | Ok _ -> failwith "watchdog started without a thread"
+
 (** Runs the watchdog regressions. *)
 let () =
   test_step_rule ();
@@ -591,4 +656,6 @@ let () =
   test_stuck_query_reports_failed_queries ();
   test_stuck_eviction_reports_acknowledgement ();
   test_unacknowledged_abandonment ();
+  test_host_closing_ends_sampling ();
+  test_spawn_failure_is_returned ();
   test_public_options ()

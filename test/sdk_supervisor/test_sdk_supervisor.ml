@@ -509,6 +509,59 @@ let test_shutdown_exception_is_contained_and_cached () =
   expect_failure (Supervisor.shutdown supervisor);
   expect "exceptional shutdown backend count" 1 (Atomic.get config.closes)
 
+(** #1042: a companion thread started with [spawn_owner_thread] runs on the
+    owner Domain, not on the caller's, can use the instance through its
+    ordinary entry points, and is waited for by [shutdown]'s owner join.
+    After shutdown the request is refused as [Closed]. *)
+let test_owner_thread_runs_on_owner_domain () =
+  let config = backend_config () in
+  let supervisor = Result.get_ok (Supervisor.create ~capacity:2 config) in
+  let owner_id =
+    Result.get_ok (Supervisor.perform supervisor Owner_id)
+  in
+  let thread_domain = Atomic.make (-1) in
+  let echoed = Atomic.make None in
+  let release = Atomic.make false in
+  let exited = Atomic.make false in
+  let body () =
+    Atomic.set thread_domain (Domain.self () :> int);
+    Atomic.set echoed (Some (Supervisor.perform supervisor (Echo 7)));
+    while not (Atomic.get release) do
+      Thread.delay 0.005
+    done;
+    Atomic.set exited true
+  in
+  (match Supervisor.spawn_owner_thread supervisor body with
+  | Ok (Ok ()) -> ()
+  | Ok (Error _) -> failwith "owner thread could not be created"
+  | Error _ -> failwith "owner refused the thread request");
+  (* At most about five seconds before a lost thread fails the test. *)
+  let rec await_echo remaining =
+    if Atomic.get echoed = None then
+      if remaining = 0 then failwith "owner thread did not run"
+      else begin
+        Thread.delay 0.001;
+        await_echo (remaining - 1)
+      end
+  in
+  await_echo 5_000;
+  if Atomic.get thread_domain <> owner_id then
+    failwith "companion thread did not run on the owner Domain";
+  if Atomic.get thread_domain = (Domain.self () :> int) then
+    failwith "companion thread ran on the caller's Domain";
+  expect "companion thread operation" (Some (Ok 7)) (Atomic.get echoed);
+  let shutdown = Domain.spawn (fun () -> Supervisor.shutdown supervisor) in
+  (* The owner join waits for the companion thread, so release it only
+     after shutdown started and check that shutdown returned after it. *)
+  Thread.delay 0.05;
+  Atomic.set release true;
+  expect "shutdown with companion thread" (Ok ()) (Domain.join shutdown);
+  if not (Atomic.get exited) then
+    failwith "shutdown returned before the owner thread exited";
+  match Supervisor.spawn_owner_thread supervisor ignore with
+  | Error Supervisor.Closed -> ()
+  | _ -> failwith "a closed supervisor accepted a thread request"
+
 let () =
   test_owner_domain_and_typed_operations ();
   test_concurrent_producers_are_serialized ();
@@ -524,4 +577,5 @@ let () =
   test_delegated_abandoned_cleanup_waits_for_owner ();
   test_concurrent_shutdown_callers_share_result ();
   test_creation_exception_is_contained ();
-  test_shutdown_exception_is_contained_and_cached ()
+  test_shutdown_exception_is_contained_and_cached ();
+  test_owner_thread_runs_on_owner_domain ()

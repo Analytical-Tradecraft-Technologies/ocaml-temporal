@@ -166,7 +166,9 @@ Two process constraints apply to applications that link the SDK (see
 [Process and linking constraints](docs/guides/workflows.md#process-and-linking-constraints)):
 
 - On Linux and macOS, fork or daemonise before creating any native `Client` or
-  `Worker`. Each one spawns an OCaml Domain, and OCaml 5 rejects `Unix.fork` for
+  `Worker`. Each one spawns an OCaml Domain (a running worker that registers
+  activities uses one more; see the Domain budget in `Temporal.Worker`), and
+  OCaml 5 rejects `Unix.fork` for
   the rest of the process once any Domain has been spawned. Starting
   subprocesses with `Unix.create_process` or `Unix.open_process*` still works,
   and is the only option on Windows, where `Unix.fork` is unavailable.

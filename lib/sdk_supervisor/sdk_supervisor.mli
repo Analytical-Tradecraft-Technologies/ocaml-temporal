@@ -67,6 +67,17 @@ module Make (Backend : Backend) : sig
       mailbox admission order. *)
   val perform : t -> 'result Backend.operation -> ('result, error) result
 
+  (** [spawn_owner_thread instance body] starts [body] on a new system thread
+      of the owner Domain, after the operations admitted before it (#1042).
+      The outer result reports whether the owner accepted the request; the
+      inner one is the [Thread.create] outcome. [body] never receives backend
+      state and may use the instance only through its ordinary entry points,
+      from its own thread. Because joining the owner Domain waits for every
+      thread on it, [body] must return promptly once shutdown has been
+      admitted, or [shutdown] will not return. *)
+  val spawn_owner_thread :
+    t -> (unit -> unit) -> ((unit, exn) result, error) result
+
   (** [initiate_shutdown instance] atomically admits the one terminal request
       and closes operation admission, but does not wait for earlier backend
       work or join the owner Domain. Repeated calls are harmless. This is an
@@ -706,6 +717,12 @@ module Native : sig
       with {!await_client_call}. Only submission occupies the owner Domain,
       so concurrent calls from other Domains proceed independently. *)
   val call : t -> 'value client_rpc -> ('value, error) result
+
+  (** Starts a companion system thread on the owner Domain; see
+      {!Make.spawn_owner_thread}. The native worker hosts its activation
+      watchdog there (#1042). *)
+  val spawn_owner_thread :
+    t -> (unit -> unit) -> ((unit, exn) result, error) result
 
   (** Closes operation admission without waiting for native teardown. This is
       an internal lifecycle seam; application code should call [shutdown]. *)

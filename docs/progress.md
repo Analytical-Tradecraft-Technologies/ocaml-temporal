@@ -15,6 +15,59 @@ implementation when a later entry documents that work as complete. The
 records the current tested source, named assertions and successful CI job for
 the Temporal acceptance controllers.
 
+## 2026-10-15: A running worker holds one or two OCaml Domains instead of three, and a Domain shortage in `run` is a typed error (#1042)
+
+Every running `Worker` held three Domains: its supervisor, an activity-lane
+Domain spawned even for a workflow-only worker, and an activation-watchdog
+Domain. That capped a process at about 42 running workers on OCaml 5.2 (128
+Domains), slowed every stop-the-world minor collection by about 8.5 µs per
+idle Domain, and was undocumented. When the activity Domain could not be
+spawned, `run` reported an untyped `native worker execution lane failed`
+defect that dropped the cause.
+
+- `Native_worker_loop.run` takes `~activity_lane`; a workflow-only worker
+  spawns no activity Domain, and its lone workflow lane keeps the native-wait
+  preference instead of alternating with local yields. A failed
+  `Domain.spawn` returns the caller's `~lane_unavailable` error before either
+  lane polls; the native worker maps it to a retryable `` `Bridge `` error
+  (`domain_unavailable`) that names the Domain limit and keeps the cause, so
+  the same worker can run again later. Any other escaped lane exception is
+  still a defect, now with the exception text.
+- The watchdog no longer owns a Domain. A system thread on the workflow
+  lane's own Domain was rejected: it runs only when the lane hands over that
+  Domain's runtime lock, which OCaml code does at periodic safepoints (a
+  10 ms sampler ran about 16 times a second against a spinning loop on
+  5.4.1) and lock-holding C code never does. Instead the sampling thread runs
+  on the worker's supervisor owner Domain, which executes only SDK code and
+  waits for Core with the lock released. `Sdk_supervisor.Make` gains a
+  `Spawn_thread` request (`spawn_owner_thread`) that starts a companion thread
+  there without exposing backend state. Because `Domain.join` waits for every
+  thread on a Domain (verified on 5.4.1), the watchdog also exits once the
+  worker begins its native release (`native_release_started`, set before
+  every `Native.shutdown` or `initiate_shutdown`), so a stuck lane cannot
+  block the supervisor's join.
+- `Owner_unavailable` diagnostics for workers, clients and replays now name
+  the Domain limit.
+- The Domain budget per instance, the per-version limits (63 running
+  activity workers or 127 workflow-only ones on threads of the main Domain,
+  42 or 63 with one Domain per `run`, from 42 and 31 before), and why the
+  supervisor and activity Domains stay are documented in `Temporal.Worker`
+  and in the
+  [native worker reference](reference/native-worker-execution.md#domain-budget).
+
+Evidence: `test/runtime/test_worker_domain_budget.ml` runs under
+`OCAMLRUNPARAM=d=1` (main Domain only) and checks that a workflow-only loop
+and the watchdog work without spawning a Domain and that a failed activity
+spawn is the typed error with no lane run; it skips the exhaustion part on
+OCaml 5.2, which ignores `d`. `test_sdk_supervisor` checks that a companion
+thread runs on the owner Domain, can use the supervisor, delays `shutdown`
+until it exits, and is refused after shutdown. The watchdog tests cover the
+exit on `host_closing` and a failed spawn. `dune build @install` plus the
+runtime, unit, sdk_supervisor and bridge suites passed four times, and the
+watchdog, budget, supervisor, loop and bounded-shutdown executables ten
+times each, on OCaml 5.4.1 (macOS arm64). The live non-yielding-workflow
+qualification is left to CI.
+
 ## 2026-10-14: Live-regression logs retained; coverage inventory, sizing guide and release checklist (#498, #504, #510, #519)
 
 The Temporal/PostgreSQL job now uploads `_build/live-regressions/*.log` and the
