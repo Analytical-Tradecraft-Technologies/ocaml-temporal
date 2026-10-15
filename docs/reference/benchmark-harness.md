@@ -473,10 +473,13 @@ completion calls and real server waits. Empty polls rose from about 2.4k to
 6.4k per sample at about 1.7 µs each. The eight-execution samples are noisy
 (67, 79 and 115 s). These are single-machine numbers.
 
-On Windows the gain is small: `Thread.delay` rounds sub-millisecond requests
-to an immediate return and longer ones to the 15.6 ms timer tick, so a
-simulated serial step takes about 21 ms with adaptive pacing against about
-23 ms with the fixed yield. [#1008] tracks closing that gap.
+On Windows the gain was initially small: `Thread.delay` rounds
+sub-millisecond requests to an immediate return and longer ones to the
+15.6 ms timer tick, so a simulated serial step took about 21 ms with adaptive
+pacing against about 23 ms with the fixed yield. [#1008] moved the local
+yield to the bridge's high-resolution pacing sleep; under the same simulated
+Windows model a serial step now takes about 1.1 ms, as on macOS
+(`IDLE_TEST_SLEEP_MODEL=windows-thread-delay` reproduces the old 21 to 23 ms).
 
 [#507]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/507
 [#526]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/526

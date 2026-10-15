@@ -90,9 +90,13 @@ val native_wait : lane -> (unit -> 'a) -> 'a
     sleeping. *)
 val next_delay : lane -> float
 
-(** [local_yield lane] sleeps for [next_delay lane] seconds, if positive.
-    [Thread.delay] releases the Domain's runtime lock, and the supervisor
-    mailbox is not entered. *)
+(** [local_yield lane] sleeps for [next_delay lane] seconds, if positive,
+    through {!Temporal_core_bridge.Native_bridge.pacing_sleep}. That releases
+    the Domain's runtime lock like [Thread.delay], and the supervisor mailbox
+    is not entered. Unlike [Thread.delay] it keeps sub-tick precision on
+    Windows, where [Thread.delay] rounds a backoff step to an immediate return
+    or a whole 15.6 ms timer tick, so the backoff schedule means the same on
+    every platform (#1008). *)
 val local_yield : lane -> unit
 
 (** [wait lane ~native_wait ready] is the {!Native_worker_loop} [wait_for_lane]

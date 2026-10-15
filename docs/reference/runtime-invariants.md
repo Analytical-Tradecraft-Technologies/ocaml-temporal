@@ -400,7 +400,10 @@ and bridge, read the [documentation guide](../README.md) first.
   event, so an idle worker settles at the 10 ms cap and never busy-spins, and
   a stopping lane still observes its stop flag within one native wait plus one
   capped yield. The poll reports a fatal Rust lane error even with no queued
-  task.
+  task. The yield sleeps through the bridge's pacing sleep, which releases the
+  runtime lock and keeps sub-millisecond precision on Windows through a
+  per-timer high-resolution waitable timer; it never raises the process- or
+  system-wide timer resolution (#1008).
 - The workflow execution Domain and capacity-one activity execution Domain
   share the same serialized supervisor mailbox. The activity Domain is spawned
   only for a worker that polls activity tasks; a failed spawn is a typed,

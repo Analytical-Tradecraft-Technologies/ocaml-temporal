@@ -4434,6 +4434,46 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_conformance_wait_ms(
     }
 }
 
+/// Longest sleep, in nanoseconds, that
+/// [`ocaml_temporal_core_v4_pacing_sleep_ns`] performs. Worker idle pacing
+/// never asks for more than its 10 ms cap; the bound keeps an accidental huge
+/// request from parking a worker lane indefinitely.
+pub const MAX_PACING_SLEEP_NS: u64 = 1_000_000_000;
+
+/// Sleeps the calling thread for `nanoseconds`, clamped to
+/// [`MAX_PACING_SLEEP_NS`], for worker idle pacing (#1008).
+///
+/// The OCaml worker lanes back off from 0.1 ms to 10 ms between nonblocking
+/// polls while the sibling lane is busy. OCaml's `Thread.delay` passes whole
+/// milliseconds to the Windows `Sleep`, which then lasts until a 15.6 ms
+/// system timer tick, so that backoff could not go below one tick there.
+/// `std::thread::sleep` instead uses a per-timer high-resolution waitable
+/// timer (`CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`, Windows 10 1803 and later)
+/// and falls back to `Sleep` only where that is unavailable. Unlike
+/// `timeBeginPeriod`, it changes no process- or system-wide timer resolution.
+/// On Unix-like targets it is `nanosleep`, like `Thread.delay`.
+///
+/// A zero request returns at once without yielding the thread. The call
+/// touches no shared bridge state and owns no handle beyond the sleep, so it
+/// is safe from any thread; the OCaml stub calls it with the runtime lock
+/// released. It is not a workflow timer and has no effect on determinism.
+///
+/// Returns `STATUS_OK`, or `STATUS_PANIC` if a panic was contained. There is
+/// no result object, so the hot idle path allocates nothing.
+#[unsafe(no_mangle)]
+pub extern "C" fn ocaml_temporal_core_v4_pacing_sleep_ns(nanoseconds: u64) -> Status {
+    if nanoseconds == 0 {
+        return STATUS_OK;
+    }
+    let duration = Duration::from_nanos(nanoseconds.min(MAX_PACING_SLEEP_NS));
+    // `std::thread::sleep` does not panic for a bounded duration; containment
+    // keeps any future unwind from crossing the C boundary, which would abort.
+    match catch_unwind(|| std::thread::sleep(duration)) {
+        Ok(()) => STATUS_OK,
+        Err(_) => STATUS_PANIC,
+    }
+}
+
 /// Builds Core and the runtime owner, forwarding Core's own log records at
 /// `log_level` (none when `off`) instead of discarding them (#833).
 ///

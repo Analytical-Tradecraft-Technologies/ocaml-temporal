@@ -188,6 +188,10 @@ external conformance_wait_ms_raw : int -> response
     interface. Implemented in C, not Rust, so the bridge ABI is unchanged. *)
 external monotonic_now_ns : unit -> int64 = "ocaml_temporal_monotonic_now_ns"
 
+(** Sleeps with the runtime lock released, through the bridge's
+    high-resolution pacing sleep; see the interface (#1008). *)
+external pacing_sleep : float -> unit = "ocaml_temporal_pacing_sleep"
+
 external response_status : response -> int = "ocaml_temporal_response_status"
 external response_value : response -> bytes = "ocaml_temporal_response_value"
 external response_error : response -> string = "ocaml_temporal_response_error"

@@ -3,6 +3,10 @@
  (libraries temporal-sdk temporal_core_bridge unix))
 
 (test
+ (name test_pacing_sleep)
+ (libraries temporal_core_bridge threads.posix))
+
+(test
  (name test_runtime_threads)
  (libraries temporal-sdk temporal_core_bridge))
 
