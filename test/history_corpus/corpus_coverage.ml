@@ -177,6 +177,9 @@ let table =
        (UpsertWorkflowSearchAttributes).";
     not_yet_captured "deterministic-time-random"
       "Commands that depend on Workflow.now or Workflow.random_int.";
+    not_yet_captured "deployment-version"
+      "A run on a deployment-versioned worker whose commands branch on \
+       Workflow.current_deployment_version.";
   ]
 
 (** The status word used in the documentation table. *)

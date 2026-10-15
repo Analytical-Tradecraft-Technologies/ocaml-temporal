@@ -403,6 +403,7 @@ with a `not yet captured` feature and requires exactly those two problems.
 | `start-metadata` | not yet captured | A start memo and search attributes read through `Workflow.start_metadata`. |
 | `search-attribute-upsert` | not yet captured | `Workflow.upsert_search_attributes`. |
 | `deterministic-time-random` | not yet captured | Commands that depend on `Workflow.now` or `Workflow.random_int`. |
+| `deployment-version` | not yet captured | A run on a deployment-versioned worker whose commands branch on `Workflow.current_deployment_version`. |
 
 ## Scope
 
