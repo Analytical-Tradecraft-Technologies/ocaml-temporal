@@ -380,6 +380,20 @@ let test_invalid_input () =
   rejected "non-UTF-8 workflow ID" (of_protobuf ~workflow_id:"\xff" "x");
   rejected "oversized workflow ID"
     (of_protobuf ~workflow_id:(String.make 65_537 'w') "x");
+  (* One byte over [max_bytes] (128 MiB + 1) is rejected by the size check
+     itself, before any base64 or JSON copy is made (#497). The allocation is
+     transient; platforms whose strings cannot be that long skip the case. *)
+  if R.History.max_bytes < Sys.max_string_length then (
+    match of_protobuf (String.make (R.History.max_bytes + 1) '\000') with
+    | Ok _ -> failwith "oversized history: accepted"
+    | Error error ->
+        let expected =
+          "replay history exceeds Temporal.Replay.History.max_bytes"
+        in
+        if Temporal.Error.message error <> expected then
+          failwith
+            ("oversized history: unexpected error "
+            ^ Temporal.Error.message error));
   let replay_bytes label bytes =
     match of_protobuf bytes with
     | Error error -> failwith (label ^ ": " ^ Temporal.Error.message error)
