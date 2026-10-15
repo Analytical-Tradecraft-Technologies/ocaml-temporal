@@ -244,8 +244,13 @@ let test_aborted_scrapes_do_not_kill_the_process () =
   let deadline = Unix.gettimeofday () +. 10. in
   let rec scrape_until_served attempt =
     let outcome : [ `Response of string | `Closed ] =
+      (* Each attempt gets only the time left before the shared deadline,
+         so a scrape that hangs cannot stretch the bound to 10 s plus a
+         full per-scrape timeout. *)
+      let timeout = Float.max 0.1 (deadline -. Unix.gettimeofday ()) in
       match
-        http_get ~label:"scrape after 64 reset connections" address "/metrics"
+        http_get ~timeout ~label:"scrape after 64 reset connections" address
+          "/metrics"
       with
       | response -> `Response response
       | exception Unix.Unix_error ((Unix.ECONNRESET | Unix.EPIPE), _, _) ->
