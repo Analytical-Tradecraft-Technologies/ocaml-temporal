@@ -36,7 +36,9 @@ let test_activity_completion_policy () =
 (** Async client heartbeats and complete/fail/cancel do not consume a Core
     completion lease. A connection result is uncertain and retains the live
     handle (#821), a definitive rejection keeps it live for a different
-    request, and the bridge's NotFound/invalid-state response closes it. This
+    request, a submission the full client-call registry did not admit keeps
+    it live for a retry (#1104), and the bridge's NotFound/invalid-state
+    response closes it. This
     must not weaken the ordinary Core completion policy tested above, which
     still fails closed on [Connection]. *)
 let test_async_operation_policy () =
@@ -59,6 +61,10 @@ let test_async_operation_policy () =
       ("local protocol rejection", Bridge.Protocol);
       ("local configuration rejection", Bridge.Configuration);
     ];
+  (* A full client-call registry refuses admission before any RPC exists:
+     transient back-pressure that must keep the handle live (#1104). *)
+  expect_disposition "client-call registry full" Policy.Not_admitted
+    (Policy.async_operation_disposition Bridge.Resource_exhausted);
   List.iter
     (fun (label, status) ->
       expect_disposition label Policy.Retired

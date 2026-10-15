@@ -1339,10 +1339,20 @@ module Make (Supervisor : SUPERVISOR) = struct
       worker lease: an uncertain RPC keeps the lease ([Retryable_submission]),
       a definitive rejection keeps the live handle ([Rejected_submission]), and
       only token loss or an unusable graph retires it. The base handle then
-      decides whether an uncertain request must be retried exactly. *)
+      decides whether an uncertain request must be retried exactly.
+
+      A call the bridge refused to admit because its client-call registry was
+      full ([Not_admitted], #1104) never reached the server, so it maps to
+      [Not_submitted] with a retryable diagnostic: the handle and lease stay
+      live, an earlier uncertain terminal submission is still owed, and the
+      caller may retry the same operation once capacity frees. *)
   let async_native_submission_error ~name ~path source_error =
     let disposition = async_operation_error_disposition source_error in
-    let retryable = disposition = Worker_policy.Retry_exact in
+    let retryable =
+      match disposition with
+      | Worker_policy.Retry_exact | Worker_policy.Not_admitted -> true
+      | Worker_policy.Rejected_live | Worker_policy.Retired -> false
+    in
     let diagnostic =
       base_operation_error name
         (supervisor_error ~path ~retryable ~error_code:Supervisor.error_code
@@ -1351,6 +1361,7 @@ module Make (Supervisor : SUPERVISOR) = struct
     match disposition with
     | Worker_policy.Retry_exact -> Async_activity.Retryable_submission diagnostic
     | Worker_policy.Rejected_live -> Async_activity.Rejected_submission diagnostic
+    | Worker_policy.Not_admitted -> Async_activity.Not_submitted diagnostic
     | Worker_policy.Retired -> Async_activity.Terminal_submission diagnostic
 
   (** Closes and drops every admitted async lease whose attempt the server
@@ -1508,11 +1519,16 @@ module Make (Supervisor : SUPERVISOR) = struct
                   | Async_activity.Activity_state _) -> ());
               (* Only a terminal request with an unknown native outcome
                  keeps its bytes for the exact retry the handle allows; a
-                 heartbeat never touches the retained completion. *)
+                 heartbeat never touches the retained completion. A call
+                 the bridge did not admit ([Not_submitted] is only produced
+                 here for a full client-call registry, #1104) leaves any
+                 retained bytes in place: the base handle still owes that
+                 earlier uncertain request, and its retry must resend them. *)
               match (request, result) with
               | Async_completion encoded,
                 Error (Async_activity.Retryable_submission _) ->
                   lease.uncertain_completion <- Some (Lazy.force key, encoded)
+              | Async_completion _, Error (Async_activity.Not_submitted _) -> ()
               | Async_completion _, _ -> lease.uncertain_completion <- None
               | Async_heartbeat _, _ -> ()
             end;
