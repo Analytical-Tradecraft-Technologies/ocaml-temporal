@@ -157,7 +157,12 @@ fi
 
 # Offline replay through the installed package: the recorded code must pass and
 # the same workflow type without its timer must be nondeterministic (#497).
-"$output_dir/_build/default/installed_replay.exe" "$output_dir/timer-history.pb"
+# The history is passed as a relative path from the consumer directory: the
+# executable is native, so on Windows it cannot open a Cygwin /cygdrive path.
+(
+  cd "$output_dir"
+  ./_build/default/installed_replay.exe timer-history.pb
+)
 
 # Malformed legacy settings used to fail before native client configuration.
 # The installed worker now reaches the same native path with either namespace
