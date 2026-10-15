@@ -89,7 +89,9 @@ module type SUPERVISOR = sig
       cancel separately from a Core worker completion. An uncertain RPC keeps
       the live handle and lease (a terminal request must then be retried
       exactly, a heartbeat is dropped); a definitive rejection releases only
-      that request; confirmed token loss retires both. *)
+      that request; a call the bridge refused to admit because its client-call
+      registry was full ([Not_admitted], #1104) keeps both live and is
+      reported as retryable; confirmed token loss retires both. *)
 
   val exception_is_retryable : exn -> bool
   (** Classifies an exception raised by the completion call. Production

@@ -48,6 +48,41 @@ tag, dispatching the workflow (it uses only the workflow token and OIDC, with
 no stored publish secret), and the prerelease rehearsal, which has not been
 done. The Release workflow cannot run from a pull request, so the attestation
 step is first exercised by that rehearsal.
+## 2026-10-16: A full client-call registry no longer closes async handles (#1104)
+
+`Native_worker_policy.async_operation_disposition` mapped
+`Resource_exhausted` to `Retired`. On the async activity path that status
+only means the bridge refused to admit the submitted call because its
+pending client-call registry was full (`max_in_flight_calls`), before any
+RPC existed; a server `ResourceExhausted` already maps to `Connection`.
+Retiring closed the handle for good, so a later `complete` could not be
+delivered and the attempt could only end by server timeout.
+
+The policy now has a fourth disposition, `Not_admitted`, for
+`Resource_exhausted`. The adapter reports it to the base handle as
+`Not_submitted` with a retryable `` `Bridge `` error: the handle and lease
+stay live, the key is released unless an earlier uncertain terminal request
+is still owed, and in that case the adapter keeps that request's retained
+bytes so the exact retry resends them. Heartbeats, `complete`, `fail` and
+`cancel` share the classification. #1103's heartbeat throttle sends
+unthrottled when its own token table is full, but every async call,
+throttled heartbeats included, still passes the registry's admission check.
+Lease expiry (#1043) is unchanged and still bounds a handle whose calls keep
+being refused. `Activity.Async_handle` documents the retryable error.
+
+Evidence on macOS with OCaml 5.4.1: the fake supervisor in
+`test/runtime/test_native_async_activity.ml` now models the registry with a
+slot count and refuses with `Resource_exhausted` when it is full. New tests
+check that `complete`, `fail`, `cancel` and `heartbeat` each return a
+retryable `` `Bridge `` error naming `resource_exhausted`, send nothing, and
+keep the handle and lease live, and that the same call succeeds once a slot
+frees. They also check that a refused retry keeps an earlier uncertain
+completion owed and later resends its bytes, and that a lease whose calls
+are refused still expires. `test_native_worker_policy.ml` pins the
+classification. Restoring `Retired` fails the policy test and the
+terminal-operation test, and clearing the retained bytes fails the
+uncertainty test. `dune build @install` and the runtime, unit,
+sdk_supervisor and bridge test aliases pass.
 
 ## 2026-10-15: Worker idle pacing keeps sub-tick precision on Windows (#1008)
 
