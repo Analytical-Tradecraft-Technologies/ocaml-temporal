@@ -19,9 +19,12 @@ type operation =
 type submit_result = (unit, Error.t) result
 
 (** Private submission disposition, independent of the public diagnostic's
-    error category. [Not_submitted] proves local validation prevented any
-    native call, permitting a corrected or different operation unless an
-    earlier submission is still unresolved. [Rejected_submission] is a
+    error category. [Not_submitted] proves no request reached the server,
+    either because local validation prevented any native call or because the
+    bridge refused to admit it while its client-call registry was full
+    (#1104, reported with a retryable error). It permits a retry or a
+    corrected or different operation unless an earlier submission is still
+    unresolved. [Rejected_submission] is a
     definitive native rejection of this exact request (heartbeat or terminal)
     that releases its key, even after an earlier uncertain attempt, while
     retaining the live handle and lease. [Retryable_submission] means the

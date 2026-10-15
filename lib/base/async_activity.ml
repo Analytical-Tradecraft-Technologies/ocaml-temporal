@@ -27,8 +27,9 @@ type operation =
 type submit_result = (unit, Error.t) result
 
 (** The adapter explicitly distinguishes preflight rejection from native
-    outcomes. [Not_submitted] releases a new operation key while preserving
-    the handle and any earlier unresolved submission. [Rejected_submission] is
+    outcomes. [Not_submitted] (local validation, or a bridge admission refusal
+    while the client-call registry is full, #1104) releases a new operation
+    key while preserving the handle and any earlier unresolved submission. [Rejected_submission] is
     a definitive native answer to this exact request, so it releases the key
     even after an earlier uncertain attempt. [Retryable_submission] retains a
     terminal operation's exact key and drops a heartbeat's.
@@ -290,8 +291,9 @@ let operation_key operation =
     retaining a stale heartbeat would only block newer progress and the
     terminal operation (#836).
 
-    A local rejection ([Not_submitted]) releases a fresh key but cannot erase
-    an earlier uncertain submission, because no native answer was received. A
+    A local rejection or an admission refusal ([Not_submitted]) releases a
+    fresh key but cannot erase an earlier uncertain submission, because no
+    native answer was received. A
     definitive native rejection of the exact request ([Rejected_submission])
     releases the key even after an earlier uncertain attempt: the server has
     answered this request, and the live handle may submit a different terminal
