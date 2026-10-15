@@ -84,8 +84,8 @@ also has a higher-level lifecycle record:
 
 | Source | Current operation identifiers |
 |---|---|
-| `temporal.sdk.bridge` | `check_abi_version`, `echo`, `conformance_wait_ms`, `runtime_create`, `runtime_close`, `client_connect`, `client_disconnect`, `client_start_workflow_json`, `client_begin_start_workflow_json`, `client_poll_start_workflow_json`, `client_wait_start_workflow_json`, `client_wait_workflow_json`, `client_submit_json`, `client_await_call`, `client_release_call`, `client_cancel_workflow_json`, `client_reset_workflow_json`, `client_terminate_workflow_json`, `client_list_visibility_json`, `client_signal_workflow_json`, `client_query_workflow_json`, `client_update_workflow_json`, `client_poll_update_workflow_json`, `client_complete_async_activity_json`, `client_record_async_activity_heartbeat_json`, `worker_start`, `worker_try_poll_workflow`, `worker_wait_workflow`, `worker_complete_workflow_json`, `worker_reject_workflow_json`, `worker_try_poll_activity`, `worker_wait_activity`, `worker_wait_any`, `worker_wait_activity_completion_retry_backoff`, `worker_complete_activity_json`, `worker_reject_activity_json`, `worker_record_activity_heartbeat_json`, `worker_shutdown`, `replay_worker_start`, `replay_worker_feed_history`, `replay_worker_try_poll_workflow`, `replay_worker_wait_workflow`, `replay_worker_complete_workflow`, `replay_worker_reject_workflow`, `replay_worker_finish_input`, `replay_worker_finalize`, `replay_worker_dispose`; codec timing (Debug only): `workflow_activation_decode`, `workflow_completion_encode`, `activity_task_decode`, `activity_completion_encode` |
-| `temporal.sdk.lifecycle` | `runtime_create`, `runtime_close`, `workflow_task_rejected`, `activity_task_failed`, `activity_task_rejected`, `activity_completion_retry`, `worker_run_started`, `worker_run_finished`, `worker_terminal_cleanup`, `worker_terminal_cleanup_failed`, `worker_shutdown`, `worker_shutdown_failed`, `activity_lane_detached`, `worker_shutdown_abandoned_work`, `worker_shutdown_teardown_detached`, `workflow_activation_completed`, `workflow_completion_diagnostic_failed`, `workflow_activation_rejected`, `workflow_poll_not_ready`, `activity_task_started`, `activity_cancellation_delivered`, `activity_task_completed`, `activity_async_handoff_accepted`, `activity_poll_not_ready` |
+| `temporal.sdk.bridge` | `check_abi_version`, `echo`, `conformance_wait_ms`, `runtime_create`, `runtime_close`, `client_connect`, `client_disconnect`, `client_start_workflow_json`, `client_begin_start_workflow_json`, `client_poll_start_workflow_json`, `client_wait_start_workflow_json`, `client_wait_workflow_json`, `client_submit_json`, `client_await_call`, `client_release_call`, `client_cancel_workflow_json`, `client_reset_workflow_json`, `client_terminate_workflow_json`, `client_list_visibility_json`, `client_signal_workflow_json`, `client_query_workflow_json`, `client_update_workflow_json`, `client_poll_update_workflow_json`, `client_complete_async_activity_json`, `client_record_async_activity_heartbeat_json`, `worker_start`, `worker_try_poll_workflow`, `worker_wait_workflow`, `worker_complete_workflow_json`, `worker_reject_workflow_json`, `worker_try_poll_activity`, `worker_wait_activity`, `worker_wait_any`, `worker_wait_activity_completion_retry_backoff`, `worker_complete_activity_json`, `worker_reject_activity_json`, `worker_record_activity_heartbeat_json`, `worker_initiate_shutdown`, `worker_shutdown`, `replay_worker_start`, `replay_worker_feed_history`, `replay_worker_try_poll_workflow`, `replay_worker_wait_workflow`, `replay_worker_complete_workflow`, `replay_worker_reject_workflow`, `replay_worker_finish_input`, `replay_worker_finalize`, `replay_worker_dispose`; codec timing (Debug only): `workflow_activation_decode`, `workflow_completion_encode`, `activity_task_decode`, `activity_completion_encode` |
+| `temporal.sdk.lifecycle` | `runtime_create`, `runtime_close`, `workflow_task_rejected`, `activity_task_failed`, `activity_task_rejected`, `activity_completion_retry`, `worker_run_started`, `worker_run_finished`, `worker_terminal_cleanup`, `worker_terminal_cleanup_failed`, `worker_shutdown`, `worker_shutdown_failed`, `worker_polling_stopped`, `worker_polling_stop_failed`, `activity_lane_detached`, `worker_shutdown_abandoned_work`, `worker_shutdown_teardown_detached`, `workflow_activation_completed`, `workflow_completion_diagnostic_failed`, `workflow_activation_rejected`, `workflow_poll_not_ready`, `activity_task_started`, `activity_cancellation_delivered`, `activity_task_completed`, `activity_async_handoff_accepted`, `activity_poll_not_ready` |
 | `temporal.sdk.workflow` | `execution_created`, `workflow_started`, `workflow_completed`, `workflow_failed`, `workflow_task_failed`, `workflow_query_unhandled`, `workflow_query_completed`, `workflow_query_failed`, `workflow_update_unhandled`, `workflow_signal_unhandled`, `workflow_signal_received`, `workflow_signal_handled`, `workflow_cancelled`, `execution_evicted`, `activation_ignored`, `activate` |
 
 The bridge source emits a completion record for every bridge call and a
@@ -159,10 +159,10 @@ replay-tagged: activities do not replay.
 
 The `activity_async_handoff_accepted` record therefore proves only that the
 worker-side handoff was accepted. It does not prove that a later asynchronous
-completion or heartbeat was accepted. Those operations have their own bridge
-records (`client_complete_async_activity_json` and
-`client_record_async_activity_heartbeat_json`), while the public handle keeps
-their typed result and retry semantics.
+completion or heartbeat was accepted. Those operations are submitted client
+calls (#1025), so they appear as `client_submit_json` and `client_await_call`
+bridge records, while the public handle keeps their typed result and retry
+semantics.
 
 ### Workflow execution and interaction events
 
@@ -240,7 +240,9 @@ adapter from a public `Worker.run` or `Worker.shutdown` result:
 | `worker_terminal_cleanup_failed` | `Error` | Native terminal cleanup returned `Error` or cleanup raised. A returned native error still proves the force-release boundary, so the adapter maps are discarded and cleanup-pending is cleared. An exception leaves cleanup-pending set for later retry or finalization; inspect `temporal.error_kind` when present. |
 | `worker_shutdown` | `Info` | A bounded public worker shutdown finished its native teardown before returning (#495). It may still have abandoned work, which `worker_shutdown_abandoned_work` reports separately. Repeated shutdown calls are cached and do not represent new native work. |
 | `worker_shutdown_failed` | `Error` | The native release returned an error, or an unexpected exception escaped it before a typed result was returned (`temporal.error_kind` is then `exception` and the cleanup path is scheduled separately). |
-| `activity_lane_detached` | `Warning` | After a stop, an activity callback was still running when the grace period ended, so `Worker.run` returned without joining its activity Domain (#495). The callback keeps running and its result will be discarded. |
+| `worker_polling_stopped` | `Debug` | After a stop, the worker asked the bridge to stop Temporal Core polling, before the grace period (#1028). Tasks already leased stay completable. Emitted once per worker, by the stopping `Worker.run` or by the shutdown thread, whichever came first. |
+| `worker_polling_stop_failed` | `Warning` | That request returned an error or raised (`temporal.error_kind`). Polling then stops at the native release instead, as before #1028. |
+| `activity_lane_detached` | `Warning` | After a stop, an activity callback was still running when the grace period ended, or any other activity lane had not returned 150 ms after it, so `Worker.run` returned without joining its activity Domain (#495, #1023). A callback keeps running and its result will be discarded. |
 | `worker_shutdown_abandoned_work` | `Warning` | Bounded shutdown stopped waiting for a lane at the end of the grace period (#495). `temporal.error_kind` is `activity_callback`, `workflow_activation`, or `native_call` (a lane blocked in a native call). The abandoned task is failed so Temporal retries it; the process should be restarted. |
 | `worker_shutdown_teardown_detached` | `Warning` | The teardown timeout elapsed before native teardown finished (#495). Shutdown returned; the teardown continues on its own SDK thread. |
 
@@ -480,8 +482,23 @@ runtime restores the endpoint. It never runs OCaml code and is not on
 the workflow or activity path: instruments are updated in memory, so a slow,
 failing, or absent scraper cannot block, fail, or reorder workflow and
 activity execution or change durable behavior. Memory is bounded by the
-label cardinality above. Each scrape connection is served by a short-lived
-task; Core imposes no connection limit, so bind the endpoint to a loopback or
+label cardinality above.
+
+Connections are bounded (#500). At most 8 scrape connections are relayed at
+once; a Prometheus server keeps one connection per target, so this leaves room
+for an HA pair, an agent and an operator's `curl`. A connection beyond the cap
+never reaches Core: it receives `503 Service Unavailable` ("Too many
+concurrent metrics scrapes; retry later.") within one second, or is closed at
+once while 16 such answers are already pending, and the first rejection logs
+one `warn` record (later ones are `debug`). Every relayed connection is also
+bounded in time: one that sends no request within 5 s is closed, one on which
+no byte moves for 10 s (for example a keep-alive scraper between scrapes) is
+closed, and none stays open longer than 60 s, after which a keep-alive scraper
+simply reconnects. Slow or idle clients therefore free their slot within a
+minute, and a connection flood costs a bounded number of descriptors and
+tasks. The limits are fixed constants rather than configuration. They protect
+the process, not the availability of the endpoint: a client that keeps
+reconnecting can still hold every slot, so bind the endpoint to a loopback or
 private interface (or put a scraping agent in front of it) rather than a
 public one. The endpoint has no authentication or TLS.
 

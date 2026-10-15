@@ -341,13 +341,30 @@ OCaml cannot preempt a callback, so the bound comes from never waiting on one
 past the grace period; the exact ownership rules are in the
 [runtime invariants](runtime-invariants.md).
 
+Temporal Core stops polling the server as soon as the stop is observed, not
+at the release (#1028): a stopping `run` asks the supervisor to initiate Core
+shutdown right after its workflow lane returns, and the shutdown thread does
+so first in any case. Core then takes no workflow or activity task that no
+lane would run (and that the release would have had to fail), while tasks
+already leased to OCaml stay completable, so a running callback still
+heartbeats and finishes during the grace period. Core's own graceful-shutdown
+timer, set to the same period, also starts then.
+
 | Outstanding work at the grace deadline | What shutdown does | Report |
 | --- | --- | --- |
-| Activity callback that ignores cancellation and never heartbeats | `run` stops joining the activity Domain and returns; the callback keeps running there. The bridge fails its task retryably, so Temporal schedules the next attempt, normally on another worker. Its eventual result reaches a closed supervisor and is discarded. | `lanes_stopped = false`, `abandoned_activity_callbacks = 1` |
+| Activity callback, synchronous or asynchronous, that ignores cancellation and never heartbeats | `run` stops joining the activity Domain and returns; the callback keeps running there. The bridge fails a remote activity's task retryably, so Temporal schedules the next attempt, normally on another worker, and reports a local activity as cancelled, which Core does not retry in-process (#1029); the workflow task that scheduled it is failed and retried. Its eventual result reaches a closed supervisor and is discarded. | `lanes_stopped = false`, `abandoned_activity_callbacks = 1` (#1023 counts asynchronous callbacks too) |
 | Non-yielding workflow activation | `run` cannot return (the activation runs on its thread). The watchdog has normally already failed the task; otherwise the bridge fails it at release. | `lanes_stopped = false`, `abandoned_workflow_activations = 1` |
 | A lane blocked in a native call on behalf of user code (for example a completion to an unreachable server) | Shutdown stops waiting for that lane. | `lanes_stopped = false`, both counts zero |
 | A retained completion that keeps failing retryably | Retried with the exact same bytes until the grace deadline, then the graph is released anyway. | `Error`: the completion was lost |
 | Native teardown that cannot finish (unreachable server) | The caller stops waiting after the teardown timeout; the shutdown thread still owns and finishes the one release within the bridge's own Core bounds. | `native_teardown = Detached` |
+
+An idle activity lane is never abandoned: at the deadline `run` detaches the
+activity Domain only while an activity callback is running, and otherwise
+keeps joining it for up
+to 150 ms more, which covers its bounded readiness wait (#1023). The
+watchdog Domain stops within one 20 ms sleep slice. A worker stopped with a
+short grace period, including zero, therefore reports `lanes_stopped = true`
+when nothing was running.
 
 `run` and `shutdown` share one lanes deadline. Whichever first computes it
 after a stop publishes it with a compare-and-set, so a `request_shutdown`

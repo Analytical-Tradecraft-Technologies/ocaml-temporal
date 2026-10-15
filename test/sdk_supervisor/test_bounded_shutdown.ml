@@ -30,6 +30,10 @@ type state = {
   entered : bool Atomic.t;  (** Set when a [Complete] begins. *)
   closes : int Atomic.t;
   completions : int Atomic.t;
+  polling_stops : int Atomic.t;
+      (** [Stop_polling] requests, which need no server (#1028). *)
+  stopped_before_close : bool Atomic.t;
+      (** Set when a [Stop_polling] ran before any teardown. *)
 }
 
 (** A fake backend whose completion and teardown need the server. *)
@@ -38,7 +42,9 @@ module Backend = struct
   type nonrec state = state
   type error = string
 
-  type _ operation = Complete : unit operation
+  (** [Complete] stands for a completion RPC; [Stop_polling] for the
+      worker's request to stop Core polling, which is local to the bridge. *)
+  type _ operation = Complete : unit operation | Stop_polling : unit operation
 
   (** The graph is the shared state record; creation cannot fail. *)
   let create state = Ok state
@@ -49,13 +55,20 @@ module Backend = struct
       Thread.delay 0.005
     done
 
-  (** Records one completion once the server is reachable. *)
+  (** Records one completion once the server is reachable, or one polling
+      stop at once. *)
   let perform : type value. state -> value operation -> (value, error) result =
-   fun state Complete ->
-    Atomic.set state.entered true;
-    wait_for_server state;
-    ignore (Atomic.fetch_and_add state.completions 1);
-    Ok ()
+   fun state -> function
+    | Complete ->
+        Atomic.set state.entered true;
+        wait_for_server state;
+        ignore (Atomic.fetch_and_add state.completions 1);
+        Ok ()
+    | Stop_polling ->
+        if Atomic.get state.closes = 0 then
+          Atomic.set state.stopped_before_close true;
+        ignore (Atomic.fetch_and_add state.polling_stops 1);
+        Ok ()
 
   (** Worker deregistration also needs the server. *)
   let shutdown state =
@@ -74,13 +87,19 @@ let state () =
     entered = Atomic.make false;
     closes = Atomic.make 0;
     completions = Atomic.make 0;
+    polling_stops = Atomic.make 0;
+    stopped_before_close = Atomic.make false;
   }
 
 (** Operations for a worker with no run loop whose release is the
-    supervisor's own terminal shutdown. *)
+    supervisor's own terminal shutdown. Stopping native polling is a
+    supervisor request, as in the native worker (#1028), so it queues behind
+    any operation that occupies the owner Domain. *)
 let operations supervisor =
   {
-    Shutdown.try_acquire_lanes = (fun () -> true);
+    Shutdown.stop_polling =
+      (fun () -> ignore (Supervisor.perform supervisor Backend.Stop_polling));
+    try_acquire_lanes = (fun () -> true);
     release_lanes = ignore;
     activity_lane_detached = (fun () -> false);
     activity_callback_running = (fun () -> false);
@@ -131,8 +150,9 @@ let test_teardown_blocked () =
   require (Supervisor.shutdown supervisor = Ok ()) "cached shutdown result";
   require (Atomic.get state.closes = 1) "the graph was released twice"
 
-(** A lane's completion RPC occupies the owner Domain, so the terminal
-    request queues behind it; the caller still returns within its bound. *)
+(** A lane's completion RPC occupies the owner Domain, so the polling stop
+    and the terminal request queue behind it; the caller still returns
+    within its bound, and the stop still precedes the teardown. *)
 let test_operation_blocked () =
   let state = state () in
   let supervisor = Result.get_ok (Supervisor.create ~capacity:4 state) in
@@ -144,7 +164,11 @@ let test_operation_blocked () =
   Atomic.set state.server_up true;
   require (Domain.join lane = Ok ()) "the in-flight completion was lost";
   await "teardown after the completion" (fun () -> Atomic.get state.closes = 1);
-  require (Atomic.get state.completions = 1) "completion count"
+  require (Atomic.get state.completions = 1) "completion count";
+  require (Atomic.get state.polling_stops = 1) "polling stop count";
+  require
+    (Atomic.get state.stopped_before_close)
+    "polling was not stopped before the teardown"
 
 (** With a reachable server the same path completes without detaching. *)
 let test_reachable_server () =
@@ -154,7 +178,13 @@ let test_reachable_server () =
   match bounded_shutdown supervisor with
   | Shutdown.Shut_down { teardown = Shutdown.Completed; lanes_stopped = true; _ }, _
     ->
-      require (Atomic.get state.closes = 1) "reachable server: close count"
+      require (Atomic.get state.closes = 1) "reachable server: close count";
+      (* #1028: Core polling stops once, before the lanes phase and the
+         release. *)
+      require (Atomic.get state.polling_stops = 1) "reachable server: stops";
+      require
+        (Atomic.get state.stopped_before_close)
+        "reachable server: polling stopped only at release"
   | _ -> failwith "a reachable server did not shut down cleanly"
 
 let () =

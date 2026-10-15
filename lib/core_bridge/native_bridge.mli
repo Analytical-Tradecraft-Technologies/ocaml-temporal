@@ -290,7 +290,13 @@ val client_wait_workflow_json : runtime -> bytes -> (bytes, error) result
 
 (** The client operation performed by one submitted call (#807). Each
     selects the request document of the matching synchronous operation
-    above. *)
+    above. [Call_async_activity_completion] and
+    [Call_async_activity_heartbeat] (#1025) take the documents of
+    {!client_complete_async_activity_json} and
+    {!client_record_async_activity_heartbeat_json}; their outcome is empty on
+    success, or exactly [not_found] where the synchronous operation would
+    fail with [Invalid_state], since an awaited [Invalid_state] means the call
+    itself was closed. *)
 type client_call_kind =
   | Call_start
   | Call_wait
@@ -302,6 +308,8 @@ type client_call_kind =
   | Call_update
   | Call_poll_update
   | Call_visibility
+  | Call_async_activity_completion
+  | Call_async_activity_heartbeat
 
 (** Handle of one submitted client call: the identity of the runtime graph
     that submitted it plus the call identifier. It names a Rust-owned
@@ -454,6 +462,14 @@ val worker_record_activity_heartbeat_json :
     failure. Rust matches the complete retained task, extracts its canonical
     opaque token, and retires that native obligation exactly once. *)
 val worker_reject_activity_json : runtime -> bytes -> (unit, error) result
+
+(** Stops the worker from taking new tasks without releasing it (#1028).
+    Admission and readiness close and Core stops polling the server, but
+    tasks already leased to OCaml may still be completed or heartbeated until
+    {!worker_shutdown}; Core's own graceful-shutdown timer starts now. It
+    never waits for Core or the network. Absence, and repetition, are
+    success. *)
+val worker_initiate_shutdown : runtime -> (unit, error) result
 
 (** Gracefully finalizes the worker. Absence is treated as already shut down,
     making sequential repeated calls safe. *)

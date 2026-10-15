@@ -553,3 +553,137 @@ fn invalid_client_limits_are_rejected() {
     }
     assert_eq!(runtime.close(true), STATUS_OK);
 }
+
+/// Polls `condition` every few milliseconds until it holds, failing with
+/// `what` after five seconds.
+fn eventually(what: &str, condition: impl Fn() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !condition() {
+        assert!(Instant::now() < deadline, "{what}");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Releasing a pending wait aborts its task at once (#1019): the transport
+/// long poll is dropped with no further submission, disconnect, or close.
+/// Before the fix, the task kept long-polling until the run closed.
+#[test]
+fn released_wait_aborts_its_long_poll() {
+    let (mut runtime, probe) = connected_runtime();
+    let owner = runtime.call_owner;
+    let wait = submit(&mut runtime, ClientCallKind::Wait, WAIT);
+    eventually("the long poll never reached the transport", || {
+        probe.long_polls.load(Ordering::SeqCst) == 1
+    });
+    crate::client_calls::release_call(wait.0, wait.1);
+    eventually("releasing the wait did not cancel its long poll", || {
+        probe.released.load(Ordering::SeqCst) == 1
+    });
+    assert_eq!(registered_calls(owner), 0);
+    let gone = await_call(wait, Duration::ZERO).expect_err("released call");
+    assert_eq!(gone.status, STATUS_INVALID_STATE);
+    assert!(runtime.disconnect_client().is_ok());
+    assert!(runtime.pending_calls.is_empty());
+    assert_eq!(runtime.close(true), STATUS_OK);
+}
+
+/// A released wait stops holding a wait slot and an in-flight slot at once
+/// (#1019), even before its aborted task has finished: with the default
+/// limits, `max_pending_waits` new distinct waits are admitted right after
+/// one wait is released.
+#[test]
+fn released_wait_frees_its_wait_slot() {
+    let (mut runtime, probe) = connected_runtime();
+    let released = submit(
+        &mut runtime,
+        ClientCallKind::Wait,
+        &wait_for("workflow-old"),
+    );
+    crate::client_calls::release_call(released.0, released.1);
+    for index in 0..MAX_PENDING_WAITS {
+        submit(
+            &mut runtime,
+            ClientCallKind::Wait,
+            &wait_for(&format!("workflow-{index}")),
+        );
+    }
+    let over = runtime
+        .submit_client_call(2, &wait_for("workflow-extra"))
+        .expect_err("live waits still fill the class");
+    assert_eq!(over.status, STATUS_RESOURCE_EXHAUSTED);
+    assert!(runtime.disconnect_client().is_ok());
+    assert_eq!(
+        probe.released.load(Ordering::SeqCst),
+        probe.long_polls.load(Ordering::SeqCst)
+    );
+    assert_eq!(runtime.close(true), STATUS_OK);
+}
+
+/// A burst of release-and-resubmit never grows the owner's task map past the
+/// in-flight ceiling (Codex review on #1077). Released tasks are aborted but
+/// their handles finish only once Tokio runs the cancellation; submission
+/// joins them once the map is full, so every admission leaves at most
+/// `in_flight_calls` retained handles, and every admission still succeeds.
+#[test]
+fn release_burst_keeps_task_handles_bounded() {
+    let (mut runtime, probe) = connected_runtime();
+    let owner = runtime.call_owner;
+    runtime.client_limits = crate::client_calls::ClientLimits::from_config(Some(2), None, Some(2))
+        .expect("valid limits");
+    for index in 0..500 {
+        let call = submit(
+            &mut runtime,
+            ClientCallKind::Wait,
+            &wait_for(&format!("workflow-{index}")),
+        );
+        assert!(
+            runtime.pending_calls.len() <= 2,
+            "retained {} task handles after admission {index}",
+            runtime.pending_calls.len()
+        );
+        crate::client_calls::release_call(call.0, call.1);
+    }
+    assert_eq!(registered_calls(owner), 0);
+    assert!(runtime.disconnect_client().is_ok());
+    assert!(runtime.pending_calls.is_empty());
+    assert_eq!(
+        probe.released.load(Ordering::SeqCst),
+        probe.long_polls.load(Ordering::SeqCst)
+    );
+    assert_eq!(runtime.close(true), STATUS_OK);
+}
+
+/// With configured limits of two waits and two in-flight calls, releasing
+/// both admitted waits lets two new distinct waits in immediately (#1019):
+/// released calls count against neither limit, while a released call's task
+/// is still joined by disconnect.
+#[test]
+fn released_calls_free_configured_in_flight_capacity() {
+    let (mut runtime, probe) = connected_runtime();
+    let owner = runtime.call_owner;
+    runtime.client_limits = crate::client_calls::ClientLimits::from_config(Some(2), None, Some(2))
+        .expect("valid limits");
+    let first = submit(&mut runtime, ClientCallKind::Wait, &wait_for("workflow-a"));
+    let second = submit(&mut runtime, ClientCallKind::Wait, &wait_for("workflow-b"));
+    let full = runtime
+        .submit_client_call(7, QUERY)
+        .expect_err("in-flight ceiling reached");
+    assert_eq!(full.status, STATUS_RESOURCE_EXHAUSTED);
+    for call in [first, second] {
+        crate::client_calls::release_call(call.0, call.1);
+    }
+    submit(&mut runtime, ClientCallKind::Wait, &wait_for("workflow-c"));
+    submit(&mut runtime, ClientCallKind::Wait, &wait_for("workflow-d"));
+    let over = runtime
+        .submit_client_call(2, &wait_for("workflow-e"))
+        .expect_err("the two live waits fill both limits");
+    assert_eq!(over.status, STATUS_RESOURCE_EXHAUSTED);
+    assert_eq!(registered_calls(owner), 2);
+    assert!(runtime.disconnect_client().is_ok());
+    assert!(runtime.pending_calls.is_empty());
+    assert_eq!(
+        probe.released.load(Ordering::SeqCst),
+        probe.long_polls.load(Ordering::SeqCst)
+    );
+    assert_eq!(runtime.close(true), STATUS_OK);
+}

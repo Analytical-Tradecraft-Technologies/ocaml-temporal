@@ -24,7 +24,9 @@ temporalio-client.workspace = true
 temporalio-common.workspace = true
 temporalio-sdk-core.workspace = true
 temporalio-protos.workspace = true
-tokio.workspace = true
+# `macros` adds no crate to the locked graph (Core already enables it); the
+# metrics relay uses `tokio::select!` for its idle-bounded copy loop (#500).
+tokio = { workspace = true, features = ["macros"] }
 # Warning and error records from the metrics endpoint's accept loop (#1030),
 # delivered through Core's log pipeline like Core's own records.
 tracing.workspace = true
