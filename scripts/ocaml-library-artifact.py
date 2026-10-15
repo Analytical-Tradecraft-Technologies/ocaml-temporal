@@ -155,8 +155,20 @@ def unpack(directory, prefix, env, commit, ocaml, platform, profile):
 def prepare_consumer(root, destination):
     """Create an independent application fixture with no SDK build inputs."""
     destination.mkdir(parents=True, exist_ok=False)
-    for name in ("dune", "dune-project", "main.ml", "public_api.ml", "worker_environment.ml"):
+    for name in (
+        "dune",
+        "dune-project",
+        "main.ml",
+        "public_api.ml",
+        "worker_environment.ml",
+        "installed_replay.ml",
+    ):
         shutil.copyfile(root / "test/fixtures/install-consumer" / name, destination / name)
+    # installed_replay.exe replays this frozen corpus history (#497).
+    shutil.copyfile(
+        root / "test/fixtures/history-corpus/histories/live-2026-10-08-timer.pb",
+        destination / "timer-history.pb",
+    )
     shutil.copyfile(root / "scripts/ocaml-library-environment.sh", destination / "environment.sh")
     shutil.copyfile(root / "test/bridge/test_prebuilt_library.sh", destination / "test.sh")
 

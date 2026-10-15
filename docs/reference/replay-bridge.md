@@ -502,7 +502,19 @@ against an `Activity` command, and an added second timer is event 16
 line breaks, a tab, a backslash, an escape byte, a multi-byte character, and
 60 KB of padding must render as one valid UTF-8 line of at most 3,072 bytes
 with the escapes and truncation marker, while `mismatch.workflow_id` stays
-byte-for-byte equal to the input.
+byte-for-byte equal to the input. A history one byte longer than
+`Replay.History.max_bytes` is rejected by `History.of_protobuf` with the
+documented size message.
+
+The installed-package consumer
+[`installed_replay.ml`](../../test/fixtures/install-consumer/installed_replay.ml)
+runs `Temporal.Replay` from outside the SDK workspace, both after
+`make test-install` and in the relocated binary-only consumer. It replays the
+corpus history `live-2026-10-08-timer.pb`: the recorded `corpus.timer` code
+must pass, and the same type with its timer removed must be `Nondeterminism`
+at the recorded `TimerStarted` event. The
+[replay command's process test](../../test/replay_cli/test_replay_cli.ml)
+feeds a sparse file of `max_bytes + 1` bytes and requires exit status 3.
 
 [`test_replay_diagnostics.ml`](../../test/bridge/test_replay_diagnostics.ml)
 replays the [history corpus](history-corpus.md)'s two negative controls
