@@ -83,6 +83,17 @@
  (action
   (run sh %{dep:test_opam_source_archive_check.sh} %{workspace_root})))
 
+; Contract for the installed-consumer build from that archive (#510); the real
+; build follows the sandboxed one in the same CI jobs.
+
+(rule
+ (alias runtest)
+ (deps
+  ../../scripts/check-source-archive-consumer.sh
+  test_source_archive_consumer_check.sh)
+ (action
+  (run sh %{dep:test_source_archive_consumer_check.sh} %{workspace_root})))
+
 (rule
  (alias runtest)
  (deps source_contract_helpers.sh test_source_contract_helpers.sh)

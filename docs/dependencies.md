@@ -641,6 +641,7 @@ version comment recorded beside a commit pin.
 | Action | Pinned ref | Release | License | Used for |
 |---|---|---|---|---|
 | `actions/checkout` | `v7` | v7 | MIT | Repository checkout |
+| `actions/attest-build-provenance` | `4d101475d8b20a2381f78447822ac1eab6504dd8` | v4.2.2 | MIT | Signing SLSA build provenance for the published release assets |
 | `actions/cache/restore` | `caa296126883cff596d87d8935842f9db880ef25` | v5 | MIT | Restoring verified Rust bridge bundles |
 | `actions/cache/save` | `caa296126883cff596d87d8935842f9db880ef25` | v5 | MIT | Saving verified Rust bridge bundles |
 | `actions/upload-artifact` | `043fb46d1a93c77aae656e7c1c64a875d1fc6a0a` | v7 | MIT | Passing bridges, reports, and release inputs between jobs |
@@ -652,6 +653,13 @@ version comment recorded beside a commit pin.
 
 `actions/checkout` is referenced by its major-version tag rather than an
 immutable commit; every other action is pinned by commit.
+
+`actions/attest-build-provenance` runs only in the Release workflow's publish
+job. From v4 it is a composite wrapper around `actions/attest`, which it pins
+by commit itself (also GitHub-owned and MIT-licensed); it signs with a
+short-lived Sigstore certificate and stores the attestation through GitHub's
+attestations API. It is a signing step, not a scanner, and adds nothing to the
+SDK or its release archives.
 
 ## Standalone Windows Rust producer
 

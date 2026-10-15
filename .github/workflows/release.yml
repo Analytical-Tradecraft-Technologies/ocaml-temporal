@@ -148,13 +148,27 @@ jobs:
           archive="_build/release-source/ocaml-temporal-$RELEASE_TAG-source.tar.gz"
           test "$(shasum -a 256 "$archive" | cut -d ' ' -f 1)" = "$ARCHIVE_SHA256"
           sh scripts/check-opam-source-archive.sh "$archive" "$RUNNER_TEMP/opam-source-check"
+      # A downstream user's view of the same build: install it into a fresh
+      # prefix, as opam install does, and build and run the archive's
+      # installed-package consumer fixture against that prefix only, outside
+      # the checkout. See scripts/check-source-archive-consumer.sh.
+      - name: Build a consumer against the package installed from the archive
+        shell: bash
+        run: sh scripts/check-source-archive-consumer.sh "$RUNNER_TEMP/opam-source-check"
 
   publish:
     name: Publish the tested release
     needs: [build, metadata, source-archive, source-archive-check]
     runs-on: ubuntu-24.04
+    # The contents permission creates the release. The id-token permission
+    # lets the attestation step mint the OIDC token that Sigstore exchanges for
+    # a short-lived signing certificate, and the attestations permission
+    # stores the signed attestations in the repository. No other job holds the
+    # last two.
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     env:
       RELEASE_TAG: ${{ inputs.tag }}
       GH_TOKEN: ${{ github.token }}
@@ -240,6 +254,17 @@ jobs:
           The SPDX document covers the Rust dependency graph; it is not a full
           application or OCaml dependency SBOM.
           EOF
+      # Signs SLSA build provenance for every file that the next step uploads,
+      # and nothing else: the source archive, the bridge and SDK archives,
+      # manifest.json, the Cargo SBOM, THIRD-PARTY-NOTICES.txt and SHA256SUMS.
+      # The assets are complete and checksummed above and are not modified
+      # afterwards, so each attested digest is the digest users download. It
+      # runs before the draft exists, so a failure here publishes nothing.
+      # Consumers verify with `gh attestation verify` (release checklist).
+      - name: Attest build provenance for the release assets
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: _build/release-assets/*
       - name: Publish the complete release from the approved tag
         run: |
           set -euo pipefail
