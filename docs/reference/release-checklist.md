@@ -66,8 +66,15 @@ limits) in the tracking issue for the release before pushing the tag.
       experimental wording from `README.md`, `dune-project` and both opam
       files; the [maturity rule](release-preflight.md#maturity-label) rejects a
       stable version still labelled experimental, and a prerelease that is not.
-- [ ] Write the release notes: breaking changes and migration, and the residual
-      limits the support policy requires them to name.
+- [ ] Add the release notes to the same PR as `docs/releases/<tag>.md` (for
+      example `docs/releases/v1.0.0-rc.1.md`), with three non-empty sections:
+      `## Changes`, `## Breaking changes and migration`, and
+      `## Residual limits`, which must name every limit the
+      [support policy](v1-support-policy.md#feature-matrix) requires.
+      `scripts/check-release-notes.sh` rejects a missing file, a missing or
+      empty section, and a `TODO`, `TBD` or `FIXME` placeholder. The
+      [v0.1.0-rc.1 notes](../releases/v0.1.0-rc.1.md) are the first example.
+      Reviewers approve the notes with the version change.
 - [ ] Merge the PR through the merge queue, so the PR and merge-group checks
       (including `release-preflight.yml`) pass on it.
 
@@ -92,11 +99,14 @@ Every item is evidence for the commit that will be tagged, not an older one.
       as in [Publish a prerelease](release-preflight.md#publish-a-prerelease).
       Double-check the SHA first: the tag cannot be corrected afterwards.
 - [ ] Dispatch **Actions → Release → Run workflow** on `master` with the same
-      tag. The workflow validates the request, runs the full `release` tier of
+      tag. The workflow validates the request, including the release notes,
+      runs the full `release` tier of
       `build-pr.yml` (sixteen OCaml combinations, four Rust producers, the
       live job and the licence audit) and `release-preflight.yml`, then
       assembles and checks the assets, uploads them to a draft, and publishes
-      it (as a prerelease when the tag has a `-` suffix).
+      it (as a prerelease when the tag has a `-` suffix). The published notes
+      are `docs/releases/<tag>.md` followed by a generated `## Release assets`
+      section; nothing else is written by hand on the release page.
 
 ### 4. Verify the published release
 
@@ -153,8 +163,10 @@ passes, so nothing is public yet.
       as [release preflight](release-preflight.md#publish-a-prerelease)
       requires; anyone who already downloaded an asset can still check it
       against `SHA256SUMS`.
-- [ ] Edit the release notes to start with a warning: what is wrong, which
-      versions are affected, and which version replaces it.
+- [ ] Edit the published release's notes on the release page to start with a
+      warning: what is wrong, which versions are affected, and which version
+      replaces it. Its `docs/releases/<tag>.md` is history and stays as
+      published; the replacement's own notes describe the defect and the fix.
 - [ ] Publish the replacement under a new version: the next release candidate
       (`v0.1.0-rc.2`) for a bad candidate, or the next patch
       (`v1.0.1`) for a bad stable release, following the full checklist.

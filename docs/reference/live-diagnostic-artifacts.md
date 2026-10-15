@@ -4,8 +4,9 @@ The PR/merge-queue and master/nightly Temporal jobs run the same seven existing
 controllers through `make test-temporal-live-ci`. Each controller takes snapshots
 before deleting worker generations, containers or coordination files. The outer
 wrapper retains partial console output and the original exit status. Upload and
-job-summary steps use `always()`, with a 40-minute scenario-step budget inside
-the existing 45-minute job budget to leave time for publication.
+job-summary steps use `always()`. Every step of the job has its own timeout
+(40 minutes for this scenario step) and the 80-minute job timeout is at least
+their sum, so a step that times out still leaves time for publication.
 
 Artifacts are named `live-diagnostics-<Actions run ID>-<attempt>` and retained for
 seven days. The job summary links the immutable downloadable artifact and reports

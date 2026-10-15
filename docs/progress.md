@@ -22,7 +22,21 @@ official-SDK interoperability evidence as a `live-regressions-<run>-<attempt>`
 artifact, in an `always()` step with the same seven-day retention and pinned
 `upload-artifact` revision as the diagnostic bundles. Before, those logs were
 only printed to the job output. The copied admin-tools CLI in the same
-directory is excluded.
+directory is excluded. Every step of that job now has its own timeout and the
+job timeout (now 80 minutes) is at least their sum, so a hung step times out
+and the evidence uploads after it still run; `test-temporal-config` enforces
+this.
+
+Releases now publish reviewed, versioned notes. The version PR commits
+`docs/releases/<tag>.md` with non-empty `Changes`, `Breaking changes and
+migration`, and `Residual limits` sections. `scripts/check-release-notes.sh`
+gates `make release-tag-check` and the Release workflow's validate job, and the
+publish job puts those notes ahead of its generated asset description instead
+of replacing them. `test/smoke/test_release_notes_contract.sh` (part of
+`make test-quality-contract`) covers the checker, the notes for the checked-in
+version, and the workflow wiring. The first notes,
+[`v0.1.0-rc.1`](releases/v0.1.0-rc.1.md), name the support policy's residual
+limits.
 
 [Live acceptance coverage](reference/live-acceptance-coverage.md#worker-crash-restart-shutdown-and-eviction-inventory)
 now maps the three #519 boundaries (worker removal during pending work,
@@ -41,10 +55,11 @@ gate, tag and verification steps and the sign-off roles, marks #506 to #510 and
 #489 as open, and describes how to supersede a bad candidate or release
 because the version-tag ruleset forbids moving or deleting a tag.
 
-This is documentation and CI configuration only; none of the four issues is
-complete. Verified with `actionlint` on the edited workflow, a YAML parse of it,
-`make test-quality-contract` (Docker-free contracts), and a relative-link check
+None of the four issues is complete. Verified with `actionlint` on the edited
+workflows, YAML parses of them, `make test-quality-contract` and
+`make test-temporal-config` (Docker-free contracts), and a relative-link check
 of the edited Markdown.
+
 ## 2026-10-13: Shutdown stops Core polling early, retires local activities without retry, reports accurately, and async activity calls leave the owner Domain (#1028, #1029, #1023, #1025)
 
 Temporal Core kept long-polling the server for the whole grace period,
