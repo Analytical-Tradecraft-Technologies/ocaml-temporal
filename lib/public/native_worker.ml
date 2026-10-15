@@ -31,6 +31,18 @@ let bounded_message value =
   if String.length value <= maximum then value
   else String.sub value 0 (maximum - 3) ^ "..."
 
+(** Explains a failed [Domain.spawn] in public diagnostics (#1042). The
+    exception alone ("Domain.spawn: maximum number of domains reached" or a
+    bare [Failure]) does not say which SDK instances hold Domains or how to
+    raise the limit. *)
+let domain_limit_hint =
+  "the OCaml runtime could not start another Domain. Each Client, Replay and \
+   Worker holds one supervisor Domain, and each running Worker that polls \
+   activity tasks one more; OCaml 5.2 allows at most 128 Domains per \
+   process, and OCaml 5.3 or later reads the limit from OCAMLRUNPARAM=d=N \
+   (default 128). Shut down unused instances, or run fewer workers per \
+   process"
+
 (** Converts a bridge status to the stable lowercase label used in diagnostics.
     The mapping is intentionally local because the bridge keeps this helper
     private to avoid exposing Rust-specific naming in the public API. *)
@@ -76,7 +88,7 @@ let native_error_view (error : Native.error) =
         try Printexc.to_string exception_
         with _ -> "unprintable Domain spawn exception"
       in
-      ("owner_unavailable", bounded_message message)
+      ("owner_unavailable", bounded_message (message ^ ": " ^ domain_limit_hint))
   | Native.Supervisor_failed exception_ ->
       let message =
         try Printexc.to_string exception_
@@ -327,6 +339,9 @@ type t = {
   supervisor : Native.t;
   workflows : Workflow.t;
   activities : Activity.t;
+  activity_tasks : bool;
+      (** [false] for a workflow-only worker. Core then runs no activity
+          poller, so [run] spawns no activity Domain (#1042). *)
   workflow_tasks : bool;
       (** [false] for an activity-only worker. Core then runs no workflow
           poller and the Rust workflow lane stays permanently idle, so the run
@@ -378,6 +393,13 @@ type t = {
       (** Set when a [run] returned without joining its activity Domain
           because a callback outlived [lanes_deadline]. That callback still
           holds the activity adapter's lock. *)
+  native_release_started : bool Atomic.t;
+      (** Set just before any path closes the supervisor's admission
+          ([Native.shutdown] or [Native.initiate_shutdown]). The activation
+          watchdog's thread lives on the supervisor's owner Domain, which
+          cannot be joined while that thread runs, so it exits as soon as this
+          is set, even if a stuck workflow lane keeps [run] from stopping it
+          (#1042). *)
   native_polling_stopped : bool Atomic.t;
       (** Set by the first caller of [stop_native_polling], so a stopping
           [run] and the shutdown thread ask Core to stop polling only once
@@ -549,34 +571,62 @@ let request_stop worker = Atomic.set worker.stop_requested true
 let stop_observed worker =
   Atomic.get worker.closed || Atomic.get worker.stop_requested
 
+(** Marks the start of the native release, before a caller closes the
+    supervisor's admission; see [native_release_started]. *)
+let begin_native_release worker =
+  Atomic.set worker.native_release_started true
+
+(** Why the activation watchdog could not start, as a public bridge error. *)
+let watchdog_start_error cause =
+  Base_error.make ~category:`Bridge
+    ~message:
+      ("workflow activation watchdog could not start: " ^ bounded_message cause)
+    ()
+
 (** Starts the activation watchdog for one run, or returns [None] when it is
-    disabled or this worker polls no workflow tasks. The watchdog only reads
-    the adapter's running epoch and, past the deadline, fails that activation's
-    workflow task through the supervisor; it never enters workflow code. *)
+    disabled, this worker polls no workflow tasks, or shutdown was already
+    admitted (the lanes then return at once). The watchdog only reads the
+    adapter's running epoch and, past the deadline, fails that activation's
+    workflow task through the supervisor; it never enters workflow code.
+
+    Its sampling thread runs on the supervisor's owner Domain rather than on a
+    Domain of its own (#1042): that Domain runs only SDK code and waits for
+    Core with the runtime lock released, so the thread keeps sampling however
+    long the workflow lane holds its own Domain's runtime lock, and the worker
+    costs no extra Domain for it. *)
 let start_watchdog worker =
   match worker.activation_deadline_ms with
   | None -> Ok None
   | Some _ when not worker.workflow_tasks -> Ok None
+  | Some _ when Atomic.get worker.closed -> Ok None
   | Some deadline_ms -> (
       match
-        Watchdog.start ~deadline_ms
+        Watchdog.start
+          ~spawn:(fun body ->
+            match Native.spawn_owner_thread worker.supervisor body with
+            | Ok (Ok ()) -> Ok ()
+            | Ok (Error exception_) -> Error (`Thread exception_)
+            | Error error -> Error (`Supervisor error))
+          ~host_closing:(fun () -> Atomic.get worker.native_release_started)
+          ~deadline_ms
           ~running_epoch:(fun () -> Workflow.running_epoch worker.workflows)
           ~abandon:(fun ~epoch ~elapsed_ms ->
             ignore
               (Workflow.abandon_activation worker.workflows ~epoch ~elapsed_ms))
       with
       | Ok watchdog -> Ok (Some watchdog)
-      | Error exception_ ->
+      | Error (`Thread exception_) ->
           let message =
             try Printexc.to_string exception_
-            with _ -> "unprintable Domain spawn exception"
+            with _ -> "unprintable thread creation exception"
           in
+          Error (watchdog_start_error ("no system thread: " ^ message))
+      | Error (`Supervisor _) when stop_observed worker -> Ok None
+      | Error (`Supervisor error) ->
+          let code, message = native_error_view error in
           Error
-            (Base_error.make ~category:`Bridge
-               ~message:
-                 ("workflow activation watchdog could not start: "
-                 ^ bounded_message message)
-               ()))
+            (watchdog_start_error
+               (Printf.sprintf "supervisor unavailable (%s): %s" code message)))
 
 (** Returns the shared lanes deadline, publishing [now + grace period] if no
     caller has published one yet. The compare-and-set makes the first writer
@@ -665,12 +715,32 @@ let note_progress pacing result =
   (match result with Ok Progress -> Idle.note_work pacing.idle | _ -> ());
   result
 
+(** The typed error for an activity lane whose Domain could not be spawned
+    (#1042). It is an operational, possibly transient resource limit, not a
+    defect, so it is a retryable [`Bridge] error that keeps the cause: the
+    same worker may run again once another instance frees a Domain. *)
+let activity_lane_unavailable exception_ =
+  let cause =
+    try Printexc.to_string exception_
+    with _ -> "unprintable Domain spawn exception"
+  in
+  Base_error.make ~category:`Bridge
+    ~message:
+      (bounded_message
+         (Printf.sprintf
+            "worker activity lane could not start (domain_unavailable): %s: %s"
+            cause domain_limit_hint))
+    ()
+
 (** Runs both lanes through the generic loop and converts an escaped lane
-    exception into a defect result. *)
+    exception into a defect result that names the exception. A workflow-only
+    worker runs no activity lane, so it spawns no Domain here (#1042). *)
 let run_lanes worker =
   let pacing = make_lane_pacing () in
   try
-    Worker_loop.run ~detach:(Some (activity_detach worker))
+    Worker_loop.run ~activity_lane:worker.activity_tasks
+      ~lane_unavailable:activity_lane_unavailable
+      ~detach:(Some (activity_detach worker))
       ~closed:(fun () -> stop_observed worker)
       ~poll_workflow:(fun () -> note_progress pacing (poll_workflow worker))
       ~poll_activity:(fun () ->
@@ -685,19 +755,27 @@ let run_lanes worker =
       ~wait_for_lane:(fun ~workflow_lane ~native_wait ->
         wait_for_lane worker pacing ~workflow_lane ~native_wait)
       ~retry_pending:(fun ~workflow_lane -> retry_pending worker ~workflow_lane)
-  with _ ->
-    Error (Base_error.defect ~message:"native worker execution lane failed")
+  with exception_ ->
+    let cause =
+      try Printexc.to_string exception_ with _ -> "unprintable exception"
+    in
+    Error
+      (Base_error.defect
+         ~message:
+           ("native worker execution lane failed: " ^ bounded_message cause))
 
 (** Runs workflow execution on this Domain and capacity-one activity execution
-    on a dedicated Domain. Both adapters continue to use the same serialized
+    on a dedicated Domain, spawned only when the worker polls activity tasks
+    (#1042). Both adapters continue to use the same serialized
     supervisor mailbox. [run_mutex] remains held until the activity Domain is
     joined, so later shutdown can drain and release the graph safely, unless
     a callback outlives the lanes deadline after a stop: the Domain is then
     detached (#495) and shutdown treats the activity adapter as busy. When
-    enabled, a watchdog Domain observes the workflow lane for the duration of
-    the run and is joined before [run_mutex] is released. A configured
-    watchdog that cannot start fails the run rather than silently running
-    unguarded. *)
+    enabled, a watchdog thread on the supervisor's owner Domain observes the
+    workflow lane for the duration of the run and has exited before
+    [run_mutex] is released. A configured watchdog that cannot start fails
+    the run rather than silently running unguarded, and an activity Domain
+    that cannot be spawned fails it with a typed, retryable bridge error. *)
 let run worker =
   if is_execution_thread worker then
       Error
@@ -746,6 +824,7 @@ let stuck_activation worker = Workflow.stuck worker.workflows
     the pending flag keeps a later finalizer or retry thread responsible. *)
 let terminal_cleanup_once worker =
   try
+    begin_native_release worker;
     let result = Native.shutdown worker.supervisor in
     (match result with
     | Ok () -> report Logs.Info ~operation:"worker_terminal_cleanup" ()
@@ -797,7 +876,9 @@ let schedule_terminal_cleanup worker =
 let schedule_terminal_cleanup_or_close worker =
   Worker_policy.spawn_or_close_admission
     ~spawn:(fun () -> schedule_terminal_cleanup worker)
-    ~close_admission:(fun () -> Native.initiate_shutdown worker.supervisor)
+    ~close_admission:(fun () ->
+      begin_native_release worker;
+      Native.initiate_shutdown worker.supervisor)
 
 (** Releases the native graph on the bounded-shutdown thread and classifies
     the result for {!Bounded_shutdown.run}. [Native.shutdown] always asks the
@@ -811,6 +892,7 @@ let schedule_terminal_cleanup_or_close worker =
     retained and the detached terminal-cleanup path becomes responsible for
     the retry. *)
 let release_native worker =
+  begin_native_release worker;
   match Native.shutdown worker.supervisor with
   | exception exception_ ->
       Atomic.set worker.terminal_cleanup_pending true;
@@ -1041,6 +1123,7 @@ let cleanup_abandoned worker =
            supervisor's own (now delegated) finalizer would have done here,
            and never blocks; it is done whether or not the retry thread can
            be created. *)
+        begin_native_release worker;
         (try Native.initiate_shutdown worker.supervisor with _ -> ());
         Atomic.set worker.closed true;
         Atomic.set worker.terminal_cleanup_pending true;
@@ -1149,6 +1232,7 @@ let create ?max_cached_workflows
         supervisor;
         workflows;
         activities;
+        activity_tasks;
         workflow_tasks;
         closed;
         stop_requested;
@@ -1164,6 +1248,7 @@ let create ?max_cached_workflows
           Int64.to_float shutdown_teardown_timeout_ms /. 1_000.;
         lanes_deadline = Atomic.make None;
         activity_detached = Atomic.make false;
+        native_release_started = Atomic.make false;
         native_polling_stopped = Atomic.make false;
         discard_pending = Bounded_shutdown.Deferred_discard.create ();
       }

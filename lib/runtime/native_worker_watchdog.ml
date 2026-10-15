@@ -34,20 +34,28 @@ let step state ~running ~tick_ms ~deadline_ms =
         ({ state with fired = Some epoch }, Some (epoch, elapsed_ms))
       else (state, None)
 
-(** The stop flag is written by [stop] on the owner's Domain and read by the
-    watchdog Domain between ticks. *)
-type t = { stop_requested : bool Atomic.t; domain : unit Domain.t }
+(** [stop_requested] is written by [stop] on the run loop's thread and read
+    by the sampling thread between sleep slices. [finished] is set, under
+    [mutex], by the sampling thread as its last action and broadcast on
+    [exited]; [stop] waits for it instead of [Thread.join] because the
+    sampling thread usually lives on another Domain (the supervisor's). *)
+type t = {
+  stop_requested : bool Atomic.t;
+  mutex : Mutex.t;
+  exited : Condition.t;
+  mutable finished : bool;
+}
 
 let stop_poll_s = 0.02
 
 (** Sleeps for [seconds] in slices of at most {!stop_poll_s}, returning early
-    once [stop_requested] is set. A whole-tick sleep made [stop] wait up to
+    once [should_stop ()] holds. A whole-tick sleep made [stop] wait up to
     250 ms, which delayed [Worker.run]'s return past the bounded-shutdown
     slack for short grace periods (#1023). The sliced sleep keeps a tick's
     length unchanged, so detection timing is unaffected. *)
-let sleep_unless_stopped ~stop_requested seconds =
+let sleep_unless_stopped ~should_stop seconds =
   let rec loop remaining =
-    if remaining > 0. && not (Atomic.get stop_requested) then begin
+    if remaining > 0. && not (should_stop ()) then begin
       let slice = Float.min remaining stop_poll_s in
       Thread.delay slice;
       loop (remaining -. slice)
@@ -55,16 +63,16 @@ let sleep_unless_stopped ~stop_requested seconds =
   in
   loop seconds
 
-(** Samples until stopped. [Thread.delay] releases the Domain's runtime lock
-    while sleeping. Callback exceptions are contained: a diagnostic defect must
-    not end detection. *)
-let run ~stop_requested ~deadline_ms ~running_epoch ~abandon =
+(** Samples until [should_stop] holds. [Thread.delay] releases the host
+    Domain's runtime lock while sleeping. Callback exceptions are contained:
+    a diagnostic defect must not end detection. *)
+let run ~should_stop ~deadline_ms ~running_epoch ~abandon =
   let tick_ms = tick_ms ~deadline_ms in
   let tick_seconds = Float.of_int tick_ms /. 1_000. in
   let rec loop state =
-    if not (Atomic.get stop_requested) then begin
-      sleep_unless_stopped ~stop_requested tick_seconds;
-      if not (Atomic.get stop_requested) then begin
+    if not (should_stop ()) then begin
+      sleep_unless_stopped ~should_stop tick_seconds;
+      if not (should_stop ()) then begin
         let running = try running_epoch () with _ -> None in
         let state, fire = step state ~running ~tick_ms ~deadline_ms in
         (match fire with
@@ -77,21 +85,49 @@ let run ~stop_requested ~deadline_ms ~running_epoch ~abandon =
   in
   loop initial
 
-(** Spawns the dedicated watchdog Domain. A separate Domain, rather than a
-    system thread on the workflow lane's Domain, keeps sampling independent of
-    whether the stuck code ever reaches a point where that Domain's runtime
-    lock can be handed to another thread. *)
-let start ~deadline_ms ~running_epoch ~abandon =
-  let stop_requested = Atomic.make false in
-  match
-    Domain.spawn (fun () ->
-        run ~stop_requested ~deadline_ms ~running_epoch ~abandon)
-  with
-  | domain -> Ok { stop_requested; domain }
-  | exception exception_ -> Error exception_
+(** Publishes the sampling thread's exit to {!stop}. *)
+let mark_finished watchdog =
+  Mutex.lock watchdog.mutex;
+  watchdog.finished <- true;
+  Condition.broadcast watchdog.exited;
+  Mutex.unlock watchdog.mutex
 
-(** Requests exit and joins; the Domain observes the flag within one
-    {!stop_poll_s} sleep slice. *)
+(** Starts the sampling thread through [spawn]. The watchdog no longer owns a
+    Domain (#1042): the caller chooses a host whose runtime lock the workflow
+    lane never holds, so a lane that never yields cannot starve the sampling
+    thread. A raising [host_closing] counts as closing, so a defect there
+    cannot keep the host's Domain from being joined. *)
+let start ~spawn ~host_closing ~deadline_ms ~running_epoch ~abandon =
+  let watchdog =
+    {
+      stop_requested = Atomic.make false;
+      mutex = Mutex.create ();
+      exited = Condition.create ();
+      finished = false;
+    }
+  in
+  let should_stop () =
+    Atomic.get watchdog.stop_requested
+    || (try host_closing () with _ -> true)
+  in
+  let body () =
+    Fun.protect
+      ~finally:(fun () -> mark_finished watchdog)
+      (fun () ->
+        try run ~should_stop ~deadline_ms ~running_epoch ~abandon with _ -> ())
+  in
+  match spawn body with
+  | Ok () -> Ok watchdog
+  | Error _ as error -> error
+
+(** Requests exit and waits for it; the sampling thread observes the flag
+    within one {!stop_poll_s} sleep slice, or at once if it already exited
+    because its host began closing. [Condition.wait] releases the caller's
+    runtime lock. *)
 let stop watchdog =
   Atomic.set watchdog.stop_requested true;
-  Domain.join watchdog.domain
+  Mutex.lock watchdog.mutex;
+  while not watchdog.finished do
+    Condition.wait watchdog.exited watchdog.mutex
+  done;
+  Mutex.unlock watchdog.mutex

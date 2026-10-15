@@ -207,7 +207,7 @@ let start_run ?(deadline = fun () -> Unix.gettimeofday () +. 0.3)
              Atomic.set returned true)
            (fun () ->
              ignore
-               (Loop.run
+               (Loop.run ~activity_lane:true ~lane_unavailable:raise
                   ~detach:
                     (Some
                        {
@@ -611,7 +611,7 @@ let test_loop_joins_without_detach () =
     (Thread.create
        (fun () ->
          ignore
-           (Loop.run ~detach:None
+           (Loop.run ~activity_lane:true ~lane_unavailable:raise ~detach:None
               ~closed:(fun () -> Atomic.get closed)
               ~poll_workflow:idle
               ~poll_activity:(fun () ->
@@ -699,7 +699,7 @@ let test_stuck_idle_lane_detached_after_allowance () =
     (Thread.create
        (fun () ->
          ignore
-           (Loop.run
+           (Loop.run ~activity_lane:true ~lane_unavailable:raise
               ~detach:
                 (Some
                    {
@@ -769,7 +769,7 @@ let test_blocked_polling_stop_does_not_hold_run () =
 let test_lane_failure_does_not_stop_polling () =
   let stops = Atomic.make 0 in
   let result =
-    Loop.run
+    Loop.run ~activity_lane:true ~lane_unavailable:raise
       ~detach:
         (Some
            {

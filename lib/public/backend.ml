@@ -519,7 +519,11 @@ let native_supervisor_error = function
       (* Resource exhaustion, not a defect: retrying may succeed once another
          client or worker releases its owner Domain. *)
       bridge_error
-        (Printf.sprintf "native client supervisor could not start: %s"
+        (Printf.sprintf
+           "native client supervisor could not start: %s (each Client, \
+            Replay and Worker holds one OCaml Domain, and the runtime's \
+            Domain limit is 128 unless OCaml 5.3+ raises it with \
+            OCAMLRUNPARAM=d=N; see Temporal.Worker)"
            (Printexc.to_string exception_))
   | Native.Supervisor_failed exception_ ->
       Error.defect

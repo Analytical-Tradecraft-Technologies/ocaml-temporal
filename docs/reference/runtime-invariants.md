@@ -94,7 +94,8 @@ and bridge, read the [documentation guide](../README.md) first.
 - Commands are returned in emission order.
 - Workflow code must yield. An activation that runs workflow code past the
   worker's activation deadline (default two seconds) without returning is
-  detected by a separate watchdog Domain that only reads an atomically
+  detected by a watchdog thread on the worker's supervisor owner Domain (a
+  Domain the workflow lane never runs on; #1042) that only reads an atomically
   published activation epoch and counts its own ticks (#493). It never
   interrupts, resumes, or inspects the stuck code and its timing never reaches
   a command, so it cannot change deterministic decisions. On detection, the
@@ -404,7 +405,9 @@ and bridge, read the [documentation guide](../README.md) first.
   per-timer high-resolution waitable timer; it never raises the process- or
   system-wide timer resolution (#1008).
 - The workflow execution Domain and capacity-one activity execution Domain
-  share the same serialized supervisor mailbox. The activity adapter retains
+  share the same serialized supervisor mailbox. The activity Domain is spawned
+  only for a worker that polls activity tasks; a failed spawn is a typed,
+  retryable bridge error from `run` before either lane polls (#1042). The activity adapter retains
   exclusive ownership of an attempt and its completion retry. Worker shutdown
   waits for that Domain only until the grace period ends; see the bounded
   shutdown invariants below (#495).
@@ -656,6 +659,13 @@ and bridge, read the [documentation guide](../README.md) first.
 - Exactly one dedicated owner Domain creates, uses, and closes the complete
   runtime/client/worker graph for an SDK instance. Individual native handles do
   not receive their own actors.
+- The owner Domain may also host companion system threads started through the
+  `Spawn_thread` request (`spawn_owner_thread`); the native worker's
+  activation watchdog is the only one (#1042). Such a thread never sees backend
+  state and reaches the graph only through ordinary mailbox requests from its
+  own thread. Joining the owner Domain waits for every thread on it, so a
+  companion thread must exit once shutdown is admitted; the watchdog exits as
+  soon as the worker begins its native release.
 - A graph attached to a shared runtime (#832) is still owned only by its own
   supervisor; what is shared is a reference-counted Core (Tokio executor), not
   mutable graph state. Core is destroyed exactly once, by the last of the

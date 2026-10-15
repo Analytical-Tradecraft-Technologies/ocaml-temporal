@@ -343,7 +343,7 @@ let run_fake fake =
     (match result with Ok Loop.Progress -> Idle.note_work idle | _ -> ());
     result
   in
-  Loop.run ~detach:None
+  Loop.run ~activity_lane:true ~lane_unavailable:raise ~detach:None
     ~closed:(fun () -> Atomic.get fake.closed)
     ~poll_workflow:(poll ~workflow_lane:true)
     ~poll_activity:(poll ~workflow_lane:false)

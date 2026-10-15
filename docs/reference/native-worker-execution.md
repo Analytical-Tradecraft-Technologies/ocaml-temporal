@@ -277,7 +277,9 @@ public API.
 
 `Temporal.Worker.run` holds the worker lifecycle mutex while two OCaml Domains
 run: the calling Domain polls and executes workflow activations, and one
-dedicated Domain polls and executes activity tasks. Both Domains send native
+dedicated Domain polls and executes activity tasks. A workflow-only worker
+spawns no activity Domain and runs its workflow lane alone (#1042; see
+[Domain budget](#domain-budget)). Both Domains send native
 operations through the same owner-Domain supervisor mailbox. Each lane waits
 in turn on the bounded combined readiness operation when both are idle, and
 uses a short adaptive local yield while its sibling is busy (#994). A slow activity callback
@@ -365,7 +367,7 @@ An idle activity lane is never abandoned: at the deadline `run` detaches the
 activity Domain only while an activity callback is running, and otherwise
 keeps joining it for up
 to 150 ms more, which covers its bounded readiness wait (#1023). The
-watchdog Domain stops within one 20 ms sleep slice. A worker stopped with a
+watchdog thread stops within one 20 ms sleep slice. A worker stopped with a
 short grace period, including zero, therefore reports `lanes_stopped = true`
 when nothing was running.
 
@@ -388,14 +390,16 @@ the worker. OCaml offers no safe way to interrupt that code, so the policy
 - **Detection.** Before any user code for an activation runs, the lane
   publishes an `in_flight` record (a fresh epoch, the activation, and the
   workflow ID and type) in an atomic cell, and withdraws it only after the
-  completion was submitted or dropped. `Worker.run` starts a watchdog Domain
+  completion was submitted or dropped. `Worker.run` starts a watchdog
   (`Native_worker_watchdog`) when the deadline is enabled and the worker polls
-  workflow tasks; it is joined before the run mutex is released. The
+  workflow tasks; it has exited before the run mutex is released. Its
+  sampling thread runs on the supervisor's owner Domain, not on a Domain of
+  its own (#1042; see [Domain budget](#domain-budget)). The
   watchdog samples `running_epoch` every quarter of the deadline (clamped to
   5–250 ms) and counts ticks rather than reading a clock, so a wall-clock
   change cannot trigger or suppress it. An epoch observed continuously for
   the deadline is reported once; detection happens at most one tick after
-  the deadline. A configured watchdog that cannot spawn its Domain fails
+  the deadline. A configured watchdog that cannot start its thread fails
   `run` with a typed error instead of running unguarded.
 - **Single-owner completion.** Each `in_flight` record has one atomic claim.
   The lane claims it in `enqueue_pending` before any of its own completion
@@ -469,6 +473,76 @@ evidence.
 Activity commands are accepted only when their required identifiers, payloads,
 timeout policies, and cancellation options are present; a missing field is
 rejected in the same typed way.
+
+## Domain budget
+
+OCaml limits the number of Domains a process may run at once: OCaml 5.2 has a
+fixed limit of 128, and OCaml 5.3 and later default to 128 and read a higher
+limit from `OCAMLRUNPARAM=d=N`. The main Domain counts. Every Domain, even an
+idle one, also joins each stop-the-world minor collection; on OCaml 5.4.1
+(macOS arm64) one minor GC on a busy Domain grew by about 8.5 µs per idle
+SDK-style Domain (70 µs with none, 306 µs with 32), so the budget is a
+throughput cost as well as a cap (#1042).
+
+| Instance | Domains it holds | When |
+| --- | --- | --- |
+| `Client`, `Replay`, `Worker` | 1 supervisor (owner) Domain | from `create` until `shutdown` |
+| `Worker` that registers at least one activity | 1 activity-lane Domain | while `run` is active |
+| Workflow lane | none: the thread that called `run` | while `run` is active |
+| Activation watchdog | none: a system thread on the worker's supervisor Domain | while `run` is active |
+
+Before #1042 a running worker held three Domains whatever it registered: its
+supervisor, an activity Domain even for a workflow-only worker, and a watchdog
+Domain. It now holds two when it registers activities and one when it is
+workflow-only. A shared `Runtime.t` changes none of these numbers; it shares
+Tokio threads, not Domains.
+
+Practical limits with the 128 default and no clients (subtract one per
+`Client` or `Replay`):
+
+| Workers run on | Polling activities | Workflow-only | Before #1042 |
+| --- | --- | --- | --- |
+| system threads of the main Domain | 63 | 127 | 42 |
+| one Domain per `run` | 42 | 63 | 31 |
+
+Failure is typed at the point where the Domain is needed. `Worker.create`
+(and `Client`/`Replay` creation) returns a retryable `` `Bridge `` error
+(`owner_unavailable`) when the supervisor Domain cannot start, and
+`Worker.run` returns a retryable `` `Bridge `` error
+(`domain_unavailable`) before polling anything when the activity Domain cannot
+start. Both name the Domain limit; the same worker can be run again once
+another instance has shut down. Previously the activity-lane spawn failure
+escaped as an untyped `native worker execution lane failed` defect.
+
+Why the remaining Domains stay:
+
+- The supervisor Domain is required by the runtime invariants: one owner per
+  SDK instance serializes the Rust handle graph and waits for Core with the
+  runtime lock released.
+- The activity lane keeps a Domain because a stopping `run` must be able to
+  return while an activity callback is still running (#495): the callback is
+  left on its Domain and `run` returns. On the calling thread that callback
+  would hold `run` (and the worker lifecycle lock) until it finished, and on a
+  system thread of the calling Domain a CPU-bound callback would compete with
+  workflow activations for that Domain's runtime lock.
+- The watchdog no longer needs a Domain, but it does need a host whose runtime
+  lock the workflow lane never holds. A system thread on the workflow lane's
+  own Domain runs only when the lane hands over that lock: OCaml code does so
+  at its periodic safepoints (a test loop let a 10 ms sampler run about 16
+  times a second), and C code that holds the lock never does. The supervisor's
+  owner Domain runs only SDK code and spends its waits in C with the lock
+  released, so the sampling thread runs there, started through the
+  supervisor's `spawn_owner_thread` request. Joining that Domain waits for
+  every thread on it, so the thread also exits as soon as the native release
+  begins; a stuck workflow lane that never lets `run` stop the watchdog
+  therefore cannot block shutdown. An activation that becomes stuck only
+  after the release has started is not reported, but the release force-retires
+  its lease anyway.
+
+`test/runtime/test_worker_domain_budget.ml` runs with `OCAMLRUNPARAM=d=1`
+(only the main Domain) to check that a workflow-only loop and the watchdog
+need no Domain and that a failed activity-Domain spawn is a typed error; it
+skips the exhaustion part on OCaml 5.2, which ignores `d`.
 
 ## Verification
 
