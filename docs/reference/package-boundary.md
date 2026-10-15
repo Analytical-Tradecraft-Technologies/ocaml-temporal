@@ -240,19 +240,31 @@ script also clears `CARGO_TARGET_DIR`, `TEMPORAL_RUST_BRIDGE_DIR`/`KEY`, and
 `CARGO_NET_OFFLINE`, and fails unless the build leaves a
 `temporal-sdk.install` that lists the Rust bridge.
 
+`scripts/check-source-archive-consumer.sh` then takes the downstream view of
+that same build (#510). It runs `dune install -p temporal-sdk` from the
+unpacked archive into a fresh prefix, as `opam install` copies the
+`temporal-sdk.install` files into a switch, and builds the archive's own
+`test/fixtures/install-consumer` in a separate Dune root with only that prefix
+added to `OCAMLPATH`. The consumer runs the public API witness natively and as
+a Dune `(modes byte)` program, the worker-environment probe, and offline replay
+of a frozen history. It refuses a switch that already provides `temporal-sdk`,
+which could otherwise satisfy the consumer instead of the archive.
+
 The Release workflow gates publication on the exact published file: its
 `source-archive` job creates the archive and audited notices once and uploads
 them as the `release-source` artifact with the archive's SHA-256; the
 `source-archive-check` job (macOS ARM64, OCaml 5.5) downloads that artifact,
-confirms the digest, and runs the check; and `publish`, which needs both,
+confirms the digest, and runs both checks; and `publish`, which needs both,
 confirms the digest again before adding the same file to the release. Master
 builds also run the `opam-source-offline` job in `build-pr.yml`, which checks
 an archive it creates itself, as an early warning; pull requests skip both
-because of the full optimized Rust build. Run the check locally with
-`sh scripts/check-opam-source-archive.sh <archive> [work-dir]`; it needs the
+because of the full optimized Rust build. Run the checks locally with
+`sh scripts/check-opam-source-archive.sh <archive> <work-dir>` followed by
+`sh scripts/check-source-archive-consumer.sh <work-dir>`; they need the
 locked opam dependencies, Rust and `protoc`, and several gigabytes.
-`test/smoke/test_opam_source_archive_check.sh` checks the script's own
-decisions on every `dune runtest` with stand-ins for opam's hook, curl, and
+`test/smoke/test_opam_source_archive_check.sh` and
+`test/smoke/test_source_archive_consumer_check.sh` check the scripts' own
+decisions on every `dune runtest` with stand-ins for opam, its hook, curl, and
 dune.
 
 ## Regression evidence

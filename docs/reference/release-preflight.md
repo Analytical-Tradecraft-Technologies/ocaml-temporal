@@ -92,10 +92,17 @@ Open **Actions → Release → Run workflow**, select `master`, and enter the sa
    validate all bridge and OCaml SDK bundles, add `LICENSE` and the notices to
    every archive, archive the exact source commit with its vendored Cargo
    sources and notices, audit the Cargo SPDX SBOM,
-   and generate the release manifest and asset checksums.
-4. Fetch and verify the remote tag again before creating the draft and before
+   and generate the release manifest and asset checksums. The
+   `source-archive-check` job builds the source archive inside an opam build
+   sandbox, installs that build into a fresh prefix, and builds and runs the
+   archive's installed-package consumer against it.
+4. Sign SLSA build provenance for every asset with
+   `actions/attest-build-provenance`, before any release exists. Only the
+   publish job holds the `id-token: write` and `attestations: write`
+   permissions this needs.
+5. Fetch and verify the remote tag again before creating the draft and before
    publishing it. The workflow never creates or moves the protected tag.
-5. Upload assets to a draft release and publish it as a prerelease when the tag
+6. Upload assets to a draft release and publish it as a prerelease when the tag
    has a prerelease suffix. The release notes are `docs/releases/<tag>.md`
    followed by a generated description of the assets. No manual asset upload
    or notes editing is required.
@@ -127,8 +134,11 @@ inspect it. A rerun may finish if no draft release exists yet; it will not
 silently replace an existing draft or release. If a published release is found
 defective, preserve its tag and assets for audit,
 mark it superseded in its notes, and issue a corrected version under a new tag.
-The source SHA and checksums in the manifest identify what was built, but are
-not a signed provenance attestation. The
+The source SHA and checksums in the manifest identify what was built; the
+signed provenance attestations bind each asset's digest to the Release workflow
+run, commit and repository that produced it, and `gh attestation verify`
+checks them (see the
+[release checklist](release-checklist.md#4-verify-the-published-release)). The
 [release checklist](release-checklist.md) collects these steps, the sign-off,
 the open qualification gates, and the remediation procedure in one place.
 

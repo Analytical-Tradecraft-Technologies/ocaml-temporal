@@ -15,6 +15,40 @@ implementation when a later entry documents that work as complete. The
 records the current tested source, named assertions and successful CI job for
 the Temporal acceptance controllers.
 
+## 2026-10-16: Signed release provenance and a consumer of the source archive (#510)
+
+The Release workflow's `publish` job now signs SLSA build provenance for every
+file it uploads (the source archive, the bridge and SDK archives,
+`manifest.json`, the Cargo SBOM, `THIRD-PARTY-NOTICES.txt` and `SHA256SUMS`)
+with `actions/attest-build-provenance` v4.2.2, pinned by commit and
+MIT-licensed. The step runs after the assets are complete and checksummed and
+before the draft release is created, so a signing failure publishes nothing.
+Only that job holds `id-token: write` and `attestations: write`.
+`test/smoke/test_quality_contract.sh` checks those permissions, the subject
+glob, and that the attestation precedes `gh release create`. The release
+checklist shows how a consumer verifies an asset with `gh attestation verify`,
+pinned to the Release workflow, `master`, and the tagged commit.
+
+PR #1080 already built the release source archive inside an opam build
+sandbox, but nothing consumed the result as an installed package. The new
+`scripts/check-source-archive-consumer.sh` reuses that sandboxed build: it runs
+`dune install -p temporal-sdk` from the unpacked archive into a fresh prefix
+and builds the archive's own `test/fixtures/install-consumer` in a separate
+Dune root against that prefix only. It then runs the public API witness
+(native and `(modes byte)`), the worker-environment probe, and installed
+replay of a frozen history. It refuses a switch that already provides
+`temporal-sdk`. Both `source-archive-check` in `release.yml` and the master
+`opam-source-offline` job run it after the sandboxed build.
+`test/smoke/test_source_archive_consumer_check.sh` covers the script's
+decisions on every `dune runtest`, using stand-ins for dune and opam.
+
+The release checklist now separates what the workflow automates from what
+still needs a maintainer: the qualification sign-off, creating the protected
+tag, dispatching the workflow (it uses only the workflow token and OIDC, with
+no stored publish secret), and the prerelease rehearsal, which has not been
+done. The Release workflow cannot run from a pull request, so the attestation
+step is first exercised by that rehearsal.
+
 ## 2026-10-15: Worker idle pacing keeps sub-tick precision on Windows (#1008)
 
 The adaptive idle pacing from #994 slept with `Thread.delay`, which on
