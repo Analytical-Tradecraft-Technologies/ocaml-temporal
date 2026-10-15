@@ -46,6 +46,13 @@
 //! seed, case number, reproduction command, and minimized trace. See
 //! `docs/reference/bridge-lifecycle-stress.md` for budgets and tool scope.
 //!
+//! The `live_stress` module adds a second, multi-threaded stress against the
+//! same double: concurrent live activity workers and submitted client calls,
+//! with heartbeats, server-requested cancellation, async completion, call
+//! release, initiate-shutdown and shutdown, a shared Core runtime released
+//! mid-round, and graphs released by another thread (#506). It shares
+//! [`SERIAL`], the double's ledger, and the result-contract checks.
+//!
 //! To add an operation (for example the shared-runtime symbols), add an [`Op`]
 //! variant, map it to its slot in [`Op::slot`], give it a weight in
 //! [`OP_TABLE`] (and, if it advances a state, a place in
@@ -97,13 +104,18 @@ use temporalio_common::protos::temporal::api::{
     common::v1::{ActivityType, WorkflowExecution, WorkflowType},
     history::v1::{History, history_event::Attributes},
     workflowservice::v1::{
-        PollActivityTaskQueueResponse, RespondActivityTaskCanceledRequest,
+        PollActivityTaskQueueResponse, RecordActivityTaskHeartbeatRequest,
+        RecordActivityTaskHeartbeatResponse, RespondActivityTaskCanceledRequest,
         RespondActivityTaskCompletedRequest, RespondActivityTaskFailedRequest,
     },
 };
 
 #[path = "support/replay_fixture.rs"]
 mod replay_fixture;
+
+/// Concurrent live workers and clients against the same gRPC double (#506).
+#[path = "support/live_stress.rs"]
+mod live_stress;
 
 /// Default generated cases for the ordinary test suite: a few seconds on a
 /// CI runner. Longer runs raise `LIFECYCLE_STRESS_CASES`.
@@ -593,9 +605,35 @@ struct ServerLedger {
     next_token: AtomicU64,
     /// Completion RPCs (completed, failed, or cancelled) per task token.
     completions: Mutex<HashMap<Vec<u8>, usize>>,
+    /// `RecordActivityTaskHeartbeat` RPCs per task token, from Core's own
+    /// heartbeat path and from the bridge's async heartbeat throttle alike.
+    heartbeats: Mutex<HashMap<Vec<u8>, usize>>,
+    /// History long polls (client `wait` calls) the double has held open.
+    held_long_polls: AtomicU64,
+    /// Held history long polls whose stream the client has since reset or
+    /// whose connection closed: the RPC ended rather than staying detached.
+    ended_long_polls: AtomicU64,
 }
 
 impl ServerLedger {
+    /// Returns the heartbeat count recorded for one token.
+    fn heartbeats_of(&self, token: &[u8]) -> usize {
+        self.heartbeats
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(token)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Returns the held and ended history long-poll counts.
+    fn long_polls(&self) -> (u64, u64) {
+        (
+            self.held_long_polls.load(Ordering::SeqCst),
+            self.ended_long_polls.load(Ordering::SeqCst),
+        )
+    }
+
     /// Returns the completion count recorded for one token.
     fn completions_of(&self, token: &[u8]) -> usize {
         self.completions
@@ -679,22 +717,34 @@ async fn serve_connection(socket: tokio::net::TcpStream, ledger: Arc<ServerLedge
 
 /// Reads one complete unary gRPC request message, decompressing Core's
 /// default gzip encoding when the length prefix says so.
-async fn read_unary_message(mut body: h2::RecvStream) -> Vec<u8> {
+///
+/// Returns `None` for a request the client abandoned: a stream reset before
+/// the body ended, or a body shorter than its length prefix. The concurrent
+/// live stress aborts in-flight RPCs (call release, disconnect, runtime
+/// close), and a real server never acts on such a request, so the ledgers
+/// must not count it either; a truncated body would otherwise decode as a
+/// default message with an empty task token.
+async fn read_unary_message(mut body: h2::RecvStream) -> Option<Vec<u8>> {
     let mut buffer = BytesMut::new();
-    while let Some(Ok(chunk)) = body.data().await {
+    while let Some(chunk) = body.data().await {
+        let chunk = chunk.ok()?;
         let _ = body.flow_control().release_capacity(chunk.len());
         buffer.extend_from_slice(&chunk);
     }
-    let compressed = buffer.first() == Some(&1);
-    let message = buffer.get(5..).unwrap_or_default();
-    if compressed {
+    let prefix: [u8; 4] = buffer.get(1..5)?.try_into().ok()?;
+    let length = usize::try_from(u32::from_be_bytes(prefix)).ok()?;
+    let message = buffer.get(5..)?;
+    if message.len() != length {
+        return None;
+    }
+    if buffer.first() == Some(&1) {
         let mut decoded = Vec::new();
         flate2::read::GzDecoder::new(message)
             .read_to_end(&mut decoded)
-            .expect("Core sends valid gzip request messages");
-        decoded
+            .ok()?;
+        Some(decoded)
     } else {
-        message.to_vec()
+        Some(message.to_vec())
     }
 }
 
@@ -721,12 +771,35 @@ fn activity_task(token: &[u8]) -> Vec<u8> {
     .encode_to_vec()
 }
 
+/// Prefix of every task token the double issues; the decimal suffix is the
+/// token's sequence number.
+const TOKEN_PREFIX: &str = "lifecycle-stress-token-";
+
+/// Whether the double answers a heartbeat for `token` with
+/// `cancel_requested`: every third token, so the concurrent live stress sees
+/// server-requested cancellation on both the worker heartbeat path (Core then
+/// delivers a Cancel task) and the async heartbeat path (the call's outcome
+/// says `cancel_requested`). The sequential stress never heartbeats.
+fn cancels_on_heartbeat(token: &[u8]) -> bool {
+    token
+        .strip_prefix(TOKEN_PREFIX.as_bytes())
+        .and_then(|digits| std::str::from_utf8(digits).ok())
+        .and_then(|digits| digits.parse::<u64>().ok())
+        .is_some_and(|number| number % 3 == 0)
+}
+
 /// Answers one gRPC request.
 ///
 /// Every activity poll receives a new task; workflow polls are held open like
 /// an idle long poll until Core cancels them. Activity completions of every
-/// kind are recorded per token. Every other method succeeds with an empty
-/// message, whose default encoding is valid for any response type.
+/// kind are recorded per token, and so are heartbeats, which every third
+/// token answers with `cancel_requested` ([`cancels_on_heartbeat`]). A
+/// history long poll (a submitted client `wait`) is held open until the
+/// client resets the stream or the connection closes, and both events are
+/// counted, so the checker can prove that releasing or closing a call ends
+/// its RPC (#1019). Every other method (namespace description, signals,
+/// cancellation requests) succeeds with an empty message, whose default
+/// encoding is valid for any response type.
 async fn serve_request(
     request: http::Request<h2::RecvStream>,
     mut respond: h2::server::SendResponse<Bytes>,
@@ -735,25 +808,53 @@ async fn serve_request(
     let path = request.uri().path().to_owned();
     let message = if path.ends_with("/PollActivityTaskQueue") {
         let number = ledger.next_token.fetch_add(1, Ordering::SeqCst);
-        activity_task(format!("lifecycle-stress-token-{number}").as_bytes())
+        activity_task(format!("{TOKEN_PREFIX}{number}").as_bytes())
     } else if path.ends_with("/PollWorkflowTaskQueue") {
         std::future::pending::<()>().await;
         return;
+    } else if path.ends_with("/GetWorkflowExecutionHistory") {
+        ledger.held_long_polls.fetch_add(1, Ordering::SeqCst);
+        // Resolves with the reset reason, or with an error once the
+        // connection is gone; either way the client no longer waits.
+        let _ = std::future::poll_fn(|context| respond.poll_reset(context)).await;
+        ledger.ended_long_polls.fetch_add(1, Ordering::SeqCst);
+        return;
+    } else if path.ends_with("/RecordActivityTaskHeartbeat") {
+        let Some(token) = read_unary_message(request.into_body())
+            .await
+            .and_then(|bytes| RecordActivityTaskHeartbeatRequest::decode(bytes.as_slice()).ok())
+            .map(|request| request.task_token)
+        else {
+            return;
+        };
+        *ledger
+            .heartbeats
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .entry(token.clone())
+            .or_default() += 1;
+        RecordActivityTaskHeartbeatResponse {
+            cancel_requested: cancels_on_heartbeat(&token),
+            ..Default::default()
+        }
+        .encode_to_vec()
     } else {
         let token = if path.ends_with("/RespondActivityTaskCompleted") {
-            let bytes = read_unary_message(request.into_body()).await;
-            RespondActivityTaskCompletedRequest::decode(bytes.as_slice())
-                .ok()
+            read_unary_message(request.into_body())
+                .await
+                .and_then(|bytes| {
+                    RespondActivityTaskCompletedRequest::decode(bytes.as_slice()).ok()
+                })
                 .map(|request| request.task_token)
         } else if path.ends_with("/RespondActivityTaskFailed") {
-            let bytes = read_unary_message(request.into_body()).await;
-            RespondActivityTaskFailedRequest::decode(bytes.as_slice())
-                .ok()
+            read_unary_message(request.into_body())
+                .await
+                .and_then(|bytes| RespondActivityTaskFailedRequest::decode(bytes.as_slice()).ok())
                 .map(|request| request.task_token)
         } else if path.ends_with("/RespondActivityTaskCanceled") {
-            let bytes = read_unary_message(request.into_body()).await;
-            RespondActivityTaskCanceledRequest::decode(bytes.as_slice())
-                .ok()
+            read_unary_message(request.into_body())
+                .await
+                .and_then(|bytes| RespondActivityTaskCanceledRequest::decode(bytes.as_slice()).ok())
                 .map(|request| request.task_token)
         } else {
             None
