@@ -53,6 +53,18 @@ output=$(sh "$script" "$fixture" v1.0.0)
 [ "$output" = 'release notes check: ok (docs/releases/v1.0.0.md)' ] ||
   fail "unexpected success output: $output"
 
+# The same notes with CRLF line endings, as a Windows checkout with
+# core.autocrlf produces, must also pass.
+write_notes v1.0.2
+sed 's/$/\r/' "$fixture/docs/releases/v1.0.2.md" >"$fixture/crlf.tmp"
+mv "$fixture/crlf.tmp" "$fixture/docs/releases/v1.0.2.md"
+grep -q "$(printf '\r')" "$fixture/docs/releases/v1.0.2.md" ||
+  fail "the CRLF fixture has no carriage returns"
+output=$(sh "$script" "$fixture" v1.0.2) ||
+  fail "rejected notes with CRLF line endings"
+[ "$output" = 'release notes check: ok (docs/releases/v1.0.2.md)' ] ||
+  fail "unexpected CRLF success output: $output"
+
 expect_rejected v1.0.1 'missing docs/releases/v1.0.1.md'
 expect_rejected '../v1.0.0' 'tag must start with v'
 expect_rejected 'v1.0.0/x' 'not a plain version tag'

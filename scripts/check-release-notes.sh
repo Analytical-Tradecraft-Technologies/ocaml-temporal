@@ -35,8 +35,11 @@ notes="docs/releases/$tag.md"
   fail "missing $notes; commit the reviewed release notes in the version PR"
 
 # Counts the non-blank lines of one "## " section, up to the next "## ".
+# A trailing carriage return is ignored, so notes checked out with CRLF line
+# endings (the Windows default with core.autocrlf) read the same.
 section_lines() {
   awk -v heading="## $1" '
+    { sub(/\r$/, "") }
     $0 == heading { inside = 1; found = 1; next }
     inside && /^## / { inside = 0 }
     inside && $0 !~ /^[[:space:]]*$/ { lines++ }
