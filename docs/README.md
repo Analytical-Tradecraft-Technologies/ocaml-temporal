@@ -5,7 +5,9 @@ building a worker SDK, not only a client that submits a request and reads a
 result. Read the documents in this order when you are new to the repository:
 
 1. [Writing workflows](guides/workflows.md) introduces the public OCaml API
-   and marks which examples are synthetic-only versus native-ready.
+   and marks which examples are synthetic-only versus native-ready. The
+   [worker sizing guide](guides/worker-sizing.md) explains the worker resource
+   options, background I/O threads, and the metrics that show saturation.
 2. [Verified progress](progress.md) records what has actually been implemented
    and tested at each milestone. The [live evidence audit](reference/live-acceptance-coverage.md)
    records the current tested source and CI boundary.
@@ -116,6 +118,9 @@ The remaining reference documents are useful when changing one subsystem:
 - [Release preflight](reference/release-preflight.md) documents the clean-tree
   metadata and source-input gate, deterministic CI-only Cargo
   SBOM audit, and stable/prerelease tag-to-manifest consistency check.
+- [Release checklist](reference/release-checklist.md) lists the maintainer
+  steps, gates and sign-off for publishing a version, and how to supersede a
+  bad release when version tags are immutable.
 - [Architecture specification](design/sdk-architecture.md) records the
   long-term design. APIs described there may be future work. The
   [workflow authoring API](design/workflow-authoring-api.md) and
