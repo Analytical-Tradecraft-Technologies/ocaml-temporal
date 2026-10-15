@@ -194,6 +194,14 @@ val implementation_async :
       the handle live. For [complete], [fail], and [cancel], only the
       identical call may follow until it receives a definitive answer; a
       failed [heartbeat] is forgotten and never blocks later calls.
+    - When the client the worker uses already has [max_in_flight_calls]
+      calls in flight (see [Client.connect]), the call is refused
+      before anything is sent. It returns a retryable [`Bridge] error whose
+      message names [resource_exhausted], and keeps the handle live. Nothing
+      reached the server, so retry the same call (or, if no earlier
+      [complete], [fail], or [cancel] is still awaiting an answer, a
+      different one) once other calls finish. The handle still expires as
+      described below if it is never finished.
     - A definitive server rejection of the request (for example [cancel]
       without a cancellation request) returns a non-retryable error but keeps
       the handle live, so a corrected or different operation such as [fail]

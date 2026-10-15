@@ -151,6 +151,14 @@ type fake_supervisor = {
   async_heartbeat_response : Protocol.async_heartbeat_response ref;
       (** Activity state every accepted async heartbeat reports, standing
           for the flags of the token's latest send (#1025). *)
+  free_client_call_slots : int ref;
+      (** Free slots of the bridge's pending client-call registry, which
+          every namespace-bound async call must occupy while it runs. At
+          zero the registry is full and a call is refused with
+          [Resource_exhausted] before any RPC exists (#1104). *)
+  refused_client_calls : int ref;
+      (** Async calls refused because the registry was full; they are not
+          counted as submissions. *)
 }
 (** Fake native state. [leased] and [async_leased] intentionally model
     different Temporal APIs and are never allowed to substitute for one another.
@@ -184,6 +192,8 @@ let fake_supervisor () =
     async_heartbeat_hook = ref ignore;
     async_heartbeat_timeouts = ref [];
     async_heartbeat_response = ref Protocol.Heartbeat_recorded;
+    free_client_call_slots = ref max_int;
+    refused_client_calls = ref 0;
   }
 
 (** Removes the first byte-identical token from a lease ledger. Tokens are
@@ -204,6 +214,26 @@ let has_token token tokens =
 (** Creates a stable fake error for stale or unavailable leases. *)
 let source_error ?(retryable = false) ?native_status code message =
   { code; message; retryable; native_status }
+
+(** Runs one namespace-bound async call while it occupies a slot of the
+    fake client-call registry, as the bridge's submitted-call admission does
+    (#1104). A full registry refuses the call with [Resource_exhausted]
+    before [call] runs, so nothing is submitted or recorded; otherwise the
+    slot is held for the duration of [call] and released afterwards. *)
+let with_client_call_slot supervisor call =
+  if !(supervisor.free_client_call_slots) <= 0 then begin
+    incr supervisor.refused_client_calls;
+    Error
+      (source_error ~native_status:Bridge.Resource_exhausted
+         "resource_exhausted"
+         "too many Temporal client calls are pending (limit 1)")
+  end
+  else begin
+    decr supervisor.free_client_call_slots;
+    Fun.protect
+      ~finally:(fun () -> incr supervisor.free_client_call_slots)
+      call
+  end
 
 (** Implements the complete supervisor contract needed by the adapter. All
     methods copy values before retaining them, and late operations consult only
@@ -268,8 +298,10 @@ module Fake_supervisor = struct
       one-shot failures return the native statuses the Rust bridge actually
       emits for namespace-bound completions: [Invalid_state] for a server
       [NotFound], [Connection] for an ambiguous RPC outcome, and
-      [Async_heartbeat_rejected] for a definitive rejection. *)
+      [Async_heartbeat_rejected] for a definitive rejection. A full fake
+      client-call registry refuses the call first ([Resource_exhausted]). *)
   let complete_async_activity supervisor encoded =
+    with_client_call_slot supervisor @@ fun () ->
     let completion = copy_completion encoded in
     incr supervisor.async_completion_calls;
     supervisor.async_completion_documents :=
@@ -325,6 +357,7 @@ module Fake_supervisor = struct
 
   (** Records heartbeat details against the namespace-bound async lease. *)
   let record_async_activity_heartbeat supervisor encoded =
+    with_client_call_slot supervisor @@ fun () ->
     !(supervisor.async_heartbeat_hook) ();
     let { Protocol.heartbeat; heartbeat_timeout } = copy_async_heartbeat encoded in
     incr supervisor.async_heartbeat_calls;
@@ -2303,6 +2336,188 @@ let test_async_rpc_runs_without_async_lock () =
   if List.length !(supervisor.async_heartbeats) <> 1 then
     failwith "the in-flight heartbeat was not recorded"
 
+(** Contains-substring check for diagnostics; the standard library has no
+    substring search on every supported compiler. *)
+let contains ~needle haystack =
+  let n = String.length haystack and m = String.length needle in
+  let rec loop i =
+    i + m <= n && (String.sub haystack i m = needle || loop (i + 1))
+  in
+  loop 0
+
+(** Requires a full client-call registry's refusal (#1104): a retryable
+    [`Bridge] error naming [resource_exhausted]. *)
+let expect_registry_refusal label = function
+  | Error error ->
+      let view = Temporal.Error.view error in
+      if view.non_retryable then
+        failwith (label ^ ": a full client-call registry was reported as terminal");
+      if view.category <> `Bridge then
+        failwith (label ^ ": a full client-call registry was not a bridge error");
+      if not (contains ~needle:"resource_exhausted" view.message) then
+        failwith (label ^ ": the refusal did not name resource_exhausted")
+  | Ok () -> failwith (label ^ ": a refused call was reported as accepted")
+
+(** A full client-call registry is transient back-pressure, not a terminal
+    outcome (#1104). For complete, fail, and cancel alike the refused call
+    returns a retryable error, sends nothing, and keeps both the handle and
+    the adapter lease live; once capacity frees, the same call succeeds and
+    retires the lease. *)
+let test_async_full_registry_terminal_operations_keep_handle () =
+  let failure =
+    Temporal.Error.make ~category:`Activity ~message:"external work failed" ()
+  in
+  List.iter
+    (fun (label, finish, expected) ->
+      let token = Bytes.of_string ("registry-full-" ^ label) in
+      let supervisor, worker, handle, calls =
+        heartbeat_status_fixture ~name:("registry_full_" ^ label) ~token
+      in
+      supervisor.free_client_call_slots := 0;
+      expect_registry_refusal label (finish handle);
+      if !(supervisor.refused_client_calls) <> 1
+         || !(supervisor.async_completion_calls) <> 0 then
+        failwith (label ^ ": the refused call was not stopped at admission");
+      if !calls <> 1 || !(supervisor.async_leased) <> [ token ] then
+        failwith (label ^ ": the refusal retired the live async activity");
+      if Worker.outstanding_async_leases worker <> Some 1 then
+        failwith (label ^ ": the refusal dropped the adapter async lease");
+      expect_outstanding label worker;
+      (* A second refusal is still retryable and still keeps the handle. *)
+      expect_registry_refusal label (finish handle);
+      supervisor.free_client_call_slots := 1;
+      (match finish handle with
+      | Ok () -> ()
+      | Error error ->
+          failwith (label ^ ": the retry after capacity freed failed: "
+            ^ Temporal.Error.message error));
+      (match !(supervisor.async_completions) with
+      | [ { Protocol.result; _ } ] when expected result -> ()
+      | _ -> failwith (label ^ ": the retry did not submit one expected result"));
+      if !calls <> 1 || !(supervisor.async_completion_calls) <> 1
+         || !(supervisor.async_leased) <> [] then
+        failwith (label ^ ": the retry did not retire exactly one lease");
+      (match Worker.drain worker with
+      | Ok () -> ()
+      | Error error -> failwith (label ^ ": finished handle held drain: " ^ error.code));
+      match finish handle with
+      | Error _ -> ()
+      | Ok () -> failwith (label ^ ": a finished handle accepted another call"))
+    [
+      ( "complete",
+        (fun handle -> Temporal.Activity.Async_handle.complete handle "done"),
+        function Protocol.Completed _ -> true | _ -> false );
+      ( "fail",
+        (fun handle -> Temporal.Activity.Async_handle.fail handle failure),
+        function Protocol.Failed _ -> true | _ -> false );
+      ( "cancel",
+        (fun handle -> Temporal.Activity.Async_handle.cancel handle []),
+        function Protocol.Cancelled _ -> true | _ -> false );
+    ]
+
+(** An async heartbeat refused by a full client-call registry (#1104)
+    returns a retryable error, records nothing, and neither retains the
+    heartbeat nor blocks the handle: a heartbeat and a completion succeed
+    once capacity frees. *)
+let test_async_full_registry_heartbeat_keeps_handle () =
+  let token = Bytes.of_string "registry-full-heartbeat" in
+  let supervisor, worker, handle, calls =
+    heartbeat_status_fixture ~name:"registry_full_heartbeat" ~token
+  in
+  supervisor.free_client_call_slots := 0;
+  expect_registry_refusal "heartbeat" (Temporal.Activity.Async_handle.heartbeat handle []);
+  if !(supervisor.async_heartbeat_calls) <> 0
+     || !(supervisor.refused_client_calls) <> 1
+     || !(supervisor.async_leased) <> [ token ] then
+    failwith "a refused heartbeat was submitted or retired the activity";
+  expect_outstanding "heartbeat" worker;
+  supervisor.free_client_call_slots := 1;
+  (match Temporal.Activity.Async_handle.heartbeat handle [] with
+  | Ok () -> ()
+  | Error error ->
+      failwith ("heartbeat after capacity freed failed: " ^ Temporal.Error.message error));
+  (match Temporal.Activity.Async_handle.complete handle "done" with
+  | Ok () -> ()
+  | Error error ->
+      failwith ("completion after a refused heartbeat failed: "
+        ^ Temporal.Error.message error));
+  if !calls <> 1 || List.length !(supervisor.async_heartbeats) <> 1
+     || List.length !(supervisor.async_completions) <> 1
+     || !(supervisor.async_leased) <> [] then
+    failwith "heartbeat refusal recovery submitted an unexpected sequence"
+
+(** A refused retry cannot erase an earlier uncertain terminal submission
+    (#1104): the server may already have applied that request, so only the
+    byte-identical retry may follow, and once capacity frees it resends the
+    bytes retained for the first attempt. *)
+let test_async_full_registry_preserves_uncertain_completion () =
+  let token = Bytes.of_string "registry-full-uncertain" in
+  let supervisor, worker, handle, _calls =
+    heartbeat_status_fixture ~name:"registry_full_uncertain" ~token
+  in
+  supervisor.reject_next_async_completion := true;
+  (match Temporal.Activity.Async_handle.complete handle "once" with
+  | Error error when not (Temporal.Error.view error).non_retryable -> ()
+  | _ -> failwith "uncertain completion was not reported as retryable");
+  supervisor.free_client_call_slots := 0;
+  expect_registry_refusal "uncertain retry"
+    (Temporal.Activity.Async_handle.complete handle "once");
+  (match Temporal.Activity.Async_handle.complete handle "different" with
+  | Error _ -> ()
+  | Ok () -> failwith "a refused retry released the uncertain completion");
+  if !(supervisor.refused_client_calls) <> 1
+     || !(supervisor.async_completion_calls) <> 1 then
+    failwith "a conflicting completion reached the client-call registry";
+  supervisor.free_client_call_slots := 1;
+  (match Temporal.Activity.Async_handle.complete handle "once" with
+  | Ok () -> ()
+  | Error error ->
+      failwith ("exact retry after capacity freed failed: "
+        ^ Temporal.Error.message error));
+  (match !(supervisor.async_completion_documents) with
+  | [ retry; first ] when retry == first -> ()
+  | _ -> failwith "the retry did not resend the retained completion bytes");
+  match Worker.drain worker with
+  | Ok () -> ()
+  | Error error -> failwith ("completed handle held drain: " ^ error.code)
+
+(** Retryable registry refusals do not keep a handle alive forever (#1043):
+    a lease whose every call is refused still expires once the server must
+    have timed its attempt out, after which the handle reports a
+    non-retryable error and nothing is sent. *)
+let test_async_full_registry_lease_still_expires () =
+  let clock = ref 0. in
+  let supervisor = fake_supervisor () and retained = ref None in
+  enqueue supervisor
+    (start_task_with_timeouts ~start_to_close:30
+       ~token:(Bytes.of_string "registry-full-expiry") ~activity_type:"leaked_async" ());
+  let worker =
+    match
+      Worker.create_with_clock ~now:(fun () -> !clock) ~supervisor
+        ~activities:[ Adapter.register_async (leaked_async_activity retained) ]
+        ~worker_shutting_down:(fun () -> false)
+    with
+    | Ok worker -> worker
+    | Error (error : Raw_adapter.error_view) -> failwith error.message
+  in
+  expect_deferred (Worker.poll worker);
+  let handle = Option.get !retained in
+  supervisor.free_client_call_slots := 0;
+  clock := 10.;
+  expect_registry_refusal "expiry" (Temporal.Activity.Async_handle.complete handle ());
+  expect_registry_refusal "expiry heartbeat"
+    (Temporal.Activity.Async_handle.heartbeat handle []);
+  clock := 30. +. 6.;
+  if Worker.outstanding_async_leases worker <> Some 0 then
+    failwith "a refused lease outlived its attempt timeout";
+  supervisor.free_client_call_slots := 1;
+  (match Temporal.Activity.Async_handle.complete handle () with
+  | Error error when (Temporal.Error.view error).non_retryable -> ()
+  | Error _ -> failwith "an expired handle still reported a retryable error"
+  | Ok () -> failwith "an expired handle still completed");
+  if !(supervisor.async_completion_calls) <> 0 then
+    failwith "an expired handle contacted the server"
+
 (** Runs the isolated async lifecycle assertions. *)
 let () =
   test_base_state_machine ();
@@ -2337,4 +2552,8 @@ let () =
   test_unactivated_handles_close ();
   test_async_lease_visible_while_callback_runs ();
   test_async_callback_reported_running ();
-  test_async_rpc_runs_without_async_lock ()
+  test_async_rpc_runs_without_async_lock ();
+  test_async_full_registry_terminal_operations_keep_handle ();
+  test_async_full_registry_heartbeat_keeps_handle ();
+  test_async_full_registry_preserves_uncertain_completion ();
+  test_async_full_registry_lease_still_expires ()

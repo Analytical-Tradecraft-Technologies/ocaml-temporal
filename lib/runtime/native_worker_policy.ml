@@ -15,12 +15,16 @@ let activity_completion_retryable = function
   | Temporal_core_bridge.Native_bridge.Retryable -> true
   | _ -> false
 
-(** The three ownership outcomes of a failed namespace-bound async activity
+(** The four ownership outcomes of a failed namespace-bound async activity
     request (heartbeat, complete, fail, or cancel). These RPCs address the
     server by task token and never consume a Core worker lease, so unlike
     worker completions they cannot fail closed on an uncertain transport
     result: doing so would drop a still-live activity. *)
-type async_operation_disposition = Retry_exact | Rejected_live | Retired
+type async_operation_disposition =
+  | Retry_exact
+  | Rejected_live
+  | Not_admitted
+  | Retired
 
 (** Classifies a typed async-operation result without inspecting server
     diagnostic text. [Connection] (and the bilateral [Retryable]) means the
@@ -29,8 +33,16 @@ type async_operation_disposition = Retry_exact | Rejected_live | Retired
     dropped (heartbeats). The explicit rejected status means the request was
     not applied but does not prove that the activity token is gone; local
     argument, protocol, and configuration failures likewise have not crossed
-    the RPC boundary. Every other status, including [Invalid_state] for a
-    server [NotFound], retires the handle. *)
+    the RPC boundary. [Resource_exhausted] is the bridge refusing to admit
+    the call because its pending client-call registry is full (#1104): no
+    task or RPC was created, so nothing reached the server, and the refusal
+    is transient back-pressure rather than evidence about the activity. It
+    is [Not_admitted], which keeps the handle live, preserves any earlier
+    uncertain submission, and lets the caller retry once capacity frees.
+    (A server [ResourceExhausted] answer to a submitted RPC never reaches
+    this status: the bridge reports it as the uncertain [Connection].) Every
+    other status, including [Invalid_state] for a server [NotFound],
+    retires the handle. *)
 let async_operation_disposition = function
   | Temporal_core_bridge.Native_bridge.Connection
   | Temporal_core_bridge.Native_bridge.Retryable -> Retry_exact
@@ -38,6 +50,7 @@ let async_operation_disposition = function
   | Temporal_core_bridge.Native_bridge.Invalid_argument
   | Temporal_core_bridge.Native_bridge.Protocol
   | Temporal_core_bridge.Native_bridge.Configuration -> Rejected_live
+  | Temporal_core_bridge.Native_bridge.Resource_exhausted -> Not_admitted
   | _ -> Retired
 
 type closed_flag_action =
