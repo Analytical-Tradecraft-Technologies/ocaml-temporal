@@ -244,6 +244,90 @@ The default budget (3 rounds, 4 threads, 3 graphs each) runs in about half a
 second, and it must observe a completion, a finalization, a
 `runtime_dispose`, and a `runtime_free`.
 
+### Rust: concurrent live workers and clients
+
+The replay rounds above need no server, so they never exercise a live worker
+or a client call. The test `live_stress::concurrent_live_workers_and_clients`
+in `lifecycle_stress.rs` (source `rust/core-bridge/tests/support/live_stress.rs`)
+does, against the same gRPC double as the sequential cases. The double is
+extended for it:
+
+- it records every `RecordActivityTaskHeartbeat` per token and answers it
+  with `cancel_requested` for every third token;
+- it holds every `GetWorkflowExecutionHistory` long poll (a submitted
+  `wait`) open until the client resets the stream or the connection closes,
+  and counts both the held and the ended polls;
+- it counts a completion or heartbeat only when its request arrived whole,
+  because a request that the client reset mid-body is never acted on by a
+  real server.
+
+In each round the coordinator creates one shared Core runtime and a reaper
+thread, then starts the worker threads. Each thread owns two graphs. One graph
+in three builds its own Core; the others attach to the shared runtime, which
+the coordinator frees or disposes at a seeded moment once every attach has
+finished. Each graph then runs a seeded number of operations chosen from its
+modelled state:
+
+| Area | Operations |
+| --- | --- |
+| Worker | connect; start an activity worker; bounded wait and poll; complete, reject, or heartbeat the held lease; complete it as cancelled after Core delivers a Cancel; hand it off with `will_complete_async`; `worker_initiate_shutdown`; `worker_shutdown` with or without a held lease; `client_disconnect`, which is refused while the worker runs |
+| Async activity (#1025) | submit throttled async heartbeats (500 ms heartbeat timeout) and async completions for handed-off tokens through any of the thread's graphs that runs a worker, or through one without a worker, which must refuse them |
+| Client calls (#807, #1019) | submit signals, workflow cancellation requests, and waits the double never answers; await them from the submitting thread; release some before their outcome |
+| Release | `runtime_free` or `runtime_dispose` on the owning thread, or a handoff to the reaper thread, which releases the graph while its former owner keeps awaiting the graph's calls |
+
+Every call must return a documented status, never `STATUS_PANIC`,
+`STATUS_INTERNAL`, or `STATUS_INVALID_ARGUMENT`. Native timing decides some
+outcomes, so the model accepts every documented status of a racy call and
+updates itself from the observed one. Beyond the status of each call, the
+test checks the following:
+
+- **Leases.** A Start task is delivered once across all threads and only
+  while the worker's single activity slot is free. A Cancel task must update
+  the lease the graph still holds, once. The bridge drops a Cancel whose
+  Start was retired, so a stale Cancel is a failure.
+- **Calls.** An await after release, disconnect, or a release on the owning
+  thread reports the closed failure at once, because each of those
+  unregisters the call before it returns. A call whose graph the reaper is
+  releasing must reach a terminal outcome within 30 seconds. A wait never
+  completes successfully. An async heartbeat answers `cancel_requested` only
+  for a token the double cancels. A disconnect leaves no heartbeat throttle
+  state (`test_heartbeat_throttle_counts`).
+- **Shutdown.** `worker_shutdown` returns `STATUS_OUTSTANDING_TASKS` exactly
+  when the test holds a lease. It and every waiting `runtime_free` finish
+  within 20 seconds, and a round within 180 seconds.
+- **Ledgers after the last round.** Every graph is cleaned exactly once and
+  every Core runtime, owned or shared, is dropped exactly once. The
+  process-wide client call registry returns to its baseline
+  (`test_registered_client_calls`, a test-only hook added for this check).
+  Every held history long poll has ended, so released and closed calls
+  aborted their RPCs instead of leaving them detached. Each leased token has
+  exactly one server completion when one is owed: worker completion,
+  rejection, force-completion at shutdown or release, or an async completion
+  read as accepted. A token handed off without a confirmed async completion
+  has at most one. The server never saw more heartbeats for a token than the
+  test recorded or submitted, so throttling coalesces heartbeats but never
+  invents them.
+- **Panics.** The test installs a panic hook that records panics on every
+  thread, including Core's Tokio threads. No panic may come from
+  `rust/core-bridge/src`, and each thread's body runs under `catch_unwind`, so
+  a panic in a stress thread is reported rather than lost. Panics inside
+  Temporal Core are reported in the summary; see [Findings](#findings).
+
+The default budget is 3 rounds of 4 threads with up to 48 operations per
+graph, about 120 leased tokens. It runs in about 1.5 seconds and must reach a
+fixed set of outcomes, including a Cancel for a held lease, a cancelled
+completion, an async heartbeat answered `cancel_requested`, an accepted
+async completion, a released wait, `STATUS_OUTSTANDING_TASKS` from shutdown,
+and both release paths on both threads. A failure writes the seed, round,
+rerun command, and each failing thread's trace to
+`_build/lifecycle-stress/live-<seed>-round<round>.txt`. Thread scheduling is
+not seeded, so a rerun with `LIFECYCLE_STRESS_LIVE_ROUND` regenerates the
+operation choices but not the interleaving.
+
+`make stress-qualification` runs 200 live rounds of 12 threads with up to 96
+operations per graph. Locally (seed `0x7e57`) that leased 47,950 tokens
+across 4,800 graphs and 1,805 Core runtimes in 224 seconds and passed.
+
 ### OCaml: Domains and the C borrow gates
 
 This test is not part of `dune runtest`: it runs under the
@@ -284,8 +368,15 @@ not either.
 | `CONCURRENT_STRESS_GRAPHS` | Rust graphs per thread | 3 | 1–32 |
 | `CONCURRENT_STRESS_OCAML_ROUNDS` | OCaml rounds | 6 | 1–10,000 |
 | `CONCURRENT_STRESS_OCAML_DOMAINS` | OCaml worker Domains | 4 | 2–32 |
+| `LIFECYCLE_STRESS_LIVE_ROUNDS` | Live rounds | 3 | 1–10,000 |
+| `LIFECYCLE_STRESS_LIVE_THREADS` | Live worker threads per round | 4 | 2–32 |
+| `LIFECYCLE_STRESS_LIVE_STEPS` | Upper bound of operations per live graph | 48 | 2–2,000 |
+| `LIFECYCLE_STRESS_LIVE_ROUND` | Run only this live round | unset | any |
 
-The OCaml test takes its seed from `LIFECYCLE_STRESS_SEED`.
+The OCaml test and the live stress take their seed from
+`LIFECYCLE_STRESS_SEED`. The live variables belong to
+`make test-lifecycle-stress` and `make native-test-lifecycle-stress`, which
+run the `lifecycle_stress` binary.
 
 ```sh
 make native-test-concurrent-stress CONCURRENT_STRESS_ROUNDS=300 CONCURRENT_STRESS_THREADS=16 CONCURRENT_STRESS_GRAPHS=4 CONCURRENT_STRESS_OCAML_ROUNDS=300 CONCURRENT_STRESS_OCAML_DOMAINS=8
@@ -302,31 +393,49 @@ seed, round, rerun command, and each failing thread's call trace to
 
 ### Findings
 
-Long concurrent runs occasionally record one panic inside Temporal Core, at
-`crates/sdk-core/src/pollers/poll_buffer.rs:428` in the pinned revision:
+Long concurrent runs occasionally record one panic inside Temporal Core:
 `poll_task_awaiter.await.unwrap()` on `JoinError::Cancelled`. It happens when a
 Core runtime shuts down while a worker's poll task is still running, so Tokio
 cancels the inner task and the outer task unwraps the cancellation. Tokio
 contains the panic inside its worker thread. It does not cross the ABI,
 change any status, leak a graph or a Core runtime, or break the cleanup
-counters. With the default budget it does not appear; with the large budget it
-appeared 0 to 2 times in 25,600 graphs. Release builds keep `panic = "unwind"`,
-so the containment holds there too. It is an upstream teardown-order defect,
-not a bridge memory or ownership violation. It is tracked here for
-re-evaluation after the Core upgrade in PR #989, and the stress reports any
-recurrence in its summary.
+counters. Release builds keep `panic = "unwind"`, so the containment holds
+there too. It is an upstream teardown-order defect, not a bridge memory or
+ownership violation.
+
+It was first recorded at `poll_buffer.rs:428`. The Core upgrade in PR #989 did
+not fix it. Re-checked on 2026-10-16 against the pinned Core `8fe478e`, the
+unchanged `unwrap` is now at
+`crates/sdk-core/src/pollers/poll_buffer.rs:452`, and it still occurs:
+
+- The replay concurrent stress with 400 rounds of 16 threads and 4 graphs
+  (25,600 graphs, about 7,300 Core runtimes) recorded it exactly once with
+  each of seeds `0x0506c0c0` and `0x77`, as
+  `JoinError::Cancelled` on a `tokio-rt-worker` thread. Both runs passed:
+  every graph and Core runtime was released exactly once and no bridge code
+  panicked.
+- The live stress recorded no occurrence in 1,440 graphs (60 rounds of 12
+  threads, seed `0x1234abcd`) or in 4,800 graphs at the qualification budget
+  (seed `0x7e57`).
+- With the default budgets neither stress records it.
+
+The containment therefore still holds. Both concurrent stresses report any
+recurrence in their summary (`contained_upstream_panics`) and fail on a panic
+located in bridge code. It stays tracked here, not upstream, and needs
+re-evaluation after the next Core upgrade.
 
 ## What each tool observes
 
-| Component | Rust stress | Rust concurrent stress | OCaml GC stress | OCaml multi-Domain stress | `test/bridge/test_abi.sh` |
-| --- | --- | --- | --- | --- | --- |
-| C ABI status, result, and slot contracts | Yes, called from Rust | Yes, from several threads | Indirectly | Indirectly | Yes, called from C |
-| Rust bridge (`abi.rs`, `worker_bridge.rs`, `replay_bridge.rs`) | Yes: panics, debug assertions, ledgers | Yes: panics on any thread, cleanup counters | Through the C stubs | Through the C stubs | Linked, not instrumented |
-| Shared Core runtimes and cross-thread release order | No | Yes | No | Yes, through the C gate | No |
-| Temporal Core worker and replay state machines | Yes, as linked | As linked | As linked | As linked | As linked |
-| C stubs (`native_stubs.c`) and the OCaml custom block | No | No | Yes | Yes, with cross-Domain close | No |
-| OCaml GC and finalizer interaction | No | No | Yes | Yes, with collections on other Domains | No |
-| AddressSanitizer and UndefinedBehaviorSanitizer | No | No | No | No | C harness code only |
+| Component | Rust stress | Rust concurrent stress | Rust live concurrent stress | OCaml GC stress | OCaml multi-Domain stress | `test/bridge/test_abi.sh` |
+| --- | --- | --- | --- | --- | --- | --- |
+| C ABI status, result, and slot contracts | Yes, called from Rust | Yes, from several threads | Yes, from several threads | Indirectly | Indirectly | Yes, called from C |
+| Rust bridge (`abi.rs`, `worker_bridge.rs`, `replay_bridge.rs`) | Yes: panics, debug assertions, ledgers | Yes: panics on any thread, cleanup counters | Yes: panics on any thread, cleanup counters, server ledgers | Through the C stubs | Through the C stubs | Linked, not instrumented |
+| Live workers, submitted client calls, async heartbeat throttle (`client_calls.rs`, `heartbeat_throttle.rs`) | Live workers only, one thread | No | Yes, with call registry and throttle checks | No | No | No |
+| Shared Core runtimes and cross-thread release order | No | Yes | Yes, with a reaper thread | No | Yes, through the C gate | No |
+| Temporal Core worker and replay state machines | Yes, as linked | As linked | Activity worker and client, as linked | As linked | As linked | As linked |
+| C stubs (`native_stubs.c`) and the OCaml custom block | No | No | No | Yes | Yes, with cross-Domain close | No |
+| OCaml GC and finalizer interaction | No | No | No | Yes | Yes, with collections on other Domains | No |
+| AddressSanitizer and UndefinedBehaviorSanitizer | No | No | No | No | No | C harness code only |
 
 The stable Rust test profile gives debug assertions, overflow checks, and
 panic detection. It does not give sanitizer or coverage instrumentation, and
@@ -356,11 +465,16 @@ fuzzer weekly with large budgets; see
 
 Parent issue
 [#506](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/506)
-keeps two items:
+keeps these items:
 
 - a sanitizer-instrumented build of the Rust bridge (nightly
   `-Zsanitizer=address` with `-Zbuild-std`), which the pinned stable
-  toolchain cannot provide;
-- live-worker and client paths under concurrency. The concurrent stress uses
-  replay workers, which need no server; live activity workers are covered
-  single-threaded by the gRPC double in `lifecycle_stress.rs`.
+  toolchain cannot provide and which needs a decision about a nightly
+  toolchain;
+- final qualification, which follows #492.
+
+Live-worker and client paths under concurrency are covered by the
+[live concurrent stress](#rust-concurrent-live-workers-and-clients) against
+the gRPC double. It does not cover live workflow workers, whose tasks need
+real histories from a server, or a real Temporal server's timing and
+failures; the Docker Compose acceptance suites cover those.

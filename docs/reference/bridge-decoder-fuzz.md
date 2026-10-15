@@ -187,7 +187,9 @@ container on Linux amd64 with OCaml 5.5:
 
 - the structured parser fuzz at 20,000 cases per parser;
 - both decoder fuzzers at 20,000 cases per target;
-- the lifecycle stress at 1,000 Rust cases and 2,000 OCaml cycles;
+- the lifecycle stress at 1,000 Rust cases and 2,000 OCaml cycles, and its
+  concurrent live workers and clients at 200 rounds of 12 threads with up to
+  96 operations per graph;
 - the concurrent stress at 300 rounds of 16 threads with 4 graphs each, and
   300 OCaml rounds of 8 Domains.
 

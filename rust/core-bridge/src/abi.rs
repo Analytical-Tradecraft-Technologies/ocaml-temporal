@@ -6358,6 +6358,15 @@ pub unsafe fn test_heartbeat_throttle_counts(runtime: *const Runtime) -> Option<
     Some(runtime.heartbeat_throttle.counts())
 }
 
+/// Returns the number of submitted client calls registered process-wide,
+/// across every runtime graph: submitted and not yet read, released, or
+/// closed (#807, #1019). Not part of the C ABI; the concurrent live stress
+/// uses it to prove that no call registration outlives its runtime.
+#[doc(hidden)]
+pub fn test_registered_client_calls() -> usize {
+    crate::client_calls::registered_call_total()
+}
+
 /// Returns process-local shared-runtime counts for the isolated sharing
 /// test: shared handles created, and Core runtimes whose destructor (and log
 /// writer close) returned. Not part of the C ABI.
