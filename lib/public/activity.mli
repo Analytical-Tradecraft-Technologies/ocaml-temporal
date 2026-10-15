@@ -234,11 +234,28 @@ module Async_handle : sig
   (** Reports cancellation and optional detail payloads. *)
   val cancel : 'output t -> Payload.t list -> (unit, Error.t) result
 
-  (** Sends heartbeat detail payloads. Unlike {!Context.heartbeat}, which
-      Temporal Core throttles and sends in the background, every call is a
-      separate server round trip and nothing is coalesced, so heartbeat at a
-      fraction of the activity's heartbeat timeout (for example a third of
-      it), not once per item of work. *)
+  (** Sends heartbeat detail payloads, throttled per activity the way
+      Temporal Core throttles {!Context.heartbeat}. The first call is sent
+      to the server at once and returns its result. Later calls within the
+      throttle interval return at once without a server round trip: [Ok]
+      then means the details were recorded locally, and only the latest
+      details are sent when the interval expires. The interval is 80% of
+      the activity's heartbeat timeout, or [default_heartbeat_throttle_interval]
+      without one, capped by [max_heartbeat_throttle_interval] (see
+      [Worker.Options]), so heartbeating per item of work is cheap and the
+      server still hears from the activity within its heartbeat timeout.
+
+      Each call reports the activity's state as of the latest send, which
+      for a throttled call may be a send that happened after an earlier
+      call returned. When Temporal has requested cancellation, the result
+      is a non-retryable [Error] in the [`Cancelled] category; when the
+      activity was paused or reset, it is a retryable [`Cancelled] error of
+      type ["ActivityPause"] or ["ActivityReset"]. The heartbeat was still
+      recorded and the handle stays live: stop the work and finish the
+      handle with {!cancel}, or with {!fail} and that error. A failed send
+      ends the throttle interval, so the next call is sent at once and
+      returns the server's answer, for example a non-retryable error once
+      the activity no longer exists. *)
   val heartbeat : 'output t -> Payload.t list -> (unit, Error.t) result
 end
 

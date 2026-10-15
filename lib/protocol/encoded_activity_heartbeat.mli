@@ -12,9 +12,10 @@
     [Activity_protocol.encode_heartbeat], with every check that encoder
     applies; no caller can submit unchecked JSON through it. The same value
     serves both the worker heartbeat ([Record_activity_heartbeat]) and the
-    namespace-bound asynchronous heartbeat
+    synchronous namespace-bound asynchronous heartbeat
     ([Record_async_activity_heartbeat]); both native calls accept the same
-    activity-heartbeat document. *)
+    activity-heartbeat document. The worker's throttled async heartbeat call
+    takes {!Encoded_async_activity_heartbeat} instead (#1025). *)
 
 type t
 (** Immutable canonical heartbeat JSON. The value owns its string; it holds

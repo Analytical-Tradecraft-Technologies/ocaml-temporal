@@ -10,6 +10,7 @@
 module Protocol = Temporal_protocol.Activity_protocol
 module Encoded_completion = Temporal_protocol.Encoded_activity_completion
 module Encoded_heartbeat = Temporal_protocol.Encoded_activity_heartbeat
+module Encoded_async_heartbeat = Temporal_protocol.Encoded_async_activity_heartbeat
 module Definition = Temporal_base.Definition
 module Codec = Temporal_base.Codec
 module Base_error = Temporal_base.Error
@@ -46,9 +47,14 @@ module type SUPERVISOR = sig
      adapter's single encoder pass (issue #1001) and never encode again. *)
   val record_activity_heartbeat :
     t -> Encoded_heartbeat.t -> (unit, error) result
-  (* Records heartbeat details through the namespace-bound async handle. *)
+  (* Records heartbeat details through the namespace-bound async handle. The
+     bridge throttles these per task token (#1025): a call may only record
+     its details for a trailing send. The response is the activity state the
+     token's latest send reported. *)
   val record_async_activity_heartbeat :
-    t -> Encoded_heartbeat.t -> (unit, error) result
+    t ->
+    Encoded_async_heartbeat.t ->
+    (Protocol.async_heartbeat_response, error) result
   val error_code : error -> string
   val error_message : error -> string
   val error_is_retryable : error -> bool
@@ -165,11 +171,15 @@ type rejection_origin = Application_failure | Sdk_rejection
 
 (** The server-side timeouts of an asynchronously completed attempt, in
     seconds, copied from its start task; [None] means unset. They bound how
-    long the adapter keeps the attempt's async lease (#1043). *)
+    long the adapter keeps the attempt's async lease (#1043).
+    [heartbeat_timeout] is the start task's exact heartbeat timeout, which
+    every async heartbeat carries so the bridge can derive its throttle
+    interval (#1025). *)
 type async_timeouts = {
   start_to_close_s : float option;
   schedule_to_close_s : float option;
   heartbeat_s : float option;
+  heartbeat_timeout : Protocol.duration option;
 }
 
 (** What the caller should observe after a lease is acknowledged. A rejected
@@ -243,9 +253,12 @@ type lease = {
     reference points: [attempt_deadline] adds the shorter of the
     start-to-close and schedule-to-close timeouts to the time of admission,
     which follows the attempt's start, and [last_progress] (admission, then
-    the end of each async heartbeat call that may have reached the server)
-    follows the server's last recorded heartbeat. The adapter therefore never
-    expires a lease before the server has; it may only expire it later. *)
+    the end of each async heartbeat call that may have reached the server or
+    was recorded for a throttled trailing send) bounds the server's last
+    recorded heartbeat to within one throttle interval and RPC after it (see
+    [async_lease_expired]). The adapter therefore never expires a lease
+    before the server has; it may only expire it later. [heartbeat_timeout]
+    is the exact value every async heartbeat document carries (#1025). *)
 type async_lease =
   | Async_lease :
       {
@@ -254,6 +267,7 @@ type async_lease =
         correlation : correlation option;
         attempt_deadline : float option;
         heartbeat_s : float option;
+        heartbeat_timeout : Protocol.duration option;
         mutable last_progress : float;
         mutable in_flight : bool;
         mutable uncertain_completion : (string * Encoded_completion.t) option;
@@ -281,6 +295,7 @@ let async_timeouts_of_start (start : Protocol.activity_start) =
     start_to_close_s = timeout_seconds start.start_to_close_timeout;
     schedule_to_close_s = timeout_seconds start.schedule_to_close_timeout;
     heartbeat_s = timeout_seconds start.heartbeat_timeout;
+    heartbeat_timeout = start.heartbeat_timeout;
   }
 
 (** The attempt deadline of an async lease admitted at [admitted_at]: the
@@ -294,7 +309,15 @@ let async_attempt_deadline ~admitted_at timeouts =
   | Some first, Some second -> Some (admitted_at +. Float.min first second)
 
 (** Whether the server must already have timed out the attempt behind
-    [lease] at time [now]. *)
+    [lease] at time [now].
+
+    The heartbeat bound is twice the heartbeat timeout after the last
+    progress, not once (#1025): the bridge throttles async heartbeats, so a
+    call can return after only recording its details, and the trailing send
+    that carries them follows within the throttle interval (at most 80% of
+    the heartbeat timeout) plus one RPC. The server's last heartbeat can
+    therefore be up to that much later than [last_progress]; the second
+    timeout covers the interval and leaves the rest for the trailing RPC. *)
 let async_lease_expired ~now (Async_lease lease) =
   let past deadline = now > deadline +. async_lease_expiry_slack_s in
   (match lease.attempt_deadline with
@@ -302,7 +325,7 @@ let async_lease_expired ~now (Async_lease lease) =
   | None -> false)
   ||
   match lease.heartbeat_s with
-  | Some timeout -> past (lease.last_progress +. timeout)
+  | Some timeout -> past (lease.last_progress +. (2.0 *. timeout))
   | None -> false
 
 (** Bounds diagnostics before they are sent to Logs or embedded in a
@@ -824,14 +847,50 @@ let encode_completion completion =
        ~operation:"activity_completion_encode" (fun () ->
          Encoded_completion.encode completion))
 
-(** Validates and serializes one heartbeat in its single strict encoder pass,
-    for both the synchronous context and an asynchronous handle. The
-    supervisor submits the returned bytes unchanged (issue #1001), so an
-    encoder rejection keeps the heartbeat away from the native bridge. *)
+(** Validates and serializes one synchronous context's heartbeat in its
+    single strict encoder pass. The supervisor submits the returned bytes
+    unchanged (issue #1001), so an encoder rejection keeps the heartbeat away
+    from the native bridge. *)
 let encode_heartbeat ~path heartbeat =
   Result.map_error
     (fun error -> protocol_error ~path error)
     (Encoded_heartbeat.encode heartbeat)
+
+(** The same single encoder pass for an asynchronous handle's heartbeat,
+    whose document also carries the attempt's heartbeat timeout (#1025). *)
+let encode_async_heartbeat ~path heartbeat =
+  Result.map_error
+    (fun error -> protocol_error ~path error)
+    (Encoded_async_heartbeat.encode heartbeat)
+
+(** Converts the activity state an async heartbeat reported (#1025) into the
+    handle's outcome, as the official SDKs raise a typed error from an async
+    heartbeat in these states. [Heartbeat_recorded] succeeds. The other
+    states are an [Activity_state] error in the [`Cancelled] category, shaped
+    like the errors a running activity sees: a cancellation request is the
+    non-retryable error of [Activity_context.cancelled_error], and a pause
+    or reset is a retryable error of type [ActivityPause] or [ActivityReset],
+    the failure the worker reports for a running attempt stopped that way
+    (so passing it to [Async_handle.fail] reports the same failure). The
+    heartbeat itself was recorded and the handle stays live: the activity
+    must still be finished with a terminal operation. *)
+let heartbeat_response_result = function
+  | Protocol.Heartbeat_recorded -> Ok ()
+  | Protocol.Heartbeat_cancel_requested ->
+      Error
+        (Async_activity.Activity_state
+           (Base_error.make ~non_retryable:true ~category:`Cancelled
+              ~message:"activity cancellation requested: cancelled" ()))
+  | Protocol.Heartbeat_paused ->
+      Error
+        (Async_activity.Activity_state
+           (Base_error.make ~error_type:"ActivityPause" ~category:`Cancelled
+              ~message:"activity cancellation requested: paused" ()))
+  | Protocol.Heartbeat_reset ->
+      Error
+        (Async_activity.Activity_state
+           (Base_error.make ~error_type:"ActivityReset" ~category:`Cancelled
+              ~message:"activity cancellation requested: reset" ()))
 
 (** Converts a supervisor completion exception to a stable diagnostic without
     revealing the opaque token or native exception object. *)
@@ -1213,12 +1272,12 @@ module Make (Supervisor : SUPERVISOR) = struct
       values never changes either lease ledger. *)
   type async_request =
     | Async_completion of Encoded_completion.t
-    | Async_heartbeat of Encoded_heartbeat.t
+    | Async_heartbeat of Encoded_async_heartbeat.t
 
   (** Copies and validates an entire late operation before any native call.
       Payload conversion alone cannot detect duplicate metadata or wire limits;
       the strict encoder must also accept the complete request. *)
-  let prepare_async_request ~token operation =
+  let prepare_async_request ~token ~heartbeat_timeout operation =
     let task_token = Bytes.copy token in
     (* Converts ordered detail payloads without retaining caller-owned bytes. *)
     let details path payloads =
@@ -1256,8 +1315,12 @@ module Make (Supervisor : SUPERVISOR) = struct
         let* encoded = encode_completion completion in
         Ok (Async_completion encoded)
     | `Heartbeat heartbeat ->
-        (* Likewise the heartbeat's only encoder pass. *)
-        let* encoded = encode_heartbeat ~path:"$.async_heartbeat" heartbeat in
+        (* Likewise the heartbeat's only encoder pass. The attempt's
+           heartbeat timeout travels with it for the bridge's throttle. *)
+        let* encoded =
+          encode_async_heartbeat ~path:"$.async_heartbeat"
+            { Protocol.heartbeat; heartbeat_timeout }
+        in
         Ok (Async_heartbeat encoded)
 
   (** Maps an adapter-local failure that never received a native answer (a
@@ -1362,7 +1425,10 @@ module Make (Supervisor : SUPERVISOR) = struct
                        already validated and encoded for it. *)
                     Ok (Async_completion encoded)
                 | Some _ | None -> (
-                    try prepare_async_request ~token operation with exception_ ->
+                    try
+                      prepare_async_request ~token
+                        ~heartbeat_timeout:lease.heartbeat_timeout operation
+                    with exception_ ->
                       Error (exception_error ~path:"$.async_payload" exception_))
               in
               match prepared with
@@ -1391,12 +1457,16 @@ module Make (Supervisor : SUPERVISOR) = struct
             let submitted =
               match request with
               | Async_completion encoded ->
-                  Supervisor.complete_async_activity adapter.supervisor encoded
+                  Result.map Result.ok
+                    (Supervisor.complete_async_activity adapter.supervisor encoded)
               | Async_heartbeat heartbeat ->
-                  Supervisor.record_async_activity_heartbeat adapter.supervisor heartbeat
+                  Result.map heartbeat_response_result
+                    (Supervisor.record_async_activity_heartbeat
+                       adapter.supervisor heartbeat)
             in
             match submitted with
-            | Ok () -> Ok ()
+            | Ok (Ok ()) -> Ok ()
+            | Ok (Error state_error) -> Error state_error
             | Error source_error ->
                 Error (async_native_submission_error ~name ~path source_error)
           with exception_ ->
@@ -1421,7 +1491,10 @@ module Make (Supervisor : SUPERVISOR) = struct
                  progress errs towards keeping the lease. *)
               (match (request, result) with
               | Async_heartbeat _,
-                (Ok () | Error (Async_activity.Retryable_submission _)) ->
+                ( Ok ()
+                | Error
+                    ( Async_activity.Retryable_submission _
+                    | Async_activity.Activity_state _ ) ) ->
                   lease.last_progress <- adapter.now ()
               | Async_heartbeat _, Error _ | Async_completion _, _ -> ());
               (match result with
@@ -1431,7 +1504,8 @@ module Make (Supervisor : SUPERVISOR) = struct
                   adapter.async_leases <- Token_map.remove token adapter.async_leases
               | Ok () | Error (Async_activity.Not_submitted _
                   | Async_activity.Rejected_submission _
-                  | Async_activity.Retryable_submission _) -> ());
+                  | Async_activity.Retryable_submission _
+                  | Async_activity.Activity_state _) -> ());
               (* Only a terminal request with an unknown native outcome
                  keeps its bytes for the exact retry the handle allows; a
                  heartbeat never touches the retained completion. *)
@@ -1511,6 +1585,7 @@ module Make (Supervisor : SUPERVISOR) = struct
                      attempt_deadline =
                        async_attempt_deadline ~admitted_at timeouts;
                      heartbeat_s = timeouts.heartbeat_s;
+                     heartbeat_timeout = timeouts.heartbeat_timeout;
                      last_progress = admitted_at;
                      in_flight = false;
                      uncertain_completion = None;

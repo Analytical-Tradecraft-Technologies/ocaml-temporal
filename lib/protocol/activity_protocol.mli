@@ -205,6 +205,26 @@ type completion = { task_token : bytes; result : completion_result }
 (** Progress details for one currently leased activity attempt. *)
 type heartbeat = { task_token : bytes; details : payload list }
 
+(** A heartbeat for an activity handed off with [WillCompleteAsync], carried
+    with its attempt's heartbeat timeout as copied from the start task
+    (#1025). The bridge throttles these heartbeats per task token as Core
+    throttles a running activity's heartbeats, and derives the throttle
+    interval from the timeout ([None] selects the worker's default). On the
+    wire the heartbeat's two members are joined by a required, nullable
+    [heartbeat_timeout] member. *)
+type async_heartbeat = { heartbeat : heartbeat; heartbeat_timeout : duration option }
+
+(** The outcome of an accepted async heartbeat call: the server's state of
+    the activity as of the latest send for its token, which may precede the
+    call when the call was throttled. When several flags are set the bridge
+    reports cancellation first, then reset, then pause, the precedence Core
+    uses for a running activity. *)
+type async_heartbeat_response =
+  | Heartbeat_recorded  (** No cancellation, pause, or reset was reported. *)
+  | Heartbeat_cancel_requested  (** The workflow requested cancellation. *)
+  | Heartbeat_paused  (** The activity was paused. *)
+  | Heartbeat_reset  (** The activity was reset. *)
+
 type error
 (** Opaque semantic or strict-JSON validation failure. *)
 
@@ -234,3 +254,14 @@ val decode_heartbeat : string -> (heartbeat, error) result
 val encode_heartbeat : heartbeat -> (string, error) result
 (** Validates, normalizes, and serializes an outgoing heartbeat, then applies the
     decoder's semantic rules to the validated value. *)
+
+val decode_async_heartbeat : string -> (async_heartbeat, error) result
+(** Strictly decodes and validates one async-activity heartbeat document. *)
+
+val encode_async_heartbeat : async_heartbeat -> (string, error) result
+(** Validates, normalizes, and serializes an outgoing async heartbeat, then
+    applies the decoder's semantic rules to the validated value. *)
+
+val async_heartbeat_response_of_string : string -> async_heartbeat_response option
+(** Decodes the bridge's fixed async-heartbeat outcome body: empty,
+    [cancel_requested], [paused], or [reset]. Any other body is [None]. *)

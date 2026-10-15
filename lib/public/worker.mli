@@ -153,9 +153,10 @@ module Options : sig
       Activities:
       - [max_heartbeat_throttle_interval] (default 60 s) and
         [default_heartbeat_throttle_interval] (default 30 s), each 1 ms to one
-        day, bound how often activity heartbeats are sent to the server.
-        Activities with a heartbeat timeout use 80% of it, capped by the
-        maximum; others use the default. An explicit default above an
+        day, bound how often activity heartbeats are sent to the server,
+        both from a running activity's context and from an
+        {!Activity.Async_handle}. Activities with a heartbeat timeout use
+        80% of it, capped by the maximum; others use the default. An explicit default above an
         explicit maximum returns a defect.
       - [max_worker_activities_per_second] limits how many remote activity
         tasks this worker polls per second. It must be at least one per day

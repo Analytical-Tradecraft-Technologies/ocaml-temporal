@@ -11,6 +11,7 @@
 module Protocol = Temporal_protocol.Activity_protocol
 module Encoded = Temporal_protocol.Encoded_activity_completion
 module Encoded_heartbeat = Temporal_protocol.Encoded_activity_heartbeat
+module Encoded_async_heartbeat = Temporal_protocol.Encoded_async_activity_heartbeat
 module Raw_adapter = Temporal_runtime.Native_activity_execution
 module Base_async = Temporal_base.Async_activity
 module Bridge = Temporal_core_bridge.Native_bridge
@@ -100,6 +101,18 @@ let copy_heartbeat encoded =
         failwith "async fake received non-canonical heartbeat bytes";
       value
 
+(** Strictly decodes an async handle's single-encode heartbeat bytes, which
+    also carry the attempt's heartbeat timeout (#1025), and checks that they
+    are canonical, as [copy_heartbeat] does for a worker heartbeat. *)
+let copy_async_heartbeat encoded =
+  let json = Encoded_async_heartbeat.to_string encoded in
+  match Protocol.decode_async_heartbeat json with
+  | Error _ -> failwith "async fake received an invalid async heartbeat"
+  | Ok value ->
+      if Protocol.encode_async_heartbeat value <> Ok json then
+        failwith "async fake received non-canonical async heartbeat bytes";
+      value
+
 type source_error = {
   code : string;
   message : string;
@@ -132,6 +145,12 @@ type fake_supervisor = {
   async_heartbeat_hook : (unit -> unit) ref;
       (** Runs first in every async heartbeat, standing for the time the RPC
           spends on the network; a test may block in it (#1025). *)
+  async_heartbeat_timeouts : Protocol.duration option list ref;
+      (** Heartbeat timeout carried by each accepted async heartbeat, newest
+          first (#1025). *)
+  async_heartbeat_response : Protocol.async_heartbeat_response ref;
+      (** Activity state every accepted async heartbeat reports, standing
+          for the flags of the token's latest send (#1025). *)
 }
 (** Fake native state. [leased] and [async_leased] intentionally model
     different Temporal APIs and are never allowed to substitute for one another.
@@ -163,6 +182,8 @@ let fake_supervisor () =
     reject_next_async_heartbeat_rejected = ref false;
     reject_next_async_heartbeat_terminal = ref false;
     async_heartbeat_hook = ref ignore;
+    async_heartbeat_timeouts = ref [];
+    async_heartbeat_response = ref Protocol.Heartbeat_recorded;
   }
 
 (** Removes the first byte-identical token from a lease ledger. Tokens are
@@ -305,10 +326,10 @@ module Fake_supervisor = struct
   (** Records heartbeat details against the namespace-bound async lease. *)
   let record_async_activity_heartbeat supervisor encoded =
     !(supervisor.async_heartbeat_hook) ();
-    let heartbeat = copy_heartbeat encoded in
+    let { Protocol.heartbeat; heartbeat_timeout } = copy_async_heartbeat encoded in
     incr supervisor.async_heartbeat_calls;
     supervisor.async_heartbeat_documents :=
-      Encoded_heartbeat.to_string encoded
+      Encoded_async_heartbeat.to_string encoded
       :: !(supervisor.async_heartbeat_documents);
     if !(supervisor.reject_next_async_heartbeat_terminal) then begin
       supervisor.reject_next_async_heartbeat_terminal := false;
@@ -340,7 +361,9 @@ module Fake_supervisor = struct
     end
     else if has_token heartbeat.Protocol.task_token !(supervisor.async_leased) then begin
       supervisor.async_heartbeats := heartbeat :: !(supervisor.async_heartbeats);
-      Ok ()
+      supervisor.async_heartbeat_timeouts :=
+        heartbeat_timeout :: !(supervisor.async_heartbeat_timeouts);
+      Ok !(supervisor.async_heartbeat_response)
     end
     else Error (source_error "stale_async_lease" "async lease is not active")
 
@@ -937,12 +960,15 @@ let test_async_heartbeat_single_encode () =
   Bytes.fill detail.data 0 (Bytes.length detail.data) 'x';
   (match !(supervisor.async_heartbeat_documents), !(supervisor.async_heartbeats) with
   | [ document ], [ recorded ] ->
-      if Protocol.encode_heartbeat recorded <> Ok document then
-        failwith "async heartbeat bytes are not the canonical encoding";
+      if
+        Protocol.encode_async_heartbeat
+          { Protocol.heartbeat = recorded; heartbeat_timeout = None }
+        <> Ok document
+      then failwith "async heartbeat bytes are not the canonical encoding";
       if not (Bytes.equal recorded.Protocol.task_token token) then
         failwith "async heartbeat changed the opaque token";
-      (match Protocol.decode_heartbeat document with
-      | Ok { Protocol.details = [ payload ]; _ }
+      (match Protocol.decode_async_heartbeat document with
+      | Ok { Protocol.heartbeat = { Protocol.details = [ payload ]; _ }; _ }
         when Bytes.equal payload.Protocol.data (Bytes.of_string "progress") -> ()
       | _ -> failwith "async heartbeat document observed a later buffer mutation")
   | _ -> failwith "async heartbeat was not submitted exactly once");
@@ -1488,8 +1514,10 @@ let expect_outstanding label worker =
 
 (** An admitted async lease that application code never finishes expires
     once the server must have timed its attempt out (#1043): after the
-    shorter close timeout, or the heartbeat timeout since the last async
-    heartbeat, plus a few seconds of slack, all measured from admission on
+    shorter close timeout, or twice the heartbeat timeout since the last
+    async heartbeat (a throttled heartbeat's trailing send follows within
+    one throttle interval, #1025), plus a few seconds of slack, all measured
+    from admission on
     the worker's clock. An expired lease no longer holds [drain] (and so
     shutdown), is not counted as outstanding, closes its handle with a
     non-retryable error, and sends nothing to the server. A lease whose task
@@ -1559,9 +1587,10 @@ let test_async_lease_expiry () =
   (match Temporal.Activity.Async_handle.heartbeat handle [] with
   | Ok () -> ()
   | Error error -> failwith ("async heartbeat failed: " ^ Temporal.Error.message error));
-  clock := 22.;
+  (* The heartbeat at 8 s defers expiry to 8 + 2 * 10 + 5 s of slack. *)
+  clock := 32.;
   expect_outstanding "heartbeat" worker;
-  clock := 24.;
+  clock := 34.;
   (match Worker.drain worker with
   | Ok () -> ()
   | Error error -> failwith ("a heartbeat-expired lease held drain: " ^ error.code));
@@ -1600,6 +1629,71 @@ let test_async_lease_expiry () =
   expect_closed "admission" first;
   if Worker.outstanding_async_leases worker <> Some 1 then
     failwith "admitting a lease did not retire the expired one"
+
+(** An async heartbeat carries its attempt's exact heartbeat timeout, from
+    which the bridge derives its throttle interval (#1025). A cancellation,
+    pause, or reset the bridge reports (from the token's latest send, which
+    may precede a throttled call) is returned as a typed [`Cancelled] error,
+    a pause or reset with the [error_type] a running attempt's failure uses;
+    the heartbeat was recorded, so it still
+    renews the lease's heartbeat window, and the handle stays live for the
+    terminal operation that must follow. *)
+let test_async_heartbeat_carries_timeout_and_activity_state () =
+  let clock = ref 0. in
+  let supervisor = fake_supervisor () and retained = ref None in
+  enqueue supervisor
+    (start_task_with_timeouts ~start_to_close:3_600 ~heartbeat:10
+       ~token:(Bytes.of_string "heartbeat-state") ~activity_type:"leaked_async" ());
+  let worker =
+    match
+      Worker.create_with_clock
+        ~now:(fun () -> !clock)
+        ~supervisor
+        ~activities:[ Adapter.register_async (leaked_async_activity retained) ]
+        ~worker_shutting_down:(fun () -> false)
+    with
+    | Ok worker -> worker
+    | Error (error : Raw_adapter.error_view) -> failwith error.message
+  in
+  expect_deferred (Worker.poll worker);
+  let handle = Option.get !retained in
+  (match Temporal.Activity.Async_handle.heartbeat handle [] with
+  | Ok () -> ()
+  | Error error -> failwith ("async heartbeat failed: " ^ Temporal.Error.message error));
+  (match !(supervisor.async_heartbeat_timeouts) with
+  | [ Some { Protocol.seconds = 10L; nanoseconds = 0 } ] -> ()
+  | _ -> failwith "async heartbeat did not carry the attempt's heartbeat timeout");
+  List.iteri
+    (fun index (label, response, error_type, non_retryable) ->
+      supervisor.async_heartbeat_response := response;
+      clock := float_of_int (20 * (index + 1));
+      match Temporal.Activity.Async_handle.heartbeat handle [] with
+      | Ok () -> failwith (label ^ ": the activity state was not reported")
+      | Error error ->
+          let view = Temporal.Error.view error in
+          if view.category <> `Cancelled then
+            failwith (label ^ ": wrong error category");
+          if view.error_type <> error_type then
+            failwith (label ^ ": wrong error type");
+          if view.non_retryable <> non_retryable then
+            failwith (label ^ ": wrong retryability"))
+    [
+      ("cancel", Protocol.Heartbeat_cancel_requested, None, true);
+      ("pause", Protocol.Heartbeat_paused, Some "ActivityPause", false);
+      ("reset", Protocol.Heartbeat_reset, Some "ActivityReset", false);
+    ];
+  (* The last heartbeat, at 60 s, renewed the window to 60 + 2 * 10 + 5 s. *)
+  clock := 84.;
+  expect_outstanding "activity state" worker;
+  supervisor.async_heartbeat_response := Protocol.Heartbeat_recorded;
+  (match Temporal.Activity.Async_handle.cancel handle [] with
+  | Ok () -> ()
+  | Error error ->
+      failwith ("a handle that reported cancellation could not cancel: "
+        ^ Temporal.Error.message error));
+  match Worker.drain worker with
+  | Ok () -> ()
+  | Error error -> failwith ("the cancelled lease held drain: " ^ error.code)
 
 (** A handle retained from a synchronously completed attempt must not be
     attachable to the next attempt. Its submit callback still captures the old
@@ -2236,6 +2330,7 @@ let () =
   test_async_context_info_maximum_timeouts ();
   test_async_drain_and_discard ();
   test_async_lease_expiry ();
+  test_async_heartbeat_carries_timeout_and_activity_state ();
   test_stale_handle_rejected ();
   test_completion_racing_handoff_is_retryable ();
   test_completer_domain_retries_until_handoff ();

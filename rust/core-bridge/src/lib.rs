@@ -9,6 +9,7 @@ mod client_calls;
 mod client_protocol;
 #[doc(hidden)]
 pub mod diagnostics;
+mod heartbeat_throttle;
 pub mod protocol;
 mod replay_bridge;
 #[doc(hidden)]

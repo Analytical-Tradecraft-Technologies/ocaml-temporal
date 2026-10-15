@@ -137,6 +137,52 @@ let test_heartbeat_validation () =
       {|{"task_token":"AA==","details":[{"metadata":{},"data":{"encoding":"raw","data":"AA=="}}]}|};
     ]
 
+(** The async heartbeat document (#1025) adds a required, nullable heartbeat
+    timeout to the heartbeat members, in the exact shape the Rust decoder
+    accepts; the plain heartbeat decoder rejects it. The bridge's fixed
+    async-heartbeat outcome words decode to the closed response type. *)
+let test_async_heartbeat () =
+  let heartbeat : Protocol.heartbeat =
+    { task_token = Bytes.of_string "\000token"; details = [] }
+  in
+  check_string "async heartbeat"
+    {|{"details":[],"heartbeat_timeout":{"nanoseconds":500000000,"seconds":2},"task_token":"AHRva2Vu"}|}
+    (unwrap
+       (Protocol.encode_async_heartbeat
+          {
+            heartbeat;
+            heartbeat_timeout = Some { seconds = 2L; nanoseconds = 500_000_000 };
+          }));
+  let unset =
+    unwrap (Protocol.encode_async_heartbeat { heartbeat; heartbeat_timeout = None })
+  in
+  check_string "unset timeout"
+    {|{"details":[],"heartbeat_timeout":null,"task_token":"AHRva2Vu"}|} unset;
+  (match Protocol.decode_async_heartbeat unset with
+  | Ok { heartbeat_timeout = None; heartbeat = { task_token; _ } }
+    when Bytes.equal task_token heartbeat.task_token -> ()
+  | _ -> failwith "async heartbeat did not round-trip");
+  require_error (Protocol.decode_heartbeat unset);
+  List.iter
+    (fun json -> require_error (Protocol.decode_async_heartbeat json))
+    [
+      {|{"task_token":"AA==","details":[]}|};
+      {|{"task_token":"AA==","details":[],"heartbeat_timeout":{"seconds":-1,"nanoseconds":0}}|};
+      {|{"task_token":"AA==","details":[],"heartbeat_timeout":null,"extra":true}|};
+    ];
+  List.iter
+    (fun (body, expected) ->
+      if Protocol.async_heartbeat_response_of_string body <> expected then
+        failwith ("async heartbeat outcome " ^ body))
+    [
+      ("", Some Protocol.Heartbeat_recorded);
+      ("cancel_requested", Some Protocol.Heartbeat_cancel_requested);
+      ("paused", Some Protocol.Heartbeat_paused);
+      ("reset", Some Protocol.Heartbeat_reset);
+      ("not_found", None);
+      ("cancelled", None);
+    ]
+
 (** Closed-object and required-nullable validation rejects protocol drift at
     every nesting level before a future worker can act on the task. *)
 let test_closed_documents () =
@@ -346,6 +392,7 @@ let () =
   run "activity completion variants" test_completion_variants;
   run "activity heartbeat round trip" test_heartbeat_round_trip;
   run "activity heartbeat validation" test_heartbeat_validation;
+  run "async activity heartbeat" test_async_heartbeat;
   run "closed activity documents" test_closed_documents;
   run "activity semantic validation" test_semantic_validation;
   run "inbound activity priority" test_inbound_priority;

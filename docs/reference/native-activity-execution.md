@@ -136,12 +136,16 @@ The four handle methods are typed and return `(unit, Error.t) result`:
 - `Async_handle.cancel` sends a canceled completion with ordered detail
   payloads.
 - `Async_handle.heartbeat` sends non-terminal progress through the
-  namespace-bound client operation. It currently returns acknowledgement only;
-  Core cancellation, pause, and reset flags are not yet represented in the
-  public result. Unlike a synchronous context's heartbeat, which Core
-  throttles and sends in the background, every call is one server round trip
-  awaited on the calling thread (#1025), so external code should heartbeat
-  at a fraction of the heartbeat timeout rather than per item.
+  namespace-bound client operation, throttled like a synchronous context's
+  heartbeat; see [Async heartbeat throttling](#async-heartbeat-throttling).
+  When the server reports that the activity's cancellation was requested,
+  or that it was paused or reset, the call returns an error in the
+  `Cancelled` category: non-retryable for a cancellation request, and a
+  retryable error of type `ActivityPause` or `ActivityReset` for a pause or
+  reset, the failure a running attempt stopped that way reports. The
+  heartbeat was still recorded and the handle stays live; the external
+  completer should stop and finish the handle (`cancel` for a cancellation,
+  or `fail` with that error for a pause or reset).
 
 Each operation is a submitted client call (#1025), like the public client's
 calls (#807): the worker's owner Domain only validates the request and spawns
@@ -202,6 +206,55 @@ classification (`Native_worker_policy.async_operation_disposition`):
 
 The activity callback is never rerun for a submission retry. The handle is not a retained activity context: ordinary
 `Activity.Context` values are still invalidated when their callback returns.
+
+### Async heartbeat throttling
+
+Core throttles a running activity's heartbeats in its heartbeat manager, but
+an async handle's heartbeats are namespace-bound client RPCs that Core never
+sees. Before #1025 every `Async_handle.heartbeat` was therefore a separate
+server round trip. The Rust bridge now applies Core's rules
+(`activity_heartbeat_manager.rs` at the pinned revision) to them, per task
+token, in `rust/core-bridge/src/heartbeat_throttle.rs`:
+
+- The first heartbeat for a token is sent at once, and the caller receives
+  that send's outcome, exactly as before.
+- Until the throttle interval has passed since that send started, later
+  calls only replace the token's pending details and return at once: `Ok`
+  means the details were recorded for the next send, not that the server
+  has them.
+- When the interval expires, a trailing send carries the latest pending
+  details and starts the next interval. If nothing is pending, the token's
+  state is dropped, so the next heartbeat is again sent at once.
+- The interval is computed as Core computes it: 80% of the attempt's
+  heartbeat timeout, or the worker's `default_heartbeat_throttle_interval`
+  when none is set, capped by `max_heartbeat_throttle_interval`. Consecutive
+  sends start at most one interval plus one RPC apart, so a caller that
+  heartbeats more often than the heartbeat timeout keeps the server's timer
+  satisfied. The adapter passes the timeout copied from the start task in
+  the heartbeat document.
+
+Every call reports the activity state of the token's latest completed send:
+a cancellation, pause, or reset seen by a trailing send is returned by the
+next heartbeat (and every later one until another send reports otherwise).
+Unlike Core, which only logs a failed background send, any failed send ends
+the token's interval, so the next heartbeat is sent at once and returns the
+server's own answer (`NotFound` closes the handle as before). A terminal
+`complete`, `fail`, or `cancel` first evicts the token, as Core evicts a
+completed activity: a sleeping trailing send is cancelled, and before a
+cancellation the pending details are flushed as Core does.
+
+Each token with state has one driver task on Core's Tokio runtime that owns
+a client and performs every send for it. Disconnect and runtime close abort
+and join every driver before the connection is dropped, as for submitted
+calls. At most the connection's in-flight call limit (`max_in_flight_calls`)
+of tokens is tracked; beyond it a heartbeat is sent unthrottled, so memory
+stays bounded however many tokens application code heartbeats. Because a
+throttled call may return before its details are sent, the async lease's
+heartbeat deadline (see [Async lease expiry](#async-lease-expiry)) allows
+twice the heartbeat timeout after the last call. The focused tests are
+[`async_activity_heartbeat_throttle.rs`](../../rust/core-bridge/tests/async_activity_heartbeat_throttle.rs)
+and
+[`test_native_async_activity.ml`](../../test/runtime/test_native_async_activity.ml).
 
 ## Registration and dispatch
 
@@ -398,13 +451,17 @@ a live lease look expired:
 
 - an attempt deadline: the time of admission plus the shorter of the
   start-to-close and schedule-to-close timeouts; and
-- a heartbeat deadline, when a heartbeat timeout is set: the heartbeat
-  timeout after admission, or after the end of the last
-  `Async_handle.heartbeat` call that may have reached the server (accepted or
-  uncertain).
+- a heartbeat deadline, when a heartbeat timeout is set: twice the
+  heartbeat timeout after admission, or after the end of the last
+  `Async_handle.heartbeat` call that may have reached the server (accepted,
+  recorded for a throttled trailing send, or uncertain). The second timeout
+  covers the throttle interval (at most 80% of the timeout) and the trailing
+  send's RPC, since a throttled call's details reach the server only with
+  that later send (#1025).
 
-Admission follows the attempt's start and each local progress time follows
-the server's own record of that heartbeat, so these bounds are never earlier
+Admission follows the attempt's start, and the server's last record of a
+heartbeat is at most one throttle interval and trailing RPC after the local
+progress time, so these bounds are never earlier
 than the server's timeouts; with five seconds of slack for the server's
 timeout processing and small clock adjustments, the adapter never expires a
 lease that could still be completed. Once a bound has passed, the lease is

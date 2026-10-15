@@ -32,12 +32,15 @@ type submit_result = (unit, Error.t) result
     a definitive native answer to this exact request, so it releases the key
     even after an earlier uncertain attempt. [Retryable_submission] retains a
     terminal operation's exact key and drops a heartbeat's.
-    [Terminal_submission] closes the handle. *)
+    [Terminal_submission] closes the handle. [Activity_state] is an applied
+    heartbeat whose response reported cancellation, pause, or reset (#1025);
+    it is handled like [Rejected_submission]. *)
 type submission_error =
   | Not_submitted of Error.t
   | Rejected_submission of Error.t
   | Retryable_submission of Error.t
   | Terminal_submission of Error.t
+  | Activity_state of Error.t
 
 (** The handle lifecycle is protected by [handle.mutex]. [Handoff_pending]
     closes the gap between a callback returning [Will_complete_async] and the
@@ -314,7 +317,7 @@ let submit_operation handle ~terminal operation =
           | Error (Not_submitted error) ->
               if not pending.retry_pending then handle.pending <- None;
               Error error
-          | Error (Rejected_submission error) ->
+          | Error (Rejected_submission error | Activity_state error) ->
               handle.pending <- None;
               Error error
           | Error (Retryable_submission error) when terminal ->

@@ -1,10 +1,10 @@
 use ocaml_temporal_core_bridge::activity_protocol::{
     ActivityCancel, ActivityCancelReason, ActivityCompletion, ActivityCompletionResult,
-    ActivityHeartbeat, ActivityTask, ActivityTaskVariant, completion_to_core, decode_completion,
-    decode_heartbeat, decode_task, encode_completion, encode_heartbeat, encode_task,
-    task_from_core,
+    ActivityHeartbeat, ActivityTask, ActivityTaskVariant, AsyncActivityHeartbeat,
+    completion_to_core, decode_async_heartbeat, decode_completion, decode_heartbeat, decode_task,
+    encode_async_heartbeat, encode_completion, encode_heartbeat, encode_task, task_from_core,
 };
-use ocaml_temporal_core_bridge::workflow_protocol::Payload;
+use ocaml_temporal_core_bridge::workflow_protocol::{Duration, Payload};
 use std::collections::BTreeMap;
 use temporalio_protos::coresdk::activity_result as core_activity_result;
 use temporalio_protos::coresdk::activity_task as core_activity_task;
@@ -176,6 +176,49 @@ fn activity_heartbeat_rejects_unsafe_documents() {
         r#"{"task_token":"AAEC/v8=","details":[{"metadata":{},"data":{"encoding":"raw","data":"AA=="}}]}"#
     )
     .is_err());
+}
+
+/// The async heartbeat document (#1025) round-trips with and without a
+/// heartbeat timeout, and requires the timeout member: it is how the bridge
+/// derives the throttle interval.
+#[test]
+fn async_activity_heartbeat_round_trips_and_requires_its_timeout() {
+    for heartbeat_timeout in [
+        None,
+        Some(Duration {
+            seconds: 2,
+            nanoseconds: 500_000_000,
+        }),
+    ] {
+        let heartbeat = AsyncActivityHeartbeat {
+            task_token: "AAEC/v8=".to_owned(),
+            details: vec![Payload {
+                metadata: BTreeMap::new(),
+                data: vec![0, 255],
+            }],
+            heartbeat_timeout,
+        };
+        let encoded = encode_async_heartbeat(&heartbeat).expect("async heartbeat should encode");
+        assert_eq!(decode_async_heartbeat(&encoded), Ok(heartbeat));
+    }
+    assert!(decode_async_heartbeat(r#"{"task_token":"AAEC/v8=","details":[]}"#).is_err());
+    assert!(
+        decode_async_heartbeat(
+            r#"{"task_token":"AAEC/v8=","details":[],"heartbeat_timeout":{"seconds":-1,"nanoseconds":0}}"#
+        )
+        .is_err()
+    );
+    assert!(
+        decode_async_heartbeat(
+            r#"{"task_token":"AAEC/v8=","details":[],"heartbeat_timeout":{"seconds":1,"nanoseconds":1000000000}}"#
+        )
+        .is_err()
+    );
+    // The synchronous heartbeat decoder does not accept the extra member.
+    assert!(
+        decode_heartbeat(r#"{"task_token":"AAEC/v8=","details":[],"heartbeat_timeout":null}"#)
+            .is_err()
+    );
 }
 
 /// Cancellation tasks retain the stable reason while preserving the single

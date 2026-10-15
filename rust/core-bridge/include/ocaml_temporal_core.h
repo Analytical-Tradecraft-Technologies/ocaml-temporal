@@ -261,14 +261,21 @@ ocaml_temporal_core_status ocaml_temporal_core_v4_client_wait_workflow_json(
     size_t input_len, ocaml_temporal_core_result *output);
 
 /* Closed selectors for ocaml_temporal_core_v4_client_submit_json (#807). Each
- * takes the request document of the matching synchronous operation. The two
- * ASYNC_ACTIVITY selectors (#1025) take the documents of
- * ocaml_temporal_core_v4_client_complete_async_activity_json and
- * ocaml_temporal_core_v4_client_record_async_activity_heartbeat_json; their
- * outcome is an empty value on success, or the fixed value "not_found" where
- * the synchronous symbol would return STATUS_INVALID_STATE (the server no
- * longer knows the task token), because an awaited call reports
- * STATUS_INVALID_STATE only when the call itself was closed. */
+ * takes the request document of the matching synchronous operation, except
+ * ASYNC_ACTIVITY_HEARTBEAT. ASYNC_ACTIVITY_COMPLETION (#1025) takes the
+ * document of ocaml_temporal_core_v4_client_complete_async_activity_json.
+ * ASYNC_ACTIVITY_HEARTBEAT takes the heartbeat document of
+ * ocaml_temporal_core_v4_client_record_async_activity_heartbeat_json plus a
+ * required, nullable "heartbeat_timeout" duration copied from the attempt's
+ * start task; the bridge throttles these heartbeats per task token as Core
+ * throttles a running activity's heartbeats, so a call may record its
+ * details for a later send instead of sending them. Both outcomes are an
+ * empty value on success, or the fixed value "not_found" where the
+ * synchronous symbol would return STATUS_INVALID_STATE (the server no longer
+ * knows the task token), because an awaited call reports
+ * STATUS_INVALID_STATE only when the call itself was closed. A heartbeat's
+ * outcome may instead be the fixed value "cancel_requested", "reset", or
+ * "paused" (in that precedence) when the latest send reported that state. */
 enum {
   OCAML_TEMPORAL_CORE_CLIENT_CALL_START = 1,
   OCAML_TEMPORAL_CORE_CLIENT_CALL_WAIT = 2,
@@ -328,7 +335,8 @@ ocaml_temporal_core_v4_client_complete_async_activity_json(
     size_t input_len, ocaml_temporal_core_result *output);
 
 /* Record a heartbeat for an admitted asynchronous activity through the
- * namespace-bound client. */
+ * namespace-bound client. Every call is one blocking, unthrottled RPC; the
+ * OCaml worker submits ASYNC_ACTIVITY_HEARTBEAT instead. */
 ocaml_temporal_core_status
 ocaml_temporal_core_v4_client_record_async_activity_heartbeat_json(
     ocaml_temporal_core_runtime *runtime, const uint8_t *input,

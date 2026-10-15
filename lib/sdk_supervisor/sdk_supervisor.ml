@@ -1033,7 +1033,8 @@ module Native_backend = struct
     | Rpc_async_activity_completion :
         Temporal_protocol.Encoded_activity_completion.t -> unit client_rpc
     | Rpc_async_activity_heartbeat :
-        Temporal_protocol.Encoded_activity_heartbeat.t -> unit client_rpc
+        Temporal_protocol.Encoded_async_activity_heartbeat.t ->
+        Temporal_protocol.Activity_protocol.async_heartbeat_response client_rpc
 
   (** A submitted native call awaiting its completion cell. *)
   type 'value client_call = ('value, Bridge.client_call) Client_call.t
@@ -1156,15 +1157,15 @@ module Native_backend = struct
         submit_encoded runtime kind ~decode (encode (with_deadline rpc_deadline)))
 
   (** Decodes the outcome of a submitted async activity call (#1025). Rust
-      reports success as an empty value and a task token the server no
-      longer knows as the fixed value [not_found], because an awaited
-      [Invalid_state] is reserved for a call closed by its runtime. The
-      latter is mapped back to the [Invalid_state] error the synchronous
-      bridge operation returns, so the activity adapter classifies both
-      paths identically. *)
-  let decode_async_activity_outcome ~operation = function
+      reports success as a fixed value that [accepted] maps (empty for a
+      terminal request; for a heartbeat, the activity state its latest send
+      reported), and a task token the server no longer knows as the fixed
+      value [not_found], because an awaited [Invalid_state] is reserved for
+      a call closed by its runtime. The latter is mapped back to the
+      [Invalid_state] error the synchronous bridge operation returns, so the
+      activity adapter classifies both paths identically. *)
+  let decode_async_activity_outcome ~operation ~accepted = function
     | Error _ as error -> error
-    | Ok body when Bytes.length body = 0 -> Ok ()
     | Ok body when Bytes.equal body (Bytes.of_string "not_found") ->
         Error
           {
@@ -1173,14 +1174,17 @@ module Native_backend = struct
               Printf.sprintf "Temporal asynchronous activity %s is no longer active"
                 operation;
           }
-    | Ok _ ->
+    | Ok body -> (
+        match accepted (Bytes.to_string body) with
+        | Some value -> Ok value
+        | None ->
         Error
           {
             Bridge.status = Bridge.Protocol;
             message =
               Printf.sprintf
                 "unexpected outcome of asynchronous activity %s" operation;
-          }
+          })
 
   (** Submits one client request on the owner Domain (#807). This only
       validates, encodes, and spawns native work; it never waits for
@@ -1247,12 +1251,18 @@ module Native_backend = struct
         (* The activity adapter already encoded the completion exactly once
            (issue #995); only the C call's owned copy is made here. *)
         submit_encoded runtime Bridge.Call_async_activity_completion
-          ~decode:(decode_async_activity_outcome ~operation:"completion")
+          ~decode:
+            (decode_async_activity_outcome ~operation:"completion"
+               ~accepted:(function "" -> Some () | _ -> None))
           (Ok (Temporal_protocol.Encoded_activity_completion.to_bytes encoded))
     | Rpc_async_activity_heartbeat encoded ->
         submit_encoded runtime Bridge.Call_async_activity_heartbeat
-          ~decode:(decode_async_activity_outcome ~operation:"heartbeat")
-          (Ok (Temporal_protocol.Encoded_activity_heartbeat.to_bytes encoded))
+          ~decode:
+            (decode_async_activity_outcome ~operation:"heartbeat"
+               ~accepted:
+                 Temporal_protocol.Activity_protocol
+                 .async_heartbeat_response_of_string)
+          (Ok (Temporal_protocol.Encoded_async_activity_heartbeat.to_bytes encoded))
 
   (** Revalidates the statically linked ABI without exposing the runtime. The
       state argument proves the operation remains ordered with lifecycle use. *)
@@ -1535,7 +1545,8 @@ module Native = struct
     | Rpc_async_activity_completion :
         Temporal_protocol.Encoded_activity_completion.t -> unit client_rpc
     | Rpc_async_activity_heartbeat :
-        Temporal_protocol.Encoded_activity_heartbeat.t -> unit client_rpc
+        Temporal_protocol.Encoded_async_activity_heartbeat.t ->
+        Temporal_protocol.Activity_protocol.async_heartbeat_response client_rpc
 
   type 'value client_call = 'value Native_backend.client_call
 
