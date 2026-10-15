@@ -827,6 +827,32 @@ one seam: Core moves out of the per-instance graph into a reference-counted
   release and Core's accept can still take a released descriptor. The
   reserve removes the deterministic starvation, not that race.
 
+  Connection cap (#500). The accept loop takes one of
+  `MAX_CONCURRENT_SCRAPES` (8) permits of a `tokio::sync::Semaphore`
+  before spawning a relay, and the relay task owns the permit until it ends,
+  so every exit path (including the abort at shutdown) returns it. A
+  connection accepted while every permit is held never connects to Core and
+  never touches the reserve: if one of `MAX_PENDING_REJECTIONS` (16)
+  rejection permits is free, a rejection task reads its request head and
+  answers `503` ("Too many concurrent metrics scrapes ..."), all within 1 s;
+  otherwise the stream is dropped (closed) on the accept loop. Reading the
+  head first matters: closing with unread request bytes makes the kernel
+  reset the connection, and macOS then discards the queued `503` before the
+  scraper reads it. The first rejection per exporter is a `warn` record,
+  later ones `debug`. Relays are bounded in time so permits cannot be held
+  forever: 5 s for the request head (as before), then a copy loop
+  (`tokio::select!` over both directions, forwarding end-of-input as a write
+  shutdown like `copy_bidirectional`) that ends after 10 s without a byte
+  moving in either direction (including a write the peer will not drain),
+  and an overall deadline 60 s after `accept()`. The limits are constants in
+  `src/telemetry.rs`, not part of the telemetry document.
+  `rust/core-bridge/tests/metrics_connection_cap.rs` holds every permit with
+  idle and kept-alive clients, requires a burst of idle over-cap
+  connections to be closed within the rejection timeout and further
+  scrapes to receive the busy `503` (never metrics) within 2 s, waits for
+  the bridge to close every holder, then requires real scrapes to succeed
+  and (on Unix) the process descriptor count to return to its baseline.
+
   The returned `MetricsExporter` guard is the first field of `SharedCore`:
   dropping the last Core reference aborts both the accept loop and Core's
   scrape task, then drops Core's Tokio runtime, which joins its workers and

@@ -1682,6 +1682,125 @@
       "expected": "nondeterminism",
       "negative_control_of": "live-2026-10-11-lifecycle-handover",
       "expected_message": "Non-deprecated patch marker encountered for change corpus.lifecycle.handover.v1, but there is no corresponding change command"
+    },
+    {
+      "id": "invalid-truncated-protobuf-activity-retry",
+      "purpose": "Malformed-history control: the activity-retry history cut to its first half (a partial export) is not a History protobuf and must be refused, not replayed as a prefix.",
+      "features": [
+        "malformed-history",
+        "invalid-history-truncated-protobuf"
+      ],
+      "workflow_type": "corpus.activity_retry",
+      "workflow_id": "history-corpus-activity-retry",
+      "run_id": "01a11a23-8cf0-7237-9d97-a77a8751bb7a",
+      "capture": "live-2026-10-08",
+      "generation": "corpus-v1",
+      "history": {
+        "protobuf": "histories/live-2026-10-08-activity-retry.pb",
+        "protobuf_sha256": "fec015f6e939a63c91a8dc6171e8bcb7417a2a6baf29c486e8935a18e852fbf6",
+        "json": "histories/live-2026-10-08-activity-retry.json",
+        "json_sha256": "b5594f3edf57b4abb0948aedeeec23f4077fc86a786715b9be9188ef9466377e"
+      },
+      "replay_definitions": "corpus-v1",
+      "expected": "invalid_history",
+      "negative_control_of": "live-2026-10-08-activity-retry",
+      "history_mutation": "truncate-protobuf",
+      "expected_message": "history failed strict validation"
+    },
+    {
+      "id": "invalid-event-id-gap-timer",
+      "purpose": "Malformed-history control: the timer history with event 3 missing (later events renumbered one higher) must be refused before Core sees it.",
+      "features": [
+        "malformed-history",
+        "invalid-history-event-id-gap"
+      ],
+      "workflow_type": "corpus.timer",
+      "workflow_id": "history-corpus-timer",
+      "run_id": "01a11a23-88ed-7d4a-bd17-721a837b08e5",
+      "capture": "live-2026-10-08",
+      "generation": "corpus-v1",
+      "history": {
+        "protobuf": "histories/live-2026-10-08-timer.pb",
+        "protobuf_sha256": "fe32c05828b95849703e8069bed5d14371fc2d52c449549056bb4b9996205bd5",
+        "json": "histories/live-2026-10-08-timer.json",
+        "json_sha256": "630c5c438289e1d1eec31da471681307ff92365a8eaae94bbcdd9d3d28c7dc82"
+      },
+      "replay_definitions": "corpus-v1",
+      "expected": "invalid_history",
+      "negative_control_of": "live-2026-10-08-timer",
+      "history_mutation": "event-id-gap",
+      "expected_message": "event IDs are not contiguous from 1"
+    },
+    {
+      "id": "invalid-missing-task-queue-interaction",
+      "purpose": "Malformed-history control: the interaction history without a task queue on its start event must be refused promptly (Core's replay poll would otherwise panic and stall).",
+      "features": [
+        "malformed-history",
+        "invalid-history-missing-task-queue"
+      ],
+      "workflow_type": "corpus.interaction",
+      "workflow_id": "history-corpus-interaction",
+      "run_id": "01a11a23-90ff-78d5-ae6b-81654f0308b4",
+      "capture": "live-2026-10-08",
+      "generation": "corpus-v1",
+      "history": {
+        "protobuf": "histories/live-2026-10-08-interaction.pb",
+        "protobuf_sha256": "4e1b2321ba4ca94c0f1889c1936e8b331c9dd046f7701edeab570e9c446b30a5",
+        "json": "histories/live-2026-10-08-interaction.json",
+        "json_sha256": "ee33d9ef8307f8d20622ccac0e4dbae6cc1068a018c7de0f542c8adcec6aa83c"
+      },
+      "replay_definitions": "corpus-v1",
+      "expected": "invalid_history",
+      "negative_control_of": "live-2026-10-08-interaction",
+      "history_mutation": "drop-start-task-queue",
+      "expected_message": "start event has no task queue"
+    },
+    {
+      "id": "invalid-first-task-rejected-continue-as-new",
+      "purpose": "Malformed-history control: the first continue-as-new run with the attributes of its first WorkflowTaskScheduled event removed passes the bridge's structural checks, but Core cannot apply the event in the run's first workflow task and auto-fails it; replay must refuse the history instead of reporting Ok without running workflow code.",
+      "features": [
+        "malformed-history",
+        "invalid-history-first-task-rejected"
+      ],
+      "workflow_type": "corpus.continue_as_new",
+      "workflow_id": "history-corpus-continue-as-new",
+      "run_id": "01a11a23-916d-7983-82ee-1bf8bfd56dc4",
+      "capture": "live-2026-10-08",
+      "generation": "corpus-v1",
+      "history": {
+        "protobuf": "histories/live-2026-10-08-continue-as-new-first.pb",
+        "protobuf_sha256": "02587d60e7de06007e4da0cdc692585a758cbdfbf26c086a491963ce69f2b86d",
+        "json": "histories/live-2026-10-08-continue-as-new-first.json",
+        "json_sha256": "6e0d253e7ba8d4492a038e3fcf83b5d0a20793d4e8383b608cc9ec3f8cfbaadf"
+      },
+      "replay_definitions": "corpus-v1",
+      "expected": "invalid_history",
+      "negative_control_of": "live-2026-10-08-continue-as-new-first",
+      "history_mutation": "drop-first-workflow-task-scheduled-attributes",
+      "expected_message": "This history is invalid"
+    },
+    {
+      "id": "invalid-workflow-id-mismatch-patch-active",
+      "purpose": "Malformed-history control: the unchanged patch-active history replayed under another corpus execution's workflow ID (history-corpus-patch-marker-free) must be refused, so a history cannot be replayed under a different execution's identity.",
+      "features": [
+        "malformed-history",
+        "invalid-history-workflow-id-mismatch"
+      ],
+      "workflow_type": "corpus.patch",
+      "workflow_id": "history-corpus-patch-marker-free",
+      "run_id": "01a11a23-84b5-728d-b3a5-816493a01d16",
+      "capture": "live-2026-10-08",
+      "generation": "corpus-v1",
+      "history": {
+        "protobuf": "histories/live-2026-10-08-patch-active.pb",
+        "protobuf_sha256": "19036e87ce3fc75e8368e1e0cdd9e7f065cbfa0e580c9d24408b2e87b6880f99",
+        "json": "histories/live-2026-10-08-patch-active.json",
+        "json_sha256": "cf73558f4e2adfcec2b37605393c6003011ba0088909e3521b1dafc4a9e081ce"
+      },
+      "replay_definitions": "corpus-v1",
+      "expected": "invalid_history",
+      "negative_control_of": "live-2026-10-08-patch-active",
+      "expected_message": "records a different workflow ID than the one supplied"
     }
   ]
 }
