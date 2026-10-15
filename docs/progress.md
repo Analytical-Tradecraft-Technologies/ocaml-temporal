@@ -15,6 +15,79 @@ implementation when a later entry documents that work as complete. The
 records the current tested source, named assertions and successful CI job for
 the Temporal acceptance controllers.
 
+## 2026-10-13: Shutdown stops Core polling early, retires local activities without retry, reports accurately, and async activity calls leave the owner Domain (#1028, #1029, #1023, #1025)
+
+Temporal Core kept long-polling the server for the whole grace period,
+because it was told to stop only at the native release; every task it took
+meanwhile waited for a lane that would never run it and was then failed, a
+spurious workflow-task failure or a lost activity attempt on every rolling
+deploy (#1028). A new bridge operation,
+`ocaml_temporal_core_v4_worker_initiate_shutdown` (supervisor operation
+`Initiate_worker_shutdown`), runs `PollLanes::initiate_shutdown` without
+releasing anything, as the official SDKs' `initiate_shutdown` does: Core
+stops polling and starts its own graceful-shutdown timer, while leased tasks
+stay completable and heartbeatable. A stopping `Worker.run` sends it right
+after its workflow lane returns (never after a lane failure), and the
+bounded-shutdown thread sends it before the lanes phase; one atomic makes it
+a single request. `run` starts its request on a detached thread and never
+awaits it, so a supervisor mailbox occupied by a stuck activity-lane native
+call cannot keep `run` past the grace deadline (Codex review).
+
+Shutdown and disposal completed a retired local-activity token with a
+retryable failure, which Core's local-activity manager retries in-process
+with fresh tokens for about a minute, so teardown stalled past its timeout
+and was reported detached (#1029). The bridge now classifies the token with
+Core's own `TaskToken::is_local_activity_task` (the predicate Core uses to
+route the completion) and reports a retired local activity as cancelled,
+which Core resolves without retrying; its workflow task is failed by the same
+drain, so the next worker re-executes it. Remote activities keep the
+retryable failure.
+
+The bounded-shutdown report miscounted (#1023). `callback_running` now reads
+an atomic set around both synchronous and asynchronous callbacks, so an
+abandoned `define_async` callback is reported as `activity_callback` and the
+probe never waits on the delivery lock a heartbeat sweep holds. The run loop
+detaches the activity lane at the deadline only while a callback runs (the
+atomic probe, not the lane's per-poll busy flag, which CI showed could be
+sampled mid-poll on an idle lane), joining an
+idle lane for up to 150 ms more; the watchdog sleeps in 20 ms slices so its
+stop is prompt. A worker with a grace period of zero or a few milliseconds
+no longer logs `activity_lane_detached` or reports `lanes_stopped = false`
+when nothing was running.
+
+`Async_handle` completions and heartbeats were blocking RPCs on the worker's
+single owner Domain, with the adapter's async lock held across them (#1025).
+They are now submitted client calls (#807), selectors 11 and 12 of
+`ocaml_temporal_core_v4_client_submit_json`, which run the RPC on a Rust task
+while the caller's thread awaits it; a server `NotFound` is the fixed outcome
+`not_found`, mapped back to `Invalid_state`, because an awaited
+`Invalid_state` means a closed call. The adapter holds its async lock only to
+claim a lease and record the outcome. Async heartbeats are still not
+throttled; the `Async_handle` docs state their cost. Throttling with a
+trailing flush, as Core does for synchronous heartbeats, needs a timer that
+outlives the caller and is left for a follow-up.
+
+Rust tests: `worker_shutdown_outstanding.rs` shows that after the initiation
+the leased task still completes, Core polls no more although the slot was
+freed (the assertion fails without the initiation), and the release fails
+nothing; `worker_local_activity_retirement.rs` covers the local/remote
+outcome; `async_activity_submitted_calls.rs` drives the submitted calls
+against a gRPC double, including `NotFound`, validation before the RPC, and
+a fast heartbeat completing while a slow one is still held by the server.
+OCaml tests: `test_native_worker_bounded_shutdown.ml` (polling stopped by
+both `run` and the shutdown thread during the grace period, a zero-grace
+idle worker not detached, a stuck idle wait still bounded, no stop after a
+lane failure, a blocked polling stop not holding `run`), `test_bounded_shutdown.ml` (the stop queued behind a blocked
+supervisor operation keeps shutdown bounded), `test_native_worker_watchdog.ml`
+(prompt stop) and `test_native_async_activity.ml` (an async callback reported
+running; the lease probe and a new handoff proceed while an async RPC is in
+flight). The new OCaml and Rust shutdown assertions were checked to fail
+with each fix reverted. Verified with `dune build @install`, the
+`test/runtime`, `test/unit`, `test/sdk_supervisor` and `test/bridge`
+aliases on OCaml 5.4.1 (macOS), scoped `cargo test`, `cargo clippy
+--all-targets -D warnings` and `cargo fmt --check`. The live regression the
+issue suggests (a client scheduling work during the grace period against a
+real server) was not run.
 ## 2026-10-13: CI builds the source archive inside an opam sandbox (#778)
 
 The vendored release source archive (2026-10-06 entry) had only been proven

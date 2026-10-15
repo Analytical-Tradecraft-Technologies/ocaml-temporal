@@ -7,7 +7,9 @@
     achieved by never waiting on one indefinitely:
 
     + {b Lanes.} The caller first closes admission (so both execution lanes
-      stop polling and activity contexts report a worker shutdown), then waits
+      stop polling and activity contexts report a worker shutdown). The
+      shutdown thread then stops native polling at once, so Temporal Core
+      takes no task that no lane would run (#1028), and waits
       until [lanes_deadline] plus {!lanes_slack_s} for the run loop to release
       its lifecycle lock. A lane that is still inside user code, or inside a
       native call, at that point is {e abandoned}: shutdown proceeds without
@@ -17,8 +19,9 @@
       An adapter whose lock is still held by abandoned code is skipped.
     + {b Release.} The native graph is released. Temporal Core's bridge
       completes every task still leased to OCaml as a retryable failure (an
-      abandoned activity) or a failed workflow task, so the server retries it
-      on another worker.
+      abandoned remote activity), a cancellation (an abandoned local
+      activity, which Core would otherwise retry in-process, #1029) or a
+      failed workflow task, so the server retries it on another worker.
 
     The whole sequence runs on one dedicated system thread, the {e shutdown
     thread}, which is the sole owner of the lifecycle lock it acquires, of
@@ -45,10 +48,16 @@ type clock = { now : unit -> float; sleep : float -> unit }
 val system_clock : clock
 
 (** How long past [lanes_deadline] the lanes phase keeps waiting before it
-    abandons a lane: 250 ms. The run loop detaches a stuck activity lane at
-    [lanes_deadline] itself and an idle lane observes the stop within one
-    100 ms native readiness wait, so the slack lets both hand the lifecycle
-    lock back before shutdown gives up on them. *)
+    abandons a lane: 250 ms. The run loop detaches a busy activity lane at
+    [lanes_deadline] itself. An idle lane observes the stop within one
+    native readiness wait (at most 100 ms, and at once after native polling
+    stopped), and the run loop joins it for at most
+    [Native_worker_loop.idle_detach_allowance_s] (150 ms) past the deadline.
+    The loop's exit then adds at most one 10 ms join poll and one 20 ms
+    watchdog stop slice ([Native_worker_watchdog.stop_poll_s]). The slack
+    covers that whole exit (about 180 ms in the worst case) with scheduling
+    margin, so a lane that was idle is never reported as abandoned for a
+    short grace period, including the minimum of zero (#1023). *)
 val lanes_slack_s : float
 
 (** Whether the native release finished before the caller's deadline. *)
@@ -103,6 +112,13 @@ type 'error release =
     shutdown thread has not published the lanes outcome in time; both must
     therefore be non-blocking and safe from any thread. *)
 type 'error operations = {
+  stop_polling : unit -> unit;
+      (** Stops native polling for new tasks without releasing anything
+          (#1028): Temporal Core stops taking tasks from the server, while
+          tasks already leased stay completable. Called first, once, on the
+          shutdown thread; it may wait for the supervisor mailbox but never
+          for the network. Idempotent; an exception is ignored, because the
+          release still stops polling. *)
   try_acquire_lanes : unit -> bool;
       (** Takes the run loop's lifecycle lock without waiting. [true] proves
           that no [run] is executing workflow code or joining the activity
@@ -114,7 +130,8 @@ type 'error operations = {
       (** Whether a [run] returned without joining its activity lane because a
           callback outlived the deadline. *)
   activity_callback_running : unit -> bool;
-      (** Whether a synchronous activity callback is executing now. *)
+      (** Whether an activity callback, synchronous or asynchronous, is
+          executing now (#1023). *)
   workflow_activation_in_flight : unit -> bool;
       (** Whether a workflow activation is between poll and completion now. *)
   drain_workflow : unit -> 'error drain;

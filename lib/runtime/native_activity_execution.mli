@@ -245,9 +245,13 @@ module Make (Supervisor : SUPERVISOR) : sig
       leave the copies to the garbage collector. *)
   val try_discard : t -> bool
 
-  (** Whether a synchronous activity callback is executing now. It takes
-      only the short delivery lock, never the adapter lock that the callback
-      holds, so it is safe from any thread while the callback runs. *)
+  (** Whether an activity callback, synchronous or asynchronous, is
+      executing now. It reads an atomic and takes no lock, so bounded shutdown
+      may call it from any thread while the callback, or a delivery sweep in
+      one of its heartbeats, runs (#1023). An asynchronous callback counts
+      only until it returns its outcome: after a [WillCompleteAsync] handoff
+      the work belongs to external code and is reported as an outstanding
+      async lease instead. *)
   val callback_running : t -> bool
 
   (** The number of admitted asynchronous activity leases ([WillCompleteAsync]
@@ -255,8 +259,10 @@ module Make (Supervisor : SUPERVISOR) : sig
       without the adapter lock that a running callback holds (#495). These
       leases belong to no callback, so bounded shutdown must not attribute
       them to an abandoned one. [None] means the separate async lock is held
-      right now, i.e. a request on an admitted lease is in flight, so at
-      least one lease is outstanding; the probe never waits for it. *)
+      at this instant by a short registry update for an admitted or arriving
+      lease (an operation's claim or outcome, or an admission); the probe
+      never waits for it, and callers treat it as at least one outstanding
+      lease. The lock is never held across the network (#1025). *)
   val outstanding_async_leases : t -> int option
 end
 

@@ -1186,6 +1186,13 @@ CAMLprim value ocaml_temporal_worker_reject_activity_json(value runtime,
       runtime, input, ocaml_temporal_core_v4_worker_reject_activity_json);
 }
 
+/* Stop the worker taking new tasks without releasing it (#1028); Rust treats
+ * an absent worker as already stopped. */
+CAMLprim value ocaml_temporal_worker_initiate_shutdown(value runtime) {
+  return invoke_runtime(runtime,
+                        ocaml_temporal_core_v4_worker_initiate_shutdown);
+}
+
 /* Gracefully stop the worker; Rust treats an absent worker as already closed. */
 CAMLprim value ocaml_temporal_worker_shutdown(value runtime) {
   return invoke_runtime(runtime, ocaml_temporal_core_v4_worker_shutdown);
