@@ -110,6 +110,19 @@ let temporary_file contents =
       Out_channel.output_string channel contents);
   path
 
+(** Creates a fresh temporary file of exactly [size] bytes without writing
+    them: [Unix.ftruncate] extends the empty file with a hole, so on file
+    systems with sparse-file support (every Unix CI runner) it occupies no
+    data blocks however large [size] is. Reading it yields [size] zero
+    bytes. *)
+let sparse_file size =
+  let path = Filename.temp_file "replay-cli-oversized" ".pb" in
+  let descriptor = Unix.openfile path [ Unix.O_WRONLY ] 0 in
+  Fun.protect
+    ~finally:(fun () -> Unix.close descriptor)
+    (fun () -> Unix.ftruncate descriptor size);
+  path
+
 (** Runs one case and fails unless it exits with [expected] and its output
     is exactly [records] lines, one per history, followed by the summary
     line, with no line that starts as a forged [PASS forged] record and every
@@ -174,10 +187,13 @@ let () =
   let not_history = temporary_file "this is not a History protobuf" in
   let empty = temporary_file "" in
   let missing = Filename.concat (Filename.get_temp_dir_name ()) "replay-cli-missing.pb" in
+  (* One byte over the public limit: the command must stop reading and report
+     an invalid history before handing anything to the SDK (#497). *)
+  let oversized = sparse_file (Temporal.Replay.History.max_bytes + 1) in
   Fun.protect
     ~finally:(fun () ->
       List.iter (fun path -> try Sys.remove path with Sys_error _ -> ())
-        [ not_history; empty ])
+        [ not_history; empty; oversized ])
     (fun () ->
       check ~name:"compatible history" ~expected:0
         ~expect_output:
@@ -202,6 +218,16 @@ let () =
         ~expect_output:[ "FAIL " ^ shown not_history; "invalid history" ]
         example
         [ "--workflow-id"; workflow_id; not_history ];
+      check ~name:"oversized history" ~expected:3
+        ~expect_output:
+          [
+            "FAIL " ^ shown oversized;
+            Printf.sprintf "invalid history: larger than %d bytes"
+              Temporal.Replay.History.max_bytes;
+            "replayed 1 history: 0 passed, 1 failed";
+          ]
+        example
+        [ "--workflow-id"; workflow_id; oversized ];
       check ~name:"empty history" ~expected:3
         ~expect_output:[ "invalid history" ]
         example

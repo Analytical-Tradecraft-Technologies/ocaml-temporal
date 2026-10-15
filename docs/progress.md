@@ -60,6 +60,29 @@ workflows, YAML parses of them, `make test-quality-contract` and
 `make test-temporal-config` (Docker-free contracts), and a relative-link check
 of the edited Markdown.
 
+## 2026-10-14: Installed consumer replays fixture histories (#497)
+
+The installed-package consumer previously only type-checked
+`Temporal.Replay` through `public_api.ml`. A new consumer executable,
+`test/fixtures/install-consumer/installed_replay.ml`, now replays the frozen
+history-corpus capture `live-2026-10-08-timer.pb` through the installed
+package and asserts both verdicts: the recorded `corpus.timer` code replays
+cleanly, and the same workflow type with its timer removed is reported as
+`Nondeterminism` at the recorded `TimerStarted` event for workflow ID
+`history-corpus-timer`. `test/bridge/test_install.sh` (`make test-install`)
+and the relocated binary-only consumer (`test/bridge/test_prebuilt_library.sh`,
+prepared by `scripts/ocaml-library-artifact.py prepare-consumer`) both copy
+the history next to the consumer and run it. No new capture was made.
+
+The oversized-history bound now has direct evidence.
+`test/replay_cli/test_replay_cli.ml` creates a sparse file of
+`Temporal.Replay.History.max_bytes + 1` bytes with `Unix.ftruncate` and
+requires the example replay command to exit 3 with
+`invalid history: larger than 134217728 bytes`. `test/bridge/test_public_replay.ml`
+passes a string of the same length to `Replay.History.of_protobuf` and
+requires the documented size rejection.
+
+Issue #497 stays open until the v1 support policy (#489) is formally closed.
 ## 2026-10-14: Metrics scrape connections are capped (#500)
 
 The bridge's public metrics accept loop spawned one relay per connection with
