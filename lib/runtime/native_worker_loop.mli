@@ -1,7 +1,8 @@
 (** Private scheduler for two independent native worker lanes.
 
-    The workflow adapter executes on the caller Domain; one activity Domain
-    executes at most one callback at a time. The adapters still serialize their
+    The workflow adapter executes on the caller Domain; one activity Domain,
+    spawned only for a worker that polls activity tasks, executes at most one
+    callback at a time. The adapters still serialize their
     own task leases, and every native operation uses the same supervisor. *)
 
 (** Scheduling summary returned by one lane poll. *)
@@ -50,7 +51,16 @@ type activity_detach = {
     still returns before shutdown stops waiting for its lifecycle lock. *)
 val idle_detach_allowance_s : float
 
-(** Runs both lanes until [closed] or a fatal lane result. With [detach = None]
+(** Runs both lanes until [closed] or a fatal lane result.
+
+    With [activity_lane = false] (a workflow-only worker) no activity Domain
+    is spawned and [poll_activity] is never called; the workflow lane then
+    runs alone and always takes the native-wait token when idle. When the
+    activity Domain cannot be spawned, typically because the runtime's Domain
+    limit is reached, [run] returns [Error (lane_unavailable exn)] with the
+    [Domain.spawn] exception before either lane polls, so nothing needs
+    stopping and the caller may run again later (#1042).
+ With [detach = None]
     the activity Domain is always joined before returning, so the caller may
     then safely drain adapters and release the native graph. With [Some detach]
     the join is bounded as described on {!activity_detach}: a detached
@@ -73,6 +83,8 @@ val idle_detach_allowance_s : float
     [retry_pending] must apply a real bounded backoff even if unrelated work is
     ready, so an uncertain completion cannot spin or rerun its callback. *)
 val run :
+  activity_lane:bool ->
+  lane_unavailable:(exn -> 'error) ->
   detach:activity_detach option ->
   closed:(unit -> bool) ->
   poll_workflow:(unit -> (progress, 'error) result) ->

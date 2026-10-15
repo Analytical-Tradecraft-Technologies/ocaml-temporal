@@ -56,8 +56,8 @@ module Native_worker_owner = Temporal_runtime.Native_worker_owner
 (** Generic private observer selection scoped to one worker constructor. *)
 module Native_worker_observer = Temporal_runtime.Native_worker_observer
 
-(** Detection-only watchdog Domain for workflow activations that do not
-    yield. *)
+(** Detection-only watchdog thread for workflow activations that do not
+    yield; the native worker hosts it on its supervisor Domain. *)
 module Native_worker_watchdog = Temporal_runtime.Native_worker_watchdog
 
 (** Idle pacing between native lane polls: joins an in-flight readiness wait

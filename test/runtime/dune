@@ -34,6 +34,8 @@
   test_execution_info
   test_thread_context_isolation
   test_race_matrix)
+ (modules
+  (:standard \ test_worker_domain_budget))
  (libraries temporal-sdk temporal_runtime temporal_core_bridge unix))
 
 ; Reruns the idle-pacing regressions with the Windows sleep model (sub-ms
@@ -48,3 +50,17 @@
    IDLE_TEST_SLEEP_MODEL
    windows
    (run %{exe:test_native_worker_idle.exe}))))
+
+; Per-worker Domain budget (#1042). OCAMLRUNPARAM=d=1 leaves the runtime only
+; its main Domain, so any Domain the code under test spawned would fail; on
+; OCaml 5.2, which ignores the parameter, the exhaustion checks are skipped.
+
+(test
+ (name test_worker_domain_budget)
+ (modules test_worker_domain_budget)
+ (libraries temporal_runtime threads unix)
+ (action
+  (setenv
+   OCAMLRUNPARAM
+   d=1
+   (run %{test}))))
