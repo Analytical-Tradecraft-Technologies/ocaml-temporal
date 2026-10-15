@@ -330,6 +330,9 @@ external worker_record_activity_heartbeat_json_raw : runtime -> bytes -> respons
 external worker_reject_activity_json_raw : runtime -> bytes -> response
   = "ocaml_temporal_worker_reject_activity_json"
 
+external worker_initiate_shutdown_raw : runtime -> response
+  = "ocaml_temporal_worker_initiate_shutdown"
+
 external worker_shutdown_raw : runtime -> response
   = "ocaml_temporal_worker_shutdown"
 
@@ -964,6 +967,8 @@ type client_call_kind =
   | Call_update
   | Call_poll_update
   | Call_visibility
+  | Call_async_activity_completion
+  | Call_async_activity_heartbeat
 
 (** Handle of one submitted call: the random identity of the runtime graph
     that submitted it and the call identifier, both issued by Rust and
@@ -984,6 +989,8 @@ let client_call_selector = function
   | Call_update -> 8
   | Call_poll_update -> 9
   | Call_visibility -> 10
+  | Call_async_activity_completion -> 11
+  | Call_async_activity_heartbeat -> 12
 
 (** Longest single native wait accepted by Rust for one await. *)
 let max_client_await_ms = 60_000
@@ -1216,6 +1223,12 @@ let worker_reject_activity_json runtime input =
   bridge_call "worker_reject_activity_json" (fun () ->
       Result.map (fun _ -> ())
         (decode (worker_reject_activity_json_raw runtime input)))
+
+(** Stops the worker taking new tasks without releasing it (#1028). Rust
+    treats repetition, and an absent worker, as success. *)
+let worker_initiate_shutdown runtime =
+  bridge_call "worker_initiate_shutdown" (fun () ->
+      Result.map (fun _ -> ()) (decode (worker_initiate_shutdown_raw runtime)))
 
 (** Gracefully closes the worker. Rust treats repetition as success. *)
 let worker_shutdown runtime =

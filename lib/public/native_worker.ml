@@ -175,9 +175,12 @@ module Activity_source = struct
 
   (** Completes an admitted asynchronous activity through the namespace-bound
       client path, never the worker task-token ledger. The completion arrives
-      already encoded once by the adapter. *)
+      already encoded once by the adapter. It is a submitted client call
+      (#1025): the owner Domain only validates it and spawns the RPC, and
+      this caller's thread waits for the server, so a slow server never
+      holds up polling and completion for the rest of the worker. *)
   let complete_async_activity supervisor encoded =
-    Native.perform supervisor (Native.Complete_async_activity encoded)
+    Native.call supervisor (Native.Rpc_async_activity_completion encoded)
 
   (** Records progress for the currently leased activity through the same
       supervisor mailbox as polling and completion. The heartbeat arrives
@@ -186,9 +189,10 @@ module Activity_source = struct
     Native.perform supervisor (Native.Record_activity_heartbeat encoded)
 
   (** Records progress for an admitted asynchronous activity, likewise as the
-      adapter's single-encode heartbeat bytes. *)
+      adapter's single-encode heartbeat bytes and likewise as a submitted
+      client call that waits on this caller's thread (#1025). *)
   let record_async_activity_heartbeat supervisor encoded =
-    Native.perform supervisor (Native.Record_async_activity_heartbeat encoded)
+    Native.call supervisor (Native.Rpc_async_activity_heartbeat encoded)
 
   (** Returns the stable classification used in adapter diagnostics. *)
   let error_code error = fst (native_error_view error)
@@ -374,6 +378,10 @@ type t = {
       (** Set when a [run] returned without joining its activity Domain
           because a callback outlived [lanes_deadline]. That callback still
           holds the activity adapter's lock. *)
+  native_polling_stopped : bool Atomic.t;
+      (** Set by the first caller of [stop_native_polling], so a stopping
+          [run] and the shutdown thread ask Core to stop polling only once
+          between them (#1028). *)
   discard_pending : Bounded_shutdown.Deferred_discard.t;
       (** Raised once the native release returned, cleared by the first
           successful discard of both adapters' copied state. When abandoned
@@ -583,6 +591,36 @@ let lanes_deadline worker =
       else
         Option.value (Atomic.get worker.lanes_deadline) ~default:deadline
 
+(** Stops Temporal Core from taking new tasks, once per worker (#1028).
+
+    Both lanes stop polling the bridge as soon as a stop is observed, but
+    Core used to keep long-polling the server until the native release,
+    which runs only after the grace period. Every task it took meanwhile
+    waited in the bridge for a lane that would never run it, and the release
+    then failed it: a spurious workflow-task failure, or a lost activity
+    attempt. This asks the bridge to stop Core's polls at once instead.
+    Tasks already handed to OCaml stay leased, so a running callback still
+    heartbeats and completes during the grace period, and Core starts its
+    own graceful-shutdown timer now rather than after the grace period.
+
+    Called by a stopping [run] (after its workflow lane returned, on a
+    detached thread that [run] never awaits, so a mailbox occupied by a stuck
+    activity-lane native call cannot hold [run]) and first by the shutdown
+    thread; whichever comes first sends the one supervisor request. It waits
+    for the mailbox but never for the network. A failure is only logged: the
+    release stops polling in any case. *)
+let stop_native_polling worker =
+  if Atomic.compare_and_set worker.native_polling_stopped false true then
+    match Native.perform worker.supervisor Native.Initiate_worker_shutdown with
+    | Ok () -> report Logs.Debug ~operation:"worker_polling_stopped" ()
+    | Error error ->
+        let error_kind, _ = native_error_view error in
+        report Logs.Warning ~operation:"worker_polling_stop_failed" ~error_kind
+          ()
+    | exception _ ->
+        report Logs.Warning ~operation:"worker_polling_stop_failed"
+          ~error_kind:"exception" ()
+
 (** Bounds the run loop's join of its activity Domain (#495). After a stop,
     the deadline is the shared lanes deadline. After a lane failure without a
     stop, a private deadline one grace period away is used and not
@@ -598,6 +636,8 @@ let activity_detach worker =
       (fun () ->
         Atomic.set worker.activity_detached true;
         report Logs.Warning ~operation:"activity_lane_detached" ());
+    on_stop = (fun () -> stop_native_polling worker);
+    callback_running = (fun () -> Activity.callback_running worker.activities);
   }
 
 (** Discards both adapters' copied state if neither lock is held. Returns
@@ -822,10 +862,13 @@ let drain_activity worker () =
 
 (** The worker's effects for {!Bounded_shutdown.run}. The lifecycle lock is
     [run_mutex], taken and released by the shutdown thread. The probes read
-    atomics or the activity adapter's short delivery lock only. *)
+    atomics only, or try a lock without waiting, so the caller may use them
+    while a lane is blocked (#1023). [stop_polling] is the one operation that
+    enters the supervisor mailbox before the release (#1028). *)
 let shutdown_operations worker =
   {
-    Bounded_shutdown.try_acquire_lanes =
+    Bounded_shutdown.stop_polling = (fun () -> stop_native_polling worker);
+    try_acquire_lanes =
       (fun () -> Mutex.try_lock worker.run_mutex);
     release_lanes = (fun () -> Mutex.unlock worker.run_mutex);
     activity_lane_detached = (fun () -> Atomic.get worker.activity_detached);
@@ -1121,6 +1164,7 @@ let create ?max_cached_workflows
           Int64.to_float shutdown_teardown_timeout_ms /. 1_000.;
         lanes_deadline = Atomic.make None;
         activity_detached = Atomic.make false;
+        native_polling_stopped = Atomic.make false;
         discard_pending = Bounded_shutdown.Deferred_discard.create ();
       }
   in

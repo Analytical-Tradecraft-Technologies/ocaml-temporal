@@ -244,7 +244,14 @@ ocaml_temporal_core_status ocaml_temporal_core_v4_client_wait_workflow_json(
     size_t input_len, ocaml_temporal_core_result *output);
 
 /* Closed selectors for ocaml_temporal_core_v4_client_submit_json (#807). Each
- * takes the request document of the matching synchronous operation. */
+ * takes the request document of the matching synchronous operation. The two
+ * ASYNC_ACTIVITY selectors (#1025) take the documents of
+ * ocaml_temporal_core_v4_client_complete_async_activity_json and
+ * ocaml_temporal_core_v4_client_record_async_activity_heartbeat_json; their
+ * outcome is an empty value on success, or the fixed value "not_found" where
+ * the synchronous symbol would return STATUS_INVALID_STATE (the server no
+ * longer knows the task token), because an awaited call reports
+ * STATUS_INVALID_STATE only when the call itself was closed. */
 enum {
   OCAML_TEMPORAL_CORE_CLIENT_CALL_START = 1,
   OCAML_TEMPORAL_CORE_CLIENT_CALL_WAIT = 2,
@@ -255,7 +262,9 @@ enum {
   OCAML_TEMPORAL_CORE_CLIENT_CALL_QUERY = 7,
   OCAML_TEMPORAL_CORE_CLIENT_CALL_UPDATE = 8,
   OCAML_TEMPORAL_CORE_CLIENT_CALL_POLL_UPDATE = 9,
-  OCAML_TEMPORAL_CORE_CLIENT_CALL_VISIBILITY = 10
+  OCAML_TEMPORAL_CORE_CLIENT_CALL_VISIBILITY = 10,
+  OCAML_TEMPORAL_CORE_CLIENT_CALL_ASYNC_ACTIVITY_COMPLETION = 11,
+  OCAML_TEMPORAL_CORE_CLIENT_CALL_ASYNC_ACTIVITY_HEARTBEAT = 12
 };
 
 /* Submit one client RPC without waiting for Temporal (#807). Only the
@@ -287,9 +296,10 @@ ocaml_temporal_core_status ocaml_temporal_core_v4_client_await_call(
 
 /* Abandon a submitted call without reading it, freeing its slot in the
  * 4,096-call ceiling (an unread completed call keeps counting until it is
- * read, released, or its runtime closes). Any published outcome is dropped.
- * Takes no runtime; a mismatched owner, retired call, or unknown identifier
- * is a successful no-op. */
+ * read, released, or its runtime closes). Any published outcome is dropped
+ * and a still-running task is aborted, so the call stops holding its wait,
+ * start, and in-flight slots at once. Takes no runtime; a mismatched owner,
+ * retired call, or unknown identifier is a successful no-op. */
 ocaml_temporal_core_status ocaml_temporal_core_v4_client_release_call(
     uint64_t owner, uint64_t call, ocaml_temporal_core_result *output);
 
@@ -442,6 +452,15 @@ ocaml_temporal_core_v4_worker_record_activity_heartbeat_json(
 ocaml_temporal_core_status ocaml_temporal_core_v4_worker_reject_activity_json(
     ocaml_temporal_core_runtime *runtime, const uint8_t *input,
     size_t input_len, ocaml_temporal_core_result *output);
+
+/* Stop the worker from taking new tasks without releasing it (#1028): close
+ * admission and readiness and ask Core to stop polling the server. Tasks
+ * already leased to OCaml may still be completed or heartbeated until
+ * ocaml_temporal_core_v4_worker_shutdown. Never blocks on Core or the
+ * network. Repeating it, or calling it without a worker, is a success. */
+ocaml_temporal_core_status ocaml_temporal_core_v4_worker_initiate_shutdown(
+    ocaml_temporal_core_runtime *runtime,
+    ocaml_temporal_core_result *output);
 
 /* Gracefully stop the worker. Repeating this operation is safe. */
 ocaml_temporal_core_status ocaml_temporal_core_v4_worker_shutdown(

@@ -214,7 +214,13 @@ val implementation_async :
     start-to-close or schedule-to-close timeout, or its heartbeat timeout
     since the last {!Async_handle.heartbeat}); the worker then closes it
     without contacting the server, and later calls return a non-retryable
-    error. *)
+    error.
+
+    Each operation is one request to the Temporal server, made while the
+    calling thread waits for its answer (up to the client's RPC timeout and
+    retries). The worker's own polling and completions do not wait for it,
+    and operations on different handles proceed independently, but a call
+    blocks its caller: do not call it from workflow code. *)
 module Async_handle : sig
   (** The handle type paired with one asynchronous activity output. *)
   type 'output t = 'output async_handle
@@ -228,7 +234,11 @@ module Async_handle : sig
   (** Reports cancellation and optional detail payloads. *)
   val cancel : 'output t -> Payload.t list -> (unit, Error.t) result
 
-  (** Sends heartbeat detail payloads. *)
+  (** Sends heartbeat detail payloads. Unlike {!Context.heartbeat}, which
+      Temporal Core throttles and sends in the background, every call is a
+      separate server round trip and nothing is coalesced, so heartbeat at a
+      fraction of the activity's heartbeat timeout (for example a third of
+      it), not once per item of work. *)
   val heartbeat : 'output t -> Payload.t list -> (unit, Error.t) result
 end
 

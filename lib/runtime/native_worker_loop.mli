@@ -15,14 +15,40 @@ type progress =
 
 (** Bounds how long [run] waits for the activity lane once the workflow lane
     has returned (#495). [deadline ()] is called once, when the workflow lane
-    returns, and yields an absolute time on the [now] clock. If the activity
-    lane is still running a callback at that time, [run] calls [on_detached]
-    and returns without joining it. *)
+    returns, and yields an absolute time on the [now] clock. If
+    [callback_running ()] reports an activity callback still executing at or
+    after that time, [run] calls [on_detached] and returns without joining
+    it. Any other lane (idle in a readiness wait, between polls, or in a
+    short native call) is joined instead for up to
+    {!idle_detach_allowance_s} past the deadline, so a short grace period
+    never detaches a lane that has no callback (#1023). [callback_running]
+    must be non-blocking; it is sampled every join poll, so a callback that
+    starts after the deadline is still detached.
+
+    [on_stop] is started once, when the workflow lane has returned because
+    [closed] holds, before the activity lane is joined. The native worker
+    uses it to stop Temporal Core polling at once rather than after the grace
+    period (#1028). It runs fire-and-forget on its own system thread, so it
+    may block (for example on a supervisor mailbox that a stuck activity-lane
+    native call occupies) without delaying the bounded join: [run] still
+    returns by the deadline. If no thread can be created it is skipped; the
+    caller must then stop polling another way. It is not called after a lane
+    failure without a stop. An exception it raises is ignored. *)
 type activity_detach = {
   now : unit -> float;
   deadline : unit -> float;
   on_detached : unit -> unit;
+  on_stop : unit -> unit;
+  callback_running : unit -> bool;
 }
+
+(** How long past its deadline the bounded join keeps waiting for an idle
+    activity lane before detaching it anyway: 150 ms. An idle lane exits
+    within one bounded readiness wait (at most 100 ms, and immediately once
+    native polling has stopped), so the allowance is not normally reached.
+    It is smaller than the bounded-shutdown lanes slack, so a joined [run]
+    still returns before shutdown stops waiting for its lifecycle lock. *)
+val idle_detach_allowance_s : float
 
 (** Runs both lanes until [closed] or a fatal lane result. With [detach = None]
     the activity Domain is always joined before returning, so the caller may

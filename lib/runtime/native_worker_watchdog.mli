@@ -54,5 +54,11 @@ val start :
   abandon:(epoch:int -> elapsed_ms:int -> unit) ->
   (t, exn) result
 
-(** Stops and joins the watchdog Domain. It returns within about one tick. *)
+(** Longest single sleep of the watchdog Domain: 20 ms. A tick is slept in
+    slices of at most this length so {!stop} never waits for a whole tick. *)
+val stop_poll_s : float
+
+(** Stops and joins the watchdog Domain. It returns within about
+    {!stop_poll_s}, whatever the tick, so the run loop that owns the watchdog
+    exits promptly enough for bounded shutdown's lanes slack (#1023). *)
 val stop : t -> unit

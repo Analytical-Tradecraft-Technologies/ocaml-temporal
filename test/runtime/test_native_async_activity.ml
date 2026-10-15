@@ -129,6 +129,9 @@ type fake_supervisor = {
   reject_next_async_heartbeat_connection : bool ref;
   reject_next_async_heartbeat_rejected : bool ref;
   reject_next_async_heartbeat_terminal : bool ref;
+  async_heartbeat_hook : (unit -> unit) ref;
+      (** Runs first in every async heartbeat, standing for the time the RPC
+          spends on the network; a test may block in it (#1025). *)
 }
 (** Fake native state. [leased] and [async_leased] intentionally model
     different Temporal APIs and are never allowed to substitute for one another.
@@ -159,6 +162,7 @@ let fake_supervisor () =
     reject_next_async_heartbeat_connection = ref false;
     reject_next_async_heartbeat_rejected = ref false;
     reject_next_async_heartbeat_terminal = ref false;
+    async_heartbeat_hook = ref ignore;
   }
 
 (** Removes the first byte-identical token from a lease ledger. Tokens are
@@ -300,6 +304,7 @@ module Fake_supervisor = struct
 
   (** Records heartbeat details against the namespace-bound async lease. *)
   let record_async_activity_heartbeat supervisor encoded =
+    !(supervisor.async_heartbeat_hook) ();
     let heartbeat = copy_heartbeat encoded in
     incr supervisor.async_heartbeat_calls;
     supervisor.async_heartbeat_documents :=
@@ -2110,6 +2115,100 @@ let test_async_lease_visible_while_callback_runs () =
   if Worker.outstanding_async_leases worker <> Some 0 then
     failwith "discard did not close the async lease"
 
+(** Waits for a cross-Domain observation, failing after five seconds. *)
+let await_flag label flag =
+  let deadline = Unix.gettimeofday () +. 5. in
+  while not (Atomic.get flag) do
+    if Unix.gettimeofday () > deadline then failwith ("timed out: " ^ label);
+    Thread.delay 0.005
+  done
+
+(** #1023: an asynchronous callback that is still running when the grace
+    period ends is abandoned user code, exactly like a synchronous one, so
+    the shutdown probe must report it. Only synchronous starts used to set
+    the running state, so an abandoned [define_async] callback was reported
+    as a native call. *)
+let test_async_callback_reported_running () =
+  let supervisor = fake_supervisor () in
+  let entered = Atomic.make false and release = Atomic.make false in
+  let activity =
+    Temporal.Activity.define_async ~name:"async_callback_running"
+      ~input:Temporal.Codec.unit ~output:Temporal.Codec.string
+      (fun context () ->
+        Atomic.set entered true;
+        while not (Atomic.get release) do
+          Thread.delay 0.005
+        done;
+        Temporal.Activity.Will_complete_async
+          (Temporal.Activity.Async_context.handle context))
+  in
+  enqueue supervisor
+    (start_task ~token:(Bytes.of_string "async-running-token")
+       ~activity_type:"async_callback_running"
+       ~input:[ encode_input Temporal.Codec.unit () ]);
+  let worker = worker supervisor [ Adapter.register_async activity ] in
+  if Worker.callback_running worker then
+    failwith "an idle adapter reported a running callback";
+  let lane = Domain.spawn (fun () -> Worker.poll worker) in
+  await_flag "async callback entered" entered;
+  if not (Worker.callback_running worker) then
+    failwith "a running asynchronous callback was not reported";
+  Atomic.set release true;
+  expect_deferred (Domain.join lane);
+  (* After the handoff the work belongs to external code: it is an async
+     lease, not a running callback. *)
+  if Worker.callback_running worker then
+    failwith "a returned asynchronous callback was still reported running";
+  if Worker.outstanding_async_leases worker <> Some 1 then
+    failwith "the handed-off lease was not counted"
+
+(** #1025: the namespace-bound RPC of an async heartbeat runs without the
+    adapter's async lock. While one handle's heartbeat waits for the server,
+    the shutdown probe still reads the lease count and the activity lane
+    still admits another handoff; before, both waited for the RPC. *)
+let test_async_rpc_runs_without_async_lock () =
+  let token = Bytes.of_string "async-unlocked-rpc-token" in
+  let supervisor, worker, handle, _ =
+    heartbeat_status_fixture ~name:"async_unlocked_rpc" ~token
+  in
+  let entered = Atomic.make false and release = Atomic.make false in
+  supervisor.async_heartbeat_hook :=
+    (fun () ->
+      Atomic.set entered true;
+      while not (Atomic.get release) do
+        Thread.delay 0.005
+      done);
+  let heartbeat =
+    Domain.spawn (fun () -> Temporal.Activity.Async_handle.heartbeat handle [])
+  in
+  await_flag "async heartbeat in flight" entered;
+  if Worker.outstanding_async_leases worker <> Some 1 then
+    failwith "the lease probe waited for, or was hidden by, an in-flight RPC";
+  (* A second attempt of the same registered type is handed off meanwhile;
+     its admission takes the same async lock. *)
+  enqueue supervisor
+    (start_task ~token:(Bytes.of_string "async-unlocked-second-token")
+       ~activity_type:"async_unlocked_rpc"
+       ~input:[ encode_input Temporal.Codec.unit () ]);
+  let admitted = Atomic.make false in
+  let lane =
+    Domain.spawn (fun () ->
+        let result = Worker.poll worker in
+        Atomic.set admitted true;
+        result)
+  in
+  await_flag "second handoff admitted during the RPC" admitted;
+  expect_deferred (Domain.join lane);
+  if Worker.outstanding_async_leases worker <> Some 2 then
+    failwith "the second lease was not admitted";
+  Atomic.set release true;
+  (match Domain.join heartbeat with
+  | Ok () -> ()
+  | Error error ->
+      failwith ("in-flight heartbeat failed: " ^ Temporal.Error.message error));
+  if List.length !(supervisor.async_heartbeats) <> 1 then
+    failwith "the in-flight heartbeat was not recorded"
+
 (** Runs the isolated async lifecycle assertions. *)
 let () =
   test_base_state_machine ();
@@ -2141,4 +2240,6 @@ let () =
   test_completion_racing_handoff_is_retryable ();
   test_completer_domain_retries_until_handoff ();
   test_unactivated_handles_close ();
-  test_async_lease_visible_while_callback_runs ()
+  test_async_lease_visible_while_callback_runs ();
+  test_async_callback_reported_running ();
+  test_async_rpc_runs_without_async_lock ()

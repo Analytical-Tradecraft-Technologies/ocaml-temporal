@@ -146,10 +146,16 @@ for workflow in "$root/.github/workflows/build.yml" "$root/.github/workflows/bui
     fail "$(basename "$workflow") allows conf packages to replace the pinned native toolchain"
   fi
 done
-if [ "$(grep -c 'run: sh scripts/opam-locked-deps.sh install --assume-depexts$' \
-    "$root/.github/workflows/build-pr.yml")" -ne 2 ]; then
-  fail "build-pr.yml native macOS/Windows lanes do not install the locked closure"
-fi
+# Each native test lane must install the locked closure itself. The check is
+# per job, so another macOS job that also installs it (the master-tier opam
+# source-archive lane, #778) cannot stand in for a lane that dropped it.
+for native_lane in native-macos native-windows; do
+  if ! sed -n "/^  $native_lane:\$/,/^  [a-z][a-z0-9-]*:\$/p" \
+      "$root/.github/workflows/build-pr.yml" |
+    grep -Fx '        run: sh scripts/opam-locked-deps.sh install --assume-depexts' >/dev/null; then
+    fail "build-pr.yml native macOS/Windows lanes do not install the locked closure"
+  fi
+done
 
 for required_dependency in $required_dependencies; do
   case "$opam_dependencies" in
