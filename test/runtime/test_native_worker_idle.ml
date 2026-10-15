@@ -5,11 +5,20 @@
     {!Temporal_runtime.Native_worker_loop} against a fake supervisor: one
     mutex stands for the single owner Domain, so a poll issued while the fake
     readiness wait runs queues behind it, as it does in the native mailbox.
-    Their assertions are on poll order and on the pacing decisions (which
-    delays the lanes request), never on wall time or on the total of
-    requested delays, because those depend on the platform's sleep
-    granularity. Every test wait has a deadline so a lost wake fails
-    promptly. *)
+    Their assertions are mainly on poll order and on the pacing decisions
+    (which delays the lanes request), not on the total of requested delays,
+    which depends on the platform's sleep granularity. Every test wait has a
+    deadline so a lost wake fails promptly, and the idle-stop test only
+    bounds its stop far above the expected time.
+
+    One assertion is deliberately on wall time: the serial chain's mean
+    step must stay below one 15.625 ms Windows timer tick (#1008). It
+    assumes that the lanes' local yields have sub-tick precision, which the
+    bridge's high-resolution pacing sleep provides on every supported
+    platform, so it is skipped under [IDLE_TEST_SLEEP_MODEL=windows-thread-delay],
+    which reproduces the old tick-bound yields. It tolerates a loaded runner
+    because the measured mean, about 1.1 ms, is more than ten times below
+    the bound, and averaging over 100 steps absorbs a few delayed ones. *)
 
 (** Seconds on the native monotonic clock, which has sub-microsecond
     resolution on every supported platform. The simulated server round trips

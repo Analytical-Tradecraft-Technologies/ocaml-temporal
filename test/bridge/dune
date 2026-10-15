@@ -4,7 +4,7 @@
 
 (test
  (name test_pacing_sleep)
- (libraries temporal_core_bridge))
+ (libraries temporal_core_bridge threads.posix))
 
 (test
  (name test_runtime_threads)

@@ -42,22 +42,43 @@ let test_precision () =
     failwith
       (Printf.sprintf "median 1 ms pacing sleep took %.3f ms" (median *. 1000.))
 
-(** Another Domain keeps running while one sleeps, so the stub released the
-    runtime lock. *)
+(** A sibling system thread on the same Domain keeps running while one
+    sleeps, so the stub released the runtime lock. Both threads share one
+    Domain's runtime lock: a separate Domain has its own and would progress
+    even if the stub held it. The observer spins in pure OCaml until a
+    deadline well inside the 200 ms sleep; if the lock were held, it could
+    only run after the sleep, so it records whether it finished first.
+    [started] is never reset, so a late observer cannot wait forever. *)
 let test_releases_runtime_lock () =
-  let progressed = Atomic.make false in
-  let sleeper = Domain.spawn (fun () -> Bridge.pacing_sleep 0.2) in
-  let worker =
-    Domain.spawn (fun () ->
+  let started = Atomic.make false in
+  let sleeping = Atomic.make false in
+  let finished_during_sleep = Atomic.make false in
+  let sleeper =
+    Thread.create
+      (fun () ->
+        Atomic.set sleeping true;
+        Atomic.set started true;
+        Bridge.pacing_sleep 0.2;
+        Atomic.set sleeping false)
+      ()
+  in
+  let observer =
+    Thread.create
+      (fun () ->
+        while not (Atomic.get started) do
+          Thread.yield ()
+        done;
         let deadline = now () +. 0.05 in
         while now () < deadline do
-          Domain.cpu_relax ()
+          ()
         done;
-        Atomic.set progressed true)
+        Atomic.set finished_during_sleep (Atomic.get sleeping))
+      ()
   in
-  Domain.join worker;
-  Domain.join sleeper;
-  assert (Atomic.get progressed)
+  Thread.join observer;
+  Thread.join sleeper;
+  if not (Atomic.get finished_during_sleep) then
+    failwith "pacing_sleep held the runtime lock"
 
 (** Runs the pacing sleep checks. *)
 let () =
