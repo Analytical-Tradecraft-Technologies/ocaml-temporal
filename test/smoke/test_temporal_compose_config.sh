@@ -512,7 +512,26 @@ require_master_smoke_text() {
 }
 require_master_smoke_text 'make test-temporal-live-ci'
 require_master_smoke_text 'name: Temporal/PostgreSQL integration smoke (OCaml 5.5)'
-require_master_smoke_text 'timeout-minutes: 45'
+require_master_smoke_text 'timeout-minutes: 80'
+# Every step carries its own timeout and the job timeout covers their sum, so
+# a hung scenario step times out on its own and the always() evidence uploads
+# after it still run before GitHub kills the job (#504, #519).
+smoke_budget=$(printf '%s\n' "$master_smoke" | awk '
+  /^    timeout-minutes:/ { job = $2 }
+  /^      - name:/ { steps++ }
+  /^        timeout-minutes:/ { timed++; sum += $2 }
+  END { printf "%d %d %d %d\n", job, steps, timed, sum }')
+read -r smoke_job smoke_steps smoke_timed smoke_sum <<EOF
+$smoke_budget
+EOF
+if [ "$smoke_steps" -eq 0 ] || [ "$smoke_steps" -ne "$smoke_timed" ]; then
+  echo "every Temporal integration step needs timeout-minutes ($smoke_timed of $smoke_steps have one)" >&2
+  exit 1
+fi
+if [ "$smoke_sum" -gt "$smoke_job" ]; then
+  echo "Temporal integration step timeouts ($smoke_sum min) exceed the job timeout ($smoke_job min)" >&2
+  exit 1
+fi
 require_master_smoke_text 'OCAML_VERSION: "5.5.1"'
 require_source_text "$makefile" '$(MAKE) test-temporal-integration'
 require_source_text "$makefile" '$(MAKE) test-temporal-worker-restart'
