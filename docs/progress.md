@@ -60,6 +60,32 @@ workflows, YAML parses of them, `make test-quality-contract` and
 `make test-temporal-config` (Docker-free contracts), and a relative-link check
 of the edited Markdown.
 
+## 2026-10-14: Malformed-history controls and feature coverage for the replay corpus (#503)
+
+The [replay history corpus](reference/history-corpus.md) gains a third
+expected verdict, `invalid_history`, and five malformed-history negative
+controls derived from committed histories: a truncated protobuf, a gap in
+event IDs, a start event without a task queue, a first workflow task Core
+auto-fails, and a history replayed under another execution's workflow ID.
+Each reuses a `replays_ok` entry's history unchanged on disk; the runner
+applies the entry's named `history_mutation` in memory before replay
+(`corpus_history_mutation.ml`), so the source entry and the edit are the
+complete provenance and no derived binary is committed. Every control pins
+its `Temporal.Replay` refusal reason with `expected_message`.
+
+The runner's `required_features` list became a feature coverage table
+(`corpus_coverage.ml`) mapping every replay-relevant supported feature to a
+`replayed` case, a nondeterminism or invalid-history control, or an explicit
+`not applicable` or `not yet captured` reason. The runner fails when a
+feature tag has no row, a covered row has no case, a gap row gains a
+`replays_ok` case without being promoted, or the table in the reference
+document differs; the report carries the table with its case IDs. The known
+gaps (cancellation, activity and workflow timeouts, workflow retries, local
+activities, external signals and cancellation, start metadata,
+search-attribute upserts, and time/random-dependent commands) still need live
+captures. Two new `test_history_corpus_mismatch` scenarios check that a
+control whose edit stops applying fails, and that unclassified and stale
+coverage is reported.
 ## 2026-10-14: Installed consumer replays fixture histories (#497)
 
 The installed-package consumer previously only type-checked
