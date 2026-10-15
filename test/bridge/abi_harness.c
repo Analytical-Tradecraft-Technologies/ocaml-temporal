@@ -85,6 +85,13 @@ int main(void) {
   assert(ocaml_temporal_core_v4_result_free(&result) ==
          OCAML_TEMPORAL_CORE_STATUS_OK);
 
+  /* The idle pacing sleep takes no result object; zero returns at once and a
+   * short request sleeps without touching bridge state (#1008). */
+  assert(ocaml_temporal_core_v4_pacing_sleep_ns(0) ==
+         OCAML_TEMPORAL_CORE_STATUS_OK);
+  assert(ocaml_temporal_core_v4_pacing_sleep_ns(UINT64_C(100000)) ==
+         OCAML_TEMPORAL_CORE_STATUS_OK);
+
   assert(ocaml_temporal_core_v4_runtime_new(&runtime, &result) ==
          OCAML_TEMPORAL_CORE_STATUS_OK);
   assert(runtime != NULL);

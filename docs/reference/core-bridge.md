@@ -85,6 +85,18 @@ the version and symbol prefix stay at 4. The completion registry, its
 ownership, and its shutdown behavior are described in the
 [client protocol](client-protocol.md#submitted-client-calls-807).
 
+The worker idle pacing sleep (#1008) is also additive within version 4.
+`ocaml_temporal_core_v4_pacing_sleep_ns(nanoseconds)` sleeps the calling
+thread for at most `OCAML_TEMPORAL_CORE_MAX_PACING_SLEEP_NS` (one second)
+through `std::thread::sleep`, which uses a per-timer high-resolution waitable
+timer (`CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`) on Windows 10 1803 and later
+and `Sleep` only where that is unavailable. It changes no process- or
+system-wide timer resolution (no `timeBeginPeriod`), touches no bridge state,
+and takes no result object, so the idle path allocates nothing; it returns
+`OK`, or `PANIC` if a panic was contained. The OCaml stub releases the
+runtime lock around it. No existing symbol or document changes, and an older
+OCaml object never calls it.
+
 The canonical header is
 `rust/core-bridge/include/ocaml_temporal_core.h`. Both Rust and C compile-time
 assertions protect the status width, every numeric status value, and field

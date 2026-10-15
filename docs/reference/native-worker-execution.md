@@ -45,7 +45,10 @@ polls keep the preferred lane from observing both lanes idle. If its sibling is
 busy or owns the native wait, a lane yields locally and then retries its
 nonblocking `try_poll_*` operation. This prevents an idle lane
 from repeatedly occupying the sole supervisor owner during work on the other
-lane. The yield is paced by the private `Native_worker_idle` module (#994).
+lane. The yield is paced by the private `Native_worker_idle` module (#994)
+and sleeps through the bridge's high-resolution pacing sleep rather than
+`Thread.delay`, so its sub-millisecond steps are not rounded to the 15.6 ms
+Windows timer tick (#1008).
 While the sibling's native wait is in flight, the lane repolls at once, but
 only once per wait: that poll queues behind the wait in the supervisor mailbox
 and runs as soon as either lane has work, so the wait serves both lanes.

@@ -80,6 +80,23 @@ ocaml_temporal_core_status ocaml_temporal_core_v4_echo(
 ocaml_temporal_core_status ocaml_temporal_core_v4_conformance_wait_ms(
     uint32_t milliseconds, ocaml_temporal_core_result *output);
 
+/* Longest sleep performed by ocaml_temporal_core_v4_pacing_sleep_ns. */
+#define OCAML_TEMPORAL_CORE_MAX_PACING_SLEEP_NS UINT64_C(1000000000)
+
+/*
+ * Sleep the calling thread for `nanoseconds`, clamped to
+ * OCAML_TEMPORAL_CORE_MAX_PACING_SLEEP_NS, for worker idle pacing (#1008).
+ * On Windows this uses a per-timer high-resolution waitable timer where the
+ * OS provides one, so sub-tick sleeps do not round up to the 15.6 ms system
+ * timer tick, and no process- or system-wide timer resolution is changed.
+ * Zero returns at once. Safe from any thread; callers should release their
+ * language runtime lock. Takes no result object: returns
+ * OCAML_TEMPORAL_CORE_STATUS_OK, or OCAML_TEMPORAL_CORE_STATUS_PANIC if a
+ * Rust panic was contained. This is not a Temporal workflow timer.
+ */
+ocaml_temporal_core_status ocaml_temporal_core_v4_pacing_sleep_ns(
+    uint64_t nanoseconds);
+
 /*
  * Create the sole native runtime owner for one SDK instance. On success,
  * `runtime` receives an opaque handle and `output` is an empty success.

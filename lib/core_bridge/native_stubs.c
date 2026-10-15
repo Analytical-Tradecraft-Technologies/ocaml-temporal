@@ -508,6 +508,33 @@ CAMLprim value ocaml_temporal_conformance_wait_ms(value milliseconds) {
   CAMLreturn(response);
 }
 
+/* Sleep [seconds] for worker idle pacing (#1008) with the OCaml runtime lock
+ * released, so other Domains and threads keep running. Rust implements the
+ * sleep with a per-timer high-resolution waitable timer on Windows, where
+ * [Thread.delay] rounds a sub-tick request up to the 15.6 ms system timer
+ * tick; elsewhere it is [nanosleep]. A request that is not positive (or NaN)
+ * returns without entering the blocking section, and longer requests are
+ * clamped to OCAML_TEMPORAL_CORE_MAX_PACING_SLEEP_NS before conversion, so the
+ * double-to-integer cast is always in range. [seconds] is read before the
+ * lock is released and never touched afterwards, and the stub allocates
+ * nothing, so it needs no GC roots. A contained Rust panic only shortens the
+ * sleep, which callers already tolerate, so its status is ignored. */
+CAMLprim value ocaml_temporal_pacing_sleep(value seconds) {
+  double requested = Double_val(seconds);
+  uint64_t nanoseconds;
+
+  if (!(requested > 0.0)) {
+    return Val_unit;
+  }
+  nanoseconds = requested * 1e9 >= (double)OCAML_TEMPORAL_CORE_MAX_PACING_SLEEP_NS
+                    ? OCAML_TEMPORAL_CORE_MAX_PACING_SLEEP_NS
+                    : (uint64_t)(requested * 1e9);
+  bridge_enter_blocking_section();
+  (void)ocaml_temporal_core_v4_pacing_sleep_ns(nanoseconds);
+  caml_leave_blocking_section();
+  return Val_unit;
+}
+
 /* Create Core/Tokio while the OCaml runtime lock is released. Rust writes only
  * C-stack storage during the blocking section; the opaque pointer and result
  * are copied into rooted custom blocks after reacquiring the lock.

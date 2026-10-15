@@ -116,9 +116,12 @@ let next_delay lane =
       next
     end
 
+(** The bridge's pacing sleep rather than [Thread.delay], which on Windows
+    rounds every backoff step to an immediate return or a whole 15.6 ms timer
+    tick (#1008). *)
 let local_yield lane =
   let delay = next_delay lane in
-  if delay > 0. then Thread.delay delay
+  if delay > 0. then Temporal_core_bridge.Native_bridge.pacing_sleep delay
 
 let wait lane ~native_wait:use_native ready =
   if not use_native then begin

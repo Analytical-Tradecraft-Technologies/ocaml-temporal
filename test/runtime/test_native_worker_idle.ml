@@ -23,29 +23,50 @@ module Loop = Temporal_runtime.Native_worker_loop
 module Idle = Temporal_runtime.Native_worker_idle
 
 (** Optional simulation of the Windows sleep, selected with
-    [IDLE_TEST_SLEEP_MODEL=windows]. OCaml's Windows [Thread.delay] passes
-    whole milliseconds to [Sleep], truncating: a request under 1 ms returns at
-    once, and a longer one lasts until a later 15.625 ms timer tick. Sub-ms
-    backoff steps are therefore free on Windows, and lanes take many more
-    pacing decisions per unit of time than on macOS or Linux. Every fixture
-    sleep, including the lanes' local yields, goes through {!sleep}, so the
-    Windows CI interleaving can be reproduced locally. Unset, sleeps are
-    passed through unchanged. *)
-let windows_sleep_model =
+    [IDLE_TEST_SLEEP_MODEL]. OCaml's Windows [Thread.delay] passes whole
+    milliseconds to [Sleep], truncating: a request under 1 ms returns at
+    once, and a longer one lasts until a later 15.625 ms timer tick.
+
+    - [windows] applies that model to every fixture sleep (the fake wait's
+      recheck, the test's own waits) but not to the lanes' local yields,
+      which go through the bridge's high-resolution pacing sleep as in
+      production (#1008). This is the interleaving of the Windows CI job.
+    - [windows-thread-delay] also applies it to the lanes' local yields,
+      reproducing the Windows behaviour before #1008, when the yields used
+      [Thread.delay]. It is a diagnostic for comparing per-step latency.
+
+    Unset, fixture sleeps are passed through to [Thread.delay] unchanged. *)
+type sleep_model = Native | Windows | Windows_thread_delay
+
+(** The model selected by [IDLE_TEST_SLEEP_MODEL]. *)
+let sleep_model =
   match Sys.getenv_opt "IDLE_TEST_SLEEP_MODEL" with
-  | None | Some "" -> false
-  | Some "windows" -> true
+  | None | Some "" -> Native
+  | Some "windows" -> Windows
+  | Some "windows-thread-delay" -> Windows_thread_delay
   | Some other -> invalid_arg ("unknown IDLE_TEST_SLEEP_MODEL " ^ other)
 
-(** Every sleep in this fixture, in seconds. *)
-let sleep seconds =
-  if not windows_sleep_model then Thread.delay seconds
+(** [Thread.delay] as OCaml performs it on Windows at the default timer
+    resolution. *)
+let windows_thread_delay seconds =
+  let whole_ms = Float.of_int (int_of_float (seconds *. 1000.)) in
+  if whole_ms <= 0. then Thread.delay 0.
   else
-    let whole_ms = Float.of_int (int_of_float (seconds *. 1000.)) in
-    if whole_ms <= 0. then Thread.delay 0.
-    else
-      let tick_ms = 15.625 in
-      Thread.delay (Float.ceil (whole_ms /. tick_ms) *. tick_ms /. 1000.)
+    let tick_ms = 15.625 in
+    Thread.delay (Float.ceil (whole_ms /. tick_ms) *. tick_ms /. 1000.)
+
+(** Every fixture sleep, in seconds, other than the lanes' local yields. *)
+let sleep seconds =
+  match sleep_model with
+  | Native -> Thread.delay seconds
+  | Windows | Windows_thread_delay -> windows_thread_delay seconds
+
+(** One lane local yield of [seconds]: the production pacing sleep, or the
+    pre-#1008 Windows [Thread.delay] under [windows-thread-delay]. *)
+let lane_yield seconds =
+  match sleep_model with
+  | Native | Windows -> Temporal_core_bridge.Native_bridge.pacing_sleep seconds
+  | Windows_thread_delay -> windows_thread_delay seconds
 
 (** Fails with [label] unless [condition] holds. *)
 let check label condition = if not condition then failwith label
@@ -322,7 +343,7 @@ let run_fake fake =
       else begin
         let delay = Idle.next_delay lane in
         record_sleep fake (lane_index ~workflow_lane) delay;
-        if delay > 0. then sleep delay;
+        if delay > 0. then lane_yield delay;
         Ok ()
       end)
     ~retry_pending:(fun ~workflow_lane:_ ->
@@ -423,16 +444,23 @@ let test_early_join_poll_requeues_behind_wait () =
     (max_sleep *. 1000.)
 
 (** A serial activity workflow alternates lanes on every step, with a
-    simulated 0.5 ms server round trip before each follow-up task. The
-    assertion is on the pacing decisions, not on time: the fixed 10 ms yield
-    requested about two capped yields per step, while adaptive pacing, which
-    restarts after every completed task, must request a capped yield in at
-    most one step in two. Neither wall time nor the total of requested
-    delays is bounded, because both depend on the platform's sleep
-    granularity: on Windows a sub-millisecond [Thread.delay] returns at once,
-    so the lanes take more backoff steps per round trip (about 6.5 ms of
-    requested yields per step, against 0.2 ms on macOS, with the same
-    decisions after each work event). *)
+    simulated 0.5 ms server round trip before each follow-up task. The main
+    assertion is on the pacing decisions: the fixed 10 ms yield requested
+    about two capped yields per step, while adaptive pacing, which restarts
+    after every completed task, must request a capped yield in at most one
+    step in two.
+
+    The total of requested delays is not bounded, because the number of
+    backoff steps per round trip depends on the sleep granularity: under
+    [windows-thread-delay], a sub-millisecond yield returns at once, so the
+    lanes request about 6.5 ms of yields per step against 0.2 ms otherwise.
+
+    The mean wall time per step must stay below one 15.625 ms Windows timer
+    tick whenever the lanes use the bridge's pacing sleep (#1008). It is
+    about 1.1 ms on macOS, natively and under the [windows] model, and 21 to
+    23 ms under [windows-thread-delay], where the bound is not applied. The
+    mean over 100 steps keeps an occasional delayed step on a loaded runner
+    from failing it. *)
 let test_serial_chain_avoids_fixed_sleep () =
   let steps = 100 in
   let rtt_s = 0.0005 in
@@ -480,7 +508,13 @@ let test_serial_chain_avoids_fixed_sleep () =
   if capped * 2 > steps then
     failwith
       (Printf.sprintf "serial chain requested %d capped yields in %d steps"
-         capped steps)
+         capped steps);
+  let windows_tick_ms = 15.625 in
+  if sleep_model <> Windows_thread_delay && wall_ms >= windows_tick_ms then
+    failwith
+      (Printf.sprintf
+         "serial chain took %.3f ms per step, not below one %.3f ms timer tick"
+         wall_ms windows_tick_ms)
 
 (** An idle worker does not spin: over one second the lanes make a bounded
     number of polls and native waits. A busy loop would make tens of

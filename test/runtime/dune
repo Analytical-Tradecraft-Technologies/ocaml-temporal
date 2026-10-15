@@ -37,9 +37,10 @@
  (libraries temporal-sdk temporal_runtime temporal_core_bridge unix))
 
 ; Reruns the idle-pacing regressions with the Windows sleep model (sub-ms
-; Thread.delay returns at once, longer sleeps last whole 15.625 ms ticks), so
-; the interleaving behind the Windows x64 CI failures is exercised on every
-; platform.
+; Thread.delay returns at once, longer sleeps last whole 15.625 ms ticks) for
+; the fixture's own sleeps, so the interleaving of the Windows x64 CI job is
+; exercised on every platform. The lanes' local yields keep using the
+; bridge's high-resolution pacing sleep, as they do on Windows (#1008).
 
 (rule
  (alias runtest)

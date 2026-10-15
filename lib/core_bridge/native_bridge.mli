@@ -82,6 +82,21 @@ val echo : bytes -> (bytes, error) result
     monotonic clock, which is a host defect. *)
 val monotonic_now_ns : unit -> int64
 
+(** [pacing_sleep seconds] blocks the calling thread for about [seconds],
+    releasing the OCaml runtime lock meanwhile, like [Thread.delay]. It exists
+    for worker idle pacing (#1008): on Windows, [Thread.delay] passes whole
+    milliseconds to [Sleep], so a sub-millisecond request returns at once and
+    a longer one lasts until the next 15.6 ms system timer tick. This sleep
+    uses a per-timer high-resolution waitable timer there instead (Windows 10
+    1803 and later; older systems fall back to [Sleep]) and never changes the
+    process- or system-wide timer resolution. Elsewhere it is [nanosleep].
+
+    A request that is not positive returns at once; requests above one second
+    are clamped to one second. Pending OCaml signal handlers are not run
+    before the sleep, but run at the next poll point after it. It is not a
+    workflow timer and must not be called from workflow code. *)
+val pacing_sleep : float -> unit
+
 (** Waits in Rust for at most 1,000 milliseconds while allowing other OCaml
     Domains to run. This tests the blocking-call design used by future worker
     polling. Values outside 0 through 1,000 return an error. *)

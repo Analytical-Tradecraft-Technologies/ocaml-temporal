@@ -15,6 +15,48 @@ implementation when a later entry documents that work as complete. The
 records the current tested source, named assertions and successful CI job for
 the Temporal acceptance controllers.
 
+## 2026-10-15: Worker idle pacing keeps sub-tick precision on Windows (#1008)
+
+The adaptive idle pacing from #994 slept with `Thread.delay`, which on
+Windows passes whole milliseconds to `Sleep`: a sub-millisecond backoff step
+returned at once and a longer one lasted until the next 15.625 ms timer tick.
+Under the simulated Windows model a serial activity step took about 21 ms,
+so #994's latency win did not apply there.
+
+`Native_worker_idle.local_yield` now sleeps through a new additive ABI
+version 4 symbol, `ocaml_temporal_core_v4_pacing_sleep_ns`, called from the
+`Native_bridge.pacing_sleep` stub with the runtime lock released. It is
+`std::thread::sleep`, which on Windows 10 1803 and later uses a per-timer
+high-resolution waitable timer (`CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`) and
+falls back to `Sleep` elsewhere; on Unix-like targets it is `nanosleep`, as
+`Thread.delay` was. The bridge adds no unsafe or platform-specific code.
+Alternatives were rejected: `timeBeginPeriod(1)` changes the timer
+resolution for the whole process and, on older Windows, the whole system,
+behind the application's back; waiting on the native readiness event
+instead of yielding is not possible, because the local yield runs exactly
+when the sibling lane holds the single supervisor (busy, or in its own
+readiness wait), and adapting the backoff to whole ticks would keep the
+15.6 ms floor. The pacing algorithm and its decisions are unchanged, so idle
+CPU, bounded shutdown (#495) and cancellation (#494) behave as before.
+
+Evidence on macOS with OCaml 5.4.1:
+- `test/runtime/test_native_worker_idle.ml` serial chain, per step:
+  1.1 ms natively and under `IDLE_TEST_SLEEP_MODEL=windows` (fixture sleeps
+  tick-bound, lane yields through the pacing sleep, as on Windows), against
+  21 to 23 ms under the new `windows-thread-delay` model, which reproduces
+  the old yields. The test now also fails if the mean step is not below one
+  15.625 ms tick whenever the lanes use the pacing sleep, so the Windows x64
+  job checks the real timer. An idle worker still makes 20 polls and
+  10 native waits per second; an idle stop returns in about 90 ms.
+- `rust/core-bridge/tests/pacing_sleep.rs` and
+  `test/bridge/test_pacing_sleep.ml`: a pacing sleep lasts at least the
+  requested time, non-positive requests return at once, the runtime lock is
+  released, the header clamp matches Rust, and the median of 21 one-millisecond
+  sleeps is below half a tick (1.5 ms on macOS). `Sleep(1)` at the default
+  resolution would last a whole tick, so these fail on Windows if the
+  high-resolution timer is not used.
+- `test/bridge/abi_harness.c` calls the new symbol from C.
+
 ## 2026-10-13: Shutdown stops Core polling early, retires local activities without retry, reports accurately, and async activity calls leave the owner Domain (#1028, #1029, #1023, #1025)
 
 Temporal Core kept long-polling the server for the whole grace period,
