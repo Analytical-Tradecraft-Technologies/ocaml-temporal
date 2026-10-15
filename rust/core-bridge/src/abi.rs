@@ -223,6 +223,11 @@ enum ClientCallKind {
     Update,
     PollUpdate,
     Visibility,
+    /// Complete, fail, or cancel an activity handed off with
+    /// `WillCompleteAsync` (#1025).
+    AsyncActivityCompletion,
+    /// Heartbeat an activity handed off with `WillCompleteAsync` (#1025).
+    AsyncActivityHeartbeat,
 }
 
 impl TryFrom<u32> for ClientCallKind {
@@ -241,6 +246,8 @@ impl TryFrom<u32> for ClientCallKind {
             8 => Self::Update,
             9 => Self::PollUpdate,
             10 => Self::Visibility,
+            11 => Self::AsyncActivityCompletion,
+            12 => Self::AsyncActivityHeartbeat,
             _ => {
                 return Err(Failure {
                     status: STATUS_INVALID_ARGUMENT,
@@ -264,6 +271,14 @@ enum ClientRpc {
     Update(client_protocol::UpdateWorkflowRequest),
     PollUpdate(client_protocol::PollWorkflowUpdateRequest),
     Visibility(client_protocol::VisibilityRequest),
+    /// A namespace-bound async activity request (#1025). `namespace` is
+    /// `None` straight after [`ClientRpc::decode`], which has no runtime;
+    /// [`ClientRpc::bind_namespace`] fills it from the worker before the
+    /// future is built.
+    AsyncActivity {
+        request: AsyncActivityRequest,
+        namespace: Option<String>,
+    },
 }
 
 /// A client RPC future that owns its connection clone and produces exactly
@@ -304,7 +319,32 @@ impl ClientRpc {
             ClientCallKind::Visibility => Self::Visibility(
                 client_protocol::decode_visibility_request(text).map_err(protocol_failure)?,
             ),
+            ClientCallKind::AsyncActivityCompletion => Self::AsyncActivity {
+                request: AsyncActivityRequest::decode_completion(text)?,
+                namespace: None,
+            },
+            ClientCallKind::AsyncActivityHeartbeat => Self::AsyncActivity {
+                request: AsyncActivityRequest::decode_heartbeat(text)?,
+                namespace: None,
+            },
         })
+    }
+
+    /// Supplies the worker namespace an async activity request is addressed
+    /// to; every other request is returned unchanged. A runtime without a
+    /// worker namespace rejects the request synchronously with the same
+    /// `STATUS_INVALID_STATE` failure as the synchronous symbols.
+    fn bind_namespace(self, worker_namespace: Option<&str>) -> std::result::Result<Self, Failure> {
+        match self {
+            Self::AsyncActivity { request, .. } => {
+                let namespace = worker_namespace.ok_or_else(missing_worker_namespace)?;
+                Ok(Self::AsyncActivity {
+                    request,
+                    namespace: Some(namespace.to_owned()),
+                })
+            }
+            other => Ok(other),
+        }
     }
 
     /// Builds the operation's future. The future captures `connection` and
@@ -373,7 +413,258 @@ impl ClientRpc {
                     .map_err(client_operation_failure)?;
                 encode_bytes(client_protocol::encode_visibility_response(&response))
             }),
+            Self::AsyncActivity { request, namespace } => Box::pin(async move {
+                // `bind_namespace` always runs first. Should it ever not, the
+                // task must still not fail with `STATUS_INVALID_STATE`, which
+                // an await reserves for a closed call.
+                let namespace = namespace.ok_or_else(|| Failure {
+                    status: STATUS_INTERNAL,
+                    message: "asynchronous activity request has no namespace".to_owned(),
+                })?;
+                let client = async_activity_client_for(connection, namespace)?;
+                submitted_async_activity_outcome(request.send(client).await)
+            }),
         }
+    }
+}
+
+/// Fixed success body of a submitted async activity call whose task token
+/// the server no longer knows (`NotFound`). A submitted task must never fail
+/// with `STATUS_INVALID_STATE`: an await reports that status as the call
+/// having been closed by its runtime (see `client_calls`). The synchronous
+/// symbols keep returning `STATUS_INVALID_STATE` for the same outcome, and
+/// the OCaml decoder maps this body back to it.
+const ASYNC_ACTIVITY_NOT_FOUND_OUTCOME: &[u8] = b"not_found";
+
+/// Converts the outcome of [`AsyncActivityRequest::send`] for a submitted
+/// call: success is an empty body, `NotFound` is
+/// [`ASYNC_ACTIVITY_NOT_FOUND_OUTCOME`], and every other failure is returned
+/// unchanged.
+fn submitted_async_activity_outcome(outcome: std::result::Result<(), Failure>) -> Operation {
+    match outcome {
+        Ok(()) => Ok(Vec::new()),
+        Err(failure) if failure.status == STATUS_INVALID_STATE => {
+            Ok(ASYNC_ACTIVITY_NOT_FOUND_OUTCOME.to_vec())
+        }
+        Err(failure) => Err(failure),
+    }
+}
+
+/// The failure for an async activity request on a runtime that has never
+/// started a worker, and so has no namespace to address.
+fn missing_worker_namespace() -> Failure {
+    Failure {
+        status: STATUS_INVALID_STATE,
+        message: "Temporal worker namespace is not available".to_owned(),
+    }
+}
+
+/// Creates the namespace-bound official client used for activities handed
+/// off with `WillCompleteAsync`; see [`Runtime::async_activity_client`].
+fn async_activity_client_for(
+    connection: Connection,
+    namespace: String,
+) -> std::result::Result<Client, Failure> {
+    Client::new(connection, ClientOptions::new(namespace).build()).map_err(|_| Failure {
+        status: STATUS_CONNECTION,
+        message: "Temporal asynchronous activity client could not be created".to_owned(),
+    })
+}
+
+/// Converts ordered semantic payloads into the optional protobuf collection
+/// accepted by the async activity RPCs; an empty list is no payloads.
+fn async_payloads(
+    values: &[workflow_protocol::Payload],
+) -> std::result::Result<Option<api_common::Payloads>, Failure> {
+    if values.is_empty() {
+        return Ok(None);
+    }
+    let payloads = values
+        .iter()
+        .map(workflow_protocol::payload_to_core)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(core_conversion_failure)?;
+    Ok(Some(api_common::Payloads { payloads }))
+}
+
+/// One validated namespace-bound request for an activity handed off with
+/// `WillCompleteAsync`, converted to Core protobuf values before any RPC.
+///
+/// Decoding is synchronous so malformed input fails before a task or RPC
+/// exists. [`Self::send`] performs the single RPC and is shared by the
+/// synchronous symbols, which block the owner thread on it, and by submitted
+/// client calls (#1025), which run it on a Tokio task so the worker's owner
+/// Domain never waits for the server. No worker ledger entry is read or
+/// retired: the OCaml async lease owns the capability until the server
+/// accepts a terminal request.
+enum AsyncActivityRequest {
+    /// `RespondActivityTaskCompleted` with an optional result payload.
+    Completed {
+        task_token: Vec<u8>,
+        result: Option<api_common::Payloads>,
+    },
+    /// `RespondActivityTaskFailed` with a converted Temporal failure, boxed
+    /// because it is far larger than every other variant.
+    Failed {
+        task_token: Vec<u8>,
+        failure: Box<temporalio_common::protos::temporal::api::failure::v1::Failure>,
+    },
+    /// `RespondActivityTaskCanceled` with the canceled failure's details.
+    Cancelled {
+        task_token: Vec<u8>,
+        details: Option<api_common::Payloads>,
+    },
+    /// `RecordActivityTaskHeartbeat` with the heartbeat details.
+    Heartbeat {
+        task_token: Vec<u8>,
+        details: Option<api_common::Payloads>,
+    },
+}
+
+impl AsyncActivityRequest {
+    /// Strictly decodes a semantic activity completion for the async client.
+    ///
+    /// The decoder is shared with worker completions, but this path rejects
+    /// `will_complete_async`: that marker is the worker-to-client handoff,
+    /// not a terminal client operation. A cancellation must carry a canceled
+    /// failure, whose details become the RPC details.
+    fn decode_completion(text: &str) -> std::result::Result<Self, Failure> {
+        let semantic = activity_protocol::decode_completion(text).map_err(protocol_failure)?;
+        let task_token =
+            activity_protocol::decode_token(&semantic.task_token).map_err(protocol_failure)?;
+        Ok(match &semantic.result {
+            activity_protocol::ActivityCompletionResult::Completed { result } => Self::Completed {
+                task_token,
+                result: async_payloads(std::slice::from_ref(result))?,
+            },
+            activity_protocol::ActivityCompletionResult::Failed { failure } => Self::Failed {
+                task_token,
+                failure: Box::new(
+                    workflow_protocol::failure_to_core(failure).map_err(core_conversion_failure)?,
+                ),
+            },
+            activity_protocol::ActivityCompletionResult::Cancelled { failure } => {
+                let details = match &failure.info {
+                    workflow_protocol::FailureInfo::Canceled { details, .. } => {
+                        async_payloads(details)?
+                    }
+                    _ => {
+                        return Err(Failure {
+                            status: STATUS_PROTOCOL,
+                            message:
+                                "asynchronous activity cancellation must use a canceled failure"
+                                    .to_owned(),
+                        });
+                    }
+                };
+                Self::Cancelled {
+                    task_token,
+                    details,
+                }
+            }
+            activity_protocol::ActivityCompletionResult::WillCompleteAsync => {
+                return Err(Failure {
+                    status: STATUS_PROTOCOL,
+                    message: "asynchronous activity completion cannot defer again".to_owned(),
+                });
+            }
+        })
+    }
+
+    /// Strictly decodes a semantic activity heartbeat for the async client.
+    fn decode_heartbeat(text: &str) -> std::result::Result<Self, Failure> {
+        let semantic = activity_protocol::decode_heartbeat(text).map_err(protocol_failure)?;
+        let task_token =
+            activity_protocol::decode_token(&semantic.task_token).map_err(protocol_failure)?;
+        Ok(Self::Heartbeat {
+            task_token,
+            details: async_payloads(&semantic.details)?,
+        })
+    }
+
+    /// Sends the request through `client`, which owns its connection clone.
+    /// A server `NotFound` is `STATUS_INVALID_STATE`, a definite rejection is
+    /// `STATUS_ASYNC_HEARTBEAT_REJECTED`, and every other RPC failure is
+    /// `STATUS_CONNECTION`; see [`async_activity_failure`].
+    async fn send(self, mut client: Client) -> std::result::Result<(), Failure> {
+        let namespace = client.namespace();
+        let identity = client.identity();
+        let (operation, result) = match self {
+            Self::Completed { task_token, result } => {
+                let request = RespondActivityTaskCompletedRequest {
+                    task_token,
+                    result,
+                    identity,
+                    namespace,
+                    ..Default::default()
+                };
+                (
+                    AsyncActivityOperation::Completion,
+                    client
+                        .respond_activity_task_completed(request.into_request())
+                        .await
+                        .map(drop),
+                )
+            }
+            Self::Failed {
+                task_token,
+                failure,
+            } => {
+                let request = RespondActivityTaskFailedRequest {
+                    task_token,
+                    failure: Some(*failure),
+                    identity,
+                    namespace,
+                    ..Default::default()
+                };
+                (
+                    AsyncActivityOperation::Completion,
+                    client
+                        .respond_activity_task_failed(request.into_request())
+                        .await
+                        .map(drop),
+                )
+            }
+            Self::Cancelled {
+                task_token,
+                details,
+            } => {
+                let request = RespondActivityTaskCanceledRequest {
+                    task_token,
+                    details,
+                    identity,
+                    namespace,
+                    ..Default::default()
+                };
+                (
+                    AsyncActivityOperation::Completion,
+                    client
+                        .respond_activity_task_canceled(request.into_request())
+                        .await
+                        .map(drop),
+                )
+            }
+            Self::Heartbeat {
+                task_token,
+                details,
+            } => {
+                let request = RecordActivityTaskHeartbeatRequest {
+                    task_token,
+                    details,
+                    identity,
+                    namespace,
+                    ..Default::default()
+                };
+                (
+                    AsyncActivityOperation::Heartbeat,
+                    client
+                        .record_activity_task_heartbeat(request.into_request())
+                        .await
+                        .map(drop),
+                )
+            }
+        };
+        result.map_err(|status| async_activity_failure(operation, async_activity_rpc_error(status)))
     }
 }
 
@@ -425,6 +716,13 @@ enum CallScope {
     Wait(client_protocol::WaitWorkflowRequest),
     /// Any other RPC, bounded by its own deadline.
     Bounded,
+    /// A call that left the completion registry (read, or released by an
+    /// interrupted caller) while its task was still running (#1019). Its task
+    /// has been aborted and is kept only so disconnect and close can join it.
+    /// It holds no start, wait, or in-flight slot, but its handle still counts
+    /// toward the bound on retained handles: submission joins released tasks
+    /// once the map reaches the in-flight ceiling.
+    Released,
 }
 
 /// One submitted call's Tokio task, retained by the runtime owner so that
@@ -720,7 +1018,12 @@ pub struct Runtime {
     /// release every call registered under it.
     call_owner: u64,
     /// Tasks of submitted client calls that may still be running, keyed by
-    /// call identifier. Finished tasks are pruned on each submission.
+    /// call identifier. Finished tasks are pruned on each submission, and a
+    /// call that has left the completion registry is marked
+    /// [`CallScope::Released`] there so it stops counting against the limits.
+    /// Released tasks are joined before admission whenever the map has
+    /// reached the in-flight ceiling, so the map never holds more than
+    /// `client_limits.in_flight_calls` handles after a submission.
     pending_calls: HashMap<u64, PendingCall>,
     /// Admission limits of the current connection (#796). Set by a successful
     /// connect and reset to the defaults by disconnect, so a runtime without
@@ -1313,7 +1616,8 @@ impl Runtime {
     /// connection lookup, matching the asynchronous path.
     fn client_rpc_blocking(&mut self, kind: ClientCallKind, input: &[u8]) -> Operation {
         let text = decode_semantic_input(input)?;
-        let rpc = ClientRpc::decode(kind, text)?;
+        let rpc =
+            ClientRpc::decode(kind, text)?.bind_namespace(self.worker_namespace.as_deref())?;
         let (connection, handle) = self.client_and_handle()?;
         handle.block_on(rpc.into_future(connection))
     }
@@ -1332,7 +1636,10 @@ impl Runtime {
     /// Starts and waits keep their own limits (distinct request IDs and
     /// distinct runs, by default 64 each; repeats share a slot) and every
     /// class shares the in-flight ceiling (by default [`MAX_PENDING_CALLS`]),
-    /// all read from the connection's `client_limits` (#796). Admission
+    /// all read from the connection's `client_limits` (#796). Only calls
+    /// still in the completion registry count: a call that was read or
+    /// released stops counting here even if its task is still running, and
+    /// that task is aborted (#1019). Admission
     /// beyond a limit returns
     /// `STATUS_RESOURCE_EXHAUSTED` before any task or RPC exists. A start
     /// whose `request_id` is in flight for a different request is rejected
@@ -1342,13 +1649,33 @@ impl Runtime {
     fn submit_client_call(&mut self, kind: u32, input: &[u8]) -> Operation {
         let kind = ClientCallKind::try_from(kind)?;
         let text = decode_semantic_input(input)?;
-        let rpc = ClientRpc::decode(kind, text)?;
+        let rpc =
+            ClientRpc::decode(kind, text)?.bind_namespace(self.worker_namespace.as_deref())?;
         let (connection, handle) = self.client_and_handle()?;
         let limits = self.client_limits;
         // Dropping a finished task's handle cannot detach live work: its
         // future, and with it the connection clone, has already completed.
         self.pending_calls
             .retain(|_, call| !call.task.is_finished());
+        // A call that left the registry while its task still runs was read
+        // (its task is about to end) or released by an interrupted caller
+        // (#1019). Release already aborts the task, and a read call's task
+        // has already published its outcome, so aborting here is idempotent
+        // and harmless. The handle stays so disconnect can still join it, but
+        // the call no longer holds a start, wait, or in-flight slot.
+        let unregistered = crate::client_calls::unregistered_calls(
+            self.call_owner,
+            self.pending_calls
+                .iter()
+                .filter(|(_, call)| !matches!(call.scope, CallScope::Released))
+                .map(|(id, _)| *id),
+        );
+        for id in unregistered {
+            if let Some(call) = self.pending_calls.get_mut(&id) {
+                call.task.abort();
+                call.scope = CallScope::Released;
+            }
+        }
         let scope = match &rpc {
             ClientRpc::Start(request) => {
                 let mut distinct = HashSet::new();
@@ -1402,7 +1729,25 @@ impl Runtime {
             }
             _ => CallScope::Bounded,
         };
-        if self.pending_calls.len() >= limits.in_flight_calls
+        // Hard bound on retained task handles (Codex review on #1077). An
+        // aborted task's handle is only reaped once Tokio has run its
+        // cancellation, so a burst of release-and-resubmit could otherwise
+        // retain released handles (and their request state) without bound.
+        // When the map has reached the in-flight ceiling, join the released
+        // tasks first. They are already aborted, so the join only waits for
+        // their cancellation to run; this happens on the owner thread with
+        // the OCaml runtime lock released, like disconnect's join. Together
+        // with the live-call check below, this keeps
+        // `pending_calls.len() <= in_flight_calls` after every admission.
+        if self.pending_calls.len() >= limits.in_flight_calls {
+            self.reap_released_calls(&handle);
+        }
+        let in_flight = self
+            .pending_calls
+            .values()
+            .filter(|call| !matches!(call.scope, CallScope::Released))
+            .count();
+        if in_flight >= limits.in_flight_calls
             || crate::client_calls::registered_calls(self.call_owner) >= limits.in_flight_calls
         {
             return Err(Failure {
@@ -1429,8 +1774,37 @@ impl Runtime {
             let outcome = future.await;
             guard.complete(outcome);
         });
+        // Let a release from any thread abort this task (#1019). This runs
+        // before the handle reaches OCaml, so no release can precede it.
+        crate::client_calls::attach_task(self.call_owner, call, task.abort_handle());
         self.pending_calls.insert(call, PendingCall { scope, task });
         Ok(encoded)
+    }
+
+    /// Removes every [`CallScope::Released`] call from the task map and joins
+    /// its already aborted task on `handle`. Joining waits only for Tokio to
+    /// run each cancellation, so it is bounded; it never detaches a task that
+    /// still owns a connection clone.
+    fn reap_released_calls(&mut self, handle: &tokio::runtime::Handle) {
+        let released = self
+            .pending_calls
+            .iter()
+            .filter(|(_, call)| matches!(call.scope, CallScope::Released))
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>();
+        let tasks = released
+            .into_iter()
+            .filter_map(|id| self.pending_calls.remove(&id))
+            .map(|call| call.task)
+            .collect::<Vec<_>>();
+        if tasks.is_empty() {
+            return;
+        }
+        handle.block_on(async {
+            for task in tasks {
+                let _ = task.await;
+            }
+        });
     }
 
     /// Releases every submitted call and returns task handles still to join.
@@ -1832,6 +2206,36 @@ impl Runtime {
         Ok(Vec::new())
     }
 
+    /// Stops the child worker from taking new tasks while leaving it owned by
+    /// the graph; absence is already stopped (#1028).
+    ///
+    /// OCaml sends this as soon as its run loop observes a stop, before the
+    /// grace period in which running callbacks may still finish. Without it,
+    /// Core kept long-polling the server until [`Self::shutdown_worker`] ran
+    /// after the grace period, taking workflow and activity tasks that no
+    /// OCaml lane would ever run and that the release then had to fail.
+    ///
+    /// [`PollLanes::initiate_shutdown`] moves the ledger to `Draining`, closes
+    /// both readiness signals (queued tasks still drain first), and calls
+    /// Core's `initiate_shutdown`, which stops new polls and starts Core's own
+    /// graceful-shutdown timer. Completions and heartbeats for tasks already
+    /// leased to OCaml remain valid, so a running callback finishes normally.
+    /// The call never blocks on Core or the network.
+    fn initiate_worker_shutdown(&mut self) -> Operation {
+        let Some(worker) = self.worker.as_mut() else {
+            return Ok(Vec::new());
+        };
+        let handle = self
+            .core
+            .as_ref()
+            .expect("a live worker always has its parent runtime")
+            .tokio_handle();
+        // `initiate_shutdown` synchronously calls `tokio::spawn`.
+        let _runtime_guard = handle.enter();
+        worker.initiate_shutdown();
+        Ok(Vec::new())
+    }
+
     /// Shuts down and finalizes the child worker in bounded time; absence is
     /// already closed.
     ///
@@ -1842,7 +2246,8 @@ impl Runtime {
     /// bridge, and Core's polls do not report `ShutDown` until that happens
     /// (issue #769). The worker is shut down in three bounded steps:
     ///
-    /// 1. initiate Core shutdown;
+    /// 1. initiate Core shutdown, unless [`Self::initiate_worker_shutdown`]
+    ///    already did when the run loop stopped (#1028; it is idempotent);
     /// 2. retire every outstanding task while joining both poll lanes, for at
     ///    most [`WORKER_SHUTDOWN_DRAIN_TIMEOUT`];
     /// 3. run Core's finalizer in a task that owns the worker, waiting for at
@@ -2552,48 +2957,19 @@ impl Runtime {
             status: STATUS_INVALID_STATE,
             message: "Temporal client is not connected".to_owned(),
         })?;
-        let namespace = self.worker_namespace.clone().ok_or_else(|| Failure {
-            status: STATUS_INVALID_STATE,
-            message: "Temporal worker namespace is not available".to_owned(),
-        })?;
-        Client::new(connection, ClientOptions::new(namespace).build()).map_err(|_| Failure {
-            status: STATUS_CONNECTION,
-            message: "Temporal asynchronous activity client could not be created".to_owned(),
-        })
+        let namespace = self
+            .worker_namespace
+            .clone()
+            .ok_or_else(missing_worker_namespace)?;
+        async_activity_client_for(connection, namespace)
     }
 
-    /// Converts ordered semantic payloads into the optional protobuf collection
-    /// accepted by Core's asynchronous activity handle.
-    fn async_payloads(
-        values: &[workflow_protocol::Payload],
-    ) -> std::result::Result<Option<api_common::Payloads>, Failure> {
-        if values.is_empty() {
-            return Ok(None);
-        }
-        let payloads = values
-            .iter()
-            .map(workflow_protocol::payload_to_core)
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(core_conversion_failure)?;
-        Ok(Some(api_common::Payloads { payloads }))
-    }
-
-    /// Completes a previously accepted asynchronous activity through Core's
-    /// namespace-bound client API.
-    ///
-    /// The semantic decoder is intentionally shared with worker completions,
-    /// but this endpoint rejects `will_complete_async`: that marker is the
-    /// worker-to-client handoff, not a terminal client operation. No entry in
-    /// `self.activity_tasks` is read or retired here; the OCaml async lease
-    /// owns the capability until Core accepts a terminal request.
-    fn complete_async_activity(&mut self, input: &[u8]) -> Operation {
-        let text = decode_semantic_input(input)?;
-        let semantic = activity_protocol::decode_completion(text).map_err(protocol_failure)?;
-        let task_token =
-            activity_protocol::decode_token(&semantic.task_token).map_err(protocol_failure)?;
-        let mut client = self.async_activity_client()?;
-        let namespace = client.namespace();
-        let identity = client.identity();
+    /// Runs one validated async activity request to completion on the
+    /// calling owner thread. This is the synchronous ABI path kept for direct
+    /// bridge callers; the OCaml worker submits the same request as a client
+    /// call instead, so its owner Domain never waits for the server (#1025).
+    fn async_activity_blocking(&mut self, request: AsyncActivityRequest) -> Operation {
+        let client = self.async_activity_client()?;
         let handle = self
             .core
             .as_ref()
@@ -2602,108 +2978,27 @@ impl Runtime {
                 message: "Temporal runtime is already closed".to_owned(),
             })?
             .tokio_handle();
-        let operation = match &semantic.result {
-            activity_protocol::ActivityCompletionResult::Completed { result } => {
-                let payloads = Self::async_payloads(std::slice::from_ref(result))?;
-                let request = RespondActivityTaskCompletedRequest {
-                    task_token,
-                    result: payloads,
-                    identity,
-                    namespace,
-                    ..Default::default()
-                };
-                handle
-                    .block_on(client.respond_activity_task_completed(request.into_request()))
-                    .map(drop)
-            }
-            activity_protocol::ActivityCompletionResult::Failed { failure } => {
-                let failure =
-                    workflow_protocol::failure_to_core(failure).map_err(core_conversion_failure)?;
-                let request = RespondActivityTaskFailedRequest {
-                    task_token,
-                    failure: Some(failure),
-                    identity,
-                    namespace,
-                    ..Default::default()
-                };
-                handle
-                    .block_on(client.respond_activity_task_failed(request.into_request()))
-                    .map(drop)
-            }
-            activity_protocol::ActivityCompletionResult::Cancelled { failure } => {
-                let details = match &failure.info {
-                    workflow_protocol::FailureInfo::Canceled { details, .. } => {
-                        Self::async_payloads(details)?
-                    }
-                    _ => {
-                        return Err(Failure {
-                            status: STATUS_PROTOCOL,
-                            message:
-                                "asynchronous activity cancellation must use a canceled failure"
-                                    .to_owned(),
-                        });
-                    }
-                };
-                let request = RespondActivityTaskCanceledRequest {
-                    task_token,
-                    details,
-                    identity,
-                    namespace,
-                    ..Default::default()
-                };
-                handle
-                    .block_on(client.respond_activity_task_canceled(request.into_request()))
-                    .map(drop)
-            }
-            activity_protocol::ActivityCompletionResult::WillCompleteAsync => {
-                return Err(Failure {
-                    status: STATUS_PROTOCOL,
-                    message: "asynchronous activity completion cannot defer again".to_owned(),
-                });
-            }
-        };
-        operation.map_err(|status| {
-            async_activity_failure(
-                AsyncActivityOperation::Completion,
-                async_activity_rpc_error(status),
-            )
-        })?;
+        handle.block_on(request.send(client))?;
         Ok(Vec::new())
+    }
+
+    /// Completes a previously accepted asynchronous activity through Core's
+    /// namespace-bound client API; see
+    /// [`AsyncActivityRequest::decode_completion`] for the accepted input.
+    /// No entry in the worker ledger is read or retired here; the OCaml async
+    /// lease owns the capability until Core accepts a terminal request.
+    fn complete_async_activity(&mut self, input: &[u8]) -> Operation {
+        let text = decode_semantic_input(input)?;
+        let request = AsyncActivityRequest::decode_completion(text)?;
+        self.async_activity_blocking(request)
     }
 
     /// Records a heartbeat for an asynchronously completed activity through
     /// the same namespace-bound client handle used for terminal operations.
     fn record_async_activity_heartbeat(&mut self, input: &[u8]) -> Operation {
         let text = decode_semantic_input(input)?;
-        let semantic = activity_protocol::decode_heartbeat(text).map_err(protocol_failure)?;
-        let task_token =
-            activity_protocol::decode_token(&semantic.task_token).map_err(protocol_failure)?;
-        let details = Self::async_payloads(&semantic.details)?;
-        let mut client = self.async_activity_client()?;
-        let request = RecordActivityTaskHeartbeatRequest {
-            task_token,
-            details,
-            identity: client.identity(),
-            namespace: client.namespace(),
-            ..Default::default()
-        };
-        let handle = self
-            .core
-            .as_ref()
-            .ok_or_else(|| Failure {
-                status: STATUS_INVALID_STATE,
-                message: "Temporal runtime is already closed".to_owned(),
-            })?
-            .tokio_handle();
-        handle
-            .block_on(client.record_activity_task_heartbeat(request.into_request()))
-            .map_err(|status| {
-                async_activity_failure(
-                    AsyncActivityOperation::Heartbeat,
-                    async_activity_rpc_error(status),
-                )
-            })?;
-        Ok(Vec::new())
+        let request = AsyncActivityRequest::decode_heartbeat(text)?;
+        self.async_activity_blocking(request)
     }
 
     /// Revalidates Rust-produced task JSON and removes only the rejected
@@ -5539,6 +5834,39 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_worker_reject_activity_json(
                     message: "runtime pointer is null".to_owned(),
                 })?
                 .reject_polled_activity(input)
+        })
+    }
+}
+
+/// Stop the runtime graph's worker from taking new tasks, without releasing
+/// it (#1028).
+///
+/// Closes the bridge's admission and readiness signals and asks Core to stop
+/// polling the server. Outstanding tasks stay owned by the worker: OCaml may
+/// still complete or heartbeat them until
+/// [`ocaml_temporal_core_v4_worker_shutdown`] releases the worker, and Core's
+/// own graceful-shutdown timer starts now. Idempotent, and a success when no
+/// worker exists.
+///
+/// # Safety
+///
+/// The pointer contracts match [`ocaml_temporal_core_v4_worker_shutdown`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ocaml_temporal_core_v4_worker_initiate_shutdown(
+    runtime: *mut Runtime,
+    output: *mut Result,
+) -> Status {
+    // SAFETY: `invoke` validates the result before the closure checks and uses
+    // the opaque runtime pointer.
+    unsafe {
+        invoke(output, || {
+            runtime
+                .as_mut()
+                .ok_or_else(|| Failure {
+                    status: STATUS_INVALID_ARGUMENT,
+                    message: "runtime pointer is null".to_owned(),
+                })?
+                .initiate_worker_shutdown()
         })
     }
 }

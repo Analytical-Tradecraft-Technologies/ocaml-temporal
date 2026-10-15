@@ -138,7 +138,21 @@ The four handle methods are typed and return `(unit, Error.t) result`:
 - `Async_handle.heartbeat` sends non-terminal progress through the
   namespace-bound client operation. It currently returns acknowledgement only;
   Core cancellation, pause, and reset flags are not yet represented in the
-  public result.
+  public result. Unlike a synchronous context's heartbeat, which Core
+  throttles and sends in the background, every call is one server round trip
+  awaited on the calling thread (#1025), so external code should heartbeat
+  at a fraction of the heartbeat timeout rather than per item.
+
+Each operation is a submitted client call (#1025), like the public client's
+calls (#807): the worker's owner Domain only validates the request and spawns
+the RPC on a Rust task, and the calling thread waits for the server, so a
+slow or unreachable server delays only that handle's caller, never the
+worker's polls and completions. The adapter's async lock is held only while
+an operation claims its lease (marking it in flight) and while it records the
+outcome, never across the RPC, so other handles, the admission of a new
+handoff and the shutdown probes do not wait for it either. Terminal
+`discard` may run while an operation is in flight; the operation then finds
+its lease gone and only returns its own outcome.
 
 All payloads and task tokens are copied before crossing a boundary. The
 handle's private state allows one operation at a time and rejects a different
@@ -568,10 +582,11 @@ callbacks have no synchronous context and are not notified; an asynchronous
 handle's heartbeat does not report cancellation.
 
 `Context.is_worker_shutting_down` reads the public worker's `closed` and
-`stop_requested` flags. Because the worker waits for the running callback
-(for up to the grace period) before it drains and closes Core, Core's own
-`WorkerShutdown` cancellation cannot reach a running callback; this flag is
-the shutdown signal. A callback that ignores it is abandoned when the grace
+`stop_requested` flags; it is the shutdown signal. Core's polling stops as
+soon as the stop is observed (#1028) and Core's own graceful-shutdown timer,
+set to the same period, starts then, so Core's `WorkerShutdown` cancellation
+reaches a heartbeating callback only as that period ends, when the worker is
+abandoning it anyway. A callback that ignores it is abandoned when the grace
 period ends: the worker stops waiting for it, the bridge fails its task
 retryably so Temporal runs the next attempt elsewhere, and its eventual
 result is discarded ([#495]; see the bounded-shutdown section of the

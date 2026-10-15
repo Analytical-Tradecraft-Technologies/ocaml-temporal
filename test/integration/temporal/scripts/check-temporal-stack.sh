@@ -12,9 +12,16 @@ sleep_seconds=${TEMPORAL_HEALTH_SLEEP_SECONDS:-2}
 
 # Only frontend availability and the CLI connection deadline are transient.
 # Authentication, configuration, and other RPC failures must fail immediately.
+# The CLI's connection-deadline error is matched on its first line only:
+# current CLI releases append diagnostic lines after it (namespace, TLS, and
+# "Connection checks"), so an exact match on the whole text would treat a
+# transient startup deadline as fatal.
 is_transient_cli_error() {
   case "$1" in
     *"code = Unavailable"*|*"code = DeadlineExceeded"*) return 0 ;;
+  esac
+  first_line=$(printf '%s\n' "$1" | sed -n '1p')
+  case "$first_line" in
     "Error: failed connecting to Temporal server at $address: context deadline exceeded") return 0 ;;
   esac
   return 1

@@ -10,6 +10,7 @@ use std::io::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
+use temporalio_common::protos::TaskToken;
 use temporalio_common::protos::coresdk::{
     ActivityHeartbeat, ActivityTaskCompletion,
     activity_result::ActivityExecutionResult,
@@ -147,11 +148,49 @@ async fn complete_workflow_for_dispose(
     }
 }
 
-/// Fails one Core activity task that the bridge will never hand to OCaml.
+/// Reports whether `task_token` names a local activity, using the same
+/// predicate Core uses to route an activity completion to its in-process
+/// local-activity manager instead of the server.
+///
+/// Core marks every local-activity token with a fixed prefix when it
+/// dispatches the activity, so the token alone is authoritative; no separate
+/// ledger bit can disagree with Core's own routing (#1029).
+pub fn is_local_activity_token(task_token: &[u8]) -> bool {
+    TaskToken::from(task_token.to_vec()).is_local_activity_task()
+}
+
+/// Builds the result the bridge sends when it completes an activity task on
+/// OCaml's behalf, during admission failure, shutdown, or disposal.
+///
+/// A remote activity is failed with a retryable application failure carrying
+/// `message`, so the server can dispatch the next attempt under the
+/// activity's retry policy, possibly to another worker.
+///
+/// A local activity is reported as cancelled instead (#1029). A local
+/// activity has no server-side dispatch: Core's local-activity manager
+/// retries a retryable failure *in-process*, generating a new token after a
+/// backoff of 1 s, 2 s, 4 s and so on until the backoff exceeds the
+/// local-retry threshold (60 s by default). During shutdown every such retry
+/// would be admitted and retired again, holding the supervisor for about a
+/// minute and pushing teardown past its timeout. Core reports a cancelled
+/// local activity to its workflow without retrying it. That resolution is
+/// never applied durably here: the bridge retires it by failing the workflow
+/// task that owns it, so the server re-executes the local activity on the
+/// workflow's next worker, exactly as it would after a failed attempt.
+pub fn bridge_retirement_result(task_token: &[u8], message: String) -> ActivityExecutionResult {
+    if is_local_activity_token(task_token) {
+        ActivityExecutionResult::cancel_from_details(None)
+    } else {
+        ActivityExecutionResult::fail(message.into())
+    }
+}
+
+/// Completes one Core activity task that the bridge will never hand to OCaml.
 ///
 /// Used only for undeliverable *start* (or malformed) tasks that would
 /// otherwise leave a Core completion debt. Pure cancel notifications that do
-/// not create a new ledger obligation are not completed here.
+/// not create a new ledger obligation are not completed here. The outcome
+/// depends on locality; see [`bridge_retirement_result`].
 async fn force_fail_undeliverable_activity(
     worker: &Worker,
     task_token: &[u8],
@@ -159,8 +198,9 @@ async fn force_fail_undeliverable_activity(
 ) {
     let completion = ActivityTaskCompletion {
         task_token: task_token.to_vec(),
-        result: Some(ActivityExecutionResult::fail(
-            activity_admission_rejection_message(reason).into(),
+        result: Some(bridge_retirement_result(
+            task_token,
+            activity_admission_rejection_message(reason),
         )),
     };
     let _ = worker.complete_activity_task(completion).await;
@@ -433,14 +473,20 @@ async fn complete_workflow_for_shutdown(
     let _ = worker.complete_workflow_activation(completion).await;
 }
 
-/// Fails one activity start that shutdown retires on OCaml's behalf. The
-/// failure is retryable under the activity's retry policy, so the server can
-/// dispatch the attempt to another worker.
+/// Completes one activity start that shutdown retires on OCaml's behalf.
+///
+/// A remote activity is failed retryably under its retry policy, so the
+/// server can dispatch the attempt to another worker. A local activity has no
+/// server-side dispatch and is reported as cancelled, so Core does not retry
+/// it in-process while the worker drains; the workflow task that owns it is
+/// failed by the same drain, and the server re-executes the local activity
+/// on the workflow's next worker. See [`bridge_retirement_result`] (#1029).
 async fn fail_activity_for_shutdown(worker: &Worker, task_token: &[u8], reason: &'static str) {
     let completion = ActivityTaskCompletion {
         task_token: task_token.to_vec(),
-        result: Some(ActivityExecutionResult::fail(
-            shutdown_retirement_message(reason).into(),
+        result: Some(bridge_retirement_result(
+            task_token,
+            shutdown_retirement_message(reason),
         )),
     };
     let _ = worker.complete_activity_task(completion).await;

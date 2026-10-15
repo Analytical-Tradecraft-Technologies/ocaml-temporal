@@ -38,6 +38,228 @@ passes a string of the same length to `Replay.History.of_protobuf` and
 requires the documented size rejection.
 
 Issue #497 stays open until the v1 support policy (#489) is formally closed.
+## 2026-10-14: Metrics scrape connections are capped (#500)
+
+The bridge's public metrics accept loop spawned one relay per connection with
+no limit, and a relay that had received its request could be held open
+forever by a client that stopped reading or kept the connection alive. The
+accept loop now takes one of 8 semaphore permits (`MAX_CONCURRENT_SCRAPES`)
+before spawning a relay. A connection over the cap never connects to Core and
+never touches the descriptor reserve; it receives a `503` from a short
+rejection task (at most 16 pending, 1 s each) or is closed at once. Relays end
+after 10 s without traffic and 60 s in total, in addition to the existing 5 s
+request-head timeout, so slow and idle clients free their slot.
+
+Evidence: `rust/core-bridge/tests/metrics_connection_cap.rs` saturates the cap
+with idle and kept-alive clients, checks that idle over-cap bursts are closed
+and further scrapes receive the busy `503` (never metrics) promptly, that the
+bridge closes every holder, that real scrapes are served afterwards and that
+the descriptor count returns to its baseline. The four metrics test binaries
+passed four consecutive runs on macOS ARM, with `cargo clippy --locked
+--all-targets -- -D warnings`, `cargo fmt --check` and
+`dune build --root . @install @test/bridge/runtest`. Remaining #500 work:
+OCaml-side metrics for SDK-only paths, a sample deployment that demonstrates
+the declared failure signals, and OTLP export.
+## 2026-10-13: Shutdown stops Core polling early, retires local activities without retry, reports accurately, and async activity calls leave the owner Domain (#1028, #1029, #1023, #1025)
+
+Temporal Core kept long-polling the server for the whole grace period,
+because it was told to stop only at the native release; every task it took
+meanwhile waited for a lane that would never run it and was then failed, a
+spurious workflow-task failure or a lost activity attempt on every rolling
+deploy (#1028). A new bridge operation,
+`ocaml_temporal_core_v4_worker_initiate_shutdown` (supervisor operation
+`Initiate_worker_shutdown`), runs `PollLanes::initiate_shutdown` without
+releasing anything, as the official SDKs' `initiate_shutdown` does: Core
+stops polling and starts its own graceful-shutdown timer, while leased tasks
+stay completable and heartbeatable. A stopping `Worker.run` sends it right
+after its workflow lane returns (never after a lane failure), and the
+bounded-shutdown thread sends it before the lanes phase; one atomic makes it
+a single request. `run` starts its request on a detached thread and never
+awaits it, so a supervisor mailbox occupied by a stuck activity-lane native
+call cannot keep `run` past the grace deadline (Codex review).
+
+Shutdown and disposal completed a retired local-activity token with a
+retryable failure, which Core's local-activity manager retries in-process
+with fresh tokens for about a minute, so teardown stalled past its timeout
+and was reported detached (#1029). The bridge now classifies the token with
+Core's own `TaskToken::is_local_activity_task` (the predicate Core uses to
+route the completion) and reports a retired local activity as cancelled,
+which Core resolves without retrying; its workflow task is failed by the same
+drain, so the next worker re-executes it. Remote activities keep the
+retryable failure.
+
+The bounded-shutdown report miscounted (#1023). `callback_running` now reads
+an atomic set around both synchronous and asynchronous callbacks, so an
+abandoned `define_async` callback is reported as `activity_callback` and the
+probe never waits on the delivery lock a heartbeat sweep holds. The run loop
+detaches the activity lane at the deadline only while a callback runs (the
+atomic probe, not the lane's per-poll busy flag, which CI showed could be
+sampled mid-poll on an idle lane), joining an
+idle lane for up to 150 ms more; the watchdog sleeps in 20 ms slices so its
+stop is prompt. A worker with a grace period of zero or a few milliseconds
+no longer logs `activity_lane_detached` or reports `lanes_stopped = false`
+when nothing was running.
+
+`Async_handle` completions and heartbeats were blocking RPCs on the worker's
+single owner Domain, with the adapter's async lock held across them (#1025).
+They are now submitted client calls (#807), selectors 11 and 12 of
+`ocaml_temporal_core_v4_client_submit_json`, which run the RPC on a Rust task
+while the caller's thread awaits it; a server `NotFound` is the fixed outcome
+`not_found`, mapped back to `Invalid_state`, because an awaited
+`Invalid_state` means a closed call. The adapter holds its async lock only to
+claim a lease and record the outcome. Async heartbeats are still not
+throttled; the `Async_handle` docs state their cost. Throttling with a
+trailing flush, as Core does for synchronous heartbeats, needs a timer that
+outlives the caller and is left for a follow-up.
+
+Rust tests: `worker_shutdown_outstanding.rs` shows that after the initiation
+the leased task still completes, Core polls no more although the slot was
+freed (the assertion fails without the initiation), and the release fails
+nothing; `worker_local_activity_retirement.rs` covers the local/remote
+outcome; `async_activity_submitted_calls.rs` drives the submitted calls
+against a gRPC double, including `NotFound`, validation before the RPC, and
+a fast heartbeat completing while a slow one is still held by the server.
+OCaml tests: `test_native_worker_bounded_shutdown.ml` (polling stopped by
+both `run` and the shutdown thread during the grace period, a zero-grace
+idle worker not detached, a stuck idle wait still bounded, no stop after a
+lane failure, a blocked polling stop not holding `run`), `test_bounded_shutdown.ml` (the stop queued behind a blocked
+supervisor operation keeps shutdown bounded), `test_native_worker_watchdog.ml`
+(prompt stop) and `test_native_async_activity.ml` (an async callback reported
+running; the lease probe and a new handoff proceed while an async RPC is in
+flight). The new OCaml and Rust shutdown assertions were checked to fail
+with each fix reverted. Verified with `dune build @install`, the
+`test/runtime`, `test/unit`, `test/sdk_supervisor` and `test/bridge`
+aliases on OCaml 5.4.1 (macOS), scoped `cargo test`, `cargo clippy
+--all-targets -D warnings` and `cargo fmt --check`. The live regression the
+issue suggests (a client scheduling work during the grace period against a
+real server) was not run.
+## 2026-10-13: CI builds the source archive inside an opam sandbox (#778)
+
+The vendored release source archive (2026-10-06 entry) had only been proven
+offline by hand; no CI job ran a sandboxed opam build from it.
+`scripts/check-opam-source-archive.sh` now unpacks an archive and runs the
+package's opam build command, `dune build -p temporal-sdk -j <jobs>`, through
+opam's own build wrapper (`opam-init/hooks/sandbox.sh build`) or, on macOS
+without one, an equivalent `sandbox-exec` policy. It first proves the sandbox
+blocks a request to crates.io, clears every variable that would bypass the
+archive's vendored sources, gives Cargo a fresh, empty `CARGO_HOME` so a home
+warmed by `cargo vendor` cannot hide a source the archive omits, and requires
+the resulting `temporal-sdk.install` to list the Rust bridge. The Release
+workflow now creates the archive and audited notices once in a
+`source-archive` job, and its macOS ARM64 `source-archive-check` job runs the
+check on that artifact after confirming its SHA-256; `publish` needs both and
+confirms the digest again before publishing the same file, so the archive
+users download is the one that passed. Master builds also run an
+`opam-source-offline` job in `build-pr.yml` on an archive it creates itself,
+as an early warning.
+
+`test/smoke/test_opam_source_archive_check.sh`, part of `dune runtest`, drives
+the script with stand-in opam hook, curl and dune executables: a complete
+archive builds through the hook's `build` mode with the bypass variables
+cleared, a sandbox that lets the probe through is refused before building, and
+archives without `rust/vendor.tar` or with a changed opam build command are
+rejected; Cargo must see a cold home in place of the caller's warm one.
+Removing the variable clearing or keeping the caller's `CARGO_HOME` makes it
+fail. Locally on macOS
+(opam 2.5.2, OCaml 5.4.1), an archive created by
+`scripts/create-source-archive.sh` from this branch built successfully with the
+optimized Rust bridge through both the real opam 2.5.2 sandbox wrapper and the
+`sandbox-exec` fallback, with the network probe denied in each, and again
+through the opam wrapper with the empty `CARGO_HOME`.
+`dune build @test/smoke/runtest` and `test/smoke/test_quality_contract.sh`
+pass. The new jobs have not run yet: the master job's first result comes from
+the next master build, and the release jobs from the next release.
+
+## 2026-10-13: Unknown update stages and visibility statuses degrade (#1078)
+
+The client protocol rejected two server enums when a newer server sent a value
+this SDK does not know, so an added update lifecycle stage made
+`start_update` fail and an added execution status failed a whole
+`list_visibility` page. Start-update now trusts an outcome whatever stage
+accompanies it, and reads an unknown stage without an outcome as "not yet
+accepted": the update is re-issued under the same ID until a known `Accepted`
+stage or the typed `deadline_exceeded` error, so it never becomes a handle
+without established durability. A `Completed` stage without an outcome still
+fails closed. A visibility row with an unknown status is reported as
+`unknown_<n>` with its canonical decimal wire value; an unspecified (`0`)
+status is still a malformed row. The Rust encoder and OCaml decoder accept the
+same vocabulary, including rejecting non-canonical spellings and
+`unknown_<n>` for a named value, and the public `Client.visibility_execution`
+status field documents it.
+
+`rust/core-bridge/tests/support/client_update.rs` drives a scripted Core
+connection that returns an outcome with an unknown stage and an unknown stage
+before `Accepted`; `client_protocol.rs` unit tests cover status conversion and
+the shared vocabulary; `test/bridge/test_ocaml_client_protocol.ml` decodes
+`unknown_<n>` rows and rejects malformed spellings. Verified with the scoped
+`cargo test --lib client_protocol`, `cargo clippy -D warnings`, `cargo fmt
+--check`, `dune build @install` and the OCaml client protocol test on OCaml
+5.4.1 (macOS).
+## 2026-10-13: Released client calls free their capacity at once (#1019)
+
+`Client_call.await` releases a call it leaves without a terminal read, for
+example when an asynchronous exception or a decoder exception interrupts
+`Client.wait`. Release unregistered the call's completion cell but left its
+Tokio task running. The owner pruned only finished tasks and counted every
+remaining task against the wait and in-flight limits. An exact-run wait has
+no total deadline, so each abandoned wait on an open run kept a server long
+poll and both slots until the run closed or the client shut down. After
+`max_pending_waits` such abandonments, every new wait returned
+`Resource_exhausted`.
+
+The completion registry now holds each task's Tokio `AbortHandle`, attached
+by the owner right after spawning. `release_call` closes the cell and aborts
+the task from whichever thread releases it. This needs no runtime pointer.
+At each submission the owner marks any call that has left the registry as
+`Released` and aborts it again, which is idempotent. A released call holds no
+start, wait or in-flight slot, even before its aborted task has finished.
+Its join handle stays in the owner's task map, so disconnect and close still
+join it. Because an abort finishes only once Tokio runs the cancellation,
+submission joins the released tasks whenever the task map has reached the
+in-flight ceiling, so the map never retains more than `max_in_flight_calls`
+handles. The C header, the release stub comment and
+`docs/reference/client-protocol.md` describe the
+new release contract.
+
+Four new tests in `rust/core-bridge/tests/support/client_calls.rs` use the
+callback transport, whose history long polls never answer:
+
+- releasing a pending wait drops its transport long poll with no further
+  submit or disconnect;
+- with the default limits, `max_pending_waits` new distinct waits are
+  admitted right after one wait is released;
+- with configured limits of two waits and two in-flight calls, releasing
+  both waits admits two new ones at once;
+- a burst of 500 submit-and-release cycles under a two-call ceiling never
+  retains more than two task handles.
+
+All four fail without the fix. Verified with the crate's library tests and
+`tests/abi.rs`, `cargo clippy --lib --tests -D warnings` and
+`cargo fmt --check` (macOS).
+
+## 2026-10-13: A raising signal handler no longer leaks bridge borrows (#1018)
+
+In OCaml 5, `caml_enter_blocking_section` runs pending signal handlers and
+re-raises their exceptions. The bridge stubs entered it after taking a counted
+runtime or shared-runtime borrow, after `runtime_close` had detached the
+native pointer, or while holding a `malloc`'d input copy. A raising handler,
+such as `Sys.Break` under `Sys.catch_break true`, therefore unwound the stub
+and leaked that resource: the next close spun forever on the leaked borrow,
+the GC finalizer could spin while holding the domain lock, or a detached Core
+graph was never freed. Every stub in `lib/core_bridge/native_stubs.c` now
+releases the lock through one helper that calls
+`caml_enter_blocking_section_no_pending`, which every supported compiler
+series (5.2 to 5.5) provides. A pending handler still runs, at the first OCaml
+poll point after the stub has returned and released everything it owns.
+
+`test/bridge/test_signal_borrow_release.ml` makes SIGUSR1 pending with a test
+C helper that does not run OCaml handlers, then calls the production stubs
+directly: the no-input and JSON runtime paths, client submit, shared-runtime
+attach, and close. It checks that each stub returns and the raising handler
+then runs exactly once, and that every runtime and the shared runtime close
+afterwards. Without the fix the test fails at the first stub. It is skipped on
+Windows, which has no SIGUSR1. Verified with `dune build @install` and
+`dune build @test/bridge/runtest` on OCaml 5.4.1 (macOS).
 
 ## 2026-10-13: Teardown cleanup keeps the terminal command and eviction ack (#1021)
 
