@@ -60,6 +60,28 @@ workflows, YAML parses of them, `make test-quality-contract` and
 `make test-temporal-config` (Docker-free contracts), and a relative-link check
 of the edited Markdown.
 
+## 2026-10-14: Metrics scrape connections are capped (#500)
+
+The bridge's public metrics accept loop spawned one relay per connection with
+no limit, and a relay that had received its request could be held open
+forever by a client that stopped reading or kept the connection alive. The
+accept loop now takes one of 8 semaphore permits (`MAX_CONCURRENT_SCRAPES`)
+before spawning a relay. A connection over the cap never connects to Core and
+never touches the descriptor reserve; it receives a `503` from a short
+rejection task (at most 16 pending, 1 s each) or is closed at once. Relays end
+after 10 s without traffic and 60 s in total, in addition to the existing 5 s
+request-head timeout, so slow and idle clients free their slot.
+
+Evidence: `rust/core-bridge/tests/metrics_connection_cap.rs` saturates the cap
+with idle and kept-alive clients, checks that idle over-cap bursts are closed
+and further scrapes receive the busy `503` (never metrics) promptly, that the
+bridge closes every holder, that real scrapes are served afterwards and that
+the descriptor count returns to its baseline. The four metrics test binaries
+passed four consecutive runs on macOS ARM, with `cargo clippy --locked
+--all-targets -- -D warnings`, `cargo fmt --check` and
+`dune build --root . @install @test/bridge/runtest`. Remaining #500 work:
+OCaml-side metrics for SDK-only paths, a sample deployment that demonstrates
+the declared failure signals, and OTLP export.
 ## 2026-10-13: Shutdown stops Core polling early, retires local activities without retry, reports accurately, and async activity calls leave the owner Domain (#1028, #1029, #1023, #1025)
 
 Temporal Core kept long-polling the server for the whole grace period,
