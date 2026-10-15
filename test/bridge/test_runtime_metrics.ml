@@ -11,6 +11,14 @@ open Temporal
 (** Unwraps a public result in fixture setup. *)
 let get = function Ok value -> value | Error error -> failwith (Error.message error)
 
+(** Whether [needle] occurs in [haystack]. *)
+let contains haystack needle =
+  let n = String.length needle and h = String.length haystack in
+  let rec at i =
+    i + n <= h && (String.sub haystack i n = needle || at (i + 1))
+  in
+  at 0
+
 (** Splits ["host:port"] (IPv4 only, as these tests bind loopback). *)
 let socket_of address =
   match String.rindex_opt address ':' with
@@ -226,10 +234,47 @@ let test_aborted_scrapes_do_not_kill_the_process () =
     Unix.setsockopt_optint socket Unix.SO_LINGER (Some 0);
     Unix.close socket
   done;
-  let scrape =
-    http_get ~label:"scrape after 64 reset connections" address "/metrics"
+  (* Since #500's connection cap, relays for the reset connections may still
+     hold some of the endpoint's slots for a moment, and a scrape arriving
+     then is answered with the documented transient busy [503] or, when even
+     the rejection slots are taken, closed without a response. The property
+     under test is that the process survived and the endpoint serves again
+     once those relays end, so the scrape is retried briefly on exactly those
+     transient outcomes. *)
+  let deadline = Unix.gettimeofday () +. 10. in
+  let rec scrape_until_served attempt =
+    let outcome : [ `Response of string | `Closed ] =
+      match
+        http_get ~label:"scrape after 64 reset connections" address "/metrics"
+      with
+      | response -> `Response response
+      | exception Unix.Unix_error ((Unix.ECONNRESET | Unix.EPIPE), _, _) ->
+          `Closed
+    in
+    let transient =
+      match outcome with
+      | `Closed -> true
+      | `Response "" -> true
+      | `Response response ->
+          String.starts_with ~prefix:"HTTP/1.1 503" response
+          && contains response "Too many concurrent metrics scrapes"
+    in
+    match outcome with
+    | `Response response when String.starts_with ~prefix:"HTTP/1.1 200" response
+      -> ()
+    | _ when transient && Unix.gettimeofday () < deadline ->
+        Unix.sleepf 0.05;
+        scrape_until_served (attempt + 1)
+    | `Response response ->
+        failwith
+          (Printf.sprintf
+             "endpoint did not serve after reset connections (attempt %d): %S"
+             attempt
+             (String.sub response 0 (min 200 (String.length response))))
+    | `Closed ->
+        failwith "endpoint kept closing scrapes after reset connections"
   in
-  assert (String.starts_with ~prefix:"HTTP/1.1 200" scrape);
+  scrape_until_served 1;
   get (Runtime.shutdown runtime)
 
 (** Without [~metrics] no endpoint exists. *)
