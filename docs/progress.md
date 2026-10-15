@@ -68,6 +68,122 @@ watchdog, budget, supervisor, loop and bounded-shutdown executables ten
 times each, on OCaml 5.4.1 (macOS arm64). The live non-yielding-workflow
 qualification is left to CI.
 
+## 2026-10-14: Live-regression logs retained; coverage inventory, sizing guide and release checklist (#498, #504, #510, #519)
+
+The Temporal/PostgreSQL job now uploads `_build/live-regressions/*.log` and the
+official-SDK interoperability evidence as a `live-regressions-<run>-<attempt>`
+artifact, in an `always()` step with the same seven-day retention and pinned
+`upload-artifact` revision as the diagnostic bundles. Before, those logs were
+only printed to the job output. The copied admin-tools CLI in the same
+directory is excluded. Every step of that job now has its own timeout and the
+job timeout (now 80 minutes) is at least their sum, so a hung step times out
+and the evidence uploads after it still run; `test-temporal-config` enforces
+this.
+
+Releases now publish reviewed, versioned notes. The version PR commits
+`docs/releases/<tag>.md` with non-empty `Changes`, `Breaking changes and
+migration`, and `Residual limits` sections. `scripts/check-release-notes.sh`
+gates `make release-tag-check` and the Release workflow's validate job, and the
+publish job puts those notes ahead of its generated asset description instead
+of replacing them. `test/smoke/test_release_notes_contract.sh` (part of
+`make test-quality-contract`) covers the checker, the notes for the checked-in
+version, and the workflow wiring. The first notes,
+[`v0.1.0-rc.1`](releases/v0.1.0-rc.1.md), name the support policy's residual
+limits.
+
+[Live acceptance coverage](reference/live-acceptance-coverage.md#worker-crash-restart-shutdown-and-eviction-inventory)
+now maps the three #519 boundaries (worker removal during pending work,
+shutdown with outstanding work, eviction followed by continued progress) to the
+crash-recovery, cache-eviction and parent/child restart controllers and the
+`interaction_recovery` and `bounded_shutdown` regressions, with the commands
+that reproduce each. It names the remaining gap: no suite kills a worker
+while an activity callback is running.
+
+The [worker sizing guide](guides/worker-sizing.md) (#498) covers the validated
+`Worker.Options`, `io_threads` and shared runtimes, the sticky cache, small and
+production starting points, and the metrics that show saturation. It states
+that each worker runs one activity callback at a time (#777, #492). The
+[release checklist](reference/release-checklist.md) (#510) lists the version,
+gate, tag and verification steps and the sign-off roles, marks #506 to #510 and
+#489 as open, and describes how to supersede a bad candidate or release
+because the version-tag ruleset forbids moving or deleting a tag.
+
+None of the four issues is complete. Verified with `actionlint` on the edited
+workflows, YAML parses of them, `make test-quality-contract` and
+`make test-temporal-config` (Docker-free contracts), and a relative-link check
+of the edited Markdown.
+
+## 2026-10-14: Malformed-history controls and feature coverage for the replay corpus (#503)
+
+The [replay history corpus](reference/history-corpus.md) gains a third
+expected verdict, `invalid_history`, and five malformed-history negative
+controls derived from committed histories: a truncated protobuf, a gap in
+event IDs, a start event without a task queue, a first workflow task Core
+auto-fails, and a history replayed under another execution's workflow ID.
+Each reuses a `replays_ok` entry's history unchanged on disk; the runner
+applies the entry's named `history_mutation` in memory before replay
+(`corpus_history_mutation.ml`), so the source entry and the edit are the
+complete provenance and no derived binary is committed. Every control pins
+its `Temporal.Replay` refusal reason with `expected_message`.
+
+The runner's `required_features` list became a feature coverage table
+(`corpus_coverage.ml`) mapping every replay-relevant supported feature to a
+`replayed` case, a nondeterminism or invalid-history control, or an explicit
+`not applicable` or `not yet captured` reason. The runner fails when a
+feature tag has no row, a covered row has no case, a gap row gains a
+`replays_ok` case without being promoted, or the table in the reference
+document differs; the report carries the table with its case IDs. The known
+gaps (cancellation, activity and workflow timeouts, workflow retries, local
+activities, external signals and cancellation, start metadata,
+search-attribute upserts, and time/random-dependent commands) still need live
+captures. Two new `test_history_corpus_mismatch` scenarios check that a
+control whose edit stops applying fails, and that unclassified and stale
+coverage is reported.
+## 2026-10-14: Installed consumer replays fixture histories (#497)
+
+The installed-package consumer previously only type-checked
+`Temporal.Replay` through `public_api.ml`. A new consumer executable,
+`test/fixtures/install-consumer/installed_replay.ml`, now replays the frozen
+history-corpus capture `live-2026-10-08-timer.pb` through the installed
+package and asserts both verdicts: the recorded `corpus.timer` code replays
+cleanly, and the same workflow type with its timer removed is reported as
+`Nondeterminism` at the recorded `TimerStarted` event for workflow ID
+`history-corpus-timer`. `test/bridge/test_install.sh` (`make test-install`)
+and the relocated binary-only consumer (`test/bridge/test_prebuilt_library.sh`,
+prepared by `scripts/ocaml-library-artifact.py prepare-consumer`) both copy
+the history next to the consumer and run it. No new capture was made.
+
+The oversized-history bound now has direct evidence.
+`test/replay_cli/test_replay_cli.ml` creates a sparse file of
+`Temporal.Replay.History.max_bytes + 1` bytes with `Unix.ftruncate` and
+requires the example replay command to exit 3 with
+`invalid history: larger than 134217728 bytes`. `test/bridge/test_public_replay.ml`
+passes a string of the same length to `Replay.History.of_protobuf` and
+requires the documented size rejection.
+
+Issue #497 stays open until the v1 support policy (#489) is formally closed.
+## 2026-10-14: Metrics scrape connections are capped (#500)
+
+The bridge's public metrics accept loop spawned one relay per connection with
+no limit, and a relay that had received its request could be held open
+forever by a client that stopped reading or kept the connection alive. The
+accept loop now takes one of 8 semaphore permits (`MAX_CONCURRENT_SCRAPES`)
+before spawning a relay. A connection over the cap never connects to Core and
+never touches the descriptor reserve; it receives a `503` from a short
+rejection task (at most 16 pending, 1 s each) or is closed at once. Relays end
+after 10 s without traffic and 60 s in total, in addition to the existing 5 s
+request-head timeout, so slow and idle clients free their slot.
+
+Evidence: `rust/core-bridge/tests/metrics_connection_cap.rs` saturates the cap
+with idle and kept-alive clients, checks that idle over-cap bursts are closed
+and further scrapes receive the busy `503` (never metrics) promptly, that the
+bridge closes every holder, that real scrapes are served afterwards and that
+the descriptor count returns to its baseline. The four metrics test binaries
+passed four consecutive runs on macOS ARM, with `cargo clippy --locked
+--all-targets -- -D warnings`, `cargo fmt --check` and
+`dune build --root . @install @test/bridge/runtest`. Remaining #500 work:
+OCaml-side metrics for SDK-only paths, a sample deployment that demonstrates
+the declared failure signals, and OTLP export.
 ## 2026-10-13: Shutdown stops Core polling early, retires local activities without retry, reports accurately, and async activity calls leave the owner Domain (#1028, #1029, #1023, #1025)
 
 Temporal Core kept long-polling the server for the whole grace period,

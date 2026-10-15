@@ -26,7 +26,7 @@ type outcome =
           set, an unregistered workflow type, or an unreadable history), so no
           replay was attempted. *)
 
-(** Stable lowercase label used in the table and in the JSON report. The two
+(** Stable lowercase label used in the table and in the JSON report. The three
     labels shared with the manifest are spelled exactly as its [expected]
     values. *)
 let outcome_label = function
@@ -42,6 +42,7 @@ let outcome_label = function
 let expected_outcome = function
   | Corpus_manifest.Replays_ok -> Replays_ok
   | Corpus_manifest.Nondeterminism -> Nondeterminism
+  | Corpus_manifest.Invalid_history -> Invalid_history
 
 (** The result of one corpus entry. *)
 type case = {
@@ -180,8 +181,11 @@ let contains ~fragment text =
 (** Replays one entry from [root], the corpus directory, and compares the
     outcome with the manifest. A nondeterminism verdict must also name the
     entry's run ID, so a negative control cannot pass on the wrong run, and
-    its failure text must contain the entry's [expected_message] when the
-    manifest declares one, so it cannot pass for an unrelated mismatch. *)
+    a negative control's failure text must contain the entry's
+    [expected_message] when the manifest declares one, so it cannot pass for
+    an unrelated mismatch or rejection. A malformed-history control's
+    [history_mutation] is applied to the committed bytes in memory first;
+    the file on disk is never modified. *)
 let run_entry ~root ~captures (entry : Corpus_manifest.entry) =
   let capture =
     List.find_opt
@@ -208,8 +212,15 @@ let run_entry ~root ~captures (entry : Corpus_manifest.entry) =
     with
     | exception Sys_error message -> Error message
     | bytes ->
-        Temporal.Replay.History.of_protobuf ~workflow_id:entry.workflow_id bytes
-        |> Result.map_error Temporal.Error.message
+        let bytes =
+          match entry.history_mutation with
+          | None -> Ok bytes
+          | Some mutation -> Corpus_history_mutation.apply mutation bytes
+        in
+        Result.bind bytes (fun bytes ->
+            Temporal.Replay.History.of_protobuf ~workflow_id:entry.workflow_id
+              bytes
+            |> Result.map_error Temporal.Error.message)
   in
   match (history, registrations entry) with
   | Error message, _ | _, Error message -> finish Not_run (Some message)
@@ -320,8 +331,9 @@ let json_option = function None -> `Null | Some value -> `String value
 
 (** Builds the machine-readable report. [problems] are manifest or coverage
     failures not tied to a single replayed case; any problem or failing case
-    makes the status ["fail"]. *)
-let report ~manifest_path ~candidate ~problems cases =
+    makes the status ["fail"]. [feature_coverage] is the coverage table with
+    the case IDs satisfying each row (see {!Corpus_coverage.report_json}). *)
+let report ~manifest_path ~candidate ~problems ~feature_coverage cases =
   let failing = failing_ids cases in
   let passed = List.length cases - List.length failing in
   `Assoc
@@ -350,6 +362,7 @@ let report ~manifest_path ~candidate ~problems cases =
           ] );
       ("failing_cases", `List (List.map (fun id -> `String id) failing));
       ("problems", `List (List.map (fun problem -> `String problem) problems));
+      ("feature_coverage", feature_coverage);
       ( "cases",
         `List
           (List.map

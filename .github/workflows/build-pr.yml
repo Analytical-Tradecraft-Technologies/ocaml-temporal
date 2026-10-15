@@ -157,7 +157,12 @@ jobs:
     # Independent live controllers run sequentially while reusing the
     # checked-out source and build cache. Parent/child recovery includes a
     # deliberate 120-second timer and two complete worker generations.
-    timeout-minutes: 45
+    # Every step has its own timeout and the job timeout is at least their
+    # sum, so a hung scenario step is stopped by its own timeout and the
+    # always() evidence uploads after it still run before the job is killed
+    # (test/smoke/test_temporal_compose_config.sh checks this). A normal run
+    # takes about 25 minutes.
+    timeout-minutes: 80
     env:
       # Keep this as one explicit compatibility lane because it starts the
       # complete PostgreSQL/Temporal stack and two OCaml processes.
@@ -167,17 +172,21 @@ jobs:
       # Always make failure-reporting scripts available, even if a producer
       # failed and the dependency gate below stops the live test steps.
       - name: Check out repository
+        timeout-minutes: 3
         uses: actions/checkout@v7
       - name: Require successful OCaml builds
+        timeout-minutes: 1
         env:
           OCAML_RESULT: ${{ needs.verify.result }}
         run: test "$OCAML_RESULT" = success
       - name: Download compiled smoke executables
+        timeout-minutes: 3
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: temporal-smoke-linux-amd64-ocaml-5.5.1
           path: _build/smoke-artifact
       - name: Verify and unpack the exact tested executables
+        timeout-minutes: 3
         run: python3 scripts/smoke-artifact.py unpack --directory _build/smoke-artifact --commit "$GITHUB_SHA" --ocaml "$OCAML_VERSION"
       - name: Reclaim disposable GitHub-hosted runner disk
         # The smoke lane downloads executables that statically link Rust.
@@ -185,6 +194,7 @@ jobs:
         # preinstalled SDKs before the first Compose build so a valid native
         # link cannot fail because the disposable runner ran out of space.
         if: runner.environment == 'github-hosted'
+        timeout-minutes: 4
         shell: bash
         run: |
           set -euo pipefail
@@ -193,6 +203,7 @@ jobs:
           docker system prune --all --force --volumes
           df -h /
       - name: Verify workflow start metadata and exact-history worker replacement
+        timeout-minutes: 10
         env:
           TEMPORAL_COMPOSE_PROJECT: ocaml-temporal-metadata-ci
         run: |
@@ -200,6 +211,7 @@ jobs:
           make test-temporal-start-metadata-live
       - name: Retain synthetic workflow start metadata evidence
         if: always()
+        timeout-minutes: 2
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: workflow-start-metadata-${{ github.run_id }}-${{ github.run_attempt }}
@@ -213,9 +225,11 @@ jobs:
       - name: Recover the same workflow runs after task failures
         # Independent of the seven existing controllers; any failed
         # assertion fails this job after retaining this gate's evidence.
+        timeout-minutes: 5
         run: make test-temporal-task-failure-live
       - name: Retain exact-run task failure recovery evidence
         if: always()
+        timeout-minutes: 2
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: workflow-task-failure-${{ github.run_id }}-${{ github.run_attempt }}
@@ -224,13 +238,15 @@ jobs:
           retention-days: 14
 
       - name: Run the live two-OCaml-binary Temporal Compose smoke
-        # Leave time for always() upload after a scenario step times out.
+        # The job timeout reserves time for the always() uploads below after
+        # this step times out.
         timeout-minutes: 40
         env:
           TEMPORAL_DIAGNOSTICS_DIR: ${{ github.workspace }}/_build/live-diagnostics
         run: make test-temporal-live-ci
       - name: Upload bounded live diagnostic bundles
         if: always()
+        timeout-minutes: 2
         id: live-artifacts
         continue-on-error: true
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
@@ -239,8 +255,25 @@ jobs:
           path: _build/live-diagnostics/
           retention-days: 7
           if-no-files-found: warn
+      - name: Upload live regression suite logs
+        # run-live-regressions.sh writes one log per suite and the official-SDK
+        # interop evidence under _build/live-regressions (#504, #519). The
+        # copied admin-tools CLI binary in that directory is deliberately
+        # excluded. Upload failure is reported here, not as a scenario failure.
+        if: always()
+        timeout-minutes: 2
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: live-regressions-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            _build/live-regressions/*.log
+            _build/live-regressions/sdk_interop/
+          retention-days: 7
+          if-no-files-found: warn
       - name: Link live diagnostics and collection status
         if: always()
+        timeout-minutes: 1
         env:
           LIVE_ARTIFACT_URL: ${{ steps.live-artifacts.outputs.artifact-url }}
           LIVE_UPLOAD_OUTCOME: ${{ steps.live-artifacts.outcome }}

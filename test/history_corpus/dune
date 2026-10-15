@@ -9,18 +9,26 @@
  (modules corpus_definitions)
  (libraries temporal-sdk task_failure_support))
 
-; Manifest validation and public Temporal.Replay execution used by the runner.
+; Manifest validation, malformed-history controls, the feature coverage table
+; and public Temporal.Replay execution used by the runner.
 
 (library
  (name temporal_history_corpus_runner)
  (wrapped false)
- (modules corpus_sha256 corpus_history_identity corpus_manifest corpus_runner)
+ (modules
+  corpus_sha256
+  corpus_history_identity
+  corpus_history_mutation
+  corpus_manifest
+  corpus_coverage
+  corpus_runner)
  (libraries temporal-sdk temporal_history_corpus_definitions yojson))
 
 ; The gate and upgrade runner. `dune runtest` replays the committed corpus;
 ; `make test-history-corpus-upgrade` runs the same executable with a JSON
 ; report and candidate identifiers. Cargo.lock is a dependency so a Core pin
-; change always re-runs the corpus.
+; change always re-runs the corpus. The reference document is a dependency
+; because its feature coverage table must match the runner's.
 
 (test
  (name history_corpus_runner)
@@ -32,7 +40,9 @@
    %{test}
    %{dep:../fixtures/history-corpus/manifest.json}
    --cargo-lock
-   %{dep:../../rust/Cargo.lock}))
+   %{dep:../../rust/Cargo.lock}
+   --coverage-doc
+   %{dep:../../docs/reference/history-corpus.md}))
  (libraries temporal_history_corpus_runner))
 
 ; Negative path: a mutated copy of the corpus must fail with its case IDs.

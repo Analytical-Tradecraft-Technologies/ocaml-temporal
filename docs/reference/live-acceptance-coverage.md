@@ -72,6 +72,63 @@ records the original PR #361 evidence. Its status is live-tested, not pending a
 first run. Broader child failure, cache-pressure, repeated restart, and recovery
 combinations still need dedicated cases.
 
+## Worker crash, restart, shutdown and eviction inventory
+
+Issue [#519][issue-519] names three boundaries. The existing suites below
+already cover part of each; this table records which part, so new cases extend
+them rather than duplicate them. Every suite asserts a durable server outcome
+for exact runs, not just a process exit, and each runs in the Build workflow's
+Temporal/PostgreSQL job through `make test-temporal-live-ci`.
+
+| Boundary | Suite | What it removes or forces, and when | Durable outcome asserted |
+| --- | --- | --- | --- |
+| Worker removal during pending work | `test-temporal-worker-crash-recovery` | `docker kill --signal KILL` on generation one once the exact run's history shows its pending timer; exit 137, no graceful-stop marker | Generation two replays (`is_replaying=true`) and the same run completes |
+| Worker removal during pending work | `test-temporal-parent-child-restart` | Graceful `Worker.shutdown` of generation one while a parent and its long-running child are both suspended | Both exact runs replay on generation two and complete with exact parent/child linkage |
+| Worker removal during pending work | `interaction_recovery` (#530) | `SIGTERM` to the worker process that accepted a suspended update | The replacement answers queries from replayed state; history has one acceptance and one completion of the original update ID, attributed to the original and replacement workers |
+| Shutdown with outstanding work | `bounded_shutdown` (#495) | `Worker.shutdown_with_report` with a two-second grace period while an activity callback ignores cancellation and the shutdown flag | Shutdown returns within its bound and reports one abandoned callback; Temporal retries the attempt and a second worker completes attempt 2 |
+| Eviction followed by continued progress | `test-temporal-worker-cache-eviction` | One-slot cache; a second parked run forces Core `RemoveFromCache` (`cache_full`) of the first | Empty eviction acknowledgement, continued progress, and typed terminal outcomes after cancelling both exact runs |
+| Eviction followed by continued progress | `interaction_recovery` (#530) | One-entry sticky cache; a filler run evicts the target while an update handler is suspended | A query answers from replayed state, the release signal resumes the handler from history, and the run's durable events equal the control run's |
+
+Reproduce each against the pinned Compose stack (Docker required). The first
+three targets each own a fresh Temporal/PostgreSQL lifecycle:
+
+```sh
+make test-temporal-worker-crash-recovery
+make test-temporal-worker-cache-eviction
+make test-temporal-parent-child-restart
+# All LIVE_REGRESSION_EXECUTABLES, including interaction_recovery and
+# bounded_shutdown, against one fresh stack; logs land in _build/live-regressions/.
+make test-temporal-live-regressions
+```
+
+To run one regression suite against an already running disposable server, use
+its focused target. `interaction_recovery` needs a `default` namespace and the
+official Temporal CLI; `bounded_shutdown` defaults to `temporal-sdk-test`:
+
+```sh
+make test-interaction-recovery-live RUN='opam exec --' \
+  TEMPORAL_CLIENT_TEST_URL=http://127.0.0.1:7233 \
+  TEMPORAL_TEST_CLI=/absolute/path/to/temporal
+make test-bounded-shutdown-live RUN='opam exec --' \
+  TEMPORAL_CLIENT_TEST_URL=http://127.0.0.1:7233
+```
+
+In CI, the controllers' bundles are in the `live-diagnostics-<run>-<attempt>`
+artifact ([live diagnostic artifacts](live-diagnostic-artifacts.md)), and each
+regression suite's log, plus the official-SDK interoperability evidence, is in
+`live-regressions-<run>-<attempt>`. Both are uploaded even when the step fails
+and kept for seven days.
+
+**Remaining gap.** No suite kills a worker process (SIGKILL, or any abrupt
+exit) while an activity callback is running. The crash controller kills
+generation one while it is parked on a timer with no activity in flight;
+`bounded_shutdown` abandons a running callback through the graceful path, and
+its process stays alive. A crash during a callback must be recovered by
+Temporal's activity timeouts and retry policy alone (start-to-close or
+heartbeat timeout, then the next attempt on another worker). That
+at-least-once redelivery is the documented contract, but it has no live
+evidence yet. #519 keeps this case open.
+
 ## Baseline scenario assertions
 
 The following names refer to the [exact workflow definitions][definitions] and
@@ -194,3 +251,4 @@ make verify
 [child-source]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/blob/beae10d0a58e58fb8e076734cd38113d7a2b4466/lib/public/child_workflow.ml
 [scope-tests]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/blob/beae10d0a58e58fb8e076734cd38113d7a2b4466/test/runtime/test_scope.ml
 [activation-tests]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/blob/beae10d0a58e58fb8e076734cd38113d7a2b4466/test/runtime/test_activation.ml
+[issue-519]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/519

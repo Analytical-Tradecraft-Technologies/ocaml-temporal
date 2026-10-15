@@ -23,6 +23,17 @@
 //! just before each private `connect()`, so descriptor pressure on the public
 //! side cannot leave Core's `accept()` without a descriptor.
 //!
+//! Connection cap (#500): at most [`MAX_CONCURRENT_SCRAPES`] connections are
+//! relayed at once. The accept loop takes a semaphore permit before spawning
+//! a relay. A connection accepted while every permit is held never connects
+//! to Core and never touches the descriptor reserve: a short rejection task
+//! (at most [`MAX_PENDING_REJECTIONS`] at once, each bounded by
+//! [`REJECTION_TIMEOUT`]) reads its request head and answers `503`, and once
+//! those are exhausted too the connection is closed straight away. Every
+//! relay is bounded in time (request head, idle and lifetime timeouts), so
+//! slow or idle clients release their permit after at most
+//! [`RELAY_MAX_LIFETIME`].
+//!
 //! Ownership: [`start_metrics`] binds the public listener, starts Core's
 //! scrape server, and spawns the accept loop, all on the runtime's own Tokio
 //! pool, and returns a [`MetricsExporter`] guard. The guard is stored in the
@@ -50,7 +61,9 @@ use temporalio_common::telemetry::{PrometheusExporterOptions, start_prometheus_m
 use temporalio_sdk_core::CoreRuntime;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::AbortHandle;
+use tokio::time::Instant;
 
 /// Longest accepted `bind_address`, in bytes. Any IPv6 socket address with a
 /// scope identifier fits comfortably.
@@ -89,6 +102,40 @@ const REQUEST_HEAD_MAX_BYTES: usize = 8 * 1024;
 /// connection.
 const FIRST_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Most scrape connections relayed at once (#500). A Prometheus server keeps
+/// one connection per target, so a handful of scrapers (an HA pair, an
+/// agent, an operator's `curl`) fit with room to spare, while a flood of
+/// connections holds at most this many relays, each with two sockets of its
+/// own and one on Core's side. Connections beyond the cap receive a `503`
+/// with [`BUSY_BODY`] (see [`MAX_PENDING_REJECTIONS`]).
+pub const MAX_CONCURRENT_SCRAPES: usize = 8;
+
+/// Most over-cap connections answered with a `503` at once. Each holds one
+/// socket for at most [`REJECTION_TIMEOUT`]; a connection accepted while
+/// this many are pending is closed without an answer, so a flood costs one
+/// `accept()` and one `close()` per connection beyond both bounds.
+const MAX_PENDING_REJECTIONS: usize = 16;
+
+/// Longest time an over-cap connection is kept to read its request head and
+/// receive the `503`. Reading the head first lets the close be an orderly
+/// FIN: closing with unread request bytes makes the kernel send a reset,
+/// which on some platforms discards the response before the scraper reads it.
+const REJECTION_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Longest time a relayed connection may go without a byte moving in either
+/// direction before the relay closes it. Releases the permit of a keep-alive
+/// scraper between scrapes and of a client that stopped reading or writing.
+const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Longest time a relayed connection may stay open in total, measured from
+/// `accept()`. Bounds a client that trickles bytes just often enough to
+/// defeat [`RELAY_IDLE_TIMEOUT`]. A keep-alive scraper whose connection is
+/// closed here simply reconnects for its next scrape.
+const RELAY_MAX_LIFETIME: Duration = Duration::from_secs(60);
+
+/// Buffer size for each direction of a relayed connection.
+const RELAY_BUFFER_BYTES: usize = 8 * 1024;
+
 /// Spare descriptors the relays keep open (#1030). Releasing them immediately
 /// before a private `connect` leaves, even when the process is otherwise at
 /// its descriptor limit, one descriptor for the relay's own socket, one for
@@ -109,6 +156,11 @@ const STOPPED_BODY: &str = "Temporal Core metrics server stopped; recreate the r
 /// relaying would risk starving Core's `accept()`. Transient: the next scrape
 /// after descriptor pressure eases is served normally.
 const STARVED_BODY: &str = "Too few file descriptors to serve metrics safely; retry later.\n";
+
+/// Body of the `503` sent to a connection accepted while
+/// [`MAX_CONCURRENT_SCRAPES`] relays are running. Transient: a later scrape
+/// is served once a relay finishes.
+const BUSY_BODY: &str = "Too many concurrent metrics scrapes; retry later.\n";
 
 /// Label names that Core (or the Prometheus exposition format) already uses.
 /// A global tag with one of these names would collide with a per-series label
@@ -287,6 +339,16 @@ struct RelayShared {
     /// response, which is what makes the released descriptors available to
     /// Core rather than to a concurrent relay.
     reserve: tokio::sync::Mutex<DescriptorReserve>,
+    /// One permit per relay that may run, [`MAX_CONCURRENT_SCRAPES`] in all.
+    /// The accept loop takes a permit before spawning a relay, and the relay
+    /// task owns it until the task ends, so every exit path releases it.
+    relay_slots: Arc<Semaphore>,
+    /// One permit per pending over-cap rejection, [`MAX_PENDING_REJECTIONS`]
+    /// in all, owned by the rejection task like `relay_slots`.
+    rejection_slots: Arc<Semaphore>,
+    /// Makes the first "too many concurrent scrapes" record a warning; later
+    /// rejections are logged at debug level so a flood cannot flood the log.
+    busy_reported: AtomicBool,
 }
 
 /// Whether an `accept()` error concerns only the connection being accepted
@@ -303,6 +365,13 @@ fn connection_scoped(kind: ErrorKind) -> bool {
 /// Accepts scrape connections on the public listener until aborted, relaying
 /// each one to Core's scrape server.
 ///
+/// Each relay needs one of [`MAX_CONCURRENT_SCRAPES`] permits. A connection
+/// accepted when none is free is answered by [`reject_busy`] if one of
+/// [`MAX_PENDING_REJECTIONS`] rejection permits is free, and closed at once
+/// otherwise. Accepting continues while every permit is held, so the
+/// kernel's listen backlog does not fill with connections that would
+/// otherwise wait unanswered.
+///
 /// No `accept()` error ends the loop. Connection-scoped errors are skipped;
 /// any other error (descriptor exhaustion, a network that went down) is
 /// logged with its kind only and retried after a backoff that doubles from
@@ -314,7 +383,20 @@ async fn serve_scrapes(listener: TcpListener, shared: Arc<RelayShared>) {
         match listener.accept().await {
             Ok((client, _)) => {
                 retry = ACCEPT_RETRY_MIN;
-                tokio::spawn(relay_scrape(client, Arc::clone(&shared)));
+                match Arc::clone(&shared.relay_slots).try_acquire_owned() {
+                    Ok(permit) => {
+                        tokio::spawn(relay_scrape(client, Arc::clone(&shared), permit));
+                    }
+                    Err(_) => {
+                        report_busy(&shared);
+                        if let Ok(permit) = Arc::clone(&shared.rejection_slots).try_acquire_owned()
+                        {
+                            tokio::spawn(reject_busy(client, permit));
+                        }
+                        // Otherwise `client` is dropped here, closing it
+                        // without an answer.
+                    }
+                }
             }
             Err(error) if connection_scoped(error.kind()) => {
                 tracing::debug!(kind = ?error.kind(), "metrics endpoint skipped a failed connection");
@@ -333,8 +415,40 @@ async fn serve_scrapes(listener: TcpListener, shared: Arc<RelayShared>) {
     }
 }
 
+/// Logs that a connection arrived while every relay permit was held. The
+/// first rejection per exporter is a `warn` record and later ones are
+/// `debug`, so a connection flood cannot flood the log.
+fn report_busy(shared: &RelayShared) {
+    if shared.busy_reported.swap(true, Ordering::Relaxed) {
+        tracing::debug!("metrics endpoint at its connection cap; answering 503");
+    } else {
+        tracing::warn!(
+            limit = MAX_CONCURRENT_SCRAPES,
+            "metrics endpoint at its concurrent connection cap; answering 503 (further rejections are logged at debug level)"
+        );
+    }
+}
+
+/// Answers an over-cap connection with a `503` carrying [`BUSY_BODY`] and
+/// closes it, within [`REJECTION_TIMEOUT`] in total. The request head is read
+/// first so the close is an orderly FIN; a connection that sends nothing in
+/// time is closed without an answer. Never connects to Core and never touches
+/// the descriptor reserve. `_permit` is one of the
+/// [`MAX_PENDING_REJECTIONS`] slots, released when the task ends.
+async fn reject_busy(mut client: TcpStream, _permit: OwnedSemaphorePermit) {
+    let _ = tokio::time::timeout(REJECTION_TIMEOUT, async {
+        if read_request_head(&mut client).await.is_some() {
+            answer_unavailable(&mut client, BUSY_BODY).await;
+        }
+    })
+    .await;
+}
+
 /// Relays one scrape connection to Core's scrape server, byte for byte, until
-/// either side closes.
+/// either side closes, the connection idles for [`RELAY_IDLE_TIMEOUT`], or
+/// [`RELAY_MAX_LIFETIME`] has passed since it was accepted. `_permit` is one
+/// of the [`MAX_CONCURRENT_SCRAPES`] relay slots; it is released when this
+/// task ends, whichever way it ends (including an abort at shutdown).
 ///
 /// The request head is read before Core is involved, so a connection that
 /// sends nothing never occupies the reserve. Then, holding the reserve:
@@ -346,7 +460,12 @@ async fn serve_scrapes(listener: TcpListener, shared: Arc<RelayShared>) {
 /// - otherwise the reserve is released, the relay connects and forwards the
 ///   head, and refills the reserve only once Core's first response bytes
 ///   arrive (or [`FIRST_RESPONSE_TIMEOUT`] passes), before relaying the rest.
-async fn relay_scrape(mut client: TcpStream, shared: Arc<RelayShared>) {
+async fn relay_scrape(
+    mut client: TcpStream,
+    shared: Arc<RelayShared>,
+    _permit: OwnedSemaphorePermit,
+) {
+    let deadline = Instant::now() + RELAY_MAX_LIFETIME;
     let Some(head) = read_request_head(&mut client).await else {
         return;
     };
@@ -402,9 +521,56 @@ async fn relay_scrape(mut client: TcpStream, shared: Arc<RelayShared>) {
         }
         Err(_elapsed) => {}
     }
-    // Errors here are a scraper or Core closing its side; there is nothing to
-    // report beyond what Core logs for its connection.
-    let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+    // Ending at the deadline drops both streams, which closes them; a slow
+    // write stuck inside `relay_until_idle` is cancelled with it.
+    let _ = tokio::time::timeout_at(deadline, relay_until_idle(&mut client, &mut upstream)).await;
+}
+
+/// Copies bytes in both directions until both sides have closed, either side
+/// fails, or no byte moves for [`RELAY_IDLE_TIMEOUT`].
+///
+/// A side's end of input is forwarded as a write shutdown to the other side,
+/// as `tokio::io::copy_bidirectional` does, so HTTP half-close keeps working.
+/// A write that cannot complete within the idle timeout (a scraper that
+/// stopped reading) also ends the relay. Errors are a scraper or Core closing
+/// its side; there is nothing to report beyond what Core logs for its
+/// connection.
+async fn relay_until_idle(client: &mut TcpStream, upstream: &mut TcpStream) {
+    let (mut client_read, mut client_write) = client.split();
+    let (mut core_read, mut core_write) = upstream.split();
+    let mut to_core = vec![0_u8; RELAY_BUFFER_BYTES];
+    let mut to_client = vec![0_u8; RELAY_BUFFER_BYTES];
+    let mut client_open = true;
+    let mut core_open = true;
+    while client_open || core_open {
+        // One step: wait for either side's next read and forward it in full.
+        // Both branches borrow disjoint halves, and a branch that is not
+        // chosen is dropped before any bytes are consumed from its socket.
+        let step = tokio::time::timeout(RELAY_IDLE_TIMEOUT, async {
+            tokio::select! {
+                read = client_read.read(&mut to_core), if client_open => match read {
+                    Ok(0) => {
+                        client_open = false;
+                        core_write.shutdown().await.is_ok()
+                    }
+                    Ok(count) => core_write.write_all(&to_core[..count]).await.is_ok(),
+                    Err(_) => false,
+                },
+                read = core_read.read(&mut to_client), if core_open => match read {
+                    Ok(0) => {
+                        core_open = false;
+                        client_write.shutdown().await.is_ok()
+                    }
+                    Ok(count) => client_write.write_all(&to_client[..count]).await.is_ok(),
+                    Err(_) => false,
+                },
+            }
+        })
+        .await;
+        if !matches!(step, Ok(true)) {
+            return;
+        }
+    }
 }
 
 /// Logs that Core's scrape server has stopped, once per exporter.
@@ -632,6 +798,9 @@ pub(crate) fn start_metrics(
         core_server: Arc::clone(&core_server),
         stop_reported: AtomicBool::new(false),
         reserve: tokio::sync::Mutex::new(reserve),
+        relay_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_SCRAPES)),
+        rejection_slots: Arc::new(Semaphore::new(MAX_PENDING_REJECTIONS)),
+        busy_reported: AtomicBool::new(false),
     });
     let accept_loop = handle.spawn(serve_scrapes(listener, shared)).abort_handle();
     drop(context);

@@ -348,6 +348,7 @@ are excluded from log messages. See the [observability reference](docs/reference
 - [Documentation guide and glossary](docs/README.md)
 - [Supported public API map](docs/reference/public-api-map.md)
 - [Workflow authoring guide](docs/guides/workflows.md)
+- [Worker sizing guide](docs/guides/worker-sizing.md)
 - [Architecture specification](docs/design/sdk-architecture.md)
 - [Implementation roadmap](docs/implementation-roadmap.md)
 - [Runtime invariants](docs/reference/runtime-invariants.md)
@@ -372,6 +373,7 @@ are excluded from log messages. See the [observability reference](docs/reference
 - [Installed package boundary](docs/reference/package-boundary.md)
 - [Local Temporal and PostgreSQL stack](docs/reference/local-temporal-stack.md)
 - [Quality and security gates](docs/reference/quality-gates.md)
+- [Release checklist and bad-release remediation](docs/reference/release-checklist.md)
 - [Dependency and license inventory](docs/dependencies.md)
 - [Verified progress](docs/progress.md)
 
