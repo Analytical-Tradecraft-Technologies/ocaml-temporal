@@ -28,9 +28,16 @@ enum Final {
     /// Stage `Completed` but no outcome, which is an invalid server answer.
     CompletedWithoutOutcome,
     /// A failure outcome paired with a lifecycle stage this bridge does not
-    /// know, as a malformed or forward-incompatible server might send.
+    /// know, as a newer server that added a stage might send.
     OutcomeWithUnknownStage,
+    /// One reply with an unknown lifecycle stage and no outcome, then
+    /// `Accepted`: the unknown stage must be retried, not trusted or rejected.
+    UnknownStageThenAccepted,
 }
+
+/// Lifecycle stage number no current Temporal API defines, standing in for a
+/// stage a newer server might add.
+const UNKNOWN_STAGE: i32 = 99;
 
 /// Records every update request the scripted server received.
 #[derive(Default)]
@@ -67,7 +74,13 @@ fn scripted_response(
     }
     match last {
         Final::NeverAccepted => admitted_only,
-        Final::Accepted => UpdateWorkflowExecutionResponse {
+        Final::UnknownStageThenAccepted if index == admitted => UpdateWorkflowExecutionResponse {
+            update_ref: Some(update_ref()),
+            outcome: None,
+            stage: UNKNOWN_STAGE,
+            ..Default::default()
+        },
+        Final::Accepted | Final::UnknownStageThenAccepted => UpdateWorkflowExecutionResponse {
             update_ref: Some(update_ref()),
             outcome: None,
             stage: i32::from(UpdateWorkflowExecutionLifecycleStage::Accepted),
@@ -92,7 +105,7 @@ fn scripted_response(
                     ..Default::default()
                 })),
             }),
-            stage: 99,
+            stage: UNKNOWN_STAGE,
             ..Default::default()
         },
         Final::CompletedWithoutOutcome => UpdateWorkflowExecutionResponse {
@@ -240,18 +253,42 @@ fn completed_stage_without_outcome_fails_closed() {
     assert!(matches!(error, ClientOperationError::Core(_)));
 }
 
-/// An outcome does not excuse an unknown lifecycle stage: the response fails
-/// closed as a Core defect instead of being trusted.
+/// An outcome is final even when it arrives with a lifecycle stage this
+/// bridge does not know (#1078): a newer server's stage must not turn a
+/// validator rejection into a protocol error.
 #[test]
-fn outcome_with_unknown_stage_fails_closed() {
-    let (core, connection, _probe) = scripted_connection(0, Final::OutcomeWithUnknownStage);
-    let error = start_update(&core, connection, Duration::from_secs(10))
-        .expect_err("unknown stage must fail closed even with an outcome");
-    assert!(matches!(error, ClientOperationError::Core(_)));
+fn outcome_with_unknown_stage_is_returned() {
+    let (core, connection, probe) = scripted_connection(0, Final::OutcomeWithUnknownStage);
+    let response = start_update(&core, connection, Duration::from_secs(10))
+        .expect("an outcome is trusted whatever its stage");
+    match response.outcome {
+        Some(UpdateOutcome::Failed { failure }) => {
+            assert_eq!(failure.message, "validator rejected the update");
+        }
+        other => panic!("expected a rejected outcome, got {other:?}"),
+    }
+    assert_eq!(probe.requests.lock().unwrap().len(), 1);
 }
 
-/// Stage classification retries only the not-yet-accepted stages and rejects
-/// stages this bridge does not know.
+/// An unknown lifecycle stage without an outcome is read as "not yet
+/// accepted" (#1078): the update is re-issued under the same ID and the
+/// handle is returned only once the server reports `Accepted`.
+#[test]
+fn unknown_stage_without_outcome_is_reissued() {
+    let (core, connection, probe) = scripted_connection(1, Final::UnknownStageThenAccepted);
+    let response = start_update(&core, connection, Duration::from_secs(10))
+        .expect("update accepted after an unknown stage");
+    assert_eq!(response.outcome, None);
+    let requests = probe.requests.lock().unwrap();
+    assert_eq!(requests.len(), 3);
+    for request in requests.iter() {
+        let meta = request.request.as_ref().unwrap().meta.as_ref().unwrap();
+        assert_eq!(meta.update_id, "update-1");
+    }
+}
+
+/// Stage classification retries the not-yet-accepted stages, including stages
+/// this bridge does not know, and rejects only `Completed` without an outcome.
 #[test]
 fn lifecycle_stage_classification() {
     assert!(
@@ -263,5 +300,10 @@ fn lifecycle_stage_classification() {
             .unwrap()
     );
     assert!(!update_stage_is_accepted(0).unwrap());
-    assert!(update_stage_is_accepted(99).is_err());
+    assert!(!update_stage_is_accepted(UNKNOWN_STAGE).unwrap());
+    assert!(!update_stage_is_accepted(-1).unwrap());
+    assert!(
+        update_stage_is_accepted(i32::from(UpdateWorkflowExecutionLifecycleStage::Completed))
+            .is_err()
+    );
 }

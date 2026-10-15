@@ -36,6 +36,7 @@ type 'error release =
   | Release_failed of 'error
 
 type 'error operations = {
+  stop_polling : unit -> unit;
   try_acquire_lanes : unit -> bool;
   release_lanes : unit -> unit;
   activity_lane_detached : unit -> bool;
@@ -155,6 +156,11 @@ let first_drain_failure workflow activity =
     it, and a stuck caller of [run] cannot be waiting for it. *)
 let sequence ~clock ~lanes_deadline operations progress =
   let give_up = lanes_deadline +. lanes_slack_s in
+  (* Stop Core taking new tasks before waiting out the grace period: no lane
+     will run them, and the release could only fail them (#1028). Running
+     work keeps its leases and may still complete. A run loop that observed
+     the stop may already have done this; the operation is idempotent. *)
+  probe () operations.stop_polling;
   let acquired = acquire_lanes ~clock ~give_up operations in
   let drains () =
     let workflow =

@@ -25,6 +25,15 @@
 //!   never touches the runtime graph, the registry, or OCaml; it only writes
 //!   its slot and wakes the waiter. Its join handle stays in the runtime's own
 //!   registry so shutdown can abort and join it.
+//! * The registry entry also holds the task's [`AbortHandle`], attached by
+//!   the owner right after spawning ([`attach_task`]). Releasing a call
+//!   aborts its task through that handle (#1019), so an abandoned long poll
+//!   ends at once instead of running until its run closes or the client
+//!   shuts down. Aborting needs no runtime pointer and is safe from any
+//!   thread; the join handle still lets disconnect and close join the task.
+//!   The owner also stops counting a call against any limit as soon as the
+//!   call leaves the registry ([`unregistered_calls`]), even if the aborted
+//!   task has not finished unwinding yet.
 //! * Awaiting a call needs no runtime pointer. The registry is reached by
 //!   identifier, so a caller racing shutdown can never dereference a released
 //!   graph: it simply observes that its call was closed.
@@ -51,6 +60,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
+use tokio::task::AbortHandle;
 
 /// Largest call identifier handed to OCaml. OCaml represents it as a native
 /// `int`, which has at least 63 bits on every supported platform; staying
@@ -77,10 +87,15 @@ pub(crate) struct CallSlot {
     changed: Condvar,
 }
 
-/// One registered call: its slot and the runtime that may release it.
+/// One registered call: its slot, the runtime that may release it, and the
+/// handle that aborts its task once the owner has attached it.
 struct RegisteredCall {
     owner: u64,
     slot: Arc<CallSlot>,
+    /// `None` only between [`register`] and [`attach_task`], which the owner
+    /// runs back to back before the call identifier leaves the owner Domain,
+    /// so no caller can release the call in that window.
+    task: Option<AbortHandle>,
 }
 
 /// Registered calls plus a per-owner count of them, kept in step under one
@@ -246,6 +261,7 @@ pub(crate) fn register(owner: u64) -> std::result::Result<(u64, CompletionGuard)
         RegisteredCall {
             owner,
             slot: Arc::clone(&slot),
+            task: None,
         },
     );
     Ok((call, CompletionGuard { slot: Some(slot) }))
@@ -274,19 +290,65 @@ pub(crate) fn release_owner(owner: u64) {
     }
 }
 
+/// Records the abort handle of the task the owner just spawned for `call`,
+/// so a later [`release_call`] can end that task (#1019). The owner calls
+/// this before the call identifier is returned to OCaml, so the call is
+/// always still registered; if it somehow is not, the task is aborted at
+/// once rather than left running unowned.
+pub(crate) fn attach_task(owner: u64, call: u64, task: AbortHandle) {
+    let orphan = {
+        let mut registry = lock(&CALLS);
+        match registry.calls.get_mut(&call) {
+            Some(registered) if registered.owner == owner => {
+                registered.task = Some(task);
+                None
+            }
+            Some(_) | None => Some(task),
+        }
+    };
+    if let Some(task) = orphan {
+        task.abort();
+    }
+}
+
 /// Abandons the call named by `(owner, call)` without reading it: the call
 /// is unregistered, which frees its capacity slot and drops any outcome
-/// already published, and a still-running task later finds its cell closed.
-/// The task itself is not aborted here (only the owner Domain may touch the
-/// runtime's task registry); it ends at its own RPC deadline or at shutdown.
-/// A mismatched owner, a retired call, or an unknown identifier is a no-op,
-/// so callers may release unconditionally and learn nothing about other
-/// owners' calls. Any thread may call this.
+/// already published, and its task is aborted (#1019). An abandoned long
+/// poll, such as an interrupted `Client.wait` on a run that stays open, would
+/// otherwise keep its server request and its owner's wait and in-flight
+/// slots until the run closed or the client shut down. Aborting through the
+/// [`AbortHandle`] touches neither the runtime graph nor its task registry;
+/// the owner still holds the join handle, stops counting the call at its
+/// next submission, and joins the task at disconnect or close. An aborted
+/// task's completion guard finds its cell already closed. A mismatched owner,
+/// a retired call, or an unknown identifier is a no-op, so callers may
+/// release unconditionally and learn nothing about other owners' calls. Any
+/// thread may call this.
 pub(crate) fn release_call(owner: u64, call: u64) {
     let released = lock(&CALLS).remove(call, Some(owner));
     if let Some(released) = released {
+        // Close before aborting, and outside the registry lock (lock order):
+        // a task dropped by the abort settles its guard against the slot.
         released.slot.close();
+        if let Some(task) = released.task {
+            task.abort();
+        }
     }
+}
+
+/// Returns those of `calls` that are no longer registered under `owner`:
+/// read, released, or closed. The owner uses this at submission to stop
+/// counting such calls against its limits while their tasks finish (#1019).
+pub(crate) fn unregistered_calls(owner: u64, calls: impl Iterator<Item = u64>) -> Vec<u64> {
+    let registry = lock(&CALLS);
+    calls
+        .filter(|call| {
+            !registry
+                .calls
+                .get(call)
+                .is_some_and(|registered| registered.owner == owner)
+        })
+        .collect()
 }
 
 /// Blocks the calling thread for at most `timeout` until the call named by
