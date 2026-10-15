@@ -11,14 +11,16 @@
     deadline so a lost wake fails promptly, and the idle-stop test only
     bounds its stop far above the expected time.
 
-    One assertion is deliberately on wall time: the serial chain's mean
-    step must stay below one 15.625 ms Windows timer tick (#1008). It
-    assumes that the lanes' local yields have sub-tick precision, which the
-    bridge's high-resolution pacing sleep provides on every supported
-    platform, so it is skipped under [IDLE_TEST_SLEEP_MODEL=windows-thread-delay],
-    which reproduces the old tick-bound yields. It tolerates a loaded runner
-    because the measured mean, about 1.1 ms, is more than ten times below
-    the bound, and averaging over 100 steps absorbs a few delayed ones. *)
+    One assertion is deliberately on wall time: on Windows, the serial
+    chain's mean step must stay below one 15.625 ms Windows timer tick
+    (#1008). It assumes that the lanes' local yields have sub-tick
+    precision, which the bridge's high-resolution pacing sleep provides, so
+    it is skipped under [IDLE_TEST_SLEEP_MODEL=windows-thread-delay], which
+    reproduces the old tick-bound yields. It is enforced only on Windows,
+    where the timer tick is the regression it guards: on other platforms a
+    virtualised CI runner's scheduling delay (1 ms sleeps lasting over
+    12 ms were seen on macOS) is unrelated to it, so the mean is only
+    printed there. Averaging over 100 steps absorbs a few delayed steps. *)
 
 (** Seconds on the native monotonic clock, which has sub-microsecond
     resolution on every supported platform. The simulated server round trips
@@ -464,8 +466,8 @@ let test_early_join_poll_requeues_behind_wait () =
     [windows-thread-delay], a sub-millisecond yield returns at once, so the
     lanes request about 6.5 ms of yields per step against 0.2 ms otherwise.
 
-    The mean wall time per step must stay below one 15.625 ms Windows timer
-    tick whenever the lanes use the bridge's pacing sleep (#1008). It is
+    On Windows, the mean wall time per step must stay below one 15.625 ms
+    timer tick whenever the lanes use the bridge's pacing sleep (#1008). It is
     about 1.1 ms on macOS, natively and under the [windows] model, and 21 to
     23 ms under [windows-thread-delay], where the bound is not applied. The
     mean over 100 steps keeps an occasional delayed step on a loaded runner
@@ -519,7 +521,8 @@ let test_serial_chain_avoids_fixed_sleep () =
       (Printf.sprintf "serial chain requested %d capped yields in %d steps"
          capped steps);
   let windows_tick_ms = 15.625 in
-  if sleep_model <> Windows_thread_delay && wall_ms >= windows_tick_ms then
+  if Sys.win32 && sleep_model <> Windows_thread_delay
+     && wall_ms >= windows_tick_ms then
     failwith
       (Printf.sprintf
          "serial chain took %.3f ms per step, not below one %.3f ms timer tick"

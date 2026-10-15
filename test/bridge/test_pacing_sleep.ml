@@ -38,7 +38,10 @@ let test_precision () =
   Array.sort Float.compare samples;
   let median = samples.(Array.length samples / 2) in
   Printf.printf "median 1 ms pacing sleep: %.3f ms\n%!" (median *. 1000.);
-  if median >= windows_tick_s /. 2. then
+  (* Enforced only on Windows, where the default timer tick is the
+     regression this guards; elsewhere the sleep is nanosleep and a
+     virtualised runner's scheduling delay is unrelated (#1008). *)
+  if Sys.win32 && median >= windows_tick_s /. 2. then
     failwith
       (Printf.sprintf "median 1 ms pacing sleep took %.3f ms" (median *. 1000.))
 

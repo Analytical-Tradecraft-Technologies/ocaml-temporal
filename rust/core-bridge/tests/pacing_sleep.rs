@@ -42,7 +42,11 @@ fn sleeps_at_least_the_requested_time() {
 
 /// A 1 ms pacing sleep typically lasts far less than one Windows timer tick.
 /// `Sleep(1)` at the default timer resolution would last a whole tick every
-/// time, so this fails if the high-resolution timer is not used.
+/// time, so this fails if the high-resolution timer is not used. It runs only
+/// on Windows: elsewhere the sleep is `nanosleep`, and a virtualised CI
+/// runner's scheduling delay (medians above 12 ms were seen on macOS) says
+/// nothing about the Windows timer this guards.
+#[cfg(windows)]
 #[test]
 fn one_millisecond_sleep_is_shorter_than_a_timer_tick() {
     let mut samples: Vec<Duration> = (0..21).map(|_| timed_sleep(1_000_000)).collect();
