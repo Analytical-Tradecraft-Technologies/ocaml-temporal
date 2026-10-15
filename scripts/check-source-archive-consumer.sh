@@ -78,7 +78,7 @@ jobs=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)
 # -p implies --root . and the release profile, matching the sandboxed build,
 # so Dune reuses its output rather than rebuilding anything.
 (
-  cd "$package_root"
+  cd "$package_root" || exit 1
   dune install -p "$package" --prefix "$prefix"
 )
 installed=$prefix/lib/$package
@@ -120,7 +120,7 @@ cp "$history" "$consumer/timer-history.pb"
 # the fixture also checks that the same workflow without its timer is
 # nondeterministic (#497).
 (
-  cd "$consumer"
+  cd "$consumer" || exit 1
   ./_build/default/installed_replay.exe timer-history.pb
 )
 echo "installed consumer of $(basename "$package_root") built and ran from $prefix"
