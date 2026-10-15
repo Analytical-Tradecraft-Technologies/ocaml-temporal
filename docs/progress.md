@@ -15,6 +15,65 @@ implementation when a later entry documents that work as complete. The
 records the current tested source, named assertions and successful CI job for
 the Temporal acceptance controllers.
 
+## 2026-10-16: Concurrent live worker and client lifecycle stress (#506)
+
+Before this change, the lifecycle stress drove live activity workers from one
+thread only, and the concurrent stress used replay workers only. A new test
+in the `lifecycle_stress` binary, `live_stress::concurrent_live_workers_and_clients`,
+runs live activity workers and submitted client calls on several threads at
+once against the binary's gRPC double. The double now records heartbeats per
+token and answers every third with `cancel_requested`. It holds history long
+polls open until the client resets them, and counts only requests that
+arrived whole. The stress covers:
+
+- polling, worker completions and rejections, and worker heartbeats followed
+  by Core's Cancel task and a cancelled completion;
+- handoff to async completion, then throttled async heartbeats and async
+  completions submitted as client calls (#1025);
+- signals, workflow cancellation requests, and never-answered waits, some
+  released before their outcome (#1019);
+- initiate-shutdown and shutdown with and without a held lease (#1028), and
+  disconnect;
+- graphs on owned Cores or on a shared Core that the coordinator releases
+  mid-round, released on their own thread or by a reaper thread while their
+  owner still awaits their calls.
+
+After the rounds, the test checks the following:
+
+- every graph was cleaned once and every Core dropped once;
+- the client call registry is back at its baseline, through
+  `test_registered_client_calls`, a new hidden test hook;
+- every held long poll ended;
+- every owed completion arrived exactly once, and an unconfirmed async
+  completion arrived at most once;
+- the server never saw more heartbeats than the test sent;
+- no panic came from bridge code on any thread.
+
+Shutdown and waiting frees must finish within 20 seconds, and calls of a
+released graph must end within 30 seconds.
+
+The default budget (3 rounds, 4 threads, up to 48 operations per graph) runs
+in about 1.5 seconds in the ordinary `cargo test`. The
+`LIFECYCLE_STRESS_LIVE_{ROUNDS,THREADS,STEPS,ROUND}` variables scale it.
+`make stress-qualification` runs 200 rounds of 12 threads with up to 96
+operations per graph. On an Apple
+M-series laptop that budget (seed `0x7e57`) leased 47,950 tokens across 4,800
+graphs and 1,805 Core runtimes in 224 seconds and passed, with no panic of
+any kind. A run of 60 rounds of 12 threads (seed `0x1234abcd`) took 67 seconds.
+
+The first large run failed on the double, not the bridge. A completion RPC
+that the client aborted mid-body was decoded as a completion with an empty
+token. The double now discards a request whose stream was reset or whose body
+is shorter than its gRPC length prefix.
+
+The upstream Core teardown panic in the Findings section of
+[bridge lifecycle stress](reference/bridge-lifecycle-stress.md#findings) was
+re-checked against the pinned Core `8fe478e`. The unchanged
+`poll_task_awaiter.await.unwrap()` is now at `poll_buffer.rs:452`, and the
+panic still occurs: once with each of two seeds in 25,600 replay graphs. It
+remains contained on a Tokio worker thread, with every graph and Core
+released exactly once.
+
 ## 2026-10-15: Worker idle pacing keeps sub-tick precision on Windows (#1008)
 
 The adaptive idle pacing from #994 slept with `Thread.delay`, which on
