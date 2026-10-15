@@ -32,7 +32,9 @@ The remaining reference documents are useful when changing one subsystem:
 - [OCaml activity protocol adapter](reference/activity-protocol.md) documents
   remote activity tasks, completions, heartbeats, and opaque task-token
   ownership. The heartbeat schema is
-  [`activity-heartbeat.schema.json`](schemas/bridge/activity-heartbeat.schema.json).
+  [`activity-heartbeat.schema.json`](schemas/bridge/activity-heartbeat.schema.json);
+  an async handle's throttled heartbeat uses
+  [`activity-async-heartbeat.schema.json`](schemas/bridge/activity-async-heartbeat.schema.json).
 - [Native workflow execution](reference/native-worker-execution.md) documents
   the current native worker command slice and two-stage child resolution.
 - [Native activity execution](reference/native-activity-execution.md) documents

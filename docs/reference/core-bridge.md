@@ -85,6 +85,23 @@ the version and symbol prefix stay at 4. The completion registry, its
 ownership, and its shutdown behavior are described in the
 [client protocol](client-protocol.md#submitted-client-calls-807).
 
+The async activity heartbeat selector (`ASYNC_ACTIVITY_HEARTBEAT`, #1025) is
+the one selector whose document is not its synchronous symbol's: it adds the
+attempt's required, nullable `heartbeat_timeout`
+([schema](../schemas/bridge/activity-async-heartbeat.schema.json)), and its
+outcome may also be the fixed value `cancel_requested`, `reset`, or
+`paused`. The selector was added and then changed before any release
+shipped it, so this stays within version 4. The bridge throttles those
+heartbeats per task token with the worker's heartbeat throttle settings
+(`rust/core-bridge/src/heartbeat_throttle.rs`). Each throttled token has one
+driver task on Core's Tokio runtime that owns a client (a connection
+clone); the runtime owner keeps every driver's `JoinHandle`, and disconnect
+and close abort and join the drivers after the submitted calls, before the
+connection is dropped (the GC close path hands them to the cleanup thread
+with the other aborted tasks). Throttle state is bounded by the
+connection's `max_in_flight_calls`; see
+[native activity execution](native-activity-execution.md#async-heartbeat-throttling).
+
 The canonical header is
 `rust/core-bridge/include/ocaml_temporal_core.h`. Both Rust and C compile-time
 assertions protect the status width, every numeric status value, and field
@@ -606,7 +623,7 @@ operations. It exposes a typed GADT rather than raw JSON bytes:
 | `Try_poll_activity` | `Activity_protocol.task option`; `None` means the activity lane was empty at that instant |
 | `Wait_activity` | bounded native readiness wait; it does not consume an activity task and releases the OCaml runtime lock |
 | `Wait_any` | bounded native readiness wait that any queued workflow activation or activity task ends; it consumes nothing and releases the OCaml runtime lock |
-| `Record_activity_heartbeat encoded` | an `Encoded_activity_heartbeat.t` holding the canonical JSON from the activity adapter's single encoder pass, which validated the token and details; the supervisor copies those bytes into the native call without encoding them again (#1001), and Rust records them for the outstanding activity lease without retiring it. The acknowledgement carries no cancellation flags, which arrive later on the activity poll lane. `Record_async_activity_heartbeat` takes the same value |
+| `Record_activity_heartbeat encoded` | an `Encoded_activity_heartbeat.t` holding the canonical JSON from the activity adapter's single encoder pass, which validated the token and details; the supervisor copies those bytes into the native call without encoding them again (#1001), and Rust records them for the outstanding activity lease without retiring it. The acknowledgement carries no cancellation flags, which arrive later on the activity poll lane. `Record_async_activity_heartbeat` takes the same value; the worker's throttled `Rpc_async_activity_heartbeat` client call instead takes an `Encoded_async_activity_heartbeat.t`, which adds the attempt's heartbeat timeout, and returns the activity state of the token's latest send (#1025) |
 | `Complete_activity encoded` | an `Encoded_activity_completion.t` holding the canonical JSON from the activity adapter's single encoder pass, which validated the opaque token and result; the supervisor copies those bytes into the native completion call without encoding them again, and Rust strictly decodes them. `Complete_async_activity` takes the same value |
 
 All eight operations enter the same bounded mailbox as client and worker

@@ -152,6 +152,18 @@ type completion = { task_token : bytes; result : completion_result }
 (** Progress details submitted for one currently leased activity token. Rust
     converts the opaque token back to the official Core protobuf. *)
 type heartbeat = { task_token : bytes; details : payload list }
+
+(** An async-handle heartbeat with its attempt's heartbeat timeout (#1025);
+    see the interface. *)
+type async_heartbeat = { heartbeat : heartbeat; heartbeat_timeout : duration option }
+
+(** The closed set of submitted async-heartbeat outcomes; see the
+    interface. *)
+type async_heartbeat_response =
+  | Heartbeat_recorded
+  | Heartbeat_cancel_requested
+  | Heartbeat_paused
+  | Heartbeat_reset
 type error = Workflow.error
 type error_view = Workflow.error_view = { code : string; path : string; message : string }
 
@@ -683,3 +695,52 @@ let encode_heartbeat (value : heartbeat) =
          parsing [output] again would only repeat the payload passes. *)
       let* _ = heartbeat_from_json json in
       Ok output
+
+(** Decodes an async heartbeat object after closing its exact three-member
+    shape; the heartbeat members follow the plain heartbeat's rules. *)
+let async_heartbeat_from_json json =
+  let* entries =
+    Shared.exact_object "$" [ "task_token"; "details"; "heartbeat_timeout" ] json
+  in
+  let* token_json = required "$" "task_token" entries in
+  let* task_token = task_token "$.task_token" token_json in
+  let* details_json = required "$" "details" entries in
+  let* details = Shared.list "$.details" Shared.payload details_json in
+  let* timeout_json = required "$" "heartbeat_timeout" entries in
+  let* heartbeat_timeout =
+    Shared.nullable "$.heartbeat_timeout" Shared.duration timeout_json
+  in
+  Ok { heartbeat = { task_token; details }; heartbeat_timeout }
+
+(** Strictly decodes one async-activity heartbeat JSON document. *)
+let decode_async_heartbeat input =
+  match Control.decode_payload_object input with
+  | Error error -> Error (of_control_error error)
+  | Ok json -> async_heartbeat_from_json json
+
+(** Encodes an async heartbeat and applies the decoder's semantic rules
+    before sending it across the native boundary. *)
+let encode_async_heartbeat (value : async_heartbeat) =
+  let* token = task_token_json "$.task_token" value.heartbeat.task_token in
+  let* details = payloads_json value.heartbeat.details in
+  let json =
+    `Assoc
+      [
+        ("task_token", token);
+        ("details", details);
+        ("heartbeat_timeout", optional_duration value.heartbeat_timeout);
+      ]
+  in
+  match Control.encode_payload_object json with
+  | Error error -> Error (of_control_error error)
+  | Ok output ->
+      let* _ = async_heartbeat_from_json json in
+      Ok output
+
+(** Maps the bridge's fixed outcome words; anything else is [None]. *)
+let async_heartbeat_response_of_string = function
+  | "" -> Some Heartbeat_recorded
+  | "cancel_requested" -> Some Heartbeat_cancel_requested
+  | "paused" -> Some Heartbeat_paused
+  | "reset" -> Some Heartbeat_reset
+  | _ -> None

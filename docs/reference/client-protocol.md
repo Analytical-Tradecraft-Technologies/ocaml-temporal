@@ -864,10 +864,33 @@ The corresponding heartbeat request is non-terminal:
 ```
 
 Heartbeat details use the same ordered binary payload representation as task
-inputs and completions. A successful heartbeat only acknowledges submission;
-it does not retire the activity or report cancellation, pause, or reset flags.
-Those Core outcomes remain asynchronous and are not synthesized into this
-client response.
+inputs and completions. A successful heartbeat through this synchronous
+endpoint only acknowledges submission; it does not retire the activity or
+report cancellation, pause, or reset flags, and every call is one RPC.
+
+The OCaml worker does not use that endpoint. It submits the
+`ASYNC_ACTIVITY_HEARTBEAT` client call (#1025), whose document adds the
+attempt's heartbeat timeout as a required, nullable member:
+
+```json
+{
+  "task_token": "AAEC/v8=",
+  "details": [],
+  "heartbeat_timeout": {"seconds": 10, "nanoseconds": 0}
+}
+```
+
+The bridge throttles these heartbeats per task token exactly as Core
+throttles a running activity's heartbeats: the first is sent at once,
+later ones within the throttle interval only replace the pending details,
+and a trailing send carries the latest details when the interval expires.
+The interval is 80% of the heartbeat timeout, or the worker's
+`default_heartbeat_throttle_interval` without one, capped by
+`max_heartbeat_throttle_interval`. The call's outcome is empty, or the
+fixed value `cancel_requested`, `reset`, or `paused` when the token's latest
+send reported that state; see
+[native activity execution](native-activity-execution.md#asynchronous-completion)
+for the full semantics.
 
 Neither endpoint reads or retires the worker's activity-task ledger. The
 worker lease was already handed off, and the OCaml async-activity state machine
@@ -888,7 +911,9 @@ completions, which keep the fail-closed `Retryable`-only replay policy.
 The request shapes are defined by
 [`activity-async-completion.schema.json`](../schemas/bridge/activity-async-completion.schema.json)
 and
-[`activity-heartbeat.schema.json`](../schemas/bridge/activity-heartbeat.schema.json).
+[`activity-heartbeat.schema.json`](../schemas/bridge/activity-heartbeat.schema.json),
+or, for the submitted heartbeat call,
+[`activity-async-heartbeat.schema.json`](../schemas/bridge/activity-async-heartbeat.schema.json).
 The shared task-token, payload, and failure constraints are documented in the
 [activity protocol reference](activity-protocol.md); the worker-only
 completion schema intentionally remains broader because it includes the

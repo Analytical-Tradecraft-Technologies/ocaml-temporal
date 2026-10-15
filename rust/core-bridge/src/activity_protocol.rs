@@ -173,6 +173,28 @@ pub struct ActivityHeartbeat {
     pub details: Vec<Payload>,
 }
 
+/// Progress details for an activity handed off with `WillCompleteAsync`,
+/// together with the attempt's heartbeat timeout (#1025).
+///
+/// The bridge throttles these heartbeats per task token as Core throttles a
+/// running activity's heartbeats. Core derives the throttle interval from the
+/// heartbeat timeout of the task it still tracks; the async client path has
+/// no such task, so the OCaml adapter, which copied the timeout from the
+/// attempt's start task, supplies it here. `None` (and a zero duration, which
+/// the server uses for an unset timeout) selects the worker's default
+/// throttle interval.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AsyncActivityHeartbeat {
+    /// Opaque canonical-base64 token copied from the handed-off task.
+    pub task_token: String,
+    /// Ordered details retained by Temporal for the next retry attempt.
+    pub details: Vec<Payload>,
+    /// Heartbeat timeout of the attempt, copied from its start task.
+    #[serde(deserialize_with = "workflow_protocol::required_nullable")]
+    pub heartbeat_timeout: Option<Duration>,
+}
+
 /// Supported activity completion outcomes.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -291,6 +313,25 @@ pub fn encode_heartbeat(value: &ActivityHeartbeat) -> Result<String, ProtocolErr
         .map_err(|_| ProtocolError::invalid("$", "could not encode activity heartbeat"))?;
     let output = protocol::encode_payload_object(&from_serde(json)?)?;
     decode_heartbeat(&output)?;
+    Ok(output)
+}
+
+/// Decodes and validates one strict async-activity heartbeat document.
+pub fn decode_async_heartbeat(input: &str) -> Result<AsyncActivityHeartbeat, ProtocolError> {
+    let value = protocol::decode_payload_object(input)?;
+    let heartbeat: AsyncActivityHeartbeat = serde_json::from_value(to_serde(value))
+        .map_err(|_| ProtocolError::invalid("$", "invalid async activity heartbeat semantics"))?;
+    validate_async_heartbeat(&heartbeat)?;
+    Ok(heartbeat)
+}
+
+/// Validates, normalizes, and reparses one outgoing async-activity heartbeat.
+pub fn encode_async_heartbeat(value: &AsyncActivityHeartbeat) -> Result<String, ProtocolError> {
+    validate_async_heartbeat(value)?;
+    let json = serde_json::to_value(value)
+        .map_err(|_| ProtocolError::invalid("$", "could not encode async activity heartbeat"))?;
+    let output = protocol::encode_payload_object(&from_serde(json)?)?;
+    decode_async_heartbeat(&output)?;
     Ok(output)
 }
 
@@ -465,6 +506,26 @@ fn validate_heartbeat(value: &ActivityHeartbeat) -> Result<(), ProtocolError> {
         workflow_protocol::validate_payload_limits(payload).map_err(|_| {
             ProtocolError::invalid("$.details", "heartbeat payload violates protocol limits")
         })?;
+    }
+    Ok(())
+}
+
+/// Applies the heartbeat rules to an async heartbeat and checks that its
+/// heartbeat timeout is an exact nonnegative protobuf duration.
+fn validate_async_heartbeat(value: &AsyncActivityHeartbeat) -> Result<(), ProtocolError> {
+    decode_token(&value.task_token)?;
+    for payload in &value.details {
+        workflow_protocol::validate_payload_limits(payload).map_err(|_| {
+            ProtocolError::invalid("$.details", "heartbeat payload violates protocol limits")
+        })?;
+    }
+    if let Some(timeout) = value.heartbeat_timeout {
+        workflow_protocol::validate_time(
+            timeout.seconds,
+            timeout.nanoseconds,
+            true,
+            "$.heartbeat_timeout",
+        )?;
     }
     Ok(())
 }

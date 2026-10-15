@@ -311,7 +311,7 @@ module Fake_supervisor = struct
       }
 
   let record_async_activity_heartbeat _supervisor
-      (_encoded : Encoded_heartbeat.t) =
+      (_encoded : Temporal_protocol.Encoded_async_activity_heartbeat.t) =
     Error
       {
         code = "unsupported";
