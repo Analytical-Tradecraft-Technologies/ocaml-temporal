@@ -190,7 +190,10 @@ module Activity_source = struct
 
   (** Records progress for an admitted asynchronous activity, likewise as the
       adapter's single-encode heartbeat bytes and likewise as a submitted
-      client call that waits on this caller's thread (#1025). *)
+      client call that waits on this caller's thread (#1025). The bridge
+      throttles these per task token, so a call within the throttle interval
+      returns without a server round trip; the result is the activity state
+      of the token's latest send. *)
   let record_async_activity_heartbeat supervisor encoded =
     Native.call supervisor (Native.Rpc_async_activity_heartbeat encoded)
 

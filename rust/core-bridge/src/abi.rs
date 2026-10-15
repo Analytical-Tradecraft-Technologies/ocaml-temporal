@@ -1,3 +1,6 @@
+use crate::heartbeat_throttle::{
+    self, Admission, HeartbeatFlags, HeartbeatIntervals, HeartbeatThrottle,
+};
 use crate::replay_bridge::{ReplayWorker, ReplayWorkerError};
 use crate::worker_bridge::{
     BoundedFinalize, PollLaneError, PollLanes, ReadinessWait, ShutdownDrainError,
@@ -226,7 +229,11 @@ enum ClientCallKind {
     /// Complete, fail, or cancel an activity handed off with
     /// `WillCompleteAsync` (#1025).
     AsyncActivityCompletion,
-    /// Heartbeat an activity handed off with `WillCompleteAsync` (#1025).
+    /// Heartbeat an activity handed off with `WillCompleteAsync` (#1025),
+    /// throttled per task token like Core's own heartbeats. Unlike every
+    /// other selector, its document is not the one its synchronous symbol
+    /// accepts: it adds the attempt's heartbeat timeout; see
+    /// [`activity_protocol::AsyncActivityHeartbeat`].
     AsyncActivityHeartbeat,
 }
 
@@ -271,14 +278,78 @@ enum ClientRpc {
     Update(client_protocol::UpdateWorkflowRequest),
     PollUpdate(client_protocol::PollWorkflowUpdateRequest),
     Visibility(client_protocol::VisibilityRequest),
-    /// A namespace-bound async activity request (#1025). `namespace` is
-    /// `None` straight after [`ClientRpc::decode`], which has no runtime;
-    /// [`ClientRpc::bind_namespace`] fills it from the worker before the
-    /// future is built.
+    /// A namespace-bound async activity completion, failure, or
+    /// cancellation (#1025). `binding` is `None` straight after
+    /// [`ClientRpc::decode`], which has no runtime;
+    /// [`ClientRpc::bind_async_activity`] fills it from the worker before
+    /// the future is built.
     AsyncActivity {
         request: AsyncActivityRequest,
-        namespace: Option<String>,
+        binding: Option<AsyncActivityBinding>,
     },
+    /// A throttled async activity heartbeat (#1025), bound like
+    /// [`ClientRpc::AsyncActivity`].
+    AsyncHeartbeat {
+        heartbeat: ThrottledHeartbeat,
+        binding: Option<AsyncActivityBinding>,
+    },
+}
+
+/// The worker-scoped state an async activity request needs, captured on the
+/// owner Domain when the request is submitted.
+struct AsyncActivityBinding {
+    /// Namespace of the worker that handed the activity off.
+    namespace: String,
+    /// The runtime's heartbeat throttle; terminal requests evict their token
+    /// from it and heartbeats are admitted through it.
+    throttle: Arc<HeartbeatThrottle>,
+    /// The worker's heartbeat throttle settings.
+    intervals: HeartbeatIntervals,
+    /// Most tokens the throttle tracks: the connection's in-flight call
+    /// limit, since every tracked token has a driver that may hold an RPC.
+    max_throttled_tokens: usize,
+}
+
+/// One validated async heartbeat, converted to protobuf values before any
+/// RPC, with the attempt's heartbeat timeout for the throttle interval.
+struct ThrottledHeartbeat {
+    /// Opaque token of the handed-off activity; the throttle's key.
+    task_token: Vec<u8>,
+    /// Details for the server; `None` when the caller sent none.
+    details: Option<api_common::Payloads>,
+    /// The attempt's heartbeat timeout, `None` when unset.
+    heartbeat_timeout: Option<Duration>,
+}
+
+impl ThrottledHeartbeat {
+    /// Strictly decodes an async-activity heartbeat document.
+    fn decode(text: &str) -> std::result::Result<Self, Failure> {
+        let semantic = activity_protocol::decode_async_heartbeat(text).map_err(protocol_failure)?;
+        let task_token =
+            activity_protocol::decode_token(&semantic.task_token).map_err(protocol_failure)?;
+        let heartbeat_timeout = match semantic.heartbeat_timeout {
+            None => None,
+            Some(timeout) => Some(std_duration(timeout)?),
+        };
+        Ok(Self {
+            task_token,
+            details: async_payloads(&semantic.details)?,
+            heartbeat_timeout,
+        })
+    }
+}
+
+/// Converts a validated nonnegative protobuf duration to a standard one.
+fn std_duration(value: workflow_protocol::Duration) -> std::result::Result<Duration, Failure> {
+    let seconds = u64::try_from(value.seconds).map_err(|_| Failure {
+        status: STATUS_PROTOCOL,
+        message: "duration must not be negative".to_owned(),
+    })?;
+    let nanoseconds = u32::try_from(value.nanoseconds).map_err(|_| Failure {
+        status: STATUS_PROTOCOL,
+        message: "duration nanoseconds are outside protobuf range".to_owned(),
+    })?;
+    Ok(Duration::new(seconds, 0).saturating_add(Duration::from_nanos(u64::from(nanoseconds))))
 }
 
 /// A client RPC future that owns its connection clone and produces exactly
@@ -321,28 +392,33 @@ impl ClientRpc {
             ),
             ClientCallKind::AsyncActivityCompletion => Self::AsyncActivity {
                 request: AsyncActivityRequest::decode_completion(text)?,
-                namespace: None,
+                binding: None,
             },
-            ClientCallKind::AsyncActivityHeartbeat => Self::AsyncActivity {
-                request: AsyncActivityRequest::decode_heartbeat(text)?,
-                namespace: None,
+            ClientCallKind::AsyncActivityHeartbeat => Self::AsyncHeartbeat {
+                heartbeat: ThrottledHeartbeat::decode(text)?,
+                binding: None,
             },
         })
     }
 
-    /// Supplies the worker namespace an async activity request is addressed
-    /// to; every other request is returned unchanged. A runtime without a
-    /// worker namespace rejects the request synchronously with the same
-    /// `STATUS_INVALID_STATE` failure as the synchronous symbols.
-    fn bind_namespace(self, worker_namespace: Option<&str>) -> std::result::Result<Self, Failure> {
+    /// Supplies the worker state an async activity request needs, built by
+    /// `binding` only for such a request; every other request is returned
+    /// unchanged. A runtime without a worker namespace rejects the request
+    /// synchronously with the same `STATUS_INVALID_STATE` failure as the
+    /// synchronous symbols.
+    fn bind_async_activity(
+        self,
+        binding: impl FnOnce() -> std::result::Result<AsyncActivityBinding, Failure>,
+    ) -> std::result::Result<Self, Failure> {
         match self {
-            Self::AsyncActivity { request, .. } => {
-                let namespace = worker_namespace.ok_or_else(missing_worker_namespace)?;
-                Ok(Self::AsyncActivity {
-                    request,
-                    namespace: Some(namespace.to_owned()),
-                })
-            }
+            Self::AsyncActivity { request, .. } => Ok(Self::AsyncActivity {
+                request,
+                binding: Some(binding()?),
+            }),
+            Self::AsyncHeartbeat { heartbeat, .. } => Ok(Self::AsyncHeartbeat {
+                heartbeat,
+                binding: Some(binding()?),
+            }),
             other => Ok(other),
         }
     }
@@ -413,18 +489,54 @@ impl ClientRpc {
                     .map_err(client_operation_failure)?;
                 encode_bytes(client_protocol::encode_visibility_response(&response))
             }),
-            Self::AsyncActivity { request, namespace } => Box::pin(async move {
-                // `bind_namespace` always runs first. Should it ever not, the
-                // task must still not fail with `STATUS_INVALID_STATE`, which
-                // an await reserves for a closed call.
-                let namespace = namespace.ok_or_else(|| Failure {
-                    status: STATUS_INTERNAL,
-                    message: "asynchronous activity request has no namespace".to_owned(),
-                })?;
-                let client = async_activity_client_for(connection, namespace)?;
-                submitted_async_activity_outcome(request.send(client).await)
+            Self::AsyncActivity { request, binding } => Box::pin(async move {
+                let binding = binding.ok_or_else(unbound_async_activity)?;
+                let client = async_activity_client_for(connection, binding.namespace)?;
+                let outcome = request
+                    .send_evicting(client, &binding.throttle)
+                    .await
+                    .map(|()| Vec::new());
+                submitted_async_activity_outcome(outcome)
+            }),
+            Self::AsyncHeartbeat { heartbeat, binding } => Box::pin(async move {
+                let binding = binding.ok_or_else(unbound_async_activity)?;
+                let client = async_activity_client_for(connection, binding.namespace)?;
+                let ThrottledHeartbeat {
+                    task_token,
+                    details,
+                    heartbeat_timeout,
+                } = heartbeat;
+                let admission = binding.throttle.record(
+                    &tokio::runtime::Handle::current(),
+                    client.clone(),
+                    task_token.clone(),
+                    details,
+                    binding.intervals.interval(heartbeat_timeout),
+                    binding.max_throttled_tokens,
+                );
+                let outcome = match admission {
+                    Admission::Sent(outcome) => outcome
+                        .await
+                        .unwrap_or_else(|_| Err(heartbeat_throttle::unknown_outcome())),
+                    Admission::Coalesced(flags) => Ok(flags),
+                    Admission::Unthrottled(details) => {
+                        send_async_heartbeat(client, task_token, details).await
+                    }
+                };
+                submitted_async_activity_outcome(outcome.map(|flags| flags.outcome_body().to_vec()))
             }),
         }
+    }
+}
+
+/// The failure of an async activity request whose future was built without
+/// its worker binding. [`ClientRpc::bind_async_activity`] always runs first;
+/// should it ever not, the task must still not fail with
+/// `STATUS_INVALID_STATE`, which an await reserves for a closed call.
+fn unbound_async_activity() -> Failure {
+    Failure {
+        status: STATUS_INTERNAL,
+        message: "asynchronous activity request has no worker binding".to_owned(),
     }
 }
 
@@ -436,13 +548,14 @@ impl ClientRpc {
 /// the OCaml decoder maps this body back to it.
 const ASYNC_ACTIVITY_NOT_FOUND_OUTCOME: &[u8] = b"not_found";
 
-/// Converts the outcome of [`AsyncActivityRequest::send`] for a submitted
-/// call: success is an empty body, `NotFound` is
+/// Converts the outcome of an async activity RPC for a submitted call:
+/// success is its body (empty for an accepted terminal request; for a
+/// heartbeat, see [`HeartbeatFlags::outcome_body`]), `NotFound` is
 /// [`ASYNC_ACTIVITY_NOT_FOUND_OUTCOME`], and every other failure is returned
 /// unchanged.
-fn submitted_async_activity_outcome(outcome: std::result::Result<(), Failure>) -> Operation {
+fn submitted_async_activity_outcome(outcome: std::result::Result<Vec<u8>, Failure>) -> Operation {
     match outcome {
-        Ok(()) => Ok(Vec::new()),
+        Ok(body) => Ok(body),
         Err(failure) if failure.status == STATUS_INVALID_STATE => {
             Ok(ASYNC_ACTIVITY_NOT_FOUND_OUTCOME.to_vec())
         }
@@ -582,6 +695,37 @@ impl AsyncActivityRequest {
         })
     }
 
+    /// The task token the request addresses.
+    fn task_token(&self) -> &[u8] {
+        match self {
+            Self::Completed { task_token, .. }
+            | Self::Failed { task_token, .. }
+            | Self::Cancelled { task_token, .. }
+            | Self::Heartbeat { task_token, .. } => task_token,
+        }
+    }
+
+    /// Sends a terminal request after evicting its token from `throttle`,
+    /// as Core evicts a completed activity from its heartbeat manager, so no
+    /// trailing heartbeat follows the completion and the token's state is
+    /// freed at once. Like Core, details recorded for a trailing heartbeat
+    /// are flushed first only before a cancellation, which does not carry
+    /// the last heartbeat's details; the flush's outcome is ignored, as Core
+    /// ignores it. A heartbeat request is sent unchanged.
+    async fn send_evicting(
+        self,
+        client: Client,
+        throttle: &HeartbeatThrottle,
+    ) -> std::result::Result<(), Failure> {
+        if !matches!(self, Self::Heartbeat { .. })
+            && let Some(pending) = throttle.evict(self.task_token())
+            && matches!(self, Self::Cancelled { .. })
+        {
+            let _ = send_async_heartbeat(client.clone(), self.task_token().to_vec(), pending).await;
+        }
+        self.send(client).await
+    }
+
     /// Sends the request through `client`, which owns its connection clone.
     /// A server `NotFound` is `STATUS_INVALID_STATE`, a definite rejection is
     /// `STATUS_ASYNC_HEARTBEAT_REJECTED`, and every other RPC failure is
@@ -648,24 +792,45 @@ impl AsyncActivityRequest {
                 task_token,
                 details,
             } => {
-                let request = RecordActivityTaskHeartbeatRequest {
-                    task_token,
-                    details,
-                    identity,
-                    namespace,
-                    ..Default::default()
-                };
-                (
-                    AsyncActivityOperation::Heartbeat,
-                    client
-                        .record_activity_task_heartbeat(request.into_request())
-                        .await
-                        .map(drop),
-                )
+                return send_async_heartbeat(client, task_token, details)
+                    .await
+                    .map(drop);
             }
         };
         result.map_err(|status| async_activity_failure(operation, async_activity_rpc_error(status)))
     }
+}
+
+/// Sends one `RecordActivityTaskHeartbeat` for an async activity through
+/// `client` and returns the server's activity flags. Failures are classified
+/// as for every async activity request; see [`async_activity_failure`].
+pub(crate) async fn send_async_heartbeat(
+    mut client: Client,
+    task_token: Vec<u8>,
+    details: Option<api_common::Payloads>,
+) -> std::result::Result<HeartbeatFlags, Failure> {
+    let request = RecordActivityTaskHeartbeatRequest {
+        namespace: client.namespace(),
+        identity: client.identity(),
+        task_token,
+        details,
+        ..Default::default()
+    };
+    let response = client
+        .record_activity_task_heartbeat(request.into_request())
+        .await
+        .map_err(|status| {
+            async_activity_failure(
+                AsyncActivityOperation::Heartbeat,
+                async_activity_rpc_error(status),
+            )
+        })?
+        .into_inner();
+    Ok(HeartbeatFlags {
+        cancel_requested: response.cancel_requested,
+        paused: response.activity_paused,
+        reset: response.activity_reset,
+    })
 }
 
 /// Converts a validated response encoding into the ABI byte result.
@@ -1025,6 +1190,13 @@ pub struct Runtime {
     /// reached the in-flight ceiling, so the map never holds more than
     /// `client_limits.in_flight_calls` handles after a submission.
     pending_calls: HashMap<u64, PendingCall>,
+    /// Per-token throttle of async activity heartbeats (#1025). Its drivers
+    /// own connection clones, so disconnect and close abort and join them
+    /// like submitted calls; disconnect replaces it with an empty throttle.
+    heartbeat_throttle: Arc<HeartbeatThrottle>,
+    /// Heartbeat throttle settings of the most recently started worker, the
+    /// same values handed to Core; Core's defaults before any worker.
+    heartbeat_intervals: HeartbeatIntervals,
     /// Admission limits of the current connection (#796). Set by a successful
     /// connect and reset to the defaults by disconnect, so a runtime without
     /// a connection always reports the defaults.
@@ -1383,6 +1555,8 @@ impl Runtime {
             pending_waits: HashMap::new(),
             call_owner: crate::client_calls::new_owner_id(),
             pending_calls: HashMap::new(),
+            heartbeat_throttle: Arc::new(HeartbeatThrottle::new()),
+            heartbeat_intervals: CORE_DEFAULT_HEARTBEAT_INTERVALS,
             client_limits: crate::client_calls::ClientLimits::default(),
             cleanup,
         })
@@ -1617,7 +1791,7 @@ impl Runtime {
     fn client_rpc_blocking(&mut self, kind: ClientCallKind, input: &[u8]) -> Operation {
         let text = decode_semantic_input(input)?;
         let rpc =
-            ClientRpc::decode(kind, text)?.bind_namespace(self.worker_namespace.as_deref())?;
+            ClientRpc::decode(kind, text)?.bind_async_activity(|| self.async_activity_binding())?;
         let (connection, handle) = self.client_and_handle()?;
         handle.block_on(rpc.into_future(connection))
     }
@@ -1650,7 +1824,7 @@ impl Runtime {
         let kind = ClientCallKind::try_from(kind)?;
         let text = decode_semantic_input(input)?;
         let rpc =
-            ClientRpc::decode(kind, text)?.bind_namespace(self.worker_namespace.as_deref())?;
+            ClientRpc::decode(kind, text)?.bind_async_activity(|| self.async_activity_binding())?;
         let (connection, handle) = self.client_and_handle()?;
         let limits = self.client_limits;
         // Dropping a finished task's handle cannot detach live work: its
@@ -1805,6 +1979,45 @@ impl Runtime {
                 let _ = task.await;
             }
         });
+    }
+
+    /// The worker state an async activity request is bound to on submission;
+    /// fails with `STATUS_INVALID_STATE` without a worker namespace.
+    fn async_activity_binding(&self) -> std::result::Result<AsyncActivityBinding, Failure> {
+        Ok(AsyncActivityBinding {
+            namespace: self
+                .worker_namespace
+                .clone()
+                .ok_or_else(missing_worker_namespace)?,
+            throttle: Arc::clone(&self.heartbeat_throttle),
+            intervals: self.heartbeat_intervals,
+            max_throttled_tokens: self.client_limits.in_flight_calls,
+        })
+    }
+
+    /// Shuts the heartbeat throttle down and installs an empty one, returning
+    /// the aborted driver handles still to join; see
+    /// [`Self::abort_pending_calls`] for `wait`. Runs after the submitted
+    /// calls were released, so no call can admit a heartbeat into the old
+    /// throttle afterwards; one that still could finds it closed and sends
+    /// unthrottled.
+    fn abort_heartbeat_drivers(&mut self, wait: bool) -> Vec<JoinHandle<()>> {
+        let throttle = std::mem::replace(
+            &mut self.heartbeat_throttle,
+            Arc::new(HeartbeatThrottle::new()),
+        );
+        let drivers = throttle.shutdown();
+        match (wait, self.core.as_ref()) {
+            (true, Some(core)) => {
+                core.tokio_handle().block_on(async {
+                    for driver in drivers {
+                        let _ = driver.await;
+                    }
+                });
+                Vec::new()
+            }
+            _ => drivers,
+        }
     }
 
     /// Releases every submitted call and returns task handles still to join.
@@ -2134,6 +2347,8 @@ impl Runtime {
         // command, but Core needs the worker namespace to populate failure
         // metadata consistently when a child is cancelled before it starts.
         let worker_namespace = config.namespace.clone();
+        // The async heartbeat throttle uses the settings handed to Core.
+        let heartbeat_intervals = config.tuning.heartbeat_intervals()?;
         let worker_config = config.into_core()?;
         let core = self.core.as_ref().ok_or_else(|| Failure {
             status: STATUS_INVALID_STATE,
@@ -2175,6 +2390,7 @@ impl Runtime {
         }
         self.worker = Some(PollLanes::start(worker, &handle));
         self.worker_namespace = Some(worker_namespace);
+        self.heartbeat_intervals = heartbeat_intervals;
         Ok(Vec::new())
     }
 
@@ -2968,6 +3184,8 @@ impl Runtime {
     /// calling owner thread. This is the synchronous ABI path kept for direct
     /// bridge callers; the OCaml worker submits the same request as a client
     /// call instead, so its owner Domain never waits for the server (#1025).
+    /// Its heartbeats are not throttled, but its terminal requests evict their
+    /// token from the heartbeat throttle like submitted ones.
     fn async_activity_blocking(&mut self, request: AsyncActivityRequest) -> Operation {
         let client = self.async_activity_client()?;
         let handle = self
@@ -2978,7 +3196,7 @@ impl Runtime {
                 message: "Temporal runtime is already closed".to_owned(),
             })?
             .tokio_handle();
-        handle.block_on(request.send(client))?;
+        handle.block_on(request.send_evicting(client, &self.heartbeat_throttle))?;
         Ok(Vec::new())
     }
 
@@ -3068,6 +3286,9 @@ impl Runtime {
         // connection is dropped (#807).
         let remaining = self.abort_pending_calls(true);
         debug_assert!(remaining.is_empty());
+        // Heartbeat drivers hold connection clones too (#1025).
+        let remaining = self.abort_heartbeat_drivers(true);
+        debug_assert!(remaining.is_empty());
         self.client.take();
         // Limits belong to the connection they were configured with (#796):
         // a runtime without a connection reports the defaults again, and a
@@ -3089,6 +3310,8 @@ impl Runtime {
         // Submitted client calls follow the same abort/join rule; their
         // unjoined handles share the cleanup thread's join list (#807).
         pending_start_tasks.extend(self.abort_pending_calls(wait));
+        // So do async heartbeat drivers (#1025).
+        pending_start_tasks.extend(self.abort_heartbeat_drivers(wait));
         let Some(core) = self.core.take() else {
             return STATUS_OK;
         };
@@ -3734,6 +3957,12 @@ const CORE_DEFAULT_STICKY_QUEUE_SCHEDULE_TO_START_MS: u64 = 10_000;
 const CORE_DEFAULT_MAX_HEARTBEAT_THROTTLE_MS: u64 = 60_000;
 /// Core's default heartbeat throttle interval without a heartbeat timeout.
 const CORE_DEFAULT_HEARTBEAT_THROTTLE_MS: u64 = 30_000;
+/// Async heartbeat throttle settings of a runtime that has not started a
+/// worker; such a runtime has no namespace, so they are never used.
+const CORE_DEFAULT_HEARTBEAT_INTERVALS: HeartbeatIntervals = HeartbeatIntervals {
+    max: Duration::from_millis(CORE_DEFAULT_MAX_HEARTBEAT_THROTTLE_MS),
+    default: Duration::from_millis(CORE_DEFAULT_HEARTBEAT_THROTTLE_MS),
+};
 
 /// Tuning values after bridge validation, ready for the Core builder.
 struct ValidatedTuning {
@@ -3802,6 +4031,16 @@ impl WorkerTuningInput {
                 "workflow_task_poller_autoscaling.initial",
                 autoscaling.initial,
             )?,
+        })
+    }
+
+    /// The validated heartbeat throttle settings, exactly as handed to Core,
+    /// for the async heartbeat throttle (#1025).
+    fn heartbeat_intervals(&self) -> std::result::Result<HeartbeatIntervals, Failure> {
+        let tuning = self.validated()?;
+        Ok(HeartbeatIntervals {
+            max: tuning.max_heartbeat_throttle_interval,
+            default: tuning.default_heartbeat_throttle_interval,
         })
     }
 
@@ -5780,7 +6019,9 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_client_complete_async_activity_j
 }
 
 /// Record a heartbeat for an activity that previously accepted asynchronous
-/// completion.
+/// completion. Every call is one blocking RPC and is not throttled; the
+/// OCaml worker submits the throttled `AsyncActivityHeartbeat` client call
+/// instead (#1025).
 ///
 /// # Safety
 ///
@@ -6060,6 +6301,21 @@ pub fn test_runtime_cleanup_counts() -> (u64, u64) {
         RUNTIMES_CREATED.load(Ordering::Acquire),
         RUNTIMES_CLEANED.load(Ordering::Acquire),
     )
+}
+
+/// Returns the number of task tokens the async heartbeat throttle tracks and
+/// of driver tasks it retains (finished drivers reaped first), or `None` for
+/// a null handle. Not part of the C ABI; it lets tests prove the throttle's
+/// state is bounded and released (#1025).
+///
+/// # Safety
+///
+/// `runtime` must be null or a live handle not used concurrently.
+#[doc(hidden)]
+pub unsafe fn test_heartbeat_throttle_counts(runtime: *const Runtime) -> Option<(usize, usize)> {
+    // SAFETY: The caller promises a null or live, unshared handle.
+    let runtime = unsafe { runtime.as_ref()? };
+    Some(runtime.heartbeat_throttle.counts())
 }
 
 /// Returns process-local shared-runtime counts for the isolated sharing

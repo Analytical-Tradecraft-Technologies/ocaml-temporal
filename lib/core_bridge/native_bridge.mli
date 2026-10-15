@@ -290,13 +290,17 @@ val client_wait_workflow_json : runtime -> bytes -> (bytes, error) result
 
 (** The client operation performed by one submitted call (#807). Each
     selects the request document of the matching synchronous operation
-    above. [Call_async_activity_completion] and
-    [Call_async_activity_heartbeat] (#1025) take the documents of
-    {!client_complete_async_activity_json} and
-    {!client_record_async_activity_heartbeat_json}; their outcome is empty on
-    success, or exactly [not_found] where the synchronous operation would
-    fail with [Invalid_state], since an awaited [Invalid_state] means the call
-    itself was closed. *)
+    above, except [Call_async_activity_heartbeat].
+    [Call_async_activity_completion] (#1025) takes the document of
+    {!client_complete_async_activity_json}. [Call_async_activity_heartbeat]
+    takes an async heartbeat document, which adds the attempt's heartbeat
+    timeout to the heartbeat of {!client_record_async_activity_heartbeat_json};
+    the bridge throttles these heartbeats per task token. Both outcomes are
+    empty on success, or exactly [not_found] where the synchronous operation
+    would fail with [Invalid_state], since an awaited [Invalid_state] means
+    the call itself was closed. A heartbeat's outcome may instead be
+    [cancel_requested], [reset], or [paused], the activity state reported by
+    the token's latest send. *)
 type client_call_kind =
   | Call_start
   | Call_wait

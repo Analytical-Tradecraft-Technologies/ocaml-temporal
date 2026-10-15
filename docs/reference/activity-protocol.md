@@ -138,11 +138,16 @@ cancelled completion only after a cancellation request, a task whose
 primary reason is a pause or reset is instead completed with a retryable
 `ActivityPause` or `ActivityReset` application failure (#1022; see
 [pause and reset](native-activity-execution.md#pause-and-reset)). An asynchronous heartbeat instead
-uses the namespace-bound client path and is checked by Core's async activity
-handle; its separate async lease remains non-terminal until an async terminal
-operation is accepted or a non-retryable bridge failure closes and removes it.
+uses the namespace-bound client path; its separate async lease remains
+non-terminal until an async terminal operation is accepted or a
+non-retryable bridge failure closes and removes it. Its document adds a
+required, nullable `heartbeat_timeout` duration copied from the start task,
+from which the bridge derives the per-token throttle interval (#1025); the
+plain heartbeat decoder rejects that member, and the async one requires it.
 
-The schema is [`activity-heartbeat.schema.json`](../schemas/bridge/activity-heartbeat.schema.json).
+The schema is [`activity-heartbeat.schema.json`](../schemas/bridge/activity-heartbeat.schema.json),
+and [`activity-async-heartbeat.schema.json`](../schemas/bridge/activity-async-heartbeat.schema.json)
+for the async heartbeat.
 The focused bilateral tests are
 `test/bridge/test_ocaml_activity_protocol.ml` and
 `rust/core-bridge/tests/activity_protocol.rs`. The Rust ownership regression

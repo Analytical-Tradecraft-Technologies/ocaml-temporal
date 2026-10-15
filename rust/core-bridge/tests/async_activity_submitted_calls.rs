@@ -45,13 +45,21 @@ const MISSING_TOKEN: &[u8] = b"async-missing-token";
 /// `async-slow-token`.
 const SLOW_TOKEN: &[u8] = b"async-slow-token";
 
-/// Heartbeat document for a token the double accepts (base64 of
-/// `async-known-token`).
-const KNOWN_HEARTBEAT: &str = r#"{"task_token":"YXN5bmMta25vd24tdG9rZW4=","details":[]}"#;
-/// Heartbeat document for [`MISSING_TOKEN`].
-const MISSING_HEARTBEAT: &str = r#"{"task_token":"YXN5bmMtbWlzc2luZy10b2tlbg==","details":[]}"#;
-/// Heartbeat document for [`SLOW_TOKEN`].
-const SLOW_HEARTBEAT: &str = r#"{"task_token":"YXN5bmMtc2xvdy10b2tlbg==","details":[]}"#;
+/// Submitted heartbeat document for a token the double accepts (base64 of
+/// `async-known-token`). A submitted heartbeat carries the attempt's
+/// heartbeat timeout for the throttle (see `async_activity_heartbeat_throttle.rs`).
+const KNOWN_HEARTBEAT: &str =
+    r#"{"task_token":"YXN5bmMta25vd24tdG9rZW4=","details":[],"heartbeat_timeout":null}"#;
+/// Submitted heartbeat document for [`MISSING_TOKEN`].
+const MISSING_HEARTBEAT: &str =
+    r#"{"task_token":"YXN5bmMtbWlzc2luZy10b2tlbg==","details":[],"heartbeat_timeout":null}"#;
+/// The synchronous symbol's heartbeat document for [`MISSING_TOKEN`], which
+/// has no heartbeat timeout because that path is not throttled.
+const MISSING_SYNC_HEARTBEAT: &str =
+    r#"{"task_token":"YXN5bmMtbWlzc2luZy10b2tlbg==","details":[]}"#;
+/// Submitted heartbeat document for [`SLOW_TOKEN`].
+const SLOW_HEARTBEAT: &str =
+    r#"{"task_token":"YXN5bmMtc2xvdy10b2tlbg==","details":[],"heartbeat_timeout":null}"#;
 /// Successful completion of the same accepted token with an empty payload.
 const KNOWN_COMPLETION: &str = r#"{"task_token":"YXN5bmMta25vd24tdG9rZW4=","result":{"kind":"completed","result":{"metadata":{},"data":{"encoding":"base64","data":""}}}}"#;
 
@@ -386,8 +394,8 @@ fn submitted_async_activity_calls_report_server_outcomes() {
     unsafe {
         ocaml_temporal_core_v4_client_record_async_activity_heartbeat_json(
             runtime,
-            MISSING_HEARTBEAT.as_ptr(),
-            MISSING_HEARTBEAT.len(),
+            MISSING_SYNC_HEARTBEAT.as_ptr(),
+            MISSING_SYNC_HEARTBEAT.len(),
             &mut result,
         );
     }

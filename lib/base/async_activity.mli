@@ -28,12 +28,16 @@ type submit_result = (unit, Error.t) result
     native outcome is unknown: a terminal operation retains its exact key for
     a byte-identical retry, while a heartbeat key is released because a newer
     heartbeat supersedes it. [Terminal_submission] (lost token or closed
-    capability) retires the handle. *)
+    capability) retires the handle. [Activity_state] means a heartbeat was
+    applied but the server reported the activity cancelled, paused, or reset
+    (#1025); like [Rejected_submission] it releases the key and keeps the
+    live handle, which must still be finished by a terminal operation. *)
 type submission_error =
   | Not_submitted of Error.t
   | Rejected_submission of Error.t
   | Retryable_submission of Error.t
   | Terminal_submission of Error.t
+  | Activity_state of Error.t
 
 (** An opaque handle paired with the output type of its activity definition.
 

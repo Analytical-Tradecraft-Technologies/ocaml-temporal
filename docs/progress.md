@@ -15,6 +15,79 @@ implementation when a later entry documents that work as complete. The
 records the current tested source, named assertions and successful CI job for
 the Temporal acceptance controllers.
 
+## 2026-10-15: Async activity heartbeats are throttled like Core's (#1025)
+
+#1081 made `Async_handle` heartbeats and completions submitted client calls,
+so they no longer block the worker's owner Domain, but every heartbeat was
+still its own server round trip: a completer reporting progress per item
+sent one RPC per item, while a running activity's heartbeats go through
+Core's throttling heartbeat manager. The Rust bridge now throttles async
+heartbeats per task token with Core's rules
+(`activity_heartbeat_manager.rs` at the pinned revision), in the new
+`heartbeat_throttle.rs`: the first heartbeat is sent at once and returns
+that send's outcome; later ones within the interval only replace the
+pending details and return at once; a trailing send carries the latest
+details when the interval expires, and a quiet interval forgets the token.
+The interval is computed as Core computes it, 80% of the heartbeat timeout
+or the worker's `default_heartbeat_throttle_interval`, capped by
+`max_heartbeat_throttle_interval`. The heartbeat timeout reaches the bridge
+in a new async heartbeat document (`Encoded_async_activity_heartbeat`,
+schema `activity-async-heartbeat.schema.json`) that adds the start task's
+timeout to the heartbeat; the submitted-call selector 12 takes it, while
+the unthrottled synchronous symbol keeps the plain document.
+
+Each call now reports the activity state of the token's latest send. The
+bridge returns the server's `cancel_requested`, `activity_reset`, or
+`activity_paused` flag (in Core's precedence) as a fixed outcome word, and
+`Async_handle.heartbeat` returns a `Cancelled` error for it, shaped like a
+running activity's: non-retryable for a cancellation request, retryable with
+type `ActivityPause` or `ActivityReset` otherwise. The heartbeat was still
+recorded and the handle stays live (new private submission outcome
+`Activity_state`); previously these flags were dropped. A flag seen by a
+trailing send reaches the caller on its next heartbeat. Unlike Core, which
+only logs a failed background send, a failed send ends the token's interval,
+so the next heartbeat is sent at once and reports the server's own answer.
+A terminal `complete`/`fail`/`cancel` evicts the token first (cancelling a
+sleeping trailing send, and flushing pending details before a cancellation,
+as Core does).
+
+Each throttled token has one driver task on Core's Tokio runtime owning a
+client; the runtime owner keeps every driver's handle, and disconnect and
+close abort and join them after the submitted calls, before the connection
+is dropped. At most the connection's `max_in_flight_calls` tokens are
+tracked; beyond that heartbeats are sent unthrottled. Because a throttled
+call can return before its details reach the server, the async lease's
+heartbeat expiry (#1043) now allows twice the heartbeat timeout after the
+last heartbeat call.
+
+Evidence:
+
+- `rust/core-bridge/tests/async_activity_heartbeat_throttle.rs` (gRPC
+  double): first send immediate, coalescing into one trailing send with the
+  latest details between 1.5 s and the 2 s heartbeat timeout, state released
+  after a quiet interval and the next heartbeat sent at once; worker
+  maximum/default intervals applied; cancellation reported by the send that
+  saw it, on coalesced calls, and after a trailing send; a failed trailing
+  send ending the window (`not_found` on the next call); eviction by
+  completion (no trailing send) and cancellation (pending details flushed
+  first); disconnect and close releasing every token and driver with no later
+  send; at most `max_in_flight_calls` tokens tracked and 3 x 200 tokens
+  leaving no state; the document requiring its timeout.
+  `activity_protocol.rs` covers the document's round trip and validation;
+  the existing submitted-call tests use the new document.
+- `test/runtime/test_native_async_activity.ml`: the heartbeat carries the
+  start task's exact timeout; cancel/pause/reset map to the documented
+  errors, keep the handle live, renew the lease, and allow the following
+  `cancel`; heartbeat expiry at twice the timeout.
+  `test/bridge/test_ocaml_activity_protocol.ml` checks the canonical
+  document, its validation, and the outcome words.
+- Local (OCaml 5.4.1, macOS): `dune build @install`, `@test/runtime/runtest`,
+  `@test/unit/runtest`, `@test/sdk_supervisor/runtest`,
+  `@test/bridge/runtest`; scoped `cargo test` (lib, abi, activity_protocol,
+  decoder_fuzz, lifecycle, runtime_cleanup, client_input_limits,
+  client_bridge, worker_shutdown_outstanding, both async activity suites);
+  `cargo clippy --locked --all-targets -- -D warnings`; `cargo fmt --check`.
+
 ## 2026-10-13: Shutdown stops Core polling early, retires local activities without retry, reports accurately, and async activity calls leave the owner Domain (#1028, #1029, #1023, #1025)
 
 Temporal Core kept long-polling the server for the whole grace period,

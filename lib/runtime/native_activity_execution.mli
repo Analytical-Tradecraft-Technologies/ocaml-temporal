@@ -59,9 +59,16 @@ module type SUPERVISOR = sig
       call with completion and shutdown operations. *)
 
   val record_async_activity_heartbeat :
-    t -> Temporal_protocol.Encoded_activity_heartbeat.t -> (unit, error) result
+    t ->
+    Temporal_protocol.Encoded_async_activity_heartbeat.t ->
+    (Temporal_protocol.Activity_protocol.async_heartbeat_response, error) result
   (** Records heartbeat details for an admitted asynchronous activity, with
-      the same single-encode contract as [record_activity_heartbeat]. *)
+      the same single-encode contract as [record_activity_heartbeat]. The
+      document carries the attempt's heartbeat timeout, and the native side
+      throttles these heartbeats per task token (#1025): a call within the
+      throttle interval only records its details for a trailing send. The
+      response is the activity state reported by the token's latest send,
+      which the adapter turns into the handle's typed outcome. *)
 
   val error_code : error -> string
   (** Stable classification for a native failure. *)

@@ -453,9 +453,15 @@ module Native : sig
             RPC runs on a Rust task, so the owner Domain does not wait for
             the server while other worker operations queue behind it. *)
     | Rpc_async_activity_heartbeat :
-        Temporal_protocol.Encoded_activity_heartbeat.t -> unit client_rpc
-        (** Heartbeats an activity handed off with [WillCompleteAsync], with
-            the same relation to [Record_async_activity_heartbeat]. *)
+        Temporal_protocol.Encoded_async_activity_heartbeat.t ->
+        Temporal_protocol.Activity_protocol.async_heartbeat_response client_rpc
+        (** Heartbeats an activity handed off with [WillCompleteAsync]. Unlike
+            [Record_async_activity_heartbeat], which sends every heartbeat,
+            the bridge throttles these per task token as Core throttles a
+            running activity's heartbeats, using the heartbeat timeout the
+            document carries: a call within the throttle interval only
+            records its details for a trailing send. The result is the
+            activity state reported by the token's latest send. *)
 
   (** A submitted native call, awaited with {!await_client_call}. *)
   type 'value client_call =
