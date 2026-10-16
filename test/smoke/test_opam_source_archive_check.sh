@@ -93,12 +93,13 @@ make_archive() {
 }
 
 # Runs the check against archive $1 with curl exiting $2; the exit status and
-# combined output are left in $status and $temporary_root/output.
+# combined output are left in $status and $temporary_root/output. The stand-in
+# directory is prepended to $check_path, which defaults to the caller's PATH.
 run_check() {
   rm -rf "$temporary_root/work" "$temporary_root/check.log"
   : >"$temporary_root/check.log"
   set +e
-  PATH=$temporary_root/bin:$PATH \
+  PATH=$temporary_root/bin:${check_path:-$PATH} \
     FAKE_OPAM_ROOT=$fake_opam_root FAKE_OPAM_PREFIX=$temporary_root/switch \
     FAKE_CURL_STATUS=$2 CHECK_LOG=$temporary_root/check.log \
     CARGO_TARGET_DIR=$temporary_root/shared-target \
@@ -158,5 +159,23 @@ make_archive "$temporary_root/changed.tar.gz" "$temporary_root/changed.opam" \
 run_check "$temporary_root/changed.tar.gz" 7
 test "$status" -ne 0
 expect_output 'update this check'
+
+# Outside `opam exec` the switch's dune is not on PATH, and opam's wrapper
+# would only say "Command not found". The check must name the remedy before
+# probing or building. The stand-ins are reduced to opam and curl, and the
+# rest of PATH to the system directories; skipped where those provide dune.
+if ! PATH=/usr/bin:/bin command -v dune >/dev/null 2>&1; then
+  mkdir -p "$temporary_root/no-dune-bin"
+  cp "$temporary_root/bin/opam" "$temporary_root/bin/curl" "$temporary_root/no-dune-bin/"
+  mv "$temporary_root/bin" "$temporary_root/full-bin"
+  mv "$temporary_root/no-dune-bin" "$temporary_root/bin"
+  check_path=/usr/bin:/bin run_check "$temporary_root/complete.tar.gz" 7
+  test "$status" -ne 0
+  expect_output 'dune is not on PATH; run this script under opam exec --'
+  if grep -q '^build' "$temporary_root/check.log"; then
+    echo "the check ran the sandbox although dune is not on PATH" >&2
+    exit 1
+  fi
+fi
 
 echo "opam source archive check contract: passed"

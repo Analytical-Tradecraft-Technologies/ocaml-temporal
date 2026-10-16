@@ -579,10 +579,10 @@ jobs:
       - name: Build the archive inside the opam build sandbox
         shell: bash
         run: >-
-          sh scripts/check-opam-source-archive.sh
+          opam exec -- sh scripts/check-opam-source-archive.sh
           "$RUNNER_TEMP/ocaml-temporal-source.tar.gz" "$RUNNER_TEMP/opam-source-check"
       # Installs that build into a fresh prefix and builds the installed-package
       # consumer fixture from the archive against it, outside the checkout.
       - name: Build a consumer against the package installed from the archive
         shell: bash
-        run: sh scripts/check-source-archive-consumer.sh "$RUNNER_TEMP/opam-source-check"
+        run: opam exec -- sh scripts/check-source-archive-consumer.sh "$RUNNER_TEMP/opam-source-check"
