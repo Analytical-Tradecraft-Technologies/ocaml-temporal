@@ -19,6 +19,7 @@ module Observer = Temporal_sdk_kernel.Native_worker_observer
 module Watchdog = Temporal_sdk_kernel.Native_worker_watchdog
 module Idle = Temporal_sdk_kernel.Native_worker_idle
 module Bounded_shutdown = Temporal_sdk_kernel.Native_worker_shutdown
+module Metrics = Temporal_sdk_kernel.Native_worker_metrics
 
 (** Result-bind notation keeps expected startup and lifecycle failures typed. *)
 let ( let* ) = Result.bind
@@ -414,6 +415,10 @@ type t = {
           thread to release one: the detached activity lane after its
           callback returns (see [run_lanes]), or [run] after its workflow
           lane returns. *)
+  metrics : Metrics.t;
+      (** SDK-side metrics recorder (#500): [Metrics.disabled] unless the
+          worker runs on a [~runtime] with a metrics exporter. The activity
+          adapter holds the same value. *)
 }
 (** Native worker lifecycle state. The [closed] and [stop_requested] atomics
     are the only state observed by the polling lanes from [shutdown] and
@@ -478,6 +483,7 @@ let poll_activity worker =
   | Error { retryable = true; code; _ } ->
       report Logs.Warning ~operation:"activity_completion_retry"
         ~error_kind:code ();
+      Metrics.activity_completion_retry worker.metrics;
       (* The adapter has retained the exact completion. Returning a scheduling
          result, rather than a fatal worker error, lets the generic loop apply
          its bounded activity-lane wait before retrying it. *)
@@ -688,7 +694,8 @@ let activity_detach worker =
     on_detached =
       (fun () ->
         Atomic.set worker.activity_detached true;
-        report Logs.Warning ~operation:"activity_lane_detached" ());
+        report Logs.Warning ~operation:"activity_lane_detached" ();
+        Metrics.activity_lane_detached worker.metrics);
     on_stop = (fun () -> stop_native_polling worker);
     callback_running = (fun () -> Activity.callback_running worker.activities);
   }
@@ -995,23 +1002,37 @@ let already_shut_down =
     teardown = Bounded_shutdown.Completed;
   }
 
-(** Logs what a bounded shutdown left behind. No identifier is included:
-    the abandonment kind and the teardown state are the whole diagnostic. *)
-let report_shutdown (shutdown_report : Bounded_shutdown.report) =
-  if not shutdown_report.lanes_stopped then
-    report Logs.Warning ~operation:"worker_shutdown_abandoned_work"
-      ~error_kind:
-        (if shutdown_report.abandoned_activity_callbacks > 0 then
-           "activity_callback"
-         else if shutdown_report.abandoned_workflow_activations > 0 then
-           "workflow_activation"
-         else "native_call")
+(** Logs what a bounded shutdown left behind and records it as metrics
+    (#500). No identifier is included: the abandonment kind and the teardown
+    state are the whole diagnostic. [failure] is the outcome of a shutdown
+    that returned an error; it takes precedence over the teardown state in
+    the [outcome] label, so each shutdown counts exactly once. *)
+let report_shutdown ?failure worker (shutdown_report : Bounded_shutdown.report)
+    =
+  if not shutdown_report.lanes_stopped then begin
+    let error_kind, abandoned =
+      if shutdown_report.abandoned_activity_callbacks > 0 then
+        ("activity_callback", Metrics.Activity_callback)
+      else if shutdown_report.abandoned_workflow_activations > 0 then
+        ("workflow_activation", Metrics.Workflow_activation)
+      else ("native_call", Metrics.Native_call)
+    in
+    report Logs.Warning ~operation:"worker_shutdown_abandoned_work" ~error_kind
       ();
-  match shutdown_report.teardown with
+    Metrics.worker_shutdown_abandoned worker.metrics abandoned
+  end;
+  (match shutdown_report.teardown with
   | Bounded_shutdown.Completed ->
       report Logs.Info ~operation:"worker_shutdown" ()
   | Bounded_shutdown.Detached ->
-      report Logs.Warning ~operation:"worker_shutdown_teardown_detached" ()
+      report Logs.Warning ~operation:"worker_shutdown_teardown_detached" ());
+  Metrics.worker_shutdown worker.metrics
+    (match (failure, shutdown_report.teardown) with
+    | Some outcome, _ -> outcome
+    | None, Bounded_shutdown.Detached -> Metrics.Teardown_detached
+    | None, Bounded_shutdown.Completed ->
+        if shutdown_report.lanes_stopped then Metrics.Clean
+        else Metrics.Abandoned_work)
 
 (** Closes admission, then runs the bounded shutdown sequence (#495): wait
     until the lanes deadline for the run loop to stop, drain retained
@@ -1067,13 +1088,16 @@ let shutdown worker =
     in
     match outcome with
     | Bounded_shutdown.Shut_down shutdown_report ->
-        report_shutdown shutdown_report;
+        report_shutdown worker shutdown_report;
         Ok shutdown_report
-    | Bounded_shutdown.Completion_lost { error; report = shutdown_report }
+    | Bounded_shutdown.Completion_lost { error; report = shutdown_report } ->
+        report_shutdown ~failure:Metrics.Completion_lost worker shutdown_report;
+        Error error
     | Bounded_shutdown.Release_error { error; report = shutdown_report } ->
-        report_shutdown shutdown_report;
+        report_shutdown ~failure:Metrics.Release_failed worker shutdown_report;
         Error error
     | Bounded_shutdown.Release_unproven _ ->
+        Metrics.worker_shutdown worker.metrics Metrics.Release_unproven;
         Error
           (Base_error.defect
              ~message:
@@ -1230,6 +1254,24 @@ let create ?max_cached_workflows
       Activity.create ~supervisor ~activities ~worker_shutting_down
       |> Result.map_error (public_activity_error "activity registration")
     in
+    (* SDK-side metrics (#500) exist only on a shared runtime with an
+       exporter. A registration the bridge refuses is reported and leaves
+       metrics off for this worker: metrics never decide whether a worker
+       runs. *)
+    let metrics =
+      match
+        Option.bind runtime Temporal_sdk_kernel.Shared_runtime.metric_meter
+      with
+      | None -> Metrics.disabled
+      | Some meter -> (
+          match Metrics.create meter ~namespace ~task_queue with
+          | Ok metrics -> metrics
+          | Error { Bridge.status; _ } ->
+              report Logs.Warning ~operation:"worker_metrics_unavailable"
+                ~error_kind:(bridge_status status) ();
+              Metrics.disabled)
+    in
+    Activity.attach_metrics activities metrics;
     Ok
       {
         supervisor;
@@ -1254,6 +1296,7 @@ let create ?max_cached_workflows
         native_release_started = Atomic.make false;
         native_polling_stopped = Atomic.make false;
         discard_pending = Bounded_shutdown.Deferred_discard.create ();
+        metrics;
       }
   in
   match setup with

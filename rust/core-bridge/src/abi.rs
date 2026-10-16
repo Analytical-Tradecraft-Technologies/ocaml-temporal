@@ -2,6 +2,8 @@ use crate::heartbeat_throttle::{
     self, Admission, HeartbeatFlags, HeartbeatIntervals, HeartbeatThrottle,
 };
 use crate::replay_bridge::{ReplayWorker, ReplayWorkerError};
+/// SDK-side metrics recorder handle; see [`ocaml_temporal_core_v4_shared_runtime_metric_meter`].
+pub use crate::telemetry::MetricMeter;
 use crate::worker_bridge::{
     BoundedFinalize, PollLaneError, PollLanes, ReadinessWait, ShutdownDrainError,
     WORKER_FINALIZE_TIMEOUT, WORKER_SHUTDOWN_DRAIN_TIMEOUT, WorkerBridgeError,
@@ -4932,6 +4934,198 @@ unsafe fn release_shared_runtime_slot(shared: *mut *mut SharedRuntime, wait: boo
             let shared = unsafe { Box::from_raw(owned) };
             shared.release(wait)
         }
+    }));
+    outcome.unwrap_or(STATUS_PANIC)
+}
+
+/// Create an SDK metrics recorder over a shared runtime's Core meter (#500).
+///
+/// Some worker states exist only in the OCaml SDK (activity-lane occupancy,
+/// refused tasks, retained-completion retries, shutdown outcomes, expired
+/// asynchronous leases), so Core cannot instrument them. The returned
+/// [`MetricMeter`] lets the SDK record them into the same Prometheus
+/// registry as Core's own metrics; see `docs/reference/core-bridge.md`.
+///
+/// On success `*meter` receives one owned handle, or stays null when the
+/// runtime was created without a metrics exporter, in which case the caller
+/// records nothing at all. The handle references Core's meter, not Core, so
+/// it may outlive the shared handle and every attached graph; it must be
+/// released exactly once with [`ocaml_temporal_core_v4_metric_meter_free`].
+/// A null `shared` fails with `STATUS_INVALID_ARGUMENT`, a released one with
+/// `STATUS_INVALID_STATE`.
+///
+/// # Safety
+///
+/// `shared` must be null or a live handle from
+/// [`ocaml_temporal_core_v4_shared_runtime_new`] that is not concurrently
+/// released. `meter` must be null or point to writable storage for one
+/// handle pointer that does not already contain a live handle. `output`
+/// follows the result contract of [`ocaml_temporal_core_v4_check_abi_version`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ocaml_temporal_core_v4_shared_runtime_metric_meter(
+    shared: *const SharedRuntime,
+    meter: *mut *mut MetricMeter,
+    output: *mut Result,
+) -> Status {
+    if !meter.is_null() {
+        // SAFETY: A non-null slot promises writable pointer storage.
+        unsafe { ptr::write(meter, ptr::null_mut()) };
+    }
+    if output.is_null() {
+        return STATUS_INVALID_ARGUMENT;
+    }
+    // SAFETY: The result pointer was checked above; the other pointers are
+    // checked in the closure before use.
+    unsafe {
+        invoke(output, || {
+            if meter.is_null() {
+                return Err(Failure {
+                    status: STATUS_INVALID_ARGUMENT,
+                    message: "metric meter output pointer is null".to_owned(),
+                });
+            }
+            // SAFETY: The caller promises a null or live, unreleased handle.
+            let shared = shared.as_ref().ok_or_else(|| Failure {
+                status: STATUS_INVALID_ARGUMENT,
+                message: "shared runtime handle is null".to_owned(),
+            })?;
+            let core = shared.core.as_ref().ok_or_else(|| Failure {
+                status: STATUS_INVALID_STATE,
+                message: "shared Temporal runtime is already released".to_owned(),
+            })?;
+            if let Some(temporal_meter) = core.telemetry().get_temporal_metric_meter() {
+                let global_tag_names = core
+                    .metrics
+                    .as_ref()
+                    .map(|exporter| exporter.global_tag_names().to_vec())
+                    .unwrap_or_default();
+                let owned =
+                    Box::into_raw(Box::new(MetricMeter::new(temporal_meter, global_tag_names)));
+                // SAFETY: The slot was validated above and is exclusively
+                // owned by this call until it returns.
+                ptr::write(meter, owned);
+            }
+            Ok(Vec::new())
+        })
+    }
+}
+
+/// Register one SDK metric series from strict JSON and return its identifier
+/// in `*id` (#500).
+///
+/// The document is `{"kind": K, "name": N, "description": D, "labels":
+/// [{"name": L, "value": V}, ...]}`, where `K` is `counter`,
+/// `up_down_counter`, `gauge`, `histogram`, or `duration_histogram`; see
+/// `docs/reference/core-bridge.md` for the bounds. Registering an identical
+/// series again returns the same identifier. A rejected document fails with
+/// `STATUS_CONFIGURATION` and leaves `*id` at `u32::MAX`.
+///
+/// # Safety
+///
+/// `meter` must be null or a live handle from
+/// [`ocaml_temporal_core_v4_shared_runtime_metric_meter`]; concurrent calls
+/// on one handle are permitted. `input` must be readable for `input_len`
+/// bytes (it may be null only when `input_len` is zero). `id` must be null
+/// or writable. `output` follows the result contract of
+/// [`ocaml_temporal_core_v4_check_abi_version`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ocaml_temporal_core_v4_metric_meter_register_json(
+    meter: *const MetricMeter,
+    input: *const u8,
+    input_len: usize,
+    id: *mut u32,
+    output: *mut Result,
+) -> Status {
+    if !id.is_null() {
+        // SAFETY: A non-null slot promises writable storage.
+        unsafe { ptr::write(id, u32::MAX) };
+    }
+    if output.is_null() {
+        return STATUS_INVALID_ARGUMENT;
+    }
+    // SAFETY: The result pointer was checked above; the other pointers are
+    // checked in the closure before use.
+    unsafe {
+        invoke(output, || {
+            if id.is_null() {
+                return Err(Failure {
+                    status: STATUS_INVALID_ARGUMENT,
+                    message: "metric identifier output pointer is null".to_owned(),
+                });
+            }
+            // SAFETY: The caller promises a null or live handle.
+            let meter = meter.as_ref().ok_or_else(|| Failure {
+                status: STATUS_INVALID_ARGUMENT,
+                message: "metric meter handle is null".to_owned(),
+            })?;
+            // SAFETY: The caller promises the readable span documented above.
+            let bytes = input_span(
+                input,
+                input_len,
+                telemetry::MAX_SDK_INSTRUMENT_DOCUMENT_BYTES,
+            )?;
+            let registered = meter.register(bytes)?;
+            // SAFETY: The slot was validated above.
+            ptr::write(id, registered);
+            Ok(Vec::new())
+        })
+    }
+}
+
+/// Record `value` into the SDK metric series `id` (#500).
+///
+/// This is the hot path: it allocates no result and takes only a read lock,
+/// so the OCaml stub calls it without releasing the runtime lock. A counter,
+/// gauge or histogram requires `value >= 0`; an up-down counter adds the
+/// signed delta; a duration histogram reads microseconds. A null handle, an
+/// unknown identifier, or a negative unsigned value returns
+/// `STATUS_INVALID_ARGUMENT` and records nothing; a contained panic returns
+/// `STATUS_PANIC`.
+///
+/// # Safety
+///
+/// `meter` must be null or a live handle from
+/// [`ocaml_temporal_core_v4_shared_runtime_metric_meter`]; concurrent calls
+/// on one handle, from any thread, are permitted.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ocaml_temporal_core_v4_metric_meter_record(
+    meter: *const MetricMeter,
+    id: u32,
+    value: i64,
+) -> Status {
+    // SAFETY: The caller promises a null or live handle.
+    let Some(meter) = (unsafe { meter.as_ref() }) else {
+        return STATUS_INVALID_ARGUMENT;
+    };
+    catch_unwind(AssertUnwindSafe(|| meter.record(id, value))).unwrap_or(STATUS_PANIC)
+}
+
+/// Release an SDK metrics recorder and clear the caller's slot. Dropping it
+/// touches only memory (never Core or Tokio), so this is safe from a GC
+/// finalizer and on any thread. Calling again with the now-null slot is safe.
+///
+/// # Safety
+///
+/// `meter` must be null or point to a slot initialized by
+/// [`ocaml_temporal_core_v4_shared_runtime_metric_meter`]. No other call on
+/// the handle may be running or start afterwards.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ocaml_temporal_core_v4_metric_meter_free(
+    meter: *mut *mut MetricMeter,
+) -> Status {
+    if meter.is_null() {
+        return STATUS_INVALID_ARGUMENT;
+    }
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: The caller guarantees exclusive writable access to the slot.
+        let owned = unsafe { ptr::replace(meter, ptr::null_mut()) };
+        if !owned.is_null() {
+            // SAFETY: Non-null values in this slot originate from
+            // `Box::into_raw` in `shared_runtime_metric_meter` and are
+            // consumed once.
+            drop(unsafe { Box::from_raw(owned) });
+        }
+        STATUS_OK
     }));
     outcome.unwrap_or(STATUS_PANIC)
 }

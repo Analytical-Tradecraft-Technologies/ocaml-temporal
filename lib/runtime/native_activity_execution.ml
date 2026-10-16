@@ -18,6 +18,7 @@ module Observability = Temporal_base.Observability
 module Activity_context = Temporal_base.Activity_context
 module Async_activity = Temporal_base.Async_activity
 module Worker_policy = Native_worker_policy
+module Metrics = Native_worker_metrics
 
 (** Result-bind notation keeps expected protocol and codec failures on typed
     paths rather than using exceptions as ordinary activity control flow. *)
@@ -1053,6 +1054,10 @@ module Make (Supervisor : SUPERVISOR) = struct
     (* Monotonic seconds used only to expire async leases (#1043); tests
        inject a controllable clock. *)
     now : unit -> float;
+    (* SDK-side metrics recorder (#500), [Metrics.disabled] until
+       [attach_metrics]. Atomic so a lane on another Domain reads a fully
+       published value; it is written once, before polling starts. *)
+    metrics : Metrics.t Atomic.t;
   }
 
   (** The public worker handle is the mutex-confined state above. *)
@@ -1245,6 +1250,7 @@ module Make (Supervisor : SUPERVISOR) = struct
             callback_active = Atomic.make false;
             worker_shutting_down;
             now;
+            metrics = Atomic.make Metrics.disabled;
           }
 
   (** Creates the registry with the process's monotonic clock, in seconds.
@@ -1346,8 +1352,16 @@ module Make (Supervisor : SUPERVISOR) = struct
       [Not_submitted] with a retryable diagnostic: the handle and lease stay
       live, an earlier uncertain terminal submission is still owed, and the
       caller may retry the same operation once capacity frees. *)
-  let async_native_submission_error ~name ~path source_error =
+  let async_native_submission_error adapter ~operation ~name ~path
+      source_error =
     let disposition = async_operation_error_disposition source_error in
+    (match disposition with
+    | Worker_policy.Not_admitted ->
+        Metrics.async_activity_not_admitted (Atomic.get adapter.metrics)
+          operation
+    | Worker_policy.Retry_exact | Worker_policy.Rejected_live
+    | Worker_policy.Retired ->
+        ());
     let retryable =
       match disposition with
       | Worker_policy.Retry_exact | Worker_policy.Not_admitted -> true
@@ -1385,6 +1399,7 @@ module Make (Supervisor : SUPERVISOR) = struct
     Token_map.iter
       (fun _ (Async_lease lease) ->
         ignore (Async_activity.close lease.handle);
+        Metrics.async_activity_lease_expired (Atomic.get adapter.metrics);
         report Logs.Warning ~operation:"activity_async_lease_expired"
           ?correlation:lease.correlation ())
       expired
@@ -1479,7 +1494,12 @@ module Make (Supervisor : SUPERVISOR) = struct
             | Ok (Ok ()) -> Ok ()
             | Ok (Error state_error) -> Error state_error
             | Error source_error ->
-                Error (async_native_submission_error ~name ~path source_error)
+                Error
+                  (async_native_submission_error adapter
+                     ~operation:
+                       (if terminal then Metrics.Completion
+                        else Metrics.Heartbeat)
+                     ~name ~path source_error)
           with exception_ ->
             Error (async_submission_error name (exception_error ~path exception_))
         in
@@ -1738,6 +1758,8 @@ module Make (Supervisor : SUPERVISOR) = struct
              application details. Encode (and so validate) the fallback too,
              before admission. *)
           let* encoded = encode_completion fallback in
+          Metrics.activity_task_refused (Atomic.get adapter.metrics)
+            Metrics.Invalid;
           Ok (encoded, Rejected_result { error; origin = Sdk_rejection })
     in
     let lease =
@@ -1774,9 +1796,16 @@ module Make (Supervisor : SUPERVISOR) = struct
 
   (** Acknowledges the task with [failure] while preserving the original task
       token. [origin] defaults to [Sdk_rejection]; application [Error] results
-      pass [Application_failure] so they are logged as ordinary failures. *)
-  let reject_task_with_failure ?(origin = Sdk_rejection) adapter ~token
-      ~correlation ~failure error =
+      pass [Application_failure] so they are logged as ordinary failures. An
+      SDK rejection is counted once here, under [refusal] (default
+      [Invalid]), before submission, so a retried completion is not counted
+      again. *)
+  let reject_task_with_failure ?(origin = Sdk_rejection)
+      ?(refusal = Metrics.Invalid) adapter ~token ~correlation ~failure error =
+    (match origin with
+    | Sdk_rejection ->
+        Metrics.activity_task_refused (Atomic.get adapter.metrics) refusal
+    | Application_failure -> ());
     let completion =
       Protocol.{ task_token = Bytes.copy token; result = Failed failure }
     in
@@ -1803,8 +1832,8 @@ module Make (Supervisor : SUPERVISOR) = struct
       the same way, so it stays non-retryable. *)
   let reject_unrunnable_task ?type_name adapter ~token ~correlation
       ~(start : Protocol.activity_start) error =
-    reject_task_with_failure adapter ~token ~correlation
-      ~failure:
+    reject_task_with_failure ~refusal:Metrics.Unrunnable adapter ~token
+      ~correlation ~failure:
         (failure_of_error ?type_name ~non_retryable:start.is_local error)
       error
 
@@ -1833,21 +1862,46 @@ module Make (Supervisor : SUPERVISOR) = struct
     let diagnostic =
       exception_error ~path:"$.implementation" exception_
     in
-    reject_task_with_failure adapter ~token ~correlation
-      ~failure:(callback_exception_failure diagnostic backtrace) diagnostic
+    reject_task_with_failure ~refusal:Metrics.Callback_raised adapter ~token
+      ~correlation ~failure:(callback_exception_failure diagnostic backtrace)
+      diagnostic
+
+  (** Records that an application callback is about to run (admission and
+      occupancy, #500) and returns the function that records its end
+      (occupancy and duration). Both synchronous and asynchronous dispatch
+      call it immediately around the callback. With metrics off it reads no
+      clock and returns [ignore]; the returned function never raises, so it
+      is safe in a [finally]. *)
+  let begin_callback_metrics adapter =
+    let metrics = Atomic.get adapter.metrics in
+    if not (Metrics.enabled metrics) then ignore
+    else begin
+      let started_ns = Temporal_core_bridge.Native_bridge.monotonic_now_ns () in
+      Metrics.activity_callback_started metrics;
+      fun () ->
+        Metrics.activity_callback_finished metrics
+          ~elapsed_ns:
+            (Int64.sub
+               (Temporal_core_bridge.Native_bridge.monotonic_now_ns ())
+               started_ns)
+    end
 
   (** Runs one application callback with [callback_active] set, clearing it
       however the callback ends. Its exception, and the backtrace an
-      immediate handler then reads, pass through unchanged. *)
+      immediate handler then reads, pass through unchanged. The callback's
+      metrics are recorded around it ({!begin_callback_metrics}). *)
   let with_callback_active adapter callback =
+    let finished = begin_callback_metrics adapter in
     Atomic.set adapter.callback_active true;
     match callback () with
     | result ->
         Atomic.set adapter.callback_active false;
+        finished ();
         result
     | exception exception_ ->
         let backtrace = Printexc.get_raw_backtrace () in
         Atomic.set adapter.callback_active false;
+        finished ();
         Printexc.raise_with_backtrace exception_ backtrace
 
   (** Reports whether an activity error claims to acknowledge cancellation. *)
@@ -2089,13 +2143,15 @@ module Make (Supervisor : SUPERVISOR) = struct
                      sweep that delivers the cancellation after the callback
                      returned its [`Cancelled] error. The exception backtrace
                      is captured in the handler, before any other work. *)
+                  let finish_metrics = begin_callback_metrics adapter in
                   let returned =
                     Fun.protect
                       ~finally:(fun () ->
                         Activity_context.invalidate context;
                         with_delivery adapter (fun () ->
                             adapter.running <- None);
-                        Atomic.set adapter.callback_active false)
+                        Atomic.set adapter.callback_active false;
+                        finish_metrics ())
                       (fun () ->
                         match implementation context input with
                         | result -> Ok result
@@ -2387,6 +2443,8 @@ module Make (Supervisor : SUPERVISOR) = struct
       reading [running] under it could make the shutdown thread wait for an
       abandoned callback (#1023). *)
   let callback_running adapter = Atomic.get adapter.callback_active
+
+  let attach_metrics adapter metrics = Atomic.set adapter.metrics metrics
 
   (** Counts admitted async leases under [async_mutex] only, which a running
       callback never holds. The lock is held only for short registry updates

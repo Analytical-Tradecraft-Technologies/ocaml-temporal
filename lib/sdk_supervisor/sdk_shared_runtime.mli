@@ -54,6 +54,12 @@ val create :
     lifetime; the endpoint itself stops when Core is destroyed. *)
 val metrics_address : t -> string option
 
+(** The SDK-side metrics recorder over the runtime's exporter (#500), or
+    [None] when no exporter was configured. Constant for the value's
+    lifetime and safe to record into from any Domain, even after
+    {!shutdown}. *)
+val metric_meter : t -> Temporal_core_bridge.Native_bridge.metric_meter option
+
 (** Reserves one attachment, or returns [None] once the runtime is shut down.
     The caller must eventually pass the lease to {!release}. *)
 val acquire : t -> lease option
