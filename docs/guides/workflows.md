@@ -738,6 +738,16 @@ retain their handles when they must be controlled independently. Losing
 futures in `Future.race` remain ordinary observations unless the caller
 explicitly uses a scope around the later wait.
 
+Scopes cancel work the workflow itself started. A cancellation of the
+workflow run (from `Client.cancel` or a parent) is different: the worker
+closes the run as cancelled in the activation that delivers the request, so
+workflow code cannot observe it or schedule and await cleanup first.
+Cooperative workflow cancellation with durable cleanup is excluded from the
+proposed MVP v1 scope ([#514](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/514);
+see the [v1 support policy](../reference/v1-support-policy.md)). A workflow
+that must compensate should model the stop request as a signal or update and
+run its cleanup activities before returning normally.
+
 ## 6. Child workflows: authoring versus native support
 
 Child-workflow references use the same typed shape as activities:

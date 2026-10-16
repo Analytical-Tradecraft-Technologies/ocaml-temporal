@@ -420,7 +420,12 @@ val wait :
 
 (** Requests cancellation of the run [handle] addresses. A successful
     call acknowledges Temporal's cancellation RPC; it does not wait for the
-    workflow to stop. Call [wait handle] to observe [Cancelled]. [request_id]
+    workflow to stop. Call [wait handle] to observe [Cancelled]. An OCaml
+    worker closes the run as cancelled in the activation that delivers the
+    request: workflow code cannot observe it, or schedule and await durable
+    cleanup, before the run ends. Cooperative workflow cancellation with
+    cleanup is excluded from the proposed MVP v1 scope (issue #514), so do not
+    rely on this call to trigger compensation. [request_id]
     is the idempotency key for this logical control operation. When omitted,
     the client derives a stable key from the handle's workflow ID and run ID
     (the workflow ID alone for a current-run handle),

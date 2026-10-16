@@ -169,7 +169,7 @@ Every item is evidence for the commit that will be tagged, not an older one.
 ## Qualification gates
 
 These issues are blockers of [#510] or required by the support policy. Status
-is as of 2026-10-14; check each issue before relying on it.
+is as of 2026-10-17; check each issue before relying on it.
 
 | Gate | Issue | Status |
 | --- | --- | --- |
