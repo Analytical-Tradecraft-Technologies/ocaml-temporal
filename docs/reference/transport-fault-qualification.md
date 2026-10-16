@@ -8,8 +8,9 @@ that the server may have applied. The suite is
 
 ## Harness
 
-The regression starts two in-process TCP proxies (`Fault_proxy`), one for a
-client and one for a worker, both in front of the same Temporal frontend. A
+The regression starts in-process TCP proxies (`Fault_proxy`) in front of the
+same Temporal frontend: one for a client, one for the main worker, and a third
+for the worker that the outage-shutdown scenario creates and shuts down. A
 third client connects directly to the server. It is never faulted, so it
 reports the durable state. The proxy has three modes, and the driver switches
 between them at exact points in a scenario:
@@ -52,9 +53,11 @@ operational failure.
 | Terminate, acknowledgement lost | `Drop_responses` during `Client.terminate` | `rpc_status = Termination_outcome_uncertain`, non-retryable | A direct `wait` observes `Terminated`. |
 | Worker poll outage | `Refuse` for the worker while a workflow is started | `Worker.run` keeps running | The workflow completes after `restore`. |
 | Activity completion, acknowledgement lost | `Drop_responses` for the worker while the activity completes, until the fault is proven | The completion is retained and re-sent after reconnecting. Core treats the server's `NotFound` for the already-applied completion as done | The workflow completes, and the activity callback was dispatched exactly once in that attempt. |
+| Workflow task completion, acknowledgement lost | `Drop_responses` for the worker while the first workflow task completes with a local activity marker and a `StartTimer` command, until the fault is proven | `Worker.run` keeps running. The lost completion is resolved by Core (see below); a retried, failed or timed-out workflow task is accepted | The workflow returns its exact result. Its history records exactly one `MarkerRecorded`, `TimerStarted`, `TimerFired` and `WorkflowExecutionCompleted`, the local activity callback ran once, and a fresh run on the same worker then completes. |
 | Client shutdown while unavailable | `Refuse`, then `Client.shutdown` | `Ok ()` without waiting on the transport | None needed. |
+| Worker shutdown while unavailable | `Refuse` for 2 s on an idle polling worker with its own `Runtime.t`, then `Worker.shutdown_with_report` with a 1 s grace period and a 3 s teardown timeout | `Ok` report within grace plus teardown plus 2 s, both lanes stopped, nothing abandoned, teardown `` `Completed `` or `` `Detached ``; `Worker.run` returns `Ok ()` | After `restore`, the worker detaches from its runtime, `Runtime.shutdown` succeeds, and the proxy has no open connection. |
 
-Two scenarios do not end their fault after a fixed delay, because a loaded
+Three scenarios do not end their fault after a fixed delay, because a loaded
 host could run the operation only after recovery and the scenario would then
 pass without exercising the lost response. Each one waits, with a deadline,
 for evidence that the fault happened, and fails with a clear message if the
@@ -66,11 +69,18 @@ evidence never appears:
 - Activity completion: the run's history, read through the official Temporal
   CLI, already records `ActivityTaskCompleted`, and the worker proxy has
   discarded response bytes.
+- Workflow task completion: the workflow body is deterministic. It runs one
+  local activity, then a timer. A local activity runs inside the workflow
+  task that scheduled it, so the task's completion is sent only after the
+  callback returns. The gate is in that activity callback, never in workflow
+  code, and holds until responses are dropped. The run's history then already
+  records `TimerStarted`, and the worker proxy has discarded response bytes.
+  Replay resolves the local activity from its recorded marker.
 
 The proxy counts every discarded byte, and the log records the count for each
 of these scenarios.
 
-After every proxied client and the worker are shut down, both proxies must
+After every proxied client and the worker are shut down, every proxy must
 report zero open connections. A connection still open at that point is a
 leaked native handle or socket.
 
@@ -82,6 +92,25 @@ leaked native handle or socket.
   defaulted key for cancel), or by observing the exact run with `wait` or a
   query. Terminate has no idempotency key, so it reports
   `Termination_outcome_uncertain` instead of retrying blindly.
+- A lost workflow-task completion that the server applied is not applied
+  again. Its completion call fails when `restore` closes the connection. If
+  Core's retrying client sends it again on a new connection, the server
+  answers `NotFound` for the already completed task token. Core evicts the
+  run from its cache on `NotFound` and on any other completion error alike. When
+  the timer fires, the next workflow task replays the full history: the
+  replayed `StartTimer` matches the recorded `TimerStarted`, and the local
+  activity resolves from its marker without running again, so no command is
+  recorded twice. If the timer's workflow task is itself lost to a dropped
+  poll response on a slow host, the server times it out and retries it; the
+  scenario logs workflow task completed, failed and timed-out counts so such
+  a retry is visible.
+- Shutting down a worker during an outage stays within its documented bound.
+  Core sends its final `ShutdownWorker` call without retries and ignores
+  `Unavailable`, so how long native teardown takes against a refusing server
+  is Core's timing, and the report may say `` `Completed `` or
+  `` `Detached ``. Either way the worker stays attached to its runtime until
+  the release has finished, which the scenario observes after the server
+  returns.
 - Retrying a retained activity completion does not run the callback again in
   the same in-memory attempt. The activity scenario counts callback
   dispatches to check this.
@@ -97,9 +126,10 @@ leaked native handle or socket.
 
 CI runs the suite against the Compose Temporal/PostgreSQL stack through
 `make test-temporal-live-regressions`, which `make test-temporal-live-ci`
-invokes. The suite usually finishes in under a minute, and the controller
+invokes. The suite usually finishes in about a minute, and the controller
 bounds it at 180 s. That controller also supplies the pinned admin-tools
-Temporal CLI, which the activity scenario uses to read its own history. To run
+Temporal CLI, which the activity and workflow-task scenarios use to read their
+own histories. To run
 the suite locally against a disposable server that has the `default`
 namespace, pass an official CLI path:
 
@@ -113,16 +143,15 @@ make test-transport-interruption-live RUN='opam exec --' \
 
 The following parts of #504 are not covered by this suite:
 
-- Worker shutdown while the transport is unavailable, live. #495 bounds
-  shutdown and covers an unreachable server with focused tests over a
-  blocking fake backend; a live transport fault during shutdown is not yet
-  part of this suite.
-- Faults on authenticated (TLS) connections. This depends on #496.
-- Workflow task completion loss as its own targeted scenario. It is exercised
-  only indirectly here, through lost poll responses during the activity
-  scenario.
+- Faults on authenticated (TLS) connections. This depends on #496 and is
+  left for later.
 - The worked side-effecting activity example with an external store that
   provides an atomic idempotency contract, and the failure-after-commit
-  redelivery test across a worker restart.
+  redelivery test across a worker restart. This is also left for later.
 - Retention of CI diagnostic artifacts (#490). Today the suite's evidence is
   its log under `_build/live-regressions/`.
+
+Worker shutdown while the transport is unavailable and a lost workflow-task
+completion are now live scenarios (above). The focused #495 tests over a
+blocking fake backend still cover the `` `Detached `` path deterministically,
+because this live scenario does not force teardown to outlast its timeout.
