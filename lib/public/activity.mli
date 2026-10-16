@@ -383,6 +383,13 @@ end
     when the activity next heartbeats. Configure a [heartbeat_timeout] when
     scheduling an activity that must react promptly.
 
+    An asynchronous activity has no context to read. Its completer learns of
+    the same requests from the result of {!Async_handle.heartbeat} and
+    reports the outcome itself, with {!Async_handle.cancel} or
+    {!Async_handle.fail}. The repository's [examples/cancellation] shows both
+    forms releasing an external reservation idempotently on cancellation and
+    on worker shutdown.
+
     {[
       let process_batch =
         Temporal.Activity.define_with_context ~name:"process_batch"

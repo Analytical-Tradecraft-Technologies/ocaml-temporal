@@ -15,6 +15,45 @@ implementation when a later entry documents that work as complete. The
 records the current tested source, named assertions and successful CI job for
 the Temporal acceptance controllers.
 
+## 2026-10-16: Runnable cooperative cancellation example (#494)
+
+`examples/cancellation` is a self-checking example of cooperative activity
+cleanup. Its activities hold a reservation in an in-memory ledger that stands
+in for an external service. The ledger key is the workflow ID plus the
+explicit activity ID, so every attempt uses the same key, and acquire,
+release and commit are idempotent, so retries and redeliveries are safe. A
+synchronous activity checks `Context.is_worker_shutting_down` and heartbeats
+before each step; on any early exit it releases the reservation and then
+returns the heartbeat's `` `Cancelled `` error, or a retryable error when its
+worker is stopping, resuming later from its last heartbeat details. An
+asynchronous activity's completer thread treats a non-retryable
+`` `Cancelled `` result from `Async_handle.heartbeat` (#1103) as a requested
+cancellation and a retryable one as a pause or reset, releases the
+reservation, and then calls `Async_handle.cancel` or `Async_handle.fail`.
+
+The driver runs a worker in the same process and checks the ledger history
+for three scenarios: a workflow cancels the synchronous activity, and the
+asynchronous one, under `Wait_cancellation_completed` and must see a
+cancelled activity whose only attempt released its reservation because of
+the cancellation; and the driver shuts the worker down while an activity
+holds a reservation, so that attempt must release it because its worker is
+stopping, and a replacement worker's retry must reacquire the key and commit
+it. It prints a fixed four-line report.
+
+The executable is in `EXAMPLE_EXECUTABLES` and the CI smoke artifact, and
+`run-examples-live.sh` runs it as a one-shot container on its own
+`-cancellation` task queue and requires the exact report. The asynchronous
+scenario is the first live use of the async heartbeat cancellation result.
+The examples guide, the workflow guide, the feature coverage table and the
+README describe the contract; the stale statement that asynchronous handles
+are not notified of cancellation is corrected.
+
+Evidence: `dune build --root . @install` and the example executables on OCaml
+5.4.1 (macOS), `test/smoke/test_examples_live_contract.sh` (4 executables),
+`scripts/check-live-acceptance-inventory.sh --check` and shellcheck of the
+live controller. The live run needs the Compose stack and happens only in CI.
+Re-qualification after the isolated activity dispatch of #492 remains.
+
 ## 2026-10-16: Worker shutdown during an outage and a lost workflow-task completion (#504)
 
 The transport interruption live regression has two new worker scenarios.

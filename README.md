@@ -72,9 +72,10 @@ platforms does not establish live compatibility there.
   The live fixture uses a local plaintext Temporal endpoint.
 - Running activity callbacks are serialized. A synchronous callback observes
   cancellation only cooperatively, at its heartbeats, and worker shutdown
-  through `Activity.Context.is_worker_shutting_down`; asynchronous handles are
-  not notified of cancellation, and bounded operational shutdown qualification
-  remains incomplete.
+  through `Activity.Context.is_worker_shutting_down`; an asynchronous handle
+  observes cancellation, pause and reset only through the result of
+  `Activity.Async_handle.heartbeat` and is not told about worker shutdown.
+  Bounded operational shutdown qualification remains incomplete.
 - Offline replay of binary histories is available through
   [`Temporal.Replay`](docs/guides/workflows.md#replay-recorded-histories-before-deploying)
   and the copyable [replay command example](examples/README.md#replay-recorded-histories-before-deploying);
@@ -325,10 +326,15 @@ The complete, buildable version is split the way a real deployment often is:
 - [Client](examples/client/client.ml) connects, starts one exact workflow run,
   waits for its typed terminal result, prints it, and releases the connection.
 
+A separate, self-checking [cancellation example](examples/README.md#cancel-activities-cooperatively)
+shows synchronous and asynchronous activities that release an external
+reservation idempotently when a workflow cancels them or their worker shuts
+down.
+
 See the [examples guide](examples/README.md) for the startup order, connection
-settings, and commands. CI compiles all three executables on every Docker and
-native build, and the Linux live job runs them together against Temporal Server
-with `make test-temporal-examples-live`.
+settings, and commands. CI compiles every example executable on every Docker
+and native build, and the Linux live job runs them against Temporal Server with
+`make test-temporal-examples-live`.
 
 See [Writing Workflows in OCaml](docs/guides/workflows.md) for codecs, worker
 registration, client handles, child-workflow boundaries, futures, and
