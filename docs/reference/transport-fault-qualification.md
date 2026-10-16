@@ -148,8 +148,10 @@ The following parts of #504 are not covered by this suite:
 - The worked side-effecting activity example with an external store that
   provides an atomic idempotency contract, and the failure-after-commit
   redelivery test across a worker restart. This is also left for later.
-- Retention of CI diagnostic artifacts (#490). Today the suite's evidence is
-  its log under `_build/live-regressions/`.
+
+CI artifact retention (#490) is closed: the live job uploads this suite's log
+from `_build/live-regressions/` in its `live-regressions-*` artifact, kept for
+seven days.
 
 Worker shutdown while the transport is unavailable and a lost workflow-task
 completion are now live scenarios (above). The focused #495 tests over a

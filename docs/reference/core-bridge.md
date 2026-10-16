@@ -1107,8 +1107,10 @@ limits, uncached workers, and rejection of a one-task cached worker. Live
 qualification uses `make test-temporal-worker-cache-eviction`, which must
 observe A's `cache_full` eviction after starting B and typed cancellation of
 both runs. Increasing the watchdog or accepting a successful retry is not a
-substitute for those observations. CI artifact retention and release
-qualification remain tracked by issues #490 and #501.
+substitute for those observations. Issues #490 (CI artifact retention) and
+#501 (the cache-eviction timeout) are closed; the exact release candidate must
+still pass its own cache-eviction controller, as the v1 support policy
+requires.
 
 The public `Temporal.Worker.create` accepts validated `Temporal.Worker.Options`
 for routing and resource policy. `Options.make ~versioning:(Legacy_build_id

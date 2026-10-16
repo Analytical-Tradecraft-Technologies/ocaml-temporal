@@ -76,6 +76,12 @@ platforms does not establish live compatibility there.
   observes cancellation, pause and reset only through the result of
   `Activity.Async_handle.heartbeat` and is not told about worker shutdown.
   Bounded operational shutdown qualification remains incomplete.
+- Workflow-level cooperative cancellation and durable cleanup are not
+  supported ([#514](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/514)):
+  `Client.cancel` closes the run as cancelled without letting workflow code
+  run cleanup first, and the proposed
+  [v1 support policy](docs/reference/v1-support-policy.md) excludes it from
+  MVP v1.
 - Offline replay of binary histories is available through
   [`Temporal.Replay`](docs/guides/workflows.md#replay-recorded-histories-before-deploying)
   and the copyable [replay command example](examples/README.md#replay-recorded-histories-before-deploying);

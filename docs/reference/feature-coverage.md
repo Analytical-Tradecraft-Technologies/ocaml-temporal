@@ -80,6 +80,10 @@ See [runtime invariants](runtime-invariants.md), [Core ownership](core-bridge.md
 - Concurrency/load/resource qualification and operational guidance. Shutdown
   is bounded (#495), but abandoned callbacks keep running until the process
   exits.
+- Cooperative workflow cancellation and durable cleanup (#514). A
+  cancellation request closes the run as cancelled in the activation that
+  delivers it; workflow code cannot observe it or run cleanup first. The
+  proposed [v1 support policy](v1-support-policy.md) excludes it from MVP v1.
 - Schedules, Nexus, interceptors, workflow side effects, workflow-level
   priority/fairness and remaining Temporal parity work.
 - Client signal-with-start and describe-workflow operations are not

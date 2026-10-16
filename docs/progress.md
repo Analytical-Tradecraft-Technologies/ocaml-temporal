@@ -15,6 +15,31 @@ implementation when a later entry documents that work as complete. The
 records the current tested source, named assertions and successful CI job for
 the Temporal acceptance controllers.
 
+## 2026-10-17: v1 policy and qualification docs reconciled with merged work (#489, #514)
+
+This is a documentation-only correction; the v1 support policy's approval
+status is unchanged and remains a maintainer decision on #489. Each statement
+was checked against `origin/master` code and tests before editing:
+
+- The policy's remote-activity row no longer says callbacks run serially under
+  the polling lock. Since PR #752 activity callbacks run on a dedicated
+  capacity-one Domain, so a blocked callback stops other activities but not
+  unrelated workflow progress; #492 stays open for qualification.
+- Asynchronous handles observe cancellation, pause and reset through the
+  result of `Async_handle.heartbeat` (PR #1103, exercised live by the PR #1117
+  example). They are still not notified of worker shutdown.
+- The metrics row now lists the SDK-side `temporal_ocaml_` worker series
+  (PR #1114), activity-scoped log correlation (PR #1051) and the bounded scrape
+  connections (PR #1096). The endpoint still has no authentication or TLS.
+- The transport-fault qualification and Core bridge references no longer list
+  #490 (CI artifact retention) or #501 as open. The release checklist's gate
+  statuses were rechecked and its date refreshed.
+- The policy, README, workflow guide, feature coverage and the
+  `Client.cancel` documentation now say plainly that workflow-level
+  cooperative cancellation with durable cleanup is excluded from the proposed
+  MVP v1 scope (#514): a cancellation request closes the run in the activation
+  that delivers it, before workflow code can run cleanup.
+
 ## 2026-10-16: Runnable cooperative cancellation example (#494)
 
 `examples/cancellation` is a self-checking example of cooperative activity
