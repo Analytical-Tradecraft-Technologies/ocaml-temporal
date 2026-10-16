@@ -162,7 +162,7 @@ jobs:
     # always() evidence uploads after it still run before the job is killed
     # (test/smoke/test_temporal_compose_config.sh checks this). A normal run
     # takes about 25 minutes.
-    timeout-minutes: 80
+    timeout-minutes: 86
     env:
       # Keep this as one explicit compatibility lane because it starts the
       # complete PostgreSQL/Temporal stack and two OCaml processes.
@@ -194,7 +194,9 @@ jobs:
         # preinstalled SDKs before the first Compose build so a valid native
         # link cannot fail because the disposable runner ran out of space.
         if: runner.environment == 'github-hosted'
-        timeout-minutes: 4
+        # Measured at 37 s to 3 min 47 s on hosted runners; a 4 minute bound
+        # timed out before any test ran.
+        timeout-minutes: 10
         shell: bash
         run: |
           set -euo pipefail
@@ -256,8 +258,9 @@ jobs:
           retention-days: 7
           if-no-files-found: warn
       - name: Upload live regression suite logs
-        # run-live-regressions.sh writes one log per suite and the official-SDK
-        # interop evidence under _build/live-regressions (#504, #519). The
+        # run-live-regressions.sh writes one log per suite, the official-SDK
+        # interop evidence and the activity worker crash suite's histories and
+        # worker logs under _build/live-regressions (#504, #519). The
         # copied admin-tools CLI binary in that directory is deliberately
         # excluded. Upload failure is reported here, not as a scenario failure.
         if: always()
@@ -268,6 +271,7 @@ jobs:
           name: live-regressions-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             _build/live-regressions/*.log
+            _build/live-regressions/activity_worker_crash/
             _build/live-regressions/sdk_interop/
           retention-days: 7
           if-no-files-found: warn
