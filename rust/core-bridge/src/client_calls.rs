@@ -398,6 +398,14 @@ pub(crate) fn registered_calls(owner: u64) -> usize {
     lock(&CALLS).per_owner.get(&owner).copied().unwrap_or(0)
 }
 
+/// Reports how many calls are registered for every owner together. Only
+/// the test hook `test_registered_client_calls` reads it: a registry that
+/// does not return to its baseline once every runtime is released would be a
+/// leaked call slot.
+pub(crate) fn registered_call_total() -> usize {
+    lock(&CALLS).calls.len()
+}
+
 /// Largest accepted `max_pending_waits` (#796). Each distinct waited run holds
 /// one Tokio task and one open history long poll, so the bound keeps a typo
 /// from turning one client into thousands of server long polls.

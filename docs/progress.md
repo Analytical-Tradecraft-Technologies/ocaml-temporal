@@ -15,6 +15,171 @@ implementation when a later entry documents that work as complete. The
 records the current tested source, named assertions and successful CI job for
 the Temporal acceptance controllers.
 
+## 2026-10-16: Worker shutdown during an outage and a lost workflow-task completion (#504)
+
+The transport interruption live regression has two new worker scenarios.
+
+A lost workflow-task completion: a deterministic workflow runs one local
+activity and then a timer. The local activity callback, not workflow code,
+holds the first workflow task open until the worker proxy drops responses, so
+the task completes with the marker and a `StartTimer` command only then. The scenario requires the run's history to record
+`TimerStarted` while the acknowledgement is still being dropped, then
+restores the proxy. Core's completion call fails; a retry gets `NotFound` for
+the applied task token, and Core evicts the run either way. The timer's
+workflow task replays the full history without recording anything twice. The
+scenario requires the exact result, exactly one `MarkerRecorded`,
+`TimerStarted`, `TimerFired` and `WorkflowExecutionCompleted`, one local
+activity callback, a still-running `Worker.run`, and a fresh run
+completing afterwards. It accepts a retried, failed or timed-out workflow task
+and logs their counts.
+
+Worker shutdown during an outage: an idle worker with its own proxy and
+`Runtime.t` polls until the proxy refuses all traffic for 2 s. Then
+`Worker.shutdown_with_report` (1 s grace period, 3 s teardown timeout) must
+return `Ok` within 6 s, with both lanes stopped and nothing abandoned, and
+`Worker.run` must return `Ok ()`. Core sends `ShutdownWorker` without retries
+and ignores `Unavailable`, so the teardown may be `` `Completed `` or
+`` `Detached ``. After `restore` the worker must detach from its runtime,
+`Runtime.shutdown` must succeed, and the proxy must have no open connection.
+
+[Transport fault qualification](reference/transport-fault-qualification.md)
+documents both scenarios and narrows the remaining #504 scope to TLS faults
+(#496) and the side-effecting idempotency example, both left for later.
+
+Evidence: `dune build --root . @install` and the suite executable build
+locally, and `test/smoke/test_live_regressions_contract.sh` and
+`test/smoke/test_live_acceptance_inventory_contract.sh` pass. The suite needs
+the Compose Temporal stack, so its live run is in CI through
+`make test-temporal-live-regressions`; this entry does not claim a local live
+pass.
+
+## 2026-10-16: Signed release provenance and a consumer of the source archive (#510)
+
+The Release workflow's `publish` job now signs SLSA build provenance for every
+file it uploads (the source archive, the bridge and SDK archives,
+`manifest.json`, the Cargo SBOM, `THIRD-PARTY-NOTICES.txt` and `SHA256SUMS`)
+with `actions/attest-build-provenance` v4.2.2, pinned by commit and
+MIT-licensed. The step runs after the assets are complete and checksummed and
+before the draft release is created, so a signing failure publishes nothing.
+Only that job holds `id-token: write` and `attestations: write`.
+`test/smoke/test_quality_contract.sh` checks those permissions, the subject
+glob, and that the attestation precedes `gh release create`. The release
+checklist shows how a consumer verifies an asset with `gh attestation verify`,
+pinned to the Release workflow, `master`, and the tagged commit.
+
+PR #1080 already built the release source archive inside an opam build
+sandbox, but nothing consumed the result as an installed package. The new
+`scripts/check-source-archive-consumer.sh` reuses that sandboxed build: it runs
+`dune install -p temporal-sdk` from the unpacked archive into a fresh prefix
+and builds the archive's own `test/fixtures/install-consumer` in a separate
+Dune root against that prefix only. It then runs the public API witness
+(native and `(modes byte)`), the worker-environment probe, and installed
+replay of a frozen history. It refuses a switch that already provides
+`temporal-sdk`. Both `source-archive-check` in `release.yml` and the master
+`opam-source-offline` job run it after the sandboxed build.
+`test/smoke/test_source_archive_consumer_check.sh` covers the script's
+decisions on every `dune runtest`, using stand-ins for dune and opam.
+
+The release checklist now separates what the workflow automates from what
+still needs a maintainer: the qualification sign-off, creating the protected
+tag, dispatching the workflow (it uses only the workflow token and OIDC, with
+no stored publish secret), and the prerelease rehearsal, which has not been
+done. The Release workflow cannot run from a pull request, so the attestation
+step is first exercised by that rehearsal.
+## 2026-10-16: Concurrent live worker and client lifecycle stress (#506)
+
+Before this change, the lifecycle stress drove live activity workers from one
+thread only, and the concurrent stress used replay workers only. A new test
+in the `lifecycle_stress` binary, `live_stress::concurrent_live_workers_and_clients`,
+runs live activity workers and submitted client calls on several threads at
+once against the binary's gRPC double. The double now records heartbeats per
+token and answers every third with `cancel_requested`. It holds history long
+polls open until the client resets them, and counts only requests that
+arrived whole. The stress covers:
+
+- polling, worker completions and rejections, and worker heartbeats followed
+  by Core's Cancel task and a cancelled completion;
+- handoff to async completion, then throttled async heartbeats and async
+  completions submitted as client calls (#1025);
+- signals, workflow cancellation requests, and never-answered waits, some
+  released before their outcome (#1019);
+- initiate-shutdown and shutdown with and without a held lease (#1028), and
+  disconnect;
+- graphs on owned Cores or on a shared Core that the coordinator releases
+  mid-round, released on their own thread or by a reaper thread while their
+  owner still awaits their calls.
+
+After the rounds, the test checks the following:
+
+- every graph was cleaned once and every Core dropped once;
+- the client call registry is back at its baseline, through
+  `test_registered_client_calls`, a new hidden test hook;
+- every held long poll ended;
+- every owed completion arrived exactly once, and an unconfirmed async
+  completion arrived at most once;
+- the server never saw more heartbeats than the test sent;
+- no panic came from bridge code on any thread.
+
+Shutdown and waiting frees must finish within 20 seconds, and calls of a
+released graph must end within 30 seconds.
+
+The default budget (3 rounds, 4 threads, up to 48 operations per graph) runs
+in about 1.5 seconds in the ordinary `cargo test`. The
+`LIFECYCLE_STRESS_LIVE_{ROUNDS,THREADS,STEPS,ROUND}` variables scale it.
+`make stress-qualification` runs 200 rounds of 12 threads with up to 96
+operations per graph. On an Apple
+M-series laptop that budget (seed `0x7e57`) leased 47,950 tokens across 4,800
+graphs and 1,805 Core runtimes in 224 seconds and passed, with no panic of
+any kind. A run of 60 rounds of 12 threads (seed `0x1234abcd`) took 67 seconds.
+
+The first large run failed on the double, not the bridge. A completion RPC
+that the client aborted mid-body was decoded as a completion with an empty
+token. The double now discards a request whose stream was reset or whose body
+is shorter than its gRPC length prefix.
+
+The upstream Core teardown panic in the Findings section of
+[bridge lifecycle stress](reference/bridge-lifecycle-stress.md#findings) was
+re-checked against the pinned Core `8fe478e`. The unchanged
+`poll_task_awaiter.await.unwrap()` is now at `poll_buffer.rs:452`, and the
+panic still occurs: once with each of two seeds in 25,600 replay graphs. It
+remains contained on a Tokio worker thread, with every graph and Core
+released exactly once.
+## 2026-10-16: A full client-call registry no longer closes async handles (#1104)
+
+`Native_worker_policy.async_operation_disposition` mapped
+`Resource_exhausted` to `Retired`. On the async activity path that status
+only means the bridge refused to admit the submitted call because its
+pending client-call registry was full (`max_in_flight_calls`), before any
+RPC existed; a server `ResourceExhausted` already maps to `Connection`.
+Retiring closed the handle for good, so a later `complete` could not be
+delivered and the attempt could only end by server timeout.
+
+The policy now has a fourth disposition, `Not_admitted`, for
+`Resource_exhausted`. The adapter reports it to the base handle as
+`Not_submitted` with a retryable `` `Bridge `` error: the handle and lease
+stay live, the key is released unless an earlier uncertain terminal request
+is still owed, and in that case the adapter keeps that request's retained
+bytes so the exact retry resends them. Heartbeats, `complete`, `fail` and
+`cancel` share the classification. #1103's heartbeat throttle sends
+unthrottled when its own token table is full, but every async call,
+throttled heartbeats included, still passes the registry's admission check.
+Lease expiry (#1043) is unchanged and still bounds a handle whose calls keep
+being refused. `Activity.Async_handle` documents the retryable error.
+
+Evidence on macOS with OCaml 5.4.1: the fake supervisor in
+`test/runtime/test_native_async_activity.ml` now models the registry with a
+slot count and refuses with `Resource_exhausted` when it is full. New tests
+check that `complete`, `fail`, `cancel` and `heartbeat` each return a
+retryable `` `Bridge `` error naming `resource_exhausted`, send nothing, and
+keep the handle and lease live, and that the same call succeeds once a slot
+frees. They also check that a refused retry keeps an earlier uncertain
+completion owed and later resends its bytes, and that a lease whose calls
+are refused still expires. `test_native_worker_policy.ml` pins the
+classification. Restoring `Retired` fails the policy test and the
+terminal-operation test, and clearing the retained bytes fails the
+uncertainty test. `dune build @install` and the runtime, unit,
+sdk_supervisor and bridge test aliases pass.
+
 ## 2026-10-15: Worker idle pacing keeps sub-tick precision on Windows (#1008)
 
 The adaptive idle pacing from #994 slept with `Thread.delay`, which on

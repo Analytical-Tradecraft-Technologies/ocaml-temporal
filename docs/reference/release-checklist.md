@@ -16,6 +16,26 @@ a release that turns out to be bad. It is built on the existing machinery:
 No release has been published yet. Rehearsing this procedure end to end, as a
 prerelease, is [#510], which is open.
 
+## Automated and maintainer-owned steps
+
+The Release workflow automates everything that can be checked from the
+repository. These steps still need a maintainer, and the workflow cannot
+replace them:
+
+| Step | Automated by the Release workflow | Needs a maintainer |
+| --- | --- | --- |
+| Version metadata, release notes, tag-to-commit match | Yes, before any build and again before the draft and before publishing | Writing the notes and the version PR |
+| Full release build and test graph, licence audit, Cargo SBOM | Yes | No |
+| Source archive builds inside the opam sandbox | Yes, `source-archive-check` | No |
+| Consumer built against the package installed from that archive, outside the checkout | Yes, `source-archive-check` ([#510]) | No |
+| `SHA256SUMS` over every asset | Yes | No |
+| Signed SLSA build provenance for every asset | Yes, `actions/attest-build-provenance` in `publish` ([#510]) | No |
+| Qualification evidence and sign-off | No | The release owner, in the tracking issue |
+| Creating the protected version tag | No | A member of the maintainer team |
+| Publish credentials | The job uses the workflow's own `GITHUB_TOKEN` and OIDC token; no stored secret | Dispatching the workflow; a future opam-repository submission needs a maintainer's own account |
+| Prerelease rehearsal: dispatch a real `-rc` tag, then download and verify it as in step 4 | No | A maintainer; not done yet ([#510]) |
+| Bad-release remediation | No | A maintainer, as described below |
+
 ## Tag rules
 
 Two repository rulesets apply to every `refs/tags/v*` ref:
@@ -102,9 +122,11 @@ Every item is evidence for the commit that will be tagged, not an older one.
       tag. The workflow validates the request, including the release notes,
       runs the full `release` tier of
       `build-pr.yml` (sixteen OCaml combinations, four Rust producers, the
-      live job and the licence audit) and `release-preflight.yml`, then
-      assembles and checks the assets, uploads them to a draft, and publishes
-      it (as a prerelease when the tag has a `-` suffix). The published notes
+      live job and the licence audit) and `release-preflight.yml`, builds the
+      source archive in the opam sandbox and a consumer against the package
+      installed from it, then assembles and checks the assets, signs their
+      build provenance, uploads them to a draft, and publishes it (as a
+      prerelease when the tag has a `-` suffix). The published notes
       are `docs/releases/<tag>.md` followed by a generated `## Release assets`
       section; nothing else is written by hand on the release page.
 
@@ -112,6 +134,32 @@ Every item is evidence for the commit that will be tagged, not an older one.
 
 - [ ] Download the assets and run `sha256sum --check SHA256SUMS`.
 - [ ] Check that `manifest.json` names the tagged commit.
+- [ ] Verify the provenance attestation of every asset, as any consumer can:
+
+  ```sh
+  repo=Analytical-Tradecraft-Technologies/ocaml-temporal
+  tag=v0.1.0-rc.1
+  gh release download "$tag" --repo "$repo" --dir "ocaml-temporal-$tag"
+  cd "ocaml-temporal-$tag"
+  sha256sum --check SHA256SUMS
+  # The commit the protected tag peels to; the workflow ran from master at it.
+  commit=$(git ls-remote "https://github.com/$repo" "refs/tags/$tag^{}" | cut -f 1)
+  for asset in *; do
+    gh attestation verify "$asset" --repo "$repo" \
+      --signer-workflow "$repo/.github/workflows/release.yml" \
+      --source-ref refs/heads/master --source-digest "$commit" \
+      --deny-self-hosted-runners
+  done
+  ```
+
+  `gh attestation verify` (signed in with `gh auth login`) looks up the
+  attestations for the file's SHA-256, checks the Sigstore signature and
+  certificate, and requires that this repository's Release workflow produced
+  the file on a GitHub-hosted runner from that commit. A modified file, or one
+  built anywhere else, fails. To verify later without network access, save the
+  bundle once with `gh attestation download <asset> --repo "$repo"` and pass
+  it with `--bundle`. The repository's **Actions → Attestations** page lists
+  the same attestations.
 - [ ] Install the source archive in a fresh environment with
       [`opam install`](package-boundary.md#offline-opam-source-builds) and
       build a consumer against it; link one prebuilt SDK archive as described
@@ -129,7 +177,7 @@ is as of 2026-10-14; check each issue before relying on it.
 | Benchmark and sustained-load gates | [#507] | Open. The [benchmark harness](benchmark-harness.md) is exploratory and is not a load gate. |
 | Worker upgrade and rollback | [#508] | Open. [The rehearsal](worker-upgrade-rollback.md) is a proposed procedure, not an accepted upgrade. |
 | Security reporting and maintenance | [#509] | Open. There is no `SECURITY.md` yet. |
-| Release pipeline rehearsal | [#510] | Open. This checklist is part of it; a prerelease rehearsal is still required. |
+| Release pipeline rehearsal | [#510] | Open. The source-archive consumer build and signed provenance are automated; a maintainer's prerelease rehearsal is still required. |
 | v1 support and compatibility policy | [#489] | Open. |
 | Documentation reconciled with CI evidence | [#491] | Closed. |
 | Test instrumentation removed from the production worker | [#502] | Closed. |

@@ -4,7 +4,10 @@ name: Scheduled bridge stress
 # and master builds already run every target with a small fixed budget (the
 # Rust tests in `cargo test`, the OCaml ones in the @test/bridge/bridge-stress
 # step after `dune runtest`); this workflow reruns the same targets
-# with large budgets and a fresh seed, on a schedule and on demand. See
+# with large budgets and a fresh seed, on a schedule and on demand. The
+# lifecycle stress includes concurrent live activity workers and client calls
+# against its gRPC double, whose failure reports land in
+# _build/lifecycle-stress/ with the sequential ones. See
 # docs/reference/bridge-decoder-fuzz.md and
 # docs/reference/bridge-lifecycle-stress.md.
 

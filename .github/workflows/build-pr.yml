@@ -162,7 +162,7 @@ jobs:
     # always() evidence uploads after it still run before the job is killed
     # (test/smoke/test_temporal_compose_config.sh checks this). A normal run
     # takes about 25 minutes.
-    timeout-minutes: 80
+    timeout-minutes: 86
     env:
       # Keep this as one explicit compatibility lane because it starts the
       # complete PostgreSQL/Temporal stack and two OCaml processes.
@@ -194,7 +194,9 @@ jobs:
         # preinstalled SDKs before the first Compose build so a valid native
         # link cannot fail because the disposable runner ran out of space.
         if: runner.environment == 'github-hosted'
-        timeout-minutes: 4
+        # Measured at 37 s to 3 min 47 s on hosted runners; a 4 minute bound
+        # timed out before any test ran.
+        timeout-minutes: 10
         shell: bash
         run: |
           set -euo pipefail
@@ -577,3 +579,8 @@ jobs:
         run: >-
           sh scripts/check-opam-source-archive.sh
           "$RUNNER_TEMP/ocaml-temporal-source.tar.gz" "$RUNNER_TEMP/opam-source-check"
+      # Installs that build into a fresh prefix and builds the installed-package
+      # consumer fixture from the archive against it, outside the checkout.
+      - name: Build a consumer against the package installed from the archive
+        shell: bash
+        run: sh scripts/check-source-archive-consumer.sh "$RUNNER_TEMP/opam-source-check"

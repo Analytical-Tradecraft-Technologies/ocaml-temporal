@@ -512,7 +512,7 @@ require_master_smoke_text() {
 }
 require_master_smoke_text 'make test-temporal-live-ci'
 require_master_smoke_text 'name: Temporal/PostgreSQL integration smoke (OCaml 5.5)'
-require_master_smoke_text 'timeout-minutes: 80'
+require_master_smoke_text 'timeout-minutes: 86'
 # Every step carries its own timeout and the job timeout covers their sum, so
 # a hung scenario step times out on its own and the always() evidence uploads
 # after it still run before GitHub kills the job (#504, #519).

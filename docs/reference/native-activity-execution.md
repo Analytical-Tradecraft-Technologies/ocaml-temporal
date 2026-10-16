@@ -203,6 +203,20 @@ classification (`Native_worker_policy.async_operation_disposition`):
 - `NotFound` maps to `Invalid_state` and closes the handle because the server
   has discarded the token. After an uncertain terminal request, this can also
   mean the earlier attempt was applied.
+- `Resource_exhausted` is never a server answer here (a server
+  `ResourceExhausted` maps to `Connection`, above). It means the bridge
+  refused to admit the submitted call because the client's pending-call
+  registry already held `max_in_flight_calls` calls, before any task or RPC
+  existed. That is transient back-pressure, so it maps to the `Not_admitted`
+  disposition (#1104): the base handle sees `Not_submitted` with a retryable
+  `` `Bridge `` error naming `resource_exhausted`, and the handle and adapter
+  lease stay live. As with a local rejection, the key is released unless an
+  earlier uncertain terminal request is still owed; in that case only its
+  exact retry may follow, and the adapter keeps that request's retained
+  bytes for it. Heartbeats, `complete`, `fail` and `cancel` behave the same.
+  A refused heartbeat does not count as progress, and lease expiry (#1043)
+  still bounds a handle whose calls keep being refused. Before #1104 this
+  status fell through to `Retired` and closed the handle permanently.
 
 The activity callback is never rerun for a submission retry. The handle is not a retained activity context: ordinary
 `Activity.Context` values are still invalidated when their callback returns.
