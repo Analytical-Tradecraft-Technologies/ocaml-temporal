@@ -15,6 +15,37 @@ implementation when a later entry documents that work as complete. The
 records the current tested source, named assertions and successful CI job for
 the Temporal acceptance controllers.
 
+## 2026-10-16: Start metadata survives a cache-full eviction (#512)
+
+`make test-temporal-start-metadata-live` has a second phase. Before this,
+the gate evicted runs only by replacing the worker, with the default cache
+size. A fresh worker now runs the metadata workflow with
+`max_cached_workflows = 1`, set through `Worker.Options`, on its own task
+queue. The client starts three runs with different memo, search attribute
+and execution-deadline combinations, one at a time. It waits for each run to
+park before starting the next, so each new run's first task makes Core evict
+the previous one with `RemoveFromCache` reason cache-full. It reads each
+run's exact snapshot while the run is cached: the summary plus the
+nanosecond expiration. It then queries, signals and completes the runs in
+start order, which evicts the last cached run and rebuilds every run from
+history. Each replayed snapshot must match the cached one, and each result
+must be exact.
+
+The cache worker installs the private observer seam and appends one
+payload-free line per activation and acknowledged completion to
+`cache-events.tsv`. The verifier requires each run to have a `cache_full`
+completion followed by a replaying activation of the same run. It applies
+the existing history and visibility checks to the three runs and requires
+each snapshot's expiration to equal the start event's, to the nanosecond.
+The evidence sits with the gate's other artifacts under
+`_build/start-metadata-evidence`, and CI uploads it through the existing
+`*.tsv`, `*.json` and `*.log` patterns.
+
+Verified locally: `dune build --root . @install` and the
+`start_metadata_driver` executable build; ShellCheck passes for the
+controller and verifier; the verifier's eviction and timestamp checks were
+exercised on synthetic records; and the Docker-free contract targets pass.
+The live gate needs the Docker Compose stack and runs only in CI.
 ## 2026-10-16: Source-archive checks run with the switch on PATH
 
 The master-only `opam-source-offline` job had failed on every master build
