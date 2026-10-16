@@ -46,6 +46,19 @@ Verified locally: `dune build --root . @install` and the
 controller and verifier; the verifier's eviction and timestamp checks were
 exercised on synthetic records; and the Docker-free contract targets pass.
 The live gate needs the Docker Compose stack and runs only in CI.
+## 2026-10-16: Source-archive checks run with the switch on PATH
+
+The master-only `opam-source-offline` job had failed on every master build
+since #1080: `setup-ocaml` does not put the switch's `bin` directory on PATH
+for plain `bash` steps, so opam's sandbox wrapper reported `Command not found:
+dune` straight after the network probe. Both source-archive steps in
+`build-pr.yml`, and the matching `source-archive-check` steps in
+`release.yml`, now run under `opam exec --`, like the Makefile's native
+targets. `scripts/check-opam-source-archive.sh` checks for `dune` before
+probing or building and names that remedy, and
+`test/smoke/test_opam_source_archive_check.sh` covers the missing-`dune` case
+(it reproduces the master failure without the script change).
+
 ## 2026-10-16: SDK-side worker metrics (#500)
 
 Core's Prometheus exporter (#1000) covers what Core sees. Worker states that
