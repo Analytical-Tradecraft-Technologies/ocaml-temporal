@@ -33,6 +33,43 @@ In that image, rustup installed 1.99.1 with Clippy and rustfmt, and
 `make test-quality-contract` and `scripts/check-dependency-inventory.sh`
 passed.
 
+## 2026-10-16: Live regression for a worker killed during a running activity (#519)
+
+`test/integration/activity_worker_crash` adds the worker-removal case that the
+#519 inventory left open: a worker process dies abruptly while an activity
+callback is running. The driver spawns generation 1 (hosting the workflow and
+the activity) as a separate process. The activity has a three-second heartbeat
+timeout, a long start-to-close timeout and a one-second retry interval. Its
+generation-1 callback heartbeats a fixed detail every 200 ms and never
+returns. The driver kills generation 1 with `SIGKILL` only after two barriers,
+with no fixed sleep: the callback's marker file, written after its first
+accepted heartbeat, and `workflow describe` showing attempt 1 started on
+generation 1 with recorded heartbeat details. It then requires that the
+process died of that signal. With no worker polling, a third barrier waits
+until `describe` shows attempt 2 scheduled with a heartbeat-timeout last
+failure, so the server alone detected the lost attempt. Only then does
+generation 2 start. Its callback reports `Activity.Info.attempt` and the
+previous attempt's heartbeat detail. The run must return exactly
+`completed:activity-worker-crash:attempt=2:generation=2:previous_heartbeat=generation-1-attempt-1`.
+The exact-run history must hold one scheduled, started and completed activity
+event and no activity failure or timeout. The started event must record
+attempt 2, generation 2's identity and the heartbeat-timeout last failure.
+
+The suite is in `LIVE_REGRESSION_EXECUTABLES`, the CI smoke artifact list and
+`run-live-regressions.sh`. The controller passes it the official CLI and
+`_build/live-regressions/activity_worker_crash/`, where it keeps both
+`describe` snapshots, the raw history and each generation's log. The Build
+workflow uploads that directory with the suite logs. `make
+test-activity-worker-crash-live` runs it against a disposable server.
+`docs/reference/live-acceptance-coverage.md` records it in the #519 inventory
+and drops the remaining-gap note.
+
+Verified locally: `dune build --root . @install`, the new executable, a
+failure-path run against a closed port (the driver fails, kills generation 1
+and prints its log), `make test-temporal-live-regressions-contract`,
+`test_temporal_compose_config.sh`, `test_ci_artifacts.py` and shellcheck of the
+controller. Docker was unavailable, so the live result comes only from the
+Build workflow's Temporal/PostgreSQL job.
 ## 2026-10-16: Worker shutdown during an outage and a lost workflow-task completion (#504)
 
 The transport interruption live regression has two new worker scenarios.

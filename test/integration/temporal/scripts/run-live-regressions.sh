@@ -146,6 +146,10 @@ for executable in "$@"; do
     test/integration/update_outcomes/regression.exe|\
     test/integration/update_run_close/regression.exe)
       cli_argument=$container_cli ;;
+    test/integration/activity_worker_crash/regression.exe)
+      # The CLI path, then the suite's evidence directory (#519) for its
+      # describe snapshots, exact-run history and worker generation logs.
+      cli_argument="$container_cli /workspace/_build/live-regressions/activity_worker_crash" ;;
     test/integration/sdk_interop/regression.exe)
       cli_argument='' ;;
     *)
@@ -160,7 +164,8 @@ for executable in "$@"; do
   if [ "$suite" = sdk_interop ]; then
     run_sdk_interop "$executable" >"$log" 2>&1 || status=$?
   else
-    # cli_argument is either empty or one path without whitespace.
+    # cli_argument is empty or a few paths, none containing whitespace, so
+    # word splitting yields one argument per path.
     # shellcheck disable=SC2086
     in_dev "$limit" "/workspace/_build/default/$executable" check "$address" $cli_argument \
       >"$log" 2>&1 || status=$?

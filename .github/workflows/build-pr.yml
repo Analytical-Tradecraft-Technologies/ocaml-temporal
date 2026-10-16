@@ -258,8 +258,9 @@ jobs:
           retention-days: 7
           if-no-files-found: warn
       - name: Upload live regression suite logs
-        # run-live-regressions.sh writes one log per suite and the official-SDK
-        # interop evidence under _build/live-regressions (#504, #519). The
+        # run-live-regressions.sh writes one log per suite, the official-SDK
+        # interop evidence and the activity worker crash suite's histories and
+        # worker logs under _build/live-regressions (#504, #519). The
         # copied admin-tools CLI binary in that directory is deliberately
         # excluded. Upload failure is reported here, not as a scenario failure.
         if: always()
@@ -270,6 +271,7 @@ jobs:
           name: live-regressions-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             _build/live-regressions/*.log
+            _build/live-regressions/activity_worker_crash/
             _build/live-regressions/sdk_interop/
           retention-days: 7
           if-no-files-found: warn
