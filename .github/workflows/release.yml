@@ -119,7 +119,7 @@ jobs:
     timeout-minutes: 60
     env:
       RELEASE_TAG: ${{ inputs.tag }}
-      RUSTUP_TOOLCHAIN: 1.99.0-aarch64-apple-darwin
+      RUSTUP_TOOLCHAIN: 1.99.1-aarch64-apple-darwin
       ARCHIVE_SHA256: ${{ needs.source-archive.outputs.sha256 }}
     steps:
       - name: Check out the exact requested commit
