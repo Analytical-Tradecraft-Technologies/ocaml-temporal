@@ -15,6 +15,42 @@ implementation when a later entry documents that work as complete. The
 records the current tested source, named assertions and successful CI job for
 the Temporal acceptance controllers.
 
+## 2026-10-16: Worker shutdown during an outage and a lost workflow-task completion (#504)
+
+The transport interruption live regression has two new worker scenarios.
+
+A lost workflow-task completion: the workflow holds its first activation on a
+process-local gate until the worker proxy drops responses, then completes with
+a `StartTimer` command. The scenario requires the run's history to record
+`TimerStarted` while the acknowledgement is still being dropped, then
+restores the proxy. Core's completion call fails; a retry gets `NotFound` for
+the applied task token, and Core evicts the run either way. The timer's
+workflow task replays the full history without recording anything twice. The
+scenario requires the exact result, exactly one `TimerStarted`, `TimerFired`
+and `WorkflowExecutionCompleted`, a still-running `Worker.run`, and a fresh run
+completing afterwards. It accepts a retried, failed or timed-out workflow task
+and logs their counts.
+
+Worker shutdown during an outage: an idle worker with its own proxy and
+`Runtime.t` polls until the proxy refuses all traffic for 2 s. Then
+`Worker.shutdown_with_report` (1 s grace period, 3 s teardown timeout) must
+return `Ok` within 6 s, with both lanes stopped and nothing abandoned, and
+`Worker.run` must return `Ok ()`. Core sends `ShutdownWorker` without retries
+and ignores `Unavailable`, so the teardown may be `` `Completed `` or
+`` `Detached ``. After `restore` the worker must detach from its runtime,
+`Runtime.shutdown` must succeed, and the proxy must have no open connection.
+
+[Transport fault qualification](reference/transport-fault-qualification.md)
+documents both scenarios and narrows the remaining #504 scope to TLS faults
+(#496) and the side-effecting idempotency example, both left for later.
+
+Evidence: `dune build --root . @install` and the suite executable build
+locally, and `test/smoke/test_live_regressions_contract.sh` and
+`test/smoke/test_live_acceptance_inventory_contract.sh` pass. The suite needs
+the Compose Temporal stack, so its live run is in CI through
+`make test-temporal-live-regressions`; this entry does not claim a local live
+pass.
+
 ## 2026-10-16: Signed release provenance and a consumer of the source archive (#510)
 
 The Release workflow's `publish` job now signs SLSA build provenance for every

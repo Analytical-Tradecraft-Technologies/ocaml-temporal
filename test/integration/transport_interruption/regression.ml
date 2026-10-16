@@ -10,11 +10,16 @@
     as a definite rejection; and the durable outcome reconciled through the
     direct client matches exactly one application of the operation.
 
-    The fixture owns its worker Domain, uses a unique task queue, terminates
+    Two worker scenarios fault the worker's own transport instead: a lost
+    workflow-task completion must not wedge the worker or duplicate a command,
+    and a worker shut down while its server is unreachable must return within
+    its bound and release its native resources once the server returns.
+
+    The fixture owns its worker Domains, uses unique task queues, terminates
     every execution it creates, and requires every proxied socket to be closed
     after client and worker shutdown. Use only a disposable Temporal Server
     with the [default] namespace. The official Temporal CLI path is an
-    explicit argument; it only reads this fixture's own activity history. *)
+    explicit argument; it only reads this fixture's own workflow histories. *)
 open Temporal
 
 let namespace = "default"
@@ -87,6 +92,29 @@ let activity_workflow =
     (fun input ->
       Activity.execute ~start_to_close_timeout:(Duration.of_ms 120_000L)
         side_effect input)
+
+(** Workflow-task gate for the lost completion scenario. Like the activity
+    gate, these are process-local and only delay the first activation; they
+    never change which commands the workflow produces, so the replay after
+    Core evicts the run produces the same commands as the original
+    activation. [release_workflow_task] stays [true] once set, so a replay
+    never waits. *)
+let workflow_task_entered = Atomic.make false
+let release_workflow_task = Atomic.make false
+
+(** Holds its first activation until the driver has switched the worker proxy
+    to drop responses, then starts one durable timer and returns [input + 1].
+    The timer is the command whose duplication the lost completion scenario
+    checks for. It is long enough to fire only after the fault window, so the
+    new workflow task it causes is not itself lost to a dropped poll
+    response on a loaded host. The wait is a few milliseconds, well inside the
+    worker's two-second activation deadline. *)
+let timer_workflow =
+  Workflow.define ~name:"transport-interruption.timer" ~input:number ~output:number
+    (fun input ->
+      Atomic.set workflow_task_entered true;
+      while not (Atomic.get release_workflow_task) do Thread.delay 0.01 done;
+      Result.map (fun () -> input + 1) (Workflow.sleep (Duration.of_ms 5_000L)))
 
 (** Splits ["http://host:port"] into the proxy's upstream address. *)
 let upstream address =
@@ -426,7 +454,99 @@ let activity_completion_ack_lost ~proxy ~direct ~queue ~track ~cli ~address =
     failwith (Printf.sprintf
       "activity_completion_ack_lost: callback ran %d times in one attempt" invocations)
 
-(** Scenario 9: shutting a client down while its server is unreachable is
+(** Number of occurrences of one event type in a history read. *)
+let count_events event_type types =
+  List.length (List.filter (String.equal event_type) types)
+
+(** Scenario 9: a workflow-task completion reaches Temporal but its
+    acknowledgement is lost. The activation is held until the worker proxy
+    drops responses, then completes with a [StartTimer] command. Before the
+    fault ends, the run's history must already record [TimerStarted] and the
+    proxy must have discarded response bytes, so the scenario cannot pass by
+    completing the task only after recovery.
+
+    [restore] closes the connection, so Core's completion call fails. If its
+    retrying client sends it again on a new connection, the server answers
+    [NotFound] for the already applied task token. Core evicts the run from
+    its cache on [NotFound] and on any other completion error alike. When
+    the timer fires, the next workflow task replays the full history: the
+    replayed [StartTimer] matches the recorded [TimerStarted], so nothing is
+    recorded twice. A retried, failed or timed-out workflow task is acceptable; the
+    exact result and the single timer and completion events are required, and
+    the worker must still be running and take new work afterwards. *)
+let workflow_task_completion_ack_lost ~proxy ~direct ~queue ~track ~cli ~address
+    ~worker_stopped =
+  let handle =
+    track (get "workflow task fixture start"
+      (Client.start direct ~workflow:timer_workflow ~task_queue:queue
+         ~id:(queue ^ "-workflow-task-ack-lost") ~input:20 ()))
+  in
+  await "first workflow activation" 30. (fun () -> Atomic.get workflow_task_entered);
+  let dropped_before = Fault_proxy.dropped_bytes proxy in
+  Fault_proxy.set_mode proxy Fault_proxy.Drop_responses;
+  Atomic.set release_workflow_task true;
+  (* Bounded: a completion that never reaches the server while responses are
+     dropped means the lost acknowledgement was not exercised. *)
+  await "durable TimerStarted while the completion acknowledgement is dropped" 30.
+    (fun () ->
+      match history_event_types cli address handle with
+      | Some types -> List.mem "EVENT_TYPE_TIMER_STARTED" types
+      | None -> false);
+  let dropped = Fault_proxy.dropped_bytes proxy - dropped_before in
+  if dropped <= 0 then
+    failwith "workflow_task_completion_ack_lost: the proxy discarded no response bytes";
+  Fault_proxy.log
+    "scenario=workflow_task_completion_ack_lost fault_exercised=true dropped_bytes=%d"
+    dropped;
+  Fault_proxy.restore proxy;
+  (match
+     timed "workflow_task_completion_ack_lost" 60. (fun () -> Client.wait handle)
+   with
+  | Ok (Client.Completed { output = 21; _ }) -> ()
+  | Ok _ -> failwith "workflow_task_completion_ack_lost: unexpected terminal outcome"
+  | Error error ->
+      failwith ("workflow_task_completion_ack_lost: wait failed: " ^ describe error));
+  if Atomic.get worker_stopped then
+    failwith "workflow_task_completion_ack_lost: Worker.run returned after the fault";
+  let types =
+    let latest = ref None in
+    await "closed workflow history" 30. (fun () ->
+      latest := history_event_types cli address handle;
+      Option.is_some !latest);
+    Option.get !latest
+  in
+  let count event_type = count_events event_type types in
+  Fault_proxy.log
+    "scenario=workflow_task_completion_ack_lost run_id=%s timer_started=%d \
+     timer_fired=%d workflow_task_completed=%d workflow_task_failed=%d \
+     workflow_task_timed_out=%d"
+    (Option.get (Client.run_id handle))
+    (count "EVENT_TYPE_TIMER_STARTED") (count "EVENT_TYPE_TIMER_FIRED")
+    (count "EVENT_TYPE_WORKFLOW_TASK_COMPLETED")
+    (count "EVENT_TYPE_WORKFLOW_TASK_FAILED")
+    (count "EVENT_TYPE_WORKFLOW_TASK_TIMED_OUT");
+  List.iter
+    (fun event_type ->
+      if count event_type <> 1 then
+        failwith (Printf.sprintf
+          "workflow_task_completion_ack_lost: expected one %s, history has %d"
+          event_type (count event_type)))
+    [ "EVENT_TYPE_TIMER_STARTED"; "EVENT_TYPE_TIMER_FIRED";
+      "EVENT_TYPE_WORKFLOW_EXECUTION_COMPLETED" ];
+  (* The worker must not be wedged on the evicted run: a fresh run completes. *)
+  let probe =
+    track (get "post-fault probe start"
+      (Client.start direct ~workflow:counter ~task_queue:queue
+         ~id:(queue ^ "-workflow-task-probe") ~input:0 ()))
+  in
+  match timed "workflow_task_completion_probe" 30. (fun () -> Client.wait probe) with
+  | Ok (Client.Completed { output = 0; _ }) ->
+      Fault_proxy.log "scenario=workflow_task_completion_ack_lost probe=completed"
+  | Ok _ -> failwith "workflow_task_completion_ack_lost: probe ended unexpectedly"
+  | Error error ->
+      failwith ("workflow_task_completion_ack_lost: probe wait failed: " ^ describe error)
+
+(** Scenario 10: shutting a client down while its server is unreachable is
     bounded and returns [Ok]; nothing waits for the lost transport. *)
 let shutdown_while_unavailable proxy =
   let client =
@@ -444,6 +564,108 @@ let expect_no_connections proxy label =
     Fault_proxy.active_connections proxy = 0);
   Fault_proxy.log "proxy=%s leak_check=ok accepted=%d" label
     (Fault_proxy.accepted_connections proxy)
+
+(** Grace period and teardown timeout of the scenario 11 worker, in
+    milliseconds. Short, so the bound is checked tightly; the worker is idle,
+    so the grace period never abandons work. *)
+let outage_grace_ms = 1_000L
+let outage_teardown_ms = 3_000L
+
+(** Scenario 11: a worker shut down while its server is unreachable returns
+    within its documented bound and is released cleanly once the server
+    returns.
+
+    The worker has its own proxy, task queue and {!Runtime.t}, so the main
+    worker is not faulted and the runtime's attachment count observes the
+    native release. It polls through the proxy until a connection exists,
+    then the proxy refuses all traffic for two seconds before
+    [Worker.shutdown_with_report] is called, so the pollers are already
+    failing when shutdown starts.
+
+    Required: an [Ok] report within the grace period plus the teardown
+    timeout (plus the same 2 s scheduling slack as the bounded-shutdown
+    regression), both lanes stopped, nothing abandoned, and [Worker.run]
+    returning [Ok ()]. The teardown may be [`Completed] or [`Detached]: Core
+    sends its final [ShutdownWorker] call without retries and ignores
+    [Unavailable], so how long teardown takes against a refusing server is
+    Core's timing, not an SDK contract. After [restore], the worker must
+    detach from the runtime (proving a [`Detached] teardown finished in the
+    background), [Runtime.shutdown] must succeed, and the proxy must report
+    no open connection. *)
+let worker_shutdown_while_unavailable ~host ~port ~queue =
+  let proxy = Fault_proxy.start ~name:"shutdown" ~upstream_host:host ~upstream_port:port in
+  let runtime = get "shutdown fixture runtime" (Runtime.create ()) in
+  let options =
+    get "shutdown fixture options"
+      (Worker.Options.make
+         ~graceful_shutdown_period:(Duration.of_ms outage_grace_ms)
+         ~shutdown_teardown_timeout:(Duration.of_ms outage_teardown_ms) ())
+  in
+  let worker =
+    get "shutdown fixture worker"
+      (Worker.create ~options ~runtime ~target_url:(Fault_proxy.url proxy) ~namespace
+         ~task_queue:(queue ^ "-shutdown") ~workflows:[ Worker.workflow counter ]
+         ~activities:[] ())
+  in
+  let running = in_background (fun () -> Worker.run worker) in
+  (* [Domain.join] may be called once; cleanup after a failure must not
+     join a Domain the scenario already joined. *)
+  let joined = ref None in
+  let join_run () =
+    match !joined with
+    | Some result -> result
+    | None ->
+        let result = join running in
+        joined := Some result;
+        result
+  in
+  let scenario () =
+    await "shutdown worker poll connection" 15. (fun () ->
+      Fault_proxy.active_connections proxy > 0);
+    Fault_proxy.set_mode proxy Fault_proxy.Refuse;
+    Thread.delay 2.;
+    let bound =
+      (Int64.to_float outage_grace_ms +. Int64.to_float outage_teardown_ms) /. 1_000. +. 2.
+    in
+    let report =
+      get "worker shutdown while unavailable"
+        (timed "worker_shutdown_while_unavailable" bound (fun () ->
+           Worker.shutdown_with_report worker))
+    in
+    let attached_at_return = Runtime.attached runtime in
+    Fault_proxy.log
+      "scenario=worker_shutdown_while_unavailable elapsed=%Ldms lanes_stopped=%b \
+       abandoned_activity_callbacks=%d abandoned_workflow_activations=%d teardown=%s \
+       runtime_attached=%d"
+      (Duration.to_ms report.Worker.Shutdown_report.elapsed) report.lanes_stopped
+      report.abandoned_activity_callbacks report.abandoned_workflow_activations
+      (match report.native_teardown with `Completed -> "completed" | `Detached -> "detached")
+      attached_at_return;
+    if not report.lanes_stopped
+       || report.abandoned_activity_callbacks <> 0
+       || report.abandoned_workflow_activations <> 0
+    then failwith "worker_shutdown_while_unavailable: an idle worker abandoned work";
+    get "shutdown worker run" (timed "shutdown worker run return" 5. join_run);
+    Fault_proxy.restore proxy;
+    (* A detached teardown keeps the worker attached until it finishes; the
+       bridge's own Core waits bound it once the server is reachable. *)
+    await "worker detached from its runtime after restore" 60. (fun () ->
+      Runtime.attached runtime = 0);
+    get "shutdown fixture runtime release" (Runtime.shutdown runtime);
+    expect_no_connections proxy "shutdown";
+    Fault_proxy.stop proxy;
+    Fault_proxy.log "scenario=worker_shutdown_while_unavailable released=clean"
+  in
+  match scenario () with
+  | () -> ()
+  | exception failure ->
+      (* Best effort, so the original failure is the one reported. *)
+      Fault_proxy.restore proxy;
+      ignore (Worker.shutdown worker);
+      (try ignore (join_run ()) with _ -> ());
+      ignore (Runtime.shutdown runtime);
+      Fault_proxy.stop proxy;
+      raise failure
 
 (** Runs every scenario in order against one worker and cleans up even when
     an assertion fails. *)
@@ -465,7 +687,8 @@ let check address cli =
                ~signals:[ Signal.Handler.make signal (fun amount -> Result.map ignore (add amount)) ]
                ~queries:[ Query.Handler.make query read ]
                ~updates:[ Update.Handler.make update add ];
-             Worker.workflow activity_workflow ]
+             Worker.workflow activity_workflow;
+             Worker.workflow timer_workflow ]
          ~activities:[ Worker.activity side_effect ] ())
   in
   let worker_stopped = Atomic.make false in
@@ -498,13 +721,18 @@ let check address cli =
       terminate_ack_lost ~proxy:client_proxy ~client ~direct ~queue ~track;
       worker_poll_outage ~proxy:worker_proxy ~direct ~queue ~track ~worker_stopped;
       activity_completion_ack_lost ~proxy:worker_proxy ~direct ~queue ~track ~cli ~address;
+      workflow_task_completion_ack_lost ~proxy:worker_proxy ~direct ~queue ~track ~cli
+        ~address ~worker_stopped;
       shutdown_while_unavailable client_proxy;
+      worker_shutdown_while_unavailable ~host ~port ~queue;
       Ok ()
     with exception_ -> Error exception_
   in
-  (* Cleanup runs in a fixed order: release the callback, close executions,
-     then the proxied client, then the worker, and only then check sockets. *)
+  (* Cleanup runs in a fixed order: release the callback and the held
+     activation, close executions, then the proxied client, then the worker,
+     and only then check sockets. *)
   Atomic.set release_activity true;
+  Atomic.set release_workflow_task true;
   Fault_proxy.restore client_proxy;
   Fault_proxy.restore worker_proxy;
   List.iter (fun terminate -> try terminate () with _ -> ()) !terminations;
