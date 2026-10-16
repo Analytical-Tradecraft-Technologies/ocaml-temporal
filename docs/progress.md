@@ -59,6 +59,23 @@ Evidence: `dune build --root . @install` and the example executables on OCaml
 `scripts/check-live-acceptance-inventory.sh --check` and shellcheck of the
 live controller. The live run needs the Compose stack and happens only in CI.
 Re-qualification after the isolated activity dispatch of #492 remains.
+## 2026-10-16: Rust toolchain 1.99.1 at every pin
+
+The exact Rust compiler moved from 1.99.0 to 1.99.1 in one change across
+`rust/rust-toolchain.toml`, the Makefile's `NATIVE_RUST_VERSION`, the
+`build-pr`, `release` and `rust-bridge` workflows, the toolchain smoke gate
+and its Makefile fixtures, and the dependency inventory. This supersedes the
+Dependabot PR (#1110) that changed only the toolchain file. The
+`rust:1.99-bookworm` digest used by `Dockerfile.dev` and `Dockerfile.rust-ci`
+was refreshed to `sha256:e12566d5…de29`: the old index still shipped
+`RUST_VERSION=1.99.0`, while every platform in the new index ships 1.99.1.
+
+In that image, rustup installed 1.99.1 with Clippy and rustfmt, and
+`cargo check --locked --all-targets`, `cargo clippy --locked --all-targets --
+-D warnings` and `cargo fmt --all --check` were clean with no new lints.
+`test/smoke/test_rust_toolchain.sh` built the bridge archive, and
+`make test-quality-contract` and `scripts/check-dependency-inventory.sh`
+passed.
 
 ## 2026-10-16: Live regression for a worker killed during a running activity (#519)
 
