@@ -259,8 +259,9 @@ confirms the digest again before adding the same file to the release. Master
 builds also run the `opam-source-offline` job in `build-pr.yml`, which checks
 an archive it creates itself, as an early warning; pull requests skip both
 because of the full optimized Rust build. Run the checks locally with
-`sh scripts/check-opam-source-archive.sh <archive> <work-dir>` followed by
-`sh scripts/check-source-archive-consumer.sh <work-dir>`; they need the
+`opam exec -- sh scripts/check-opam-source-archive.sh <archive> <work-dir>`
+followed by `opam exec -- sh scripts/check-source-archive-consumer.sh
+<work-dir>`; they need the
 locked opam dependencies, Rust and `protoc`, and several gigabytes.
 `test/smoke/test_opam_source_archive_check.sh` and
 `test/smoke/test_source_archive_consumer_check.sh` check the scripts' own
