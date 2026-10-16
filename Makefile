@@ -701,7 +701,7 @@ test-temporal-diagnostics-contract:
 # CI executes (#795). Every entry must also be in scripts/ci-smoke-executables.txt,
 # and test/smoke/test_live_regressions_contract.sh fails when a regression
 # executable under test/integration is neither here nor otherwise run by CI.
-LIVE_REGRESSION_EXECUTABLES := test/integration/activity_cancellation/regression.exe test/integration/bounded_shutdown/regression.exe test/integration/client_policies/regression.exe test/integration/client_request_ids/regression.exe test/integration/completed_queries/regression.exe test/integration/concurrent_client/regression.exe test/integration/interaction_recovery/regression.exe test/integration/local_activity_cancellation/regression.exe test/integration/non_yielding_workflow/regression.exe test/integration/sdk_interop/regression.exe test/integration/split_worker_task_types/regression.exe test/integration/transport_interruption/regression.exe test/integration/update_outcomes/regression.exe test/integration/update_run_close/regression.exe test/integration/worker_metrics/regression.exe test/integration/worker_resource_options/regression.exe test/integration/workflow_start_info/regression.exe
+LIVE_REGRESSION_EXECUTABLES := test/integration/activity_cancellation/regression.exe test/integration/activity_worker_crash/regression.exe test/integration/bounded_shutdown/regression.exe test/integration/client_policies/regression.exe test/integration/client_request_ids/regression.exe test/integration/completed_queries/regression.exe test/integration/concurrent_client/regression.exe test/integration/interaction_recovery/regression.exe test/integration/local_activity_cancellation/regression.exe test/integration/non_yielding_workflow/regression.exe test/integration/sdk_interop/regression.exe test/integration/split_worker_task_types/regression.exe test/integration/transport_interruption/regression.exe test/integration/update_outcomes/regression.exe test/integration/update_run_close/regression.exe test/integration/worker_metrics/regression.exe test/integration/worker_resource_options/regression.exe test/integration/workflow_start_info/regression.exe
 # Seconds for each regression process; the suites normally finish in seconds.
 LIVE_REGRESSION_TIMEOUT_SECONDS ?= 180
 
@@ -1072,6 +1072,14 @@ test-unit:
 .PHONY: test-activity-cancellation-live
 test-activity-cancellation-live:
 	$(RUN) dune exec $(DUNE_BUILD_ARGS) test/integration/activity_cancellation/regression.exe -- check $(TEMPORAL_CLIENT_TEST_URL)
+
+# Requires a disposable server with a `default` namespace and an explicit
+# official Temporal CLI path (#519). Optional ACTIVITY_WORKER_CRASH_EVIDENCE
+# names the directory for the describe snapshots, history and worker logs;
+# without it the suite uses a fresh temporary directory and prints its path.
+.PHONY: test-activity-worker-crash-live
+test-activity-worker-crash-live:
+	$(RUN) dune exec $(DUNE_BUILD_ARGS) test/integration/activity_worker_crash/regression.exe -- check $(TEMPORAL_CLIENT_TEST_URL) $(TEMPORAL_TEST_CLI) $(ACTIVITY_WORKER_CRASH_EVIDENCE)
 
 # Requires a disposable server with the `temporal-sdk-test` namespace, or the
 # namespace named by TEMPORAL_NAMESPACE (#495).
