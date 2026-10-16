@@ -204,3 +204,36 @@ let worker_shutdown_abandoned metrics = function
   | Activity_callback -> record metrics abandoned_activity_callback 1
   | Workflow_activation -> record metrics abandoned_workflow_activation 1
   | Native_call -> record metrics abandoned_native_call 1
+
+let abandoned_work_label = function
+  | Activity_callback -> "activity_callback"
+  | Workflow_activation -> "workflow_activation"
+  | Native_call -> "native_call"
+
+let classify_shutdown ?failure (report : Native_worker_shutdown.report) =
+  let abandoned =
+    if report.lanes_stopped then []
+    else
+      match
+        (if report.abandoned_activity_callbacks > 0 then [ Activity_callback ]
+         else [])
+        @
+        if report.abandoned_workflow_activations > 0 then [ Workflow_activation ]
+        else []
+      with
+      | [] -> [ Native_call ]
+      | kinds -> kinds
+  in
+  let outcome =
+    match (failure, report.teardown) with
+    | Some outcome, _ -> outcome
+    | None, Native_worker_shutdown.Detached -> Teardown_detached
+    | None, Native_worker_shutdown.Completed ->
+        if report.lanes_stopped then Clean else Abandoned_work
+  in
+  (outcome, abandoned)
+
+let record_shutdown metrics ?failure report =
+  let outcome, abandoned = classify_shutdown ?failure report in
+  List.iter (worker_shutdown_abandoned metrics) abandoned;
+  worker_shutdown metrics outcome

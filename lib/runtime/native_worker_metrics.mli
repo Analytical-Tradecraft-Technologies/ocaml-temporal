@@ -113,6 +113,28 @@ val worker_shutdown : t -> shutdown_outcome -> unit
 (** One bounded shutdown abandoned work of this kind. *)
 val worker_shutdown_abandoned : t -> abandoned_work -> unit
 
+(** Classifies one bounded shutdown report: its [outcome] label and every
+    kind of work it abandoned. [failure], the outcome of a shutdown that
+    returned an error, takes precedence; otherwise a detached teardown is
+    [Teardown_detached], an abandoned lane [Abandoned_work], and anything
+    else [Clean]. When a lane was abandoned, each kind with a positive count
+    is listed (both when both lanes outlived the grace period); a lane
+    blocked in a native call is counted in neither, so [Native_call] is
+    listed only when no count is positive. Pure. *)
+val classify_shutdown :
+  ?failure:shutdown_outcome ->
+  Native_worker_shutdown.report ->
+  shutdown_outcome * abandoned_work list
+
+(** Records one shutdown as classified by {!classify_shutdown}: one
+    [outcome] increment and one increment per abandoned kind. *)
+val record_shutdown :
+  t -> ?failure:shutdown_outcome -> Native_worker_shutdown.report -> unit
+
+(** The [kind] label value of an abandoned-work kind, also used as the
+    [temporal.error_kind] of the matching lifecycle record. *)
+val abandoned_work_label : abandoned_work -> string
+
 (** Exported metric names (with Core's [temporal_] prefix), for tests and
     documentation checks. *)
 val metric_names : string list

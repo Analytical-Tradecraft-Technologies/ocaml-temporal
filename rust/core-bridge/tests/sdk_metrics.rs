@@ -407,20 +407,32 @@ fn meter_lifecycle_follows_its_runtime() {
     );
 }
 
+/// A live meter handle shared by the recorder threads of
+/// [`concurrent_recording_is_exact`]. Only the pointer value crosses threads;
+/// the bridge, not the test, reads through it.
+struct MeterHandle(*mut MetricMeter);
+
+// SAFETY: The meter's ABI permits concurrent `record` calls from any thread,
+// and the owning test keeps the handle alive until every thread has joined.
+unsafe impl Sync for MeterHandle {}
+
 /// Many threads record into one meter at once; every increment is counted.
 #[test]
 fn concurrent_recording_is_exact() {
     let (mut shared, address) = exporting_runtime();
     let (_status, mut meter) = meter_of(shared);
     let id = register_ok(meter, r#"{"kind":"counter","name":"ocaml_concurrent"}"#);
-    // SAFETY: The meter is live until `free_meter` below, after every
-    // scoped thread has joined; `MetricMeter` is `Sync`.
-    let shared_meter: &MetricMeter = unsafe { &*meter };
+    assert!(!meter.is_null(), "an exporting runtime has a meter");
+    // The test never dereferences the handle itself: every thread passes the
+    // raw pointer to the ABI, which the C contract allows concurrently. The
+    // scope joins every thread before `free_meter` below runs.
+    let handle = MeterHandle(meter);
     std::thread::scope(|scope| {
         for _ in 0..8 {
-            scope.spawn(|| {
+            let handle = &handle;
+            scope.spawn(move || {
                 for _ in 0..1_000 {
-                    assert_eq!(record(ptr::from_ref(shared_meter), id, 1), STATUS_OK);
+                    assert_eq!(record(handle.0, id, 1), STATUS_OK);
                 }
             });
         }

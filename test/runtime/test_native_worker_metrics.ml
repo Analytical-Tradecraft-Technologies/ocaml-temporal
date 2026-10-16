@@ -18,6 +18,48 @@ module Metrics = Temporal_runtime.Native_worker_metrics
 module Bridge = Temporal_core_bridge.Native_bridge
 module Worker_policy = Temporal_runtime.Native_worker_policy
 module Base_async = Temporal_base.Async_activity
+module Shutdown = Temporal_runtime.Native_worker_shutdown
+
+(** A bounded-shutdown report with the given lane facts. *)
+let shutdown_report ?(teardown = Shutdown.Completed) ~lanes_stopped ~activity
+    ~workflow () : Shutdown.report =
+  {
+    elapsed_s = 0.;
+    lanes_stopped;
+    abandoned_activity_callbacks = activity;
+    abandoned_workflow_activations = workflow;
+    teardown;
+  }
+
+(** Shutdown classification (review of #1114): both abandoned lanes are
+    reported, [Native_call] only when no count is positive, and an error
+    outcome (including [Release_unproven]) keeps its abandonment facts. *)
+let test_shutdown_classification () =
+  let check label ?failure report expected =
+    if Metrics.classify_shutdown ?failure report <> expected then
+      failwith ("shutdown classification: " ^ label)
+  in
+  check "clean"
+    (shutdown_report ~lanes_stopped:true ~activity:0 ~workflow:0 ())
+    (Metrics.Clean, []);
+  check "both lanes abandoned"
+    (shutdown_report ~lanes_stopped:false ~activity:1 ~workflow:2 ())
+    (Metrics.Abandoned_work, [ Metrics.Activity_callback; Metrics.Workflow_activation ]);
+  check "workflow lane only"
+    (shutdown_report ~lanes_stopped:false ~activity:0 ~workflow:1 ())
+    (Metrics.Abandoned_work, [ Metrics.Workflow_activation ]);
+  check "lane blocked in a native call"
+    (shutdown_report ~lanes_stopped:false ~activity:0 ~workflow:0 ())
+    (Metrics.Abandoned_work, [ Metrics.Native_call ]);
+  check "detached teardown"
+    (shutdown_report ~teardown:Shutdown.Detached ~lanes_stopped:true ~activity:0
+       ~workflow:0 ())
+    (Metrics.Teardown_detached, []);
+  check "release raised after abandoning both lanes"
+    ~failure:Metrics.Release_unproven
+    (shutdown_report ~teardown:Shutdown.Detached ~lanes_stopped:false
+       ~activity:1 ~workflow:1 ())
+    (Metrics.Release_unproven, [ Metrics.Activity_callback; Metrics.Workflow_activation ])
 
 (** Unwraps a public result in fixture setup. *)
 let get = function
@@ -250,6 +292,7 @@ let check_cardinality text =
     [ workflow_id; run_id; activity_id; "never_registered" ]
 
 let () =
+  test_shutdown_classification ();
   let metrics_config =
     get
       (Temporal.Runtime.Metrics.prometheus ~bind_address:"127.0.0.1:0"
@@ -357,6 +400,12 @@ let () =
   Metrics.worker_shutdown metrics Metrics.Clean;
   Metrics.worker_shutdown metrics Metrics.Teardown_detached;
   Metrics.worker_shutdown_abandoned metrics Metrics.Activity_callback;
+  (* Both lanes abandoned, then a release that raised: each kind and the
+     [release_unproven] outcome are counted once. *)
+  Metrics.record_shutdown metrics
+    (shutdown_report ~lanes_stopped:false ~activity:1 ~workflow:1 ());
+  Metrics.record_shutdown metrics ~failure:Metrics.Release_unproven
+    (shutdown_report ~lanes_stopped:false ~activity:0 ~workflow:1 ());
   (* Recording on [disabled] is a no-op and never raises. *)
   Metrics.activity_callback_started Metrics.disabled;
   Metrics.worker_shutdown Metrics.disabled Metrics.Clean;
@@ -385,7 +434,15 @@ let () =
   expect text "temporal_ocaml_worker_shutdowns"
     ~labels:(("outcome", "teardown_detached") :: labels) 1.;
   expect text "temporal_ocaml_worker_shutdown_abandoned_work"
-    ~labels:(("kind", "activity_callback") :: labels) 1.;
+    ~labels:(("kind", "activity_callback") :: labels) 2.;
+  expect text "temporal_ocaml_worker_shutdown_abandoned_work"
+    ~labels:(("kind", "workflow_activation") :: labels) 2.;
+  expect text "temporal_ocaml_worker_shutdown_abandoned_work"
+    ~labels:(("kind", "native_call") :: labels) 0.;
+  expect text "temporal_ocaml_worker_shutdowns"
+    ~labels:(("outcome", "abandoned_work") :: labels) 1.;
+  expect text "temporal_ocaml_worker_shutdowns"
+    ~labels:(("outcome", "release_unproven") :: labels) 1.;
   (* Every documented family is present, with Core's labels and the global
      tag, and nothing unbounded. *)
   List.iter

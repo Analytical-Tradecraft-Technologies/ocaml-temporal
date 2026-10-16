@@ -1003,36 +1003,26 @@ let already_shut_down =
   }
 
 (** Logs what a bounded shutdown left behind and records it as metrics
-    (#500). No identifier is included: the abandonment kind and the teardown
-    state are the whole diagnostic. [failure] is the outcome of a shutdown
-    that returned an error; it takes precedence over the teardown state in
-    the [outcome] label, so each shutdown counts exactly once. *)
+    (#500). No identifier is included: the abandonment kinds and the
+    teardown state are the whole diagnostic. [failure] is the outcome of a
+    shutdown that returned an error, including one whose release raised; it
+    takes precedence over the teardown state in the [outcome] label, so each
+    shutdown counts exactly once. Every abandoned kind is logged and counted
+    on its own ({!Metrics.classify_shutdown}). *)
 let report_shutdown ?failure worker (shutdown_report : Bounded_shutdown.report)
     =
-  if not shutdown_report.lanes_stopped then begin
-    let error_kind, abandoned =
-      if shutdown_report.abandoned_activity_callbacks > 0 then
-        ("activity_callback", Metrics.Activity_callback)
-      else if shutdown_report.abandoned_workflow_activations > 0 then
-        ("workflow_activation", Metrics.Workflow_activation)
-      else ("native_call", Metrics.Native_call)
-    in
-    report Logs.Warning ~operation:"worker_shutdown_abandoned_work" ~error_kind
-      ();
-    Metrics.worker_shutdown_abandoned worker.metrics abandoned
-  end;
+  let _outcome, abandoned = Metrics.classify_shutdown ?failure shutdown_report in
+  List.iter
+    (fun kind ->
+      report Logs.Warning ~operation:"worker_shutdown_abandoned_work"
+        ~error_kind:(Metrics.abandoned_work_label kind) ())
+    abandoned;
   (match shutdown_report.teardown with
   | Bounded_shutdown.Completed ->
       report Logs.Info ~operation:"worker_shutdown" ()
   | Bounded_shutdown.Detached ->
       report Logs.Warning ~operation:"worker_shutdown_teardown_detached" ());
-  Metrics.worker_shutdown worker.metrics
-    (match (failure, shutdown_report.teardown) with
-    | Some outcome, _ -> outcome
-    | None, Bounded_shutdown.Detached -> Metrics.Teardown_detached
-    | None, Bounded_shutdown.Completed ->
-        if shutdown_report.lanes_stopped then Metrics.Clean
-        else Metrics.Abandoned_work)
+  Metrics.record_shutdown worker.metrics ?failure shutdown_report
 
 (** Closes admission, then runs the bounded shutdown sequence (#495): wait
     until the lanes deadline for the run loop to stop, drain retained
@@ -1096,8 +1086,11 @@ let shutdown worker =
     | Bounded_shutdown.Release_error { error; report = shutdown_report } ->
         report_shutdown ~failure:Metrics.Release_failed worker shutdown_report;
         Error error
-    | Bounded_shutdown.Release_unproven _ ->
-        Metrics.worker_shutdown worker.metrics Metrics.Release_unproven;
+    | Bounded_shutdown.Release_unproven shutdown_report ->
+        (* The lanes phase completed before the release raised, so its
+           abandonment and teardown facts are reported as for any other
+           outcome, under the [release_unproven] classification. *)
+        report_shutdown ~failure:Metrics.Release_unproven worker shutdown_report;
         Error
           (Base_error.defect
              ~message:
