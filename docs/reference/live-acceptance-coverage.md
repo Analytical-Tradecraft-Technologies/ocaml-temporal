@@ -84,6 +84,7 @@ Temporal/PostgreSQL job through `make test-temporal-live-ci`.
 | --- | --- | --- | --- |
 | Worker removal during pending work | `test-temporal-worker-crash-recovery` | `docker kill --signal KILL` on generation one once the exact run's history shows its pending timer; exit 137, no graceful-stop marker | Generation two replays (`is_replaying=true`) and the same run completes |
 | Worker removal during pending work | `test-temporal-parent-child-restart` | Graceful `Worker.shutdown` of generation one while a parent and its long-running child are both suspended | Both exact runs replay on generation two and complete with exact parent/child linkage |
+| Worker removal during a running activity callback | `activity_worker_crash` (#519) | `SIGKILL` to the worker process (hosting the workflow and the activity) after the callback's marker file and `workflow describe` both show attempt 1 started and heartbeating on it; the process must die of that signal | With no worker polling, the server alone fails attempt 1 on its three-second heartbeat timeout and schedules attempt 2. A replacement process completes attempt 2 (`Activity.Info.attempt`), reads attempt 1's last heartbeat detail, and the run returns the exact expected result; history has one scheduled, started (attempt 2, replacement identity, heartbeat-timeout last failure) and completed activity event and no activity failure or timeout |
 | Worker removal during pending work | `interaction_recovery` (#530) | `SIGTERM` to the worker process that accepted a suspended update | The replacement answers queries from replayed state; history has one acceptance and one completion of the original update ID, attributed to the original and replacement workers |
 | Shutdown with outstanding work | `bounded_shutdown` (#495) | `Worker.shutdown_with_report` with a two-second grace period while an activity callback ignores cancellation and the shutdown flag | Shutdown returns within its bound and reports one abandoned callback; Temporal retries the attempt and a second worker completes attempt 2 |
 | Eviction followed by continued progress | `test-temporal-worker-cache-eviction` | One-slot cache; a second parked run forces Core `RemoveFromCache` (`cache_full`) of the first | Empty eviction acknowledgement, continued progress, and typed terminal outcomes after cancelling both exact runs |
@@ -96,19 +97,25 @@ three targets each own a fresh Temporal/PostgreSQL lifecycle:
 make test-temporal-worker-crash-recovery
 make test-temporal-worker-cache-eviction
 make test-temporal-parent-child-restart
-# All LIVE_REGRESSION_EXECUTABLES, including interaction_recovery and
-# bounded_shutdown, against one fresh stack; logs land in _build/live-regressions/.
+# All LIVE_REGRESSION_EXECUTABLES, including interaction_recovery,
+# bounded_shutdown and activity_worker_crash, against one fresh stack; logs
+# land in _build/live-regressions/.
 make test-temporal-live-regressions
 ```
 
 To run one regression suite against an already running disposable server, use
-its focused target. `interaction_recovery` needs a `default` namespace and the
-official Temporal CLI; `bounded_shutdown` defaults to `temporal-sdk-test`:
+its focused target. `interaction_recovery` and `activity_worker_crash` need a
+`default` namespace and the official Temporal CLI; `bounded_shutdown` defaults
+to `temporal-sdk-test`:
 
 ```sh
 make test-interaction-recovery-live RUN='opam exec --' \
   TEMPORAL_CLIENT_TEST_URL=http://127.0.0.1:7233 \
   TEMPORAL_TEST_CLI=/absolute/path/to/temporal
+make test-activity-worker-crash-live RUN='opam exec --' \
+  TEMPORAL_CLIENT_TEST_URL=http://127.0.0.1:7233 \
+  TEMPORAL_TEST_CLI=/absolute/path/to/temporal \
+  ACTIVITY_WORKER_CRASH_EVIDENCE=$PWD/_build/activity-worker-crash
 make test-bounded-shutdown-live RUN='opam exec --' \
   TEMPORAL_CLIENT_TEST_URL=http://127.0.0.1:7233
 ```
@@ -116,18 +123,18 @@ make test-bounded-shutdown-live RUN='opam exec --' \
 In CI, the controllers' bundles are in the `live-diagnostics-<run>-<attempt>`
 artifact ([live diagnostic artifacts](live-diagnostic-artifacts.md)), and each
 regression suite's log, plus the official-SDK interoperability evidence, is in
-`live-regressions-<run>-<attempt>`. Both are uploaded even when the step fails
-and kept for seven days.
+`live-regressions-<run>-<attempt>`. That artifact also holds
+`activity_worker_crash/`: the suite's `describe` snapshots before and after the
+kill, the raw exact-run history, and each worker generation's log (the logs are
+copied into the suite log too). Both artifacts are uploaded even when the step
+fails and kept for seven days.
 
-**Remaining gap.** No suite kills a worker process (SIGKILL, or any abrupt
-exit) while an activity callback is running. The crash controller kills
-generation one while it is parked on a timer with no activity in flight;
-`bounded_shutdown` abandons a running callback through the graceful path, and
-its process stays alive. A crash during a callback must be recovered by
-Temporal's activity timeouts and retry policy alone (start-to-close or
-heartbeat timeout, then the next attempt on another worker). That
-at-least-once redelivery is the documented contract, but it has no live
-evidence yet. #519 keeps this case open.
+The `activity_worker_crash` suite covers the case the other suites leave open:
+an abrupt process death while an activity callback is running. The crash
+controller kills its worker while the run is parked on a timer, and
+`bounded_shutdown` abandons a running callback through the graceful path in a
+process that stays alive. Here recovery rests on Temporal's heartbeat timeout
+and retry policy alone, the documented at-least-once contract.
 
 ## Baseline scenario assertions
 
