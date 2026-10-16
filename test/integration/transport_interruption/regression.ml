@@ -93,28 +93,42 @@ let activity_workflow =
       Activity.execute ~start_to_close_timeout:(Duration.of_ms 120_000L)
         side_effect input)
 
-(** Workflow-task gate for the lost completion scenario. Like the activity
-    gate, these are process-local and only delay the first activation; they
-    never change which commands the workflow produces, so the replay after
-    Core evicts the run produces the same commands as the original
-    activation. [release_workflow_task] stays [true] once set, so a replay
-    never waits. *)
+(** Gate and invocation counter for the lost workflow-task completion
+    scenario. They belong to this process and are touched only by the
+    [hold_workflow_task] activity callback and the driver, never by workflow
+    code, so replay sees only the durable local activity marker. *)
 let workflow_task_entered = Atomic.make false
 let release_workflow_task = Atomic.make false
+let hold_invocations = Atomic.make 0
 
-(** Holds its first activation until the driver has switched the worker proxy
-    to drop responses, then starts one durable timer and returns [input + 1].
-    The timer is the command whose duplication the lost completion scenario
-    checks for. It is long enough to fire only after the fault window, so the
-    new workflow task it causes is not itself lost to a dropped poll
-    response on a loaded host. The wait is a few milliseconds, well inside the
-    worker's two-second activation deadline. *)
+(** Local activity that keeps the first workflow task open until the driver
+    has switched the worker proxy to drop responses. A local activity runs
+    inside the workflow task that scheduled it, so the task's completion is
+    sent only after this callback returns: that completion is the one whose
+    acknowledgement the scenario loses. Returns its input unchanged. *)
+let hold_workflow_task =
+  Activity.define ~name:"transport-interruption.hold-workflow-task" ~input:number
+    ~output:number (fun input ->
+      Atomic.incr hold_invocations;
+      Atomic.set workflow_task_entered true;
+      while not (Atomic.get release_workflow_task) do Thread.delay 0.01 done;
+      Ok input)
+
+(** Deterministic workflow for the lost completion scenario: one local
+    activity, then one durable timer, then [input + 1]. The first workflow
+    task completes with the local activity marker and the [StartTimer]
+    command together; those are the commands whose duplication the scenario
+    checks for. The timer is long enough to fire only after the fault window,
+    so the workflow task it causes is not itself lost to a dropped poll
+    response on a loaded host. *)
 let timer_workflow =
   Workflow.define ~name:"transport-interruption.timer" ~input:number ~output:number
     (fun input ->
-      Atomic.set workflow_task_entered true;
-      while not (Atomic.get release_workflow_task) do Thread.delay 0.01 done;
-      Result.map (fun () -> input + 1) (Workflow.sleep (Duration.of_ms 5_000L)))
+      Result.bind
+        (Activity.execute_local ~start_to_close_timeout:(Duration.of_ms 30_000L)
+           hold_workflow_task input)
+        (fun held ->
+          Result.map (fun () -> held + 1) (Workflow.sleep (Duration.of_ms 5_000L))))
 
 (** Splits ["http://host:port"] into the proxy's upstream address. *)
 let upstream address =
@@ -459,8 +473,9 @@ let count_events event_type types =
   List.length (List.filter (String.equal event_type) types)
 
 (** Scenario 9: a workflow-task completion reaches Temporal but its
-    acknowledgement is lost. The activation is held until the worker proxy
-    drops responses, then completes with a [StartTimer] command. Before the
+    acknowledgement is lost. The first workflow task is kept open by its
+    local activity until the worker proxy drops responses, then completes
+    with the local activity marker and a [StartTimer] command. Before the
     fault ends, the run's history must already record [TimerStarted] and the
     proxy must have discarded response bytes, so the scenario cannot pass by
     completing the task only after recovery.
@@ -470,8 +485,9 @@ let count_events event_type types =
     [NotFound] for the already applied task token. Core evicts the run from
     its cache on [NotFound] and on any other completion error alike. When
     the timer fires, the next workflow task replays the full history: the
-    replayed [StartTimer] matches the recorded [TimerStarted], so nothing is
-    recorded twice. A retried, failed or timed-out workflow task is acceptable; the
+    replayed [StartTimer] matches the recorded [TimerStarted] and the local
+    activity resolves from its recorded marker, so nothing is recorded twice
+    and the callback does not run again. A retried, failed or timed-out workflow task is acceptable; the
     exact result and the single timer and completion events are required, and
     the worker must still be running and take new work afterwards. *)
 let workflow_task_completion_ack_lost ~proxy ~direct ~queue ~track ~cli ~address
@@ -481,7 +497,8 @@ let workflow_task_completion_ack_lost ~proxy ~direct ~queue ~track ~cli ~address
       (Client.start direct ~workflow:timer_workflow ~task_queue:queue
          ~id:(queue ^ "-workflow-task-ack-lost") ~input:20 ()))
   in
-  await "first workflow activation" 30. (fun () -> Atomic.get workflow_task_entered);
+  await "local activity holding the first workflow task" 30. (fun () ->
+    Atomic.get workflow_task_entered);
   let dropped_before = Fault_proxy.dropped_bytes proxy in
   Fault_proxy.set_mode proxy Fault_proxy.Drop_responses;
   Atomic.set release_workflow_task true;
@@ -518,21 +535,27 @@ let workflow_task_completion_ack_lost ~proxy ~direct ~queue ~track ~cli ~address
   let count event_type = count_events event_type types in
   Fault_proxy.log
     "scenario=workflow_task_completion_ack_lost run_id=%s timer_started=%d \
-     timer_fired=%d workflow_task_completed=%d workflow_task_failed=%d \
-     workflow_task_timed_out=%d"
+     timer_fired=%d markers=%d workflow_task_completed=%d workflow_task_failed=%d \
+     workflow_task_timed_out=%d hold_invocations=%d"
     (Option.get (Client.run_id handle))
     (count "EVENT_TYPE_TIMER_STARTED") (count "EVENT_TYPE_TIMER_FIRED")
+    (count "EVENT_TYPE_MARKER_RECORDED")
     (count "EVENT_TYPE_WORKFLOW_TASK_COMPLETED")
     (count "EVENT_TYPE_WORKFLOW_TASK_FAILED")
-    (count "EVENT_TYPE_WORKFLOW_TASK_TIMED_OUT");
+    (count "EVENT_TYPE_WORKFLOW_TASK_TIMED_OUT")
+    (Atomic.get hold_invocations);
   List.iter
     (fun event_type ->
       if count event_type <> 1 then
         failwith (Printf.sprintf
           "workflow_task_completion_ack_lost: expected one %s, history has %d"
           event_type (count event_type)))
-    [ "EVENT_TYPE_TIMER_STARTED"; "EVENT_TYPE_TIMER_FIRED";
+    [ "EVENT_TYPE_MARKER_RECORDED"; "EVENT_TYPE_TIMER_STARTED"; "EVENT_TYPE_TIMER_FIRED";
       "EVENT_TYPE_WORKFLOW_EXECUTION_COMPLETED" ];
+  if Atomic.get hold_invocations <> 1 then
+    failwith (Printf.sprintf
+      "workflow_task_completion_ack_lost: local activity callback ran %d times"
+      (Atomic.get hold_invocations));
   (* The worker must not be wedged on the evicted run: a fresh run completes. *)
   let probe =
     track (get "post-fault probe start"
@@ -689,7 +712,7 @@ let check address cli =
                ~updates:[ Update.Handler.make update add ];
              Worker.workflow activity_workflow;
              Worker.workflow timer_workflow ]
-         ~activities:[ Worker.activity side_effect ] ())
+         ~activities:[ Worker.activity side_effect; Worker.activity hold_workflow_task ] ())
   in
   let worker_stopped = Atomic.make false in
   let running =
@@ -729,7 +752,7 @@ let check address cli =
     with exception_ -> Error exception_
   in
   (* Cleanup runs in a fixed order: release the callback and the held
-     activation, close executions, then the proxied client, then the worker,
+     local activity, close executions, then the proxied client, then the worker,
      and only then check sockets. *)
   Atomic.set release_activity true;
   Atomic.set release_workflow_task true;

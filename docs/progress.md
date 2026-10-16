@@ -19,15 +19,17 @@ the Temporal acceptance controllers.
 
 The transport interruption live regression has two new worker scenarios.
 
-A lost workflow-task completion: the workflow holds its first activation on a
-process-local gate until the worker proxy drops responses, then completes with
-a `StartTimer` command. The scenario requires the run's history to record
+A lost workflow-task completion: a deterministic workflow runs one local
+activity and then a timer. The local activity callback, not workflow code,
+holds the first workflow task open until the worker proxy drops responses, so
+the task completes with the marker and a `StartTimer` command only then. The scenario requires the run's history to record
 `TimerStarted` while the acknowledgement is still being dropped, then
 restores the proxy. Core's completion call fails; a retry gets `NotFound` for
 the applied task token, and Core evicts the run either way. The timer's
 workflow task replays the full history without recording anything twice. The
-scenario requires the exact result, exactly one `TimerStarted`, `TimerFired`
-and `WorkflowExecutionCompleted`, a still-running `Worker.run`, and a fresh run
+scenario requires the exact result, exactly one `MarkerRecorded`,
+`TimerStarted`, `TimerFired` and `WorkflowExecutionCompleted`, one local
+activity callback, a still-running `Worker.run`, and a fresh run
 completing afterwards. It accepts a retried, failed or timed-out workflow task
 and logs their counts.
 

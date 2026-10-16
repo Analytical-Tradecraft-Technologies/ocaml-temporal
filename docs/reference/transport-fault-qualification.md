@@ -53,7 +53,7 @@ operational failure.
 | Terminate, acknowledgement lost | `Drop_responses` during `Client.terminate` | `rpc_status = Termination_outcome_uncertain`, non-retryable | A direct `wait` observes `Terminated`. |
 | Worker poll outage | `Refuse` for the worker while a workflow is started | `Worker.run` keeps running | The workflow completes after `restore`. |
 | Activity completion, acknowledgement lost | `Drop_responses` for the worker while the activity completes, until the fault is proven | The completion is retained and re-sent after reconnecting. Core treats the server's `NotFound` for the already-applied completion as done | The workflow completes, and the activity callback was dispatched exactly once in that attempt. |
-| Workflow task completion, acknowledgement lost | `Drop_responses` for the worker while the first workflow activation completes with a `StartTimer` command, until the fault is proven | `Worker.run` keeps running. The lost completion is resolved by Core (see below); a retried, failed or timed-out workflow task is accepted | The workflow returns its exact result. Its history records exactly one `TimerStarted`, one `TimerFired` and one `WorkflowExecutionCompleted`, and a fresh run on the same worker then completes. |
+| Workflow task completion, acknowledgement lost | `Drop_responses` for the worker while the first workflow task completes with a local activity marker and a `StartTimer` command, until the fault is proven | `Worker.run` keeps running. The lost completion is resolved by Core (see below); a retried, failed or timed-out workflow task is accepted | The workflow returns its exact result. Its history records exactly one `MarkerRecorded`, `TimerStarted`, `TimerFired` and `WorkflowExecutionCompleted`, the local activity callback ran once, and a fresh run on the same worker then completes. |
 | Client shutdown while unavailable | `Refuse`, then `Client.shutdown` | `Ok ()` without waiting on the transport | None needed. |
 | Worker shutdown while unavailable | `Refuse` for 2 s on an idle polling worker with its own `Runtime.t`, then `Worker.shutdown_with_report` with a 1 s grace period and a 3 s teardown timeout | `Ok` report within grace plus teardown plus 2 s, both lanes stopped, nothing abandoned, teardown `` `Completed `` or `` `Detached ``; `Worker.run` returns `Ok ()` | After `restore`, the worker detaches from its runtime, `Runtime.shutdown` succeeds, and the proxy has no open connection. |
 
@@ -69,11 +69,13 @@ evidence never appears:
 - Activity completion: the run's history, read through the official Temporal
   CLI, already records `ActivityTaskCompleted`, and the worker proxy has
   discarded response bytes.
-- Workflow task completion: the workflow holds its first activation on a
-  process-local gate until responses are dropped. The run's history then
-  already records `TimerStarted`, and the worker proxy has discarded response
-  bytes. The gate only delays the activation and never changes its commands,
-  so the later replay is unaffected.
+- Workflow task completion: the workflow body is deterministic. It runs one
+  local activity, then a timer. A local activity runs inside the workflow
+  task that scheduled it, so the task's completion is sent only after the
+  callback returns. The gate is in that activity callback, never in workflow
+  code, and holds until responses are dropped. The run's history then already
+  records `TimerStarted`, and the worker proxy has discarded response bytes.
+  Replay resolves the local activity from its recorded marker.
 
 The proxy counts every discarded byte, and the log records the count for each
 of these scenarios.
@@ -96,7 +98,8 @@ leaked native handle or socket.
   answers `NotFound` for the already completed task token. Core evicts the
   run from its cache on `NotFound` and on any other completion error alike. When
   the timer fires, the next workflow task replays the full history: the
-  replayed `StartTimer` matches the recorded `TimerStarted`, so no command is
+  replayed `StartTimer` matches the recorded `TimerStarted`, and the local
+  activity resolves from its marker without running again, so no command is
   recorded twice. If the timer's workflow task is itself lost to a dropped
   poll response on a slow host, the server times it out and retries it; the
   scenario logs workflow task completed, failed and timed-out counts so such
