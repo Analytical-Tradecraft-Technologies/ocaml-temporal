@@ -298,7 +298,7 @@ and `make license-check` audits them alongside the lock.
 
 ## Toolchain and CI images
 
-The development image copies the Rust toolchain `1.99.0`, Cargo, Clippy, and
+The development image copies the Rust toolchain `1.99.1`, Cargo, Clippy, and
 rustfmt from the official multi-architecture Rust image below, and
 `Dockerfile.rust-ci` builds the shared Linux Rust producer from the same
 digest. Rust is dual-licensed Apache-2.0 OR MIT. Debian's `protobuf-compiler`
@@ -320,7 +320,7 @@ Python image is linked into or redistributed with the SDK.
 
 | Image | Manifest index digest | Used by | Native platforms | License |
 |---|---|---|---|---|
-| `rust:1.99-bookworm` | `sha256:59037199c44290f2befcdd58dcc540164763fc296950255aaefeef096a1866b0` | `Dockerfile.dev` Rust toolchain stage and `Dockerfile.rust-ci` | Linux amd64 and arm64/v8 | Rust is Apache-2.0 OR MIT; image packaging (`rust-lang/docker-rust`) is Apache-2.0 OR MIT |
+| `rust:1.99-bookworm` | `sha256:e12566d5abc17a0da741628782cdb504b68b8961f5bfcf677936bf3e8b32de29` | `Dockerfile.dev` Rust toolchain stage and `Dockerfile.rust-ci` | Linux amd64 and arm64/v8 | Rust is Apache-2.0 OR MIT; image packaging (`rust-lang/docker-rust`) is Apache-2.0 OR MIT |
 | `python:3.14-slim-bookworm` | `sha256:48b13b003dda20b16f9442b8475aa05fe21bf6579a8c881db92ffb4d8fd20f83` | Cargo license audit, release-preflight Cargo SBOM generation and audit, the official-SDK interoperability driver, and its Python license audit (CI-only) | Linux amd64, arm64/v8, and additional official architectures | CPython's PSF license stack (SPDX `Python-2.0`); image packaging (`docker-library/python`) is MIT |
 
 `ocamlformat` is deliberately absent. Version 0.28.1 is MIT licensed, but its
