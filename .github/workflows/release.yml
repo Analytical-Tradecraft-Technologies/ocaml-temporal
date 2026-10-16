@@ -147,14 +147,14 @@ jobs:
           set -euo pipefail
           archive="_build/release-source/ocaml-temporal-$RELEASE_TAG-source.tar.gz"
           test "$(shasum -a 256 "$archive" | cut -d ' ' -f 1)" = "$ARCHIVE_SHA256"
-          sh scripts/check-opam-source-archive.sh "$archive" "$RUNNER_TEMP/opam-source-check"
+          opam exec -- sh scripts/check-opam-source-archive.sh "$archive" "$RUNNER_TEMP/opam-source-check"
       # A downstream user's view of the same build: install it into a fresh
       # prefix, as opam install does, and build and run the archive's
       # installed-package consumer fixture against that prefix only, outside
       # the checkout. See scripts/check-source-archive-consumer.sh.
       - name: Build a consumer against the package installed from the archive
         shell: bash
-        run: sh scripts/check-source-archive-consumer.sh "$RUNNER_TEMP/opam-source-check"
+        run: opam exec -- sh scripts/check-source-archive-consumer.sh "$RUNNER_TEMP/opam-source-check"
 
   publish:
     name: Publish the tested release

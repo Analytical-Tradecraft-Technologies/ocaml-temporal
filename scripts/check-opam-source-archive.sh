@@ -38,7 +38,8 @@ set -eu
 # select the vendored build.
 #
 # The script needs OCaml, the locked opam dependencies, Rust and protoc on
-# PATH, as `opam install` would. It writes only below WORK_DIRECTORY and the
+# PATH, as `opam install` would; run it under `opam exec --` so the switch's
+# dune is found, because opam's wrapper resolves the build command on PATH. It writes only below WORK_DIRECTORY and the
 # Dune cache.
 archive=$1
 work_root=${2:-}
@@ -143,6 +144,13 @@ elif [ "$(uname -s)" = Darwin ] && command -v sandbox-exec >/dev/null 2>&1; then
   echo "sandbox: sandbox-exec with opam's macOS build policy"
 else
   echo "no opam build sandbox is available on this platform; enable opam sandboxing" >&2
+  exit 1
+fi
+
+# Both wrappers look the build command up on PATH; fail here with the remedy
+# rather than with the wrapper's bare "Command not found".
+if ! command -v dune >/dev/null 2>&1; then
+  echo "dune is not on PATH; run this script under opam exec --" >&2
   exit 1
 fi
 
