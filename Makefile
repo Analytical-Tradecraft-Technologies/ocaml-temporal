@@ -241,12 +241,12 @@ build:
 	$(if $(strip $(TEMPORAL_RUST_BRIDGE_DIR)),,$(CARGO) build --manifest-path $(CARGO_MANIFEST) --locked)
 
 # Keep the examples as explicit compile targets rather than relying on Dune's
-# default alias. Every Docker and native build therefore proves that all three
-# executable applications compile against the public installed-library name.
+# default alias. Every Docker and native build therefore proves that every
+# example executable compiles against the public installed-library name.
 # test-temporal-examples-live runs the same list against the Compose stack, and
 # test/smoke/test_examples_live_contract.sh fails when an example directory is
 # missing from it.
-EXAMPLE_EXECUTABLES := examples/workflow_worker/workflow_worker.exe examples/activity_worker/activity_worker.exe examples/client/client.exe
+EXAMPLE_EXECUTABLES := examples/workflow_worker/workflow_worker.exe examples/activity_worker/activity_worker.exe examples/client/client.exe examples/cancellation/cancellation.exe
 build-examples:
 	$(RUN) dune build $(DUNE_BUILD_ARGS) $(EXAMPLE_EXECUTABLES)
 
@@ -1331,7 +1331,9 @@ native-verify: native-version-check native-build native-lint native-test
 # examples guide describes: the activity worker and workflow worker as separate
 # long-lived processes on one task queue, then one-shot client runs. The
 # controller asserts the client's exact success output, its typed failure for
-# invalid input, and that both workers exit cleanly after SIGTERM. Every process
+# invalid input, and that both workers exit cleanly after SIGTERM. It then runs
+# the self-checking cooperative cancellation example (#494) on its own task
+# queue and requires its exact report. Every process
 # is bounded by a timeout, and the stack is always removed afterwards. In CI the
 # executables come from the verified smoke artifact (TEMPORAL_PREBUILT_SMOKE=1);
 # locally they are compiled first so no long-lived `dune exec` lock is held.

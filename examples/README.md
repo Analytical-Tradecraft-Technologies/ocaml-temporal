@@ -57,12 +57,14 @@ useful for
 compilation checks, but it does not replace the three `dune exec` processes.
 
 `make test-temporal-examples-live` runs this exact application in CI: it
-compiles the three executables, starts the Compose Temporal/PostgreSQL stack,
+compiles the example executables, starts the Compose Temporal/PostgreSQL stack,
 starts both workers as separate containers on a fresh task queue, runs the
 client, and requires the documented output below. It also checks that a blank
 name fails the workflow with `a name is required`, and that both workers exit
-cleanly after `SIGTERM`. It always removes the stack afterwards. A new example
-executable must be added to that target;
+cleanly after `SIGTERM`. It then runs the
+[cooperative cancellation example](#cancel-activities-cooperatively) and
+requires its exact report. It always removes the stack afterwards. A new
+example executable must be added to that target;
 `test/smoke/test_examples_live_contract.sh` fails until it is.
 
 ```text
@@ -107,6 +109,116 @@ the [workflow guide](../docs/guides/workflows.md#continue-a-run-with-fresh-histo
 for the explicit `Client.follow` path. Stop the local infrastructure after the
 example run with `make temporal-stop`; use `make temporal-clean` when the
 PostgreSQL volume and its workflow history should also be removed.
+
+## Cancel activities cooperatively
+
+`examples/cancellation` shows how an activity stops early without leaving
+external state behind. The worker never interrupts activity code: an activity
+finds out that it should stop only when it checks, so a long-running activity
+must heartbeat and look at the answer.
+
+Each activity in [`cooperative_cleanup.ml`](cancellation/cooperative_cleanup.ml)
+holds a reservation in a small in-memory ledger while it works. The ledger
+stands in for an external service such as a database or a lock service. The
+reservation key is the workflow ID, run ID and activity ID, so every attempt
+of the same scheduled activity uses the same key. An idempotency key should
+name the business operation: retries of one activity share it, while a new
+run that reuses a closed run's workflow ID (which `Client.start` allows by
+default) is a new operation and gets a new key. Leaving out the run ID would
+let that new run find the old run's committed reservation and report success
+without doing any work. When work must happen at most once across runs, key
+it by a business identifier in the activity input instead. Every ledger
+operation is idempotent: acquiring a held key keeps the hold, releasing a key that is not
+held does nothing, and neither undoes a commit. That matters because Temporal
+delivers an activity at least once. A retry, or a redelivery after a worker
+crash, can repeat any step, and a redelivered attempt that finds its
+reservation already committed reports success without doing the work again.
+
+- **Synchronous activity** (`hold_reservation`, from
+  `Activity.define_with_context`). Before each step it checks
+  `Activity.Context.is_worker_shutting_down`, then calls
+  `Activity.Context.heartbeat`. A heartbeat returns a `` `Cancelled `` error
+  once Temporal has asked the attempt to stop, and
+  `Activity.Context.cancellation` then tells it why. On every early exit the
+  activity releases its reservation first and then returns:
+  - the heartbeat's `` `Cancelled `` error for a requested cancellation, so
+    Temporal records the attempt as cancelled;
+  - a retryable error when its worker is stopping, so Temporal runs another
+    attempt, which resumes from the step in the last heartbeat details;
+  - the heartbeat's error for an operator pause or reset, which the worker
+    reports as a retryable `ActivityPause` or `ActivityReset` failure.
+- **Asynchronous activity** (`hold_reservation_async`, from
+  `Activity.define_async`). The callback acquires the reservation and hands
+  the attempt to a thread, which heartbeats with `Activity.Async_handle.heartbeat`.
+  An asynchronous activity has no context to poll; the heartbeat result is its
+  cancellation signal. A non-retryable `` `Cancelled `` error is a requested
+  cancellation: the thread releases the reservation and then calls
+  `Async_handle.cancel`. A retryable `` `Cancelled `` error is a pause or
+  reset: it releases the reservation and calls `Async_handle.fail` with that
+  error, because Temporal accepts a cancelled completion only after a
+  cancellation request.
+
+  Only the synchronous form can clean up when its worker stops. An
+  asynchronous handle is not notified: a worker shutdown waits for it for the
+  graceful shutdown period and then closes it as a lost completion, and a
+  handle that is never finished expires once Temporal must have timed its
+  attempt out (#1043). Its later calls return a non-retryable error, at which
+  point this example's completer releases the reservation, and Temporal
+  retries the attempt after its heartbeat or start-to-close timeout.
+
+The `reserve-then-cancel` workflow starts one of these activities with
+`Activity.start_handle ~cancellation_type:Wait_cancellation_completed`,
+waits three seconds, and calls `Activity.cancel`. With that policy the
+activity's future resolves only after the activity has acknowledged the
+cancellation, which it does after its cleanup, so the workflow could safely
+start compensating work at that point. Cancellation reaches an activity only
+in the response to a heartbeat, so schedule a cancellable activity with a
+`heartbeat_timeout`; here two seconds bounds how long the activity takes to
+notice.
+
+[`cancellation.ml`](cancellation/cancellation.ml) is a self-checking driver.
+It runs a worker in the same process, so it can read the ledger, and runs
+four scenarios:
+
+1. The workflow cancels the synchronous activity. The ledger must show the
+   only attempt acquiring the reservation and then releasing it because of
+   the cancellation, and the workflow must see the activity as cancelled.
+2. The same with the asynchronous activity.
+3. The driver shuts the worker down while a `reserve-and-commit` activity
+   holds its reservation. The attempt must release it because its worker is
+   stopping and fail retryably. The driver then starts a replacement worker,
+   whose retry must reacquire the same key and commit it. This uses the
+   synchronous activity, the only form that observes its worker stopping.
+4. The driver starts a new run under the closed run's workflow ID. Its
+   activity must make and commit a reservation of its own, under the new run
+   ID, and leave the old run's reservation unchanged.
+
+With the server and environment from the start of this guide:
+
+```sh
+dune exec examples/cancellation/cancellation.exe
+```
+
+```text
+Cancelled activity: released its reservation, then acknowledged the cancellation.
+Cancelled asynchronous activity: released its reservation, then acknowledged the cancellation.
+Worker shutdown: the activity released its reservation, and a replacement worker retried and committed it.
+Reused workflow ID: the new run made and committed its own reservation.
+Cooperative cancellation example passed.
+```
+
+It exits 1 with a description of the unexpected ledger history or workflow
+result if any scenario behaves differently. It uses the task queue
+`$TEMPORAL_TASK_QUEUE-cancellation`, so the other example workers never take
+its tasks, and fresh workflow IDs, so it can be rerun in the same namespace.
+It needs no worker running in another terminal.
+
+An activity that never heartbeats never learns of a cancellation, and one
+that ignores the shutdown flag keeps running after the worker's graceful
+shutdown period. The worker then abandons it, fails its attempt retryably and
+discards its result, so its cleanup must still be safe to repeat in the next
+attempt. See the [`Activity.Cancellation`](../lib/public/activity.mli)
+documentation for the full contract.
 
 ## Replay recorded histories before deploying
 

@@ -1,4 +1,5 @@
 examples/activity_worker/activity_worker.exe
+examples/cancellation/cancellation.exe
 examples/client/client.exe
 examples/workflow_worker/workflow_worker.exe
 test/integration/activity_cancellation/regression.exe

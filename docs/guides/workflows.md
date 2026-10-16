@@ -528,6 +528,47 @@ its attempt out (its start-to-close or schedule-to-close timeout, or its
 heartbeat timeout since the last heartbeat); the worker then closes it
 without contacting the server, and later calls return a non-retryable error.
 
+Activity cancellation and worker shutdown are cooperative: the worker never
+interrupts activity code, so a long-running activity must ask whether it
+should stop. Temporal delivers a cancellation, pause or reset only in the
+response to a heartbeat, so schedule such an activity with a
+`heartbeat_timeout` and heartbeat regularly:
+
+- A synchronous activity from `Activity.define_with_context` calls
+  `Activity.Context.heartbeat`, which returns a `` `Cancelled `` error once a
+  cancellation has been delivered; `Activity.Context.cancellation` then gives
+  the reason. Returning that error completes the attempt as cancelled.
+  `Activity.Context.is_worker_shutting_down` turns `true` when the worker
+  begins to stop; the callback then has the worker's graceful shutdown period
+  to finish, for example by returning a retryable error so that another
+  worker retries it.
+- An asynchronous activity learns of it from `Activity.Async_handle.heartbeat`:
+  a non-retryable `` `Cancelled `` error is a requested cancellation, to be
+  acknowledged with `Async_handle.cancel`, and a retryable one is a pause or
+  reset, to be reported with `Async_handle.fail` and that error. The heartbeat
+  is still recorded and the handle stays live until one of those calls.
+  Handles are not told about worker shutdown, so cleanup on shutdown is
+  available only to synchronous activities. A worker shutdown waits for an
+  unfinished handle for the graceful shutdown period and then closes it as a
+  lost completion; a handle that is never finished expires once Temporal must
+  have timed its attempt out (#1043). Later handle calls return a
+  non-retryable error, and Temporal retries the attempt after its heartbeat,
+  start-to-close or schedule-to-close timeout.
+
+Clean up before reporting the outcome, so a workflow that schedules the
+activity with `~cancellation_type:Wait_cancellation_completed` knows the
+cleanup ran once the activity's future resolves as cancelled. Make every
+external side effect idempotent and key it by the business operation it
+performs. Every retry of one scheduled activity shares its workflow run ID and
+activity ID, so those two (or a business key passed in the input, when the
+work must happen at most once across runs) identify it; the workflow ID alone
+does not, because a closed run's ID can be reused. Temporal delivers an
+activity at least once, and an attempt that ignores the signal past the grace period is
+abandoned and retried while its own code still runs. The runnable
+[cooperative cancellation example](../../examples/README.md#cancel-activities-cooperatively)
+shows both forms releasing a reservation on cancellation, and the synchronous
+form on worker shutdown, and is run against Temporal Server in CI.
+
 Use `Activity.remote` or `Workflow.remote` when another worker owns the
 implementation. A remote definition keeps the name and codecs needed to
 encode and decode the call, but it cannot be registered as a local worker

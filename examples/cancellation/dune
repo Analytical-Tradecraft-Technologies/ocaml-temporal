@@ -1,0 +1,7 @@
+; The cooperative cancellation example (#494). One process runs the worker
+; and the checking driver, so the driver can inspect the in-memory
+; reservation ledger that stands in for an external service.
+
+(executable
+ (name cancellation)
+ (libraries temporal-sdk temporal_sdk_examples_common threads.posix unix))

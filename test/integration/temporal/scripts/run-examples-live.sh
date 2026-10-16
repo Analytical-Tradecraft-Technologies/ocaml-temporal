@@ -5,8 +5,9 @@ set -eu
 # the already-started Compose Temporal stack (#798). The activity worker and
 # the workflow worker are separate long-lived containers sharing one task
 # queue; the client is a one-shot container. The caller owns the server
-# lifecycle; this script owns, and always removes, only its three example
-# containers.
+# lifecycle; this script owns, and always removes, only its example
+# containers. The self-checking cooperative cancellation example (#494) runs
+# afterwards as one more one-shot container on its own task queue.
 #
 # Assertions:
 # - a valid name completes and the client prints exactly the documented
@@ -14,7 +15,12 @@ set -eu
 # - a blank name fails the workflow (not only its task) and the client exits 1
 #   with the typed business failure, proving it does not hang on retries;
 # - both workers stay alive while serving, then exit 0 with their clean-stop
-#   line after SIGTERM, which exercises the public graceful shutdown path.
+#   line after SIGTERM, which exercises the public graceful shutdown path;
+# - the cancellation example exits 0 and prints exactly its documented report:
+#   a cancelled synchronous and a cancelled asynchronous activity each release
+#   their reservation before acknowledging, and an activity whose worker shuts
+#   down releases its reservation and is committed by a replacement worker,
+#   and a new run reusing that workflow ID does its own work.
 #
 # The executables must already exist under _build/default: the Makefile target
 # compiles them locally, and CI unpacks the verified smoke artifact. Running
@@ -35,14 +41,16 @@ task_queue="ocaml-temporal-example-live-$suffix"
 activity_worker="$project-example-activity-worker"
 workflow_worker="$project-example-workflow-worker"
 client="$project-example-client"
+cancellation="$project-example-cancellation"
 activity_executable=examples/activity_worker/activity_worker.exe
 workflow_executable=examples/workflow_worker/workflow_worker.exe
 client_executable=examples/client/client.exe
+cancellation_executable=examples/cancellation/cancellation.exe
 
 rm -rf "$evidence"
 mkdir -p "$evidence"
 
-for executable in "$activity_executable" "$workflow_executable" "$client_executable"; do
+for executable in "$activity_executable" "$workflow_executable" "$client_executable" "$cancellation_executable"; do
   test -x "$root/_build/default/$executable" || {
     echo "missing compiled example executable: $executable" >&2
     exit 1
@@ -94,14 +102,14 @@ cleanup() {
       tail -n 100 "$log"
     done
   fi
-  docker rm -f "$activity_worker" "$workflow_worker" "$client" >/dev/null 2>&1 || true
+  docker rm -f "$activity_worker" "$workflow_worker" "$client" "$cancellation" >/dev/null 2>&1 || true
   exit "$status"
 }
 trap cleanup EXIT
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
-docker rm -f "$activity_worker" "$workflow_worker" "$client" >/dev/null 2>&1 || true
+docker rm -f "$activity_worker" "$workflow_worker" "$client" "$cancellation" >/dev/null 2>&1 || true
 
 # Fails when a worker container has exited, so a startup error is reported as
 # such rather than as an unrelated client timeout.
@@ -173,5 +181,29 @@ grep -Fx 'workflow worker stopped cleanly' "$evidence/$workflow_worker.log" >/de
   exit 1
 }
 
+# Cooperative cancellation (#494): one self-checking process with its own
+# worker, on the "$task_queue-cancellation" queue, so the example workers above
+# could not take its tasks even if they were still running.
+status=0
+example "$cancellation" "$client_timeout" "$cancellation_executable" --rm -- \
+  >"$evidence/cancellation.stdout" 2>"$evidence/cancellation.stderr" || status=$?
+if [ "$status" -ne 0 ]; then
+  echo "cancellation example exited with status $status" >&2
+  exit 1
+fi
+printf '%s\n' \
+  'Cancelled activity: released its reservation, then acknowledged the cancellation.' \
+  'Cancelled asynchronous activity: released its reservation, then acknowledged the cancellation.' \
+  'Worker shutdown: the activity released its reservation, and a replacement worker retried and committed it.' \
+  'Reused workflow ID: the new run made and committed its own reservation.' \
+  'Cooperative cancellation example passed.' \
+  >"$evidence/cancellation.expected"
+if ! cmp -s "$evidence/cancellation.expected" "$evidence/cancellation.stdout"; then
+  echo "cancellation example output differs from the documented report" >&2
+  diff "$evidence/cancellation.expected" "$evidence/cancellation.stdout" >&2 || true
+  exit 1
+fi
+
 cat "$evidence/client-success.stdout"
+cat "$evidence/cancellation.stdout"
 printf 'Example application acceptance passed. Logs: %s\n' "$evidence"
