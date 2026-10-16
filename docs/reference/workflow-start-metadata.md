@@ -93,15 +93,37 @@ continued-both, and an official Temporal CLI start using the Go SDK with both
 metadata fields and execution/run/task timeouts. It registers the keyword
 attribute, checks workflow snapshots, replaces the worker and discards its entire cache, checks snapshots again, signals completion, and retains initial and
 terminal histories plus visibility descriptions under
-`_build/start-metadata-evidence`. Each invocation uses fresh workflow IDs on an isolated Compose project;
+`_build/start-metadata-evidence`.
+
+A second phase of the same gate qualifies cache-full eviction (#512). A fresh
+worker, built with `Worker.Options.make ~max_cached_workflows:1`, polls its own
+task queue (`ocaml-start-metadata-cache`) so no default-cache worker can take
+its tasks. The client starts three runs: memo, search attribute and execution
+deadline together; memo only; and search attribute with a deadline. Each run
+must report that it has parked on its signal (a read-only phase query) before
+the next one starts, so B's first task evicts A and C's evicts B. The client
+reads each run's exact snapshot while it is cached: the summary plus the
+expiration timestamp to the nanosecond. It then queries, signals and waits
+for the runs in start order. Querying A evicts C, and each run is rebuilt
+from history before it answers. Every replayed snapshot must equal the one
+read before eviction, and every run must complete with its exact expected
+result. The worker records one payload-free line per activation and per
+acknowledged completion in `cache-events.tsv`: run ID, replay flag, history
+length and cache-removal reason, with the workflow ID when Core supplies it. The
+verifier requires each cache run to have a `cache_full` completion followed
+by a replaying activation of that run. It applies the same history and
+visibility checks as the replacement scenario, with every workflow task
+completed by `metadata-worker-cache`. It also requires each snapshot's
+expiration to equal the start event's `workflowExecutionExpirationTime`. Each invocation uses fresh workflow IDs on an isolated Compose project;
 the caller owns server cleanup. CI runs this gate before the existing live
 controllers on its own project, cleans that project, and uploads the synthetic
 JSON/log/identity evidence for seven days, including on failure. `TEMPORAL_METADATA_IMAGE` can select an already
 built development image for the application processes.
 
-This is exact-history worker replacement/replay coverage. It does not qualify
-cache-full eviction, whose polling-capacity issue is tracked separately in
-#501/PR #555.
+The first phase is exact-history worker replacement/replay coverage; the
+second is cache-full eviction/replay coverage on a live worker. The
+polling-capacity defect that delayed cache-full eviction with a one-slot
+cache was fixed in PR #555 (#501).
 
 These retained histories are inputs for the shared replay corpus (#503) and
 feature conformance gate (#505); this change does not claim to implement that
