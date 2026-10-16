@@ -18,6 +18,8 @@
 
 ;; A standalone client/worker binary lets the live controller replace workers
 ;; without holding Dune locks or linking another copy of Core for each process.
+;; temporal_runtime supplies only the private observer seam that the one-slot
+;; cache worker uses to record cache-full evictions and replay activations.
 (executable
  (name start_metadata_driver)
- (libraries temporal-sdk unix))
+ (libraries temporal-sdk temporal_runtime unix))
