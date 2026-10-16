@@ -19,9 +19,10 @@ the Temporal acceptance controllers.
 
 `examples/cancellation` is a self-checking example of cooperative activity
 cleanup. Its activities hold a reservation in an in-memory ledger that stands
-in for an external service. The ledger key is the workflow ID plus the
-explicit activity ID, so every attempt uses the same key, and acquire,
-release and commit are idempotent, so retries and redeliveries are safe. A
+in for an external service. The ledger key is the workflow ID, run ID and
+explicit activity ID, so every attempt of one scheduled activity uses the
+same key while a new run that reuses a closed run's workflow ID gets its own;
+acquire, release and commit are idempotent, so retries and redeliveries are safe. A
 synchronous activity checks `Context.is_worker_shutting_down` and heartbeats
 before each step; on any early exit it releases the reservation and then
 returns the heartbeat's `` `Cancelled `` error, or a retryable error when its
@@ -32,13 +33,18 @@ cancellation and a retryable one as a pause or reset, releases the
 reservation, and then calls `Async_handle.cancel` or `Async_handle.fail`.
 
 The driver runs a worker in the same process and checks the ledger history
-for three scenarios: a workflow cancels the synchronous activity, and the
+for four scenarios: a workflow cancels the synchronous activity, and the
 asynchronous one, under `Wait_cancellation_completed` and must see a
 cancelled activity whose only attempt released its reservation because of
 the cancellation; and the driver shuts the worker down while an activity
-holds a reservation, so that attempt must release it because its worker is
-stopping, and a replacement worker's retry must reacquire the key and commit
-it. It prints a fixed four-line report.
+holds a synchronous activity's reservation, so that attempt must release it
+because its worker is stopping, and a replacement worker's retry must
+reacquire the key and commit it; finally a new run under the same workflow ID
+must make and commit its own reservation. It prints a fixed five-line report.
+Cleanup on worker shutdown is synchronous-only: an asynchronous handle is not
+notified when its worker stops, shutdown closes it as a lost completion after
+the grace period, an unfinished handle expires per #1043, and Temporal retries
+the attempt according to its timeouts. The docs say so.
 
 The executable is in `EXAMPLE_EXECUTABLES` and the CI smoke artifact, and
 `run-examples-live.sh` runs it as a one-shot container on its own

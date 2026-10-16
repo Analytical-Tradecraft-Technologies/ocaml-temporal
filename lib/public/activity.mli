@@ -386,9 +386,15 @@ end
     An asynchronous activity has no context to read. Its completer learns of
     the same requests from the result of {!Async_handle.heartbeat} and
     reports the outcome itself, with {!Async_handle.cancel} or
-    {!Async_handle.fail}. The repository's [examples/cancellation] shows both
-    forms releasing an external reservation idempotently on cancellation and
-    on worker shutdown.
+    {!Async_handle.fail}. It is not notified when its worker stops: shutdown
+    waits for the handle for the graceful shutdown period and then closes it
+    as a lost completion, after which its calls return a non-retryable error,
+    and a handle that is never finished expires once Temporal must have timed
+    its attempt out. Temporal then retries the attempt according to its
+    heartbeat, start-to-close and schedule-to-close timeouts. The
+    repository's [examples/cancellation] shows both forms releasing an
+    external reservation idempotently on cancellation, and the synchronous
+    form doing so on worker shutdown.
 
     {[
       let process_batch =

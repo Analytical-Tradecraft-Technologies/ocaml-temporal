@@ -1,5 +1,5 @@
-(** Activities and workflows that show cooperative activity cancellation and
-    cleanup on worker shutdown (#494).
+(** Activities and workflows that show cooperative activity cancellation and,
+    for synchronous activities, cleanup on worker shutdown (#494).
 
     Each activity holds a reservation in an external system while it works,
     and must not leave it behind when it stops early. The worker never
@@ -8,8 +8,9 @@
     [Temporal.Activity.Context.cancellation], or
     [Temporal.Activity.Context.is_worker_shutting_down]. Every external
     operation is idempotent and keyed by an identifier that is stable across
-    retries, because Temporal delivers an activity at least once: a retry, or
-    a redelivery after a worker crash, can repeat any step. *)
+    the retries of one workflow run's activity, because Temporal delivers an
+    activity at least once: a retry, or a redelivery after a worker crash,
+    can repeat any step. *)
 
 (** A stand-in for an external reservation service, such as a database table
     of seat holds or a lock service. A real application would call that
@@ -121,17 +122,33 @@ module Ledger = struct
 end
 
 (** The activity ID both workflows pass explicitly. A stable activity ID,
-    together with the workflow ID, gives every attempt of the same scheduled
+    together with the workflow run, gives every attempt of the same scheduled
     activity the same reservation key. *)
 let reservation_activity_id = "reservation"
 
-(** Returns the reservation key for one scheduled activity: its workflow ID
-    and activity ID, which stay the same across retries. Attempt-specific
-    data, such as [Info.attempt], is deliberately left out, so a retry finds
-    the hold of the attempt it replaces. *)
+(** Returns the reservation key for one scheduled activity: its workflow ID,
+    run ID and activity ID.
+
+    An idempotency key should name the business operation, here "this run's
+    reservation". Every retry of one scheduled activity belongs to the same
+    run and shares the key, so attempt-specific data such as [Info.attempt]
+    is deliberately left out: a retry finds the hold of the attempt it
+    replaces. The run ID is included because a workflow ID alone is not
+    unique: after a run closes, [Client.start] may reuse its ID by default,
+    and the new run's activity, with the same explicit activity ID, would
+    otherwise find the old run's committed reservation and report success
+    without doing any work. A workflow retry or continue-as-new also starts
+    a new run, and so does the work again. When an operation must happen at
+    most once across runs (for example one payment per order), key it by a
+    business identifier passed in the activity input instead. *)
 let reservation_key info =
   let workflow = Temporal.Activity.Info.workflow info in
-  workflow.workflow_id ^ "/" ^ Temporal.Activity.Info.activity_id info
+  String.concat "/"
+    [
+      workflow.workflow_id;
+      workflow.run_id;
+      Temporal.Activity.Info.activity_id info;
+    ]
 
 (** Seconds of simulated work per step. Each step is followed by a heartbeat,
     which is also how cancellation reaches the activity, so this bounds how
@@ -273,7 +290,16 @@ let step_details index =
       send failed transiently, so the same step is retried;
     - another non-retryable error means the handle is closed (for example
       the activity no longer exists), so the reservation is released and
-      nothing more can be reported. *)
+      nothing more can be reported.
+
+    The handle is not notified when its worker stops, so this thread cannot
+    clean up on shutdown the way {!hold_reservation} does. A worker shutdown
+    waits for the handle for the graceful shutdown period and then closes it
+    as a lost completion, and an unfinished handle expires once Temporal must
+    have timed its attempt out; the next heartbeat then returns a
+    non-retryable error and the last case above releases the reservation.
+    Temporal retries the attempt after its heartbeat or start-to-close
+    timeout. *)
 let drive_async handle ~key ~attempt ~steps =
   let module Handle = Temporal.Activity.Async_handle in
   let rec step index =

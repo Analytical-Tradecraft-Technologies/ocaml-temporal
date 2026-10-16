@@ -1,7 +1,7 @@
 (** Self-checking cooperative cancellation example (#494).
 
     One process runs a worker for the activities and workflows in
-    {!Cooperative_cleanup} and a client driver that starts three executions
+    {!Cooperative_cleanup} and a client driver that starts four executions
     and checks their outcomes against the reservation ledger:
 
     + A workflow cancels a running synchronous activity. The activity must
@@ -12,9 +12,12 @@
     + The worker is shut down while an activity runs. The activity must
       release its reservation and fail retryably; a replacement worker then
       runs the retry, which reacquires the same reservation key and commits
-      it.
+      it. The synchronous activity is used because only it can observe its
+      worker stopping; an asynchronous handle is not notified.
+    + A new run reuses the closed run's workflow ID. Its activity must make
+      and commit its own reservation, because the key includes the run ID.
 
-    It prints one line per scenario and exits 0 only if all three behaved as
+    It prints one line per scenario and exits 0 only if all four behaved as
     described. The executions use the task queue [TEMPORAL_TASK_QUEUE] with
     a [-cancellation] suffix, so this example never shares a queue with the
     other example workers, and fresh workflow IDs, so it can be rerun in the
@@ -104,8 +107,19 @@ let wait_completed handle =
       Error (check_failed ("workflow ended: " ^ Temporal.Error.message error))
   | Continued_as_new _ -> Error (check_failed "workflow continued as new")
 
-(** Returns the ledger key of the reservation activity in workflow [id]. *)
-let key_of id = id ^ "/" ^ Cooperative_cleanup.reservation_activity_id
+(** Returns the ledger key of the reservation activity in the exact run
+    that [handle] addresses, matching [Cooperative_cleanup.reservation_key]. *)
+let key_of handle =
+  match Temporal.Client.run_id handle with
+  | Some run_id ->
+      Ok
+        (String.concat "/"
+           [
+             Temporal.Client.workflow_id handle;
+             run_id;
+             Cooperative_cleanup.reservation_activity_id;
+           ])
+  | None -> Error (check_failed "a started workflow handle has no run ID")
 
 (** Describes a reservation history for a failed check. *)
 let describe_history history =
@@ -139,12 +153,13 @@ let cancellation_scenario client ~task_queue ~suffix mode =
     start client ~task_queue
       ~workflow:Cooperative_cleanup.reserve_then_cancel_workflow ~id mode
   in
+  let* key = key_of handle in
   let* output = wait_completed handle in
   let* () =
     if String.equal output "cancelled" then Ok ()
     else Error (check_failed (mode ^ " activity was not cancelled: " ^ output))
   in
-  match Cooperative_cleanup.Ledger.history (key_of id) with
+  match Cooperative_cleanup.Ledger.history key with
   | [ Acquired { attempt = 1 };
       Released { attempt = 1; reason = Cancellation_requested } ] ->
       Ok ()
@@ -169,37 +184,73 @@ let wait_until_held key =
   in
   poll ()
 
+(** Scenario 4: starts a new run under the closed run's workflow ID [id],
+    which [Client.start]'s default reuse policy allows. The new run's
+    activity has the same explicit activity ID, but its reservation key
+    includes the new run ID, so it must make and commit a reservation of its
+    own rather than find the old run's committed one and skip the work.
+    [old_key] is the previous run's key, whose history must not change. *)
+let reuse_scenario client ~task_queue ~id ~old_key =
+  let open Temporal.Result_syntax in
+  let old_history = Cooperative_cleanup.Ledger.history old_key in
+  let* handle =
+    start client ~task_queue
+      ~workflow:Cooperative_cleanup.reserve_and_commit_workflow ~id 3
+  in
+  let* key = key_of handle in
+  let* _output = wait_completed handle in
+  let* () =
+    if Cooperative_cleanup.Ledger.history old_key = old_history then Ok ()
+    else Error (check_failed "the reused workflow ID changed the old reservation")
+  in
+  match Cooperative_cleanup.Ledger.history key with
+  | [ Acquired { attempt = 1 }; Committed { attempt = 1 } ]
+    when not (String.equal key old_key) ->
+      Ok ()
+  | history ->
+      Error
+        (check_failed
+           ("the run with a reused workflow ID did not do its own work: "
+           ^ describe_history history))
+
 (** Scenario 3: shuts [first] down while its activity holds a reservation,
     then starts a replacement worker. Checks that the first attempt
     released the reservation because its worker was stopping, and that a
-    later attempt on the replacement reacquired and committed it. *)
+    later attempt on the replacement reacquired and committed it. Scenario 4
+    ({!reuse_scenario}) then runs on the replacement worker. *)
 let shutdown_scenario config client ~task_queue ~suffix first =
   let open Temporal.Result_syntax in
   let id = "ocaml-temporal-example-shutdown-" ^ suffix in
-  let key = key_of id in
   let* handle =
     start client ~task_queue
       ~workflow:Cooperative_cleanup.reserve_and_commit_workflow ~id 30
   in
+  let* key = key_of handle in
   let* () = wait_until_held key in
   let* () = stop first in
   with_worker config ~task_queue
     ~identity:"ocaml-temporal-example-cancellation-replacement" (fun _ ->
       let* _output = wait_completed handle in
-      match Cooperative_cleanup.Ledger.history key with
-      | [ Acquired { attempt = 1 };
-          Released { attempt = 1; reason = Worker_stopping };
-          Acquired { attempt = retry };
-          Committed { attempt = committed } ]
-        when retry > 1 && committed = retry ->
-          Ok ()
-      | history ->
-          Error
-            (check_failed
-               ("the reservation did not survive the worker shutdown: "
-               ^ describe_history history)))
+      let* () =
+        match Cooperative_cleanup.Ledger.history key with
+        | [ Acquired { attempt = 1 };
+            Released { attempt = 1; reason = Worker_stopping };
+            Acquired { attempt = retry };
+            Committed { attempt = committed } ]
+          when retry > 1 && committed = retry ->
+            Ok ()
+        | history ->
+            Error
+              (check_failed
+                 ("the reservation did not survive the worker shutdown: "
+                 ^ describe_history history))
+      in
+      print_endline
+        "Worker shutdown: the activity released its reservation, and a \
+         replacement worker retried and committed it.";
+      reuse_scenario client ~task_queue ~id ~old_key:key)
 
-(** Runs the three scenarios in order and prints one line for each. *)
+(** Runs the four scenarios in order and prints one line for each. *)
 let run () =
   let open Temporal.Result_syntax in
   let* config = Example_support.Config.from_environment () in
@@ -218,8 +269,8 @@ let run () =
              acknowledged the cancellation.";
           let* () = shutdown_scenario config client ~task_queue ~suffix worker in
           print_endline
-            "Worker shutdown: the activity released its reservation, and a \
-             replacement worker retried and committed it.";
+            "Reused workflow ID: the new run made and committed its own \
+             reservation.";
           Ok ()))
 
 (** Reports the outcome after every worker and the client have been shut

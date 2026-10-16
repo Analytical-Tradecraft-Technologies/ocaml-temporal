@@ -547,18 +547,27 @@ response to a heartbeat, so schedule such an activity with a
   acknowledged with `Async_handle.cancel`, and a retryable one is a pause or
   reset, to be reported with `Async_handle.fail` and that error. The heartbeat
   is still recorded and the handle stays live until one of those calls.
-  Handles are not told about worker shutdown.
+  Handles are not told about worker shutdown, so cleanup on shutdown is
+  available only to synchronous activities. A worker shutdown waits for an
+  unfinished handle for the graceful shutdown period and then closes it as a
+  lost completion; a handle that is never finished expires once Temporal must
+  have timed its attempt out (#1043). Later handle calls return a
+  non-retryable error, and Temporal retries the attempt after its heartbeat,
+  start-to-close or schedule-to-close timeout.
 
 Clean up before reporting the outcome, so a workflow that schedules the
 activity with `~cancellation_type:Wait_cancellation_completed` knows the
 cleanup ran once the activity's future resolves as cancelled. Make every
-external side effect idempotent and key it by the workflow ID and activity
-ID, which stay the same across retries: Temporal delivers an activity at least
-once, and an attempt that ignores the signal past the grace period is
+external side effect idempotent and key it by the business operation it
+performs. Every retry of one scheduled activity shares its workflow run ID and
+activity ID, so those two (or a business key passed in the input, when the
+work must happen at most once across runs) identify it; the workflow ID alone
+does not, because a closed run's ID can be reused. Temporal delivers an
+activity at least once, and an attempt that ignores the signal past the grace period is
 abandoned and retried while its own code still runs. The runnable
 [cooperative cancellation example](../../examples/README.md#cancel-activities-cooperatively)
-shows both forms releasing a reservation on cancellation and on worker
-shutdown, and is run against Temporal Server in CI.
+shows both forms releasing a reservation on cancellation, and the synchronous
+form on worker shutdown, and is run against Temporal Server in CI.
 
 Use `Activity.remote` or `Workflow.remote` when another worker owns the
 implementation. A remote definition keeps the name and codecs needed to

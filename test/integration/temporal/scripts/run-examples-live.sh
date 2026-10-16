@@ -19,7 +19,8 @@ set -eu
 # - the cancellation example exits 0 and prints exactly its documented report:
 #   a cancelled synchronous and a cancelled asynchronous activity each release
 #   their reservation before acknowledging, and an activity whose worker shuts
-#   down releases its reservation and is committed by a replacement worker.
+#   down releases its reservation and is committed by a replacement worker,
+#   and a new run reusing that workflow ID does its own work.
 #
 # The executables must already exist under _build/default: the Makefile target
 # compiles them locally, and CI unpacks the verified smoke artifact. Running
@@ -194,6 +195,7 @@ printf '%s\n' \
   'Cancelled activity: released its reservation, then acknowledged the cancellation.' \
   'Cancelled asynchronous activity: released its reservation, then acknowledged the cancellation.' \
   'Worker shutdown: the activity released its reservation, and a replacement worker retried and committed it.' \
+  'Reused workflow ID: the new run made and committed its own reservation.' \
   'Cooperative cancellation example passed.' \
   >"$evidence/cancellation.expected"
 if ! cmp -s "$evidence/cancellation.expected" "$evidence/cancellation.stdout"; then

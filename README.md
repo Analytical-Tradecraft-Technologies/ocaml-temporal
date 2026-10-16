@@ -328,8 +328,8 @@ The complete, buildable version is split the way a real deployment often is:
 
 A separate, self-checking [cancellation example](examples/README.md#cancel-activities-cooperatively)
 shows synchronous and asynchronous activities that release an external
-reservation idempotently when a workflow cancels them or their worker shuts
-down.
+reservation idempotently when a workflow cancels them, and a synchronous
+activity doing so when its worker shuts down.
 
 See the [examples guide](examples/README.md) for the startup order, connection
 settings, and commands. CI compiles every example executable on every Docker
