@@ -3,6 +3,7 @@ examples/cancellation/cancellation.exe
 examples/client/client.exe
 examples/workflow_worker/workflow_worker.exe
 test/integration/activity_cancellation/regression.exe
+test/integration/activity_worker_crash/regression.exe
 test/integration/bounded_shutdown/regression.exe
 test/integration/client_policies/regression.exe
 test/integration/client_request_ids/regression.exe
