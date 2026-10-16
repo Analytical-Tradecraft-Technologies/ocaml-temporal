@@ -49,6 +49,9 @@ module Native_worker_loop = Temporal_runtime.Native_worker_loop
 (** Closed retry and shutdown classification rules for the native loop. *)
 module Native_worker_policy = Temporal_runtime.Native_worker_policy
 
+(** SDK-side worker metrics recorded into the runtime's Core meter (#500). *)
+module Native_worker_metrics = Temporal_runtime.Native_worker_metrics
+
 (** Thread-granular execution-lane identity used by shutdown re-entrancy
     checks. *)
 module Native_worker_owner = Temporal_runtime.Native_worker_owner

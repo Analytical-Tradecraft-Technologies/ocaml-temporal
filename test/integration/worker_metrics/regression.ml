@@ -10,8 +10,12 @@
       cardinality contract in docs/reference/observability.md;
     - the configured global tag is attached;
     and that the SDK's [workflow_activation_completed] log records for the
-    execution carry its workflow ID, run ID, and replay flag. After
-    shutdown the endpoint must be closed.
+    execution carry its workflow ID, run ID, and replay flag. The SDK's own
+    [temporal_ocaml_] series (#500) are checked too: the activity callback
+    is counted as admitted and timed, and a second scrape after
+    [Worker.shutdown], while the shared runtime still serves, shows one
+    clean shutdown for the worker's task queue. After [Runtime.shutdown] the
+    endpoint must be closed.
 
     Run against a disposable Temporal Server only:
     [dune exec test/integration/worker_metrics/regression.exe -- check
@@ -56,6 +60,17 @@ let required_metrics =
     "temporal_activity_schedule_to_start_latency";
     "temporal_activity_execution_latency";
     "temporal_activity_succeed_endtoend_latency";
+    (* SDK-side series (#500); counters are exported from worker creation. *)
+    "temporal_ocaml_activity_callbacks_running";
+    "temporal_ocaml_activity_callback_duration";
+    "temporal_ocaml_activity_tasks_admitted";
+    "temporal_ocaml_activity_tasks_refused";
+    "temporal_ocaml_async_activity_not_admitted";
+    "temporal_ocaml_async_activity_leases_expired";
+    "temporal_ocaml_activity_completion_retries";
+    "temporal_ocaml_activity_lanes_detached";
+    "temporal_ocaml_worker_shutdowns";
+    "temporal_ocaml_worker_shutdown_abandoned_work";
   ]
 
 (** Label names a scraped series may carry: Core's bounded labels plus the
@@ -75,6 +90,10 @@ let allowed_labels =
     "status_code";
     "le";
     "deployment";
+    (* Closed enumerations of the SDK-side series (#500). *)
+    "reason";
+    "outcome";
+    "kind";
   ]
 
 (** Returns whether [needle] occurs in [haystack]. *)
@@ -173,6 +192,22 @@ let labels_of_sample line =
       names [] 0
   | _ -> []
 
+(** The value of the one sample of [family] whose line contains every
+    fragment of [fragments] (for example [{|outcome="clean"|}]); fails when
+    there is none. *)
+let sample_value lines family fragments =
+  match
+    List.find_opt
+      (fun line ->
+        String.starts_with ~prefix:(family ^ "{") line
+        && List.for_all (fun needle -> contains ~haystack:line ~needle) fragments)
+      lines
+  with
+  | None -> failwith ("missing sample " ^ family ^ " " ^ String.concat " " fragments)
+  | Some line ->
+      let space = String.rindex line ' ' in
+      float_of_string (String.sub line (space + 1) (String.length line - space - 1))
+
 (** Sample lines of an exposition body (comments and blank lines dropped). *)
 let samples body =
   let body =
@@ -264,6 +299,13 @@ let check address =
   ignore (Client.shutdown client);
   ignore (get (Worker.shutdown worker));
   ignore (Domain.join running);
+  (* The shared runtime outlives the worker, so its shutdown outcome is
+     still scrapeable here (#500). *)
+  let after_shutdown =
+    match body with
+    | Ok _ -> ( try Some (scrape endpoint) with _ -> None)
+    | Error _ -> None
+  in
   get (Runtime.shutdown runtime);
   let run_id, response =
     match body with Ok value -> value | Error exception_ -> raise exception_
@@ -292,6 +334,24 @@ let check address =
   then failwith "global tag missing from the scrape";
   if not (contains ~haystack:response ~needle:("task_queue=\"" ^ queue ^ "\"")) then
     failwith "task_queue label missing from the scrape";
+  (* SDK-side series (#500): the one activity callback was admitted and
+     timed, nothing is still running, and the worker shut down cleanly. *)
+  let queue_label = "task_queue=\"" ^ queue ^ "\"" in
+  if sample_value lines "temporal_ocaml_activity_tasks_admitted" [ queue_label ] <> 1.
+  then failwith "the activity callback was not counted as admitted";
+  if sample_value lines "temporal_ocaml_activity_callback_duration_count"
+       [ queue_label ] <> 1.
+  then failwith "the activity callback duration was not observed";
+  if sample_value lines "temporal_ocaml_activity_callbacks_running" [ queue_label ]
+     <> 0.
+  then failwith "an activity callback is still counted as running";
+  (match after_shutdown with
+  | None -> failwith "no scrape after Worker.shutdown"
+  | Some response ->
+      let after = samples response in
+      if sample_value after "temporal_ocaml_worker_shutdowns"
+           [ queue_label; {|outcome="clean"|} ] <> 1.
+      then failwith "the clean worker shutdown was not counted");
   (* Correlation: the lease records of this run name it exactly. *)
   Mutex.lock captured_mutex;
   let records = !captured in

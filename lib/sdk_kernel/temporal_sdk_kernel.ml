@@ -17,6 +17,7 @@ module Native_worker_execution = Temporal_runtime.Native_worker_execution
 module Native_activity_execution = Temporal_runtime.Native_activity_execution
 module Native_worker_loop = Temporal_runtime.Native_worker_loop
 module Native_worker_policy = Temporal_runtime.Native_worker_policy
+module Native_worker_metrics = Temporal_runtime.Native_worker_metrics
 module Native_worker_owner = Temporal_runtime.Native_worker_owner
 module Native_worker_observer = Temporal_runtime.Native_worker_observer
 module Native_worker_watchdog = Temporal_runtime.Native_worker_watchdog

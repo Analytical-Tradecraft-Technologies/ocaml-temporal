@@ -533,3 +533,57 @@ val runtime_attach : shared_runtime -> (runtime, error) result
     remains; otherwise the last graph's {!runtime_close} destroys it.
     Repeating the call is safe. *)
 val shared_runtime_close : shared_runtime -> (unit, error) result
+
+(** {1 SDK metrics (#500)}
+
+    Core instruments its own workers and clients. Worker states that exist
+    only in the OCaml SDK are recorded through a {!metric_meter} into the
+    same Prometheus registry, with Core's [temporal_] name prefix, its
+    [service_name] label and the runtime's global tags. *)
+
+(** Recorder over one shared runtime's Core meter. It references the
+    meter, not Core, so it stays valid (recording into a registry nobody
+    scrapes any longer) after the runtime is shut down. It is released only
+    by the GC, so values may be shared freely between Domains. *)
+type metric_meter
+
+(** Kind of one series; one metric name keeps one kind. [Up_down_counter]
+    adds signed deltas and is exported as a gauge; [Duration_histogram]
+    records microseconds and is exported in milliseconds (or seconds with
+    [durations_as_seconds]) like Core's latency histograms. *)
+type metric_kind =
+  | Counter
+  | Up_down_counter
+  | Gauge
+  | Histogram
+  | Duration_histogram
+
+(** Creates [shared]'s recorder, or [None] when the runtime was created
+    without a metrics exporter (recording is then skipped entirely). A
+    closed [shared] returns [Invalid_argument]. *)
+val shared_runtime_metric_meter :
+  shared_runtime -> (metric_meter option, error) result
+
+(** Registers one series and returns its identifier; registering an
+    identical series again returns the same identifier. Names omit the
+    [temporal_] prefix and, like label names, match [[a-z_][a-z0-9_]*]. At
+    most 8 labels, values of 1 to 256 bytes without control characters, a
+    label may not repeat [le], [quantile], [service_name] or a global tag,
+    and one meter holds at most 1,024 series. Callers must keep label values
+    bounded (task queue, namespace, closed enumerations); a rejected
+    registration is a [Configuration] error. *)
+val metric_register :
+  metric_meter ->
+  kind:metric_kind ->
+  name:string ->
+  description:string ->
+  labels:(string * string) list ->
+  (int, error) result
+
+(** [metric_record meter id value] records into series [id]: a counter adds
+    [value], an up-down counter adds the signed delta, a gauge is set, a
+    histogram observes [value] (microseconds for a duration histogram).
+    Returns [false], recording nothing, for an unknown identifier or a
+    negative value on an unsigned instrument. Allocation-free and safe from
+    any Domain; it never blocks on I/O. *)
+val metric_record : metric_meter -> int -> int -> bool

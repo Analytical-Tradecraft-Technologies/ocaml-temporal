@@ -48,15 +48,20 @@
 //! bypasses OCaml still cannot register a label that collides with Core's own
 //! labels or exceeds the documented bounds.
 
-use crate::abi::{Failure, STATUS_CONFIGURATION};
+use crate::abi::{Failure, STATUS_CONFIGURATION, STATUS_INVALID_ARGUMENT, STATUS_OK, Status};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::io::ErrorKind;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::str::FromStr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
+use temporalio_common::telemetry::metrics::{
+    Counter, CounterBase, Gauge, GaugeBase, Histogram, HistogramBase, HistogramDuration,
+    HistogramDurationBase, MetricAttributable, MetricKeyValue, MetricParameters, NewAttributes,
+    TemporalMeter, UpDownCounter, UpDownCounterBase,
+};
 use temporalio_common::telemetry::{PrometheusExporterOptions, start_prometheus_metric_exporter};
 use temporalio_sdk_core::CoreRuntime;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -242,6 +247,10 @@ pub(crate) struct MetricsExporter {
     /// [`AbortHandle::is_finished`] to tell a stopped server from a transient
     /// connect failure.
     core_server: Arc<AbortHandle>,
+    /// Names of the configured global tags. Every series already carries
+    /// them, so an SDK instrument label with one of these names would
+    /// duplicate a label; [`MetricMeter::register`] refuses it.
+    global_tag_names: Vec<String>,
 }
 
 impl MetricsExporter {
@@ -261,6 +270,11 @@ impl MetricsExporter {
     /// Whether Core's scrape server task has ended. Test support only.
     pub(crate) fn core_server_stopped(&self) -> bool {
         self.core_server.is_finished()
+    }
+
+    /// Names of the configured global tags, in configuration order.
+    pub(crate) fn global_tag_names(&self) -> &[String] {
+        &self.global_tag_names
     }
 }
 
@@ -810,5 +824,339 @@ pub(crate) fn start_metrics(
         bound_address,
         accept_loop,
         core_server,
+        global_tag_names: prometheus
+            .global_tags
+            .iter()
+            .map(|tag| tag.name.clone())
+            .collect(),
     }))
+}
+
+/// Most series one [`MetricMeter`] registers. The SDK registers a fixed set
+/// per worker (a few dozen), so the bound only stops a defect from growing
+/// the registry, and with it every scrape, without limit.
+pub(crate) const MAX_SDK_INSTRUMENTS: usize = 1024;
+
+/// Most labels one SDK series carries, besides Core's `service_name` and the
+/// runtime's global tags.
+pub(crate) const MAX_SDK_INSTRUMENT_LABELS: usize = 8;
+
+/// Longest accepted SDK metric name, in bytes, before Core's `temporal_`
+/// prefix.
+pub(crate) const MAX_SDK_INSTRUMENT_NAME_BYTES: usize = 128;
+
+/// Longest accepted SDK metric description, in bytes.
+pub(crate) const MAX_SDK_INSTRUMENT_DESCRIPTION_BYTES: usize = 512;
+
+/// Upper bound on one series registration document.
+pub(crate) const MAX_SDK_INSTRUMENT_DOCUMENT_BYTES: usize = 8 * 1024;
+
+/// Label names an SDK series may not use: Core attaches `service_name` to
+/// every series, and Prometheus reserves `le` and `quantile` for histogram
+/// and summary samples.
+const RESERVED_SDK_LABEL_NAMES: &[&str] = &["le", "quantile", "service_name"];
+
+/// The kind of one SDK metric, fixed per metric name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum InstrumentKind {
+    /// Monotonic counter; a recorded value is added.
+    Counter,
+    /// Signed gauge driven by deltas; a recorded value, which may be
+    /// negative, is added. Exported as a Prometheus gauge.
+    UpDownCounter,
+    /// Gauge; a recorded value replaces the current one.
+    Gauge,
+    /// Histogram of plain numbers; a recorded value is one observation.
+    Histogram,
+    /// Duration histogram; a recorded value is one observation in
+    /// microseconds. Core exports it in milliseconds or, with
+    /// `durations_as_seconds`, in seconds, like its own latency histograms.
+    DurationHistogram,
+}
+
+/// Strict registration document accepted by
+/// `ocaml_temporal_core_v4_metric_meter_register_json`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InstrumentSpec {
+    kind: InstrumentKind,
+    /// Name without Core's `temporal_` prefix, which Core adds.
+    name: String,
+    /// Prometheus `HELP` text; identical for every series of one name.
+    #[serde(default)]
+    description: String,
+    /// Constant labels of this series, in caller order.
+    #[serde(default)]
+    labels: Vec<GlobalTag>,
+}
+
+/// One registered series, bound to its label set at registration so that
+/// recording neither allocates nor looks labels up: Core caches the bound
+/// Prometheus child on first use.
+enum Instrument {
+    Counter(Counter),
+    UpDownCounter(UpDownCounter),
+    Gauge(Gauge),
+    Histogram(Histogram),
+    DurationHistogram(HistogramDuration),
+}
+
+/// Registration state behind [`MetricMeter`]'s lock.
+#[derive(Default)]
+struct InstrumentRegistry {
+    /// Bound series, indexed by the identifier returned to the caller.
+    instruments: Vec<Instrument>,
+    /// Canonical registration key (kind, name and labels) to identifier, so
+    /// registering the same series twice returns the same identifier.
+    ids: HashMap<String, u32>,
+    /// Kind and description of every registered name. One Prometheus family
+    /// has one type and one help text, so a conflicting registration is
+    /// refused rather than producing a malformed scrape.
+    families: HashMap<String, (InstrumentKind, String)>,
+}
+
+/// SDK-side metrics recorder over a runtime's Core meter (#500).
+///
+/// Core records its own worker and client metrics, but some worker states
+/// exist only in the OCaml SDK (activity-lane occupancy, refused tasks,
+/// retained-completion retries, shutdown outcomes, expired asynchronous
+/// leases). The SDK registers each series once with [`MetricMeter::register`]
+/// and then records into it by identifier with [`MetricMeter::record`]. The
+/// series land in the same Prometheus registry as Core's own instruments,
+/// with Core's `temporal_` prefix, its `service_name` label, and the
+/// runtime's global tags.
+///
+/// Ownership: the meter holds a clone of Core's meter (the Prometheus
+/// registry), not of Core itself, so it never keeps Core's Tokio runtime
+/// alive and may be dropped on any thread, including from a GC finalizer.
+/// Recording after Core was destroyed updates a registry that nobody scrapes
+/// any longer, which is harmless. Registration takes the write lock and
+/// recording only the read lock, so concurrent recorders on several threads
+/// never wait for each other.
+pub struct MetricMeter {
+    meter: TemporalMeter,
+    /// Label names the runtime's global tags already use.
+    global_tag_names: Vec<String>,
+    registry: RwLock<InstrumentRegistry>,
+}
+
+impl std::fmt::Debug for MetricMeter {
+    /// Bound instruments are opaque Core values; only their count is useful.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let count = self
+            .registry
+            .read()
+            .map_or(0, |registry| registry.instruments.len());
+        formatter
+            .debug_struct("MetricMeter")
+            .field("instruments", &count)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Whether `name` is an acceptable SDK metric or label name:
+/// `[a-z_][a-z0-9_]*`, without the Prometheus-reserved `__` prefix.
+fn valid_sdk_identifier(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    bytes
+        .next()
+        .is_some_and(|byte| byte.is_ascii_lowercase() || byte == b'_')
+        && bytes.all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+        && !name.starts_with("__")
+}
+
+impl MetricMeter {
+    /// Wraps a runtime's prefixed Core meter. `global_tag_names` are the
+    /// exporter's constant labels, which series labels may not repeat.
+    pub(crate) fn new(meter: TemporalMeter, global_tag_names: Vec<String>) -> Self {
+        Self {
+            meter,
+            global_tag_names,
+            registry: RwLock::new(InstrumentRegistry::default()),
+        }
+    }
+
+    /// Registers one series from a strict JSON document and returns its
+    /// identifier. Registering an identical series again returns the first
+    /// identifier. Every validation failure is a configuration error whose
+    /// message names only the violated rule, never the rejected text.
+    pub(crate) fn register(&self, bytes: &[u8]) -> Result<u32, Failure> {
+        let spec: InstrumentSpec = serde_json::from_slice(bytes)
+            .map_err(|_error| invalid("invalid SDK metric registration JSON".to_owned()))?;
+        self.validate(&spec)?;
+        // The key is unambiguous: names exclude both separators, and label
+        // values may not contain control characters.
+        let mut key = format!("{:?}\u{1}{}", spec.kind, spec.name);
+        for label in &spec.labels {
+            key.push('\u{1}');
+            key.push_str(&label.name);
+            key.push('\u{2}');
+            key.push_str(&label.value);
+        }
+        let mut registry = self
+            .registry
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((kind, description)) = registry.families.get(&spec.name)
+            && (*kind != spec.kind || *description != spec.description)
+        {
+            return Err(invalid(
+                "an SDK metric name must keep one kind and one description".to_owned(),
+            ));
+        }
+        if let Some(id) = registry.ids.get(&key) {
+            return Ok(*id);
+        }
+        if registry.instruments.len() >= MAX_SDK_INSTRUMENTS {
+            return Err(invalid(format!(
+                "at most {MAX_SDK_INSTRUMENTS} SDK metric series may be registered"
+            )));
+        }
+        let id = u32::try_from(registry.instruments.len())
+            .map_err(|_error| invalid("SDK metric identifier overflow".to_owned()))?;
+        let instrument = self.bind(&spec);
+        registry.instruments.push(instrument);
+        registry.ids.insert(key, id);
+        registry
+            .families
+            .insert(spec.name, (spec.kind, spec.description));
+        Ok(id)
+    }
+
+    /// Applies the documented bounds to one registration.
+    fn validate(&self, spec: &InstrumentSpec) -> Result<(), Failure> {
+        if spec.name.len() > MAX_SDK_INSTRUMENT_NAME_BYTES
+            || !valid_sdk_identifier(&spec.name)
+            || spec.name.starts_with("temporal_")
+        {
+            return Err(invalid(format!(
+                "SDK metric names must match [a-z_][a-z0-9_]*, be at most \
+                 {MAX_SDK_INSTRUMENT_NAME_BYTES} bytes, and omit the temporal_ prefix"
+            )));
+        }
+        if spec.description.len() > MAX_SDK_INSTRUMENT_DESCRIPTION_BYTES
+            || spec.description.chars().any(char::is_control)
+        {
+            return Err(invalid(format!(
+                "SDK metric descriptions must be at most \
+                 {MAX_SDK_INSTRUMENT_DESCRIPTION_BYTES} bytes without control characters"
+            )));
+        }
+        if spec.labels.len() > MAX_SDK_INSTRUMENT_LABELS {
+            return Err(invalid(format!(
+                "an SDK metric series accepts at most {MAX_SDK_INSTRUMENT_LABELS} labels"
+            )));
+        }
+        let mut seen = HashSet::new();
+        for label in &spec.labels {
+            if label.name.len() > MAX_METRICS_TAG_NAME_BYTES
+                || !valid_sdk_identifier(&label.name)
+                || RESERVED_SDK_LABEL_NAMES.contains(&label.name.as_str())
+                || self.global_tag_names.contains(&label.name)
+                || !seen.insert(label.name.as_str())
+            {
+                return Err(invalid(format!(
+                    "SDK metric label names must match [a-z_][a-z0-9_]*, be at most \
+                     {MAX_METRICS_TAG_NAME_BYTES} bytes, be unique, and not repeat a \
+                     reserved label or a global tag"
+                )));
+            }
+            if label.value.is_empty()
+                || label.value.len() > MAX_METRICS_TAG_VALUE_BYTES
+                || label.value.chars().any(char::is_control)
+            {
+                return Err(invalid(format!(
+                    "SDK metric label values must be 1 to {MAX_METRICS_TAG_VALUE_BYTES} \
+                     bytes without control characters"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Creates the Core instrument for `spec` and binds it to its labels plus
+    /// the meter's default `service_name`.
+    ///
+    /// Core's wrappers bind infallibly (they defer the Prometheus lookup to
+    /// the first recording and cache it), so the unbound fallback below is
+    /// unreachable in practice; it only keeps a future Core change from
+    /// turning a metrics defect into a worker failure.
+    fn bind(&self, spec: &InstrumentSpec) -> Instrument {
+        let attributes = self.meter.extend_attributes(
+            self.meter.get_default_attributes().clone(),
+            NewAttributes::from(
+                spec.labels
+                    .iter()
+                    .map(|label| MetricKeyValue::new(label.name.clone(), label.value.clone())),
+            ),
+        );
+        let parameters = MetricParameters::builder()
+            .name(spec.name.clone())
+            .description(spec.description.clone())
+            .build();
+        match spec.kind {
+            InstrumentKind::Counter => {
+                let unbound = self.meter.counter(parameters);
+                Instrument::Counter(unbound.with_attributes(&attributes).unwrap_or(unbound))
+            }
+            InstrumentKind::UpDownCounter => {
+                let unbound = self.meter.up_down_counter(parameters);
+                Instrument::UpDownCounter(unbound.with_attributes(&attributes).unwrap_or(unbound))
+            }
+            InstrumentKind::Gauge => {
+                let unbound = self.meter.gauge(parameters);
+                Instrument::Gauge(unbound.with_attributes(&attributes).unwrap_or(unbound))
+            }
+            InstrumentKind::Histogram => {
+                let unbound = self.meter.histogram(parameters);
+                Instrument::Histogram(unbound.with_attributes(&attributes).unwrap_or(unbound))
+            }
+            InstrumentKind::DurationHistogram => {
+                let unbound = self.meter.histogram_duration(parameters);
+                Instrument::DurationHistogram(
+                    unbound.with_attributes(&attributes).unwrap_or(unbound),
+                )
+            }
+        }
+    }
+
+    /// Records `value` into the series registered as `id`.
+    ///
+    /// A counter, gauge or histogram requires a non-negative value; an
+    /// up-down counter adds it as a signed delta; a duration histogram reads
+    /// it as microseconds. An unknown identifier, or a negative value for an
+    /// unsigned instrument, returns `STATUS_INVALID_ARGUMENT` and records
+    /// nothing. Only the read lock is taken, and nothing is allocated once
+    /// the series has been recorded into for the first time.
+    pub(crate) fn record(&self, id: u32, value: i64) -> Status {
+        let registry = self
+            .registry
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(instrument) = usize::try_from(id)
+            .ok()
+            .and_then(|index| registry.instruments.get(index))
+        else {
+            return STATUS_INVALID_ARGUMENT;
+        };
+        if let Instrument::UpDownCounter(counter) = instrument {
+            counter.adds(value);
+            return STATUS_OK;
+        }
+        let Ok(unsigned) = u64::try_from(value) else {
+            return STATUS_INVALID_ARGUMENT;
+        };
+        match instrument {
+            Instrument::Counter(counter) => counter.adds(unsigned),
+            Instrument::Gauge(gauge) => gauge.records(unsigned),
+            Instrument::Histogram(histogram) => histogram.records(unsigned),
+            Instrument::DurationHistogram(histogram) => {
+                histogram.records(Duration::from_micros(unsigned));
+            }
+            // Handled above, before the sign check.
+            Instrument::UpDownCounter(_) => {}
+        }
+        STATUS_OK
+    }
 }

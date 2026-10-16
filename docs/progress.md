@@ -46,6 +46,54 @@ Verified locally: `dune build --root . @install` and the
 controller and verifier; the verifier's eviction and timestamp checks were
 exercised on synthetic records; and the Docker-free contract targets pass.
 The live gate needs the Docker Compose stack and runs only in CI.
+## 2026-10-16: SDK-side worker metrics (#500)
+
+Core's Prometheus exporter (#1000) covers what Core sees. Worker states that
+exist only in the OCaml SDK are now recorded into the same registry, under
+`temporal_ocaml_` names with Core's `service_name` label and the runtime's
+global tags: activity-lane occupancy and callback duration, admitted and
+refused activity tasks (by a closed `reason`), asynchronous operations the
+bridge refused because its client-call registry was full (#1104), expired
+asynchronous leases (#1043), retained-completion retries, detached activity
+lanes, and the outcome of every bounded worker shutdown (`clean`,
+`abandoned_work`, `teardown_detached`, or the error outcomes) with the kind of
+abandoned work. Every series carries only `namespace`, `task_queue` and at
+most one closed-enumeration label; activity types are not a label because a
+refused task's type is chosen by its scheduler. The names, types, units and
+labels are in [observability](reference/observability.md#sdk-worker-metrics),
+together with two example alerts.
+
+The bridge path is additive to ABI version 4:
+`ocaml_temporal_core_v4_shared_runtime_metric_meter`,
+`..._metric_meter_register_json`, `..._metric_meter_record` and
+`..._metric_meter_free` ([core bridge](reference/core-bridge.md#sdk-metric-meter-500)).
+The meter holds Core's meter, not Core, so it may outlive the runtime and is
+freed only by its OCaml finalizer; registration binds each series to its
+labels once and enforces the cardinality bounds (name and label syntax,
+reserved and global-tag label names, 8 labels, 256-byte values, 1,024 series);
+recording is an allocation-free `[@@noalloc]` call that takes a read lock and
+does no I/O. `Sdk_shared_runtime` creates the meter with an exporting runtime;
+`Native_worker_metrics` registers a worker's series (counters exported at 0
+from creation) and is a no-op when metrics are off. The activity adapter
+records around both callback paths, at each SDK refusal, at the #1104
+`Not_admitted` disposition and at lease expiry; the public worker records
+completion retries, detached lanes and shutdown outcomes. A registration
+failure leaves the worker running without SDK metrics after one
+`worker_metrics_unavailable` warning.
+
+Evidence: `rust/core-bridge/tests/sdk_metrics.rs` (every kind read back from a
+real scrape, every registration bound, recording errors, a meter outliving its
+runtime, exact totals from eight concurrent recorders);
+`test/runtime/test_native_worker_metrics.ml` (adapter paths against a real
+exporting runtime with a fake supervisor: occupancy during a callback,
+admissions, refusals by reason, both `Not_admitted` operations, lease expiry,
+worker-level outcomes, every documented family, the label allow-list, and no
+execution identifier in the scrape); and the live
+`test/integration/worker_metrics/regression.exe`, which now also requires the
+SDK families, an admitted and timed callback, and one `clean` shutdown in a
+scrape taken after `Worker.shutdown` (CI only, Compose). Locally:
+`dune build --root . @install`, `dune runtest --root .`, the Rust test above,
+`cargo clippy --locked --all-targets -- -D warnings` and `cargo fmt --check`.
 ## 2026-10-16: Rust toolchain 1.99.1 at every pin
 
 The exact Rust compiler moved from 1.99.0 to 1.99.1 in one change across

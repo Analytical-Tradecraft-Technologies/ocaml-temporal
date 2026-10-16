@@ -53,6 +53,9 @@ typedef struct ocaml_temporal_core_runtime ocaml_temporal_core_runtime;
 /* A Core runtime (Tokio executor) shared by several runtime graphs (#832). */
 typedef struct ocaml_temporal_core_shared_runtime
     ocaml_temporal_core_shared_runtime;
+/* SDK-side metrics recorder over a shared runtime's Core meter (#500). */
+typedef struct ocaml_temporal_core_metric_meter
+    ocaml_temporal_core_metric_meter;
 typedef struct ocaml_temporal_core_client ocaml_temporal_core_client;
 typedef struct ocaml_temporal_core_worker ocaml_temporal_core_worker;
 
@@ -527,6 +530,46 @@ ocaml_temporal_core_status ocaml_temporal_core_v4_shared_runtime_free(
  */
 ocaml_temporal_core_status ocaml_temporal_core_v4_shared_runtime_dispose(
     ocaml_temporal_core_shared_runtime **shared);
+
+/*
+ * Create an SDK metrics recorder over `shared`'s Core meter (#500). On
+ * success `*meter` receives an owned handle, or stays NULL when the runtime
+ * has no metrics exporter. The handle references Core's meter, not Core, so
+ * it may outlive `shared`; release it once with metric_meter_free. A
+ * released `shared` fails with OCAML_TEMPORAL_CORE_STATUS_INVALID_STATE.
+ */
+ocaml_temporal_core_status ocaml_temporal_core_v4_shared_runtime_metric_meter(
+    const ocaml_temporal_core_shared_runtime *shared,
+    ocaml_temporal_core_metric_meter **meter,
+    ocaml_temporal_core_result *output);
+
+/*
+ * Register one SDK metric series from a strict UTF-8 JSON document of at
+ * most 8 KiB and store its identifier in `*id` (UINT32_MAX on failure).
+ * Registering an identical series again returns the same identifier.
+ * Concurrent calls on one live handle are permitted.
+ */
+ocaml_temporal_core_status ocaml_temporal_core_v4_metric_meter_register_json(
+    const ocaml_temporal_core_metric_meter *meter, const uint8_t *input,
+    size_t input_len, uint32_t *id, ocaml_temporal_core_result *output);
+
+/*
+ * Record `value` into series `id`. Allocates no result and never blocks on
+ * I/O, so it may be called with the OCaml runtime lock held, from any
+ * thread. Unsigned instruments reject a negative value with
+ * OCAML_TEMPORAL_CORE_STATUS_INVALID_ARGUMENT; a duration histogram reads
+ * microseconds.
+ */
+ocaml_temporal_core_status ocaml_temporal_core_v4_metric_meter_record(
+    const ocaml_temporal_core_metric_meter *meter, uint32_t id, int64_t value);
+
+/*
+ * Release an SDK metrics recorder and clear the slot. Touches only memory,
+ * so it is safe from a GC finalizer. Calling again with the now-null slot is
+ * safe.
+ */
+ocaml_temporal_core_status ocaml_temporal_core_v4_metric_meter_free(
+    ocaml_temporal_core_metric_meter **meter);
 
 ocaml_temporal_core_status ocaml_temporal_core_v4_result_free(
     ocaml_temporal_core_result *result);
