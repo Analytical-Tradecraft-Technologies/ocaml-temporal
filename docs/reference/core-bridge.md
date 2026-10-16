@@ -930,6 +930,68 @@ handle from escaping through an otherwise convenient callback. See
 [ADR 0004](../decisions/0004-sdk-instance-supervisor.md) for its lifecycle,
 failure, and scheduler contracts.
 
+### SDK metric meter (#500)
+
+Core records its own worker and client metrics, but some worker states exist
+only in the OCaml SDK (activity-lane occupancy, refused tasks, retained
+completion retries, shutdown outcomes, expired asynchronous leases). Four
+additive version 4 symbols let the SDK record them into the same Prometheus
+registry as Core's instruments, so they share the endpoint, Core's
+`temporal_` prefix, its `service_name` label, and the runtime's global tags.
+An older archive lacks the symbols, so a stale pairing fails at link time.
+
+- `ocaml_temporal_core_v4_shared_runtime_metric_meter(shared, &meter, out)`
+  returns an owned `MetricMeter` built from Core's prefixed meter
+  (`get_temporal_metric_meter`), or leaves `*meter` null when the runtime has
+  no exporter; the SDK then records nothing at all. The meter holds a clone
+  of Core's meter (the Prometheus registry), not of `SharedCore`, so it never
+  keeps Core's Tokio runtime alive and may outlive the shared handle and every
+  attached graph; recording afterwards updates a registry nobody scrapes. A
+  null `shared` (which is what the C gate passes for a closed owner) is
+  `INVALID_ARGUMENT`.
+- `ocaml_temporal_core_v4_metric_meter_register_json(meter, input, input_len,
+  &id, out)` registers one series from a strict document of at most 8 KiB:
+  `{"kind": K, "name": N, "description": D, "labels": [{"name": L, "value":
+  V}, ...]}`, with `K` one of `counter`, `up_down_counter`, `gauge`,
+  `histogram`, `duration_histogram`. Names are `[a-z_][a-z0-9_]*` up to 128
+  bytes, without `__` or the `temporal_` prefix Core adds; at most 8 labels,
+  names `[a-z_][a-z0-9_]*` up to 64 bytes, unique, not `le`, `quantile`,
+  `service_name` or a configured global tag; values 1 to 256 bytes without
+  control characters; descriptions up to 512 bytes without control
+  characters; one name keeps one kind and one description; at most 1,024
+  series per meter. A violation is `CONFIGURATION` with a message that names
+  the rule, never the rejected text, and `*id` is `UINT32_MAX`. An identical
+  registration returns the first identifier, so two workers on one task queue
+  share their series. Each series is bound to its label set once here.
+- `ocaml_temporal_core_v4_metric_meter_record(meter, id, value)` is the hot
+  path: no result, no allocation once the series has been recorded into, only
+  a read lock, no I/O. A counter, gauge or histogram needs `value >= 0`; an
+  up-down counter adds the signed delta (exported as a gauge); a duration
+  histogram reads microseconds and Core exports it in milliseconds, or in
+  seconds with `durations_as_seconds`. An unknown identifier or a negative
+  unsigned value is `INVALID_ARGUMENT`; a panic is contained as `PANIC`.
+- `ocaml_temporal_core_v4_metric_meter_free(&meter)` clears the slot and drops
+  the meter. It touches only memory, never Core or Tokio, so the OCaml
+  custom-block finalizer calls it directly.
+
+OCaml ownership: `Native_bridge.metric_meter` is a custom block whose payload
+is the Rust pointer (possibly null). It is never released explicitly, only by
+its finalizer once no OCaml value can reach it, so no borrow gate is needed
+and recorders on several Domains can never observe a freed handle. The record
+stub keeps the runtime lock and is `[@@noalloc]`; the register stub borrows
+the OCaml string in place for the same reason (Rust neither calls back nor
+retains it). `Sdk_shared_runtime` creates the meter once with the runtime, so
+every worker on it shares one set of series; `Native_worker_metrics` registers
+a worker's fixed series and records into them.
+
+Tests: `rust/core-bridge/tests/sdk_metrics.rs` registers every kind,
+records, and reads the values back from the runtime's real scrape (with Core's
+prefix, `service_name` and the global tag); checks every registration bound,
+the kind and description conflict rule, identifier reuse, the series cap and
+the recording errors; checks that a runtime without an exporter has no meter
+and that a meter outlives its runtime safely; and records from eight threads
+at once with an exact total.
+
 ### Lifecycle configuration JSON
 
 The OCaml wrapper constructs two private JSON documents; applications never

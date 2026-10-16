@@ -1396,3 +1396,73 @@ let runtime_attach shared =
   |> report_shared_lifecycle ~operation:"runtime_attach"
        ~ok_message:"runtime attached to shared runtime"
        ~error_message:"runtime attach failed"
+
+(** SDK metrics recorder of a shared runtime (#500); see the interface. The
+    C payload is the Rust handle, or NULL when the runtime has no exporter;
+    only the GC finalizer releases it. *)
+type metric_meter
+
+(** Kind of one SDK metric series; fixed per metric name. *)
+type metric_kind =
+  | Counter
+  | Up_down_counter
+  | Gauge
+  | Histogram
+  | Duration_histogram
+
+external shared_runtime_metric_meter_raw :
+  shared_runtime -> metric_meter * response
+  = "ocaml_temporal_shared_runtime_metric_meter"
+
+external metric_meter_enabled : metric_meter -> bool
+  = "ocaml_temporal_metric_meter_enabled"
+[@@noalloc]
+
+external metric_register_raw : metric_meter -> string -> int * response
+  = "ocaml_temporal_metric_meter_register"
+
+(** The hot recording path: allocation-free on both sides of the boundary,
+    and it never releases the runtime lock (Rust takes only a read lock and
+    performs no I/O). Returns the bridge status code. *)
+external metric_record_raw : metric_meter -> int -> int -> int
+  = "ocaml_temporal_metric_meter_record"
+[@@noalloc]
+
+let shared_runtime_metric_meter shared =
+  let meter, response = shared_runtime_metric_meter_raw shared in
+  match decode response with
+  | Ok _ -> Ok (if metric_meter_enabled meter then Some meter else None)
+  | Error _ as error -> error
+
+(** The registration document's [kind] member. *)
+let metric_kind_name = function
+  | Counter -> "counter"
+  | Up_down_counter -> "up_down_counter"
+  | Gauge -> "gauge"
+  | Histogram -> "histogram"
+  | Duration_histogram -> "duration_histogram"
+
+let metric_register meter ~kind ~name ~description ~labels =
+  let document =
+    `Assoc
+      [
+        ("kind", `String (metric_kind_name kind));
+        ("name", `String name);
+        ("description", `String description);
+        ( "labels",
+          `List
+            (List.map
+               (fun (label, value) ->
+                 `Assoc [ ("name", `String label); ("value", `String value) ])
+               labels) );
+      ]
+  in
+  let id, response = metric_register_raw meter (Yojson.Safe.to_string document) in
+  match decode response with
+  | Ok _ when id >= 0 -> Ok id
+  | Ok _ ->
+      Error
+        { status = Internal; message = "metric registration returned no identifier" }
+  | Error _ as error -> error
+
+let metric_record meter id value = metric_record_raw meter id value = 0

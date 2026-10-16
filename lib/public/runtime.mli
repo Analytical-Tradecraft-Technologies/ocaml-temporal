@@ -41,6 +41,12 @@ type t = Temporal_sdk_kernel.Shared_runtime.t
     Temporal SDKs export, so existing dashboards and alerts apply. See
     [docs/reference/observability.md] for the list, units, and labels.
 
+    Workers also report a few states that only this SDK sees, under
+    [temporal_ocaml_] names: activity-lane occupancy and callback duration,
+    admitted and refused activity tasks, asynchronous activity operations
+    refused for back-pressure, expired asynchronous leases, completion
+    retries, detached lanes, and the outcome of every worker shutdown.
+
     Labels are bounded: namespace, task queue, workflow and activity type,
     and a few closed enumerations. Workflow IDs, run IDs, activity IDs,
     payloads, and credentials are never metric labels.

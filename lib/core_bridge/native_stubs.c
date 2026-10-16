@@ -807,6 +807,114 @@ CAMLprim value ocaml_temporal_shared_runtime_close(value shared) {
   CAMLreturn(Val_int(status));
 }
 
+/* SDK metrics recorder (#500). The custom block payload is the Rust handle
+ * pointer itself, possibly NULL when the runtime has no exporter. Unlike a
+ * runtime, a meter is never released explicitly: only this finalizer frees
+ * it, once no OCaml value can reach it, so no borrow gate is needed and
+ * concurrent recorders on several Domains can never observe a freed handle.
+ * Freeing touches only Rust memory (never Core or Tokio), which a finalizer
+ * may do. */
+static ocaml_temporal_core_metric_meter **Metric_meter_slot(value meter) {
+  return (ocaml_temporal_core_metric_meter **)Data_custom_val(meter);
+}
+
+/* GC release of a metric meter; a NULL payload is a no-op in Rust. */
+static void finalize_metric_meter(value meter) {
+  (void)ocaml_temporal_core_v4_metric_meter_free(Metric_meter_slot(meter));
+}
+
+/* Metric meters are identity resources, like [runtime_operations]. */
+static struct custom_operations metric_meter_operations = {
+    .identifier = "org.ocaml-temporal.native-metric-meter.v1",
+    .finalize = finalize_metric_meter,
+    .compare = custom_compare_default,
+    .hash = custom_hash_default,
+    .serialize = custom_serialize_default,
+    .deserialize = custom_deserialize_default,
+    .compare_ext = custom_compare_ext_default,
+    .fixed_length = NULL,
+};
+
+/* Create the SDK metrics recorder of a shared runtime and return
+ * (meter, response). The meter block is allocated, NULL-initialized, before
+ * Rust runs so a later allocation failure cannot orphan the handle. The
+ * shared pointer is borrowed through its gate; a closed owner passes NULL
+ * and Rust reports its typed invalid-argument status. The call is short and
+ * performs no I/O, so the runtime lock is kept. */
+CAMLprim value ocaml_temporal_shared_runtime_metric_meter(value shared) {
+  CAMLparam1(shared);
+  CAMLlocal3(meter, response, pair);
+  owned_shared_runtime *shared_owner = Shared_runtime_val(shared);
+  ocaml_temporal_core_shared_runtime *native_shared = NULL;
+  ocaml_temporal_core_metric_meter *native_meter = NULL;
+  ocaml_temporal_core_result native_result = {0};
+  int admitted;
+
+  meter = caml_alloc_custom(&metric_meter_operations,
+                            sizeof(ocaml_temporal_core_metric_meter *), 0, 1);
+  *Metric_meter_slot(meter) = NULL;
+  response = alloc_response();
+
+  admitted = acquire_shared_runtime(shared_owner, &native_shared);
+  (void)ocaml_temporal_core_v4_shared_runtime_metric_meter(
+      native_shared, &native_meter, &native_result);
+  if (admitted) {
+    atomic_fetch_sub_explicit(&shared_owner->active_calls, 1,
+                              memory_order_seq_cst);
+  }
+
+  *Metric_meter_slot(meter) = native_meter;
+  Response_val(response)->result = native_result;
+
+  pair = caml_alloc_tuple(2);
+  Store_field(pair, 0, meter);
+  Store_field(pair, 1, response);
+  CAMLreturn(pair);
+}
+
+/* Whether a meter block holds a Rust handle; false when the runtime has no
+ * exporter. Allocation-free. */
+CAMLprim value ocaml_temporal_metric_meter_enabled(value meter) {
+  return Val_bool(*Metric_meter_slot(meter) != NULL);
+}
+
+/* Register one series from a strict JSON document and return (id,
+ * response); id is -1 on failure. The string is borrowed in place: the
+ * runtime lock is held for the whole call and Rust neither allocates OCaml
+ * memory nor retains the pointer, so the GC cannot move it meanwhile. */
+CAMLprim value ocaml_temporal_metric_meter_register(value meter, value input) {
+  CAMLparam2(meter, input);
+  CAMLlocal2(response, pair);
+  ocaml_temporal_core_result native_result = {0};
+  uint32_t id = UINT32_MAX;
+
+  response = alloc_response();
+  (void)ocaml_temporal_core_v4_metric_meter_register_json(
+      *Metric_meter_slot(meter), (const uint8_t *)String_val(input),
+      caml_string_length(input), &id, &native_result);
+  Response_val(response)->result = native_result;
+
+  pair = caml_alloc_tuple(2);
+  Store_field(pair, 0, id == UINT32_MAX ? Val_long(-1) : Val_long((intnat)id));
+  Store_field(pair, 1, response);
+  CAMLreturn(pair);
+}
+
+/* Record one value into series [id] and return the bridge status. This is
+ * the SDK's metrics hot path: it allocates nothing on either side of the
+ * boundary and keeps the runtime lock (Rust takes only a read lock and does
+ * no I/O), so the OCaml external is [@@noalloc]. An identifier outside the
+ * u32 range is refused here before reaching Rust. */
+CAMLprim value ocaml_temporal_metric_meter_record(value meter, value id,
+                                                  value amount) {
+  intnat raw_id = Long_val(id);
+  if (raw_id < 0 || (uintnat)raw_id >= UINT32_MAX) {
+    return Val_int(OCAML_TEMPORAL_CORE_STATUS_INVALID_ARGUMENT);
+  }
+  return Val_int(ocaml_temporal_core_v4_metric_meter_record(
+      *Metric_meter_slot(meter), (uint32_t)raw_id, (int64_t)Long_val(amount)));
+}
+
 /* Connect the official client using a strict JSON configuration while the
  * OCaml runtime lock is available to other Domains. */
 CAMLprim value ocaml_temporal_client_connect(value runtime, value input) {

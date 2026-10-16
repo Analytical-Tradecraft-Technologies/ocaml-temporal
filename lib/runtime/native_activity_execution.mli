@@ -263,6 +263,14 @@ module Make (Supervisor : SUPERVISOR) : sig
       async lease instead. *)
   val callback_running : t -> bool
 
+  (** Makes the adapter record its SDK-side metrics (#500) into [metrics]:
+      callbacks admitted, running and their duration, tasks refused (by
+      reason), asynchronous operations the bridge did not admit (#1104),
+      and expired asynchronous leases (#1043). A new adapter records
+      nothing. Call it once, before the first {!poll}; recording never
+      affects the adapter's behavior. *)
+  val attach_metrics : t -> Native_worker_metrics.t -> unit
+
   (** The number of admitted asynchronous activity leases ([WillCompleteAsync]
       handoffs Core accepted that external code has not yet completed), read
       without the adapter lock that a running callback holds (#495). These
