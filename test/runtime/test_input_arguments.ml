@@ -75,7 +75,7 @@ let check_codec : type a. string -> a Temporal.Codec.t -> a ->
   expect (label ^ " external signal") expected
     (commands_of (fun () ->
          Temporal.Workflow.signal_external_workflow ~workflow_id:"target"
-           ~run_id:"" ~signal ~input:value))
+           ~signal ~input:value ()))
 
 let () =
   (* A unit input is a call with no arguments. *)

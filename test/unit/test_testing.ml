@@ -661,11 +661,11 @@ let sender_workflow =
       let* () =
         T.Future.await
           (T.Workflow.signal_external_workflow ~workflow_id:"cart-target"
-             ~run_id:"" ~signal:add_item_signal ~input:item)
+             ~signal:add_item_signal ~input:item ())
       in
       T.Future.await
         (T.Workflow.signal_external_workflow ~workflow_id:"cart-target"
-           ~run_id:"" ~signal:close_signal ~input:()))
+           ~signal:close_signal ~input:() ()))
 
 (** One workflow signals another through the environment, and signalling a
     workflow that does not exist fails the sender's future. *)
@@ -712,7 +712,7 @@ let fire_and_forget_workflow =
            ~id:("abandoned-" ^ id) abandoned_child id);
       ignore
         (T.Workflow.signal_external_workflow ~workflow_id:"cart-final"
-           ~run_id:"" ~signal:add_item_signal ~input:id);
+           ~signal:add_item_signal ~input:id ());
       Ok ())
 
 (** Commands emitted in a run's final activation are not executed (#1035). *)
@@ -760,8 +760,8 @@ let bumper_workflow =
     (fun () ->
       let* () = T.Workflow.sleep (T.Duration.of_ms 1_000L) in
       T.Future.await
-        (T.Workflow.signal_external_workflow ~workflow_id:"r" ~run_id:""
-           ~signal:bump_signal ~input:()))
+        (T.Workflow.signal_external_workflow ~workflow_id:"r"
+           ~signal:bump_signal ~input:() ()))
 
 (** A signal and a timer that land in one activation are delivered in Core's
     order, signal first, so the acknowledged signal's handler runs before the
