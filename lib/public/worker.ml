@@ -718,19 +718,7 @@ let collect_activities definitions =
 
 (** Creates the private backend only after all local registration invariants are
     proven. This ordering prevents leaked graphs on invalid definitions. *)
-let resolve_options options max_cached_workflows =
-  match (options, max_cached_workflows) with
-  | Some _, Some _ ->
-      Error
-        (Error.defect
-           ~message:
-             "Worker.create accepts either ~options or ~max_cached_workflows, not both")
-  | Some options, None -> Ok options
-  | None, Some max_cached_workflows ->
-      Options.make ~max_cached_workflows ()
-  | None, None -> Ok Options.default
-
-let create ?identity ?options ?max_cached_workflows ?io_threads ?runtime
+let create ?identity ?(options = Options.default) ?io_threads ?runtime
     ~target_url
     ~namespace ~task_queue ~workflows ~activities () =
   match Backend.validate_io_threads io_threads with
@@ -739,9 +727,6 @@ let create ?identity ?options ?max_cached_workflows ?io_threads ?runtime
   match Backend.validate_runtime_source ~io_threads ~runtime with
   | Error error -> Error error
   | Ok () ->
-  match resolve_options options max_cached_workflows with
-  | Error error -> Error error
-  | Ok options ->
     let effective_max_cached_workflows =
       Options.max_cached_workflows options
     in

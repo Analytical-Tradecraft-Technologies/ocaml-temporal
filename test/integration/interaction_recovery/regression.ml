@@ -134,7 +134,8 @@ let worker address queue cache =
   let max_cached_workflows = match cache with
     | "default" -> None
     | bound -> Some (int_of_string bound) in
-  let worker = get (Worker.create ?max_cached_workflows ~target_url:address
+  let options = get (Worker.Options.make ?max_cached_workflows ()) in
+  let worker = get (Worker.create ~options ~target_url:address
     ~namespace:"default" ~task_queue:queue ~activities:[]
     ~workflows:[
       Worker.workflow workflow

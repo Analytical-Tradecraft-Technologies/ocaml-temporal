@@ -337,13 +337,9 @@ type t
     [Workflow.sleep] return defects. It is not a
     workflow test environment. An [http://] or [https://]
     target creates the OCaml-owned native Core worker and its private Rust
-    bridge. [max_cached_workflows] optionally bounds Core's sticky workflow
-    cache; omitting it preserves the default, while a small positive bound can
-    cause explicit cache-eviction activations that the worker acknowledges with
-    an empty completion. Passing both [options] and [max_cached_workflows] is
-    a typed defect. Every other resource and shutdown setting comes from
-    [options] and is validated by {!Options.make}; {!options} reports the
-    effective values. An explicit [identity] is used unchanged and must be
+    bridge. Every routing, resource, and shutdown setting, including the
+    sticky-cache bound, comes from [options] (default {!Options.default}) and
+    is validated by {!Options.make}; {!options} reports the effective values. An explicit [identity] is used unchanged and must be
     non-empty and NUL-free. When omitted, the
     identity defaults to [<pid>@<hostname>], matching the official Temporal
     SDKs, computed once when the worker is created so pollers from different
@@ -367,7 +363,6 @@ type t
 val create :
   ?identity:string ->
   ?options:Options.t ->
-  ?max_cached_workflows:int ->
   ?io_threads:int ->
   ?runtime:Runtime.t ->
   target_url:string ->
@@ -402,9 +397,7 @@ val run : t -> (unit, Error.t) result
 
 (** The options the worker was created with. The [Options] accessors report
     each effective setting, defaults included, and none of them carries a
-    credential, so the result is safe to log for diagnostics. A worker
-    created with [~max_cached_workflows] alone reports options holding that
-    bound. *)
+    credential, so the result is safe to log for diagnostics. *)
 val options : t -> Options.t
 
 (** Reports whether the workflow activation watchdog has detected workflow

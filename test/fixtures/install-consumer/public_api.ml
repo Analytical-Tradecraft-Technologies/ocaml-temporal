@@ -811,7 +811,6 @@ let _worker_activity :
 let _worker_create :
     ?identity:string ->
     ?options:T.Worker.Options.t ->
-    ?max_cached_workflows:int ->
     ?io_threads:int ->
     ?runtime:T.Runtime.t ->
     target_url:string ->

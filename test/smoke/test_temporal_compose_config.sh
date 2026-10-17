@@ -184,7 +184,7 @@ require_source_text "$worker_dune" 'temporal-sdk'
 require_source_text "$worker_dune" 'temporal_two_binary_smoke_common'
 require_source_text "$worker" 'module Worker = Temporal.Worker'
 require_source_text "$worker" \
-  'Worker.create ?max_cached_workflows ~target_url ~namespace'
+  'Worker.create ~options ~target_url ~namespace'
 require_source_text "$worker" 'Worker.run worker'
 require_source_text "$worker" 'Worker.shutdown worker'
 # Keep both live query handlers registered. The typed-input handler is on a
@@ -202,7 +202,7 @@ require_source_absent "$worker" 'Client.wait'
 # refactor cannot silently reconnect the driver to the noisy all-workflow
 # worker and reintroduce the original cache-pressure race.
 require_source_text "$cache_worker" 'module Worker = Temporal.Worker'
-require_source_text "$cache_worker" '~max_cached_workflows:1'
+require_source_text "$cache_worker" 'Worker.Options.make ~max_cached_workflows:1'
 require_source_text "$cache_worker" 'Worker.run worker'
 require_source_absent "$cache_worker" 'Client.start'
 

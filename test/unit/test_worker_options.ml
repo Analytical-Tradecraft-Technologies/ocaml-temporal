@@ -200,16 +200,16 @@ let test_invalid_rates () =
        (Options.make ~max_worker_activities_per_second:(1.0 /. 86_400.0)
           ~max_task_queue_activities_per_second:Float.min_float ()))
 
-(** A worker reports the options it was created with, and the legacy
-    [~max_cached_workflows] argument is folded into those options. *)
+(** A worker reports the options it was created with, and the default options
+    when none are given. *)
 let test_worker_reports_options () =
   let workflow =
     Temporal.Workflow.define ~name:"unit.options-workflow"
       ~input:Temporal.Codec.unit ~output:Temporal.Codec.unit (fun () -> Ok ())
   in
-  let create ?options ?max_cached_workflows () =
+  let create ?options () =
     unwrap
-      (Temporal.Worker.create ?options ?max_cached_workflows
+      (Temporal.Worker.create ?options
          ~target_url:"mock://options" ~namespace:"unit-test"
          ~task_queue:"unit-test"
          ~workflows:[ Temporal.Worker.workflow workflow ]
@@ -225,10 +225,9 @@ let test_worker_reports_options () =
   assert (same_duration (ms 1_000L) (Options.graceful_shutdown_period reported));
   assert (Options.max_worker_activities_per_second reported = Some 3.0);
   unwrap (Temporal.Worker.shutdown worker);
-  let legacy = create ~max_cached_workflows:7 () in
-  assert (
-    Options.max_cached_workflows (Temporal.Worker.options legacy) = Some 7);
-  unwrap (Temporal.Worker.shutdown legacy)
+  let defaulted = create () in
+  assert (Options.max_cached_workflows (Temporal.Worker.options defaulted) = None);
+  unwrap (Temporal.Worker.shutdown defaulted)
 
 (** Fully tuned options pass the private bridge's own validation: worker
     creation against an unreachable port reaches the client connection,
