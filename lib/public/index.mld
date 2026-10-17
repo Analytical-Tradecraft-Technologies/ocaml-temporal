@@ -120,6 +120,7 @@ Temporal.Codec
 Temporal.Payload
 Temporal.Error
 Temporal.Result_syntax
+Temporal.Retry_policy
 Temporal.Duration
 Temporal.Time
 Temporal.Workflow_context

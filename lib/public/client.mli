@@ -287,7 +287,7 @@ val create :
 
     [retry_policy] asks Temporal to retry a failed or timed-out run as a new
     run of the same workflow ID. Omitted, a workflow is not retried. The
-    policy is the same validated {!Activity.Retry_policy.t} used for
+    policy is the same validated {!Retry_policy.t} used for
     activities. An exact-run {!wait} on a run that was retried returns
     [Failed] with the error that caused the retry, or [Timed_out], with the
     retry run as its successor; it never reports a retry as
@@ -341,7 +341,7 @@ val start :
   ?execution_timeout:Duration.t ->
   ?run_timeout:Duration.t ->
   ?task_timeout:Duration.t ->
-  ?retry_policy:Activity.Retry_policy.t ->
+  ?retry_policy:Retry_policy.t ->
   ?rpc_timeout:Duration.t ->
   workflow:('input, 'output) Workflow.t ->
   task_queue:string ->

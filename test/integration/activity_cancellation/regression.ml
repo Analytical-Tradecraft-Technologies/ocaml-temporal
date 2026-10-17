@@ -153,7 +153,7 @@ let heartbeat_timeout =
     ~input:Codec.string ~output:Codec.string (fun label ->
       let retry_policy =
         get
-          (Activity.Retry_policy.make ~initial_interval:(Duration.of_ms 1_000L)
+          (Retry_policy.make ~initial_interval:(Duration.of_ms 1_000L)
              ~backoff_coefficient:1.0 ~maximum_interval:(Duration.of_ms 1_000L)
              ~maximum_attempts:1 ())
       in

@@ -27,6 +27,7 @@ module Payload = Payload
 module Query = Query
 module Replay = Replay
 module Result_syntax = Result_syntax
+module Retry_policy = Retry_policy
 module Runtime = Runtime
 module Runtime_info = Runtime_info
 module Scope = Scope

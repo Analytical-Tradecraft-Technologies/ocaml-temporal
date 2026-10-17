@@ -218,7 +218,7 @@ let _activity_execute :
     ?schedule_to_start_timeout:T.Duration.t ->
     ?start_to_close_timeout:T.Duration.t ->
     ?heartbeat_timeout:T.Duration.t ->
-    ?retry_policy:T.Activity.Retry_policy.t ->
+    ?retry_policy:T.Retry_policy.t ->
     ?priority:T.Activity.Priority.t ->
     ?cancellation_type:T.Activity.cancellation_type ->
     ?do_not_eagerly_execute:bool ->
@@ -241,28 +241,28 @@ let _activity_retry_policy_make :
     maximum_interval:T.Duration.t ->
     maximum_attempts:int ->
     ?non_retryable_error_types:string list ->
-    unit -> (T.Activity.Retry_policy.t, T.Error.t) result =
-  T.Activity.Retry_policy.make
+    unit -> (T.Retry_policy.t, T.Error.t) result =
+  T.Retry_policy.make
 
 let _activity_retry_policy_initial_interval :
-    T.Activity.Retry_policy.t -> T.Duration.t =
-  T.Activity.Retry_policy.initial_interval
+    T.Retry_policy.t -> T.Duration.t =
+  T.Retry_policy.initial_interval
 
 let _activity_retry_policy_backoff :
-    T.Activity.Retry_policy.t -> float =
-  T.Activity.Retry_policy.backoff_coefficient
+    T.Retry_policy.t -> float =
+  T.Retry_policy.backoff_coefficient
 
 let _activity_retry_policy_maximum_interval :
-    T.Activity.Retry_policy.t -> T.Duration.t =
-  T.Activity.Retry_policy.maximum_interval
+    T.Retry_policy.t -> T.Duration.t =
+  T.Retry_policy.maximum_interval
 
 let _activity_retry_policy_maximum_attempts :
-    T.Activity.Retry_policy.t -> int =
-  T.Activity.Retry_policy.maximum_attempts
+    T.Retry_policy.t -> int =
+  T.Retry_policy.maximum_attempts
 
 let _activity_retry_policy_non_retryable :
-    T.Activity.Retry_policy.t -> string list =
-  T.Activity.Retry_policy.non_retryable_error_types
+    T.Retry_policy.t -> string list =
+  T.Retry_policy.non_retryable_error_types
 
 let _activity_start_handle :
     ?scope:T.Scope.t ->
@@ -272,7 +272,7 @@ let _activity_start_handle :
     ?schedule_to_start_timeout:T.Duration.t ->
     ?start_to_close_timeout:T.Duration.t ->
     ?heartbeat_timeout:T.Duration.t ->
-    ?retry_policy:T.Activity.Retry_policy.t ->
+    ?retry_policy:T.Retry_policy.t ->
     ?priority:T.Activity.Priority.t ->
     ?cancellation_type:T.Activity.cancellation_type ->
     ?do_not_eagerly_execute:bool ->
@@ -288,7 +288,7 @@ let _activity_start :
     ?schedule_to_start_timeout:T.Duration.t ->
     ?start_to_close_timeout:T.Duration.t ->
     ?heartbeat_timeout:T.Duration.t ->
-    ?retry_policy:T.Activity.Retry_policy.t ->
+    ?retry_policy:T.Retry_policy.t ->
     ?priority:T.Activity.Priority.t ->
     ?cancellation_type:T.Activity.cancellation_type ->
     ?do_not_eagerly_execute:bool ->
@@ -299,7 +299,7 @@ let _activity_start :
 let _child_start :
     ?scope:T.Scope.t ->
     ?cancellation_type:T.Child_workflow.cancellation_type ->
-    ?retry_policy:T.Activity.Retry_policy.t ->
+    ?retry_policy:T.Retry_policy.t ->
     ?task_queue:string ->
     ?parent_close_policy:T.Child_workflow.Parent_close_policy.t ->
     id:string ->
@@ -311,7 +311,7 @@ let _child_start :
 let _child_start_handle :
     ?scope:T.Scope.t ->
     ?cancellation_type:T.Child_workflow.cancellation_type ->
-    ?retry_policy:T.Activity.Retry_policy.t ->
+    ?retry_policy:T.Retry_policy.t ->
     ?task_queue:string ->
     ?parent_close_policy:T.Child_workflow.Parent_close_policy.t ->
     id:string ->
@@ -335,7 +335,7 @@ let _child_cancel :
 let _child_execute :
     ?scope:T.Scope.t ->
     ?cancellation_type:T.Child_workflow.cancellation_type ->
-    ?retry_policy:T.Activity.Retry_policy.t ->
+    ?retry_policy:T.Retry_policy.t ->
     ?task_queue:string ->
     ?parent_close_policy:T.Child_workflow.Parent_close_policy.t ->
     id:string ->
@@ -653,7 +653,7 @@ let _client_start :
     ?execution_timeout:T.Duration.t ->
     ?run_timeout:T.Duration.t ->
     ?task_timeout:T.Duration.t ->
-    ?retry_policy:T.Activity.Retry_policy.t ->
+    ?retry_policy:T.Retry_policy.t ->
     ?rpc_timeout:T.Duration.t ->
     workflow:('input, 'output) T.Workflow.t ->
     task_queue:string ->
@@ -861,7 +861,7 @@ let _workflow_info_task_timeout : T.Workflow.Info.t -> T.Duration.t option =
   T.Workflow.Info.task_timeout
 
 let _workflow_info_retry_policy :
-    T.Workflow.Info.t -> T.Activity.Retry_policy.t option =
+    T.Workflow.Info.t -> T.Retry_policy.t option =
   T.Workflow.Info.retry_policy
 
 let _workflow_info_parent : T.Workflow.Info.t -> T.Workflow.Info.parent option =
@@ -1053,7 +1053,7 @@ let _activity_start_local :
     ?schedule_to_close_timeout:T.Duration.t ->
     ?schedule_to_start_timeout:T.Duration.t ->
     ?start_to_close_timeout:T.Duration.t ->
-    ?retry_policy:T.Activity.Retry_policy.t ->
+    ?retry_policy:T.Retry_policy.t ->
     ?cancellation_type:T.Activity.cancellation_type ->
     ('input, 'output) T.Activity.t ->
     'input -> ('output, T.Error.t) T.Future.t =
@@ -1064,7 +1064,7 @@ let _activity_execute_local :
     ?schedule_to_close_timeout:T.Duration.t ->
     ?schedule_to_start_timeout:T.Duration.t ->
     ?start_to_close_timeout:T.Duration.t ->
-    ?retry_policy:T.Activity.Retry_policy.t ->
+    ?retry_policy:T.Retry_policy.t ->
     ?cancellation_type:T.Activity.cancellation_type ->
     ('input, 'output) T.Activity.t ->
     'input -> ('output, T.Error.t) result =

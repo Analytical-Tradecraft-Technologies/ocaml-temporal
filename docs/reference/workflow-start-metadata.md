@@ -48,7 +48,7 @@ match Info.continuation_initiator info with
   recorded; Temporal records its 10 second task-timeout default when the
   starter supplied none. They are metadata only: the server enforces them and
   reading one schedules nothing.
-- `retry_policy` returns the effective policy as an `Activity.Retry_policy.t`
+- `retry_policy` returns the effective policy as a `Retry_policy.t`
   (Temporal fills omitted fields before recording it), or `None` when the run
   is not retried. The backoff coefficient keeps its exact IEEE-754 bits.
 - `continued_from_run_id` and `continuation_initiator` name the predecessor

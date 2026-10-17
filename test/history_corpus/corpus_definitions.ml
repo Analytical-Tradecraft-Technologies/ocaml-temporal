@@ -130,7 +130,7 @@ let timer_removed_workflow =
     backoff and three attempts. The activity needs exactly two. A constructor
     error is returned from the workflow as a typed defect. *)
 let retry_policy =
-  Temporal.Activity.Retry_policy.make
+  Temporal.Retry_policy.make
     ~initial_interval:(Temporal.Duration.of_ms 100L) ~backoff_coefficient:1.0
     ~maximum_interval:(Temporal.Duration.of_ms 100L) ~maximum_attempts:3 ()
 

@@ -260,7 +260,7 @@ let observe_start_policy () =
   | Error error -> failwith (Temporal.Error.message error)
   | Ok info ->
       let module Info = Temporal.Workflow.Info in
-      let module Policy = Temporal.Activity.Retry_policy in
+      let module Policy = Temporal.Retry_policy in
       let ms = Option.map Temporal.Duration.to_ms in
       {
         timeouts =

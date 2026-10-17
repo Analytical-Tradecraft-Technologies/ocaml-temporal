@@ -181,7 +181,7 @@ let flaky =
 (** A one-second, doubling retry policy with a bounded attempt budget. *)
 let retry_policy ~maximum_attempts =
   ok "retry policy"
-    (T.Activity.Retry_policy.make
+    (T.Retry_policy.make
        ~initial_interval:(T.Duration.of_ms 1_000L)
        ~backoff_coefficient:2.0
        ~maximum_interval:(T.Duration.of_ms 60_000L)

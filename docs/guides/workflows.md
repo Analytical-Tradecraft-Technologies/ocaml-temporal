@@ -619,7 +619,7 @@ optional retry policy:
 
 ```ocaml
 let policy =
-  Temporal.Activity.Retry_policy.make
+  Temporal.Retry_policy.make
     ~initial_interval:(Temporal.Duration.of_ms 1_000L)
     ~backoff_coefficient:1.5
     ~maximum_interval:(Temporal.Duration.of_ms 60_000L)
@@ -774,7 +774,7 @@ machine, so replay does not run an OCaml retry loop:
 
 ```ocaml
 let retry_policy =
-  Temporal.Activity.Retry_policy.make
+  Temporal.Retry_policy.make
     ~initial_interval:(Temporal.Duration.of_ms 1_000L)
     ~backoff_coefficient:2.0
     ~maximum_interval:(Temporal.Duration.of_ms 5_000L)

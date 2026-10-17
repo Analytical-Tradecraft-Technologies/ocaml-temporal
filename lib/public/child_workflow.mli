@@ -50,7 +50,7 @@ type 'output handle
 val start_handle :
   ?scope:Scope.t ->
   ?cancellation_type:cancellation_type ->
-  ?retry_policy:Activity.Retry_policy.t ->
+  ?retry_policy:Retry_policy.t ->
   ?task_queue:string ->
   ?parent_close_policy:Parent_close_policy.t ->
   id:string ->
@@ -104,7 +104,7 @@ val cancel :
 val start :
   ?scope:Scope.t ->
   ?cancellation_type:cancellation_type ->
-  ?retry_policy:Activity.Retry_policy.t ->
+  ?retry_policy:Retry_policy.t ->
   ?task_queue:string ->
   ?parent_close_policy:Parent_close_policy.t ->
   id:string ->
@@ -120,7 +120,7 @@ val start :
 val execute :
   ?scope:Scope.t ->
   ?cancellation_type:cancellation_type ->
-  ?retry_policy:Activity.Retry_policy.t ->
+  ?retry_policy:Retry_policy.t ->
   ?task_queue:string ->
   ?parent_close_policy:Parent_close_policy.t ->
   id:string ->

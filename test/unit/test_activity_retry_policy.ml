@@ -1,4 +1,4 @@
-module Retry_policy = Temporal.Activity.Retry_policy
+module Retry_policy = Temporal.Retry_policy
 
 (** Builds a valid policy shared by the accessor and boundary tests. *)
 let valid_policy () =
