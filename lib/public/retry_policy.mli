@@ -1,6 +1,6 @@
 (** A deterministic Temporal retry policy, shared by activities
-    ({!Activity.start}), child workflows ({!Child_workflow.start}), and
-    client-started workflows ({!Client.start}).
+    ([Activity.start]), child workflows ([Child_workflow.start]), and
+    client-started workflows ([Client.start]).
 
     [initial_interval] and [maximum_interval] are positive whole-millisecond
     durations, with the maximum at least as large as the initial delay.
