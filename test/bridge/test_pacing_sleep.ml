@@ -22,10 +22,18 @@ let timed_sleep seconds =
   Bridge.pacing_sleep seconds;
   now () -. started
 
-(** Requests that are not positive return at once. *)
+(** Requests that are not positive return at once. Each request is timed
+    several times and judged on its fastest run: a loaded CI runner can
+    preempt any single call for longer than a timer tick, but a stub that
+    actually slept would make every run at least that long. *)
 let test_non_positive_requests () =
   List.iter
-    (fun seconds -> assert (timed_sleep seconds < windows_tick_s))
+    (fun seconds ->
+      let fastest =
+        List.fold_left Float.min Float.infinity
+          (List.init 5 (fun _ -> timed_sleep seconds))
+      in
+      assert (fastest < windows_tick_s))
     [ 0.; -1.; Float.nan; Float.neg_infinity ]
 
 (** A request sleeps about as long as asked, and a 1 ms request typically
