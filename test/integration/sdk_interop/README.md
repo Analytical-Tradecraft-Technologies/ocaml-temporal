@@ -6,7 +6,7 @@ Temporal SDK interoperate with an OCaml workflow through the default
 `temporalio` 1.33.0 (MIT), pinned with its whole dependency closure by
 SHA-256 digest in [`python/requirements.lock`](python/requirements.lock) and
 inventoried in [dependencies](../../../docs/dependencies.md#ci-only-interoperability-tooling).
-It runs only in the digest-pinned `python:3.14-slim-bookworm` image as the
+It runs only in the digest-pinned `python:3.15-slim-bookworm` image as the
 `sdk-interop-python` Compose service; the OCaml development image never gains
 Python.
 

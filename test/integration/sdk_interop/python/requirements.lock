@@ -1,6 +1,6 @@
 # Official Temporal Python SDK closure for the CI-only interoperability
-# regression (#517), resolved for CPython 3.14 with prebuilt wheels only:
-#   uv pip compile --generate-hashes --python-version 3.14 --only-binary :all:
+# regression (#517), resolved for CPython 3.15 with prebuilt wheels only:
+#   uv pip compile --generate-hashes --python-version 3.15 --only-binary :all:
 # Installed by run-driver.sh with --require-hashes --no-deps inside the pinned
 # python image; never part of the OCaml SDK, its lock, or its artifacts.
 # Every package row is mirrored in docs/dependencies.md and checked by

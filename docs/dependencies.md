@@ -177,7 +177,7 @@ Packages the docs stage reuses from the SDK lock (`dune`, `ocamlfind`,
 The [official-SDK interoperability regression](../test/integration/sdk_interop/README.md)
 (#517) drives OCaml workflows from the official Temporal Python SDK. The
 SDK and its runtime dependencies are installed only inside the digest-pinned
-`python:3.14-slim-bookworm` image listed under
+`python:3.15-slim-bookworm` image listed under
 [toolchain and CI images](#toolchain-and-ci-images), into a throwaway virtual
 environment, by `test/integration/sdk_interop/python/run-driver.sh`. That
 script installs `test/integration/sdk_interop/python/requirements.lock` with
@@ -321,7 +321,7 @@ Python image is linked into or redistributed with the SDK.
 | Image | Manifest index digest | Used by | Native platforms | License |
 |---|---|---|---|---|
 | `rust:1.99-bookworm` | `sha256:e12566d5abc17a0da741628782cdb504b68b8961f5bfcf677936bf3e8b32de29` | `Dockerfile.dev` Rust toolchain stage and `Dockerfile.rust-ci` | Linux amd64 and arm64/v8 | Rust is Apache-2.0 OR MIT; image packaging (`rust-lang/docker-rust`) is Apache-2.0 OR MIT |
-| `python:3.14-slim-bookworm` | `sha256:48b13b003dda20b16f9442b8475aa05fe21bf6579a8c881db92ffb4d8fd20f83` | Cargo license audit, release-preflight Cargo SBOM generation and audit, the official-SDK interoperability driver, and its Python license audit (CI-only) | Linux amd64, arm64/v8, and additional official architectures | CPython's PSF license stack (SPDX `Python-2.0`); image packaging (`docker-library/python`) is MIT |
+| `python:3.15-slim-bookworm` | `sha256:122756f3fe72c4f5d3d71897888204ee85774bc79de952555b8a474e1d0a5d53` | Cargo license audit, release-preflight Cargo SBOM generation and audit, the official-SDK interoperability driver, and its Python license audit (CI-only) | Linux amd64, arm64/v8, and additional official architectures | CPython's PSF license stack (SPDX `Python-2.0`); image packaging (`docker-library/python`) is MIT |
 
 `ocamlformat` is deliberately absent. Version 0.28.1 is MIT licensed, but its
 build closure includes ordinary GPL packages (`menhir` and `fix`), which this
