@@ -89,9 +89,9 @@ let start_sleep duration =
 (** Implements direct-style sleep as timer creation followed by a future wait. *)
 let sleep duration = Future.await (start_sleep duration)
 
-(** Validates a workflow execution target before retaining it in a command. A
-    run ID may be empty to let Temporal resolve the current run, but workflow
-    IDs and signal names are always required identifiers. *)
+(** Validates a workflow execution target before retaining it in a command.
+    [run_id] is [None] to let Temporal resolve the current run; the workflow
+    ID and any explicit run ID are required identifiers. *)
 let validate_external_target ~workflow_id ~run_id =
   let validate_required field value =
     if String.equal value "" then
@@ -104,18 +104,14 @@ let validate_external_target ~workflow_id ~run_id =
       Error (Error.defect ~message:(field ^ " must be valid UTF-8"))
     else Ok ()
   in
-  let validate_optional field value =
-    if String.length value > max_name_bytes then
-      Error (Error.defect ~message:(field ^ " exceeds 65536 bytes"))
-    else if String.contains value '\000' then
-      Error (Error.defect ~message:(field ^ " must not contain NUL"))
-    else if not (Temporal_base.Codec.valid_utf_8 value) then
-      Error (Error.defect ~message:(field ^ " must be valid UTF-8"))
-    else Ok ()
-  in
   match validate_required "external workflow id" workflow_id with
   | Error _ as error -> error
-  | Ok () -> validate_optional "external run id" run_id
+  | Ok () -> (
+      (* An omitted run ID selects the current run; an explicit one must name
+         a run, so an empty string is a defect rather than a "latest" alias. *)
+      match run_id with
+      | None -> Ok ()
+      | Some run_id -> validate_required "external run id" run_id)
 
 (** Returns a local operation failure on the current workflow's scheduler.
     Retaining that owner and its suspension gate lets ready errors compose
@@ -129,8 +125,8 @@ let failed_external_operation context error =
 (** Sends a typed signal to another workflow execution. The returned future
     suspends the current workflow until Core reports delivery or a structured
     failure; it does not perform nondeterministic network I/O itself. *)
-let signal_external_workflow ~workflow_id ~run_id ~(signal : 'input Signal.t)
-    ~input =
+let signal_external_workflow ~workflow_id ?run_id ~(signal : 'input Signal.t)
+    ~input () =
   let outside_error () =
     Error.defect ~message:"external workflow signal used outside a workflow execution"
   in
@@ -151,7 +147,8 @@ let signal_external_workflow ~workflow_id ~run_id ~(signal : 'input Signal.t)
                  does not compare signal arguments during replay. *)
               let future =
                 Temporal_sdk_kernel.Workflow_context_store.signal_external_workflow
-                  context ~workflow_id ~run_id
+                  context ~workflow_id
+                  ~run_id:(Option.value run_id ~default:"")
                   ~signal_name:(Signal.name signal)
                   ~input:arguments ()
               in
@@ -160,7 +157,7 @@ let signal_external_workflow ~workflow_id ~run_id ~(signal : 'input Signal.t)
 (** Requests cancellation of another workflow execution. Core owns delivery and
     target lookup; the returned future therefore reports acknowledgement or a
     typed Temporal failure rather than raising an exception. *)
-let cancel_external_workflow ~workflow_id ~run_id ~reason =
+let cancel_external_workflow ~workflow_id ?run_id ~reason () =
   let outside_error () =
     Error.defect ~message:"external workflow cancellation used outside a workflow execution"
   in
@@ -185,7 +182,9 @@ let cancel_external_workflow ~workflow_id ~run_id ~reason =
       | Ok () ->
           Future_private.of_internal
             (Temporal_sdk_kernel.Workflow_context_store.cancel_external_workflow
-               context ~workflow_id ~run_id ~reason ()))
+               context ~workflow_id
+               ~run_id:(Option.value run_id ~default:"")
+               ~reason ()))
 
 (** Reads the deterministic timestamp captured from the current Temporal
     activation. The runtime stores it in the workflow context before invoking

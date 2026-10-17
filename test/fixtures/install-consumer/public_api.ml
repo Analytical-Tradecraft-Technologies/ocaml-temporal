@@ -1253,15 +1253,15 @@ let _worker_health_abandonment : T.Worker.Health.abandonment -> string =
 (* External workflow commands and search attributes from workflow code. *)
 let _workflow_signal_external_workflow :
     workflow_id:string ->
-    run_id:string ->
+    ?run_id:string ->
     signal:'input T.Signal.t ->
-    input:'input -> (unit, T.Error.t) T.Future.t =
+    input:'input -> unit -> (unit, T.Error.t) T.Future.t =
   T.Workflow.signal_external_workflow
 
 let _workflow_cancel_external_workflow :
     workflow_id:string ->
-    run_id:string ->
-    reason:string -> (unit, T.Error.t) T.Future.t =
+    ?run_id:string ->
+    reason:string -> unit -> (unit, T.Error.t) T.Future.t =
   T.Workflow.cancel_external_workflow
 
 let _workflow_upsert_search_attributes :

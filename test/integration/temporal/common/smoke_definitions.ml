@@ -364,7 +364,7 @@ let external_signal_parent =
       | [ workflow_id; run_id ] ->
           let* () =
             Temporal.Workflow.signal_external_workflow ~workflow_id ~run_id
-              ~signal:signal_value ~input:"external"
+              ~signal:signal_value ~input:"external" ()
             |> Temporal.Future.await
           in
           Ok "SMOKE:EXTERNAL:SIGNAL:ACK"
@@ -385,7 +385,7 @@ let external_cancellation_wrong_run_parent =
       | [ workflow_id; wrong_run_id ] -> (
           match
             Temporal.Workflow.cancel_external_workflow ~workflow_id
-              ~run_id:wrong_run_id ~reason:"external acceptance mismatched run ID"
+              ~run_id:wrong_run_id ~reason:"external acceptance mismatched run ID" ()
             |> Temporal.Future.await
           with
           | Error error ->
@@ -438,7 +438,7 @@ let external_signal_completed_parent =
       | [ workflow_id; run_id ] -> (
           match
             Temporal.Workflow.signal_external_workflow ~workflow_id ~run_id
-              ~signal:signal_value ~input:"after-completion"
+              ~signal:signal_value ~input:"after-completion" ()
             |> Temporal.Future.await
           with
           | Error error ->
@@ -475,7 +475,7 @@ let external_cancellation_parent =
       | [ workflow_id; run_id ] ->
           let* () =
             Temporal.Workflow.cancel_external_workflow ~workflow_id ~run_id
-              ~reason:"external acceptance requested cancellation"
+              ~reason:"external acceptance requested cancellation" ()
             |> Temporal.Future.await
           in
           Ok "SMOKE:EXTERNAL:CANCEL:ACK"

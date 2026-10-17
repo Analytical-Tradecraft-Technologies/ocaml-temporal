@@ -83,21 +83,27 @@ val sleep : Duration.t -> (unit, Error.t) result
 
 (** Sends a typed signal to another workflow execution. The operation is
     represented as a future because Temporal acknowledges delivery in a later
-    activation; [run_id] may be empty when the server should resolve the
-    current run for the workflow ID. *)
+    activation. Omitting [run_id] lets the server resolve the current run for
+    [workflow_id]; an explicit [run_id] targets that run and, like
+    [workflow_id], must be non-empty, valid UTF-8, NUL-free, and at most
+    65,536 bytes, or the future resolves with a typed defect. *)
 val signal_external_workflow :
   workflow_id:string ->
-  run_id:string ->
+  ?run_id:string ->
   signal:'input Signal.t ->
   input:'input ->
+  unit ->
   (unit, Error.t) Future.t
 
 (** Requests cancellation of another workflow execution and returns a future
-    resolved by Temporal's acknowledgement or structured failure. *)
+    resolved by Temporal's acknowledgement or structured failure. [run_id]
+    follows {!signal_external_workflow}: omitted selects the current run, and
+    an explicit value must be a valid non-empty run ID. *)
 val cancel_external_workflow :
   workflow_id:string ->
-  run_id:string ->
+  ?run_id:string ->
   reason:string ->
+  unit ->
   (unit, Error.t) Future.t
 
 (** Returns the exact timestamp attached to the activation currently executing

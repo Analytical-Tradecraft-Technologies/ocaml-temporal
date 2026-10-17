@@ -865,20 +865,22 @@ like any other workflow operation:
 let refresh_signal =
   Temporal.Signal.define ~name:"refresh" ~input:Temporal.Codec.string
 
-let notify_refresh workflow_id run_id reason =
+let notify_refresh ?run_id workflow_id reason =
   Temporal.Workflow.signal_external_workflow
-    ~workflow_id ~run_id ~signal:refresh_signal ~input:reason
+    ~workflow_id ?run_id ~signal:refresh_signal ~input:reason ()
 
-let stop_other_workflow workflow_id run_id =
+let stop_other_workflow ~run_id workflow_id =
   Temporal.Workflow.cancel_external_workflow
-    ~workflow_id ~run_id ~reason:"superseded by a newer execution"
+    ~workflow_id ~run_id ~reason:"superseded by a newer execution" ()
 ```
 
 Both operations emit a deterministic command and suspend the current workflow
 until Core reports an acknowledgement or structured failure. They do not make
-network calls from OCaml or block an Eio fiber or Domain. The exact run ID is
-optional for targets that intentionally address the latest execution, but
-supplying it is safer when a workflow must never affect a replacement run.
+network calls from OCaml or block an Eio fiber or Domain. Omit `?run_id` to
+address the current execution for the workflow ID; supplying the exact run ID
+is safer when a workflow must never affect a replacement run. An explicit
+`run_id` must be a valid non-empty identifier: `""` is a typed defect, not a
+"latest run" alias.
 Input and headers are copied through the private JSON bridge; invalid names,
 payloads, NUL bytes, and duplicate sequence resolutions become typed errors.
 See the [external workflow protocol reference](../reference/core-protocol.md#external-workflow-operations)
