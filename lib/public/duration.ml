@@ -18,4 +18,18 @@ let of_ms milliseconds =
     invalid_arg "Temporal duration exceeds the protobuf maximum of 10,000 years";
   milliseconds
 
+(** Scales a whole-unit count to milliseconds. The bound is compared against
+    [max_ms / unit_ms] before multiplying, so a large count is rejected
+    rather than wrapping around [Int64] into a plausible duration. *)
+let of_unit ~unit_ms count =
+  if Int64.compare count 0L < 0 then
+    invalid_arg "Temporal duration cannot be negative";
+  if Int64.compare count (Int64.div max_ms unit_ms) > 0 then
+    invalid_arg "Temporal duration exceeds the protobuf maximum of 10,000 years";
+  Int64.mul count unit_ms
+
+let of_seconds = of_unit ~unit_ms:1_000L
+let of_minutes = of_unit ~unit_ms:60_000L
+let of_hours = of_unit ~unit_ms:3_600_000L
+
 let to_ms duration = duration

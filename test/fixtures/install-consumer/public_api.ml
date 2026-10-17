@@ -392,6 +392,9 @@ let _codec_json_conv :
   T.Codec.json_conv
 
 let _duration_of_ms : int64 -> T.Duration.t = T.Duration.of_ms
+let _duration_of_seconds : int64 -> T.Duration.t = T.Duration.of_seconds
+let _duration_of_minutes : int64 -> T.Duration.t = T.Duration.of_minutes
+let _duration_of_hours : int64 -> T.Duration.t = T.Duration.of_hours
 let _duration_to_ms : T.Duration.t -> int64 = T.Duration.to_ms
 
 let _error_make :

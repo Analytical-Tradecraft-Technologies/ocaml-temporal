@@ -12,5 +12,16 @@ type t
     would otherwise reject the resulting command on every workflow task. *)
 val of_ms : int64 -> t
 
+(** Creates a duration from whole seconds, with the same bounds and
+    [Invalid_argument] contract as {!of_ms}. The range check runs before
+    scaling, so no input can overflow into an accepted value. *)
+val of_seconds : int64 -> t
+
+(** Creates a duration from whole minutes; see {!of_seconds}. *)
+val of_minutes : int64 -> t
+
+(** Creates a duration from whole hours; see {!of_seconds}. *)
+val of_hours : int64 -> t
+
 (** Returns the exact number of milliseconds supplied to [of_ms]. *)
 val to_ms : t -> int64
