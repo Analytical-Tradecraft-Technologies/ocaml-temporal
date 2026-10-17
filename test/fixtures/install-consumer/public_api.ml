@@ -1103,8 +1103,20 @@ let _client_list_visibility :
     unit -> (T.Client.visibility_page, T.Error.t) result =
   T.Client.list_visibility
 
+let _client_execution_status_cases : T.Client.execution_status -> int = function
+  | `Running -> 1
+  | `Completed -> 2
+  | `Failed -> 3
+  | `Canceled -> 4
+  | `Terminated -> 5
+  | `Continued_as_new -> 6
+  | `Timed_out -> 7
+  | `Paused -> 8
+  | `Unknown value -> value
+
 let _client_visibility_page_fields (page : T.Client.visibility_page) :
-    (string * string * string * string * string) list * string option =
+    (string * string * string * string * T.Client.execution_status) list
+    * string option =
   ( List.map
       (fun (execution : T.Client.visibility_execution) ->
         ( execution.workflow_id,

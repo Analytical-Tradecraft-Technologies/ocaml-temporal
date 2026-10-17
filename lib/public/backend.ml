@@ -176,7 +176,7 @@ type visibility_execution = {
   run_id : string;
   workflow_type : string;
   task_queue : string;
-  status : string;
+  status : Temporal_sdk_kernel.Client_protocol.visibility_status;
 }
 
 (** One visibility page and its optional opaque continuation token. *)
@@ -1957,13 +1957,13 @@ let mock_client_list_visibility (client : mock_client)
               |> Seq.map (fun ((workflow_id, _run_id), (execution : mock_execution)) ->
                      let status =
                        match execution.terminal with
-                       | Mock_pending -> "running"
-                       | Mock_completed | Mock_completed_with_successor _ -> "completed"
-                       | Mock_continued_as_new _ -> "continued_as_new"
-                       | Mock_cancelled -> "canceled"
-                       | Mock_terminated -> "terminated"
-                       | Mock_failed _ -> "failed"
-                       | Mock_timed_out _ -> "timed_out"
+                       | Mock_pending -> `Running
+                       | Mock_completed | Mock_completed_with_successor _ -> `Completed
+                       | Mock_continued_as_new _ -> `Continued_as_new
+                       | Mock_cancelled -> `Canceled
+                       | Mock_terminated -> `Terminated
+                       | Mock_failed _ -> `Failed
+                       | Mock_timed_out _ -> `Timed_out
                      in
                      ({
                         workflow_id;
