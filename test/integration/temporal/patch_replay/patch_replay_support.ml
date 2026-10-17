@@ -368,17 +368,17 @@ let run_worker ~workflows ~activities =
       configuration.stopped_file
   in
   let* () = prepare_replay_diagnostics configuration in
+  (* This fixture isolates workflow patch replay from sticky-cache hand-off.
+     Sticky eviction and replacement are covered by the dedicated
+     cache-eviction and restart gates; keeping Core's cache disabled here means
+     a replacement generation receives the durable timer task from the
+     ordinary queue instead of a queue owned by the stopped generation. *)
+  let* options = Worker.Options.make ~max_cached_workflows:0 () in
   let* worker =
     Acceptance_observer.with_worker (fun () ->
       Worker.create ~target_url:configuration.target_url
         ~namespace:configuration.namespace ~identity:"ocaml-temporal-patch-replay"
-        (* This fixture isolates workflow patch replay from sticky-cache
-           hand-off. Sticky eviction and replacement are covered by the
-           dedicated cache-eviction and restart gates; keeping Core's cache
-           disabled here means a replacement generation receives the durable
-           timer task from the ordinary queue instead of a queue owned by the
-           stopped generation. *)
-        ~max_cached_workflows:0 ~task_queue ~workflows ~activities ())
+        ~options ~task_queue ~workflows ~activities ())
   in
   (* Worker creation is the ownership boundary: from this point onward every
      result path must invoke [Worker.shutdown], even if readiness publication

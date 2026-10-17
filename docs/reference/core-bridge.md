@@ -1114,9 +1114,9 @@ requires.
 
 The public `Temporal.Worker.create` accepts validated `Temporal.Worker.Options`
 for routing and resource policy. `Options.make ~versioning:(Legacy_build_id
-"build-v2") ()` enables legacy build-ID routing. It also accepts an optional
-`max_cached_workflows` bound for applications that need to tune sticky
-workflow memory. Omitting it retains the bounded default of 1,000 cached
+"build-v2") ()` enables legacy build-ID routing, and `Options.make
+~max_cached_workflows` bounds sticky workflow memory for applications that
+need to tune it. Omitting it retains the bounded default of 1,000 cached
 workflows. A zero value disables the Core cache, while a positive value can
 produce explicit `RemoveFromCache` activations when the bound is reached; the
 worker acknowledges those activations with an empty completion.

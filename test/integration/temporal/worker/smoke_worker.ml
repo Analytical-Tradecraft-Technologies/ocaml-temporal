@@ -240,6 +240,7 @@ let run () =
         | None -> Error (Error.defect ~message:"SMOKE_WORKER_GENERATION must be set")
       in
       let* max_cached_workflows = optional_cache_bound () in
+      let* options = Worker.Options.make ?max_cached_workflows () in
       let* () = clear_replay_diagnostics_before_start replay_diagnostics_file generation in
       let* cancellation_ready_file = Definitions.cancellation_ready_file () in
       let* signal_condition_ready_file =
@@ -255,7 +256,7 @@ let run () =
       in
       let worker_result =
         Acceptance_observer.with_worker (fun () ->
-          Worker.create ?max_cached_workflows ~target_url ~namespace
+          Worker.create ~options ~target_url ~namespace
             ~identity:"ocaml-temporal-two-binary-worker"
             ~task_queue:Definitions.task_queue
             ~workflows:
