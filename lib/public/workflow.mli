@@ -233,10 +233,10 @@ module Info : sig
       result is the effective policy rather than the literal request.
       Intervals are rounded up to whole milliseconds. Temporal does not
       validate a policy whose maximum attempts is 1, so another SDK can
-      record one that {!Activity.Retry_policy.make} would reject (for
+      record one that {!Retry_policy.make} would reject (for
       example a backoff coefficient below 1.0); such a policy is also
       reported as [None]. *)
-  val retry_policy : t -> Activity.Retry_policy.t option
+  val retry_policy : t -> Retry_policy.t option
 
   (** Returns the parent workflow, or [None] for a top-level workflow. *)
   val parent : t -> parent option

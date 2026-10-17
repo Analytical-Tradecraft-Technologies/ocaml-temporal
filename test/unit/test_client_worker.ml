@@ -1701,7 +1701,7 @@ let test_client_execution_policy_validation () =
       page.executions);
   let retry_policy =
     unwrap
-      (Temporal.Activity.Retry_policy.make ~initial_interval:(ms 1_000L)
+      (Temporal.Retry_policy.make ~initial_interval:(ms 1_000L)
          ~backoff_coefficient:2.0 ~maximum_interval:(ms 10_000L)
          ~maximum_attempts:3 ())
   in

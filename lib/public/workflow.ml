@@ -331,7 +331,7 @@ module Info = struct
 
   (** Rebuilds the public policy from the recorded start event. The server
       skips retry-policy validation when [maximum_attempts] is 1, so a
-      recorded policy can violate [Activity.Retry_policy.make]'s rules (a
+      recorded policy can violate [Retry_policy.make]'s rules (a
       coefficient below 1.0, an empty non-retryable type, a zero interval)
       and the protocol layers deliberately accept it (#1016). Such a policy
       has no public representation and is reported as [None] rather than
@@ -346,7 +346,7 @@ module Info = struct
             (Int64.of_string ("0u" ^ policy.backoff_coefficient_bits))
         in
         Result.to_option
-          (Activity.Retry_policy.make
+          (Retry_policy.make
              ~initial_interval:(duration policy.initial_interval)
              ~backoff_coefficient:coefficient
              ~maximum_interval:(duration policy.maximum_interval)

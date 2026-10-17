@@ -373,7 +373,7 @@ require_source_text "$worker" \
   'Worker.activity Definitions.heartbeat_timeout_retry_activity'
 
 require_source_text "$definitions" \
-  'Temporal.Activity.Retry_policy.make'
+  'Temporal.Retry_policy.make'
 require_source_text "$definitions" \
   '~non_retryable_error_types:[ "SmokeInvalidInput" ] ()'
 require_source_text "$definitions" \

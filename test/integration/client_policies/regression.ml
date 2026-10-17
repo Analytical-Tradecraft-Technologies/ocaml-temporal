@@ -226,7 +226,7 @@ let check_reuse_policies context =
     exactly one retry run that ends the chain. *)
 let retry_policy =
   get
-    (Activity.Retry_policy.make ~initial_interval:(ms 500L)
+    (Retry_policy.make ~initial_interval:(ms 500L)
        ~backoff_coefficient:1.0 ~maximum_interval:(ms 500L)
        ~maximum_attempts:2 ())
 

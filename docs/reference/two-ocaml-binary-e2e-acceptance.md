@@ -376,7 +376,7 @@ registers these local definitions with the public SDK:
   the child itself waits on a long durable timer so natural completion cannot
   satisfy the assertion.
 * `smoke.activity_retry`: schedules `smoke.retry_once` with a two-attempt
-  `Temporal.Activity.Retry_policy`. The worker activity deliberately returns a
+  `Temporal.Retry_policy`. The worker activity deliberately returns a
   retryable error on its first call and includes the successful attempt number
   in its second result, giving the driver a direct assertion that Temporal
   performed the retry.

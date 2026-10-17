@@ -490,7 +490,7 @@ let external_cancellation_parent =
     constructor's validation ever changes, instead of hiding a construction
     exception in a module initializer. *)
 let retry_policy =
-  Temporal.Activity.Retry_policy.make
+  Temporal.Retry_policy.make
     ~initial_interval:(Temporal.Duration.of_ms 100L)
     ~backoff_coefficient:1.0
     ~maximum_interval:(Temporal.Duration.of_ms 100L)
@@ -501,7 +501,7 @@ let retry_policy =
     immediate second attempt, while keeping the live acceptance bounded and
     independent of the much slower timeout-triggered scenarios. *)
 let long_backoff_retry_policy =
-  Temporal.Activity.Retry_policy.make
+  Temporal.Retry_policy.make
     ~initial_interval:(Temporal.Duration.of_ms 2_000L)
     ~backoff_coefficient:1.0
     ~maximum_interval:(Temporal.Duration.of_ms 2_000L)
@@ -798,7 +798,7 @@ let timeout_retry_first_attempt_sleep_seconds = 6.0
     coverage for the other activities without hiding the adapter's ordering
     invariant by enlarging their leases. *)
 let timeout_retry_policy =
-  Temporal.Activity.Retry_policy.make
+  Temporal.Retry_policy.make
     ~initial_interval:(Temporal.Duration.of_ms 7_000L)
     ~backoff_coefficient:1.0
     ~maximum_interval:(Temporal.Duration.of_ms 7_000L)
@@ -865,7 +865,7 @@ let heartbeat_timeout_retry_first_attempt_sleep_seconds = 6.0
     local to this scenario so the next task cannot be mistaken for a queue
     timeout caused by the still-running first callback. *)
 let heartbeat_timeout_retry_policy =
-  Temporal.Activity.Retry_policy.make
+  Temporal.Retry_policy.make
     ~initial_interval:(Temporal.Duration.of_ms 7_000L)
     ~backoff_coefficient:1.0
     ~maximum_interval:(Temporal.Duration.of_ms 7_000L)
@@ -943,7 +943,7 @@ let activity_heartbeat_timeout_retry =
     the runtime preserved the activity category, error type and non-retryable
     decision. *)
 let non_retryable_activity_policy =
-  Temporal.Activity.Retry_policy.make
+  Temporal.Retry_policy.make
     ~initial_interval:(Temporal.Duration.of_ms 100L)
     ~backoff_coefficient:1.0
     ~maximum_interval:(Temporal.Duration.of_ms 100L)
@@ -1055,7 +1055,7 @@ let activity_non_retryable_failure =
     that Temporal retries the child execution rather than merely retrying its
     activity. *)
 let child_activity_no_retry_policy =
-  Temporal.Activity.Retry_policy.make
+  Temporal.Retry_policy.make
     ~initial_interval:(Temporal.Duration.of_ms 100L)
     ~backoff_coefficient:1.0
     ~maximum_interval:(Temporal.Duration.of_ms 100L)
@@ -1114,7 +1114,7 @@ let child_retryable_failure =
     separate from the activity's one-attempt policy makes the ownership of the
     retry state machine visible in the fixture. *)
 let child_retry_policy =
-  Temporal.Activity.Retry_policy.make
+  Temporal.Retry_policy.make
     ~initial_interval:(Temporal.Duration.of_ms 100L)
     ~backoff_coefficient:1.0
     ~maximum_interval:(Temporal.Duration.of_ms 100L)

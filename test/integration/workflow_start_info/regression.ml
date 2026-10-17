@@ -57,7 +57,7 @@ let report () =
     | Some payload -> Codec.decode Codec.string payload
   in
   let module Info = Workflow.Info in
-  let module Policy = Activity.Retry_policy in
+  let module Policy = Retry_policy in
   let initiator =
     match Info.continuation_initiator info with
     | None -> "-"
@@ -191,7 +191,7 @@ let expect_report context label handle expected =
 (** The retry policy every option-bearing chain is started with. *)
 let retry_policy =
   get
-    (Activity.Retry_policy.make ~initial_interval:(ms 500L)
+    (Retry_policy.make ~initial_interval:(ms 500L)
        ~backoff_coefficient:1.5 ~maximum_interval:(ms 2_000L)
        ~maximum_attempts:3 ~non_retryable_error_types:[ "StartInfoFatal" ] ())
 

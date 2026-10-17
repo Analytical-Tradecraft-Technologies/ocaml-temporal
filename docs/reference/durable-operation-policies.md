@@ -14,7 +14,7 @@ records the wire-format decision.
 
 ## Retry policy
 
-`Temporal.Activity.Retry_policy.make` constructs one immutable policy. The
+`Temporal.Retry_policy.make` constructs one immutable policy. The
 same policy type is accepted by activity and child-workflow operations:
 
 ```ocaml
@@ -32,7 +32,7 @@ let validate_order =
 let run_with_retry activity child input =
   let open Temporal.Result_syntax in
   let* retry_policy =
-    Temporal.Activity.Retry_policy.make
+    Temporal.Retry_policy.make
       ~initial_interval:(Temporal.Duration.of_ms 100L)
       ~backoff_coefficient:2.0
       ~maximum_interval:(Temporal.Duration.of_ms 10_000L)

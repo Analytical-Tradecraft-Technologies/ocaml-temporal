@@ -88,6 +88,14 @@ history.
   separate follow-up work; focused tests continue to cover policy encoding and
   malformed-input boundaries.
 
+## Follow-up: top-level module (#793)
+
+The same policy value is also accepted by child workflow starts and client
+workflow starts, so the API freeze review moved it from
+`Temporal.Activity.Retry_policy` to the top-level `Temporal.Retry_policy`.
+The constructor contract, validation, and replay-stable coefficient encoding
+described above are unchanged.
+
 ## Evidence
 
 The public constructor and accessors are covered by

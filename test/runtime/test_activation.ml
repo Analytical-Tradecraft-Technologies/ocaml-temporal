@@ -126,7 +126,7 @@ let greeting_child =
     and activity retries share Temporal Core's wire representation. *)
 let child_retry_policy =
   match
-    Temporal.Activity.Retry_policy.make
+    Temporal.Retry_policy.make
       ~initial_interval:(Temporal.Duration.of_ms 1_000L)
       ~backoff_coefficient:2.0
       ~maximum_interval:(Temporal.Duration.of_ms 5_000L)
