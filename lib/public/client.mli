@@ -146,19 +146,28 @@ type id_conflict_policy = [ `Fail | `Use_existing | `Terminate_existing ]
 type id_reuse_policy =
   [ `Allow_duplicate | `Allow_duplicate_failed_only | `Reject_duplicate ]
 
+(** Status of a workflow execution as reported by Temporal visibility.
+    [`Unknown n] carries the wire value of a status this SDK does not name,
+    such as one added by a newer Temporal server, so a listing never fails
+    because of it; handle it as an unrecognized status. *)
+type execution_status =
+  [ `Running
+  | `Completed
+  | `Failed
+  | `Canceled
+  | `Terminated
+  | `Continued_as_new
+  | `Timed_out
+  | `Paused
+  | `Unknown of int ]
+
 (** One execution row returned by the Temporal visibility service. *)
 type visibility_execution = {
   workflow_id : string;
   run_id : string;
   workflow_type : string;
   task_queue : string;
-  status : string;
-      (** Execution status: one of ["running"], ["completed"], ["failed"],
-          ["canceled"], ["terminated"], ["continued_as_new"], ["timed_out"],
-          or ["paused"]. A status added by a newer Temporal server than this
-          SDK knows is reported as ["unknown_<n>"] with its decimal wire
-          value (for example ["unknown_9"]) rather than failing the listing,
-          so match on the known names and treat anything else as unknown. *)
+  status : execution_status;
 }
 
 (** A bounded visibility page and its opaque continuation token. *)

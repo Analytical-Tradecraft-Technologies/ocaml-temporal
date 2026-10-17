@@ -188,12 +188,27 @@ type visibility_request = {
 }
 (** One explicitly bounded visibility page request. The token is opaque base64. *)
 
+type visibility_status =
+  [ `Running
+  | `Completed
+  | `Failed
+  | `Canceled
+  | `Terminated
+  | `Continued_as_new
+  | `Timed_out
+  | `Paused
+  | `Unknown of int ]
+(** Temporal [WorkflowExecutionStatus] decoded from its Rust name. A value
+    the SDK does not name (a newer server's addition, or the legacy
+    [unspecified] name, which is wire value [0]) is [`Unknown n] with its
+    wire value. *)
+
 type visibility_execution = {
   workflow_id : string;
   run_id : string;
   workflow_type : string;
   task_queue : string;
-  status : string;
+  status : visibility_status;
 }
 (** Stable subset of Temporal visibility metadata exposed by this SDK. *)
 

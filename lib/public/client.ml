@@ -95,13 +95,26 @@ type 'output terminal_result =
   (* The run continued as a new execution; callers choose whether to follow it. *)
   | Continued_as_new of execution
 
+(** Visibility status; the same closed polymorphic variant as the private
+    protocol's, so rows pass through without conversion. *)
+type execution_status =
+  [ `Running
+  | `Completed
+  | `Failed
+  | `Canceled
+  | `Terminated
+  | `Continued_as_new
+  | `Timed_out
+  | `Paused
+  | `Unknown of int ]
+
 (** One execution row returned by the Temporal visibility service. *)
 type visibility_execution = {
   workflow_id : string;
   run_id : string;
   workflow_type : string;
   task_queue : string;
-  status : string;
+  status : execution_status;
 }
 
 (** A bounded visibility page and its opaque continuation token. *)

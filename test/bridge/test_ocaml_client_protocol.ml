@@ -463,7 +463,7 @@ let test_visibility_protocol () =
   (match unwrap (Protocol.decode_visibility_response response) with
   | { executions = [ row ]; next_page_token = Some "dG9rZW4=" } ->
       assert (String.equal row.workflow_id "workflow-1");
-      assert (String.equal row.status "running")
+      assert (row.status = `Running)
   | _ -> failwith "visibility response changed shape");
   let row_with_status status =
     Printf.sprintf
@@ -473,11 +473,25 @@ let test_visibility_protocol () =
   (* A status a newer server added arrives as [unknown_<n>] and must not fail
      the whole page (#1078); the spellings match the Rust encoder's. *)
   List.iter
-    (fun status ->
-      match unwrap (Protocol.decode_visibility_response (row_with_status status)) with
-      | { executions = [ row ]; _ } -> assert (String.equal row.status status)
+    (fun (name, expected) ->
+      match unwrap (Protocol.decode_visibility_response (row_with_status name)) with
+      | { executions = [ row ]; _ } -> assert (row.status = expected)
       | _ -> failwith "unknown visibility status changed shape")
-    [ "unknown_9"; "unknown_-1"; "unknown_2147483647"; "unknown_-2147483648"; "paused" ];
+    [
+      ("running", `Running);
+      ("completed", `Completed);
+      ("failed", `Failed);
+      ("canceled", `Canceled);
+      ("terminated", `Terminated);
+      ("continued_as_new", `Continued_as_new);
+      ("timed_out", `Timed_out);
+      ("paused", `Paused);
+      ("unspecified", `Unknown 0);
+      ("unknown_9", `Unknown 9);
+      ("unknown_-1", `Unknown (-1));
+      ("unknown_2147483647", `Unknown 2147483647);
+      ("unknown_-2147483648", `Unknown (-2147483648));
+    ];
   List.iter
     (fun malformed -> require_error (Protocol.decode_visibility_response malformed))
     ([

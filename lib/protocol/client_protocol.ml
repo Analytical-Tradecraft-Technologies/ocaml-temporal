@@ -128,12 +128,23 @@ type visibility_request = {
   rpc_deadline : rpc_deadline option;
 }
 
+type visibility_status =
+  [ `Running
+  | `Completed
+  | `Failed
+  | `Canceled
+  | `Terminated
+  | `Continued_as_new
+  | `Timed_out
+  | `Paused
+  | `Unknown of int ]
+
 type visibility_execution = {
   workflow_id : string;
   run_id : string;
   workflow_type : string;
   task_queue : string;
-  status : string;
+  status : visibility_status;
 }
 
 type visibility_page = {
@@ -756,34 +767,44 @@ let unknown_visibility_status_prefix = "unknown_"
 (** Highest [WorkflowExecutionStatus] wire value with a fixed name. *)
 let max_known_visibility_status = 8
 
-(** Returns whether [status] is a visibility status name the Rust bridge can
-    emit, mirroring [is_visibility_status_name] in
-    [rust/core-bridge/src/client_protocol.rs]. Besides the fixed names (and the
-    legacy [unspecified]), a value a newer server added is accepted as
-    [unknown_<n>] (#1078), where [n] is the canonical decimal spelling of a
-    32-bit value outside the named range, so each wire value has exactly one
-    accepted spelling. *)
-let is_visibility_status_name status =
+(** Decodes a visibility status name the Rust bridge can emit, mirroring
+    [is_visibility_status_name] in [rust/core-bridge/src/client_protocol.rs],
+    or returns [None] for any other spelling. Besides the fixed names (and the
+    legacy [unspecified], wire value [0]), a value a newer server added is
+    accepted as [unknown_<n>] (#1078), where [n] is the canonical decimal
+    spelling of a 32-bit value outside the named range, so each wire value has
+    exactly one accepted spelling. *)
+let visibility_status_of_name status : visibility_status option =
   match status with
-  | "running" | "completed" | "failed" | "canceled" | "terminated"
-  | "continued_as_new" | "timed_out" | "paused" | "unspecified" ->
-      true
+  | "running" -> Some `Running
+  | "completed" -> Some `Completed
+  | "failed" -> Some `Failed
+  | "canceled" -> Some `Canceled
+  | "terminated" -> Some `Terminated
+  | "continued_as_new" -> Some `Continued_as_new
+  | "timed_out" -> Some `Timed_out
+  | "paused" -> Some `Paused
+  | "unspecified" -> Some (`Unknown 0)
   | _ -> (
       let prefix_length = String.length unknown_visibility_status_prefix in
-      String.starts_with ~prefix:unknown_visibility_status_prefix status
-      &&
-      let digits =
-        String.sub status prefix_length (String.length status - prefix_length)
-      in
-      match int_of_string_opt digits with
-      | None -> false
-      | Some value ->
-          (* [int_of_string_opt] also accepts [+], [_], and radix prefixes;
-             comparing against the canonical rendering rejects them. *)
-          String.equal (string_of_int value) digits
-          && value >= Int32.to_int Int32.min_int
-          && value <= Int32.to_int Int32.max_int
-          && (value < 0 || value > max_known_visibility_status))
+      if not (String.starts_with ~prefix:unknown_visibility_status_prefix status)
+      then None
+      else
+        let digits =
+          String.sub status prefix_length (String.length status - prefix_length)
+        in
+        match int_of_string_opt digits with
+        | None -> None
+        | Some value ->
+            (* [int_of_string_opt] also accepts [+], [_], and radix prefixes;
+               comparing against the canonical rendering rejects them. *)
+            if
+              String.equal (string_of_int value) digits
+              && value >= Int32.to_int Int32.min_int
+              && value <= Int32.to_int Int32.max_int
+              && (value < 0 || value > max_known_visibility_status)
+            then Some (`Unknown value)
+            else None)
 
 let decode_visibility_response input : (visibility_page, error) result =
   let* json = decode_object input in
@@ -809,8 +830,9 @@ let decode_visibility_response input : (visibility_page, error) result =
               let* status_json = field path "status" row in
               let* status = identifier (path ^ ".status") status_json in
               let* status =
-                if is_visibility_status_name status then Ok status
-                else Error (invalid ~path:(path ^ ".status") "unknown visibility status")
+                match visibility_status_of_name status with
+                | Some status -> Ok status
+                | None -> Error (invalid ~path:(path ^ ".status") "unknown visibility status")
               in
               loop (index + 1) ({ workflow_id; run_id; workflow_type; task_queue; status } :: acc) rest
         in

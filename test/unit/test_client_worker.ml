@@ -545,7 +545,7 @@ let test_client_visibility_listing () =
       assert (second.workflow_id = "visibility-b");
       assert (first.workflow_type = "unit.echo");
       assert (first.task_queue = "unit-test");
-      assert (first.status = "running")
+      assert (first.status = `Running)
   | _ -> failwith "visibility listing returned an unexpected row count");
   let first_page =
     unwrap (Temporal.Client.list_visibility client ~page_size:1 ~query:"" ())
@@ -779,8 +779,8 @@ let test_exact_run_reset () =
         String.equal row.run_id execution.run_id)
       visibility.executions
   in
-  assert (old_row.status = "terminated");
-  assert (successor_row.status = "running");
+  assert (old_row.status = `Terminated);
+  assert (successor_row.status = `Running);
   (match Temporal.Client.wait handle with
   | Ok (Temporal.Client.Terminated error) ->
       assert ((Temporal.Error.view error).category = `Terminated)
@@ -1027,7 +1027,7 @@ let test_reset_rejects_early_event_ids () =
   | [ execution ] ->
       assert (execution.workflow_id = "unit-reset-early-event");
       assert (execution.run_id = Option.get (Temporal.Client.run_id handle));
-      assert (execution.status = "running")
+      assert (execution.status = `Running)
   | _ -> failwith "invalid resets changed mock visibility");
   (match Temporal.Client.wait handle with
   | Ok (Temporal.Client.Completed { output = "still-running"; _ }) -> ()

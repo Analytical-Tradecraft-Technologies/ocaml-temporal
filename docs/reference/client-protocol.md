@@ -1282,7 +1282,11 @@ instead of failing the whole page (#1078); a row whose status is unspecified
 (`0`) is still a malformed response. OCaml strictly rejects unknown fields,
 missing row fields, empty identifiers, malformed tokens, and status strings
 outside that vocabulary, including non-canonical `unknown_` spellings and
-`unknown_<n>` for a value that has a fixed name.
+`unknown_<n>` for a value that has a fixed name. The decoder turns each
+accepted name into the closed polymorphic variant exposed as
+`Client.execution_status`: a fixed name becomes its constructor (for example
+`` `Running ``), and `unknown_<n>` or the legacy `unspecified` name becomes
+`` `Unknown n `` with the wire value (`0` for `unspecified`).
 
 The token is never interpreted by OCaml and must be passed unchanged to fetch
 the next page. The private request and response shapes are defined by

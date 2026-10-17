@@ -182,7 +182,7 @@ type visibility_execution = {
   run_id : string;
   workflow_type : string;
   task_queue : string;
-  status : string;
+  status : Temporal_sdk_kernel.Client_protocol.visibility_status;
 }
 
 (** One visibility page and its optional opaque continuation token. *)
