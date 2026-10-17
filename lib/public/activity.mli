@@ -65,14 +65,6 @@ module Priority : sig
     unit ->
     (t, Error.t) result
 
-  (** Alias for [make]. *)
-  val create :
-    ?priority_key:int ->
-    ?fairness_key:string ->
-    ?fairness_weight:float ->
-    unit ->
-    (t, Error.t) result
-
   (** Returns the configured priority key, if present. *)
   val priority_key : t -> int option
 
@@ -457,13 +449,6 @@ module Cancellation : sig
   val to_error : t -> Error.t
 end
 
-(** Encodes and submits one typed heartbeat value for the current activity. The
-    payload is copied before crossing into the private runtime, and stale or
-    unavailable contexts return typed errors rather than retaining a released
-    task token. After a cancellation has been delivered it returns an [Error]
-    in the [`Cancelled] category; see {!Cancellation}. *)
-val heartbeat : context -> 'a Codec.t -> 'a -> (unit, Error.t) result
-
 (** Operations available to a contextual activity attempt. *)
 module Context : sig
   (** The attempt-scoped context passed to contextual activity helpers. *)
@@ -557,16 +542,6 @@ module Retry_policy : sig
 
   (** Validates and constructs an immutable retry policy. *)
   val make :
-    initial_interval:Duration.t ->
-    backoff_coefficient:float ->
-    maximum_interval:Duration.t ->
-    maximum_attempts:int ->
-    ?non_retryable_error_types:string list ->
-    unit ->
-    (t, Error.t) result
-
-  (** Alias for [make] for callers that prefer constructor terminology. *)
-  val create :
     initial_interval:Duration.t ->
     backoff_coefficient:float ->
     maximum_interval:Duration.t ->

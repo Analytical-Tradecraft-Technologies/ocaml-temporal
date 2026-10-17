@@ -235,10 +235,6 @@ let _activity_cancel :
     'output T.Activity.handle -> (unit, T.Error.t) result =
   T.Activity.cancel
 
-let _activity_heartbeat :
-    T.Activity.context -> 'a T.Codec.t -> 'a -> (unit, T.Error.t) result =
-  T.Activity.heartbeat
-
 let _activity_retry_policy_make :
     initial_interval:T.Duration.t ->
     backoff_coefficient:float ->
@@ -247,15 +243,6 @@ let _activity_retry_policy_make :
     ?non_retryable_error_types:string list ->
     unit -> (T.Activity.Retry_policy.t, T.Error.t) result =
   T.Activity.Retry_policy.make
-
-let _activity_retry_policy_create :
-    initial_interval:T.Duration.t ->
-    backoff_coefficient:float ->
-    maximum_interval:T.Duration.t ->
-    maximum_attempts:int ->
-    ?non_retryable_error_types:string list ->
-    unit -> (T.Activity.Retry_policy.t, T.Error.t) result =
-  T.Activity.Retry_policy.create
 
 let _activity_retry_policy_initial_interval :
     T.Activity.Retry_policy.t -> T.Duration.t =
@@ -1047,13 +1034,6 @@ let _activity_priority_make :
     ?fairness_weight:float ->
     unit -> (T.Activity.Priority.t, T.Error.t) result =
   T.Activity.Priority.make
-
-let _activity_priority_create :
-    ?priority_key:int ->
-    ?fairness_key:string ->
-    ?fairness_weight:float ->
-    unit -> (T.Activity.Priority.t, T.Error.t) result =
-  T.Activity.Priority.create
 
 let _activity_priority_key : T.Activity.Priority.t -> int option =
   T.Activity.Priority.priority_key

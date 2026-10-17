@@ -70,7 +70,7 @@ let () =
   in
   assert (Retry_policy.maximum_attempts maximum_policy = maximum_attempts);
   expect_invalid "zero initial interval"
-    (Retry_policy.create
+    (Retry_policy.make
        ~initial_interval:(Temporal.Duration.of_ms 0L)
        ~backoff_coefficient:1.0
        ~maximum_interval:(Temporal.Duration.of_ms 1L) ~maximum_attempts:0 ());
