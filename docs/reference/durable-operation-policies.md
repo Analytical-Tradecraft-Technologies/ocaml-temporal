@@ -67,7 +67,7 @@ The constructor validates before a command is emitted and returns a typed
   matches every untyped error of that category. Names must satisfy the same
   strict text constraints as other values crossing the native boundary.
 
-`Retry_policy.create` is an alias for `make`. The accessor functions return
+The accessor functions return
 copies or immutable scalar values, so changing a caller-owned list after
 construction cannot change a command already selected by workflow code.
 Passing no `~retry_policy` leaves the option absent; it does not create an

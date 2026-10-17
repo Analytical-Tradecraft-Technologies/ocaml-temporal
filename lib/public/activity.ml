@@ -145,9 +145,6 @@ module Priority = struct
                           ~fairness_weight_bits;
                     }))
 
-  (** Alias for callers who prefer constructor terminology. *)
-  let create = make
-
   (** Returns the optional positive priority key. *)
   let priority_key value = value.priority_key
 
@@ -630,13 +627,6 @@ module Retry_policy = struct
                     non_retryable_error_types =
                       List.map Fun.id non_retryable_error_types;
                   })
-
-  (** The [create] spelling is useful at call sites that treat policies as
-      immutable values rather than mutable builders. *)
-  let create ~initial_interval ~backoff_coefficient ~maximum_interval
-      ~maximum_attempts ?non_retryable_error_types () =
-    make ~initial_interval ~backoff_coefficient ~maximum_interval
-      ~maximum_attempts ?non_retryable_error_types ()
 
   (** Returns the exact delay before the first retry. *)
   let initial_interval policy = policy.initial_interval
