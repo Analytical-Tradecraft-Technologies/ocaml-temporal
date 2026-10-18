@@ -402,7 +402,7 @@ the `license` field of `cargo metadata` for the locked version.
 | temporalio-common | Core revision | 1.1.0 | normal | MIT (reviewed `LICENSE.txt`) | Temporal Core shared types |
 | temporalio-sdk-core | Core revision | 0.10.0 | normal | MIT (reviewed `LICENSE.txt`) | Temporal Core worker state machines |
 | temporalio-protos | Core revision | 0.10.0 | normal | MIT (reviewed `LICENSE.txt`) | Temporal API protobuf types |
-| tokio | 1.52.3 | 1.53.2 | normal, dev | MIT | Core's existing executor, channels, and task handles for the guarded poll lanes; `net` and `io-util` for the metrics endpoint's accept loop and relay |
+| tokio | 1.52.3 | 1.53.3 | normal, dev | MIT | Core's existing executor, channels, and task handles for the guarded poll lanes; `net` and `io-util` for the metrics endpoint's accept loop and relay |
 | tracing | 0.1.44 | 0.1.44 | normal | MIT | Warning and error records from the metrics endpoint, through Core's existing log pipeline |
 | uuid | 1.23.4 | 1.28.0 | normal | Apache-2.0 OR MIT | Random v4 tickets for pending workflow-start operations |
 
