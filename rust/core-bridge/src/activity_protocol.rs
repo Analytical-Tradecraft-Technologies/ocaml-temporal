@@ -227,9 +227,10 @@ pub enum ActivityCompletionResult {
 
 /// Decodes and validates one strict activity-task document.
 pub fn decode_task(input: &str) -> Result<ActivityTask, ProtocolError> {
-    let value = protocol::decode_payload_object(input)?;
-    let task: ActivityTask = serde_json::from_value(to_serde(value))
-        .map_err(|_| ProtocolError::invalid("$", "invalid activity task semantics"))?;
+    let task: ActivityTask = protocol::semantic_from_value(
+        protocol::decode_payload_object(input)?,
+        "invalid activity task semantics",
+    )?;
     validate_task(&task)?;
     Ok(task)
 }
@@ -237,9 +238,7 @@ pub fn decode_task(input: &str) -> Result<ActivityTask, ProtocolError> {
 /// Validates, normalizes, and reparses one outgoing activity task.
 pub fn encode_task(value: &ActivityTask) -> Result<String, ProtocolError> {
     validate_task(value)?;
-    let json = serde_json::to_value(value)
-        .map_err(|_| ProtocolError::invalid("$", "could not encode activity task"))?;
-    let output = protocol::encode_payload_object(&from_serde(json)?)?;
+    let output = protocol::encode_semantic(value, "could not encode activity task")?;
     decode_task(&output)?;
     Ok(output)
 }
@@ -248,8 +247,8 @@ pub fn encode_task(value: &ActivityTask) -> Result<String, ProtocolError> {
 pub fn decode_completion(input: &str) -> Result<ActivityCompletion, ProtocolError> {
     let value = protocol::decode_payload_object(input)?;
     reject_null_completed_payload(&value)?;
-    let completion: ActivityCompletion = serde_json::from_value(to_serde(value))
-        .map_err(|_| ProtocolError::invalid("$", "invalid activity completion semantics"))?;
+    let completion: ActivityCompletion =
+        protocol::semantic_from_value(value, "invalid activity completion semantics")?;
     validate_completion(&completion)?;
     Ok(completion)
 }
@@ -290,18 +289,17 @@ fn reject_null_completed_payload(value: &protocol::JsonValue) -> Result<(), Prot
 /// Validates, normalizes, and reparses one outgoing activity completion.
 pub fn encode_completion(value: &ActivityCompletion) -> Result<String, ProtocolError> {
     validate_completion(value)?;
-    let json = serde_json::to_value(value)
-        .map_err(|_| ProtocolError::invalid("$", "could not encode activity completion"))?;
-    let output = protocol::encode_payload_object(&from_serde(json)?)?;
+    let output = protocol::encode_semantic(value, "could not encode activity completion")?;
     decode_completion(&output)?;
     Ok(output)
 }
 
 /// Decodes and validates one strict activity-heartbeat document.
 pub fn decode_heartbeat(input: &str) -> Result<ActivityHeartbeat, ProtocolError> {
-    let value = protocol::decode_payload_object(input)?;
-    let heartbeat: ActivityHeartbeat = serde_json::from_value(to_serde(value))
-        .map_err(|_| ProtocolError::invalid("$", "invalid activity heartbeat semantics"))?;
+    let heartbeat: ActivityHeartbeat = protocol::semantic_from_value(
+        protocol::decode_payload_object(input)?,
+        "invalid activity heartbeat semantics",
+    )?;
     validate_heartbeat(&heartbeat)?;
     Ok(heartbeat)
 }
@@ -309,18 +307,17 @@ pub fn decode_heartbeat(input: &str) -> Result<ActivityHeartbeat, ProtocolError>
 /// Validates, normalizes, and reparses one outgoing activity heartbeat.
 pub fn encode_heartbeat(value: &ActivityHeartbeat) -> Result<String, ProtocolError> {
     validate_heartbeat(value)?;
-    let json = serde_json::to_value(value)
-        .map_err(|_| ProtocolError::invalid("$", "could not encode activity heartbeat"))?;
-    let output = protocol::encode_payload_object(&from_serde(json)?)?;
+    let output = protocol::encode_semantic(value, "could not encode activity heartbeat")?;
     decode_heartbeat(&output)?;
     Ok(output)
 }
 
 /// Decodes and validates one strict async-activity heartbeat document.
 pub fn decode_async_heartbeat(input: &str) -> Result<AsyncActivityHeartbeat, ProtocolError> {
-    let value = protocol::decode_payload_object(input)?;
-    let heartbeat: AsyncActivityHeartbeat = serde_json::from_value(to_serde(value))
-        .map_err(|_| ProtocolError::invalid("$", "invalid async activity heartbeat semantics"))?;
+    let heartbeat: AsyncActivityHeartbeat = protocol::semantic_from_value(
+        protocol::decode_payload_object(input)?,
+        "invalid async activity heartbeat semantics",
+    )?;
     validate_async_heartbeat(&heartbeat)?;
     Ok(heartbeat)
 }
@@ -328,9 +325,7 @@ pub fn decode_async_heartbeat(input: &str) -> Result<AsyncActivityHeartbeat, Pro
 /// Validates, normalizes, and reparses one outgoing async-activity heartbeat.
 pub fn encode_async_heartbeat(value: &AsyncActivityHeartbeat) -> Result<String, ProtocolError> {
     validate_async_heartbeat(value)?;
-    let json = serde_json::to_value(value)
-        .map_err(|_| ProtocolError::invalid("$", "could not encode async activity heartbeat"))?;
-    let output = protocol::encode_payload_object(&from_serde(json)?)?;
+    let output = protocol::encode_semantic(value, "could not encode async activity heartbeat")?;
     decode_async_heartbeat(&output)?;
     Ok(output)
 }
@@ -734,47 +729,4 @@ fn cancel_reason_from_core(value: i32) -> Result<ActivityCancelReason, CoreConve
             Core::Reset => ActivityCancelReason::Reset,
         },
     )
-}
-
-/// Converts the duplicate-aware protocol tree into Serde's value tree.
-fn to_serde(value: protocol::JsonValue) -> serde_json::Value {
-    match value {
-        protocol::JsonValue::Null => serde_json::Value::Null,
-        protocol::JsonValue::Bool(value) => serde_json::Value::Bool(value),
-        protocol::JsonValue::Signed(value) => value.into(),
-        protocol::JsonValue::Unsigned(value) => value.into(),
-        protocol::JsonValue::String(value) => serde_json::Value::String(value),
-        protocol::JsonValue::Array(values) => {
-            serde_json::Value::Array(values.into_iter().map(to_serde).collect())
-        }
-        protocol::JsonValue::Object(fields) => {
-            serde_json::Value::Object(fields.into_iter().map(|(k, v)| (k, to_serde(v))).collect())
-        }
-    }
-}
-
-/// Converts a Serde value into the normalized protocol tree.
-fn from_serde(value: serde_json::Value) -> Result<protocol::JsonValue, ProtocolError> {
-    Ok(match value {
-        serde_json::Value::Null => protocol::JsonValue::Null,
-        serde_json::Value::Bool(value) => protocol::JsonValue::Bool(value),
-        serde_json::Value::Number(value) => value
-            .as_i64()
-            .map(protocol::JsonValue::Signed)
-            .or_else(|| value.as_u64().map(protocol::JsonValue::Unsigned))
-            .ok_or_else(|| ProtocolError::invalid("$", "number is not integral"))?,
-        serde_json::Value::String(value) => protocol::JsonValue::String(value),
-        serde_json::Value::Array(values) => protocol::JsonValue::Array(
-            values
-                .into_iter()
-                .map(from_serde)
-                .collect::<Result<_, _>>()?,
-        ),
-        serde_json::Value::Object(fields) => protocol::JsonValue::Object(
-            fields
-                .into_iter()
-                .map(|(k, v)| Ok((k, from_serde(v)?)))
-                .collect::<Result<_, ProtocolError>>()?,
-        ),
-    })
 }
