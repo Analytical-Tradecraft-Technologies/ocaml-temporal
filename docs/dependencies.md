@@ -253,7 +253,7 @@ the pin files, the Dependabot entries and the CI matrix stay in step.
 
 | Image | Pin file | Manifest index digest |
 |---|---|---|
-| `ocaml/opam:debian-12-ocaml-5.2` | `docker/ocaml-5.2/Dockerfile` | `sha256:3f7f5f5adffbb0f69172d69ec34450695257aaf148d4549b3227c6998c5eb2a4` |
+| `ocaml/opam:debian-12-ocaml-5.2` | `docker/ocaml-5.2/Dockerfile` | `sha256:9a6c4e97c6cd133003f89c99fa74093902d88b385494dfcbcd77d22125e82086` |
 | `ocaml/opam:debian-12-ocaml-5.3` | `docker/ocaml-5.3/Dockerfile` | `sha256:bbaac53e502f6602013d8967c3a54cfcb898b556f453ab72e8e23966c3c681df` |
 | `ocaml/opam:debian-12-ocaml-5.4` | `docker/ocaml-5.4/Dockerfile` | `sha256:56c9ab2e2f9e8fa926efbc36bedf75fbdb0dd7661765440397def7a24d4e3bfa` |
 | `ocaml/opam:debian-12-ocaml-5.5` | `docker/ocaml-5.5/Dockerfile` | `sha256:36803e379c31545ef00dfb64f8bdf3226b5e8c7b76746b636caedda811c625f3` |
